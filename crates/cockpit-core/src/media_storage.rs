@@ -457,11 +457,11 @@ async fn block_component_lease_after_failed_proof(
     db.transaction(move |conn| {
         let next_attachment = authority.availability_generation.checked_add(1).context("availability generation overflow")?;
         let next_component = authority.component.component_generation.checked_add(1).context("component generation overflow")?;
-        let changed = conn.execute("UPDATE media_attachments SET availability='security_blocked',availability_generation=?1,updated_at_unix_ms=?2 WHERE attachment_id=?3 AND attachment_version=?4 AND availability='ready' AND availability_generation=?5",params![next_attachment.to_string(),now_unix_ms,authority.attachment_id.to_string(),authority.attachment_version.to_string(),authority.availability_generation.to_string()])?;
+        let changed = conn.execute("UPDATE media_attachments SET availability='security_blocked',availability_generation=?1,updated_at_unix_ms=?2 WHERE attachment_id=?3 AND attachment_version=?4 AND availability='ready' AND availability_generation=?5",params![i64::try_from(next_attachment).context("availability generation overflow")?,now_unix_ms,authority.attachment_id.to_string(),i64::try_from(authority.attachment_version).context("attachment version overflow")?,i64::try_from(authority.availability_generation).context("availability generation overflow")?])?;
         ensure!(changed == 1,"media security transition lost compare-and-swap");
-        let changed = conn.execute("UPDATE media_attachment_components SET lifecycle_state='security_blocked',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4 AND lifecycle_state='ready'",params![next_component.to_string(),now_unix_ms,authority.component.component_id.to_string(),authority.component.component_generation.to_string()])?;
+        let changed = conn.execute("UPDATE media_attachment_components SET lifecycle_state='security_blocked',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4 AND lifecycle_state='ready'",params![i64::try_from(next_component).context("component generation overflow")?,now_unix_ms,authority.component.component_id.to_string(),i64::try_from(authority.component.component_generation).context("component generation overflow")?])?;
         ensure!(changed == 1,"media component security transition lost compare-and-swap");
-        conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,'ready','security_blocked',?3,?4)",params![authority.attachment_id.to_string(),next_attachment.to_string(),authority.lease_id.to_string(),now_unix_ms])?;
+        conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,'ready','security_blocked',?3,?4)",params![authority.attachment_id.to_string(),i64::try_from(next_attachment).context("availability generation overflow")?,authority.lease_id.to_string(),now_unix_ms])?;
         conn.execute("INSERT INTO media_component_security_evidence(lease_id,attachment_id,component_id,reason,recorded_at_unix_ms) VALUES(?1,?2,?3,'storage_security_violation',?4)",params![authority.lease_id.to_string(),authority.attachment_id.to_string(),authority.component.component_id.to_string(),now_unix_ms])?;
         cockpit_db::Db::release_media_component_lease_conn(conn,authority.lease_id,now_unix_ms)?;
         Ok(())
@@ -987,10 +987,10 @@ impl MediaStorageRecovery {
                 let (version, generation, capability, availability) = conn.query_row(
                     "SELECT attachment_version, availability_generation, captured_capability_generation, availability FROM media_attachments WHERE attachment_id=?1",
                     [attachment_id.to_string()],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, String>(3)?)),
                 )?;
-                ensure!(version.parse::<u64>()? == expected_version && availability == "ready", "media_attachment_unavailable");
-                Ok((generation.parse()?, capability.parse()?))
+                ensure!(u64::try_from(version).context("attachment version overflow")? == expected_version && availability == "ready", "media_attachment_unavailable");
+                Ok((u64::try_from(generation).context("availability generation overflow")?, u64::try_from(capability).context("capability generation overflow")?))
             })
             .await?;
         let held = self
@@ -1137,7 +1137,7 @@ impl MediaStorageRecovery {
                 }
             })?;
         for (component_id, storage_id, identity, length, checksum) in rows {
-            let length = length.parse::<u64>()?;
+            let length = u64::try_from(length).context("component byte length overflow")?;
             let mut intent_hasher = Sha256::new();
             intent_hasher.update(b"media-component-delete-intent-v1\0");
             for value in [
@@ -1247,7 +1247,7 @@ impl MediaStorageRecovery {
         }
         let attachment_for_complete = attachment.clone();
         self.db.blocking_write_for_sync_ui(move |conn| {
-            let row: Option<(String, String)> = conn.query_row(
+            let row: Option<(String, i64)> = conn.query_row(
                 "SELECT a.source_kind,a.availability_generation
                    FROM media_attachments a
                    JOIN media_attachment_cleanup_intents i ON i.attachment_id=a.attachment_id
@@ -1294,10 +1294,8 @@ impl MediaStorageRecovery {
                 )?;
             }
             let next = generation
-                .parse::<u64>()?
                 .checked_add(1)
-                .context("availability generation overflow")?
-                .to_string();
+                .context("availability generation overflow")?;
             let terminal = if source == "local_path" {
                 "borrowed_derivatives_deleted"
             } else {
@@ -1667,21 +1665,21 @@ impl MediaStorageRecovery {
                 conn.execute_batch("COMMIT")?;
                 return Ok(());
             }
-            let aggregate = conn.query_row("SELECT attachment_version,availability_generation,reference_generation,source_kind,availability FROM media_attachments WHERE attachment_id=?1", [&attachment], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?))).optional()?;
+            let aggregate = conn.query_row("SELECT attachment_version,availability_generation,reference_generation,source_kind,availability FROM media_attachments WHERE attachment_id=?1", [&attachment], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?))).optional()?;
             let Some((version, generation, reference_generation, source_kind, availability)) = aggregate else {
                 conn.execute_batch("ROLLBACK")?;
                 return Ok(());
             };
             let result = (|| -> Result<()> {
-                let components = { let mut statement=conn.prepare("SELECT component_id,component_kind,component_generation FROM media_attachment_components WHERE attachment_id=?1 AND lifecycle_state<>'deleted' ORDER BY component_id")?; statement.query_map([&attachment],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()? };
+                let components = { let mut statement=conn.prepare("SELECT component_id,component_kind,component_generation FROM media_attachment_components WHERE attachment_id=?1 AND lifecycle_state<>'deleted' ORDER BY component_id")?; statement.query_map([&attachment],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()? };
                 let mut hasher=Sha256::new();
                 hasher.update(b"media-cleanup-component-set-v1\0");
-                for (id,kind,component_generation) in &components { hasher.update(id.as_bytes());hasher.update([0]);hasher.update(kind.as_bytes());hasher.update([0]);hasher.update(component_generation.as_bytes());hasher.update([0]); }
+                for (id,kind,component_generation) in &components { hasher.update(id.as_bytes());hasher.update([0]);hasher.update(kind.as_bytes());hasher.update([0]);hasher.update(component_generation.to_string().as_bytes());hasher.update([0]); }
                 let set_digest=crate::intel::hex_lower(&hasher.finalize());
-                let next=generation.parse::<u64>()?.checked_add(1).context("availability generation overflow")?.to_string();
+                let next=generation.checked_add(1).context("availability generation overflow")?;
                 let pending=if source_kind=="local_path"{"borrowed_cleanup_pending"}else{"owned_cleanup_pending"};
                 ensure!(conn.execute("UPDATE media_attachments SET availability=?1,availability_generation=?2,updated_at_unix_ms=?3 WHERE attachment_id=?4 AND availability_generation=?5",params![pending,next,now,attachment,generation])?==1,"tool image cleanup lost compare-and-swap");
-                for(component_id,_,component_generation)in &components { let component_next=component_generation.parse::<u64>()?.checked_add(1).context("component generation overflow")?.to_string();ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='cleanup_pending',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4 AND lifecycle_state<>'deleted'",params![component_next,now,component_id,component_generation])?==1,"tool image component cleanup lost compare-and-swap"); }
+                for(component_id,_,component_generation)in &components { let component_next=component_generation.checked_add(1).context("component generation overflow")?;ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='cleanup_pending',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4 AND lifecycle_state<>'deleted'",params![component_next,now,component_id,component_generation])?==1,"tool image component cleanup lost compare-and-swap"); }
                 let intent_id=Uuid::now_v7().to_string();
                 conn.execute("INSERT INTO media_attachment_cleanup_intents(intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,'discard',?7)",params![intent_id,attachment,version,next,reference_generation,set_digest,now])?;
                 conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment,next,availability,pending,intent_id,now])?;
@@ -1773,7 +1771,7 @@ impl MediaStorageRecovery {
                     ],
                     |row| {
                         Ok((
-                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(0)?,
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
                             row.get::<_, String>(3)?,
@@ -1793,17 +1791,17 @@ impl MediaStorageRecovery {
             if availability != "ready"
                 || live_kind != expected_kind
                 || live_project_digest != project_digest
-                || live_version.parse::<u64>().ok() != Some(attachment_version)
+                || u64::try_from(live_version).ok() != Some(attachment_version)
             {
                 return Ok(None);
             }
             let component = conn.query_row(
                 "SELECT storage_id, byte_length, sha256, stable_identity_digest FROM media_attachment_components WHERE attachment_id=?1 AND attachment_version=?2 AND lifecycle_state='ready' ORDER BY CASE component_kind WHEN 'image_model' THEN 0 WHEN 'quarantined_original' THEN 1 ELSE 2 END LIMIT 1",
-                params![Uuid::from_bytes(attachment_id).to_string(), attachment_version.to_string()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
+                params![Uuid::from_bytes(attachment_id).to_string(), i64::try_from(attachment_version).map_err(|_| rusqlite::Error::InvalidQuery)?],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
             ).optional()?;
             let Some((storage_id, byte_length, component_sha256, component_identity)) = component else { return Ok(None); };
-            let Ok(byte_length) = byte_length.parse::<usize>() else { return Ok(None); };
+            let Ok(byte_length) = usize::try_from(byte_length) else { return Ok(None); };
             if byte_length > max_bytes { return Ok(None); }
             let held = self.owned_root.open_file_verified(&storage_id)
                 .map_err(|_| rusqlite::Error::InvalidQuery)?;
@@ -1875,14 +1873,14 @@ impl MediaStorageRecovery {
                     AND component_kind=?3 AND lifecycle_state='ready'",
                 params![
                     attachment_id.to_string(),
-                    attachment_version.to_string(),
+                    i64::try_from(attachment_version).context("attachment version overflow")?,
                     component_kind,
                 ],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(2)?,
                         row.get::<_, String>(3)?,
                     ))
                 },
@@ -1894,7 +1892,8 @@ impl MediaStorageRecovery {
         else {
             return Ok(None);
         };
-        let expected_length = expected_length.parse::<u64>()?;
+        let expected_length =
+            u64::try_from(expected_length).context("component byte length overflow")?;
         let ceiling = (max_bytes as u64).min(TOOL_MEDIA_INPUT_CEILING_BYTES);
         // Reject hostile/corrupt durable metadata before opening the object or
         // allocating a buffer from its declared size. `max_bytes` is the
@@ -2250,7 +2249,7 @@ impl MediaStorageRecovery {
             conn.query_row(
                 "SELECT attachment_id,attachment_version,availability_generation,reservation_id,normalized_sha256,normalized_byte_length,width,height,request_source_digest,session_id FROM media_ingress_admission_receipts WHERE admission_id=?1",
                 params![admission_id.to_string()],
-                |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,u32>(6)?,row.get::<_,u32>(7)?,row.get::<_,String>(8)?,row.get::<_,String>(9)?)),
+                |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,i64>(5)?,row.get::<_,u32>(6)?,row.get::<_,u32>(7)?,row.get::<_,String>(8)?,row.get::<_,String>(9)?)),
             )
             .optional()?
             .map(|row| {
@@ -2260,11 +2259,11 @@ impl MediaStorageRecovery {
                 admission_id,
                 session_id,
                 attachment_id: Uuid::parse_str(&row.0)?,
-                attachment_version: row.1.parse()?,
-                availability_generation: row.2.parse()?,
+                attachment_version: u64::try_from(row.1).context("attachment version overflow")?,
+                availability_generation: u64::try_from(row.2).context("availability generation overflow")?,
                 reservation_id: row.3,
                 normalized_sha256: row.4,
-                normalized_byte_length: row.5.parse()?,
+                normalized_byte_length: u64::try_from(row.5).context("normalized byte length overflow")?,
                 width: row.6,
                 height: row.7,
                 })
@@ -2298,9 +2297,9 @@ impl MediaStorageRecovery {
                         |row| {
                             Ok((
                                 row.get::<_, String>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                                row.get::<_, String>(3)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, i64>(3)?,
                             ))
                         },
                     )
@@ -2316,9 +2315,9 @@ impl MediaStorageRecovery {
                         session_id,
                         canonical_project_digest,
                         attachment_id: Uuid::parse_str(&row.0)?,
-                        attachment_version: row.1.parse()?,
-                        availability_generation: row.2.parse()?,
-                        reference_generation: row.3.parse()?,
+                        attachment_version: u64::try_from(row.1).context("attachment version overflow")?,
+                        availability_generation: u64::try_from(row.2).context("availability generation overflow")?,
+                        reference_generation: u64::try_from(row.3).context("reference generation overflow")?,
                         origin_admission_id: Some(admission_id),
                         origin_upload: None,
                     },
@@ -2378,7 +2377,7 @@ impl MediaStorageRecovery {
     /// or A/V preparation pipeline used by upload Finalize.
     pub(crate) async fn process_retained_https_jobs(&self, now_unix_ms: i64) -> Result<usize> {
         let reclaim_before = now_unix_ms.saturating_sub(300_000);
-        let jobs=self.db.read(move|conn|{let mut statement=conn.prepare("SELECT j.job_id,j.attachment_id,j.expected_attachment_version,j.expected_availability_generation,j.source_evidence_digest,c.storage_id,c.stable_identity_digest,c.byte_length,c.sha256,c.reservation_id,j.state,a.media_kind FROM media_attachment_processing_jobs j JOIN media_attachments a ON a.attachment_id=j.attachment_id JOIN media_attachment_components c ON c.attachment_id=a.attachment_id AND c.component_kind='quarantined_original' WHERE (j.state='pending' OR (j.state='claimed' AND j.claimed_at_unix_ms<=?1)) AND a.source_kind='retained_https' ORDER BY j.created_at_unix_ms,j.job_id")?;statement.query_map([reclaim_before],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?,r.get::<_,String>(11)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)}).await?;
+        let jobs=self.db.read(move|conn|{let mut statement=conn.prepare("SELECT j.job_id,j.attachment_id,j.expected_attachment_version,j.expected_availability_generation,j.source_evidence_digest,c.storage_id,c.stable_identity_digest,c.byte_length,c.sha256,c.reservation_id,j.state,a.media_kind FROM media_attachment_processing_jobs j JOIN media_attachments a ON a.attachment_id=j.attachment_id JOIN media_attachment_components c ON c.attachment_id=a.attachment_id AND c.component_kind='quarantined_original' WHERE (j.state='pending' OR (j.state='claimed' AND j.claimed_at_unix_ms<=?1)) AND a.source_kind='retained_https' ORDER BY j.created_at_unix_ms,j.job_id")?;statement.query_map([reclaim_before],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,i64>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?,r.get::<_,String>(11)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)}).await?;
         let mut completed = 0;
         for (
             job,
@@ -2397,11 +2396,13 @@ impl MediaStorageRecovery {
         {
             let job_id = Uuid::parse_str(&job)?;
             let attachment_id = Uuid::parse_str(&attachment)?;
-            let expected_version = version.parse::<u64>()?;
-            let expected_generation = generation.parse::<u64>()?;
+            let expected_version =
+                u64::try_from(version).context("expected attachment version overflow")?;
+            let expected_generation =
+                u64::try_from(generation).context("expected availability generation overflow")?;
             let claimed=self.db.transaction(move|conn|{let changed=conn.execute("UPDATE media_attachment_processing_jobs SET state='claimed',claimed_at_unix_ms=?1,claim_attempt=claim_attempt+1 WHERE job_id=?2 AND (state='pending' OR (state='claimed' AND claimed_at_unix_ms<=?3))",params![now_unix_ms,job_id.to_string(),reclaim_before])?;if changed==0{return Ok(false)}
 
-            if prior_state=="pending"{cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,expected_version,expected_generation,MediaAvailability::Probing,now_unix_ms)?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,'quarantined','probing',?3,?4)",params![attachment_id.to_string(),(expected_generation+1).to_string(),job_id.to_string(),now_unix_ms])?;}Ok(true)}).await?;
+            if prior_state=="pending"{cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,expected_version,expected_generation,MediaAvailability::Probing,now_unix_ms)?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,'quarantined','probing',?3,?4)",params![attachment_id.to_string(),expected_generation+1,job_id.to_string(),now_unix_ms])?;}Ok(true)}).await?;
             if !claimed {
                 continue;
             }
@@ -2417,7 +2418,8 @@ impl MediaStorageRecovery {
                 );
                 let (actual_length, actual_checksum) = read_full_digest(&mut held)?;
                 ensure!(
-                    actual_length == length.parse::<u64>()?
+                    actual_length
+                        == u64::try_from(length).context("component byte length overflow")?
                         && actual_checksum == checksum
                         && stable_identity_digest(&held)? == identity,
                     "storage_security_violation"
@@ -2434,7 +2436,7 @@ impl MediaStorageRecovery {
                     if error.to_string().contains("storage_security_violation")
                         || error.downcast_ref::<ExternalJournalError>().is_some()
                     {
-                        self.db.transaction(move|conn|{let(component_id,component_generation):(String,String)=conn.query_row("SELECT component_id,component_generation FROM media_attachment_components WHERE attachment_id=?1 AND component_kind='quarantined_original'",[attachment_id.to_string()],|r|Ok((r.get(0)?,r.get(1)?)))?;let blocked_generation=expected_generation.checked_add(2).context("availability generation overflow")?;cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,expected_version,expected_generation+1,MediaAvailability::SecurityBlocked,now_unix_ms)?;conn.execute("UPDATE media_attachment_components SET lifecycle_state='security_blocked',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4",params![(component_generation.parse::<u64>()?+1).to_string(),now_unix_ms,component_id,component_generation])?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,'probing','security_blocked',?3,?4)",params![attachment_id.to_string(),blocked_generation.to_string(),job_id.to_string(),now_unix_ms])?;conn.execute("INSERT INTO media_attachment_processing_security_evidence(job_id,attachment_id,component_id,reason,recorded_at_unix_ms) VALUES(?1,?2,?3,'storage_security_violation',?4)",params![job_id.to_string(),attachment_id.to_string(),component_id,now_unix_ms])?;conn.execute("UPDATE media_attachment_processing_jobs SET state='completed',completed_at_unix_ms=?1 WHERE job_id=?2",params![now_unix_ms,job_id.to_string()])?;Ok(())}).await?;
+                        self.db.transaction(move|conn|{let(component_id,component_generation):(String,i64)=conn.query_row("SELECT component_id,component_generation FROM media_attachment_components WHERE attachment_id=?1 AND component_kind='quarantined_original'",[attachment_id.to_string()],|r|Ok((r.get(0)?,r.get(1)?)))?;let blocked_generation=expected_generation.checked_add(2).context("availability generation overflow")?;cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,expected_version,expected_generation+1,MediaAvailability::SecurityBlocked,now_unix_ms)?;conn.execute("UPDATE media_attachment_components SET lifecycle_state='security_blocked',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4",params![component_generation+1,now_unix_ms,component_id,component_generation])?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,'probing','security_blocked',?3,?4)",params![attachment_id.to_string(),blocked_generation,job_id.to_string(),now_unix_ms])?;conn.execute("INSERT INTO media_attachment_processing_security_evidence(job_id,attachment_id,component_id,reason,recorded_at_unix_ms) VALUES(?1,?2,?3,'storage_security_violation',?4)",params![job_id.to_string(),attachment_id.to_string(),component_id,now_unix_ms])?;conn.execute("UPDATE media_attachment_processing_jobs SET state='completed',completed_at_unix_ms=?1 WHERE job_id=?2",params![now_unix_ms,job_id.to_string()])?;Ok(())}).await?;
                         completed += 1;
                         continue;
                     }
@@ -2856,7 +2858,7 @@ impl MediaStorageRecovery {
             crate::media_reservation::reserve_conn(conn,crate::media_reservation::ReserveRequest{reservation_id:reservation_id.clone(),recovery_id:reservation_id.clone(),owner:crate::media_reservation::MediaOwner{project_id:request_for_tx.canonical_project_digest.clone(),session_id:request_for_tx.session_id.to_string()},operation:"retained_https_ingest".into(),purpose:"retained_media".into(),plans,wall_ms:u64::try_from(now_unix_ms)?},monotonic_now_ms)?;
             cockpit_db::Db::insert_media_attachment_conn(conn,&record)?; cockpit_db::Db::insert_media_attachment_component_conn(conn,&component)?;
             conn.execute("INSERT INTO media_retained_https_evidence(attachment_id,source_evidence_digest,redirect_classes_json,path_segment_count,safe_basename,fetched_at_unix_ms,reservation_id,reservation_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![attachment_id.to_string(),source_evidence_digest,serde_json::to_string(&redirect_classes)?,path_segment_count,safe_basename,now_unix_ms,reservation_id,reservation_digest])?;
-            conn.execute("INSERT INTO media_attachment_processing_jobs(job_id,attachment_id,expected_attachment_version,expected_availability_generation,source_evidence_digest,state,created_at_unix_ms) VALUES(?1,?2,'1','1',?3,'pending',?4)",params![Uuid::now_v7().to_string(),attachment_id.to_string(),source_evidence_digest,now_unix_ms])?;
+            conn.execute("INSERT INTO media_attachment_processing_jobs(job_id,attachment_id,expected_attachment_version,expected_availability_generation,source_evidence_digest,state,created_at_unix_ms) VALUES(?1,?2,1,1,?3,'pending',?4)",params![Uuid::now_v7().to_string(),attachment_id.to_string(),source_evidence_digest,now_unix_ms])?;
             conn.execute("INSERT INTO media_retained_https_operations(local_operation_id,authoritative_operation_id,session_id,canonical_project_digest,client_draft_id,request_binding_digest,operation_request_digest,semantic_command_digest,receipt_json,committed_at_unix_ms,is_alias) VALUES(?1,?1,?2,?3,?4,?5,?6,?7,?8,?9,0)",params![request_for_tx.local_operation_id.to_string(),request_for_tx.session_id.to_string(),request_for_tx.canonical_project_digest,request_for_tx.client_draft_id.to_string(),binding,request_digest,semantic_digest,receipt_json,now_unix_ms])?;
             conn.execute("INSERT INTO media_retained_https_audit(local_operation_id,outcome,committed_at_unix_ms) VALUES(?1,'retained',?2)",params![request_for_tx.local_operation_id.to_string(),now_unix_ms])?; conn.execute("DELETE FROM media_retained_https_publication_intents WHERE local_operation_id=?1",[request_for_tx.local_operation_id.to_string()])?; Ok(receipt)
         }).await;
@@ -3344,8 +3346,8 @@ impl MediaStorageRecovery {
                 )?;
                 crate::media_reservation::settle_and_publish_conn(conn, &transaction_reservation)?;
                 conn.execute(
-                    "INSERT INTO media_ingress_admission_receipts(admission_id,session_id,attachment_id,attachment_version,availability_generation,reservation_id,normalized_sha256,request_source_digest,normalized_byte_length,width,height,committed_at_unix_ms) VALUES(?1,?2,?3,'1','1',?4,?5,?6,?7,?8,?9,?10)",
-                    params![admission_id.to_string(),session_id.to_string(),attachment_id.to_string(),receipt_reservation,receipt_sha,receipt_request_digest,length.to_string(),width,height,now_unix_ms],
+                    "INSERT INTO media_ingress_admission_receipts(admission_id,session_id,attachment_id,attachment_version,availability_generation,reservation_id,normalized_sha256,request_source_digest,normalized_byte_length,width,height,committed_at_unix_ms) VALUES(?1,?2,?3,1,1,?4,?5,?6,?7,?8,?9,?10)",
+                    params![admission_id.to_string(),session_id.to_string(),attachment_id.to_string(),receipt_reservation,receipt_sha,receipt_request_digest,i64::try_from(length).context("normalized byte length overflow")?,width,height,now_unix_ms],
                 )?;
                 ensure!(
                     conn.execute(
@@ -3485,7 +3487,7 @@ impl MediaStorageRecovery {
         component_id: String,
         now_unix_ms: i64,
     ) -> Result<()> {
-        self.db.transaction(move|conn|{let (availability,generation):(String,String)=conn.query_row("SELECT availability,availability_generation FROM media_attachments WHERE attachment_id=?1",[&attachment_id],|row|Ok((row.get(0)?,row.get(1)?)))?;if availability=="security_blocked"{return Ok(());}ensure!(matches!(availability.as_str(),"owned_cleanup_pending"|"borrowed_cleanup_pending"),"cleanup security transition requires pending state");let next=generation.parse::<u64>()?.checked_add(1).context("availability generation overflow")?.to_string();ensure!(conn.execute("UPDATE media_attachments SET availability='security_blocked',availability_generation=?1,updated_at_unix_ms=?2 WHERE attachment_id=?3 AND availability_generation=?4",params![next,now_unix_ms,attachment_id,generation])?==1,"cleanup security aggregate CAS failed");let component_generation:String=conn.query_row("SELECT component_generation FROM media_attachment_components WHERE component_id=?1",[&component_id],|row|row.get(0))?;let component_next=component_generation.parse::<u64>()?.checked_add(1).context("component generation overflow")?.to_string();ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='security_blocked',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4 AND lifecycle_state='cleanup_pending'",params![component_next,now_unix_ms,component_id,component_generation])?==1,"cleanup security component CAS failed");conn.execute("INSERT INTO media_cleanup_security_evidence(component_id,attachment_id,reason,recorded_at_unix_ms) VALUES(?1,?2,'storage_security_violation',?3)",params![component_id,attachment_id,now_unix_ms])?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,'security_blocked',?4,?5)",params![attachment_id,next,availability,Uuid::now_v7().to_string(),now_unix_ms])?;Ok(())}).await
+        self.db.transaction(move|conn|{let (availability,generation):(String,i64)=conn.query_row("SELECT availability,availability_generation FROM media_attachments WHERE attachment_id=?1",[&attachment_id],|row|Ok((row.get(0)?,row.get(1)?)))?;if availability=="security_blocked"{return Ok(());}ensure!(matches!(availability.as_str(),"owned_cleanup_pending"|"borrowed_cleanup_pending"),"cleanup security transition requires pending state");let next=generation.checked_add(1).context("availability generation overflow")?;ensure!(conn.execute("UPDATE media_attachments SET availability='security_blocked',availability_generation=?1,updated_at_unix_ms=?2 WHERE attachment_id=?3 AND availability_generation=?4",params![next,now_unix_ms,attachment_id,generation])?==1,"cleanup security aggregate CAS failed");let component_generation:i64=conn.query_row("SELECT component_generation FROM media_attachment_components WHERE component_id=?1",[&component_id],|row|row.get(0))?;let component_next=component_generation.checked_add(1).context("component generation overflow")?;ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='security_blocked',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4 AND lifecycle_state='cleanup_pending'",params![component_next,now_unix_ms,component_id,component_generation])?==1,"cleanup security component CAS failed");conn.execute("INSERT INTO media_cleanup_security_evidence(component_id,attachment_id,reason,recorded_at_unix_ms) VALUES(?1,?2,'storage_security_violation',?3)",params![component_id,attachment_id,now_unix_ms])?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,'security_blocked',?4,?5)",params![attachment_id,next,availability,Uuid::now_v7().to_string(),now_unix_ms])?;Ok(())}).await
     }
 
     /// Starts every due 24-hour orphan-draft or 30-day completed-session
@@ -3494,16 +3496,16 @@ impl MediaStorageRecovery {
     pub(crate) async fn begin_due_retention(&self, now_unix_ms: i64) -> Result<usize> {
         const COMPLETED_SESSION_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
         self.db.transaction(move |conn| {
-            let candidates={let mut statement=conn.prepare("SELECT a.attachment_id,a.attachment_version,a.availability_generation,a.reference_generation,a.source_kind,a.availability,CASE WHEN a.draft_expires_at_unix_ms IS NOT NULL AND a.first_referenced_at_unix_ms IS NULL AND a.draft_expires_at_unix_ms<=?1 THEN 'draft_expired' ELSE 'session_retention' END FROM media_attachments a JOIN sessions s ON s.session_id=a.session_id WHERE a.availability IN ('registered','quarantined','probing','decoding','normalizing','ready','model_derivative_unavailable','source_changed','failed') AND NOT EXISTS(SELECT 1 FROM media_attachment_cleanup_intents i WHERE i.attachment_id=a.attachment_id) AND NOT EXISTS(SELECT 1 FROM media_attachment_references r WHERE r.attachment_id=a.attachment_id AND r.released_at_unix_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM media_attachment_component_leases l WHERE l.attachment_id=a.attachment_id AND l.released_at_unix_ms IS NULL) AND ((a.draft_expires_at_unix_ms IS NOT NULL AND a.first_referenced_at_unix_ms IS NULL AND a.draft_expires_at_unix_ms<=?1) OR (s.ended_at_unix_ms IS NOT NULL AND ?1>=s.ended_at_unix_ms+?2)) ORDER BY a.attachment_id")?;statement.query_map(params![now_unix_ms,COMPLETED_SESSION_RETENTION_MS],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?)))?.collect::<std::result::Result<Vec<_>,_>>()?};
+            let candidates={let mut statement=conn.prepare("SELECT a.attachment_id,a.attachment_version,a.availability_generation,a.reference_generation,a.source_kind,a.availability,CASE WHEN a.draft_expires_at_unix_ms IS NOT NULL AND a.first_referenced_at_unix_ms IS NULL AND a.draft_expires_at_unix_ms<=?1 THEN 'draft_expired' ELSE 'session_retention' END FROM media_attachments a JOIN sessions s ON s.session_id=a.session_id WHERE a.availability IN ('registered','quarantined','probing','decoding','normalizing','ready','model_derivative_unavailable','source_changed','failed') AND NOT EXISTS(SELECT 1 FROM media_attachment_cleanup_intents i WHERE i.attachment_id=a.attachment_id) AND NOT EXISTS(SELECT 1 FROM media_attachment_references r WHERE r.attachment_id=a.attachment_id AND r.released_at_unix_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM media_attachment_component_leases l WHERE l.attachment_id=a.attachment_id AND l.released_at_unix_ms IS NULL) AND ((a.draft_expires_at_unix_ms IS NOT NULL AND a.first_referenced_at_unix_ms IS NULL AND a.draft_expires_at_unix_ms<=?1) OR (s.ended_at_unix_ms IS NOT NULL AND ?1>=s.ended_at_unix_ms+?2)) ORDER BY a.attachment_id")?;statement.query_map(params![now_unix_ms,COMPLETED_SESSION_RETENTION_MS],|row|Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?)))?.collect::<std::result::Result<Vec<_>,_>>()?};
             let mut started=0;
             for (attachment,version,generation,reference_generation,source_kind,from_state,reason) in candidates {
-                let components={let mut statement=conn.prepare("SELECT component_id,component_kind,component_generation FROM media_attachment_components WHERE attachment_id=?1 AND lifecycle_state<>'deleted' ORDER BY component_id")?;statement.query_map([&attachment],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()?};
-                let mut hasher=Sha256::new();hasher.update(b"media-cleanup-component-set-v1\0");for (id,kind,component_generation) in &components {hasher.update(id.as_bytes());hasher.update([0]);hasher.update(kind.as_bytes());hasher.update([0]);hasher.update(component_generation.as_bytes());hasher.update([0]);}let set_digest=crate::intel::hex_lower(&hasher.finalize());
-                let generation_number=generation.parse::<u64>()?;let next=generation_number.checked_add(1).context("availability generation overflow")?.to_string();
+                let components={let mut statement=conn.prepare("SELECT component_id,component_kind,component_generation FROM media_attachment_components WHERE attachment_id=?1 AND lifecycle_state<>'deleted' ORDER BY component_id")?;statement.query_map([&attachment],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()?};
+                let mut hasher=Sha256::new();hasher.update(b"media-cleanup-component-set-v1\0");for (id,kind,component_generation) in &components {hasher.update(id.as_bytes());hasher.update([0]);hasher.update(kind.as_bytes());hasher.update([0]);hasher.update(component_generation.to_string().as_bytes());hasher.update([0]);}let set_digest=crate::intel::hex_lower(&hasher.finalize());
+                let next=generation.checked_add(1).context("availability generation overflow")?;
                 let pending=if source_kind=="local_path"{"borrowed_cleanup_pending"}else{"owned_cleanup_pending"};
                 let changed=conn.execute("UPDATE media_attachments SET availability=?1,availability_generation=?2,updated_at_unix_ms=?3 WHERE attachment_id=?4 AND availability_generation=?5 AND availability NOT IN ('security_blocked','owned_cleanup_pending','borrowed_cleanup_pending')",params![pending,next,now_unix_ms,attachment,generation])?;
                 ensure!(changed==1,"retention cleanup lost compare-and-swap");
-                for (component_id,_,component_generation) in &components {let component_next=component_generation.parse::<u64>()?.checked_add(1).context("component generation overflow")?.to_string();ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='cleanup_pending',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4 AND lifecycle_state<>'deleted'",params![component_next,now_unix_ms,component_id,component_generation])?==1,"retention component cleanup lost compare-and-swap");}
+                for (component_id,_,component_generation) in &components {let component_next=component_generation.checked_add(1).context("component generation overflow")?;ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='cleanup_pending',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4 AND lifecycle_state<>'deleted'",params![component_next,now_unix_ms,component_id,component_generation])?==1,"retention component cleanup lost compare-and-swap");}
                 conn.execute("INSERT INTO media_attachment_cleanup_intents(intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![Uuid::now_v7().to_string(),attachment,version,next,reference_generation,set_digest,reason,now_unix_ms])?;
                 conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment,next,from_state,pending,Uuid::now_v7().to_string(),now_unix_ms])?;
                 started+=1;
@@ -3517,17 +3519,17 @@ impl MediaStorageRecovery {
         session_id: Uuid,
         now_unix_ms: i64,
     ) -> Result<usize> {
-        self.db.transaction(move|conn|{let mut candidates=Vec::new();for member in crate::db::sessions::collect_subtree(conn,session_id)?{let mut statement=conn.prepare("SELECT a.attachment_id,a.attachment_version,a.availability_generation,a.reference_generation,a.source_kind,a.availability FROM media_attachments a WHERE a.session_id=?1 AND a.availability IN ('registered','quarantined','probing','decoding','normalizing','ready','model_derivative_unavailable','source_changed','failed') AND NOT EXISTS(SELECT 1 FROM media_attachment_cleanup_intents i WHERE i.attachment_id=a.attachment_id) AND NOT EXISTS(SELECT 1 FROM media_attachment_references r WHERE r.attachment_id=a.attachment_id AND r.released_at_unix_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM media_attachment_component_leases l WHERE l.attachment_id=a.attachment_id AND l.released_at_unix_ms IS NULL) ORDER BY a.attachment_id")?;candidates.extend(statement.query_map([member.to_string()],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?)))?.collect::<std::result::Result<Vec<_>,_>>()?);}let mut started=0;for(attachment,version,generation,reference_generation,source_kind,from_state)in candidates{let components={let mut statement=conn.prepare("SELECT component_id,component_kind,component_generation FROM media_attachment_components WHERE attachment_id=?1 AND lifecycle_state<>'deleted' ORDER BY component_id")?;statement.query_map([&attachment],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()?};let mut hasher=Sha256::new();hasher.update(b"media-cleanup-component-set-v1\0");for(id,kind,component_generation)in&components{hasher.update(id.as_bytes());hasher.update([0]);hasher.update(kind.as_bytes());hasher.update([0]);hasher.update(component_generation.as_bytes());hasher.update([0]);}let set_digest=crate::intel::hex_lower(&hasher.finalize());let next=generation.parse::<u64>()?.checked_add(1).context("availability generation overflow")?.to_string();let pending=if source_kind=="local_path"{"borrowed_cleanup_pending"}else{"owned_cleanup_pending"};ensure!(conn.execute("UPDATE media_attachments SET availability=?1,availability_generation=?2,updated_at_unix_ms=?3 WHERE attachment_id=?4 AND availability_generation=?5",params![pending,next,now_unix_ms,attachment,generation])?==1,"session deletion cleanup lost compare-and-swap");for(component_id,_,component_generation)in&components{let component_next=component_generation.parse::<u64>()?.checked_add(1).context("component generation overflow")?.to_string();ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='cleanup_pending',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4 AND lifecycle_state<>'deleted'",params![component_next,now_unix_ms,component_id,component_generation])?==1,"session deletion component cleanup lost compare-and-swap");}conn.execute("INSERT INTO media_attachment_cleanup_intents(intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,'session_deleted',?7)",params![Uuid::now_v7().to_string(),attachment,version,next,reference_generation,set_digest,now_unix_ms])?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment,next,from_state,pending,Uuid::now_v7().to_string(),now_unix_ms])?;started+=1;}Ok(started)}).await
+        self.db.transaction(move|conn|{let mut candidates=Vec::new();for member in crate::db::sessions::collect_subtree(conn,session_id)?{let mut statement=conn.prepare("SELECT a.attachment_id,a.attachment_version,a.availability_generation,a.reference_generation,a.source_kind,a.availability FROM media_attachments a WHERE a.session_id=?1 AND a.availability IN ('registered','quarantined','probing','decoding','normalizing','ready','model_derivative_unavailable','source_changed','failed') AND NOT EXISTS(SELECT 1 FROM media_attachment_cleanup_intents i WHERE i.attachment_id=a.attachment_id) AND NOT EXISTS(SELECT 1 FROM media_attachment_references r WHERE r.attachment_id=a.attachment_id AND r.released_at_unix_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM media_attachment_component_leases l WHERE l.attachment_id=a.attachment_id AND l.released_at_unix_ms IS NULL) ORDER BY a.attachment_id")?;candidates.extend(statement.query_map([member.to_string()],|row|Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?)))?.collect::<std::result::Result<Vec<_>,_>>()?);}let mut started=0;for(attachment,version,generation,reference_generation,source_kind,from_state)in candidates{let components={let mut statement=conn.prepare("SELECT component_id,component_kind,component_generation FROM media_attachment_components WHERE attachment_id=?1 AND lifecycle_state<>'deleted' ORDER BY component_id")?;statement.query_map([&attachment],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()?};let mut hasher=Sha256::new();hasher.update(b"media-cleanup-component-set-v1\0");for(id,kind,component_generation)in&components{hasher.update(id.as_bytes());hasher.update([0]);hasher.update(kind.as_bytes());hasher.update([0]);hasher.update(component_generation.to_string().as_bytes());hasher.update([0]);}let set_digest=crate::intel::hex_lower(&hasher.finalize());let next=generation.checked_add(1).context("availability generation overflow")?;let pending=if source_kind=="local_path"{"borrowed_cleanup_pending"}else{"owned_cleanup_pending"};ensure!(conn.execute("UPDATE media_attachments SET availability=?1,availability_generation=?2,updated_at_unix_ms=?3 WHERE attachment_id=?4 AND availability_generation=?5",params![pending,next,now_unix_ms,attachment,generation])?==1,"session deletion cleanup lost compare-and-swap");for(component_id,_,component_generation)in&components{let component_next=component_generation.checked_add(1).context("component generation overflow")?;ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='cleanup_pending',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4 AND lifecycle_state<>'deleted'",params![component_next,now_unix_ms,component_id,component_generation])?==1,"session deletion component cleanup lost compare-and-swap");}conn.execute("INSERT INTO media_attachment_cleanup_intents(intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,'session_deleted',?7)",params![Uuid::now_v7().to_string(),attachment,version,next,reference_generation,set_digest,now_unix_ms])?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment,next,from_state,pending,Uuid::now_v7().to_string(),now_unix_ms])?;started+=1;}Ok(started)}).await
     }
 
     /// Resume every durable cleanup intent component-by-component. Capacity is
     /// intentionally not released here unless the central reservation ledger
     /// can consume the committed deletion evidence in the same transaction.
     pub(crate) async fn reconcile_media_cleanup_intents(&self, now_unix_ms: i64) -> Result<usize> {
-        let rows=self.db.read(|conn|{let mut statement=conn.prepare("SELECT c.component_id,c.attachment_id,c.storage_id,c.stable_identity_digest,c.byte_length,c.sha256 FROM media_attachment_components c JOIN media_attachment_cleanup_intents i ON i.attachment_id=c.attachment_id WHERE i.completed_at_unix_ms IS NULL AND c.lifecycle_state='cleanup_pending' ORDER BY c.attachment_id,c.component_id")?;statement.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)}).await?;
+        let rows=self.db.read(|conn|{let mut statement=conn.prepare("SELECT c.component_id,c.attachment_id,c.storage_id,c.stable_identity_digest,c.byte_length,c.sha256 FROM media_attachment_components c JOIN media_attachment_cleanup_intents i ON i.attachment_id=c.attachment_id WHERE i.completed_at_unix_ms IS NULL AND c.lifecycle_state='cleanup_pending' ORDER BY c.attachment_id,c.component_id")?;statement.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,i64>(4)?,row.get::<_,String>(5)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)}).await?;
         let mut completed = 0usize;
         for (component_id, attachment_id, storage_id, identity, length, checksum) in rows {
-            let length = length.parse::<u64>()?;
+            let length = u64::try_from(length).context("component byte length overflow")?;
             let mut intent_hasher = Sha256::new();
             intent_hasher.update(b"media-component-delete-intent-v1\0");
             for value in [
@@ -3651,9 +3653,9 @@ impl MediaStorageRecovery {
             self.db.transaction(move|conn|{conn.execute("INSERT INTO media_component_deletion_evidence(component_id,attachment_id,intent_digest,deletion_evidence_digest,deletion_kind,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(component_id) DO NOTHING",params![component,attachment,intent,evidence,deletion_kind,now_unix_ms])?;ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='deleted',deletion_evidence_digest=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND lifecycle_state='cleanup_pending'",params![evidence,now_unix_ms,component_id])?==1,"cleanup component tombstone lost compare-and-swap");Ok(())}).await?;
             completed += 1;
         }
-        let attachments=self.db.read(|conn|{let mut statement=conn.prepare("SELECT a.attachment_id,a.source_kind,a.availability_generation FROM media_attachments a JOIN media_attachment_cleanup_intents i ON i.attachment_id=a.attachment_id WHERE i.completed_at_unix_ms IS NULL AND a.availability IN ('owned_cleanup_pending','borrowed_cleanup_pending') AND NOT EXISTS(SELECT 1 FROM media_attachment_components c WHERE c.attachment_id=a.attachment_id AND c.lifecycle_state<>'deleted') ORDER BY a.attachment_id")?;statement.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)}).await?;
+        let attachments=self.db.read(|conn|{let mut statement=conn.prepare("SELECT a.attachment_id,a.source_kind,a.availability_generation FROM media_attachments a JOIN media_attachment_cleanup_intents i ON i.attachment_id=a.attachment_id WHERE i.completed_at_unix_ms IS NULL AND a.availability IN ('owned_cleanup_pending','borrowed_cleanup_pending') AND NOT EXISTS(SELECT 1 FROM media_attachment_components c WHERE c.attachment_id=a.attachment_id AND c.lifecycle_state<>'deleted') ORDER BY a.attachment_id")?;statement.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)}).await?;
         for (attachment, source, generation) in attachments {
-            self.db.transaction(move|conn|{let evidence={let mut statement=conn.prepare("SELECT c.reservation_id,e.deletion_evidence_digest FROM media_attachment_components c LEFT JOIN media_component_deletion_evidence e ON e.component_id=c.component_id WHERE c.attachment_id=?1 ORDER BY c.component_id")?;statement.query_map([&attachment],|row|Ok((row.get::<_,String>(0)?,row.get::<_,Option<String>>(1)?)))?.collect::<std::result::Result<Vec<_>,_>>()?};ensure!(evidence.iter().all(|(_,digest)|digest.is_some()),"verified component deletion evidence missing");let mut hasher=Sha256::new();hasher.update(b"media-attachment-cleanup-evidence-v1\0");for (_,digest) in &evidence{hasher.update(digest.as_deref().unwrap_or_default().as_bytes());hasher.update([0]);}let cleanup_digest=crate::intel::hex_lower(&hasher.finalize());let reservations=evidence.iter().map(|(id,_)|id).collect::<std::collections::BTreeSet<_>>();for reservation in reservations{crate::media_reservation::destroy_verified_media_artifacts_conn(conn,reservation,&cleanup_digest,u64::try_from(now_unix_ms)?)?;}let next=generation.parse::<u64>()?.checked_add(1).context("availability generation overflow")?.to_string();let terminal=if source=="local_path"{"borrowed_derivatives_deleted"}else{"retained_copy_deleted"};ensure!(conn.execute("UPDATE media_attachments SET availability=?1,availability_generation=?2,updated_at_unix_ms=?3,draft_expires_at_unix_ms=NULL WHERE attachment_id=?4 AND availability_generation=?5",params![terminal,next,now_unix_ms,attachment,generation])?==1,"cleanup terminal lost compare-and-swap");conn.execute("UPDATE media_attachment_cleanup_intents SET completed_at_unix_ms=?1 WHERE attachment_id=?2 AND completed_at_unix_ms IS NULL",params![now_unix_ms,attachment])?;Ok(())}).await?;
+            self.db.transaction(move|conn|{let evidence={let mut statement=conn.prepare("SELECT c.reservation_id,e.deletion_evidence_digest FROM media_attachment_components c LEFT JOIN media_component_deletion_evidence e ON e.component_id=c.component_id WHERE c.attachment_id=?1 ORDER BY c.component_id")?;statement.query_map([&attachment],|row|Ok((row.get::<_,String>(0)?,row.get::<_,Option<String>>(1)?)))?.collect::<std::result::Result<Vec<_>,_>>()?};ensure!(evidence.iter().all(|(_,digest)|digest.is_some()),"verified component deletion evidence missing");let mut hasher=Sha256::new();hasher.update(b"media-attachment-cleanup-evidence-v1\0");for (_,digest) in &evidence{hasher.update(digest.as_deref().unwrap_or_default().as_bytes());hasher.update([0]);}let cleanup_digest=crate::intel::hex_lower(&hasher.finalize());let reservations=evidence.iter().map(|(id,_)|id).collect::<std::collections::BTreeSet<_>>();for reservation in reservations{crate::media_reservation::destroy_verified_media_artifacts_conn(conn,reservation,&cleanup_digest,u64::try_from(now_unix_ms)?)?;}let next=generation.checked_add(1).context("availability generation overflow")?;let terminal=if source=="local_path"{"borrowed_derivatives_deleted"}else{"retained_copy_deleted"};ensure!(conn.execute("UPDATE media_attachments SET availability=?1,availability_generation=?2,updated_at_unix_ms=?3,draft_expires_at_unix_ms=NULL WHERE attachment_id=?4 AND availability_generation=?5",params![terminal,next,now_unix_ms,attachment,generation])?==1,"cleanup terminal lost compare-and-swap");conn.execute("UPDATE media_attachment_cleanup_intents SET completed_at_unix_ms=?1 WHERE attachment_id=?2 AND completed_at_unix_ms IS NULL",params![now_unix_ms,attachment])?;Ok(())}).await?;
         }
         Ok(completed)
     }
@@ -5092,7 +5094,7 @@ impl MediaStorageRecovery {
             cockpit_db::Db::insert_media_attachment_conn(conn,&record)?;
             let receipt=LocalPathRegistrationReceiptV1{schema_version:1,kind:"localPathMediaRegistrationReceipt".into(),receipt_id,local_operation_id:request_for_tx.local_operation_id,owner_principal_digest:request_for_tx.owner_principal_digest.clone(),session_id:request_for_tx.session_id,canonical_project_digest:request_for_tx.canonical_project_digest.clone(),client_draft_id:request_for_tx.client_draft_id,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),result:LocalPathRegistrationResultV1::Registered{attachment_id,attachment_version:1,availability_state:"registered".into(),availability_generation:1,reference_generation:1,reservation_id:reservation_id.clone(),reservation_digest:reservation_digest.clone(),source_evidence_digest:evidence_digest.clone()},committed_at_unix_ms:now_unix_ms};
             let receipt_json=serde_json::to_string(&receipt)?;
-            conn.execute("INSERT INTO media_local_path_registration_evidence(attachment_id,canonical_path_digest,path_authority_digest,source_evidence_digest,source_mtime_unix_ns,reservation_id,reservation_digest) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![attachment_id.to_string(),canonical_path_digest,authority_digest,evidence_digest,mtime_ns.to_string(),reservation_id,reservation_digest])?;
+            conn.execute("INSERT INTO media_local_path_registration_evidence(attachment_id,canonical_path_digest,path_authority_digest,source_evidence_digest,source_mtime_unix_ns,reservation_id,reservation_digest) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![attachment_id.to_string(),canonical_path_digest,authority_digest,evidence_digest,i64::try_from(mtime_ns).context("source mtime overflow")?,reservation_id,reservation_digest])?;
             conn.execute("INSERT INTO media_local_path_registration_operations(local_operation_id,authoritative_operation_id,session_id,canonical_project_digest,client_draft_id,request_binding_digest,operation_request_digest,semantic_command_digest,receipt_json,committed_at_unix_ms,is_alias) VALUES(?1,?1,?2,?3,?4,?5,?6,?7,?8,?9,0)",params![request_for_tx.local_operation_id.to_string(),request_for_tx.session_id.to_string(),request_for_tx.canonical_project_digest,request_for_tx.client_draft_id.to_string(),binding_digest,request_digest,semantic_digest,receipt_json,now_unix_ms])?;
             conn.execute("INSERT INTO media_local_path_registration_audit(local_operation_id,outcome,committed_at_unix_ms) VALUES(?1,'registered',?2)",params![request_for_tx.local_operation_id.to_string(),now_unix_ms])?;
             Ok((receipt,Some(attachment_id)))
@@ -7507,8 +7509,8 @@ fn commit_security_recovery(
         } else {
             "owned_cleanup_pending"
         };
-        ensure!(conn.execute("UPDATE media_attachments SET availability=?1,availability_generation=?2,updated_at_unix_ms=?3 WHERE attachment_id=?4 AND attachment_version=?5 AND availability_generation=?6 AND availability='security_blocked'", params![next_state,generation_after.to_string(),now_unix_ms,request.attachment_id.to_string(),request.attachment_version.to_string(),generation_before.to_string()])? == 1, "security recovery aggregate CAS failed");
-        conn.execute("INSERT INTO media_attachment_cleanup_intents (intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,'security_recovery',?7)", params![Uuid::now_v7().to_string(),request.attachment_id.to_string(),request.attachment_version.to_string(),generation_after.to_string(),snapshot.attachment.reference_generation.to_string(),snapshot.affected_set_digest,now_unix_ms])?;
+        ensure!(conn.execute("UPDATE media_attachments SET availability=?1,availability_generation=?2,updated_at_unix_ms=?3 WHERE attachment_id=?4 AND attachment_version=?5 AND availability_generation=?6 AND availability='security_blocked'", params![next_state,i64::try_from(generation_after).context("availability generation overflow")?,now_unix_ms,request.attachment_id.to_string(),i64::try_from(request.attachment_version).context("attachment version overflow")?,i64::try_from(generation_before).context("availability generation overflow")?])? == 1, "security recovery aggregate CAS failed");
+        conn.execute("INSERT INTO media_attachment_cleanup_intents (intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,'security_recovery',?7)", params![Uuid::now_v7().to_string(),request.attachment_id.to_string(),i64::try_from(request.attachment_version).context("attachment version overflow")?,i64::try_from(generation_after).context("availability generation overflow")?,i64::try_from(snapshot.attachment.reference_generation).context("reference generation overflow")?,snapshot.affected_set_digest,now_unix_ms])?;
     }
     let receipt = LocalMediaOwnerReceiptV1 {
         schema_version: 1,
@@ -7527,7 +7529,7 @@ fn commit_security_recovery(
         components,
         committed_at_unix_ms: now_unix_ms,
     };
-    conn.execute("INSERT INTO media_security_recovery_operations (local_request_id,owner_principal_digest,attachment_id,attachment_version,request_digest,affected_set_digest,receipt_json,committed_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![request.local_request_id.to_string(),request.owner_principal_digest,request.attachment_id.to_string(),request.attachment_version.to_string(),snapshot.request_digest,snapshot.affected_set_digest,serde_json::to_string(&receipt)?,now_unix_ms])?;
+    conn.execute("INSERT INTO media_security_recovery_operations (local_request_id,owner_principal_digest,attachment_id,attachment_version,request_digest,affected_set_digest,receipt_json,committed_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![request.local_request_id.to_string(),request.owner_principal_digest,request.attachment_id.to_string(),i64::try_from(request.attachment_version).context("attachment version overflow")?,snapshot.request_digest,snapshot.affected_set_digest,serde_json::to_string(&receipt)?,now_unix_ms])?;
     Ok(receipt)
 }
 

@@ -351,13 +351,8 @@ async fn negotiation_sends_attach_with_negotiated_client_protocol_version() {
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut daemon = ProtoStream::new(stream);
-        send_daemon_hello(
-            &mut daemon,
-            "0.1.handshake",
-            proto::MIN_SUPPORTED_PROTOCOL_VERSION,
-        )
-        .await;
-        daemon.set_negotiated_version(proto::MIN_SUPPORTED_PROTOCOL_VERSION);
+        send_daemon_hello(&mut daemon, "0.1.handshake", proto::PROTOCOL_VERSION).await;
+        daemon.set_negotiated_version(proto::PROTOCOL_VERSION);
         complete_wire_connect_handshake(&mut daemon).await;
         let request_id = match daemon.recv().await.unwrap().unwrap() {
             proto::RecvFrame::Envelope(env) => match env.body {
@@ -366,10 +361,7 @@ async fn negotiation_sends_attach_with_negotiated_client_protocol_version() {
                         Request::Attach {
                             client_protocol_version,
                             ..
-                        } => assert_eq!(
-                            client_protocol_version,
-                            proto::MIN_SUPPORTED_PROTOCOL_VERSION
-                        ),
+                        } => assert_eq!(client_protocol_version, proto::PROTOCOL_VERSION),
                         other => panic!("expected attach request, got {other:?}"),
                     }
                     id

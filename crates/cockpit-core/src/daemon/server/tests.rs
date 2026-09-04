@@ -38978,8 +38978,7 @@ async fn server_responses_use_negotiated_client_protocol_version() {
         false,
         None,
     ));
-    let mut client =
-        ProtoStream::with_version(client_stream, proto::MIN_SUPPORTED_PROTOCOL_VERSION);
+    let mut client = ProtoStream::with_version(client_stream, proto::PROTOCOL_VERSION);
 
     // The hello is intentionally emitted at the daemon's current protocol so
     // older clients can parse it as a raw handshake before negotiation.
@@ -38988,7 +38987,7 @@ async fn server_responses_use_negotiated_client_protocol_version() {
     let status_id = Uuid::new_v4();
     client
         .send(&Envelope::request_at(
-            proto::MIN_SUPPORTED_PROTOCOL_VERSION,
+            proto::PROTOCOL_VERSION,
             status_id,
             Request::DaemonStatus,
         ))
@@ -38998,7 +38997,7 @@ async fn server_responses_use_negotiated_client_protocol_version() {
     loop {
         match client.recv().await.unwrap().unwrap() {
             RecvFrame::Envelope(env) => {
-                assert_eq!(env.v, proto::MIN_SUPPORTED_PROTOCOL_VERSION);
+                assert_eq!(env.v, proto::PROTOCOL_VERSION);
                 match env.body {
                     Body::Event { .. } => continue,
                     Body::Response { id, response } => {

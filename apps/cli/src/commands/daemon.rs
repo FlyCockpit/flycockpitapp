@@ -456,7 +456,7 @@ fn render_incompatible_protocol_status(socket: &str, hello: &proto::DaemonHello)
         hello.protocol_version,
         proto::DAEMON_VERSION,
         proto::PROTOCOL_VERSION,
-        proto::MIN_SUPPORTED_PROTOCOL_VERSION,
+        proto::PROTOCOL_VERSION,
         proto::PROTOCOL_VERSION,
         PROTOCOL_MISMATCH_STATUS_REMEDY
     )
@@ -706,7 +706,7 @@ mod tests {
                 "daemon: running but speaks an incompatible protocol\n  socket: /tmp/cockpit.sock\n  daemon: 0.0.old (protocol v0)\n  client: {} (protocol v{}, supports v{}..=v{})\n  run `cockpit daemon restart` to restart the daemon on this version",
                 proto::DAEMON_VERSION,
                 proto::PROTOCOL_VERSION,
-                proto::MIN_SUPPORTED_PROTOCOL_VERSION,
+                proto::PROTOCOL_VERSION,
                 proto::PROTOCOL_VERSION
             )
         );

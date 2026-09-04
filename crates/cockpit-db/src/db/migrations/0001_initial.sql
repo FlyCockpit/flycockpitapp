@@ -483,12 +483,12 @@ CREATE TABLE media_attachments (
         'security_blocked', 'owned_cleanup_pending', 'retained_copy_deleted',
         'borrowed_cleanup_pending', 'borrowed_derivatives_deleted', 'metadata_deleted'
     )),
-    attachment_version             TEXT NOT NULL,
-    availability_generation        TEXT NOT NULL,
-    reference_generation           TEXT NOT NULL,
-    captured_capability_generation TEXT NOT NULL,
+    attachment_version             INTEGER NOT NULL CHECK (attachment_version >= 1),
+    availability_generation        INTEGER NOT NULL CHECK (availability_generation >= 1),
+    reference_generation           INTEGER NOT NULL CHECK (reference_generation >= 1),
+    captured_capability_generation INTEGER NOT NULL CHECK (captured_capability_generation >= 1),
     source_identity_digest         TEXT NOT NULL,
-    source_byte_length             TEXT NOT NULL,
+    source_byte_length             INTEGER NOT NULL CHECK (source_byte_length > 0),
     source_sha256                  TEXT NOT NULL,
     selected_video_stream_json     TEXT CHECK (selected_video_stream_json IS NULL OR (
         json_valid(selected_video_stream_json)
@@ -519,11 +519,6 @@ CREATE TABLE media_attachments (
     CHECK (length(canonical_project_digest) = 64 AND canonical_project_digest = lower(canonical_project_digest) AND canonical_project_digest NOT GLOB '*[^0-9a-f]*'),
     CHECK (length(source_identity_digest) = 64 AND source_identity_digest = lower(source_identity_digest) AND source_identity_digest NOT GLOB '*[^0-9a-f]*'),
     CHECK (length(source_sha256) = 64 AND source_sha256 = lower(source_sha256) AND source_sha256 NOT GLOB '*[^0-9a-f]*'),
-    CHECK (attachment_version NOT GLOB '*[^0-9]*' AND attachment_version GLOB '[1-9]*'),
-    CHECK (availability_generation NOT GLOB '*[^0-9]*' AND availability_generation GLOB '[1-9]*'),
-    CHECK (reference_generation NOT GLOB '*[^0-9]*' AND reference_generation GLOB '[1-9]*'),
-    CHECK (captured_capability_generation NOT GLOB '*[^0-9]*' AND captured_capability_generation GLOB '[1-9]*'),
-    CHECK (source_byte_length NOT GLOB '*[^0-9]*' AND source_byte_length GLOB '[1-9]*'),
     CHECK (updated_at_unix_ms >= created_at_unix_ms),
     CHECK (draft_expires_at_unix_ms IS NULL OR draft_expires_at_unix_ms >= created_at_unix_ms),
     CHECK (first_referenced_at_unix_ms IS NULL OR first_referenced_at_unix_ms >= created_at_unix_ms),
@@ -570,13 +565,13 @@ CREATE TABLE media_attachment_components (
         AND replace(component_id, '-', '') NOT GLOB '*[^0-9a-f]*'
     ),
     attachment_id         TEXT NOT NULL,
-    attachment_version    TEXT NOT NULL,
+    attachment_version    INTEGER NOT NULL CHECK (attachment_version >= 1),
     component_kind        TEXT NOT NULL CHECK (component_kind IN ('quarantined_original', 'image_model', 'browser_thumbnail', 'audio_model', 'video_model', 'upload_temporary')),
     storage_id            TEXT NOT NULL UNIQUE,
     lifecycle_state       TEXT NOT NULL CHECK (lifecycle_state IN ('temporary', 'ready', 'cleanup_pending', 'deleted', 'security_blocked')),
-    component_generation  TEXT NOT NULL,
+    component_generation  INTEGER NOT NULL CHECK (component_generation >= 1),
     stable_identity_digest TEXT NOT NULL,
-    byte_length           TEXT NOT NULL,
+    byte_length           INTEGER NOT NULL CHECK (byte_length > 0),
     sha256                TEXT NOT NULL,
     reservation_id        TEXT NOT NULL,
     deletion_evidence_digest TEXT,
@@ -585,8 +580,6 @@ CREATE TABLE media_attachment_components (
     CHECK (length(stable_identity_digest) = 64 AND stable_identity_digest = lower(stable_identity_digest) AND stable_identity_digest NOT GLOB '*[^0-9a-f]*'),
     CHECK (length(sha256) = 64 AND sha256 = lower(sha256) AND sha256 NOT GLOB '*[^0-9a-f]*'),
     CHECK (deletion_evidence_digest IS NULL OR (length(deletion_evidence_digest) = 64 AND deletion_evidence_digest = lower(deletion_evidence_digest) AND deletion_evidence_digest NOT GLOB '*[^0-9a-f]*')),
-    CHECK (component_generation NOT GLOB '*[^0-9]*' AND component_generation GLOB '[1-9]*'),
-    CHECK (byte_length NOT GLOB '*[^0-9]*' AND byte_length GLOB '[1-9]*'),
     CHECK (updated_at_unix_ms >= created_at_unix_ms),
     FOREIGN KEY (attachment_id, attachment_version)
         REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE ON UPDATE RESTRICT
@@ -603,7 +596,7 @@ CREATE TABLE media_image_component_dimensions (
 
 CREATE TABLE media_attachment_transition_evidence (
     attachment_id TEXT NOT NULL REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT,
-    availability_generation TEXT NOT NULL,
+    availability_generation INTEGER NOT NULL CHECK (availability_generation >= 1),
     from_state TEXT NOT NULL,
     to_state TEXT NOT NULL,
     operation_id TEXT NOT NULL,
@@ -689,21 +682,18 @@ CREATE TABLE media_ingress_admission_receipts (
     admission_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     attachment_id TEXT NOT NULL UNIQUE REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT,
-    attachment_version TEXT NOT NULL,
-    availability_generation TEXT NOT NULL,
+    attachment_version INTEGER NOT NULL CHECK (attachment_version >= 1),
+    availability_generation INTEGER NOT NULL CHECK (availability_generation >= 1),
     reservation_id TEXT NOT NULL UNIQUE REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     normalized_sha256 TEXT NOT NULL,
     request_source_digest TEXT NOT NULL,
-    normalized_byte_length TEXT NOT NULL,
+    normalized_byte_length INTEGER NOT NULL CHECK (normalized_byte_length > 0),
     width INTEGER NOT NULL,
     height INTEGER NOT NULL,
     committed_at_unix_ms INTEGER NOT NULL,
     CHECK (length(admission_id) = 36),
-    CHECK (CAST(attachment_version AS INTEGER) > 0),
-    CHECK (CAST(availability_generation AS INTEGER) > 0),
     CHECK (length(normalized_sha256) = 64 AND normalized_sha256 NOT GLOB '*[^0-9a-f]*'),
     CHECK (length(request_source_digest) = 64 AND request_source_digest NOT GLOB '*[^0-9a-f]*'),
-    CHECK (CAST(normalized_byte_length AS INTEGER) > 0),
     CHECK (width > 0 AND height > 0)
 );
 
@@ -754,10 +744,10 @@ END;
 CREATE TABLE media_attachment_references (
     reference_id          TEXT PRIMARY KEY,
     attachment_id         TEXT NOT NULL,
-    attachment_version    TEXT NOT NULL,
+    attachment_version    INTEGER NOT NULL CHECK (attachment_version >= 1),
     consumer_kind         TEXT NOT NULL CHECK (consumer_kind IN ('message', 'tool', 'job')),
     consumer_id           TEXT NOT NULL,
-    acquired_generation   TEXT NOT NULL,
+    acquired_generation   INTEGER NOT NULL CHECK (acquired_generation >= 1),
     acquired_at_unix_ms   INTEGER NOT NULL,
     released_at_unix_ms   INTEGER,
     UNIQUE (attachment_id, attachment_version, consumer_kind, consumer_id),
@@ -774,11 +764,11 @@ CREATE INDEX idx_media_attachment_references_live
 CREATE TABLE media_attachment_component_leases (
     lease_id                       TEXT PRIMARY KEY,
     attachment_id                  TEXT NOT NULL,
-    attachment_version             TEXT NOT NULL,
+    attachment_version             INTEGER NOT NULL CHECK (attachment_version >= 1),
     component_id                   TEXT NOT NULL REFERENCES media_attachment_components(component_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     lease_kind                     TEXT NOT NULL CHECK (lease_kind IN ('preview', 'model')),
-    expected_availability_generation TEXT NOT NULL,
-    captured_capability_generation TEXT NOT NULL,
+    expected_availability_generation INTEGER NOT NULL CHECK (expected_availability_generation >= 1),
+    captured_capability_generation INTEGER NOT NULL CHECK (captured_capability_generation >= 1),
     owner_session_id                TEXT NOT NULL,
     canonical_project_digest        TEXT NOT NULL,
     lease_purpose                   TEXT NOT NULL CHECK(lease_purpose IN ('preview','model_input')),
@@ -814,9 +804,9 @@ CREATE TABLE media_component_security_evidence (
 CREATE TABLE media_attachment_cleanup_intents (
     intent_id                         TEXT PRIMARY KEY,
     attachment_id                    TEXT NOT NULL UNIQUE,
-    attachment_version               TEXT NOT NULL,
-    expected_availability_generation TEXT NOT NULL,
-    expected_reference_generation    TEXT NOT NULL,
+    attachment_version               INTEGER NOT NULL CHECK (attachment_version >= 1),
+    expected_availability_generation INTEGER NOT NULL CHECK (expected_availability_generation >= 1),
+    expected_reference_generation    INTEGER NOT NULL CHECK (expected_reference_generation >= 1),
     component_set_digest             TEXT NOT NULL,
     reason                           TEXT NOT NULL CHECK (reason IN ('discard', 'draft_expired', 'session_retention', 'session_deleted', 'security_recovery')),
     created_at_unix_ms               INTEGER NOT NULL,
@@ -831,7 +821,7 @@ CREATE TABLE media_component_deletion_intents (
     attachment_id TEXT NOT NULL,
     storage_id TEXT NOT NULL,
     stable_identity_digest TEXT NOT NULL,
-    byte_length TEXT NOT NULL,
+    byte_length INTEGER NOT NULL CHECK (byte_length > 0),
     sha256 TEXT NOT NULL,
     intent_digest TEXT NOT NULL,
     created_at_unix_ms INTEGER NOT NULL,
@@ -862,7 +852,7 @@ CREATE TABLE media_security_recovery_operations (
     local_request_id       TEXT PRIMARY KEY,
     owner_principal_digest TEXT NOT NULL,
     attachment_id          TEXT NOT NULL,
-    attachment_version     TEXT NOT NULL,
+    attachment_version     INTEGER NOT NULL CHECK (attachment_version >= 1),
     request_digest         TEXT NOT NULL,
     affected_set_digest    TEXT NOT NULL,
     receipt_json           TEXT NOT NULL CHECK (
@@ -902,7 +892,7 @@ CREATE TABLE media_local_path_registration_evidence (
     canonical_path_digest     TEXT NOT NULL,
     path_authority_digest     TEXT NOT NULL,
     source_evidence_digest    TEXT NOT NULL,
-    source_mtime_unix_ns      TEXT NOT NULL,
+    source_mtime_unix_ns      INTEGER NOT NULL CHECK (source_mtime_unix_ns >= 0),
     reservation_id           TEXT NOT NULL,
     reservation_digest       TEXT NOT NULL,
     FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT
@@ -913,6 +903,8 @@ CREATE TABLE media_local_path_registration_audit (
     outcome            TEXT NOT NULL,
     committed_at_unix_ms INTEGER NOT NULL
 );
+CREATE INDEX idx_media_local_path_registration_audit_retention
+    ON media_local_path_registration_audit (committed_at_unix_ms);
 
 CREATE TABLE media_retained_https_operations (
     local_operation_id         TEXT PRIMARY KEY,
@@ -961,6 +953,8 @@ CREATE TABLE media_retained_https_audit (
     outcome              TEXT NOT NULL CHECK(outcome IN ('retained','rejected')),
     committed_at_unix_ms INTEGER NOT NULL
 );
+CREATE INDEX idx_media_retained_https_audit_retention
+    ON media_retained_https_audit (committed_at_unix_ms);
 
 CREATE TABLE media_retained_https_publication_intents (
     local_operation_id TEXT PRIMARY KEY,
@@ -980,8 +974,8 @@ CREATE TABLE media_retained_https_orphan_cleanup_evidence (
 CREATE TABLE media_attachment_processing_jobs (
     job_id                           TEXT PRIMARY KEY,
     attachment_id                   TEXT NOT NULL UNIQUE,
-    expected_attachment_version     TEXT NOT NULL,
-    expected_availability_generation TEXT NOT NULL,
+    expected_attachment_version     INTEGER NOT NULL CHECK (expected_attachment_version >= 1),
+    expected_availability_generation INTEGER NOT NULL CHECK (expected_availability_generation >= 1),
     source_evidence_digest          TEXT NOT NULL,
     state                            TEXT NOT NULL CHECK(state IN ('pending','claimed','completed')),
     claimed_at_unix_ms               INTEGER,
@@ -1094,6 +1088,8 @@ CREATE TABLE local_media_operations (
 );
 CREATE UNIQUE INDEX uq_local_media_operation_domain ON local_media_operations(action,domain_key) WHERE is_alias=0;
 CREATE TABLE local_media_operation_audit(local_operation_id TEXT PRIMARY KEY,outcome TEXT NOT NULL,committed_at_unix_ms INTEGER NOT NULL);
+CREATE INDEX idx_local_media_operation_audit_retention
+    ON local_media_operation_audit (committed_at_unix_ms);
 CREATE TABLE media_creation_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),next_value INTEGER NOT NULL);
 INSERT INTO media_creation_sequence(singleton,next_value) VALUES(1,1);
 

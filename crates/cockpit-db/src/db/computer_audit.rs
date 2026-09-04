@@ -103,13 +103,25 @@ pub fn projected_prune_checkpoint_bounds(
 
 struct ImmutableDeleteTriggerGuard<'a> {
     conn: &'a rusqlite::Connection,
-    active: bool,
+    restored: bool,
+}
+
+impl ImmutableDeleteTriggerGuard<'_> {
+    fn restore(&mut self) -> Result<()> {
+        if !self.restored {
+            self.conn
+                .execute_batch(COMPUTER_AUDIT_DELETE_TRIGGER_SQL)
+                .context("restoring computer audit delete trigger")?;
+            self.restored = true;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for ImmutableDeleteTriggerGuard<'_> {
     fn drop(&mut self) {
-        if self.active {
-            let _ = self.conn.execute_batch(COMPUTER_AUDIT_DELETE_TRIGGER_SQL);
+        if !self.restored {
+            panic!("computer audit delete trigger was not restored before writer release");
         }
     }
 }
@@ -122,7 +134,24 @@ fn drop_immutable_delete_trigger(
         [],
     )
     .context("dropping computer audit delete trigger")?;
-    Ok(ImmutableDeleteTriggerGuard { conn, active: true })
+    Ok(ImmutableDeleteTriggerGuard {
+        conn,
+        restored: false,
+    })
+}
+
+fn merge_truncation_and_restore_errors(
+    truncation: Result<u64>,
+    restore: Result<()>,
+) -> Result<u64> {
+    match (truncation, restore) {
+        (Ok(deleted), Ok(())) => Ok(deleted),
+        (Err(truncation), Err(restore)) => Err(anyhow!(
+            "{truncation}; also failed to restore computer audit delete trigger: {restore}"
+        )),
+        (Err(truncation), Ok(())) => Err(truncation),
+        (Ok(_), Err(restore)) => Err(restore),
+    }
 }
 
 fn verify_prune_checkpoint_authorizes_conn(
@@ -416,7 +445,7 @@ impl Db {
 
     /// Delete a bounded prefix after a matching signed `PruneCheckpoint` entry.
     /// Only the machine-local audit writer may call this.
-    pub(crate) async fn truncate_computer_audit_prefix_verified(
+    pub async fn truncate_computer_audit_prefix_verified(
         &self,
         authorization: ComputerAuditPruneAuthorization,
     ) -> Result<u64> {
@@ -440,28 +469,31 @@ pub(crate) fn truncate_computer_audit_prefix_conn(
         .context("computer audit truncate batch overflow")?;
     let through = i64::try_from(through_sequence_inclusive)
         .context("computer audit truncate sequence overflow")?;
-    let _trigger_guard = drop_immutable_delete_trigger(conn)?;
-    let mut total = 0_u64;
-    loop {
-        let deleted = conn
-            .execute(
-                "DELETE FROM computer_audit_entries
-                  WHERE sequence IN (
-                      SELECT sequence
-                        FROM computer_audit_entries
-                       WHERE sequence <= ?1
-                       ORDER BY sequence ASC
-                       LIMIT ?2
-                  )",
-                params![through, batch],
-            )
-            .context("truncating computer audit prefix")? as u64;
-        total = total.saturating_add(deleted);
-        if deleted < batch as u64 {
-            break;
+    let mut trigger_guard = drop_immutable_delete_trigger(conn)?;
+    let truncation = (|| {
+        let mut total = 0_u64;
+        loop {
+            let deleted = conn
+                .execute(
+                    "DELETE FROM computer_audit_entries
+                      WHERE sequence IN (
+                          SELECT sequence
+                            FROM computer_audit_entries
+                           WHERE sequence <= ?1
+                           ORDER BY sequence ASC
+                           LIMIT ?2
+                      )",
+                    params![through, batch],
+                )
+                .context("truncating computer audit prefix")? as u64;
+            total = total.saturating_add(deleted);
+            if deleted < batch as u64 {
+                break;
+            }
         }
-    }
-    Ok(total)
+        Ok(total)
+    })();
+    merge_truncation_and_restore_errors(truncation, trigger_guard.restore())
 }
 
 #[cfg(test)]

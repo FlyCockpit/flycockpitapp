@@ -14,6 +14,8 @@
 //! | `guidance_proposal_receipts` | terminal_evidence | Terminal proposal receipts past the evidence window (`created` rows are never age-deleted) |
 //! | `intel_files` (+ cascaded symbol graph) | intel_index | Stale workspace index snapshots past the evidence window |
 //! | `sealed_value_acquisition_audit`, `sealed_action_invocation_audit`, `sealed_recovery_audit` | terminal_evidence | Terminal sealed audit metadata past the evidence window (`pending` acquisition rows are never age-deleted) |
+//! | `media_retained_https_audit`, `media_local_path_registration_audit`, `local_media_operation_audit` | terminal_evidence | Terminal media-operation audit rows past the evidence window |
+//! | `remote_principal_audit` | terminal_evidence | Remote principal request audit rows past the evidence window (remote profile only) |
 //!
 //! `computer_audit_entries` remains append-only with SQL-enforced immutability;
 //! chain truncation is owned by the machine-local audit writer, not this sweep.
@@ -49,6 +51,10 @@ pub struct LedgerRetentionOutcome {
     pub sealed_value_acquisition_audit_deleted: u64,
     pub sealed_action_invocation_audit_deleted: u64,
     pub sealed_recovery_audit_deleted: u64,
+    pub media_retained_https_audit_deleted: u64,
+    pub media_local_path_registration_audit_deleted: u64,
+    pub local_media_operation_audit_deleted: u64,
+    pub remote_principal_audit_deleted: u64,
 }
 
 impl LedgerRetentionOutcome {
@@ -62,6 +68,10 @@ impl LedgerRetentionOutcome {
             .saturating_add(self.sealed_value_acquisition_audit_deleted)
             .saturating_add(self.sealed_action_invocation_audit_deleted)
             .saturating_add(self.sealed_recovery_audit_deleted)
+            .saturating_add(self.media_retained_https_audit_deleted)
+            .saturating_add(self.media_local_path_registration_audit_deleted)
+            .saturating_add(self.local_media_operation_audit_deleted)
+            .saturating_add(self.remote_principal_audit_deleted)
     }
 }
 
@@ -240,6 +250,70 @@ pub(crate) fn prune_append_only_ledgers_conn(
         .context("pruning sealed recovery audit rows")
     })?;
 
+    let media_retained_https_audit_deleted = delete_in_batches(batch, || {
+        conn.execute(
+            "DELETE FROM media_retained_https_audit
+              WHERE local_operation_id IN (
+                  SELECT local_operation_id
+                    FROM media_retained_https_audit
+                   WHERE committed_at_unix_ms < ?1
+                   ORDER BY committed_at_unix_ms ASC
+                   LIMIT ?2
+              )",
+            params![cutoff_unix_ms, batch],
+        )
+        .context("pruning media retained https audit rows")
+    })?;
+
+    let media_local_path_registration_audit_deleted = delete_in_batches(batch, || {
+        conn.execute(
+            "DELETE FROM media_local_path_registration_audit
+              WHERE local_operation_id IN (
+                  SELECT local_operation_id
+                    FROM media_local_path_registration_audit
+                   WHERE committed_at_unix_ms < ?1
+                   ORDER BY committed_at_unix_ms ASC
+                   LIMIT ?2
+              )",
+            params![cutoff_unix_ms, batch],
+        )
+        .context("pruning media local path registration audit rows")
+    })?;
+
+    let local_media_operation_audit_deleted = delete_in_batches(batch, || {
+        conn.execute(
+            "DELETE FROM local_media_operation_audit
+              WHERE local_operation_id IN (
+                  SELECT local_operation_id
+                    FROM local_media_operation_audit
+                   WHERE committed_at_unix_ms < ?1
+                   ORDER BY committed_at_unix_ms ASC
+                   LIMIT ?2
+              )",
+            params![cutoff_unix_ms, batch],
+        )
+        .context("pruning local media operation audit rows")
+    })?;
+
+    let remote_principal_audit_deleted = if table_exists(conn, "remote_principal_audit")? {
+        delete_in_batches(batch, || {
+            conn.execute(
+                "DELETE FROM remote_principal_audit
+                  WHERE audit_id IN (
+                      SELECT audit_id
+                        FROM remote_principal_audit
+                       WHERE ts_ms < ?1
+                       ORDER BY ts_ms ASC
+                       LIMIT ?2
+                  )",
+                params![cutoff_unix_ms, batch],
+            )
+            .context("pruning remote principal audit rows")
+        })?
+    } else {
+        0
+    };
+
     Ok(LedgerRetentionOutcome {
         external_journal_operations_deleted,
         external_journal_queue_entries_deleted,
@@ -250,6 +324,10 @@ pub(crate) fn prune_append_only_ledgers_conn(
         sealed_value_acquisition_audit_deleted,
         sealed_action_invocation_audit_deleted,
         sealed_recovery_audit_deleted,
+        media_retained_https_audit_deleted,
+        media_local_path_registration_audit_deleted,
+        local_media_operation_audit_deleted,
+        remote_principal_audit_deleted,
     })
 }
 
@@ -271,6 +349,20 @@ fn sql_in_list(values: &[&str]) -> String {
         .map(|value| format!("'{value}'"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let mut exists = false;
+    let mut stmt = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1")
+        .context("preparing table existence probe")?;
+    let mut rows = stmt
+        .query([table])
+        .context("querying table existence probe")?;
+    if rows.next()?.is_some() {
+        exists = true;
+    }
+    Ok(exists)
 }
 
 #[cfg(test)]

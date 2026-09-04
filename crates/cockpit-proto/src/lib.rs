@@ -1330,11 +1330,6 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// migration evidence, not a compatibility window.
 pub const PROTOCOL_VERSION: u32 = 22;
 
-/// Oldest wire schema version this binary accepts. Exact-match only until a
-/// compacted v1 ships. v22 is current-only: all pre-launch wire changes are
-/// edited in place, with no compatibility shim.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 22;
-
 /// Oldest protocol version whose daemon fixtures are frozen in the append-only
 /// archive ledger at `tests/fixtures/daemon_proto/archive.sha256`. Every
 /// version in `FIRST_ARCHIVED_PROTOCOL_VERSION..PROTOCOL_VERSION` must be
@@ -2220,7 +2215,7 @@ fn default_daemon_version() -> String {
 }
 
 fn default_client_protocol_version() -> u32 {
-    MIN_SUPPORTED_PROTOCOL_VERSION
+    PROTOCOL_VERSION
 }
 
 // (The wire event variant for the same state change lives on `Event`
@@ -4316,15 +4311,6 @@ mod proto_fixture_tests {
     }
 
     #[test]
-    fn frozen_fixture_every_supported_version_still_deserializes() {
-        for version in supported_protocol_versions() {
-            assert_frozen_fixture_deserializes::<Request>(version, "request.json");
-            assert_frozen_fixture_deserializes::<Response>(version, "response.json");
-            assert_frozen_fixture_deserializes::<Event>(version, "event.json");
-        }
-    }
-
-    #[test]
     fn frozen_fixture_directories_are_well_formed_without_expanding_compatibility() {
         let listed = supported_protocol_versions()
             .chain(archived_protocol_versions())
@@ -4387,19 +4373,6 @@ mod proto_fixture_tests {
                 canonical(value),
                 "{file_name}:{kind} must round-trip byte-equivalent after canonicalization"
             );
-        }
-    }
-
-    fn assert_frozen_fixture_deserializes<T>(version: u32, file_name: &str)
-    where
-        T: DeserializeOwned,
-    {
-        for (kind, value) in read_fixture_for(version, file_name) {
-            let _: T = serde_json::from_value(value).unwrap_or_else(|error| {
-                panic!(
-                    "frozen fixture v{version}/{file_name}:{kind} no longer deserializes — this is a breaking wire change; bump MIN_SUPPORTED_PROTOCOL_VERSION deliberately or restore compatibility: {error}"
-                )
-            });
         }
     }
 
@@ -5929,15 +5902,6 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_version_below_min_supported_is_rejected() {
-        let below_min = MIN_SUPPORTED_PROTOCOL_VERSION.saturating_sub(1);
-        let err = NegotiatedProtocol::from_hello(&hello(below_min))
-            .expect_err("below-min daemon protocol must be rejected");
-        assert_eq!(err.code, ErrorCode::ProtocolVersion);
-        assert_eq!(err.message, incompatible_daemon_protocol_message(below_min));
-    }
-
-    #[test]
     fn set_active_model_rejects_unknown_thinking_mode_during_deserialization() {
         let raw = json!({
             "request": "set_active_model",
@@ -6037,7 +6001,7 @@ mod tests {
 
     #[tokio::test]
     async fn envelope_constructors_stamp_the_negotiated_version() {
-        let negotiated = MIN_SUPPORTED_PROTOCOL_VERSION;
+        let negotiated = PROTOCOL_VERSION;
         let (left, right) = duplex(4096);
         let mut sender = ProtoStream::with_version(left, negotiated);
         let mut receiver = ProtoStream::new(right);
@@ -7534,7 +7498,6 @@ mod tests {
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
         assert_eq!(PROTOCOL_VERSION, 22);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 22);
         let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
@@ -7555,7 +7518,6 @@ mod tests {
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
         assert_eq!(PROTOCOL_VERSION, 22);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 22);
         let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
@@ -7767,10 +7729,6 @@ mod tests {
     #[test]
     fn archived_fixtures_are_retained_but_not_in_the_live_compatibility_window() {
         for version in ARCHIVED_PROTOCOL_VERSIONS {
-            assert!(
-                version < MIN_SUPPORTED_PROTOCOL_VERSION,
-                "archived fixture v{version} must remain older than the live support window"
-            );
             assert!(!is_protocol_compatible(version));
             let archived = proto_fixture_files::read_fixture_for(version, "response.json");
             assert!(archived.contains_key("config_refreshed"));

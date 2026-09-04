@@ -2139,8 +2139,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "drives the interactive Windows desktop; run manually with a stored grant"]
+    #[ignore = "drives the interactive Windows desktop; run manually with COCKPIT_TEST_ALLOW_REAL_HOME=1 and a stored grant"]
     fn real_desktop_capture_smoke() {
+        let env = cockpit_test_support::TestEnvGuard::blocking_lock();
+        env.set_var(
+            cockpit_test_support::home_isolation::COCKPIT_TEST_ALLOW_REAL_HOME_ENV,
+            "1",
+        );
         let store = RealDesktopGrantStore::for_cockpit_data_dir().unwrap();
         let mut backend =
             WindowsDesktopBackend::construct(DisplayTarget::RealDesktop, Some(&store)).unwrap();

@@ -4,18 +4,39 @@
 //! agree on where files live. Directory discovery for layered
 //! `.cockpit/` configs lives in [`crate::config::dirs`]; this module
 //! is only for the fixed system-level paths.
+//!
+//! ## Test-build home isolation
+//!
+//! Production [`cockpit_config_dir`] semantics are unchanged: platform defaults
+//! via `dirs::config_dir()` / XDG env vars, with no redirect.
+//!
+//! In test builds (`cfg(any(test, feature = "test-support"))`), the three public
+//! resolvers below pass through [`cockpit_test_support::home_isolation`]:
+//!
+//! 1. Explicit env overrides installed by [`cockpit_test_support::TestEnvGuard`]
+//!    (XDG/HOME pointing away from the real developer profile) win unchanged.
+//! 2. [`cockpit_test_support::home_isolation::COCKPIT_TEST_ALLOW_REAL_HOME_ENV`]=`1`
+//!    opts into the real path (manual smokes only).
+//! 3. Otherwise redirect to a lazy per-process isolated home mirroring
+//!    `TestEnvGuard::set_isolated_home` (`{root}/home/.config/cockpit`,
+//!    `{root}/data/cockpit`, `{root}/state/cockpit`).
+//!
+//! Under `cargo nextest` each test is its own process, so the isolated root is
+//! per test. Under `cargo test` one binary shares it across threads; creation is
+//! thread-safe via `OnceLock`.
+//!
+//! **Perimeter:** the guard is compiled into every workspace test binary that
+//! links `cockpit-config` with `cfg(test)` (this crate's own unit tests) or with
+//! the `test-support` feature enabled from `[dev-dependencies]` (`cockpit-core`,
+//! `cockpit-tui`, `apps/cli`, …). Production dependents never enable
+//! `test-support`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
 #[cfg(any(test, feature = "test-support"))]
-fn guard_resolved_cockpit_path(path: &Path) {
-    cockpit_test_support::home_isolation::assert_not_real_developer_cockpit_path(path);
-}
-
-#[cfg(not(any(test, feature = "test-support")))]
-fn guard_resolved_cockpit_path(_path: &Path) {}
+use cockpit_test_support::home_isolation::{CockpitHomeKind, finalize_test_cockpit_path};
 
 pub(crate) fn cockpit_config_dir_unchecked() -> Result<PathBuf> {
     let base = dirs::config_dir().context("could not locate user config dir")?;
@@ -58,7 +79,8 @@ pub(crate) fn cockpit_state_dir_unchecked() -> Result<PathBuf> {
 /// only those project-local layers, never this user-owned global directory.
 pub fn cockpit_config_dir() -> Result<PathBuf> {
     let path = cockpit_config_dir_unchecked()?;
-    guard_resolved_cockpit_path(&path);
+    #[cfg(any(test, feature = "test-support"))]
+    let path = finalize_test_cockpit_path(path, CockpitHomeKind::Config);
     Ok(path)
 }
 
@@ -67,7 +89,8 @@ pub fn cockpit_config_dir() -> Result<PathBuf> {
 /// and any other durable user data the daemon writes between runs.
 pub fn cockpit_data_dir() -> Result<PathBuf> {
     let path = cockpit_data_dir_unchecked()?;
-    guard_resolved_cockpit_path(&path);
+    #[cfg(any(test, feature = "test-support"))]
+    let path = finalize_test_cockpit_path(path, CockpitHomeKind::Data);
     Ok(path)
 }
 
@@ -80,13 +103,15 @@ pub fn cockpit_data_dir() -> Result<PathBuf> {
 /// directory (`crates/cockpit-tui/src/clipboard/recovery`).
 pub fn cockpit_state_dir() -> Result<PathBuf> {
     let path = cockpit_state_dir_unchecked()?;
-    guard_resolved_cockpit_path(&path);
+    #[cfg(any(test, feature = "test-support"))]
+    let path = finalize_test_cockpit_path(path, CockpitHomeKind::State);
     Ok(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn data_dir_respects_xdg() {

@@ -176,7 +176,19 @@ impl TestEnvGuard {
         let config = home.join(".config");
         let state = root.join("state");
         let runtime = root.join("runtime");
-        for dir in [&home, &data, &config, &state, &runtime] {
+        let config_cockpit = config.join("cockpit");
+        let data_cockpit = data.join("cockpit");
+        let state_cockpit = state.join("cockpit");
+        for dir in [
+            &home,
+            &data,
+            &config,
+            &state,
+            &runtime,
+            &config_cockpit,
+            &data_cockpit,
+            &state_cockpit,
+        ] {
             std::fs::create_dir_all(dir).expect("create isolated env directory");
         }
         self.set_var("HOME", &home);
@@ -316,34 +328,44 @@ mod tests {
     }
 
     #[test]
-    fn home_isolation_guard_lazy_capture_rejects_real_paths_without_test_env_guard() {
-        let real_state = dirs::home_dir()
-            .expect("real developer home dir")
-            .join(".local/state/cockpit");
-        let panic = std::panic::catch_unwind(|| {
-            home_isolation::assert_not_real_developer_cockpit_path(&real_state);
-        });
-        assert!(
-            panic.is_err(),
-            "lazy capture must reject real developer paths even without TestEnvGuard"
+    fn home_isolation_redirects_real_paths_without_test_env_guard() {
+        let real_config = dirs::config_dir()
+            .expect("real developer config dir")
+            .join("cockpit");
+        let redirected = home_isolation::finalize_test_cockpit_path(
+            real_config,
+            home_isolation::CockpitHomeKind::Config,
         );
+        home_isolation::assert_not_real_developer_cockpit_path(&redirected);
     }
 
     #[test]
-    fn home_isolation_guard_rejects_real_developer_cockpit_paths() {
+    fn home_isolation_redirects_real_developer_cockpit_paths() {
         let setup = test_env_mutex().blocking_lock();
         home_isolation::ensure_real_developer_roots_captured();
         let real_config = dirs::config_dir()
             .expect("real developer config dir")
             .join("cockpit");
-        let panic = std::panic::catch_unwind(|| {
-            home_isolation::assert_not_real_developer_cockpit_path(&real_config);
-        });
-        assert!(
-            panic.is_err(),
-            "real developer config path must be rejected"
+        let redirected = home_isolation::finalize_test_cockpit_path(
+            real_config,
+            home_isolation::CockpitHomeKind::Config,
         );
+        home_isolation::assert_not_real_developer_cockpit_path(&redirected);
         drop(setup);
+    }
+
+    #[test]
+    fn home_isolation_allow_real_home_env_keeps_developer_paths() {
+        let guard = TestEnvGuard::blocking_lock();
+        guard.set_var(home_isolation::COCKPIT_TEST_ALLOW_REAL_HOME_ENV, "1");
+        let real_config = dirs::config_dir()
+            .expect("real developer config dir")
+            .join("cockpit");
+        let kept = home_isolation::finalize_test_cockpit_path(
+            real_config.clone(),
+            home_isolation::CockpitHomeKind::Config,
+        );
+        assert_eq!(kept, real_config);
     }
 
     #[test]

@@ -3638,15 +3638,47 @@ mod tests {
             .expect("delete_session_conn exists");
         let body = &delete_fn[..delete_fn.find("\n}").expect("function body ends")];
         // Either tombstone entrypoint is fine; the invariant is that one runs
-        // before the delete, in the same transaction.
+        // before the delete, in the same transaction. Since the compaction
+        // lineage rework, the actual `DELETE FROM sessions` statements live in
+        // `delete_subtree_rows_conn`, which `delete_session_conn` calls after
+        // writing every tombstone, on the same connection and inside the
+        // caller's transaction.
         assert!(
             body.contains("tombstone_external_journal_session"),
             "delete_session_conn must record the tombstone before deleting"
         );
         assert!(
-            body.find("tombstone_external_journal_session") < body.find("DELETE FROM sessions"),
-            "the tombstone must be written before the delete"
+            body.find("tombstone_external_journal_session") < body.find("delete_subtree_rows_conn"),
+            "the tombstone must be written before the subtree delete"
         );
+        // The subtree delete primitive is the only sanctioned home for the raw
+        // statement, and it must be reachable only through delete_session_conn
+        // so no caller can bypass the tombstone write.
+        let subtree_tail = sessions
+            .split("fn delete_subtree_rows_conn")
+            .nth(1)
+            .expect("delete_subtree_rows_conn exists");
+        let subtree_body = &subtree_tail[..subtree_tail.find("\n}").expect("subtree body ends")];
+        assert!(
+            subtree_body.contains("DELETE FROM sessions"),
+            "delete_subtree_rows_conn must issue the session delete"
+        );
+        // No production caller may reach the subtree delete except
+        // delete_session_conn, which writes every tombstone first.
+        let production_sessions = production_half(&sessions);
+        let mut cursor = 0usize;
+        while let Some(offset) = production_sessions[cursor..].find("delete_subtree_rows_conn(") {
+            let index = cursor + offset;
+            let only_from_delete_fn = production_sessions[..index]
+                .rfind("pub fn delete_session_conn")
+                .map(|start| production_sessions[start..index].matches("\n}").count() == 0)
+                .unwrap_or(false);
+            assert!(
+                only_from_delete_fn,
+                "delete_subtree_rows_conn must be called only from delete_session_conn"
+            );
+            cursor = index + 1;
+        }
 
         // Writing the tombstone in the same *function* is not enough: under
         // `Db::write` each statement autocommits separately, so a failure
@@ -3725,9 +3757,16 @@ mod tests {
                         .rfind("pub fn delete_session_conn")
                         .map(|start| source[start..index].matches("\n}").count() == 0)
                         .unwrap_or(false);
+                let inside_subtree_fn = source[..index]
+                    .rfind("fn delete_subtree_rows_conn")
+                    .is_some()
+                    && source[..index]
+                        .rfind("fn delete_subtree_rows_conn")
+                        .map(|start| source[start..index].matches("\n}").count() == 0)
+                        .unwrap_or(false);
                 let inside_tests = test_marker.is_some_and(|marker| index > marker);
                 assert!(
-                    inside_delete_fn || inside_tests,
+                    inside_delete_fn || inside_subtree_fn || inside_tests,
                     "{file} has a production `DELETE FROM sessions` outside delete_session_conn"
                 );
                 cursor = index + 1;

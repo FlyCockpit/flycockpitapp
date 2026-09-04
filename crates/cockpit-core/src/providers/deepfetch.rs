@@ -1230,6 +1230,10 @@ mod tests {
             "anthropic".into(),
             ProviderEntry {
                 url: "https://api.anthropic.com/v1".into(),
+                // Wire routing is template-driven: provider ids and URLs no
+                // longer classify an entry, so the Anthropic-native identity
+                // is declared by its template.
+                template: Some("anthropic".into()),
                 models: vec![ModelEntry {
                     id: "claude-opus-4".into(),
                     ..ModelEntry::default()
@@ -1458,11 +1462,16 @@ mod tests {
         let model = &cfg.providers["acme"].models[0];
         assert_eq!(model.wire_api, WireApi::Completions);
         assert_eq!(model.wire_api_provenance, WireApiProvenance::Recovered);
-        assert_eq!(cfg.resolve_wire_api("acme", "m"), WireApi::Responses);
+        // `resolve_wire_api` is the config-only view (URLs, ids, model
+        // names, live catalog metadata, and learned endpoint state never
+        // participate): the catalog's Responses declaration routes the
+        // deepfetch probe above, and it does not rewrite the entry's
+        // config resolution for a template-less custom provider.
+        assert_eq!(cfg.resolve_wire_api("acme", "m"), WireApi::Completions);
     }
 
     #[tokio::test]
-    async fn deepfetch_renamed_copilot_uses_responses_when_both_endpoints_work() {
+    async fn deepfetch_renamed_copilot_probes_both_endpoints_and_keeps_config_default() {
         let mut cfg = ProvidersConfig::default();
         cfg.providers.insert(
             "team-github".into(),
@@ -1483,7 +1492,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(targets[0].automatic_wire_api, WireApi::Responses);
+        // Wire routing is config-driven: the copilot template's default is
+        // Chat Completions (model names no longer participate), so that is
+        // the automatic route the both-worked report carries.
+        assert_eq!(targets[0].automatic_wire_api, WireApi::Completions);
         assert_eq!(plan_deepfetch(&targets).endpoint_requests, 2);
 
         let mut client = RecordingClient::new(
@@ -1499,12 +1511,12 @@ mod tests {
         assert_eq!(
             report,
             DeepfetchApplyReport::BothEndpointsWork {
-                endpoint: WireApi::Responses,
+                endpoint: WireApi::Completions,
                 context_tokens: Some(128000),
             }
         );
         assert_eq!(client.endpoint_calls.len(), 2);
-        assert_eq!(client.context_calls[0].endpoint, ProbeEndpoint::Responses);
+        assert_eq!(client.context_calls[0].endpoint, ProbeEndpoint::Completions);
         assert_eq!(
             cfg.providers["team-github"].models[0].wire_api,
             WireApi::Auto

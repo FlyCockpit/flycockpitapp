@@ -554,44 +554,6 @@ impl ConfigMutationLock {
         Ok(Self::enter(Some(file), identity))
     }
 
-    pub(crate) fn acquire_cancellable(
-        target: &Path,
-        cancelled: &std::sync::atomic::AtomicBool,
-    ) -> Result<Self> {
-        ensure_config_parent_dir(target)?;
-        let target_identity = mutation_lock_identity(target);
-        let (parent, lock_leaf, display_path) = open_mutation_lock_parent(target)?;
-        let identity = mutation_lock_runtime_identity(&parent, &target_identity)?;
-        if Self::is_held_identity(&identity) {
-            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                anyhow::bail!("active-model config mutation was cancelled");
-            }
-            return Ok(Self::enter(None, identity));
-        }
-        let file = open_private_lock_file_at(&parent, &lock_leaf, &display_path)?;
-        loop {
-            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                anyhow::bail!("active-model config mutation was cancelled");
-            }
-            match file.try_lock() {
-                Ok(()) => {
-                    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                        anyhow::bail!("active-model config mutation was cancelled");
-                    }
-                    return Ok(Self::enter(Some(file), identity));
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                Err(std::fs::TryLockError::Error(error)) => {
-                    return Err(error).with_context(|| {
-                        format!("locking config mutation at {}", display_path.display())
-                    });
-                }
-            }
-        }
-    }
-
     /// Try to acquire the mutation lock, polling until the deadline. Returns
     /// `Ok(None)` when the deadline elapses without acquiring the lock (it
     /// remained busy). Re-entrant acquisition on the same thread succeeds
@@ -724,20 +686,6 @@ impl ConfigMutationLock {
             _file: file,
             identity,
             _not_send: std::marker::PhantomData,
-        }
-    }
-
-    /// True while this thread already owns the exact target's mutation lock.
-    pub(crate) fn is_held_by_current_thread(target: &Path) -> Result<bool> {
-        let target_identity = mutation_lock_identity(target);
-        match try_open_mutation_lock_parent(target)? {
-            None => Ok(Self::is_held_identity(
-                &missing_parent_mutation_lock_identity(&target_identity),
-            )),
-            Some((parent, _, _)) => {
-                let identity = mutation_lock_runtime_identity(&parent, &target_identity)?;
-                Ok(Self::is_held_identity(&identity))
-            }
         }
     }
 
@@ -2359,51 +2307,6 @@ fn root_cause_is_not_found(error: &anyhow::Error) -> bool {
         .root_cause()
         .downcast_ref::<std::io::Error>()
         .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-}
-
-/// Atomically replace `path` with owner-only private content.
-///
-/// This is the one platform file-security abstraction used for the
-/// effective-default rollback snapshot and journal.
-///
-/// **Unix:** the replacement is created `O_NOFOLLOW`/`O_EXCL` at mode `0600`
-/// and re-`fchmod`ded to `0600` after the rename, so the snapshot is
-/// owner-only regardless of umask. This is enforced and asserted in tests.
-///
-/// **Windows:** every path component is opened relative to a retained parent
-/// handle with `FILE_OPEN_REPARSE_POINT`, and any reparse point is rejected —
-/// no junction or symlink can redirect the snapshot outside its config
-/// directory, and a component swapped after preparation cannot redirect the
-/// commit. The file's DACL is **inherited from its parent directory** rather
-/// than being set explicitly: cockpit-owned config directories are created
-/// through [`ensure_private_dir`], but a user-chosen `COCKPIT_CONFIG`
-/// directory keeps whatever ACL it already had. An explicit owner-only
-/// security descriptor is not applied here; treat Windows confidentiality as
-/// "inherits the config directory's ACL", not "owner-only by construction".
-pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
-    prepare_atomic_write(path, contents)?.commit()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let (parent, file_name) = open_parent_directory_nofollow(path)?;
-        let file = open_file_at_nofollow(
-            &parent,
-            &file_name,
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0,
-        )?;
-        chmod_file_private(&file).with_context(|| format!("chmod 0600 {}", path.display()))?;
-        debug_assert_eq!(
-            file.metadata()
-                .with_context(|| format!("stat {}", path.display()))?
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-    }
-    Ok(())
 }
 
 /// fsync a directory so a rename or unlink inside it is durable.

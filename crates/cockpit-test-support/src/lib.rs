@@ -374,6 +374,26 @@ mod tests {
                 reason: "foreground daemon startup intentionally exports the no-sandbox marker before worker tasks start",
             },
             AllowedMutation {
+                file: "crates/cockpit-core/src/bin/cockpit-daemon-spawn-harness.rs",
+                symbol: "run",
+                reason: "foreground daemon spawn harness intentionally exports the no-sandbox marker before the runtime starts worker tasks, mirroring foreground daemon startup",
+            },
+            AllowedMutation {
+                file: "crates/cockpit-core/src/daemon/peer_authority.rs",
+                symbol: "record_launch_provenance_from_environment",
+                reason: "daemon boot scrubs the launch-ticket environment slot once so descendant processes never inherit owner-class provenance",
+            },
+            AllowedMutation {
+                file: "crates/cockpit-core/src/providers/provider_http.rs",
+                symbol: "set",
+                reason: "test-local proxy env guard saves/restores one variable serialized by its own static mutex for the test lifetime",
+            },
+            AllowedMutation {
+                file: "crates/cockpit-core/src/providers/provider_http.rs",
+                symbol: "drop",
+                reason: "test-local proxy env guard restores the saved variable serialized by its own static mutex for the test lifetime",
+            },
+            AllowedMutation {
                 file: "crates/cockpit-config/src/config/trust.rs",
                 symbol: "set_runtime_policy",
                 reason: "runtime trust policy must be exported to daemon and builder children spawned later",

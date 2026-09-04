@@ -239,14 +239,19 @@ const MAX_STRUCTURED_SEARCH_QUERY_CHARS: usize = 1_024;
 const MAX_STRUCTURED_SEARCH_FILTER_VALUE_CHARS: usize = 256;
 const MAX_STRUCTURED_SEARCH_FILTERS: usize = 16;
 /// A non-secret, host-authenticated generation marker for local KB sealed
-/// values. The marker is ignored by git and carries a host-keyed binding to
-/// the concrete source directory and marker file objects. A copied marker is
-/// therefore not a capability: only the daemon that owns the vault key can
-/// validate it for its original source object.
+/// values. The marker is a git-ignored directory (`**/.flycockpit-sealed-kb-id`)
+/// carrying a namespace id leaf and a host-keyed binding leaf. The binding
+/// covers the concrete source, marker-directory, and id-leaf objects plus the
+/// id leaf's change timestamp — a byte-for-byte copy cannot reproduce that
+/// timestamp, even when a replacement directory recycles every inode number.
+/// A copied marker is therefore not a capability: only the daemon that owns
+/// the vault key can validate it for its original source object.
 const SEALED_KNOWLEDGE_BASE_ID_FILE: &str = ".flycockpit-sealed-kb-id";
-const SEALED_KNOWLEDGE_BASE_MARKER_VERSION: &str = "v1";
+const SEALED_KNOWLEDGE_BASE_MARKER_ID_LEAF: &str = "id";
+const SEALED_KNOWLEDGE_BASE_MARKER_BINDING_LEAF: &str = "binding";
+const SEALED_KNOWLEDGE_BASE_MARKER_VERSION: &str = "v2";
 const SEALED_KNOWLEDGE_BASE_MARKER_BINDING_DOMAIN: &[u8] =
-    b"flycockpit/knowledge-base-sealed-marker/v1";
+    b"flycockpit/knowledge-base-sealed-marker/v2";
 
 #[cfg(test)]
 pub(crate) fn runtime_attached_tool_names() -> &'static [&'static str] {
@@ -5008,61 +5013,125 @@ fn ensure_sealed_knowledge_base_identity(
         return crate::sealed::SealedKnowledgeBaseId::from_attachment_id(id);
     }
 
-    let marker = sealed_knowledge_base_marker_path(&root);
+    let marker_dir = sealed_knowledge_base_marker_path(&root);
     let generated = uuid::Uuid::new_v4();
-    match std::fs::OpenOptions::new()
+    match std::fs::create_dir(&marker_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Lost a creation race, or a prior attempt crashed before
+            // committing an id leaf. A readable marker wins; a directory with
+            // no committed id leaf falls through to a fresh mint below.
+            if let Some(existing) =
+                read_sealed_knowledge_base_marker_from_retained_source(&root, &source, vault)?
+            {
+                return crate::sealed::SealedKnowledgeBaseId::from_attachment_id(existing);
+            }
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "creating knowledge-base sealed identity marker directory {}",
+                    marker_dir.display()
+                )
+            });
+        }
+    }
+    if !cockpit_config::config::directory_handle_matches_path(&source, &root)? {
+        bail!(
+            "knowledge base source {} was replaced while assigning its sealed identity",
+            root.display()
+        );
+    }
+    let marker_source = cockpit_config::config::open_config_directory_nofollow(&marker_dir)
+        .with_context(|| {
+            format!(
+                "opening knowledge-base sealed identity marker {}",
+                marker_dir.display()
+            )
+        })?;
+    if !cockpit_config::config::directory_handle_matches_path(&marker_source, &marker_dir)? {
+        bail!(
+            "knowledge base source {} was replaced while assigning its sealed identity",
+            root.display()
+        );
+    }
+    let id_leaf = sealed_knowledge_base_marker_id_leaf_path(&root);
+    let mut id_file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&marker)
-    {
-        Ok(mut file) => {
-            if !cockpit_config::config::directory_handle_matches_path(&source, &root)? {
-                bail!(
-                    "knowledge base source {} was replaced while assigning its sealed identity",
-                    root.display()
-                );
-            }
-            file.write_all(SEALED_KNOWLEDGE_BASE_MARKER_VERSION.as_bytes())?;
-            file.write_all(b"\n")?;
-            file.write_all(generated.to_string().as_bytes())?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            let marker_identity = sealed_marker_object_identity(&file)?;
-            let binding =
-                sealed_knowledge_base_marker_binding(&root, &source, marker_identity, generated)?;
-            let tag = vault.keyed_identity(SEALED_KNOWLEDGE_BASE_MARKER_BINDING_DOMAIN, &binding);
-            file.write_all(crate::intel::hex_lower(&tag).as_bytes())?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            sync_sealed_knowledge_base_marker_directory(&source, &root)?;
-            if !cockpit_config::config::directory_handle_matches_path(&source, &root)? {
-                bail!(
-                    "knowledge base source {} was replaced while assigning its sealed identity",
-                    root.display()
-                );
-            }
-            crate::sealed::SealedKnowledgeBaseId::from_attachment_id(generated)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let existing = read_sealed_knowledge_base_marker_from_retained_source(
-                &root, &source, vault,
-            )?
-            .context(
-                "knowledge-base sealed identity marker appeared but is not a regular marker file",
-            )?;
-            crate::sealed::SealedKnowledgeBaseId::from_attachment_id(existing)
-        }
-        Err(error) => Err(error).with_context(|| {
+        .open(&id_leaf)
+        .with_context(|| {
             format!(
-                "creating knowledge-base sealed identity marker {}",
-                marker.display()
+                "creating knowledge-base sealed identity marker id {}",
+                id_leaf.display()
             )
-        }),
+        })?;
+    id_file.write_all(SEALED_KNOWLEDGE_BASE_MARKER_VERSION.as_bytes())?;
+    id_file.write_all(b"\n")?;
+    id_file.write_all(generated.to_string().as_bytes())?;
+    id_file.write_all(b"\n")?;
+    id_file.sync_all()?;
+    if !cockpit_config::config::directory_handle_matches_path(&source, &root)?
+        || !cockpit_config::config::directory_handle_matches_path(&marker_source, &marker_dir)?
+    {
+        bail!(
+            "knowledge base source {} was replaced while assigning its sealed identity",
+            root.display()
+        );
     }
+    // The id leaf is never rewritten after this point, so its object identity
+    // and change timestamp stay frozen for the marker's lifetime. The change
+    // timestamp is what a byte-for-byte copy cannot reproduce: a replacement
+    // directory may recycle every inode number, but the replacement objects
+    // carry fresh change timestamps that only a privileged process can forge.
+    let marker_identity = sealed_marker_object_identity(&id_file)?;
+    let marker_change_identity = source_directory_change_identity(&id_file.metadata()?);
+    let binding = sealed_knowledge_base_marker_binding(
+        &root,
+        &source,
+        &marker_source,
+        marker_identity,
+        &marker_change_identity,
+        generated,
+    )?;
+    let tag = vault.keyed_identity(SEALED_KNOWLEDGE_BASE_MARKER_BINDING_DOMAIN, &binding);
+    let binding_leaf = sealed_knowledge_base_marker_binding_leaf_path(&root);
+    let mut binding_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&binding_leaf)
+        .with_context(|| {
+            format!(
+                "creating knowledge-base sealed identity marker binding {}",
+                binding_leaf.display()
+            )
+        })?;
+    binding_file.write_all(crate::intel::hex_lower(&tag).as_bytes())?;
+    binding_file.write_all(b"\n")?;
+    binding_file.sync_all()?;
+    sync_sealed_knowledge_base_marker_directory(&marker_source, &marker_dir)?;
+    sync_sealed_knowledge_base_marker_directory(&source, &root)?;
+    if !cockpit_config::config::directory_handle_matches_path(&source, &root)?
+        || !cockpit_config::config::directory_handle_matches_path(&marker_source, &marker_dir)?
+    {
+        bail!(
+            "knowledge base source {} was replaced while assigning its sealed identity",
+            root.display()
+        );
+    }
+    crate::sealed::SealedKnowledgeBaseId::from_attachment_id(generated)
 }
 
 fn sealed_knowledge_base_marker_path(root: &Path) -> PathBuf {
     root.join(SEALED_KNOWLEDGE_BASE_ID_FILE)
+}
+
+fn sealed_knowledge_base_marker_id_leaf_path(root: &Path) -> PathBuf {
+    sealed_knowledge_base_marker_path(root).join(SEALED_KNOWLEDGE_BASE_MARKER_ID_LEAF)
+}
+
+fn sealed_knowledge_base_marker_binding_leaf_path(root: &Path) -> PathBuf {
+    sealed_knowledge_base_marker_path(root).join(SEALED_KNOWLEDGE_BASE_MARKER_BINDING_LEAF)
 }
 
 fn read_sealed_knowledge_base_marker_from_retained_source(
@@ -5070,13 +5139,36 @@ fn read_sealed_knowledge_base_marker_from_retained_source(
     source: &std::fs::File,
     vault: &crate::secure_key::SecretVault,
 ) -> Result<Option<uuid::Uuid>> {
+    let marker_dir = sealed_knowledge_base_marker_path(root);
+    let marker_source = match cockpit_config::config::open_config_directory_nofollow(&marker_dir) {
+        Ok(handle) => handle,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error).context("opening knowledge-base sealed identity marker");
+        }
+    };
+    if !cockpit_config::config::directory_handle_matches_path(&marker_source, &marker_dir)? {
+        bail!(
+            "knowledge base source {} was replaced while resolving its sealed identity",
+            root.display()
+        );
+    }
     let (raw, marker_identity) =
         match cockpit_config::config::read_config_leaf_from_retained_directory_with_identity(
-            source,
-            std::ffi::OsStr::new(SEALED_KNOWLEDGE_BASE_ID_FILE),
+            &marker_source,
+            std::ffi::OsStr::new(SEALED_KNOWLEDGE_BASE_MARKER_ID_LEAF),
             1024,
         ) {
             Ok(value) => value,
+            // The marker directory exists but no id leaf was ever committed
+            // there (a crashed creation attempt): no namespace was handed
+            // out, so this is simply an unmarked source.
             Err(error)
                 if error
                     .downcast_ref::<std::io::Error>()
@@ -5097,9 +5189,6 @@ fn read_sealed_knowledge_base_marker_from_retained_source(
     let id = lines
         .next()
         .context("knowledge-base sealed identity marker UUID is missing")?;
-    let tag = lines
-        .next()
-        .context("knowledge-base sealed identity marker binding is missing")?;
     if version != SEALED_KNOWLEDGE_BASE_MARKER_VERSION
         || lines.next().is_some()
         || !raw.ends_with('\n')
@@ -5109,7 +5198,67 @@ fn read_sealed_knowledge_base_marker_from_retained_source(
     }
     let id = uuid::Uuid::parse_str(id)
         .context("knowledge-base sealed identity marker must contain a UUID")?;
-    let binding = sealed_knowledge_base_marker_binding(root, source, marker_identity, id)?;
+    let (binding_raw, _) =
+        match cockpit_config::config::read_config_leaf_from_retained_directory_with_identity(
+            &marker_source,
+            std::ffi::OsStr::new(SEALED_KNOWLEDGE_BASE_MARKER_BINDING_LEAF),
+            1024,
+        ) {
+            Ok(value) => value,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                bail!(
+                    "knowledge-base sealed identity marker binding is missing; remove the marker directory before authoring a new sealed value"
+                );
+            }
+            Err(error) => {
+                return Err(error).context("reading knowledge-base sealed identity marker binding");
+            }
+        };
+    let binding_raw = String::from_utf8(binding_raw)
+        .context("knowledge-base sealed identity marker binding is not UTF-8")?;
+    let mut binding_lines = binding_raw.split_terminator('\n');
+    let tag = binding_lines
+        .next()
+        .context("knowledge-base sealed identity marker binding is empty")?;
+    if binding_lines.next().is_some()
+        || !binding_raw.ends_with('\n')
+        || binding_raw.contains('\r')
+        || tag.len() != 64
+        || !tag
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        bail!("knowledge-base sealed identity marker binding has invalid content");
+    }
+    // Change identity of the exact committed id leaf. A copied marker pair
+    // reproduces the bytes and may even recycle both inode numbers, but the
+    // replacement objects carry fresh change timestamps that the keyed
+    // binding rejects.
+    let held = std::fs::symlink_metadata(sealed_knowledge_base_marker_id_leaf_path(root))
+        .context("reading knowledge-base sealed identity marker object identity")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if held.dev() != marker_identity.volume || held.ino() != marker_identity.file {
+            bail!(
+                "knowledge base source {} was replaced while resolving its sealed identity",
+                root.display()
+            );
+        }
+    }
+    let marker_change_identity = source_directory_change_identity(&held);
+    let binding = sealed_knowledge_base_marker_binding(
+        root,
+        source,
+        &marker_source,
+        marker_identity,
+        &marker_change_identity,
+        id,
+    )?;
     let expected = crate::intel::hex_lower(
         &vault.keyed_identity(SEALED_KNOWLEDGE_BASE_MARKER_BINDING_DOMAIN, &binding),
     );
@@ -5123,20 +5272,30 @@ fn read_sealed_knowledge_base_marker_from_retained_source(
 
 /// Build the authenticated evidence for the exact source object that owns a
 /// marker. The random namespace is never derived from these mutable platform
-/// identifiers; they only make a copied marker fail validation. Binding both
-/// directory and marker objects also turns an inode-reuse event into a paired
-/// ABA condition rather than a namespace derivation.
+/// identifiers; they only make a copied marker fail validation. Binding the
+/// source directory, the marker directory, the id leaf, and the id leaf's
+/// change timestamp turns an inode-reuse event into a fresh-timestamp
+/// rejection rather than a paired ABA condition: even when a replacement
+/// directory recycles every inode number, its objects are stamped with new
+/// change timestamps that only a privileged process can forge.
 fn sealed_knowledge_base_marker_binding(
     root: &Path,
     source: &std::fs::File,
+    marker_directory: &std::fs::File,
     marker_identity: cockpit_config::config::TerminalIngressFileIdentity,
+    marker_change_identity: &[u8],
     id: uuid::Uuid,
 ) -> Result<Vec<u8>> {
-    let mut binding = b"flycockpit/knowledge-base-sealed-marker-binding/v1\0".to_vec();
+    let mut binding = b"flycockpit/knowledge-base-sealed-marker-binding/v2\0".to_vec();
     append_attachment_identity_component(&mut binding, root.to_string_lossy().as_bytes());
     append_attachment_identity_component(&mut binding, id.as_bytes());
     append_sealed_marker_object_identity(&mut binding, sealed_marker_object_identity(source)?);
+    append_sealed_marker_object_identity(
+        &mut binding,
+        sealed_marker_object_identity(marker_directory)?,
+    );
     append_sealed_marker_object_identity(&mut binding, marker_identity);
+    append_attachment_identity_component(&mut binding, marker_change_identity);
     Ok(binding)
 }
 
@@ -8719,11 +8878,19 @@ mod tests {
         );
 
         ensure_sealed_knowledge_base_identity(&entry, &vault).unwrap();
-        let copied_marker = fs::read(sealed_knowledge_base_marker_path(&root)).unwrap();
+        let copied_id = fs::read(sealed_knowledge_base_marker_id_leaf_path(&root)).unwrap();
+        let copied_binding =
+            fs::read(sealed_knowledge_base_marker_binding_leaf_path(&root)).unwrap();
 
         fs::remove_dir_all(&root).unwrap();
         write_bundle(&root);
-        fs::write(sealed_knowledge_base_marker_path(&root), copied_marker).unwrap();
+        fs::create_dir_all(sealed_knowledge_base_marker_path(&root)).unwrap();
+        fs::write(sealed_knowledge_base_marker_id_leaf_path(&root), copied_id).unwrap();
+        fs::write(
+            sealed_knowledge_base_marker_binding_leaf_path(&root),
+            copied_binding,
+        )
+        .unwrap();
 
         let error = sealed_knowledge_base_identity(&entry, &vault).unwrap_err();
         assert!(
@@ -8770,7 +8937,7 @@ mod tests {
             sealed_knowledge_base_id_for_owner(tmp.path(), &extended, "project", &vault).unwrap(),
             pinned
         );
-        assert!(sealed_knowledge_base_marker_path(&root).is_file());
+        assert!(sealed_knowledge_base_marker_path(&root).is_dir());
     }
 
     #[cfg(unix)]

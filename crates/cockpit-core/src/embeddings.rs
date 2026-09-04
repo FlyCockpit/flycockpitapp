@@ -721,9 +721,10 @@ mod tests {
 
         let error = embedding.await.unwrap().unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("no longer has a global auth_command")
+            error.to_string().contains(
+                "no longer has global dynamic authentication authorized for embedding refresh"
+            ),
+            "unexpected refresh error: {error}"
         );
         assert_eq!(
             std::fs::read_to_string(&executions).unwrap(),

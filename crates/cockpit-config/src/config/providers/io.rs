@@ -1065,9 +1065,10 @@ impl ConfigDoc {
         let path = config_path_for_layer_path(path);
         let raw_str = match mask {
             Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-            None => match crate::config::files::read_workspace_config_text(&path)
-                .with_context(|| format!("reading config.json at {}", path.display()))?
-            {
+            // No outer read context: the bounded reader already attaches a
+            // `reading <path>` context to IO failures and surfaces over-cap
+            // files as a top-level `exceeds the byte limit` failure.
+            None => match crate::config::files::read_workspace_config_text(&path)? {
                 Some(raw) => raw,
                 None => "{}".to_string(),
             },
@@ -1340,9 +1341,10 @@ impl ConfigDoc {
 
     fn provider_raw_object(&self, provider_id: &str) -> Result<Map<String, Value>> {
         let path = provider_file_path_for_config(&self.path, provider_id)?;
-        let Some(raw) = crate::config::files::read_workspace_config_text(&path)
-            .with_context(|| format!("reading provider config at {}", path.display()))?
-        else {
+        // No outer read context: the bounded reader already attaches a
+        // `reading <path>` context to IO failures and surfaces over-cap
+        // files as a top-level `exceeds the byte limit` failure.
+        let Some(raw) = crate::config::files::read_workspace_config_text(&path)? else {
             return Ok(Map::new());
         };
         let value: Value = if raw.trim().is_empty() {
@@ -1820,14 +1822,15 @@ fn load_provider_files_into_config(config_path: &Path, cfg: &mut ProvidersConfig
 }
 
 pub fn load_provider_raw_file(path: &Path) -> Result<Map<String, Value>> {
-    let raw = crate::config::files::read_workspace_config_text(path)
-        .with_context(|| format!("reading provider config at {}", path.display()))?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "reading provider config at {}: file not found",
-                path.display()
-            )
-        })?;
+    // No outer read context: the bounded reader already attaches a
+    // `reading <path>` context to IO failures and surfaces over-cap
+    // files as a top-level `exceeds the byte limit` failure.
+    let raw = crate::config::files::read_workspace_config_text(path)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "reading provider config at {}: file not found",
+            path.display()
+        )
+    })?;
     let value: Value = if raw.trim().is_empty() {
         Value::Object(Map::new())
     } else {

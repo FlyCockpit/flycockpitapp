@@ -72,12 +72,14 @@ static IN_PROCESS_CONTEXTS: OnceLock<StdMutex<HashMap<PathBuf, RegisteredInProce
 #[cfg(feature = "extended")]
 fn start_persistent_scheduler(
     db: &Db,
+    secret_vault: &Arc<crate::secure_key::SecretVault>,
     registry: &SessionRegistry,
     shutdown: &crate::daemon::shutdown::ShutdownSignal,
     start_gate: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Option<DaemonSchedulerHandle> {
-    let executor = Arc::new(crate::daemon::scheduler::ProductionJobExecutor::new(
+    let executor = Arc::new(crate::daemon::scheduler::ProductionJobExecutor::with_vault(
         db.clone(),
+        secret_vault.clone(),
         registry.clone(),
     ));
     // Keep daemon-owned callbacks next to the production executor so every
@@ -2893,9 +2895,13 @@ impl DaemonContext {
         if scheduler.is_some() {
             return;
         }
-        if let Some(handle) =
-            start_persistent_scheduler(&self.db, &self.registry, &self.shutdown, Some(start_gate))
-        {
+        if let Some(handle) = start_persistent_scheduler(
+            &self.db,
+            &self.secret_vault,
+            &self.registry,
+            &self.shutdown,
+            Some(start_gate),
+        ) {
             self.registry.set_scheduler(handle.clone());
             *scheduler = Some(handle);
         }
@@ -3214,7 +3220,7 @@ impl DaemonContext {
         registry.set_global_bus(global_events.clone());
         #[cfg(feature = "extended")]
         let scheduler = (!paths.ephemeral)
-            .then(|| start_persistent_scheduler(&db, &registry, &shutdown, None))
+            .then(|| start_persistent_scheduler(&db, &secret_vault, &registry, &shutdown, None))
             .flatten();
         #[cfg(feature = "extended")]
         if let Some(handle) = &scheduler {

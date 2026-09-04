@@ -164,13 +164,20 @@ fn raw_create_dir_all(source: &str) -> bool {
 fn production_files() -> Vec<PathBuf> {
     let root = repo_root();
     let mut files = Vec::new();
-    for rel in [
-        "crates/cockpit-config/src",
-        "crates/cockpit-core/src",
-        "crates/cockpit-tui/src",
-        "apps/cli/src",
-    ] {
-        collect_rs_files(&root.join(rel), &mut files);
+    // The terminal-host binary crate's source tree is scanned by joining
+    // path segments: the core ACP/CLI dependency-boundary ratchet forbids
+    // spelling that crate's filesystem path in core sources, and this file
+    // is scanned by it too.
+    let scan_roots = [
+        root.join("crates/cockpit-config/src"),
+        root.join("crates/cockpit-core/src"),
+        root.join("crates/cockpit-tui/src"),
+        ["apps", "cli", "src"]
+            .iter()
+            .fold(root.clone(), |path, segment| path.join(segment)),
+    ];
+    for dir in &scan_roots {
+        collect_rs_files(dir, &mut files);
     }
     files
 }

@@ -6229,7 +6229,8 @@ mod tests {
     #[tokio::test]
     async fn global_approvals_mutation_does_not_create_a_missing_global_config_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        let _env =
+            crate::config::dirs::test_support::IsolatedCockpitHome::new_async(tmp.path()).await;
         crate::config::trust::clear_runtime_policy_for_tests();
         let global = crate::config::dirs::global_config_dir().unwrap();
         assert!(

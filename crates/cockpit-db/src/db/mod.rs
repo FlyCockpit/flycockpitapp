@@ -3342,6 +3342,11 @@ mod tests {
             // deleting a session must not erase spend or unblock its scopes.
             // Sidecar intents outlive the session row so boot can delete
             // files that the cascading payload delete can no longer see.
+            // Text-artifact blob cleanup intents follow the same contract:
+            // every blob identity is preserved before the cascade so replayed
+            // filesystem cleanup work survives the session delete.
+            // Sealed action/value audit rows deliberately carry no FKs:
+            // retiring an action or deleting a session must not erase evidence.
             // Guidance proposal receipts are content-free audit rows that
             // may outlive the session during retention (session_id is not a FK).
             // Image-sidecar grants are project-owned; session_id is an optional
@@ -3353,6 +3358,9 @@ mod tests {
                 || name == "image_spend_reservations"
                 || name == "task_delegation_sidecar_cleanup_intents"
                 || name == "task_delegation_sidecar_prepare_intents"
+                || name == "text_artifact_blob_cleanup_intents"
+                || name == "sealed_action_invocation_audit"
+                || name == "sealed_value_acquisition_audit"
                 || name == "guidance_proposal_receipts"
                 || name == "image_sidecar_grants"
                 || name == "tool_media_authorization_epochs"

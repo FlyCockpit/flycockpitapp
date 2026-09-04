@@ -11,9 +11,10 @@
 //!
 //! Out-of-line and inline modules; inherent `impl Db` methods; crate-local free
 //! functions; `pub`/`pub(crate)` reachability; `self`/`Self`/`Db`/`<Db>`/
-//! `crate`/`super` paths; `use` trees including `as` aliases and local glob
-//! imports; `pub use` re-exports; calls and function-item references; calls
-//! nested in closures, async blocks, matches, and multiline expressions.
+//! `crate`/`super` paths; `use` trees including `as` aliases, local glob
+//! imports, and function-body-local `use` statements; `pub use` re-exports;
+//! calls and function-item references; calls nested in closures, async blocks,
+//! matches, and multiline expressions.
 //!
 //! # Fail-closed
 //!
@@ -298,6 +299,11 @@ struct BodyWalker<'a> {
     _in_db_impl: bool,
     /// FnOnce/closure parameters — calling them is the normal Db accessor pattern.
     param_names: HashSet<String>,
+    /// Bindings from `use` statements local to the walked body. Item-position
+    /// `use` statements are registered in pass 1; function-local imports are
+    /// only visible inside that one body, so they are tracked per walker and
+    /// consulted before the crate-wide binding maps.
+    local_bindings: HashMap<String, ItemId>,
 }
 
 impl BodyWalker<'_> {
@@ -309,6 +315,9 @@ impl BodyWalker<'_> {
 
         if idents.len() == 1 {
             let name = &idents[0];
+            if let Some(id) = self.local_bindings.get(name) {
+                return Some(id.clone());
+            }
             if let Some(id) = self
                 .analysis
                 .bindings
@@ -508,6 +517,33 @@ fn is_crate_local_path(idents: &[String]) -> bool {
 }
 
 impl<'ast> Visit<'ast> for BodyWalker<'_> {
+    fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
+        // `use` statements inside a function body bind names for exactly that
+        // body. Resolve them like item-position imports (crate-local targets
+        // become real call edges; external-crate imports resolve to an
+        // out-of-boundary target like any other external path) instead of
+        // leaving their calls as unresolved indirect callables.
+        if let syn::Stmt::Use(item_use) = stmt {
+            let mut imports = Vec::new();
+            let mut globs: Vec<Vec<String>> = Vec::new();
+            flatten_use_tree(&item_use.tree, &[], &mut imports, &mut globs);
+            for (path_idents_vec, binding_name) in imports {
+                let target = resolve_import_target(self.analysis, &self.module, &path_idents_vec)
+                    .or_else(|| {
+                        path_idents_vec.last().map(|last| ItemId::FreeFn {
+                            module: path_idents_vec[..path_idents_vec.len() - 1].join("::"),
+                            name: last.clone(),
+                        })
+                    });
+                if let Some(target) = target {
+                    self.local_bindings.insert(binding_name, target);
+                }
+            }
+            return;
+        }
+        visit::visit_stmt(self, stmt);
+    }
+
     fn visit_expr(&mut self, expr: &'ast Expr) {
         match expr {
             Expr::MethodCall(mc) => {
@@ -1094,6 +1130,7 @@ fn walk_pending_bodies(analysis: &mut Analysis, pending: Vec<PendingBody>) {
             public_context: body.is_public,
             _in_db_impl: body._in_db_impl,
             param_names: body.param_names,
+            local_bindings: HashMap::new(),
         };
         for stmt in &body.block.stmts {
             walker.visit_stmt(stmt);

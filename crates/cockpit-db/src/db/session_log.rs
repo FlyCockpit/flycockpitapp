@@ -2269,9 +2269,9 @@ mod tests {
             SessionEventKind::ToolCallScheduling.as_str(),
             "tool_call_scheduling"
         );
-        // The closed inventory has 31 kinds (appended, not substituted) and
+        // The closed inventory has 32 kinds (appended, not substituted) and
         // every wire string is distinct.
-        assert_eq!(SessionEventKind::ALL.len(), 31);
+        assert_eq!(SessionEventKind::ALL.len(), 32);
         let unique: std::collections::BTreeSet<&str> = kinds.iter().copied().collect();
         assert_eq!(
             unique.len(),

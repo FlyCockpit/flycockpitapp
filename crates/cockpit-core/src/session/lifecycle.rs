@@ -436,6 +436,10 @@ fn persist_redaction_table_to_vault_on_conn(
         .map_err(|error| anyhow::anyhow!("persisting session redaction table: {error}"))
 }
 
+/// Test-only convenience over [`persist_redaction_table_to_vault`]: it opens
+/// the vault from `db` directly. Every production writer injects its
+/// session/boot vault and calls [`persist_redaction_table_to_vault`].
+#[cfg(test)]
 pub(crate) fn write_redaction_table_json_to_vault(
     db: &crate::db::Db,
     session_id: uuid::Uuid,

@@ -3665,7 +3665,20 @@ mod tests {
                 }
                 raw.push_str("\r\n");
                 raw.push_str(&response.body);
-                socket.write_all(raw.as_bytes()).await.unwrap();
+                if let Err(error) = socket.write_all(raw.as_bytes()).await {
+                    // A client enforcing the error-before-parse body bound
+                    // aborts the connection instead of draining an
+                    // oversized body, so the writer can observe a broken
+                    // pipe (or the reset that follows it). That is the
+                    // healthy outcome for oversized responses, not a
+                    // fixture failure; any other write error is real.
+                    if !matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ) {
+                        panic!("writing test model response: {error}");
+                    }
+                }
             }
             requests
         });

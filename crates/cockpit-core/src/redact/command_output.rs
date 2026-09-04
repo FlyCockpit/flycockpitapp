@@ -279,7 +279,10 @@ fn scrub_secret_shaped_xml(line: &str, placeholder: &str) -> String {
                 if value != placeholder && !keyed_novel_value_is_visible(value) {
                     out.push_str(&line[copied..value_start]);
                     out.push_str(placeholder);
-                    copied = close_end;
+                    // Only the inner text is secret: the close tag is
+                    // structure and survives, so copy resumes at it while
+                    // the scan resumes after it.
+                    copied = close_start;
                     i = close_end;
                     continue;
                 }
@@ -701,6 +704,19 @@ fn is_novel_opaque_credential(token: &str) -> bool {
         && !token.contains(char::is_whitespace)
         && token.chars().all(is_opaque_token_char)
         && token.chars().any(|c| c.is_ascii_alphanumeric())
+        // A run whose body is a secret-shaped key name is the key of an
+        // assignment — either raw (`KEY=<value>`, caught by the
+        // non-trailing-`=` rejection below) or one whose value an
+        // earlier pass already replaced with the placeholder (the
+        // placeholder is not an opaque character, so the key run now
+        // ends at its own `=`). Keys are structure and survive every
+        // scrub. The leading-dash trim mirrors the assignment pass's
+        // CLI-flag spelling (`--aws-secret-access-key=`).
+        && !command_output_key_qualifies(
+            token
+                .trim_end_matches('=')
+                .trim_start_matches('-'),
+        )
         // A non-trailing `=` makes the span an assignment shape, not a
         // bare token (trailing `=` is base64 padding).
         && !token.trim_end_matches('=').contains('=')

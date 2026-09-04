@@ -4082,6 +4082,9 @@ mod tests {
         let env = tempfile::tempdir().unwrap();
         let _home =
             cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(env.path()).await;
+        // A persisted global grant assumes the booted persistent-daemon
+        // precondition: the global layer already exists.
+        crate::config::dirs::ensure_global_config_dir().unwrap();
         let cwd = tempfile::tempdir_in(env.path()).unwrap();
         let (approver, _) = approver(cwd.path());
         let ls = classify::classify("ls").simple_commands()[0].clone();
@@ -4124,6 +4127,9 @@ mod tests {
         let env = tempfile::tempdir().unwrap();
         let _home =
             cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(env.path()).await;
+        // A persisted global grant assumes the booted persistent-daemon
+        // precondition: the global layer already exists.
+        crate::config::dirs::ensure_global_config_dir().unwrap();
         let project = tempfile::tempdir_in(env.path()).unwrap();
         init_git_repo(project.path());
         let (approver, _) = approver(project.path());
@@ -4468,6 +4474,9 @@ mod tests {
             let env = tempfile::tempdir().unwrap();
             let _home =
                 cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(env.path()).await;
+            // The global iteration of this sweep persists a reject at global
+            // scope, which assumes the global layer already exists.
+            crate::config::dirs::ensure_global_config_dir().unwrap();
             let project = tempfile::tempdir_in(env.path()).unwrap();
             let status = std::process::Command::new("git")
                 .args(["init", "-q"])

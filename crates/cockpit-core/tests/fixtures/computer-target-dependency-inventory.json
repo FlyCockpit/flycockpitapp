@@ -17,6 +17,8 @@
       "objc2-core-foundation": [
         "std",
         "CFArray",
+        "CFData",
+        "CFCGTypes",
         "CFDictionary",
         "CFFileDescriptor",
         "CFNumber",

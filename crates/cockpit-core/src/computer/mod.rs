@@ -7599,6 +7599,12 @@ mod tests {
 
     #[tokio::test]
     async fn computer_input_modes_distinct() {
+        // TypeText, KeyChord, and HoldKey are distinct keyboard input
+        // modes the backend records distinctly. Mouse button presses are
+        // refused at launch as a whole primitive (review cycle 3, finding
+        // 4): a press can drive the receiving application to inject or
+        // execute content command approval never sees, so a Click never
+        // reaches the backend.
         let actions = vec![
             ComputerAction::TypeText {
                 text: "Control+L is literal text".to_string(),
@@ -7613,14 +7619,6 @@ mod tests {
             ComputerAction::HoldKey {
                 key: KeyCode::parse("L").unwrap(),
                 duration: Duration::from_millis(5),
-            },
-            ComputerAction::Click {
-                button: MouseButton::Left,
-                count: ClickCount::Single,
-                modifiers: Modifiers {
-                    control: true,
-                    ..Modifiers::default()
-                },
             },
         ];
         let mut backend = FakeBackend::new();
@@ -7639,10 +7637,28 @@ mod tests {
             backend.recorded[2],
             NormalizedComputerEffect::HoldKey { .. }
         ));
-        assert!(matches!(
-            backend.recorded[3],
-            NormalizedComputerEffect::Click { .. }
-        ));
+
+        // The button-press primitive is refused at launch and normalizes
+        // before any dispatch, so the batch delivers zero backend effects.
+        let click = vec![ComputerAction::Click {
+            button: MouseButton::Left,
+            count: ClickCount::Single,
+            modifiers: Modifiers {
+                control: true,
+                ..Modifiers::default()
+            },
+        }];
+        let mut backend = FakeBackend::new();
+        let report = execute_backend_batch(&mut backend, &click).await;
+        assert!(
+            matches!(&report.failure, Some(ComputerFailure { index: 0, error: ComputerError::Refused(reason) }) if reason.contains("cannot press mouse buttons at launch")),
+            "a click must be refused at launch as a button press: {:?}",
+            report.failure
+        );
+        assert!(
+            backend.recorded.is_empty(),
+            "a refused launch batch must deliver zero backend effects"
+        );
     }
 
     fn chord(keys: &[&str]) -> CanonicalKeyChord {

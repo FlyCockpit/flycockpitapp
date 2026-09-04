@@ -1950,7 +1950,9 @@ mod tests {
     fn render_body_claude_mode_scrubs_command_output_at_substitution_site() {
         // Table-known secrets are redacted where the directive is replaced
         // — the documented non-bypassable GOALS §7 scrub — not deferred to
-        // dispatch time (issue #279 regression).
+        // dispatch time (issue #279 regression). Bang substitution only
+        // runs under a trusted workspace policy, so the fixture establishes
+        // one exactly like the other Claude-mode proofs.
         let cfg = RedactConfig {
             denylist: vec!["SUPERSECRETTOKEN".to_string()],
             scan_ssh_keys: false,
@@ -1958,7 +1960,7 @@ mod tests {
         };
         let redact = RedactionTable::build(&cfg, Path::new("/")).unwrap();
         let body = "leak: !`echo SUPERSECRETTOKEN`";
-        let out = render_body(body, Path::new("."), true, false, &redact);
+        let out = trusted_render_body(body, Path::new("."), true, &redact);
         assert!(!out.contains("SUPERSECRETTOKEN"), "got {out:?}");
         assert!(out.contains("REDACTED"), "got {out:?}");
     }
@@ -2012,7 +2014,7 @@ mod tests {
         };
         let redact = RedactionTable::build(&cfg, Path::new("/")).unwrap();
         let body = "x !`echo TABLESTDERRSECRET7 >&2; exit 1` y";
-        let out = render_body(body, Path::new("."), true, false, &redact);
+        let out = trusted_render_body(body, Path::new("."), true, &redact);
         assert!(!out.contains("TABLESTDERRSECRET7"), "got {out:?}");
         assert!(out.contains("[skill command"), "got {out:?}");
     }

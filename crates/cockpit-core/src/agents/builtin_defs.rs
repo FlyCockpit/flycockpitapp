@@ -1032,18 +1032,30 @@ mod tests {
     }
 
     #[test]
-    fn defensive_role_def_grants_at_most_ten_tools() {
+    fn defensive_role_def_grants_at_most_eleven_tools() {
         let def = embedded_default("Careful").expect("Careful embedded default");
         let grants = builtin_tool_names(&def);
 
+        // Eleven since the trusted-child acquisition work (#240/PR #317) added
+        // `acquire_sealed_value` to the conservative direct surface; the
+        // remaining ten stay the small ordinary-edit set.
         assert!(
-            grants.len() <= 10,
+            grants.len() <= 11,
             "Careful direct grants should stay small: {grants:?}"
         );
         assert_eq!(
             grants,
             [
-                "bash", "edit", "mcp", "question", "read", "schedule", "search", "task", "unlock",
+                "acquire_sealed_value",
+                "bash",
+                "edit",
+                "mcp",
+                "question",
+                "read",
+                "schedule",
+                "search",
+                "task",
+                "unlock",
                 "write",
             ]
             .into_iter()
@@ -1234,6 +1246,7 @@ mod tests {
                 [
                     "read",
                     "bash",
+                    "acquire_sealed_value",
                     "context_pack",
                     "code",
                     "graph",

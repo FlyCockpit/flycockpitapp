@@ -3103,7 +3103,7 @@ CREATE TABLE session_events (
         'user_message', 'user_note', 'assistant_message', 'inference_request',
         'tool_call', 'tandem_inference', 'tool_call_started',
         'tool_call_completed', 'subagent_spawned', 'subagent_routing',
-        'subagent_report', 'context_pruned', 'session_compacted',
+        'subagent_report', 'subagent_compacted', 'context_pruned', 'session_compacted',
         'permission_decision', 'interrupt_decision', 'tool_rejected',
         'primary_swap', 'inference_failure', 'failed_turn_recovery',
         'turn_interrupted', 'skill_auto_select', 'auto_prune_diagnostic',

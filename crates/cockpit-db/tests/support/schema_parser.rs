@@ -235,13 +235,21 @@ fn key_in_parens(tokens: &[Token], open: usize) -> Key {
     let terms = clauses(&tokens[open + 1..close])
         .into_iter()
         .map(|part| {
-            let (column, cursor) = if is(part.first(), "ifnull")
-                && matches!(part.get(1), Some(Token::Mark('(')))
+            let (column, cursor) = if matches!(
+                word(part.first()).as_deref(),
+                // `ifnull(a, b)` and its exact two-argument spelling
+                // `coalesce(a, b)` are the same SQLite function; the reviewed
+                // retention indexes use both spellings, so both are accepted
+                // key-expression terms with exactly two scalar arguments. Any
+                // other expression shape stays rejected.
+                Some("ifnull" | "coalesce")
+            ) && matches!(part.get(1), Some(Token::Mark('(')))
                 && matches!(part.get(3), Some(Token::Mark(',')))
-                && matches!(part.last(), Some(Token::Mark(')')))
+                && part.len() == 6
+                && matches!(part.get(5), Some(Token::Mark(')')))
             {
                 (
-                    name(part.get(2)).expect("ifnull key term requires a column"),
+                    name(part.get(2)).expect("ifnull/coalesce key term requires a column"),
                     part.len(),
                 )
             } else {
@@ -1371,6 +1379,32 @@ mod tests {
             exact_target_keys(&schema, "parent"),
             vec![vec!["right_id".to_owned(), "left_id".to_owned()]]
         );
+    }
+
+    #[test]
+    fn ifnull_and_coalesce_two_argument_key_terms_are_the_reviewed_expressions() {
+        for sql in [
+            "CREATE TABLE t(a INTEGER, b INTEGER); CREATE INDEX t_i ON t(ifnull(a, b));",
+            "CREATE TABLE t(a INTEGER, b INTEGER); CREATE INDEX t_c ON t(coalesce(a, b));",
+        ] {
+            let schema = parse(&[sql]);
+            assert_eq!(schema.indexes.len(), 1);
+            assert_eq!(schema.indexes[0].terms[0].column, "a");
+        }
+        // Three-argument coalesce, other functions, and arbitrary
+        // expressions remain unsupported fail-closed key terms.
+        for sql in [
+            "CREATE TABLE t(a INTEGER, b INTEGER, c INTEGER); \
+             CREATE INDEX t3 ON t(coalesce(a, b, c));",
+            "CREATE TABLE t(a INTEGER, b INTEGER, c INTEGER); \
+             CREATE INDEX t3 ON t(ifnull(a, b, c));",
+            "CREATE TABLE t(a TEXT); CREATE INDEX tl ON t(lower(a));",
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| parse(&[sql])).is_err(),
+                "accepted unreviewed key expression: {sql}"
+            );
+        }
     }
 
     #[test]

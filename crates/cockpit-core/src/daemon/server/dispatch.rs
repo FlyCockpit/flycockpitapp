@@ -31252,9 +31252,14 @@ pub(super) async fn import_session_archive(
                 .to_owned(),
         });
     }
-    let result = crate::session::import::import_archive(&ctx.db, archive, include_sensitive)
-        .await
-        .map_err(internal)?;
+    let result = crate::session::import::import_archive_with_vault(
+        &ctx.db,
+        ctx.secret_vault.clone(),
+        archive,
+        include_sensitive,
+    )
+    .await
+    .map_err(internal)?;
     Ok(Response::ImportSessionArchive {
         imported: result.imported,
         redacted: result.redacted,

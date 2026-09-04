@@ -9486,11 +9486,8 @@ mod tests {
                 .unwrap(),
             0
         );
-        let state = db.read(|conn| Ok((conn.query_row("SELECT availability FROM media_attachments", [], |r| r.get::<_, String>(0))?, conn.query_row("SELECT availability_generation FROM media_attachments", [], |r| r.get::<_, String>(0))?, conn.query_row("SELECT COUNT(*) FROM media_attachment_processing_failure_evidence WHERE reason='model_runtime_unavailable'", [], |r| r.get::<_, i64>(0))?, conn.query_row("SELECT COUNT(*) FROM media_attachment_transition_evidence WHERE to_state IN ('decoding','normalizing','model_derivative_unavailable')", [], |r| r.get::<_, i64>(0))?))).await.unwrap();
-        assert_eq!(
-            state,
-            ("model_derivative_unavailable".into(), "5".into(), 1, 3)
-        );
+        let state = db.read(|conn| Ok((conn.query_row("SELECT availability FROM media_attachments", [], |r| r.get::<_, String>(0))?, conn.query_row("SELECT availability_generation FROM media_attachments", [], |r| r.get::<_, i64>(0))?, conn.query_row("SELECT COUNT(*) FROM media_attachment_processing_failure_evidence WHERE reason='model_runtime_unavailable'", [], |r| r.get::<_, i64>(0))?, conn.query_row("SELECT COUNT(*) FROM media_attachment_transition_evidence WHERE to_state IN ('decoding','normalizing','model_derivative_unavailable')", [], |r| r.get::<_, i64>(0))?))).await.unwrap();
+        assert_eq!(state, ("model_derivative_unavailable".into(), 5, 1, 3));
         db.transaction(|conn| {
             let error = conn
                 .execute(
@@ -11238,11 +11235,8 @@ mod tests {
                 .await
                 .is_err()
         );
-        let blocked:(String,String,String,i64)=db.read(move|conn|Ok(conn.query_row("SELECT a.availability,a.availability_generation,c.component_generation,(SELECT COUNT(*) FROM media_component_security_evidence e WHERE e.lease_id=?1 AND e.reason='storage_security_violation') FROM media_attachments a JOIN media_attachment_components c ON c.attachment_id=a.attachment_id WHERE a.attachment_id=?2",params![failed_lease.to_string(),attachment_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?)).await.unwrap();
-        assert_eq!(
-            blocked,
-            ("security_blocked".into(), "6".into(), "2".into(), 1)
-        );
+        let blocked:(String,i64,i64,i64)=db.read(move|conn|Ok(conn.query_row("SELECT a.availability,a.availability_generation,c.component_generation,(SELECT COUNT(*) FROM media_component_security_evidence e WHERE e.lease_id=?1 AND e.reason='storage_security_violation') FROM media_attachments a JOIN media_attachment_components c ON c.attachment_id=a.attachment_id WHERE a.attachment_id=?2",params![failed_lease.to_string(),attachment_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?)).await.unwrap();
+        assert_eq!(blocked, ("security_blocked".into(), 6, 2, 1));
     }
 
     async fn fixture() -> Fixture {

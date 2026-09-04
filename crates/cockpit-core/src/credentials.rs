@@ -363,6 +363,29 @@ impl CredentialStore {
         }
     }
 
+    /// Re-read the durable backend for one record, bypassing this store's
+    /// construction-time snapshot. Single-flight refresh double-checks must
+    /// use this: a waiter's snapshot predates the winner's save, so a
+    /// snapshot read cannot observe (or supersede) the winner's credential.
+    /// Diagnostic transient layers have no durable backend, so they keep
+    /// serving their in-memory view.
+    pub(crate) fn reread_owned(&self, provider_id: &str) -> Result<Option<Value>> {
+        if let Some(records) = &self.transient_records {
+            return Ok(records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(provider_id)
+                .cloned());
+        }
+        match &self.backend {
+            CredentialBackend::Vault(vault) => load_record_from_vault(vault, provider_id),
+            #[cfg(any(test, feature = "test-support"))]
+            CredentialBackend::LegacyFile { path } => Ok(read_credential_file_readonly(path)?
+                .records
+                .remove(provider_id)),
+        }
+    }
+
     pub(crate) fn get_loaded_owned(&self, provider_id: &str) -> Option<Value> {
         if let Some(records) = &self.transient_records {
             return records
@@ -372,26 +395,6 @@ impl CredentialStore {
                 .cloned();
         }
         self.records.get(provider_id).cloned()
-    }
-
-    pub(crate) fn refresh_loaded_record_owned(&self, provider_id: &str) -> Result<Option<Value>> {
-        if let Some(records) = &self.transient_records {
-            return Ok(records
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get(provider_id)
-                .cloned());
-        }
-        if !self.records.contains_key(provider_id) {
-            return Ok(None);
-        }
-        match &self.backend {
-            CredentialBackend::Vault(vault) => load_record_from_vault(vault, provider_id),
-            #[cfg(any(test, feature = "test-support"))]
-            CredentialBackend::LegacyFile { path } => Ok(read_credential_file_readonly(path)?
-                .records
-                .remove(provider_id)),
-        }
     }
 
     pub(crate) fn refreshed_loaded_records(&self) -> Result<Self> {

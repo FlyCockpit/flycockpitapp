@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io::Cursor,
     path::Path,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -39,7 +40,9 @@ const INLINE_USER_TEXT_BYTES: usize = 64 * 1024;
 const MAX_TEXT_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SESSION_TEXT_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 
-/// Import a parsed session archive into `db`.
+/// Import a parsed session archive into `db`, installing redaction custody
+/// with the caller's injected vault. Production callers (daemon dispatch)
+/// hold the daemon boot vault and must not open one here.
 ///
 /// `include_sensitive` is the explicit raw-custody acknowledgement for an
 /// unredacted archive (`redacted == false`, written by
@@ -51,8 +54,9 @@ const MAX_SESSION_TEXT_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 /// custody for that historical material cannot be reconstructed. Refusing
 /// without an explicit acknowledgement keeps that custody drop from being
 /// silent; with the acknowledgement it is the caller's informed choice.
-pub async fn import_archive(
+pub async fn import_archive_with_vault(
     db: &Db,
+    vault: Arc<crate::secure_key::SecretVault>,
     archive: ImportArchive,
     include_sensitive: bool,
 ) -> Result<ImportResult> {
@@ -65,9 +69,6 @@ pub async fn import_archive(
         );
     }
     stage_blob_backed_import_artifacts(db, &mut archive).await?;
-    let vault = crate::secure_key::vault_for_db(db).map_err(|error| {
-        anyhow!("opening vault for imported session redaction custody: {error}")
-    })?;
     db.transaction(move |conn| {
         Db::import_session_archive_graph_conn(conn, archive, |conn, session_id| {
             crate::session::lifecycle::persist_empty_redaction_table_on_conn(
@@ -76,6 +77,21 @@ pub async fn import_archive(
         })
     })
     .await
+}
+
+/// Test-only convenience over [`import_archive_with_vault`]: opens the vault
+/// from `db` directly so tests can import against an in-memory database
+/// without plumbing a boot vault.
+#[cfg(test)]
+pub(crate) async fn import_archive(
+    db: &Db,
+    archive: ImportArchive,
+    include_sensitive: bool,
+) -> Result<ImportResult> {
+    let vault = crate::secure_key::vault_for_db(db).map_err(|error| {
+        anyhow!("opening vault for imported session redaction custody: {error}")
+    })?;
+    import_archive_with_vault(db, vault, archive, include_sensitive).await
 }
 
 /// Archive members contain the complete portable body, while the source

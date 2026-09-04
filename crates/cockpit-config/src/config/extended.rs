@@ -2926,9 +2926,10 @@ impl ExtendedConfigDoc {
     /// [`ConfigLayerOrigin::Remote`] and `image_generation` is stripped at
     /// construction. See the [`ConfigLayerOrigin`] invariant.
     pub fn load(path: &Path) -> Result<Self> {
-        let raw_str = match crate::config::files::read_workspace_config_text(path)
-            .with_context(|| format!("reading config.json at {}", path.display()))?
-        {
+        // No outer read context: the bounded reader already attaches a
+        // `reading <path>` context to IO failures and surfaces over-cap
+        // files as a top-level `exceeds the byte limit` failure.
+        let raw_str = match crate::config::files::read_workspace_config_text(path)? {
             Some(raw) => raw,
             None => "{}".to_string(),
         };

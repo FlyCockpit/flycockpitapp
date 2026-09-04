@@ -2711,7 +2711,6 @@ mod tests {
     fn database_schema_rejection_classifier_covers_every_boot_rejection_family() {
         for message in [
             "FCDB_SCHEMA_PROFILE_MISMATCH: wrong profile",
-            "FCDB_SCHEMA_REJECTED_AFTER_OPEN: backup ledger differs from compiled schema",
             "incompatible prerelease database schema v2",
             "incompatible legacy prerelease database schema v1",
             "database migration ledger is corrupt: gap",

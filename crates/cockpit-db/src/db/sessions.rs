@@ -2199,15 +2199,25 @@ impl Db {
         let session_id = Uuid::new_v4();
         let now_unix_ms = Utc::now().timestamp_millis();
         self.write(move |conn| {
-            Self::create_fork_row_body_conn(
-                conn,
+            // `Db::write` autocommits each statement separately, but a fork
+            // is one invariant: the child row plus its copied events, tool
+            // calls, pins, and artifacts must appear or vanish together. Run
+            // the body in one transaction (mirroring `create_fork_conn`) so a
+            // mid-copy failure rolls back the half-created child.
+            let tx = conn
+                .unchecked_transaction()
+                .context("begin create_fork tx")?;
+            let row = Self::create_fork_row_body_conn(
+                &tx,
                 parent_session_id,
                 fork_point_turn_id,
                 ephemeral,
                 fresh_thread,
                 session_id,
                 now_unix_ms,
-            )
+            )?;
+            tx.commit().context("commit create_fork tx")?;
+            Ok(row)
         })
         .await
     }

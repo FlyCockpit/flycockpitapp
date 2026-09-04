@@ -4624,7 +4624,14 @@ impl ComputerActionCoordinator {
         if let Err(fence) = self.pre_handoff_for_dispatch(actions_suffix, class_offset) {
             return Err(fence.batch_error());
         }
-        self.bind_backend_target_window(&actions_suffix[class_offset])?;
+        // `class_offset` is the absolute index of the suffix's first item;
+        // the action being dispatched here is that first item itself.
+        let Some(current_action) = actions_suffix.first() else {
+            return Err(ComputerError::Refused(
+                "computer action dispatch suffix is empty".to_string(),
+            ));
+        };
+        self.bind_backend_target_window(current_action)?;
         self.backend
             .as_mut()
             .execute_normalized_one(normalized)
@@ -9716,8 +9723,12 @@ mod tests {
         // an unknown program name is indistinguishable from prose at typing
         // time, so typing stays usable — but an Enter that would submit any
         // line parsing as a shell command is refused with both the reset
-        // gesture and the run tool named, and a provable `ctrl+c` cancel
-        // restores commits on the empty line.
+        // gesture and the run tool named. Identity-changing keyboard input
+        // (`ctrl+a`) leaves the receiving object unproven (#373 allowlist,
+        // #289 remaining finding 2), so a later Enter is refused by the
+        // receiver re-proof gate (#374) instead: the refusal names the dirty
+        // keyboard identity, and `ctrl+c` resets the tracked line but can
+        // no longer restore commits on an unproven receiver.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
         let mut coordinator =
             make_coordinator(Box::new(FakeBackend::new()), authorizer.clone()).await;
@@ -9758,8 +9769,13 @@ mod tests {
             failure.error
         );
 
-        // An unmodeled key taints the line: the Enter is refused, not the
-        // chord.
+        // `ctrl+a` is identity-changing keyboard input (#373): the chord
+        // itself still dispatches, but the receiving object becomes
+        // unproven and the keyboard identity is dirty, so the Enter is
+        // refused by the receiver re-proof gate (#374) before the
+        // typed-line gate — naming the dirty keyboard identity, not the
+        // ctrl+c reset gesture, because ctrl+c can no longer restore a
+        // proven receiver (#289 remaining finding 2).
         let outcome = coordinator
             .execute_openai_call(
                 "call-unmodeled",
@@ -9779,15 +9795,18 @@ mod tests {
             .await;
         let failure = match outcome {
             CoordinatedOutcome::Failed { failure, .. } => failure,
-            other => panic!("an untracked line must not submit, got {other:?}"),
+            other => panic!("an Enter on an unproven receiver must not dispatch, got {other:?}"),
         };
         assert!(
-            matches!(&failure.error, ComputerError::Refused(reason) if reason.contains("ctrl+c")),
-            "the refusal must name the reset gesture: {:?}",
+            matches!(&failure.error, ComputerError::Refused(reason) if reason.contains("identity-changing keyboard input") && reason.contains("unproven")),
+            "the refusal must name the receiver re-proof contract: {:?}",
             failure.error
         );
 
-        // `ctrl+c` provably cancels the receiver's line: commits restored.
+        // `ctrl+c` provably cancels the receiver's line contents, but it
+        // cannot restore a proven receiver (#289 remaining finding 2): the
+        // Enter stays refused until an evidence-based receiver re-proof
+        // succeeds (#374).
         let outcome = coordinator
             .execute_openai_call(
                 "call-cancel",
@@ -9805,9 +9824,22 @@ mod tests {
                 })],
             )
             .await;
+        let failure = match outcome {
+            CoordinatedOutcome::Failed { failure, .. } => failure,
+            other => panic!(
+                "an Enter after ctrl+c on an unproven receiver must not dispatch, got {other:?}"
+            ),
+        };
+        // The ctrl+c dispatch's live-baseline adoption cleared the dirty
+        // keyboard identity, so this Enter reaches the re-proof itself and
+        // fails closed there: this hermetic coordinator installs no audit
+        // chain, and a receiver re-proof journals its evidence receipt or
+        // refuses (issue #374). Either way the receiving object stays
+        // unproven and the Enter never dispatches.
         assert!(
-            matches!(outcome, CoordinatedOutcome::Completed { .. }),
-            "a provably reset line commits nothing: {outcome:?}"
+            matches!(&failure.error, ComputerError::Refused(reason) if reason.contains("cannot press Enter") && reason.contains("unproven")),
+            "ctrl+c must not restore commits on an unproven receiver: {:?}",
+            failure.error
         );
     }
 
@@ -16071,9 +16103,13 @@ mod tests {
         let open = ask_virtual_evidence();
         let mut drifted = open.clone();
         drifted.focus_generation = open.focus_generation.saturating_add(1);
+        // Snapshot order: open-time capture, batch pre-handoff fence,
+        // per-item window re-fence (#288 re-fences immediately before each
+        // backend handoff), then the drifted snapshot for the post-action
+        // recheck this test drives.
         let adapter = FakeTargetEvidenceAdapter::with_queue(
             open.backend_kind,
-            vec![open.clone(), open, drifted],
+            vec![open.clone(), open.clone(), open, drifted],
         );
         let params = CoordinatorParams {
             session_id: "session-1".to_string(),

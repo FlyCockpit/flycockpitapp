@@ -647,6 +647,14 @@ mod grant_tests {
             let mut authored = embedded.clone();
             authored.source = "workspace/custom.md".into();
             authored.name = "custom".into();
+            // An authored definition must also drop the binary-owned private
+            // tools from its cloned grant, so the inserted preference is the
+            // only acquisition-private reference left to reject. (The grant
+            // half of the rule is covered by
+            // `acquisition_private_class_requires_embedded_provenance_in_base_definition`.)
+            if let Some(tools) = &mut authored.tools {
+                tools.retain(|held| !is_acquisition_private_tool(held));
+            }
             let vnext = authored.vnext.as_mut().expect("launch-v1 definition");
             vnext.agent_id = "workspace/custom".into();
             vnext.capabilities.clear();
@@ -863,7 +871,16 @@ mod grant_tests {
             targets: vec![DelegationTarget::SameRoot],
             default_child: None,
         };
+        // The schema collapse (6a7acbfff, "unify roles capabilities and
+        // trust suggestions") removed the authored `executionKind` axis:
+        // execution kind is now a role projection (code/assistant only) and
+        // `computerUse` is a composable capability, so no authored definition
+        // can be Computer-kind and trip "computer agents cannot declare
+        // delegation". The closed schema still rejects the malformed
+        // delegation itself — and the rejection must come from that closed
+        // schema, never from a legacy tool-rule reinterpretation.
         let error = validate_invariants(&def).unwrap_err().to_string();
-        assert!(error.contains("computer"), "{error}");
+        assert!(error.contains("allowedChildren"), "{error}");
+        assert!(error.contains("non-empty"), "{error}");
     }
 }

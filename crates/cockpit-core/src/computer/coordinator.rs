@@ -72,8 +72,8 @@ use super::{
     Anthropic20250124ComputerAction, Anthropic20251124ComputerAction, ComputerAction,
     ComputerActionOutcome, ComputerBackend, ComputerBatchReport, ComputerError, ComputerFailure,
     ComputerToolContract, DisplayGeometry, EVIDENCED_WINDOW_MISMATCH, NativeComputerWire,
-    OpenAiComputerAction, SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW, TypedInputLineModel,
-    execute_backend_action, normalize_action, normalize_backend_batch,
+    NormalizedComputerAction, OpenAiComputerAction, SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW,
+    TypedInputLineModel, execute_backend_action, normalize_action, normalize_backend_batch,
     parse_anthropic_20250124_action, parse_anthropic_20251124_action, parse_openai_computer_call,
 };
 
@@ -4620,7 +4620,7 @@ impl ComputerActionCoordinator {
         actions_suffix: &[ComputerAction],
         class_offset: usize,
         normalized: &NormalizedComputerAction,
-    ) -> Result<(), ComputerError> {
+    ) -> Result<ComputerActionOutcome, ComputerError> {
         if let Err(fence) = self.pre_handoff_for_dispatch(actions_suffix, class_offset) {
             return Err(fence.batch_error());
         }
@@ -6233,7 +6233,7 @@ impl ComputerActionCoordinator {
             focus_generation: evidence.focus_generation,
         });
         if let Err(failure) = self
-            .finish_receiver_reproof_attempt(call_id, operation_id, Ok(()), &evidence)
+            .finish_receiver_reproof_attempt(call_id, operation_id, Ok(()), Some(&evidence))
             .await
         {
             return Err(failure);
@@ -6499,7 +6499,7 @@ impl ComputerActionCoordinator {
                 DispatchState::CancelledBeforeDispatch
             },
         );
-        dispatch_result
+        dispatch_result.map(|_| ())
     }
 
     /// Execute a [`NativeComputerCall`] through the coordinator, returning
@@ -16389,6 +16389,7 @@ mod tests {
             handoff_journal: Some(Arc::new(OrderRecordingHandoffJournal {
                 events: events.clone(),
             })),
+            audit_chain: None,
         };
         let mut coordinator = ComputerActionCoordinator::open(
             Box::new(OrderRecordingBackend {

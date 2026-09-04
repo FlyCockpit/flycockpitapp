@@ -338,12 +338,11 @@ impl ComputerAuditChain {
         event: &ReceiverReproofAuditAppend,
     ) -> Result<(), ReceiverReproofAppendError> {
         for _ in 0..MAX_CAS_RETRIES {
-            let loaded = self
+            let mut view = self
                 .keys
                 .sealed_load(COMPUTER_AUDIT_HEAD_V1_NAMESPACE)
                 .await
                 .map_err(|_| ReceiverReproofAppendError::Unavailable)?;
-            let mut view = loaded.map_err(|_| ReceiverReproofAppendError::Unavailable)?;
             let mut head = decode_head(view.payload.as_slice())
                 .map_err(|_| ReceiverReproofAppendError::Unavailable)?;
             let mut rows = self

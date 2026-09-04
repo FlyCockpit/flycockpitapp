@@ -26,9 +26,7 @@ use tokio::net::windows::named_pipe::NamedPipeServer;
 
 #[cfg(any(unix, windows))]
 use crate::daemon::{DaemonListener, DaemonStream};
-#[cfg(feature = "remote")]
-use tokio::sync::watch;
-use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
@@ -992,6 +990,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         // ids, normalized destinations, closed enums, and timestamps.
         proto::Response::ImageSidecarAuthoritySnapshot(..)
         | proto::Response::ImageSidecarGrantMutated(..) => {}
+        proto::Response::LocalPeerCredential { .. } => {}
         proto::Response::Unknown => {}
     }
 }
@@ -3291,7 +3290,8 @@ impl DaemonContext {
             paths,
             owner_capability: crate::daemon::owner_capability::OwnerCapability::mint(),
             approved_client_executable: std::env::current_exe()
-                .context("resolving approved local client executable")?,
+                .context("resolving approved local client executable")
+                .expect("resolving approved local client executable"),
             peer_credential_registry: Arc::new(
                 crate::daemon::peer_authority::PeerCredentialRegistry::default(),
             ),
@@ -5971,21 +5971,16 @@ fn try_send_in_process_event(
     }
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 fn socket_peer_identity(stream: &DaemonStream) -> Result<cockpit_host::peer_cred::PeerIdentity> {
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        let std_stream = stream
-            .try_clone()
-            .context("cloning accepted unix socket for peer cred")?;
-        cockpit_host::peer_cred::peer_identity_from_unix_stream(&std_stream)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawHandle;
-        cockpit_host::peer_cred::peer_identity_from_named_pipe(stream.as_raw_handle())
-    }
+    use std::os::fd::AsRawFd;
+    cockpit_host::peer_cred::peer_identity_from_unix_fd(stream.as_raw_fd())
+}
+
+#[cfg(windows)]
+fn socket_peer_identity(stream: &DaemonStream) -> Result<cockpit_host::peer_cred::PeerIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    cockpit_host::peer_cred::peer_identity_from_named_pipe(stream.as_raw_handle())
 }
 
 #[cfg(any(unix, windows))]
@@ -6583,13 +6578,13 @@ async fn run_client_executor(
     let mut shared = state.shared_snapshot();
     let mut concurrent = ConcurrentRequestRuntime::new();
     let mut credential_expiry =
-        peer_credential_expiry_sleep(state.peer_credential_expires_at_unix_ms);
+        peer_credential_expiry_deadline(state.peer_credential_expires_at_unix_ms);
     loop {
         tokio::select! {
             biased;
             () = async {
-                if let Some(sleep) = credential_expiry.as_mut() {
-                    sleep.await;
+                if let Some(deadline) = credential_expiry {
+                    tokio::time::sleep_until(deadline).await;
                 } else {
                     std::future::pending::<()>().await;
                 }
@@ -6626,7 +6621,7 @@ async fn run_client_executor(
                         {
                             return Ok(());
                         }
-                        credential_expiry = peer_credential_expiry_sleep(
+                        credential_expiry = peer_credential_expiry_deadline(
                             state.peer_credential_expires_at_unix_ms,
                         );
                     }
@@ -6644,16 +6639,16 @@ async fn run_client_executor(
     }
 }
 
-fn peer_credential_expiry_sleep(expires_at_unix_ms: Option<i64>) -> Option<tokio::time::Sleep> {
+fn peer_credential_expiry_deadline(
+    expires_at_unix_ms: Option<i64>,
+) -> Option<tokio::time::Instant> {
     expires_at_unix_ms.and_then(|expires_at_unix_ms| {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_millis() as i64)
             .unwrap_or(0);
         let delay_ms = expires_at_unix_ms.saturating_sub(now_ms);
-        Some(tokio::time::sleep(std::time::Duration::from_millis(
-            delay_ms.max(0) as u64,
-        )))
+        Some(tokio::time::Instant::now() + std::time::Duration::from_millis(delay_ms.max(0) as u64))
     })
 }
 

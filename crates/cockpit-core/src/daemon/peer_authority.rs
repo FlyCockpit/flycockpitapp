@@ -106,7 +106,7 @@ impl PeerCredentialRegistry {
         }
     }
 
-    fn remove_records<F>(&self, keep: F) -> Vec<Uuid>
+    fn remove_records<F>(&self, mut keep: F) -> Vec<Uuid>
     where
         F: FnMut(&PeerCredentialRecord) -> bool,
     {

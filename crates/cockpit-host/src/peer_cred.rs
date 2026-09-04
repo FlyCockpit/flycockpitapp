@@ -19,12 +19,8 @@ pub struct PeerIdentity {
 }
 
 #[cfg(unix)]
-pub fn peer_identity_from_unix_stream(
-    stream: &std::os::unix::net::UnixStream,
-) -> Result<PeerIdentity> {
-    use std::os::fd::AsRawFd;
-
-    let (uid, gid, pid) = peer_ucred(stream.as_raw_fd())?;
+pub fn peer_identity_from_unix_fd(fd: std::os::fd::RawFd) -> Result<PeerIdentity> {
+    let (uid, gid, pid) = peer_ucred(fd)?;
     let process_start = crate::daemon_lifecycle::process_start_identity(pid)
         .context("reading unix socket peer process start identity")?;
     Ok(PeerIdentity {
@@ -33,6 +29,15 @@ pub fn peer_identity_from_unix_stream(
         gid,
         process_start,
     })
+}
+
+#[cfg(unix)]
+pub fn peer_identity_from_unix_stream(
+    stream: &std::os::unix::net::UnixStream,
+) -> Result<PeerIdentity> {
+    use std::os::fd::AsRawFd;
+
+    peer_identity_from_unix_fd(stream.as_raw_fd())
 }
 
 #[cfg(unix)]
@@ -58,7 +63,11 @@ fn peer_ucred(fd: std::os::fd::RawFd) -> Result<(u32, u32, u32)> {
         }
         // SAFETY: `getsockopt` succeeded and initialized the `ucred` struct.
         let cred = unsafe { cred.assume_init() };
-        Ok((cred.uid, cred.gid, cred.pid))
+        Ok((
+            u32::try_from(cred.uid).context("unix socket peer uid out of range")?,
+            u32::try_from(cred.gid).context("unix socket peer gid out of range")?,
+            u32::try_from(cred.pid).context("unix socket peer pid out of range")?,
+        ))
     }
     #[cfg(not(target_os = "linux"))]
     {

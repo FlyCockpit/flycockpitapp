@@ -61,7 +61,7 @@ impl<'de> Deserialize<'de> for DaemonPidReceipt {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProcessStartIdentity {
     pub primary: u64,
     pub secondary: u64,

@@ -451,6 +451,11 @@ fn local_principal_name() -> String {
     }
 }
 
+#[cfg(not(feature = "remote"))]
+fn roots_equal(a: &str, b: &str) -> bool {
+    a == b
+}
+
 #[cfg(feature = "remote")]
 fn roots_equal(a: &str, b: &str) -> bool {
     if a == b {

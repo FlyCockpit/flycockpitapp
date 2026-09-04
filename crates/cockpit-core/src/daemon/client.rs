@@ -1758,7 +1758,7 @@ mod acp_wire_owner_tests {
             };
             daemon
                 .send(&Envelope::error(
-                    id,
+                    Some(id),
                     ErrorPayload {
                         code: ErrorCode::Authorization,
                         message: "peer role attestation failed".into(),

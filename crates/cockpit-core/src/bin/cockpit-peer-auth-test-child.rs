@@ -32,7 +32,12 @@ async fn run() -> Result<()> {
         .with_context(|| format!("connecting to {socket_path}"))?;
     let mut client = ProtoStream::new(stream);
 
-    match client.recv().await.context("receive daemon hello")? {
+    match client
+        .recv()
+        .await
+        .context("receive daemon hello")?
+        .context("daemon closed before hello")?
+    {
         cockpit_proto::RecvFrame::Envelope(envelope) => match envelope.body {
             Body::Response { response, .. }
                 if matches!(*response, Response::DaemonStatus { .. }) => {}
@@ -50,6 +55,7 @@ async fn run() -> Result<()> {
         .recv()
         .await
         .context("receive lifetime confirmation")?
+        .context("daemon closed before lifetime confirmation")?
     {
         cockpit_proto::RecvFrame::Envelope(envelope) => match envelope.body {
             Body::Response { id, .. } if id == status_id => {}
@@ -66,7 +72,12 @@ async fn run() -> Result<()> {
         ))
         .await
         .context("send peer credential exchange")?;
-    let token = match client.recv().await.context("receive peer credential")? {
+    let token = match client
+        .recv()
+        .await
+        .context("receive peer credential")?
+        .context("daemon closed before peer credential")?
+    {
         cockpit_proto::RecvFrame::Envelope(envelope) => match envelope.body {
             Body::Response { id, response } if id == exchange_id => match *response {
                 Response::LocalPeerCredential { token, role } => {
@@ -104,6 +115,7 @@ async fn run() -> Result<()> {
         .recv()
         .await
         .context("receive owner-only RPC response")?
+        .context("daemon closed before owner-only RPC response")?
     {
         cockpit_proto::RecvFrame::Envelope(envelope) => match envelope.body {
             Body::Error {

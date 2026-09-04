@@ -845,7 +845,8 @@ pub enum Request {
     },
     // ---- v10-only owner-remoted sealed-owner sensitive channel ---------
     // Every variant below is a NEW wire shape gated to protocol v10 by
-    // `body_required_protocol_version`. The plaintext literal rides ONLY the
+    // Exact protocol version matching is enforced at hello/codec boundaries.
+    // The plaintext literal rides ONLY the
     // apply request (create/replace/rotate) and the recover-apply success
     // response; it never appears on begin, cancel, inventory, edit-description,
     // action-admin, or any error payload.
@@ -2807,7 +2808,8 @@ pub enum Request {
 
     // ---- v10-only owner-remoted CLI-surface RPCs -----------------------
     // Every variant below is a NEW wire shape gated to protocol v10 by
-    // `body_required_protocol_version`. Responses carry no secret bytes.
+    // Exact protocol version matching is enforced at hello/codec boundaries.
+    // Responses carry no secret bytes.
     /// List registered packages through the daemon-owned registry.
     ListPackages,
 

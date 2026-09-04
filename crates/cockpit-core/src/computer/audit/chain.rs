@@ -21,8 +21,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use cockpit_db::computer_audit::{
     COMPUTER_AUDIT_ENTRY_LEN, COMPUTER_AUDIT_EVENT_KIND_OFFSET, COMPUTER_AUDIT_KEY_VERSION_OFFSET,
     COMPUTER_AUDIT_PROPOSAL_ID_OFFSET, COMPUTER_AUDIT_SEQUENCE_OFFSET, ComputerAuditEntryRow,
-    GUIDANCE_PROPOSAL_ACCEPTED, GUIDANCE_PROPOSAL_CREATED, GUIDANCE_PROPOSAL_EXPIRED,
-    GUIDANCE_PROPOSAL_REJECTED,
+    ComputerAuditPruneAuthorization, GUIDANCE_PROPOSAL_ACCEPTED, GUIDANCE_PROPOSAL_CREATED,
+    GUIDANCE_PROPOSAL_EXPIRED, GUIDANCE_PROPOSAL_REJECTED,
 };
 use cockpit_db::installation_identity::InstallationIdentity;
 use uuid::Uuid;
@@ -460,28 +460,41 @@ impl ComputerAuditChain {
         if rows.len() <= 1 {
             return Ok(0);
         }
+        let resumed = self
+            .resume_incomplete_prune_truncations(&rows)
+            .await
+            .context("resuming incomplete computer audit prune truncations")?;
+        let rows = if resumed > 0 {
+            self.db
+                .list_computer_audit_entries()
+                .await
+                .context("reloading computer audit entries after prune resume")?
+        } else {
+            rows
+        };
+        if rows.len() <= 1 {
+            return Ok(resumed);
+        }
         let prefix_start = next_prune_prefix_start(&rows);
-        let prefix_end = rows
-            .iter()
-            .filter_map(|row| {
-                let entry = authenticated_entry(row).ok()?;
-                if entry.event_kind == AuditEventKind::PruneCheckpoint {
-                    return None;
-                }
-                if entry.wall_unix_millis >= cutoff_unix_ms {
-                    return None;
-                }
-                if entry.sequence < prefix_start {
-                    return None;
-                }
-                if entry.sequence >= status.confirmed_sequence {
-                    return None;
-                }
-                Some(entry.sequence)
-            })
-            .max();
+        let mut prefix_end = None;
+        for row in &rows {
+            let entry = authenticated_entry(row).context("authenticating prune candidate")?;
+            if entry.sequence < prefix_start {
+                continue;
+            }
+            if entry.sequence >= status.confirmed_sequence {
+                break;
+            }
+            if entry.event_kind == AuditEventKind::PruneCheckpoint {
+                break;
+            }
+            if entry.wall_unix_millis >= cutoff_unix_ms {
+                break;
+            }
+            prefix_end = Some(entry.sequence);
+        }
         let Some(prefix_end) = prefix_end else {
-            return Ok(0);
+            return Ok(resumed);
         };
         let first_mac = rows
             .iter()
@@ -535,6 +548,7 @@ impl ComputerAuditChain {
             },
         )
         .await
+        .map(|deleted| deleted.saturating_add(resumed))
     }
 
     async fn append_prune_checkpoint_locked(
@@ -611,8 +625,7 @@ impl ComputerAuditChain {
                 Ok(_) => {
                     inner.last_monotonic = monotonic;
                     return self
-                        .db
-                        .truncate_computer_audit_prefix(event.prefix_end)
+                        .truncate_prune_checkpoint_prefix(event.prefix_end)
                         .await
                         .context("truncating pruned computer audit prefix");
                 }
@@ -623,6 +636,26 @@ impl ComputerAuditChain {
         Err(anyhow!(
             "computer audit prune checkpoint CAS exhausted retries"
         ))
+    }
+
+    async fn truncate_prune_checkpoint_prefix(&self, prefix_end: u64) -> Result<u64> {
+        self.db
+            .truncate_computer_audit_prefix_verified(ComputerAuditPruneAuthorization {
+                prefix_end_inclusive: prefix_end,
+            })
+            .await
+    }
+
+    async fn resume_incomplete_prune_truncations(
+        &self,
+        rows: &[ComputerAuditEntryRow],
+    ) -> Result<u64> {
+        let Some(prefix_end) = incomplete_prune_truncation_end(rows) else {
+            return Ok(0);
+        };
+        self.truncate_prune_checkpoint_prefix(prefix_end)
+            .await
+            .context("resuming incomplete computer audit prune truncation")
     }
 
     #[cfg(test)]
@@ -719,6 +752,10 @@ impl ComputerAuditChain {
             AuditVerifyStatus::PendingRecovery => {
                 self.recover_pending(&mut inner, &view, &head, &rows)
                     .await?;
+                let rows = self.db.list_computer_audit_entries().await?;
+                self.resume_incomplete_prune_truncations(&rows)
+                    .await
+                    .context("resuming prune truncation after pending recovery")?;
                 let rows = self.db.list_computer_audit_entries().await?;
                 let head = decode_head(
                     self.keys
@@ -1094,6 +1131,11 @@ impl ComputerAuditChain {
         match self.cas_head(view, &confirmed).await {
             Ok(_) => {
                 inner.last_monotonic = inner.last_monotonic.max(pending_entry.monotonic_nanos);
+                if pending_entry.event_kind == AuditEventKind::PruneCheckpoint {
+                    self.truncate_prune_checkpoint_prefix(pending_entry.monotonic_nanos)
+                        .await
+                        .context("truncating prune checkpoint prefix after pending recovery")?;
+                }
                 Ok(())
             }
             Err(CasOutcome::Conflict) => {
@@ -1406,6 +1448,18 @@ fn next_prune_prefix_start(rows: &[ComputerAuditEntryRow]) -> u64 {
         .map(|entry| entry.monotonic_nanos.saturating_add(1))
         .max()
         .unwrap_or(1)
+}
+
+fn incomplete_prune_truncation_end(rows: &[ComputerAuditEntryRow]) -> Option<u64> {
+    let prefix_end = rows
+        .iter()
+        .filter_map(|row| authenticated_entry(row).ok())
+        .filter(|entry| entry.event_kind == AuditEventKind::PruneCheckpoint)
+        .map(|entry| entry.monotonic_nanos)
+        .last()?;
+    rows.iter()
+        .any(|row| row.sequence <= prefix_end)
+        .then_some(prefix_end)
 }
 
 fn latest_prune_checkpoint_digest(rows: &[ComputerAuditEntryRow]) -> [u8; 32] {

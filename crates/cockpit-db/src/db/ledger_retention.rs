@@ -13,6 +13,7 @@
 //! | `decision_receipts`, `agent_transition_receipts` | terminal_evidence | Terminal audit receipts for closed sessions past the evidence window |
 //! | `guidance_proposal_receipts` | terminal_evidence | Terminal proposal receipts past the evidence window (`created` rows are never age-deleted) |
 //! | `intel_files` (+ cascaded symbol graph) | intel_index | Stale workspace index snapshots past the evidence window |
+//! | `sealed_value_acquisition_audit`, `sealed_action_invocation_audit`, `sealed_recovery_audit` | terminal_evidence | Terminal sealed audit metadata past the evidence window (`pending` acquisition rows are never age-deleted) |
 //!
 //! `computer_audit_entries` remains append-only with SQL-enforced immutability;
 //! chain truncation is owned by the machine-local audit writer, not this sweep.
@@ -45,6 +46,9 @@ pub struct LedgerRetentionOutcome {
     pub agent_transition_receipts_deleted: u64,
     pub guidance_proposal_receipts_deleted: u64,
     pub intel_files_deleted: u64,
+    pub sealed_value_acquisition_audit_deleted: u64,
+    pub sealed_action_invocation_audit_deleted: u64,
+    pub sealed_recovery_audit_deleted: u64,
 }
 
 impl LedgerRetentionOutcome {
@@ -55,6 +59,9 @@ impl LedgerRetentionOutcome {
             .saturating_add(self.agent_transition_receipts_deleted)
             .saturating_add(self.guidance_proposal_receipts_deleted)
             .saturating_add(self.intel_files_deleted)
+            .saturating_add(self.sealed_value_acquisition_audit_deleted)
+            .saturating_add(self.sealed_action_invocation_audit_deleted)
+            .saturating_add(self.sealed_recovery_audit_deleted)
     }
 }
 
@@ -187,6 +194,52 @@ pub(crate) fn prune_append_only_ledgers_conn(
         .context("pruning stale intel index files")
     })?;
 
+    let sealed_value_acquisition_audit_deleted = delete_in_batches(batch, || {
+        conn.execute(
+            "DELETE FROM sealed_value_acquisition_audit
+              WHERE acquisition_id IN (
+                  SELECT acquisition_id
+                    FROM sealed_value_acquisition_audit
+                   WHERE outcome <> 'pending'
+                     AND COALESCE(completed_at_ms, created_at_ms) < ?1
+                   ORDER BY COALESCE(completed_at_ms, created_at_ms) ASC
+                   LIMIT ?2
+              )",
+            params![cutoff_unix_ms, batch],
+        )
+        .context("pruning terminal sealed value acquisition audit rows")
+    })?;
+
+    let sealed_action_invocation_audit_deleted = delete_in_batches(batch, || {
+        conn.execute(
+            "DELETE FROM sealed_action_invocation_audit
+              WHERE audit_id IN (
+                  SELECT audit_id
+                    FROM sealed_action_invocation_audit
+                   WHERE created_at_ms < ?1
+                   ORDER BY created_at_ms ASC
+                   LIMIT ?2
+              )",
+            params![cutoff_unix_ms, batch],
+        )
+        .context("pruning sealed action invocation audit rows")
+    })?;
+
+    let sealed_recovery_audit_deleted = delete_in_batches(batch, || {
+        conn.execute(
+            "DELETE FROM sealed_recovery_audit
+              WHERE audit_id IN (
+                  SELECT audit_id
+                    FROM sealed_recovery_audit
+                   WHERE created_at_ms < ?1
+                   ORDER BY created_at_ms ASC
+                   LIMIT ?2
+              )",
+            params![cutoff_unix_ms, batch],
+        )
+        .context("pruning sealed recovery audit rows")
+    })?;
+
     Ok(LedgerRetentionOutcome {
         external_journal_operations_deleted,
         external_journal_queue_entries_deleted,
@@ -194,6 +247,9 @@ pub(crate) fn prune_append_only_ledgers_conn(
         agent_transition_receipts_deleted,
         guidance_proposal_receipts_deleted,
         intel_files_deleted,
+        sealed_value_acquisition_audit_deleted,
+        sealed_action_invocation_audit_deleted,
+        sealed_recovery_audit_deleted,
     })
 }
 

@@ -2256,7 +2256,10 @@ CREATE TABLE host_capability_refresh_operations (
         'pending', 'allowed', 'executing', 'completed', 'failed', 'cancelled'
     )),
     result_snapshot_json TEXT CHECK (
-        result_snapshot_json IS NULL OR json_valid(result_snapshot_json)
+        result_snapshot_json IS NULL OR (
+            json_valid(result_snapshot_json)
+            AND length(CAST(result_snapshot_json AS BLOB)) <= 1048576
+        )
     ),
     -- Canonical, parsed snapshot identity. The JSON body is retained for
     -- recovery, but publication and acknowledgement use these independently
@@ -6917,6 +6920,9 @@ CREATE TABLE sealed_value_acquisition_audit (
 
 CREATE INDEX idx_sealed_value_acquisition_audit_session
     ON sealed_value_acquisition_audit(session_id, created_at_ms DESC);
+CREATE INDEX idx_sealed_value_acquisition_audit_retention
+    ON sealed_value_acquisition_audit(COALESCE(completed_at_ms, created_at_ms))
+    WHERE outcome <> 'pending';
 
 CREATE UNIQUE INDEX idx_sealed_value_acquisition_succeeded_record
     ON sealed_value_acquisition_audit(record_id)
@@ -7118,6 +7124,8 @@ CREATE INDEX idx_sealed_action_invocation_audit_record
 
 CREATE INDEX idx_sealed_action_invocation_audit_action
     ON sealed_action_invocation_audit (action_id, created_at_ms);
+CREATE INDEX idx_sealed_action_invocation_audit_retention
+    ON sealed_action_invocation_audit (created_at_ms);
 
 -- ---- sealed recovery audit -------------------------------------------------
 -- A durable audit row committed BEFORE an Owner recover reveals the plaintext
@@ -7142,6 +7150,8 @@ CREATE TABLE sealed_recovery_audit (
 
 CREATE INDEX idx_sealed_recovery_audit_record
     ON sealed_recovery_audit (record_id, created_at_ms);
+CREATE INDEX idx_sealed_recovery_audit_retention
+    ON sealed_recovery_audit (created_at_ms);
 
 -- ---- protected redaction history -------------------------------------------
 --
@@ -7437,7 +7447,12 @@ CREATE TABLE provider_config_journals (
     client_operation_id TEXT,
     request_hash     BLOB CHECK (request_hash IS NULL OR (typeof(request_hash) = 'blob' AND length(request_hash) = 32)),
     fencing_generation INTEGER CHECK (fencing_generation IS NULL OR fencing_generation > 0),
-    terminal_response_json TEXT CHECK (terminal_response_json IS NULL OR json_valid(terminal_response_json)),
+    terminal_response_json TEXT CHECK (
+        terminal_response_json IS NULL OR (
+            json_valid(terminal_response_json)
+            AND length(CAST(terminal_response_json AS BLOB)) <= 1048576
+        )
+    ),
     project_root     TEXT NOT NULL,
     provider_id      TEXT NOT NULL,
     action           TEXT NOT NULL CHECK (action IN ('save', 'delete', 'batch')),
@@ -7446,11 +7461,24 @@ CREATE TABLE provider_config_journals (
     intended_revision TEXT CHECK (intended_revision IS NULL OR length(intended_revision) = 64),
     consumed_config_generation INTEGER CHECK (consumed_config_generation IS NULL OR consumed_config_generation >= 0),
     intended_config_generation INTEGER CHECK (intended_config_generation IS NULL OR intended_config_generation > 0),
-    entry_json       TEXT,
+    entry_json       TEXT CHECK (
+        entry_json IS NULL OR (
+            json_valid(entry_json)
+            AND length(CAST(entry_json AS BLOB)) <= 1048576
+        )
+    ),
     cleanup_named_json TEXT NOT NULL
-        CHECK (json_valid(cleanup_named_json) AND json_type(cleanup_named_json) = 'array'),
+        CHECK (
+            json_valid(cleanup_named_json)
+            AND json_type(cleanup_named_json) = 'array'
+            AND length(CAST(cleanup_named_json AS BLOB)) <= 65536
+        ),
     cleanup_credential_json TEXT NOT NULL
-        CHECK (json_valid(cleanup_credential_json) AND json_type(cleanup_credential_json) = 'array'),
+        CHECK (
+            json_valid(cleanup_credential_json)
+            AND json_type(cleanup_credential_json) = 'array'
+            AND length(CAST(cleanup_credential_json AS BLOB)) <= 65536
+        ),
     settlement_phase TEXT NOT NULL DEFAULT 'publication_pending'
         CHECK (settlement_phase IN ('publication_pending', 'cleanup_pending')),
     created_at       INTEGER NOT NULL,
@@ -7495,14 +7523,20 @@ CREATE TABLE mcp_config_journals (
     client_operation_id TEXT NOT NULL,
     request_hash      BLOB NOT NULL CHECK (typeof(request_hash) = 'blob' AND length(request_hash) = 32),
     fencing_generation INTEGER NOT NULL CHECK (fencing_generation > 0),
-    terminal_response_json TEXT NOT NULL CHECK (json_valid(terminal_response_json)),
+    terminal_response_json TEXT NOT NULL CHECK (
+        json_valid(terminal_response_json)
+        AND length(CAST(terminal_response_json AS BLOB)) <= 1048576
+    ),
     project_root      TEXT NOT NULL,
     config_path       TEXT NOT NULL,
     config_json       TEXT NOT NULL CHECK (
         json_valid(config_json)
         AND length(CAST(config_json AS BLOB)) <= 1048576
     ),
-    patch_intent_json TEXT NOT NULL CHECK (json_valid(patch_intent_json)),
+    patch_intent_json TEXT NOT NULL CHECK (
+        json_valid(patch_intent_json)
+        AND length(CAST(patch_intent_json AS BLOB)) <= 65536
+    ),
     consumed_revision TEXT NOT NULL CHECK (length(consumed_revision) = 64),
     intended_revision TEXT NOT NULL CHECK (length(intended_revision) = 64),
     intended_config_generation INTEGER NOT NULL CHECK (intended_config_generation > 0),
@@ -7540,7 +7574,12 @@ CREATE TABLE local_operation_receipts (
     execution_started_at_unix_ms INTEGER,
     execution_expires_at_unix_ms INTEGER,
     terminal_outcome_json TEXT
-        CHECK (terminal_outcome_json IS NULL OR json_valid(terminal_outcome_json)),
+        CHECK (
+            terminal_outcome_json IS NULL OR (
+                json_valid(terminal_outcome_json)
+                AND length(CAST(terminal_outcome_json AS BLOB)) <= 1048576
+            )
+        ),
     created_at_unix_ms  INTEGER NOT NULL,
     updated_at_unix_ms  INTEGER NOT NULL,
     PRIMARY KEY (owner_digest, client_operation_id),
@@ -7678,9 +7717,15 @@ CREATE TABLE agent_mutation_journals (
         AND intended_projection_identity = lower(intended_projection_identity)
     ),
     terminal_response_json TEXT CHECK (
-        terminal_response_json IS NULL OR json_valid(terminal_response_json)
+        terminal_response_json IS NULL OR (
+            json_valid(terminal_response_json)
+            AND length(CAST(terminal_response_json AS BLOB)) <= 1048576
+        )
     ),
-    credential_compensation_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(credential_compensation_json)),
+    credential_compensation_json TEXT NOT NULL DEFAULT '{}' CHECK (
+        json_valid(credential_compensation_json)
+        AND length(CAST(credential_compensation_json AS BLOB)) <= 65536
+    ),
     created_at_unix_ms    INTEGER NOT NULL,
     PRIMARY KEY (owner_digest, client_operation_id),
     CHECK (length(trim(owner_digest)) > 0),
@@ -7768,10 +7813,16 @@ CREATE TABLE agent_editor_leases (
         result_config_generation IS NULL OR result_config_generation >= 0
     ),
     terminal_result_json TEXT CHECK (
-        terminal_result_json IS NULL OR json_valid(terminal_result_json)
+        terminal_result_json IS NULL OR (
+            json_valid(terminal_result_json)
+            AND length(CAST(terminal_result_json AS BLOB)) <= 1048576
+        )
     ),
     terminal_error_json TEXT CHECK (
-        terminal_error_json IS NULL OR json_valid(terminal_error_json)
+        terminal_error_json IS NULL OR (
+            json_valid(terminal_error_json)
+            AND length(CAST(terminal_error_json AS BLOB)) <= 1048576
+        )
     ),
     expires_at_unix_ms  INTEGER NOT NULL,
     created_at_unix_ms  INTEGER NOT NULL,
@@ -7853,7 +7904,10 @@ CREATE TABLE extended_config_patch_journals (
     target_path           TEXT NOT NULL,
     consumed_content_hash TEXT NOT NULL CHECK (length(consumed_content_hash) = 64 AND consumed_content_hash = lower(consumed_content_hash)),
     intended_content_hash TEXT NOT NULL CHECK (length(intended_content_hash) = 64 AND intended_content_hash = lower(intended_content_hash)),
-    terminal_response_json TEXT NOT NULL CHECK (json_valid(terminal_response_json)),
+    terminal_response_json TEXT NOT NULL CHECK (
+        json_valid(terminal_response_json)
+        AND length(CAST(terminal_response_json AS BLOB)) <= 1048576
+    ),
     created_at_unix_ms    INTEGER NOT NULL,
     PRIMARY KEY (owner_digest, client_operation_id),
     CHECK (length(trim(project_root)) > 0),
@@ -7879,7 +7933,10 @@ CREATE TABLE image_config_mutation_journals (
     intended_revision      TEXT NOT NULL CHECK (length(intended_revision) = 64 AND intended_revision = lower(intended_revision)),
     consumed_generation    INTEGER NOT NULL CHECK (consumed_generation >= 0),
     publication_phase      TEXT NOT NULL CHECK (publication_phase IN ('prepared', 'publication_authorized')),
-    terminal_response_json TEXT NOT NULL CHECK (json_valid(terminal_response_json)),
+    terminal_response_json TEXT NOT NULL CHECK (
+        json_valid(terminal_response_json)
+        AND length(CAST(terminal_response_json AS BLOB)) <= 1048576
+    ),
     created_at_unix_ms     INTEGER NOT NULL,
     PRIMARY KEY (owner_digest, client_operation_id),
     FOREIGN KEY (owner_digest, client_operation_id)

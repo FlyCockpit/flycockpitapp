@@ -106,7 +106,7 @@ pub struct RetentionOutcome {
     /// their rows survive digest-only, so they are not deletions.
     pub verification_envelopes_cleaned: u64,
     /// Rows deleted from append-only ledgers (`external_journal_*`, `intel_*`,
-    /// terminal audit receipts) during the ledger retention sweep.
+    /// terminal audit receipts, sealed audit ledgers) during the ledger retention sweep.
     pub append_only_ledger_rows_deleted: u64,
     pub vacuumed: bool,
 }

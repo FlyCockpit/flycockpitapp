@@ -28,6 +28,10 @@ pub const COMPUTER_AUDIT_KEY_VERSION_OFFSET: usize = 420;
 pub const COMPUTER_AUDIT_KEY_VERSION_LEN: usize = 4;
 pub const COMPUTER_AUDIT_WALL_UNIX_MS_OFFSET: usize = 408;
 pub const COMPUTER_AUDIT_WALL_UNIX_MS_LEN: usize = 8;
+pub const COMPUTER_AUDIT_JOURNAL_VERSION_OFFSET: usize = 392;
+pub const COMPUTER_AUDIT_JOURNAL_VERSION_LEN: usize = 8;
+pub const COMPUTER_AUDIT_MONOTONIC_NANOS_OFFSET: usize = 400;
+pub const COMPUTER_AUDIT_MONOTONIC_NANOS_LEN: usize = 8;
 
 /// Prune-checkpoint event kind (`AuditEventKind::PruneCheckpoint`).
 pub const PRUNE_CHECKPOINT: u8 = 27;
@@ -41,6 +45,8 @@ const _: () = {
     assert!(COMPUTER_AUDIT_PROPOSAL_ID_OFFSET + COMPUTER_AUDIT_ID_LEN == 130);
     assert!(COMPUTER_AUDIT_KEY_VERSION_OFFSET + COMPUTER_AUDIT_KEY_VERSION_LEN == 424);
     assert!(COMPUTER_AUDIT_WALL_UNIX_MS_OFFSET + COMPUTER_AUDIT_WALL_UNIX_MS_LEN == 416);
+    assert!(COMPUTER_AUDIT_JOURNAL_VERSION_OFFSET + COMPUTER_AUDIT_JOURNAL_VERSION_LEN == 400);
+    assert!(COMPUTER_AUDIT_MONOTONIC_NANOS_OFFSET + COMPUTER_AUDIT_MONOTONIC_NANOS_LEN == 408);
 };
 
 /// Guidance-proposal audit kinds (must stay aligned with
@@ -64,6 +70,94 @@ BEGIN
     SELECT RAISE(ABORT, 'computer_audit_entries is append-only');
 END;
 ";
+
+/// Authorization to delete a bounded audit prefix. Only constructible after
+/// verifying a matching signed `PruneCheckpoint` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComputerAuditPruneAuthorization {
+    pub prefix_end_inclusive: u64,
+}
+
+/// Project `journal_version` / `monotonic_nanos` from a prune-checkpoint body.
+pub fn projected_prune_checkpoint_bounds(
+    entry_bytes: &[u8; COMPUTER_AUDIT_ENTRY_LEN],
+) -> Option<(u64, u64)> {
+    if entry_bytes[COMPUTER_AUDIT_EVENT_KIND_OFFSET] != PRUNE_CHECKPOINT {
+        return None;
+    }
+    let mut prefix_start_bytes = [0u8; COMPUTER_AUDIT_JOURNAL_VERSION_LEN];
+    prefix_start_bytes.copy_from_slice(
+        &entry_bytes[COMPUTER_AUDIT_JOURNAL_VERSION_OFFSET
+            ..COMPUTER_AUDIT_JOURNAL_VERSION_OFFSET + COMPUTER_AUDIT_JOURNAL_VERSION_LEN],
+    );
+    let mut prefix_end_bytes = [0u8; COMPUTER_AUDIT_MONOTONIC_NANOS_LEN];
+    prefix_end_bytes.copy_from_slice(
+        &entry_bytes[COMPUTER_AUDIT_MONOTONIC_NANOS_OFFSET
+            ..COMPUTER_AUDIT_MONOTONIC_NANOS_OFFSET + COMPUTER_AUDIT_MONOTONIC_NANOS_LEN],
+    );
+    Some((
+        u64::from_be_bytes(prefix_start_bytes),
+        u64::from_be_bytes(prefix_end_bytes),
+    ))
+}
+
+struct ImmutableDeleteTriggerGuard<'a> {
+    conn: &'a rusqlite::Connection,
+    active: bool,
+}
+
+impl Drop for ImmutableDeleteTriggerGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.conn.execute_batch(COMPUTER_AUDIT_DELETE_TRIGGER_SQL);
+        }
+    }
+}
+
+fn drop_immutable_delete_trigger(
+    conn: &rusqlite::Connection,
+) -> Result<ImmutableDeleteTriggerGuard<'_>> {
+    conn.execute(
+        "DROP TRIGGER IF EXISTS computer_audit_entries_immutable_delete",
+        [],
+    )
+    .context("dropping computer audit delete trigger")?;
+    Ok(ImmutableDeleteTriggerGuard { conn, active: true })
+}
+
+fn verify_prune_checkpoint_authorizes_conn(
+    conn: &rusqlite::Connection,
+    prefix_end_inclusive: u64,
+) -> Result<()> {
+    if prefix_end_inclusive == 0 {
+        bail!("computer audit truncate requires a non-zero prefix end");
+    }
+    let mut stmt = conn.prepare(
+        "SELECT entry_bytes
+           FROM computer_audit_entries
+          WHERE event_kind = ?1
+          ORDER BY sequence DESC",
+    )?;
+    let rows = stmt
+        .query_map(params![i64::from(PRUNE_CHECKPOINT)], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let authorized = rows.into_iter().any(|bytes| {
+        bytes
+            .try_into()
+            .ok()
+            .and_then(|entry_bytes: [u8; COMPUTER_AUDIT_ENTRY_LEN]| {
+                projected_prune_checkpoint_bounds(&entry_bytes)
+            })
+            .is_some_and(|(_, prefix_end)| prefix_end == prefix_end_inclusive)
+    });
+    anyhow::ensure!(
+        authorized,
+        "computer audit truncate requires a matching prune checkpoint for prefix_end {prefix_end_inclusive}"
+    );
+    Ok(())
+}
 
 /// One stored chain entry. `entry_bytes` is the sole canonical body.
 /// `sequence`, `event_kind`, `proposal_id`, and `key_version` are projections
@@ -320,14 +414,15 @@ impl Db {
         .await
     }
 
-    /// Delete a bounded prefix of the audit log. Only the machine-local audit
-    /// writer may call this after appending a `PruneCheckpoint` entry.
-    pub async fn truncate_computer_audit_prefix(
+    /// Delete a bounded prefix after a matching signed `PruneCheckpoint` entry.
+    /// Only the machine-local audit writer may call this.
+    pub(crate) async fn truncate_computer_audit_prefix_verified(
         &self,
-        through_sequence_inclusive: u64,
+        authorization: ComputerAuditPruneAuthorization,
     ) -> Result<u64> {
         self.write(move |conn| {
-            truncate_computer_audit_prefix_conn(conn, through_sequence_inclusive)
+            verify_prune_checkpoint_authorizes_conn(conn, authorization.prefix_end_inclusive)?;
+            truncate_computer_audit_prefix_conn(conn, authorization.prefix_end_inclusive)
         })
         .await
     }
@@ -345,13 +440,9 @@ pub(crate) fn truncate_computer_audit_prefix_conn(
         .context("computer audit truncate batch overflow")?;
     let through = i64::try_from(through_sequence_inclusive)
         .context("computer audit truncate sequence overflow")?;
+    let _trigger_guard = drop_immutable_delete_trigger(conn)?;
     let mut total = 0_u64;
     loop {
-        conn.execute(
-            "DROP TRIGGER IF EXISTS computer_audit_entries_immutable_delete",
-            [],
-        )
-        .context("dropping computer audit delete trigger")?;
         let deleted = conn
             .execute(
                 "DELETE FROM computer_audit_entries
@@ -365,8 +456,6 @@ pub(crate) fn truncate_computer_audit_prefix_conn(
                 params![through, batch],
             )
             .context("truncating computer audit prefix")? as u64;
-        conn.execute_batch(COMPUTER_AUDIT_DELETE_TRIGGER_SQL)
-            .context("restoring computer audit delete trigger")?;
         total = total.saturating_add(deleted);
         if deleted < batch as u64 {
             break;

@@ -1,9 +1,11 @@
-//! Pure policy reducer for `AuthorizePolicyRevisionV1`.
+//! Pure policy reducer for `AuthorizePolicyRevisionV1` (**reference contract**).
 //!
 //! After activation, `AuthorizePolicyRevisionV1` accepts only exact current
-//! + proposed policy JWS bytes and persists the accepted successor plus
-//!   policy epoch/status/outbox atomically; no unsigned policy JSON,
-//!   config-file policy mutation, or second bootstrap path is valid.
+//! + proposed policy JWS bytes and is specified to persist the accepted
+//! successor plus policy epoch/status/outbox atomically; no unsigned policy
+//! JSON, config-file policy mutation, or second bootstrap path is valid.
+//! **Persistence is not implemented**; this module provides the pure reduction
+//! logic only.
 
 use cockpit_proto::remote_tenant_authority_protocol::{self as proto, TenantAuthorityOperation};
 

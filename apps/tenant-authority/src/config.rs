@@ -1,4 +1,4 @@
-//! Strict shared/replica/credential file schemas.
+//! Strict shared/replica/credential file schemas (**reference contract**).
 //!
 //! Each strict file resolves to an absolute owner-readable nonsymlink file
 //! with safe parents. Shared config is strict JSON `{schemaVersion:1,

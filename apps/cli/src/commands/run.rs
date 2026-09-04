@@ -1979,6 +1979,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | SubagentSpawned { session_id, .. }
         | SubagentRouting { session_id, .. }
         | SubagentReport { session_id, .. }
+        | SubagentCompacted { session_id, .. }
         | NestedTurn { session_id, .. }
         | Usage { session_id, .. }
         | InterruptRaised { session_id, .. }
@@ -2018,16 +2019,15 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         } => *session_id,
         // Daemon-global events (no session_id) — irrelevant to a headless
         // one-shot run, so they're filtered out by the session check.
-        CaffeinateState { .. } | DaemonDraining { .. } | DaemonLifetimeChanged { .. }
+        CaffeinateState { .. }
+        | DaemonDraining { .. }
+        | DaemonLifetimeChanged { .. }
         | TerminalOutput { .. }
         | TerminalClipboard { .. }
         | TerminalViewers { .. }
         | TerminalClosed { .. }
         | Osc52ProtocolViolation { .. }
         | HostCapabilitiesChanged { .. }
-        // Project-scoped image-control configuration invalidations have no
-        // session id and are not part of a headless run transcript.
-        | ImageControlConfigChanged { .. }
         | LspNotice { .. }
         | EventStreamLagged {
             session_id: None, ..
@@ -2036,6 +2036,8 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | Unknown => {
             return None;
         }
+        #[cfg(feature = "extended")]
+        ImageControlConfigChanged { .. } => return None,
         #[cfg(feature = "remote")]
         ConnectorStatus { .. } => return None,
     })
@@ -2078,6 +2080,7 @@ mod tests {
         assert!(result.unwrap_err().is::<RunPreflightFailure>());
     }
 
+    #[cfg(feature = "extended")]
     #[test]
     fn image_control_config_changed_is_filtered_as_daemon_global() {
         let event = proto::Event::ImageControlConfigChanged {

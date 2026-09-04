@@ -22,6 +22,7 @@ name: CLI CI
       - "scripts/check-advisory-exceptions.sh"
       - "scripts/check-unsafe-safety-comments.sh"
       - "scripts/check-feature-gated-test-coverage.sh"
+      - "scripts/check-tenant-authority-acceptance-manifest.sh"
       - ".github/workflows/cli-ci.yml"
       - ".github/workflows/ci-runners.yml"
   pull_request:
@@ -41,6 +42,7 @@ name: CLI CI
       - "scripts/check-advisory-exceptions.sh"
       - "scripts/check-unsafe-safety-comments.sh"
       - "scripts/check-feature-gated-test-coverage.sh"
+      - "scripts/check-tenant-authority-acceptance-manifest.sh"
       - ".github/workflows/cli-ci.yml"
       - ".github/workflows/ci-runners.yml"
   # Weekly advisory sweep (issue #306): RustSec advisories and yanks can land
@@ -316,6 +318,8 @@ jobs:
   # Live-infra jobs (PKCS#11, coturn) stay workflow_dispatch opt-ins below;
   # `scripts/check-feature-gated-test-coverage.sh` is the ownership bound
   # between feature-gated test targets and these executing selections.
+  # `scripts/check-tenant-authority-acceptance-manifest.sh` is the ownership
+  # bound for the exact nine-suite `tenant_authority_*` acceptance manifest.
   remote-lockstep:
     name: Remote lockstep tests
     needs: runners
@@ -347,10 +351,74 @@ jobs:
       - name: Fetch locked graph
         run: cargo fetch --locked
 
+      # Compile the remote+extended production graph so gated surfaces cannot
+      # rot behind `required-features` test binaries. Package-specific
+      # features: tenant-authority has `remote` only, cockpit-config has
+      # `extended` only, cockpit-cli/extended pulls the TUI/core/db/proto set.
+      - name: Build remote+extended profile matrix
+        run: >
+          cargo build --locked
+          --workspace --exclude tenant-authority
+          --features
+          cockpit-proto/remote,cockpit-proto/extended,cockpit-core/remote,cockpit-core/extended,cockpit-db/remote,cockpit-db/extended,cockpit-tui/remote,cockpit-tui/extended,cockpit-cli/remote,cockpit-cli/extended,cockpit-config/extended,cockpit-client/remote,cockpit-client/extended
+
+      # The supported (remote, not extended) cell must compile: remote transport
+      # classification and daemon paths must not reference extended-only wire kinds.
+      - name: Build remote-only profile matrix
+        run: >
+          cargo build --locked
+          --workspace --exclude tenant-authority
+          --features
+          cockpit-proto/remote,cockpit-core/remote,cockpit-db/remote,cockpit-tui/remote,cockpit-cli/remote,cockpit-client/remote
+
+      # The supported extended-local schema profile compiles without remote.
+      - name: Build extended-only profile matrix
+        run: >
+          cargo build --locked
+          --workspace --exclude tenant-authority
+          --features
+          cockpit-proto/extended,cockpit-core/extended,cockpit-db/extended,cockpit-tui/extended,cockpit-cli/extended,cockpit-config/extended,cockpit-client/extended
+
+      - name: Test remote-only profile matrix
+        run: >
+          cargo nextest run --locked
+          --workspace --exclude tenant-authority
+          --features
+          cockpit-proto/remote,cockpit-core/remote,cockpit-db/remote,cockpit-tui/remote,cockpit-cli/remote,cockpit-client/remote
+
+      - name: Test extended-only profile matrix
+        run: >
+          cargo nextest run --locked
+          --workspace --exclude tenant-authority
+          --features
+          cockpit-proto/extended,cockpit-core/extended,cockpit-db/extended,cockpit-tui/extended,cockpit-cli/extended,cockpit-config/extended,cockpit-client/extended
+
+      # Off-diagonal matrix cells must be clippy-clean too: nextest does not
+      # fail on warnings, and profile-specific dead_code/unused defects only
+      # materialize when exactly one of remote/extended is enabled.
+      - name: Clippy remote-only profile matrix
+        run: >
+          cargo clippy --locked
+          --workspace --exclude tenant-authority
+          --features
+          cockpit-proto/remote,cockpit-core/remote,cockpit-db/remote,cockpit-tui/remote,cockpit-cli/remote,cockpit-client/remote
+          --tests -- -D warnings
+
+      - name: Clippy extended-only profile matrix
+        run: >
+          cargo clippy --locked
+          --workspace --exclude tenant-authority
+          --features
+          cockpit-proto/extended,cockpit-core/extended,cockpit-db/extended,cockpit-tui/extended,cockpit-cli/extended,cockpit-config/extended,cockpit-client/extended
+          --tests -- -D warnings
+
       # `extended` is required so cfg-gated spend-policy variants stay in the
       # request_variants! set the exhaustive classification test compares.
       # Package-specific features: tenant-authority has `remote` only,
       # cockpit-config has `extended` only.
+      - name: Check tenant-authority acceptance manifest
+        run: bash scripts/check-tenant-authority-acceptance-manifest.sh
+
       - name: Test remote-gated lockstep and conformance
         run: >
           cargo nextest run --locked
@@ -358,7 +426,7 @@ jobs:
           -p cockpit-tui -p cockpit-cli -p cockpit-config
           -p tenant-authority
           --features
-          cockpit-proto/remote,cockpit-proto/extended,cockpit-core/remote,cockpit-core/extended,cockpit-db/remote,cockpit-db/extended,cockpit-tui/remote,cockpit-tui/extended,cockpit-cli/remote,cockpit-config/extended,tenant-authority/remote
+          cockpit-proto/remote,cockpit-proto/extended,cockpit-core/remote,cockpit-core/extended,cockpit-db/remote,cockpit-db/extended,cockpit-tui/remote,cockpit-tui/extended,cockpit-cli/remote,cockpit-cli/extended,cockpit-config/extended,tenant-authority/remote
 
       - name: Clippy remote-gated test targets
         run: >
@@ -367,7 +435,7 @@ jobs:
           -p cockpit-tui -p cockpit-cli -p cockpit-config
           -p tenant-authority
           --features
-          cockpit-proto/remote,cockpit-proto/extended,cockpit-core/remote,cockpit-core/extended,cockpit-db/remote,cockpit-db/extended,cockpit-tui/remote,cockpit-tui/extended,cockpit-cli/remote,cockpit-config/extended,tenant-authority/remote
+          cockpit-proto/remote,cockpit-proto/extended,cockpit-core/remote,cockpit-core/extended,cockpit-db/remote,cockpit-db/extended,cockpit-tui/remote,cockpit-tui/extended,cockpit-cli/remote,cockpit-cli/extended,cockpit-config/extended,tenant-authority/remote
           --tests -- -D warnings
 
   daemon-custody-pkcs11-softhsm:

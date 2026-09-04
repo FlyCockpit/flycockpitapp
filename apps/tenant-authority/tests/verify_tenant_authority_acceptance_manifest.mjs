@@ -1,12 +1,24 @@
 #!/usr/bin/env node
 // verify_tenant_authority_acceptance_manifest.mjs
 //
-// Consumes the prefix-wide `cargo nextest list --message-format json` stream,
-// requires the recognized Nextest schema and exact test binary, and compares
-// the complete lexicographically sorted `tenant_authority_*` manifest to
-// exactly the nine names below. It rejects an empty stream, malformed/unknown
-// schema, wrong binary, missing/renamed/extra/duplicate name, or any entry
-// with `ignored=true`; it must not filter to the allowlist before comparison.
+// Consumes a package-scoped Nextest TestListSummary (`--message-format json`)
+// and compares the complete lexicographically sorted `tenant_authority_*`
+// manifest to exactly the nine names below. CI-bound executor (remote feature
+// enabled):
+//
+//   bash scripts/check-tenant-authority-acceptance-manifest.sh
+//
+// Manual pipe (same check):
+//
+//   cargo nextest list -p tenant-authority --features remote \
+//     --message-format json \
+//     | node apps/tenant-authority/tests/verify_tenant_authority_acceptance_manifest.mjs
+//
+// Within that stream, every `tenant_authority_*` name must come from binary
+// `tenant_authority_service_acceptance`. Rejects empty input, malformed JSON,
+// unknown schema, wrong binary, missing/renamed/extra/duplicate name, or any
+// entry with `ignored=true`; it must not filter to the allowlist before
+// comparison.
 
 const EXACT_NINE = [
   "tenant_authority_fixed_preparation_and_identity_rotation",
@@ -40,84 +52,71 @@ function readStream(stream) {
   });
 }
 
+function collectPrefixedTests(summary) {
+  const suites = summary["rust-suites"];
+  if (!suites || typeof suites !== "object" || Array.isArray(suites)) {
+    fail("unknown schema: missing rust-suites (expected Nextest TestListSummary)");
+  }
+
+  const seen = new Map();
+  for (const [suiteKey, suite] of Object.entries(suites)) {
+    if (!suite || typeof suite !== "object") {
+      fail(`malformed suite entry: ${suiteKey}`);
+    }
+    const binaryName = suite["binary-name"];
+    if (typeof binaryName !== "string" || binaryName.length === 0) {
+      fail(`unknown schema: missing binary-name in suite ${suiteKey}`);
+    }
+    const testcases = suite.testcases;
+    if (!testcases || typeof testcases !== "object" || Array.isArray(testcases)) {
+      continue;
+    }
+    for (const [name, meta] of Object.entries(testcases)) {
+      if (typeof name !== "string" || !name.startsWith(PREFIX)) {
+        continue;
+      }
+      if (binaryName !== EXPECTED_BINARY) {
+        fail(`wrong binary: expected ${EXPECTED_BINARY} got ${binaryName} for ${name}`);
+      }
+      if (seen.has(name)) {
+        fail(`duplicate name: ${name}`);
+      }
+      const ignored = meta && typeof meta === "object" && meta.ignored === true;
+      seen.set(name, { ignored, binary: binaryName });
+    }
+  }
+  return seen;
+}
+
 async function main() {
   const input = await readStream(process.stdin);
-  if (input.length === 0) {
-    fail("empty stream");
-  }
-  const lines = input.split("\n").filter((l) => l.trim().length > 0);
-  if (lines.length === 0) {
-    fail("no lines in stream");
+  const trimmed = input.trim();
+  if (trimmed.length === 0) {
+    fail("empty input");
   }
 
-  // First non-empty line must be the Nextest schema/version object.
-  let first;
+  let summary;
   try {
-    first = JSON.parse(lines[0]);
+    summary = JSON.parse(trimmed);
   } catch (e) {
-    fail(`malformed JSON on first line: ${e}`);
+    fail(`malformed JSON: ${e}`);
   }
-  if (
-    first.type !== "version" &&
-    first["schema-version"] === undefined &&
-    first.version === undefined
-  ) {
-    if (!Array.isArray(first.tests) && first.type !== "test") {
-      fail("unknown schema: first line is not a Nextest version event");
-    }
+  if (!summary || typeof summary !== "object" || Array.isArray(summary)) {
+    fail("unknown schema: root is not a JSON object");
   }
 
-  // Collect all test entries with the prefix from the exact binary.
-  const seen = new Map(); // name -> {ignored, binary}
-  let schemaOk = false;
-  for (const line of lines) {
-    let ev;
-    try {
-      ev = JSON.parse(line);
-    } catch (e) {
-      fail(`malformed JSON line: ${e}`);
-    }
-    if (ev.type === "version" || ev["schema-version"] !== undefined) {
-      schemaOk = true;
-      continue;
-    }
-    if (ev.type !== "test") {
-      continue;
-    }
-    schemaOk = true;
-    const name = ev.name;
-    if (typeof name !== "string") {
-      fail("test entry missing string name");
-    }
-    if (!name.startsWith(PREFIX)) {
-      continue;
-    }
-    const binary = ev.binary || ev["binary-id"] || ev.binary_id;
-    if (binary !== EXPECTED_BINARY) {
-      fail(`wrong binary: expected ${EXPECTED_BINARY} got ${binary} for ${name}`);
-    }
-    if (seen.has(name)) {
-      fail(`duplicate name: ${name}`);
-    }
-    seen.set(name, { ignored: ev.ignored === true, binary });
-  }
-
-  if (!schemaOk) {
-    fail("no recognized Nextest schema event found");
-  }
+  const seen = collectPrefixedTests(summary);
 
   if (seen.size === 0) {
     fail("no tenant_authority_* tests found");
   }
 
-  // Reject any entry with ignored=true.
   for (const [name, meta] of seen) {
     if (meta.ignored) {
       fail(`entry ${name} has ignored=true`);
     }
   }
 
-  // Complete sorted manifest.
   const sorted = [...seen.keys()].sort();
   const expected = [...EXACT_NINE].sort();
 

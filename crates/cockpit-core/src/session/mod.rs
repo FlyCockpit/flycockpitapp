@@ -114,6 +114,25 @@ pub struct SessionCompactionRecord<'a> {
     pub tail_messages: &'a [crate::engine::message::Message],
 }
 
+/// Durable boundary for a noninteractive subagent autocompact within one
+/// `(task_call_id, label)` lineage. Distinct from [`SessionCompactionRecord`]:
+/// subagent windows stay on the parent session and are scoped by lineage.
+pub struct SubagentCompactionRecord<'a> {
+    pub predecessor_window_index: u32,
+    pub successor_window_index: u32,
+    pub seed_tool_count: usize,
+    pub brief_text: &'a str,
+    pub handoff_text: &'a str,
+    pub source: &'a str,
+    pub trigger_ctx_pct: Option<f64>,
+    pub tokens_before: u64,
+    pub tokens_after: u64,
+    pub turns_summarized: usize,
+    pub tail_kept: usize,
+    pub tail_trimmed: usize,
+    pub tail_messages: &'a [crate::engine::message::Message],
+}
+
 /// Retained KB source bytes addressed by opaque, session-local read paths.
 /// They intentionally stay in memory: a resumed daemon cannot honestly claim
 /// it can still serve a prior process's retained source snapshot.
@@ -568,6 +587,7 @@ pub struct Session {
     booted_root_profile: Mutex<Option<BootedRootProfile>>,
     /// Session-owned image-generation dispatch funnel installed by the daemon
     /// worker before agent turns begin. Isolated/test sessions leave it absent.
+    #[cfg(feature = "extended")]
     image_generation_dispatch:
         Mutex<Option<Arc<crate::image_generation_job::ImageGenerationDispatchService>>>,
     active_sandbox_escalate_eligible: AtomicBool,
@@ -1210,6 +1230,7 @@ pub(crate) fn test_redaction_key_resolver()
 }
 
 impl Session {
+    #[cfg(feature = "extended")]
     pub(crate) fn set_image_generation_dispatch(
         &self,
         service: Arc<crate::image_generation_job::ImageGenerationDispatchService>,
@@ -1217,6 +1238,7 @@ impl Session {
         *crate::sync::lock_or_recover(&self.image_generation_dispatch) = Some(service);
     }
 
+    #[cfg(feature = "extended")]
     pub(crate) fn image_generation_dispatch(
         &self,
     ) -> Option<Arc<crate::image_generation_job::ImageGenerationDispatchService>> {

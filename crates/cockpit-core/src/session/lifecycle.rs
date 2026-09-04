@@ -1490,6 +1490,7 @@ impl Session {
             active_tool_names: Mutex::new(std::collections::HashSet::new()),
             #[cfg(test)]
             booted_root_profile: Mutex::new(None),
+            #[cfg(feature = "extended")]
             image_generation_dispatch: Mutex::new(None),
             active_sandbox_escalate_eligible: AtomicBool::new(false),
             last_tool_call: Mutex::new(None),

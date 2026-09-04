@@ -1619,29 +1619,34 @@ pub enum Request {
 
     /// Create or replace a durable daemon scheduler job. Owner-only; future
     /// assistant-facing tools will call this RPC after assistant policy checks.
+    #[cfg(feature = "extended")]
     CreateScheduledJob {
         job: ScheduledJobCreate,
     },
 
     /// List durable scheduler jobs. Owner filtering is exact, e.g.
     /// `assistant:alice` or `system:dreamer`.
+    #[cfg(feature = "extended")]
     ListScheduledJobs {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner: Option<String>,
     },
 
     /// Delete a durable scheduler job.
+    #[cfg(feature = "extended")]
     DeleteScheduledJob {
         id: String,
     },
 
     /// Enable or disable a durable scheduler job.
+    #[cfg(feature = "extended")]
     SetScheduledJobEnabled {
         id: String,
         enabled: bool,
     },
 
     /// Fire a durable scheduler job immediately without changing its schedule.
+    #[cfg(feature = "extended")]
     RunScheduledJob {
         id: String,
     },
@@ -2401,6 +2406,7 @@ pub enum Request {
     /// LOCAL owner READ: list the redacted image-generation endpoints for a
     /// project. Owner-only, local-only, concurrent. Secret-bearing fields
     /// (credential_ref/headers) are dropped by the safe projection.
+    #[cfg(feature = "extended")]
     ImageEndpointList {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
@@ -2411,6 +2417,7 @@ pub enum Request {
     },
 
     /// LOCAL owner READ: get one redacted image-generation endpoint.
+    #[cfg(feature = "extended")]
     ImageEndpointGet {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
@@ -2419,6 +2426,7 @@ pub enum Request {
     },
 
     /// LOCAL owner READ: list the redacted image-generation targets.
+    #[cfg(feature = "extended")]
     ImageTargetList {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
@@ -2429,6 +2437,7 @@ pub enum Request {
     },
 
     /// LOCAL owner READ: get one redacted image-generation target.
+    #[cfg(feature = "extended")]
     ImageTargetGet {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
@@ -2438,6 +2447,7 @@ pub enum Request {
 
     /// LOCAL owner READ: list the redacted registered image workflows. The
     /// safe projection drops the opaque `graph_json` blob.
+    #[cfg(feature = "extended")]
     ImageWorkflowList {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
@@ -2448,6 +2458,7 @@ pub enum Request {
     },
 
     /// LOCAL owner READ: get one redacted registered image workflow.
+    #[cfg(feature = "extended")]
     ImageWorkflowGet {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
@@ -2462,6 +2473,7 @@ pub enum Request {
     /// before any write. The generation and authoritative target-document
     /// revision are mandatory optimistic-CAS fences; there is no freshness
     /// bypass.
+    #[cfg(feature = "extended")]
     ImageEndpointCreate {
         client_operation_id: String,
         mutation_intent_hash: String,
@@ -2476,6 +2488,7 @@ pub enum Request {
 
     /// LOCAL owner CONFIG MUTATION: replace an existing image endpoint by id
     /// with the supplied opaque endpoint JSON.
+    #[cfg(feature = "extended")]
     ImageEndpointUpdate {
         client_operation_id: String,
         mutation_intent_hash: String,
@@ -2491,6 +2504,7 @@ pub enum Request {
     },
 
     /// LOCAL owner CONFIG MUTATION: remove an image endpoint by id.
+    #[cfg(feature = "extended")]
     ImageEndpointDelete {
         client_operation_id: String,
         mutation_intent_hash: String,
@@ -2504,6 +2518,7 @@ pub enum Request {
     },
 
     /// LOCAL owner CONFIG MUTATION: append a new image target (opaque JSON).
+    #[cfg(feature = "extended")]
     ImageTargetCreate {
         client_operation_id: String,
         mutation_intent_hash: String,
@@ -2517,6 +2532,7 @@ pub enum Request {
     },
 
     /// LOCAL owner CONFIG MUTATION: replace an existing image target by id.
+    #[cfg(feature = "extended")]
     ImageTargetUpdate {
         client_operation_id: String,
         mutation_intent_hash: String,
@@ -2532,6 +2548,7 @@ pub enum Request {
     },
 
     /// LOCAL owner CONFIG MUTATION: remove an image target by id.
+    #[cfg(feature = "extended")]
     ImageTargetDelete {
         client_operation_id: String,
         mutation_intent_hash: String,
@@ -2547,6 +2564,7 @@ pub enum Request {
     /// LOCAL owner CONFIG MUTATION: make the target with `target_id` the single
     /// enabled default (clearing any prior default). Enforced by the
     /// exactly-one-default invariant in `ImageGenerationConfig::new`.
+    #[cfg(feature = "extended")]
     ImageTargetSetDefault {
         client_operation_id: String,
         mutation_intent_hash: String,
@@ -2566,6 +2584,7 @@ pub enum Request {
     /// which parses `graph_json`, REJECTS a `graph_digest` that does not match the
     /// actual graph (a client cannot register a lying digest), and enforces
     /// unique ids — before any write.
+    #[cfg(feature = "extended")]
     ImageWorkflowUpload {
         client_operation_id: String,
         mutation_intent_hash: String,
@@ -2582,6 +2601,7 @@ pub enum Request {
     /// supplied opaque workflow JSON (updated bindings/outputs over the same
     /// graph). The `graph_digest` is re-verified against `graph_json` by
     /// `ImageGenerationConfig::new`.
+    #[cfg(feature = "extended")]
     ImageWorkflowBind {
         client_operation_id: String,
         mutation_intent_hash: String,
@@ -2598,6 +2618,7 @@ pub enum Request {
 
     /// LOCAL owner CONFIG MUTATION: remove a workflow by id. Fails closed if a
     /// still-enabled target binds it.
+    #[cfg(feature = "extended")]
     ImageWorkflowDelete {
         client_operation_id: String,
         mutation_intent_hash: String,
@@ -2636,6 +2657,12 @@ pub enum Request {
 
     /// Cheap liveness probe. Replaces the legacy `"ok\n"` greeting.
     DaemonStatus,
+
+    /// Mint a peer-bound local credential for the connecting process. The daemon
+    /// attests the peer's role from `SO_PEERCRED` / `getpeereid` (or the Windows
+    /// named-pipe client PID) and returns a short-lived token the peer must
+    /// present on secret-bearing RPCs.
+    ExchangeLocalPeerCredential,
 
     /// Explicitly remove a retained daemon-managed task worktree. This is a
     /// local owner-only lifecycle operation; normal task completion retains
@@ -4096,6 +4123,7 @@ impl Request {
                     return Err("image spend settings exceed maximum length".to_string());
                 }
             }
+            #[cfg(feature = "extended")]
             Self::ImageEndpointCreate {
                 client_operation_id,
                 mutation_intent_hash,
@@ -4538,10 +4566,15 @@ macro_rules! request_variants {
             (Request::ApplyAgentSessionOverride { .. }, "apply_agent_session_override");
             (Request::ResourceSnapshot, "resource_snapshot");
             (Request::PromoteResource { .. }, "promote_resource");
+            #[cfg(feature = "extended")]
             (Request::CreateScheduledJob { .. }, "create_scheduled_job");
+            #[cfg(feature = "extended")]
             (Request::ListScheduledJobs { .. }, "list_scheduled_jobs");
+            #[cfg(feature = "extended")]
             (Request::DeleteScheduledJob { .. }, "delete_scheduled_job");
+            #[cfg(feature = "extended")]
             (Request::SetScheduledJobEnabled { .. }, "set_scheduled_job_enabled");
+            #[cfg(feature = "extended")]
             (Request::RunScheduledJob { .. }, "run_scheduled_job");
             (Request::SetModelFavorite { .. }, "set_model_favorite");
             (Request::SetDefaultModel { .. }, "set_default_model");
@@ -4617,27 +4650,44 @@ macro_rules! request_variants {
             (Request::GetImageSpendPolicy { .. }, "get_image_spend_policy");
             #[cfg(feature = "extended")]
             (Request::SaveImageSpendPolicy { .. }, "save_image_spend_policy");
+            #[cfg(feature = "extended")]
             (Request::ImageEndpointList { .. }, "image_endpoint_list");
+            #[cfg(feature = "extended")]
             (Request::ImageEndpointGet { .. }, "image_endpoint_get");
+            #[cfg(feature = "extended")]
             (Request::ImageTargetList { .. }, "image_target_list");
+            #[cfg(feature = "extended")]
             (Request::ImageTargetGet { .. }, "image_target_get");
+            #[cfg(feature = "extended")]
             (Request::ImageWorkflowList { .. }, "image_workflow_list");
+            #[cfg(feature = "extended")]
             (Request::ImageWorkflowGet { .. }, "image_workflow_get");
+            #[cfg(feature = "extended")]
             (Request::ImageEndpointCreate { .. }, "image_endpoint_create");
+            #[cfg(feature = "extended")]
             (Request::ImageEndpointUpdate { .. }, "image_endpoint_update");
+            #[cfg(feature = "extended")]
             (Request::ImageEndpointDelete { .. }, "image_endpoint_delete");
+            #[cfg(feature = "extended")]
             (Request::ImageTargetCreate { .. }, "image_target_create");
+            #[cfg(feature = "extended")]
             (Request::ImageTargetUpdate { .. }, "image_target_update");
+            #[cfg(feature = "extended")]
             (Request::ImageTargetDelete { .. }, "image_target_delete");
+            #[cfg(feature = "extended")]
             (Request::ImageTargetSetDefault { .. }, "image_target_set_default");
+            #[cfg(feature = "extended")]
             (Request::ImageWorkflowUpload { .. }, "image_workflow_upload");
+            #[cfg(feature = "extended")]
             (Request::ImageWorkflowBind { .. }, "image_workflow_bind");
+            #[cfg(feature = "extended")]
             (Request::ImageWorkflowDelete { .. }, "image_workflow_delete");
             #[cfg(feature = "remote")]
             (Request::DeleteProviderConfig { .. }, "delete_provider_config");
             #[cfg(feature = "remote")]
             (Request::SetProviderLayerMetadata { .. }, "set_provider_layer_metadata");
             (Request::DaemonStatus, "daemon_status");
+            (Request::ExchangeLocalPeerCredential, "exchange_local_peer_credential");
             (Request::CleanManagedWorkspaceLease { .. }, "clean_managed_workspace_lease");
             (Request::RefreshEnv { .. }, "refresh_env");
             (Request::RefreshConfig, "refresh_config");
@@ -4886,10 +4936,15 @@ macro_rules! command {
             (Request::ApplyAgentSessionOverride { session_id, agent_instance_id, expected_override_revision, field }, "apply_agent_session_override", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|agent_instance_id:Uuid|expected_override_revision:u64|field:AgentSessionOverrideFieldV1", [session_id: Uuid => session, agent_instance_id: Uuid => param, expected_override_revision: u64 => param, field: AgentSessionOverrideFieldV1 => param]);
             (Request::ResourceSnapshot, "resource_snapshot", owner_only, none, false, local_only, none, concurrent, none, "-", []);
             (Request::PromoteResource { request_id, session_id }, "promote_resource", owner_only, option_field(session_id), true, local_only, none, serialized, none, "request_id:String|session_id:Option<Uuid>", [request_id: String => param, session_id: Option<Uuid> => session]);
+            #[cfg(feature = "extended")]
             (Request::CreateScheduledJob { job }, "create_scheduled_job", owner_only, none, true, local_only, none, serialized, none, "job:ScheduledJobCreate", [job: ScheduledJobCreate => scheduled]);
+            #[cfg(feature = "extended")]
             (Request::ListScheduledJobs { owner }, "list_scheduled_jobs", owner_only, none, false, local_only, none, concurrent, none, "owner:Option<String>", [owner: Option<String> => param]);
+            #[cfg(feature = "extended")]
             (Request::DeleteScheduledJob { id }, "delete_scheduled_job", owner_only, none, true, local_only, none, serialized, none, "id:String", [id: String => param]);
+            #[cfg(feature = "extended")]
             (Request::SetScheduledJobEnabled { id, enabled }, "set_scheduled_job_enabled", owner_only, none, true, local_only, none, serialized, none, "id:String|enabled:bool", [id: String => param, enabled: bool => param]);
+            #[cfg(feature = "extended")]
             (Request::RunScheduledJob { id }, "run_scheduled_job", owner_only, none, true, local_only, none, serialized, none, "id:String", [id: String => param]);
             (Request::SetModelFavorite { provider, model, favorite }, "set_model_favorite", owner_only, attached, true, local_only, none, serialized, none, "provider:String|model:String|favorite:bool", [provider: String => provider_model_left(model), model: String => provider_model_right(provider), favorite: bool => param]);
             (Request::SetDefaultModel { default_update_id, provider, model, reasoning_effort, thinking_mode, prompt_cache_retention, clear }, "set_default_model", owner_only, attached, true, local_only, none, serialized, none, "default_update_id:Uuid|provider:Option<String>|model:Option<String>|reasoning_effort:Option<String>|thinking_mode:Option<cockpit_config::config::providers::ThinkingMode>|prompt_cache_retention:Option<PromptCacheRetention>|clear:bool", [default_update_id: Uuid => param, provider: Option<String> => provider_model_left(model), model: Option<String> => provider_model_right(provider), reasoning_effort: Option<String> => param, thinking_mode: Option<cockpit_config::config::providers::ThinkingMode> => param, prompt_cache_retention: Option<PromptCacheRetention> => param, clear: bool => param]);
@@ -4969,29 +5024,46 @@ macro_rules! command {
             (Request::ImportPolicy { project_root, bundle_json, replace }, "import_policy", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|bundle_json:String|replace:bool", [project_root: String => project_root, bundle_json: String => param, replace: bool => param]);
             #[cfg(feature = "extended")]
             (Request::GetImageSpendPolicy { project_key }, "get_image_spend_policy", owner_only, none, false, local_only, none, concurrent, none, "project_key:String", [project_key: String => param]);
+            #[cfg(feature = "extended")]
             (Request::ImageEndpointList { project_root, limit, cursor }, "image_endpoint_list", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|limit:Option<u16>|cursor:Option<String>", [project_root: String => project_root, limit: Option<u16> => param, cursor: Option<String> => param]);
+            #[cfg(feature = "extended")]
             (Request::ImageEndpointGet { project_root, endpoint_id }, "image_endpoint_get", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|endpoint_id:String", [project_root: String => project_root, endpoint_id: String => param]);
+            #[cfg(feature = "extended")]
             (Request::ImageTargetList { project_root, limit, cursor }, "image_target_list", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|limit:Option<u16>|cursor:Option<String>", [project_root: String => project_root, limit: Option<u16> => param, cursor: Option<String> => param]);
+            #[cfg(feature = "extended")]
             (Request::ImageTargetGet { project_root, target_id }, "image_target_get", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|target_id:String", [project_root: String => project_root, target_id: String => param]);
+            #[cfg(feature = "extended")]
             (Request::ImageWorkflowList { project_root, limit, cursor }, "image_workflow_list", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|limit:Option<u16>|cursor:Option<String>", [project_root: String => project_root, limit: Option<u16> => param, cursor: Option<String> => param]);
+            #[cfg(feature = "extended")]
             (Request::ImageWorkflowGet { project_root, workflow_id }, "image_workflow_get", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|workflow_id:String", [project_root: String => project_root, workflow_id: String => param]);
             #[cfg(feature = "extended")]
             (Request::SaveImageSpendPolicy { client_operation_id, project_key, settings_json, expected_policy_version }, "save_image_spend_policy", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "client_operation_id:String|project_key:String|settings_json:String|expected_policy_version:Option<u64>", [client_operation_id: String => param, project_key: String => param, settings_json: String => param, expected_policy_version: Option<u64> => param]);
+            #[cfg(feature = "extended")]
             (Request::ImageEndpointCreate { client_operation_id, mutation_intent_hash, project_root, endpoint_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_endpoint_create", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|endpoint_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, endpoint_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1 => param]);
+            #[cfg(feature = "extended")]
             (Request::ImageEndpointUpdate { client_operation_id, mutation_intent_hash, project_root, endpoint_id, endpoint_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_endpoint_update", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|endpoint_id:String|endpoint_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, endpoint_id: String => param, endpoint_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1 => param]);
+            #[cfg(feature = "extended")]
             (Request::ImageEndpointDelete { client_operation_id, mutation_intent_hash, project_root, endpoint_id, expected_config_generation, expected_config_revision, mutation_capability }, "image_endpoint_delete", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|endpoint_id:String|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, endpoint_id: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1 => param]);
+            #[cfg(feature = "extended")]
             (Request::ImageTargetCreate { client_operation_id, mutation_intent_hash, project_root, target_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_target_create", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, target_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1 => param]);
+            #[cfg(feature = "extended")]
             (Request::ImageTargetUpdate { client_operation_id, mutation_intent_hash, project_root, target_id, target_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_target_update", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_id:String|target_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, target_id: String => param, target_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1 => param]);
+            #[cfg(feature = "extended")]
             (Request::ImageTargetDelete { client_operation_id, mutation_intent_hash, project_root, target_id, expected_config_generation, expected_config_revision, mutation_capability }, "image_target_delete", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_id:String|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, target_id: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1 => param]);
+            #[cfg(feature = "extended")]
             (Request::ImageTargetSetDefault { client_operation_id, mutation_intent_hash, project_root, target_id, expected_config_generation, expected_config_revision, mutation_capability }, "image_target_set_default", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_id:String|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, target_id: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1 => param]);
+            #[cfg(feature = "extended")]
             (Request::ImageWorkflowUpload { client_operation_id, mutation_intent_hash, project_root, workflow_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_workflow_upload", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|workflow_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, workflow_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1 => param]);
+            #[cfg(feature = "extended")]
             (Request::ImageWorkflowBind { client_operation_id, mutation_intent_hash, project_root, workflow_id, bindings_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_workflow_bind", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|workflow_id:String|bindings_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, workflow_id: String => param, bindings_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1 => param]);
+            #[cfg(feature = "extended")]
             (Request::ImageWorkflowDelete { client_operation_id, mutation_intent_hash, project_root, workflow_id, expected_config_generation, expected_config_revision, mutation_capability }, "image_workflow_delete", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|workflow_id:String|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, workflow_id: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1 => param]);
             #[cfg(feature = "remote")]
             (Request::DeleteProviderConfig { project_root, provider_id, delete_stored_secrets }, "delete_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|delete_stored_secrets:bool", [project_root: String => project_root, provider_id: String => param, delete_stored_secrets: bool => param]);
             #[cfg(feature = "remote")]
             (Request::SetProviderLayerMetadata { project_root, category_defaults_json, on_unlisted_models_fetch }, "set_provider_layer_metadata", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|category_defaults_json:String|on_unlisted_models_fetch:cockpit_config::config::providers::OnUnlistedModelsFetch", [project_root: String => project_root, category_defaults_json: String => param, on_unlisted_models_fetch: cockpit_config::config::providers::OnUnlistedModelsFetch => param]);
             (Request::DaemonStatus, "daemon_status", public_read, none, false, read_only, none, concurrent, none, "-", []);
+            (Request::ExchangeLocalPeerCredential, "exchange_local_peer_credential", public_read, none, false, read_only, none, serialized, none, "-", []);
             (Request::CleanManagedWorkspaceLease { session_id, owner_agent_instance_id, lease_id }, "clean_managed_workspace_lease", owner_only, none, true, local_only, none, serialized, none, "session_id:Uuid|owner_agent_instance_id:Uuid|lease_id:Uuid", [session_id: Uuid => session, owner_agent_instance_id: Uuid => param, lease_id: Uuid => param]);
             (Request::RefreshEnv { vars }, "refresh_env", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "vars:HashMap<String,String>", [vars: HashMap<String,String> => param]);
             (Request::RefreshConfig, "refresh_config", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);

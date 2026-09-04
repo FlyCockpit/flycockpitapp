@@ -8,13 +8,16 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::extended::SkillsConfig;
+#[cfg(feature = "extended")]
 use crate::daemon::proto::{
     MissedRunPolicy, ScheduledJobCreate, ScheduledJobPayload, ScheduledJobSchedule,
 };
+use crate::db::Db;
+#[cfg(feature = "extended")]
+use crate::db::scheduler::ScheduledJobRow;
 use crate::db::skill_usage::{
     SkillCreatedBy, SkillCuratorSnapshotRow, SkillUsageRow, SkillUsageState,
 };
-use crate::db::{Db, scheduler::ScheduledJobRow};
 
 use super::manage::{SkillLifecycleMetadata, lifecycle_metadata_for_skill, usage_seed_for_skill};
 
@@ -145,7 +148,10 @@ impl SkillCurator {
     }
 
     pub async fn run(&self, options: CuratorRunOptions) -> Result<CuratorRunReport> {
+        #[cfg(feature = "extended")]
         let cron_refs = cron_referenced_skills(&self.db).await?;
+        #[cfg(not(feature = "extended"))]
+        let cron_refs = HashSet::new();
         self.run_with_cron_refs(options, cron_refs).await
     }
 
@@ -465,10 +471,12 @@ fn transition_for(
     }
 }
 
+#[cfg(feature = "extended")]
 pub(crate) async fn cron_referenced_skills(db: &Db) -> Result<HashSet<String>> {
     cron_referenced_skills_from_jobs(db.list_scheduled_jobs(None).await?)
 }
 
+#[cfg(feature = "extended")]
 pub fn cron_referenced_skills_from_jobs(jobs: Vec<ScheduledJobRow>) -> Result<HashSet<String>> {
     let mut out = HashSet::new();
     for job in jobs {
@@ -524,6 +532,7 @@ async fn consolidation_prompt(db: &Db) -> Result<String> {
     ))
 }
 
+#[cfg(feature = "extended")]
 pub async fn register_scheduler(
     handle: &crate::daemon::scheduler::DaemonSchedulerHandle,
     db: Db,
@@ -543,6 +552,7 @@ pub async fn register_scheduler(
     ensure_default_job(handle, &db).await
 }
 
+#[cfg(feature = "extended")]
 pub async fn ensure_default_job(
     handle: &crate::daemon::scheduler::DaemonSchedulerHandle,
     db: &Db,

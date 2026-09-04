@@ -9,7 +9,6 @@ use crate::{
     proto_crate::send_user_message_v2::MessageIngressV2,
     session::Session,
 };
-use base64::Engine as _;
 #[cfg(feature = "remote")]
 use std::collections::HashSet;
 use std::{
@@ -23,21 +22,20 @@ use std::{io::Write as _, sync::Mutex as StdMutex};
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
 
-#[test]
-#[cfg(not(feature = "extended"))]
-fn compiled_product_domain_gate_rejects_extended_surface_centrally() {
-    let request = Request::ListScheduledJobs { owner: None };
-    let error = require_compiled_product_domain(&request)
-        .expect_err("scheduler RPC must be unavailable without the extended profile");
-    assert_eq!(error.code, ErrorCode::BadRequest);
-    assert!(
-        error
-            .message
-            .contains("opt-in extended local capability profile")
-    );
+fn test_principal_tx_sender() -> &'static tokio::sync::watch::Sender<ClientPrincipal> {
+    static HOLDER: std::sync::OnceLock<(
+        tokio::sync::watch::Sender<ClientPrincipal>,
+        tokio::sync::watch::Receiver<ClientPrincipal>,
+    )> = std::sync::OnceLock::new();
+    &HOLDER
+        .get_or_init(|| tokio::sync::watch::channel(ClientPrincipal::owner()))
+        .0
+}
 
-    require_compiled_product_domain(&Request::DaemonStatus)
-        .expect("base-profile RPC must remain available");
+macro_rules! test_principal_tx {
+    () => {
+        test_principal_tx_sender()
+    };
 }
 
 fn mcp_patch<T: serde::Serialize>(config: &T) -> cockpit_proto::SensitiveWirePayload {
@@ -2075,104 +2073,108 @@ async fn authorized_fcor_resources_normalize_attach_and_nested_schedule_roots() 
     );
     assert_eq!(with_session[0].value, session_id.as_bytes());
 
-    let scheduled = Request::CreateScheduledJob {
-        job: proto::ScheduledJobCreate {
-            id: "job-1".into(),
-            owner: "system:test".into(),
-            schedule: proto::ScheduledJobSchedule::Every { seconds: 60 },
-            payload: proto::ScheduledJobPayload::RunPrompt {
-                assistant: "Build".into(),
-                prompt: "run".into(),
-                project_root: root.path().join(".").to_string_lossy().into_owned(),
+    #[cfg(feature = "extended")]
+    {
+        let scheduled = Request::CreateScheduledJob {
+            job: proto::ScheduledJobCreate {
+                id: "job-1".into(),
+                owner: "system:test".into(),
+                schedule: proto::ScheduledJobSchedule::Every { seconds: 60 },
+                payload: proto::ScheduledJobPayload::RunPrompt {
+                    assistant: "Build".into(),
+                    prompt: "run".into(),
+                    project_root: root.path().join(".").to_string_lossy().into_owned(),
+                },
+                enabled: true,
+                missed_run_policy: proto::MissedRunPolicy::Skip,
             },
-            enabled: true,
-            missed_run_policy: proto::MissedRunPolicy::Skip,
-        },
-    };
-    let resources = authorize_request_context(&scheduled, &state, &ctx)
-        .await
-        .unwrap()
-        .fcor_resources;
-    assert_eq!(
-        resources
-            .iter()
-            .map(|resource| resource.kind)
-            .collect::<Vec<_>>(),
-        vec![Kind::SchedulerId, Kind::ProjectRoot]
-    );
-    assert_eq!(resources[0].value, b"job-1");
-    assert_eq!(
-        resources[1].value,
-        root.path()
-            .canonicalize()
+        };
+        let resources = authorize_request_context(&scheduled, &state, &ctx)
+            .await
             .unwrap()
-            .to_str()
-            .unwrap()
-            .as_bytes()
-    );
-    if let Request::CreateScheduledJob { job } = &scheduled {
-        use proto::remote_operation_fcor::CanonicalFcorValueV1;
-        let mut params = proto::remote_operation_fcor::CanonicalParamsV1::new();
-        job.encode_fcor_value_v1(&mut params).unwrap();
-        let params = params.into_bytes();
-        assert!(
-            !params
-                .windows(job.id.len())
-                .any(|window| window == job.id.as_bytes())
+            .fcor_resources;
+        assert_eq!(
+            resources
+                .iter()
+                .map(|resource| resource.kind)
+                .collect::<Vec<_>>(),
+            vec![Kind::SchedulerId, Kind::ProjectRoot]
         );
-        if let proto::ScheduledJobPayload::RunPrompt { project_root, .. } = &job.payload {
+        assert_eq!(resources[0].value, b"job-1");
+        assert_eq!(
+            resources[1].value,
+            root.path()
+                .canonicalize()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .as_bytes()
+        );
+        if let Request::CreateScheduledJob { job } = &scheduled {
+            use proto::remote_operation_fcor::CanonicalFcorValueV1;
+            let mut params = proto::remote_operation_fcor::CanonicalParamsV1::new();
+            job.encode_fcor_value_v1(&mut params).unwrap();
+            let params = params.into_bytes();
             assert!(
                 !params
-                    .windows(project_root.len())
-                    .any(|window| window == project_root.as_bytes())
+                    .windows(job.id.len())
+                    .any(|window| window == job.id.as_bytes())
             );
+            if let proto::ScheduledJobPayload::RunPrompt { project_root, .. } = &job.payload {
+                assert!(
+                    !params
+                        .windows(project_root.len())
+                        .any(|window| window == project_root.as_bytes())
+                );
+            }
         }
-    }
 
-    let callback = Request::CreateScheduledJob {
-        job: proto::ScheduledJobCreate {
-            id: "callback-1".into(),
-            owner: "system:test".into(),
-            schedule: proto::ScheduledJobSchedule::Every { seconds: 60 },
-            payload: proto::ScheduledJobPayload::Callback {
-                subsystem: "test".into(),
+        let callback = Request::CreateScheduledJob {
+            job: proto::ScheduledJobCreate {
+                id: "callback-1".into(),
+                owner: "system:test".into(),
+                schedule: proto::ScheduledJobSchedule::Every { seconds: 60 },
+                payload: proto::ScheduledJobPayload::Callback {
+                    subsystem: "test".into(),
+                },
+                enabled: true,
+                missed_run_policy: proto::MissedRunPolicy::Skip,
             },
-            enabled: true,
-            missed_run_policy: proto::MissedRunPolicy::Skip,
-        },
-    };
-    let callback_resources = authorize_request_context(&callback, &state, &ctx)
-        .await
-        .unwrap()
-        .fcor_resources;
-    assert_eq!(
-        callback_resources
-            .iter()
-            .map(|resource| resource.kind)
-            .collect::<Vec<_>>(),
-        vec![Kind::SchedulerId]
-    );
-
-    let resolver_calls = ctx
-        .fcor_resolver_calls
-        .load(std::sync::atomic::Ordering::SeqCst);
-    let denied = MutableClientState::detached_with_principal(
-        ctx.upload_accounting.clone(),
-        remote_principal(),
-        ctx.terminal_host.clone(),
-        Uuid::new_v4(),
-        next_terminal_connection_epoch(),
-    );
-    assert!(
-        authorize_request_context(&scheduled, &denied, &ctx)
+        };
+        let callback_resources = authorize_request_context(&callback, &state, &ctx)
             .await
-            .is_err()
-    );
-    assert_eq!(
-        ctx.fcor_resolver_calls
-            .load(std::sync::atomic::Ordering::SeqCst),
-        resolver_calls
-    );
+            .unwrap()
+            .fcor_resources;
+        assert_eq!(
+            callback_resources
+                .iter()
+                .map(|resource| resource.kind)
+                .collect::<Vec<_>>(),
+            vec![Kind::SchedulerId]
+        );
+
+        let resolver_calls = ctx
+            .fcor_resolver_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let denied = MutableClientState::detached_with_principal(
+            ctx.upload_accounting.clone(),
+            remote_principal(),
+            None,
+            ctx.terminal_host.clone(),
+            Uuid::new_v4(),
+            next_terminal_connection_epoch(),
+        );
+        assert!(
+            authorize_request_context(&scheduled, &denied, &ctx)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            ctx.fcor_resolver_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            resolver_calls
+        );
+    }
 }
 
 #[cfg(feature = "remote")]
@@ -2392,6 +2394,7 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         remote(Some(actor.clone())),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -2411,6 +2414,7 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -2428,6 +2432,7 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         remote(None),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -2440,6 +2445,7 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -2462,6 +2468,7 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -2488,6 +2495,7 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -2520,6 +2528,7 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -2546,6 +2555,7 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -2573,6 +2583,7 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -2640,6 +2651,7 @@ async fn remote_queue_envelope_stamps_server_operation_context_into_worker() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -2737,6 +2749,7 @@ async fn remote_cancel_turn_dispatches_once_then_replays_or_conflicts() {
             &mut state,
             &mut shared,
             &ctx,
+            test_principal_tx!(),
             &event_cmd_tx,
             &writer_tx,
             &mut concurrent,
@@ -2773,6 +2786,7 @@ async fn remote_cancel_turn_dispatches_once_then_replays_or_conflicts() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -2807,6 +2821,7 @@ async fn remote_cancel_turn_dispatches_once_then_replays_or_conflicts() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -2842,6 +2857,7 @@ async fn remote_cancel_turn_dispatches_once_then_replays_or_conflicts() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -2879,6 +2895,7 @@ async fn remote_cancel_turn_dispatches_once_then_replays_or_conflicts() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -2930,6 +2947,7 @@ async fn remote_cancel_turn_dispatches_once_then_replays_or_conflicts() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -2996,6 +3014,7 @@ async fn remote_session_note_applies_replays_and_conflicts_before_second_event()
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3024,6 +3043,7 @@ async fn remote_session_note_applies_replays_and_conflicts_before_second_event()
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3051,6 +3071,7 @@ async fn remote_session_note_applies_replays_and_conflicts_before_second_event()
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3106,6 +3127,7 @@ async fn remote_session_note_applies_replays_and_conflicts_before_second_event()
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3130,6 +3152,7 @@ async fn remote_session_note_applies_replays_and_conflicts_before_second_event()
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3154,6 +3177,7 @@ async fn remote_session_note_applies_replays_and_conflicts_before_second_event()
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3186,6 +3210,7 @@ async fn remote_session_note_applies_replays_and_conflicts_before_second_event()
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3210,6 +3235,7 @@ async fn remote_session_note_applies_replays_and_conflicts_before_second_event()
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3234,6 +3260,7 @@ async fn remote_session_note_applies_replays_and_conflicts_before_second_event()
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3269,6 +3296,7 @@ async fn remote_session_note_applies_replays_and_conflicts_before_second_event()
             &mut state,
             &mut shared,
             &ctx,
+            test_principal_tx!(),
             &event_cmd_tx,
             &writer_tx,
             &mut concurrent,
@@ -3294,6 +3322,7 @@ async fn remote_session_note_applies_replays_and_conflicts_before_second_event()
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3326,6 +3355,7 @@ async fn remote_session_note_applies_replays_and_conflicts_before_second_event()
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3351,6 +3381,7 @@ async fn remote_session_note_applies_replays_and_conflicts_before_second_event()
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3376,6 +3407,7 @@ async fn remote_session_note_applies_replays_and_conflicts_before_second_event()
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3450,6 +3482,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         principal,
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -3483,6 +3516,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3510,6 +3544,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3537,6 +3572,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3566,6 +3602,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3592,6 +3629,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3618,6 +3656,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3679,6 +3718,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3703,6 +3743,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3736,6 +3777,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3761,6 +3803,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3784,6 +3827,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3833,6 +3877,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3855,6 +3900,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3877,6 +3923,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3916,6 +3963,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
             &mut state,
             &mut shared,
             &ctx,
+            test_principal_tx!(),
             &event_cmd_tx,
             &writer_tx,
             &mut concurrent,
@@ -3938,6 +3986,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -3978,6 +4027,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
             &mut state,
             &mut shared,
             &ctx,
+            test_principal_tx!(),
             &event_cmd_tx,
             &writer_tx,
             &mut concurrent,
@@ -4001,6 +4051,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -4048,6 +4099,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
             &mut state,
             &mut shared,
             &ctx,
+            test_principal_tx!(),
             &event_cmd_tx,
             &writer_tx,
             &mut concurrent,
@@ -4070,6 +4122,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -4103,7 +4156,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
 }
 
 #[tokio::test]
-#[cfg(feature = "remote")]
+#[cfg(all(feature = "remote", feature = "extended"))]
 async fn remote_scheduler_mutation_is_local_only_before_ledger_or_domain_write() {
     let ctx = test_ctx();
     ctx.db
@@ -4140,6 +4193,7 @@ async fn remote_scheduler_mutation_is_local_only_before_ledger_or_domain_write()
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         principal,
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -4162,6 +4216,7 @@ async fn remote_scheduler_mutation_is_local_only_before_ledger_or_domain_write()
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -4230,6 +4285,7 @@ async fn remote_cancel_invocation_applies_replays_and_conflicts_once() {
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         principal,
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -4257,6 +4313,7 @@ async fn remote_cancel_invocation_applies_replays_and_conflicts_once() {
             &mut state,
             &mut shared,
             &ctx,
+            test_principal_tx!(),
             &event_cmd_tx,
             &writer_tx,
             &mut concurrent,
@@ -4286,6 +4343,7 @@ async fn remote_cancel_invocation_applies_replays_and_conflicts_once() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -4332,6 +4390,7 @@ async fn remote_cancel_invocation_applies_replays_and_conflicts_once() {
             &mut state,
             &mut shared,
             &ctx,
+            test_principal_tx!(),
             &event_cmd_tx,
             &writer_tx,
             &mut concurrent,
@@ -4410,6 +4469,7 @@ async fn remote_outbox_replay_is_actor_bound_ordered_and_token_correlated() {
     let mut first = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         principal_for("33333333-3333-4333-8333-333333333340"),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -4417,6 +4477,7 @@ async fn remote_outbox_replay_is_actor_bound_ordered_and_token_correlated() {
     let mut second = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         principal_for("33333333-3333-4333-8333-333333333341"),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -5315,6 +5376,7 @@ async fn media_security_recovery_denial_precedes_operation_table() {
     let state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         remote_principal(),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -7312,6 +7374,7 @@ async fn export_and_redacted_reader_reject_a_real_remote_principal() {
     let state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         remote_principal(),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -7337,6 +7400,7 @@ async fn export_and_redacted_reader_reject_a_real_remote_principal() {
     let state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         remote_principal(),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -7360,6 +7424,7 @@ async fn export_and_redacted_reader_reject_a_real_remote_principal() {
     let state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         remote_principal(),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -8064,8 +8129,10 @@ fn failed_persistent_endpoint_publication_never_exposes_persistent_services() {
     // Write fails before activation; rollback must stay a no-op.
     ctx.deactivate_persistent_services();
     assert!(ctx.is_ephemeral_lifetime());
+    #[cfg(feature = "extended")]
     assert!(ctx.scheduler().is_none());
     assert!(ctx.resource_scheduler().is_none());
+    #[cfg(feature = "extended")]
     assert!(ctx.registry.scheduler().is_none());
     assert!(ctx.registry.resource_scheduler().is_none());
     assert!(ctx.active_media_storage_recovery().is_none());
@@ -8114,6 +8181,7 @@ fn remote_principal_cannot_promote_daemon_lifetime() {
         "owner-only promotion must fail closed, got {error}"
     );
     assert!(ctx.is_ephemeral_lifetime());
+    #[cfg(feature = "extended")]
     assert!(ctx.scheduler().is_none());
     assert!(ctx.resource_scheduler().is_none());
 }
@@ -8392,6 +8460,7 @@ async fn remote_reader_assistant_attach_cannot_promote_ephemeral_owner() {
         error.message
     );
     assert!(ctx.is_ephemeral_lifetime());
+    #[cfg(feature = "extended")]
     assert!(ctx.scheduler().is_none());
     assert!(ctx.resource_scheduler().is_none());
 }
@@ -8552,7 +8621,11 @@ fn remote_state_with_grants(
             actor_binding: None,
             authorization: crate::daemon::principal::RemoteAuthorization::LegacyRelayScopes(grants),
         }),
+        socket_peer: None,
         has_owner_capability: false,
+        active_peer_credential: None,
+        peer_credential_expires_at_unix_ms: None,
+        presented_owner_capability: None,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "flycockpit:user-1".into(),
             client_instance_id: Uuid::new_v4(),
@@ -8596,7 +8669,11 @@ fn owner_state_with_instance(client_instance_id: Uuid) -> MutableClientState {
 fn owner_state() -> MutableClientState {
     MutableClientState {
         principal: ClientPrincipal::owner(),
+        socket_peer: None,
         has_owner_capability: true,
+        active_peer_credential: None,
+        peer_credential_expires_at_unix_ms: None,
+        presented_owner_capability: None,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "local-owner".into(),
             client_instance_id: Uuid::new_v4(),
@@ -8663,12 +8740,15 @@ async fn socket_peer_without_owner_capability_cannot_call_secret_rpc() {
     let ctx = test_ctx();
     let (server_stream, client_stream) = test_stream_pair();
     let mut client = ProtoStream::new(client_stream);
+    let peer = test_socket_peer();
+    let client_instance_id = Uuid::new_v4();
     let server = tokio::spawn(handle_client_transport_as(
         server_stream,
         ctx.clone(),
-        ClientPrincipal::owner(),
-        Uuid::new_v4(),
+        ClientPrincipal::local_unauthenticated(peer),
+        client_instance_id,
         false,
+        Some(peer),
     ));
     match recv_body(&mut client).await {
         Body::Response { id, response } => {
@@ -8703,6 +8783,12 @@ async fn socket_peer_without_owner_capability_cannot_call_secret_rpc() {
     }
 
     let allowed_id = Uuid::now_v7();
+    let token = ctx.peer_credential_registry.mint(
+        peer,
+        client_instance_id,
+        crate::daemon::principal::LocalClientRole::Cli,
+        Vec::new(),
+    );
     client
         .send(&Envelope::request_with_owner_capability(
             allowed_id,
@@ -8710,9 +8796,7 @@ async fn socket_peer_without_owner_capability_cannot_call_secret_rpc() {
                 name: "k".into(),
                 value: "v".into(),
             },
-            Some(proto::OwnerCapabilityToken::new(
-                ctx.owner_capability.token().to_string(),
-            )),
+            Some(proto::OwnerCapabilityToken::new(token.0)),
         ))
         .await
         .expect("send secret RPC with capability");
@@ -8731,6 +8815,508 @@ async fn socket_peer_without_owner_capability_cannot_call_secret_rpc() {
 
     drop(client);
     let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn socket_peer_legacy_owner_capability_file_token_is_not_admitted() {
+    let ctx = test_ctx();
+    let (server_stream, client_stream) = test_stream_pair();
+    let mut client = ProtoStream::new(client_stream);
+    let peer = test_socket_peer();
+    let client_instance_id = Uuid::new_v4();
+    let server = tokio::spawn(handle_client_transport_as(
+        server_stream,
+        ctx.clone(),
+        ClientPrincipal::local_unauthenticated(peer),
+        client_instance_id,
+        false,
+        Some(peer),
+    ));
+    match recv_body(&mut client).await {
+        Body::Response { id, response } => {
+            assert_eq!(id, Uuid::nil());
+            assert!(matches!(*response, Response::DaemonStatus { .. }));
+        }
+        other => panic!("expected daemon hello, got {other:?}"),
+    }
+
+    let denied_id = Uuid::now_v7();
+    client
+        .send(&Envelope::request_with_owner_capability(
+            denied_id,
+            Request::PutNamedSecret {
+                name: "k".into(),
+                value: "v".into(),
+            },
+            Some(proto::OwnerCapabilityToken::new(
+                ctx.owner_capability.token().to_string(),
+            )),
+        ))
+        .await
+        .expect("send secret RPC with legacy file token");
+    match recv_body(&mut client).await {
+        Body::Error { id, error } => {
+            assert_eq!(id, Some(denied_id));
+            assert_eq!(error.code, ErrorCode::Authorization);
+            assert!(
+                error.message.contains("daemon-private owner capability"),
+                "{}",
+                error.message
+            );
+        }
+        other => panic!("expected authorization error, got {other:?}"),
+    }
+
+    drop(client);
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn unauthenticated_local_socket_peer_is_denied_owner_rpcs() {
+    let ctx = test_ctx();
+    let peer = test_socket_peer();
+    let state = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        ClientPrincipal::local_unauthenticated(peer),
+        Some(peer),
+        test_terminal_host(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
+    );
+    let error = authorize_request(
+        &Request::PutNamedSecret {
+            name: "k".into(),
+            value: "v".into(),
+        },
+        &state,
+        &ctx,
+    )
+    .await
+    .expect_err("unauthenticated local peer must not call owner-only RPCs");
+    assert_eq!(error.code, ErrorCode::Authorization);
+}
+
+#[cfg(unix)]
+const PEER_AUTH_CHILD_BIN: &str = "cockpit-peer-auth-test-child";
+
+#[cfg(unix)]
+fn discover_peer_auth_child_executable() -> std::path::PathBuf {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_cockpit_peer_auth_test_child") {
+        return std::path::PathBuf::from(path);
+    }
+    let test_exe = std::env::current_exe().expect("current test executable");
+    discover_named_target_binary_from(&test_exe, PEER_AUTH_CHILD_BIN).unwrap_or_else(|| {
+        panic!(
+            "peer auth child ({PEER_AUTH_CHILD_BIN}) not found; build cockpit-core with \
+             `cargo build -p cockpit-core --bins`"
+        )
+    })
+}
+
+#[cfg(unix)]
+fn discover_named_target_binary_from(
+    test_exe: &std::path::Path,
+    binary_name: &str,
+) -> Option<std::path::PathBuf> {
+    use std::ffi::OsStr;
+
+    let mut dir = test_exe.parent()?;
+    loop {
+        let candidate = dir.join(binary_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if dir.file_name() == Some(OsStr::new("target")) {
+            for profile in ["debug", "release"] {
+                let candidate = dir.join(profile).join(binary_name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+        dir = dir.parent()?;
+    }
+}
+
+#[cfg(unix)]
+fn peer_auth_admission_test_ctx(child_executable: std::path::PathBuf) -> Arc<DaemonContext> {
+    let db = Db::open_in_memory().expect("in-memory db");
+    let locks = Arc::new(LockManager::in_memory(db.clone()));
+    let paths = unique_test_paths(true);
+    let mut ctx = DaemonContext::new(
+        db,
+        locks,
+        paths,
+        crate::daemon::terminal::test_host_factory(),
+        stub_config_source(),
+    );
+    ctx.approved_client_executable = child_executable;
+    let generation = ctx.host_capabilities.begin_refresh();
+    let mut snapshot = crate::daemon::session_worker::sandbox_capability_snapshot(
+        cockpit_proto::FeatureCapabilityState::Available,
+        cockpit_proto::FeatureCapabilityState::Available,
+    );
+    snapshot.generation = generation;
+    ctx.host_capabilities.publish(snapshot);
+    Arc::new(ctx)
+}
+
+/// Identity of a live child process, captured while it waits on its go-file.
+#[cfg(unix)]
+fn child_peer_identity(child_id: u32) -> cockpit_host::peer_cred::PeerIdentity {
+    let (uid, gid) =
+        cockpit_host::daemon_lifecycle::read_process_credentials(child_id).expect("child uid/gid");
+    cockpit_host::peer_cred::PeerIdentity {
+        pid: child_id,
+        uid,
+        gid,
+        process_start: cockpit_host::daemon_lifecycle::process_start_identity(child_id)
+            .expect("child process start"),
+    }
+}
+
+/// Drive the production socket accept path (`handle_client`) plus the
+/// production client connect/exchange (`DaemonClient::connect` inside the
+/// peer-auth child) and assert the exchange outcome.
+///
+/// `provenance` installs daemon-side launch provenance `(ticket, launcher
+/// identity)` while the child waits on its go-file; `ticket_env` is the launch
+/// ticket the child itself presents. A legitimate launcher presents the
+/// ticket bound to its own process identity; an attacker presents nothing.
+#[cfg(unix)]
+async fn run_peer_auth_exchange_test(
+    label: &str,
+    child_args: &[&str],
+    expect_owner: bool,
+    provenance: Option<(String, cockpit_host::peer_cred::PeerIdentity)>,
+    ticket_env: Option<&str>,
+) {
+    let child_executable =
+        std::fs::canonicalize(discover_peer_auth_child_executable()).expect("child executable");
+    let ctx = peer_auth_admission_test_ctx(child_executable.clone());
+    let socket_dir = tempfile::tempdir().expect("socket tempdir");
+    let socket_path = socket_dir.path().join("peer-auth.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind peer auth socket");
+    // The child blocks on the go-file until the test has installed the
+    // daemon-side registry state naming it as the launcher.
+    let go_dir = tempfile::tempdir().expect("go-file tempdir");
+    let go_file = go_dir.path().join("go");
+
+    let mut command = std::process::Command::new(&child_executable);
+    command
+        .args(child_args)
+        .env("COCKPIT_PEER_AUTH_MODE", "exchange")
+        .env("COCKPIT_PEER_AUTH_SOCKET", &socket_path)
+        .env(
+            "COCKPIT_PEER_AUTH_EXPECT",
+            if expect_owner { "owner" } else { "denied" },
+        );
+    if let Some(ticket) = ticket_env {
+        command.env("COCKPIT_PEER_AUTH_LAUNCH_TICKET", ticket);
+    }
+    if provenance.is_some() {
+        command.env("COCKPIT_PEER_AUTH_GO_FILE", &go_file);
+    }
+    let mut child = command.spawn().expect("spawn peer auth child");
+    if let Some((ticket, launcher)) = provenance {
+        ctx.peer_credential_registry
+            .record_launch_provenance(ticket, Some(launcher));
+        std::fs::write(&go_file, b"go").expect("release the child go-file");
+    }
+
+    let server_ctx = ctx.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept peer auth client");
+        handle_client(stream, server_ctx).await
+    });
+
+    let status = child.wait().expect("peer auth child exited");
+    assert!(
+        status.success(),
+        "peer auth child failed for {label} with args {child_args:?} (expected owner: {expect_owner})"
+    );
+
+    let _ = server.await;
+}
+
+#[cfg(unix)]
+async fn run_legitimate_peer_auth_admission_test(role: &str, child_args: &[&str]) {
+    let ticket = crate::daemon::peer_authority::mint_launch_ticket();
+    let child_executable =
+        std::fs::canonicalize(discover_peer_auth_child_executable()).expect("child executable");
+    let ctx = peer_auth_admission_test_ctx(child_executable.clone());
+    let socket_dir = tempfile::tempdir().expect("socket tempdir");
+    let socket_path = socket_dir.path().join("peer-auth.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind peer auth socket");
+    let go_dir = tempfile::tempdir().expect("go-file tempdir");
+    let go_file = go_dir.path().join("go");
+
+    let mut child = std::process::Command::new(&child_executable)
+        .args(child_args)
+        .env("COCKPIT_PEER_AUTH_MODE", "exchange")
+        .env("COCKPIT_PEER_AUTH_SOCKET", &socket_path)
+        .env("COCKPIT_PEER_AUTH_EXPECT", "owner")
+        .env("COCKPIT_PEER_AUTH_LAUNCH_TICKET", &ticket)
+        .env("COCKPIT_PEER_AUTH_GO_FILE", &go_file)
+        .spawn()
+        .expect("spawn peer auth child");
+    // The provenance launcher identity must be the live child itself: this
+    // is the production contract, the ticket is bound to the exact process
+    // that spawned the daemon and will present it.
+    ctx.peer_credential_registry
+        .record_launch_provenance(ticket, Some(child_peer_identity(child.id())));
+    std::fs::write(&go_file, b"go").expect("release the child go-file");
+
+    let server_ctx = ctx.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept peer auth client");
+        handle_client(stream, server_ctx).await
+    });
+
+    let status = child.wait().expect("peer auth child exited");
+    assert!(
+        status.success(),
+        "peer auth child failed for role {role} with args {child_args:?}"
+    );
+
+    let _ = server.await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn legitimate_tui_client_admitted_through_production_accept() {
+    run_legitimate_peer_auth_admission_test("tui", &[]).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn legitimate_cli_client_admitted_through_production_accept() {
+    run_legitimate_peer_auth_admission_test("cli", &["daemon", "status"]).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn legitimate_acp_client_admitted_through_production_accept() {
+    run_legitimate_peer_auth_admission_test("acp", &["acp"]).await;
+}
+
+/// Issue #337 invariant, driven across the production accept and exchange
+/// paths: an unconfined same-uid peer that runs the approved executable
+/// with recognized arguments holds no launch ticket and must be denied an
+/// owner-class credential (the owner-only RPC must stay unreachable).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn unproven_same_uid_peer_with_approved_executable_is_denied_owner_class() {
+    run_peer_auth_exchange_test("no ticket", &["daemon", "status"], false, None, None).await;
+}
+
+/// A ticket stolen out of another process's environment cannot be replayed:
+/// provenance binds the token to the launcher's exact process identity, and
+/// this peer is a different process even though it presents the right token.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn launch_ticket_presented_by_the_wrong_process_is_denied() {
+    let ticket = crate::daemon::peer_authority::mint_launch_ticket();
+    let current_process = child_peer_identity(std::process::id());
+    run_peer_auth_exchange_test(
+        "stolen ticket",
+        &["daemon", "status"],
+        false,
+        // Provenance binds the ticket to this test process, not the child.
+        Some((ticket.clone(), current_process)),
+        Some(ticket.as_str()),
+    )
+    .await;
+}
+
+/// The launcher itself must present the token it was issued: any other token
+/// value is denied even for the bound launcher process.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn launch_ticket_with_the_wrong_value_is_denied() {
+    let bound_ticket = crate::daemon::peer_authority::mint_launch_ticket();
+    let wrong_ticket = crate::daemon::peer_authority::mint_launch_ticket();
+    let child_executable =
+        std::fs::canonicalize(discover_peer_auth_child_executable()).expect("child executable");
+    let ctx = peer_auth_admission_test_ctx(child_executable.clone());
+    let socket_dir = tempfile::tempdir().expect("socket tempdir");
+    let socket_path = socket_dir.path().join("peer-auth.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind peer auth socket");
+    let go_dir = tempfile::tempdir().expect("go-file tempdir");
+    let go_file = go_dir.path().join("go");
+
+    let mut child = std::process::Command::new(&child_executable)
+        .args(["daemon", "status"])
+        .env("COCKPIT_PEER_AUTH_MODE", "exchange")
+        .env("COCKPIT_PEER_AUTH_SOCKET", &socket_path)
+        .env("COCKPIT_PEER_AUTH_EXPECT", "denied")
+        .env("COCKPIT_PEER_AUTH_LAUNCH_TICKET", &wrong_ticket)
+        .env("COCKPIT_PEER_AUTH_GO_FILE", &go_file)
+        .spawn()
+        .expect("spawn peer auth child");
+    ctx.peer_credential_registry
+        .record_launch_provenance(bound_ticket, Some(child_peer_identity(child.id())));
+    std::fs::write(&go_file, b"go").expect("release the child go-file");
+
+    let server_ctx = ctx.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept peer auth client");
+        handle_client(stream, server_ctx).await
+    });
+
+    let status = child.wait().expect("peer auth child exited");
+    assert!(
+        status.success(),
+        "peer presenting the wrong token value must be denied owner-class admission"
+    );
+
+    let _ = server.await;
+}
+
+/// Production spawn boundary: `spawn_detached*` mints a one-time launch
+/// ticket, delivers it through the daemon child's spawn environment, and
+/// retains the matching ticket in the launcher process. Every spawn mints
+/// a fresh, well-formed ticket, and the daemon child holds the exact copy
+/// the launcher retained.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_spawn_mints_and_delivers_the_launch_ticket_to_the_child() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let first = crate::daemon::spawn_detached(false).expect("first daemon child");
+    let first_ticket = cockpit_client::launch_provenance::process_launch_ticket()
+        .expect("launcher retains the minted launch ticket");
+    // A second isolation root so the second daemon child owns its own
+    // lifecycle paths (the first child may hold them for its lifetime).
+    let second_root = tempfile::tempdir().expect("second isolated home root");
+    env.set_isolated_home(second_root.path());
+    let second = crate::daemon::spawn_detached(false).expect("second daemon child");
+    let second_ticket = cockpit_client::launch_provenance::process_launch_ticket()
+        .expect("launcher retains the minted launch ticket");
+    assert_ne!(
+        first_ticket, second_ticket,
+        "every daemon spawn must mint a fresh launch ticket"
+    );
+
+    for (child, ticket) in [(first, &first_ticket), (second, &second_ticket)] {
+        assert_eq!(ticket.len(), 64);
+        assert!(
+            ticket
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "launch tickets are 64 lowercase hex characters"
+        );
+        let prefix = format!(
+            "{}=",
+            crate::daemon::peer_authority::DAEMON_LAUNCH_TICKET_ENV
+        );
+        // Poll briefly: `/proc/<pid>/environ` shows the parent's environment
+        // in the fork-before-exec window, and the daemon child may also exit
+        // immediately (for example when a sibling daemon already holds the
+        // lifecycle reservation).
+        let mut delivered = None;
+        for _ in 0..200 {
+            if let Ok(environ) = std::fs::read(format!("/proc/{child}/environ")) {
+                delivered = environ
+                    .split(|byte| *byte == 0)
+                    .find_map(|entry| entry.strip_prefix(prefix.as_bytes()))
+                    .map(|value| value.to_vec());
+                if delivered.is_some() {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let delivered = delivered
+            .expect("the daemon child receives the launch ticket in its spawn environment");
+        assert_eq!(
+            delivered,
+            ticket.as_bytes(),
+            "the child env carries the exact ticket the launcher retained"
+        );
+        kill_daemon_child(child);
+    }
+}
+
+/// Hard-kill a spawned daemon child and reap it so a test never leaves a
+/// detached foreground daemon (or a zombie) behind. The detach spawn path
+/// only moves the child into its own process group; it stays a direct
+/// child of this process, so a pid-specific waitpid reaps it without
+/// touching any other test-spawned child.
+#[cfg(unix)]
+fn kill_daemon_child(pid: u32) {
+    let pid = i32::try_from(pid).expect("daemon child pid fits i32");
+    // SAFETY: SIGKILL targets exactly the child this test spawned through
+    // the production detach path. A missing pid (ESRCH) is the happy path
+    // for an already-exited child.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let mut status = 0;
+        // SAFETY: waitpid restricted to this child's pid; it cannot steal
+        // another test thread's child exit status.
+        let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if rc == pid
+            || (rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+        {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Production boot recording boundary: `DaemonContext::new` records the
+/// launch ticket from the spawn environment, scrubs the environment slot
+/// so descendants never inherit it, and binds the ticket to the daemon's
+/// launcher. Only that launcher identity with that exact ticket verifies.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_context_records_launch_provenance_from_the_spawn_environment() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let ticket = crate::daemon::peer_authority::mint_launch_ticket();
+    env.set_var(
+        crate::daemon::peer_authority::DAEMON_LAUNCH_TICKET_ENV,
+        &ticket,
+    );
+    let child_executable =
+        std::fs::canonicalize(discover_peer_auth_child_executable()).expect("child executable");
+    let ctx = peer_auth_admission_test_ctx(child_executable);
+
+    // The boot path scrubs the environment slot before any descendant exists.
+    assert!(
+        std::env::var(crate::daemon::peer_authority::DAEMON_LAUNCH_TICKET_ENV).is_err(),
+        "the launch ticket must not stay in the daemon environment"
+    );
+
+    let launcher = crate::daemon::peer_authority::capture_launcher_identity()
+        .expect("the daemon parent is observable at boot");
+    assert!(
+        ctx.peer_credential_registry
+            .verify_launch_provenance(Some(&ticket), launcher.clone()),
+        "the recorded provenance must verify for the launcher presenting its ticket"
+    );
+    let mut impostor = launcher.clone();
+    impostor.pid = impostor.pid.wrapping_add(1);
+    assert!(
+        !ctx.peer_credential_registry
+            .verify_launch_provenance(Some(&ticket), impostor),
+        "a different process presenting the right ticket must stay denied"
+    );
+    assert!(
+        !ctx.peer_credential_registry
+            .verify_launch_provenance(None, launcher.clone()),
+        "the launcher without a ticket must stay denied"
+    );
+    let wrong_ticket = crate::daemon::peer_authority::mint_launch_ticket();
+    assert!(
+        !ctx.peer_credential_registry
+            .verify_launch_provenance(Some(&wrong_ticket), launcher),
+        "the launcher presenting any other ticket value must stay denied"
+    );
 }
 
 async fn trust_workspace_root(ctx: &DaemonContext, path: &Path) {
@@ -13290,6 +13876,7 @@ async fn image_generation_survives_save_extended_config_and_stays_rpc_mutable() 
 /// `BadRequest` by the `ImageGenerationConfig::new` funnel before anything is
 /// written or the generation is bumped.
 #[tokio::test]
+#[cfg(feature = "extended")]
 async fn image_control_mutation_rejects_malformed_payload_after_generation_cas() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -15542,6 +16129,7 @@ async fn remote_fs_write_real_ingress_applies_once_replays_and_conflicts_on_chan
             &mut state,
             &mut shared,
             &ctx,
+            test_principal_tx!(),
             &event_cmd_tx,
             &writer_tx,
             &mut concurrent,
@@ -15564,6 +16152,7 @@ async fn remote_fs_write_real_ingress_applies_once_replays_and_conflicts_on_chan
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -16715,7 +17304,11 @@ async fn attached_state_with_worker_receiver(
     (
         MutableClientState {
             principal: ClientPrincipal::owner(),
+            socket_peer: None,
             has_owner_capability: true,
+            active_peer_credential: None,
+            peer_credential_expires_at_unix_ms: None,
+            presented_owner_capability: None,
             terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
                 principal_id: "local-owner".into(),
                 client_instance_id: Uuid::new_v4(),
@@ -17752,6 +18345,7 @@ async fn client_state_split_concurrent_entry_point_authorizes_before_work() {
     let state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         remote_principal(),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -19611,6 +20205,21 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
     ]
 }
 
+fn test_socket_peer() -> cockpit_host::peer_cred::PeerIdentity {
+    let pid = std::process::id();
+    #[cfg(unix)]
+    let (uid, gid) = (unsafe { libc::getuid() }, unsafe { libc::getgid() });
+    #[cfg(not(unix))]
+    let (uid, gid) = (0_u32, 0_u32);
+    cockpit_host::peer_cred::PeerIdentity {
+        pid,
+        uid,
+        gid,
+        process_start: cockpit_host::daemon_lifecycle::process_start_identity(pid)
+            .expect("process start identity"),
+    }
+}
+
 fn test_stream_pair() -> (
     impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -19686,6 +20295,7 @@ async fn dispatch_authz_request_after(
         principal,
         Uuid::new_v4(),
         has_owner_capability,
+        None,
     ));
     match recv_body(&mut client).await {
         Body::Response { id, response } => {
@@ -21228,6 +21838,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             request_id: "missing".into(),
             session_id: None,
         },
+        #[cfg(feature = "extended")]
         "create_scheduled_job" => Request::CreateScheduledJob {
             job: proto::ScheduledJobCreate {
                 id: "job-authz".into(),
@@ -21240,14 +21851,18 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 missed_run_policy: proto::MissedRunPolicy::Skip,
             },
         },
+        #[cfg(feature = "extended")]
         "list_scheduled_jobs" => Request::ListScheduledJobs { owner: None },
+        #[cfg(feature = "extended")]
         "delete_scheduled_job" => Request::DeleteScheduledJob {
             id: "job-authz".into(),
         },
+        #[cfg(feature = "extended")]
         "set_scheduled_job_enabled" => Request::SetScheduledJobEnabled {
             id: "job-authz".into(),
             enabled: true,
         },
+        #[cfg(feature = "extended")]
         "run_scheduled_job" => Request::RunScheduledJob {
             id: "job-authz".into(),
         },
@@ -21641,33 +22256,40 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "get_image_spend_policy" => Request::GetImageSpendPolicy {
             project_key: root.clone(),
         },
+        #[cfg(feature = "extended")]
         "image_endpoint_list" => Request::ImageEndpointList {
             project_root: root.clone(),
             limit: None,
             cursor: None,
         },
+        #[cfg(feature = "extended")]
         "image_endpoint_get" => Request::ImageEndpointGet {
             project_root: root.clone(),
             endpoint_id: "ep-authz".into(),
         },
+        #[cfg(feature = "extended")]
         "image_target_list" => Request::ImageTargetList {
             project_root: root.clone(),
             limit: None,
             cursor: None,
         },
+        #[cfg(feature = "extended")]
         "image_target_get" => Request::ImageTargetGet {
             project_root: root.clone(),
             target_id: "t-authz".into(),
         },
+        #[cfg(feature = "extended")]
         "image_workflow_list" => Request::ImageWorkflowList {
             project_root: root.clone(),
             limit: None,
             cursor: None,
         },
+        #[cfg(feature = "extended")]
         "image_workflow_get" => Request::ImageWorkflowGet {
             project_root: root.clone(),
             workflow_id: "wf-authz".into(),
         },
+        #[cfg(feature = "extended")]
         "image_endpoint_create" => Request::ImageEndpointCreate {
             client_operation_id: "image-op".into(),
             mutation_intent_hash: "aa".repeat(32),
@@ -21679,6 +22301,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 "cc".repeat(32),
             ),
         },
+        #[cfg(feature = "extended")]
         "image_endpoint_update" => Request::ImageEndpointUpdate {
             client_operation_id: "image-op".into(),
             mutation_intent_hash: "aa".repeat(32),
@@ -21691,6 +22314,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 "cc".repeat(32),
             ),
         },
+        #[cfg(feature = "extended")]
         "image_endpoint_delete" => Request::ImageEndpointDelete {
             client_operation_id: "image-op".into(),
             mutation_intent_hash: "aa".repeat(32),
@@ -21702,6 +22326,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 "cc".repeat(32),
             ),
         },
+        #[cfg(feature = "extended")]
         "image_target_create" => Request::ImageTargetCreate {
             client_operation_id: "image-op".into(),
             mutation_intent_hash: "aa".repeat(32),
@@ -21713,6 +22338,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 "cc".repeat(32),
             ),
         },
+        #[cfg(feature = "extended")]
         "image_target_update" => Request::ImageTargetUpdate {
             client_operation_id: "image-op".into(),
             mutation_intent_hash: "aa".repeat(32),
@@ -21725,6 +22351,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 "cc".repeat(32),
             ),
         },
+        #[cfg(feature = "extended")]
         "image_target_delete" => Request::ImageTargetDelete {
             client_operation_id: "image-op".into(),
             mutation_intent_hash: "aa".repeat(32),
@@ -21736,6 +22363,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 "cc".repeat(32),
             ),
         },
+        #[cfg(feature = "extended")]
         "image_target_set_default" => Request::ImageTargetSetDefault {
             client_operation_id: "image-op".into(),
             mutation_intent_hash: "aa".repeat(32),
@@ -21747,6 +22375,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 "cc".repeat(32),
             ),
         },
+        #[cfg(feature = "extended")]
         "image_workflow_upload" => Request::ImageWorkflowUpload {
             client_operation_id: "image-op".into(),
             mutation_intent_hash: "aa".repeat(32),
@@ -21758,6 +22387,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 "cc".repeat(32),
             ),
         },
+        #[cfg(feature = "extended")]
         "image_workflow_bind" => Request::ImageWorkflowBind {
             client_operation_id: "image-op".into(),
             mutation_intent_hash: "aa".repeat(32),
@@ -21770,6 +22400,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 "cc".repeat(32),
             ),
         },
+        #[cfg(feature = "extended")]
         "image_workflow_delete" => Request::ImageWorkflowDelete {
             client_operation_id: "image-op".into(),
             mutation_intent_hash: "aa".repeat(32),
@@ -23112,6 +23743,7 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "record_session_note"
         | "delete_session" => assert_session_db_mutating_happy(case.kind).await,
         "promote_resource" => assert_promote_resource_happy().await,
+        #[cfg(feature = "extended")]
         "create_scheduled_job"
         | "delete_scheduled_job"
         | "set_scheduled_job_enabled"
@@ -23387,6 +24019,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
             };
             assert_eq!(status, proto::ResourcePromoteStatus::NotFound);
         }
+        #[cfg(feature = "extended")]
         "create_scheduled_job"
         | "delete_scheduled_job"
         | "set_scheduled_job_enabled"
@@ -25451,6 +26084,7 @@ async fn assert_terminal_mutating_happy(kind: &str) {
                 ClientPrincipal::owner(),
                 Uuid::new_v4(),
                 true,
+                None,
             ));
             match recv_body(&mut client).await {
                 Body::Response { id, response } => {
@@ -25529,6 +26163,7 @@ async fn assert_terminal_ingress_mutating_happy(kind: &str) {
         ClientPrincipal::owner(),
         Uuid::new_v4(),
         true,
+        None,
     ));
     // Consume hello.
     match recv_body(&mut client).await {
@@ -26758,6 +27393,7 @@ async fn assert_promote_resource_happy() {
     assert_eq!(status, proto::ResourcePromoteStatus::Promoted);
 }
 
+#[cfg(feature = "extended")]
 async fn assert_scheduler_shared_only_dispatch(kind: &str) {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -26773,6 +27409,7 @@ async fn assert_scheduler_shared_only_dispatch(kind: &str) {
     );
 }
 
+#[cfg(feature = "extended")]
 async fn assert_scheduler_dispatch_happy(kind: &str) {
     let ctx = persistent_test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -27615,6 +28252,7 @@ async fn pending_host_capability_refresh_does_not_block_same_client_interrupt_re
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -27645,6 +28283,7 @@ async fn pending_host_capability_refresh_does_not_block_same_client_interrupt_re
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -27681,7 +28320,7 @@ async fn pending_host_capability_refresh_does_not_block_same_client_interrupt_re
     ));
 }
 
-#[cfg(feature = "remote")]
+#[cfg(all(feature = "remote", feature = "extended"))]
 #[tokio::test]
 async fn command_table_metadata_is_exhaustive_and_stable() {
     struct CommandMetadataCase {
@@ -30150,6 +30789,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         ClientPrincipal::owner(),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -30803,6 +31443,7 @@ async fn image_submission_exact_retry_case() {
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         ClientPrincipal::owner(),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -30942,6 +31583,7 @@ async fn image_submission_exact_retry_case() {
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         ClientPrincipal::owner(),
+        None,
         ctx.terminal_host.clone(),
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
@@ -34684,7 +35326,12 @@ async fn serialized_requests_apply_in_receipt_order() {
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
         true,
+        None,
         executor_rx,
+        {
+            let (principal_tx, _) = tokio::sync::watch::channel(ClientPrincipal::owner());
+            principal_tx
+        },
         event_cmd_tx,
         writer_tx,
     ));
@@ -34864,7 +35511,12 @@ async fn concurrent_requests_may_complete_out_of_order() {
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
         true,
+        None,
         executor_rx,
+        {
+            let (principal_tx, _) = tokio::sync::watch::channel(ClientPrincipal::owner());
+            principal_tx
+        },
         event_cmd_tx,
         writer_tx,
     ));
@@ -34921,9 +35573,10 @@ async fn slow_request_does_not_block_event_forwarding() {
     let (event_cmd_tx, event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (executor_tx, executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (principal_tx, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner());
     let event_task = tokio::spawn(run_client_event_forwarder(
         ctx.clone(),
-        ClientPrincipal::owner(),
+        principal_rx,
         global_rx,
         event_cmd_rx,
         executor_tx.clone(),
@@ -34935,7 +35588,9 @@ async fn slow_request_does_not_block_event_forwarding() {
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
         true,
+        None,
         executor_rx,
+        principal_tx,
         event_cmd_tx,
         writer_tx,
     ));
@@ -34988,7 +35643,12 @@ async fn concurrent_request_panic_yields_internal_error_and_keeps_connection() {
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
         true,
+        None,
         executor_rx,
+        {
+            let (principal_tx, _) = tokio::sync::watch::channel(ClientPrincipal::owner());
+            principal_tx
+        },
         event_cmd_tx,
         writer_tx,
     ));
@@ -35046,7 +35706,12 @@ async fn blocking_fs_handler_panic_keeps_client_connection() {
         Uuid::new_v4(),
         next_terminal_connection_epoch(),
         true,
+        None,
         executor_rx,
+        {
+            let (principal_tx, _) = tokio::sync::watch::channel(ClientPrincipal::owner());
+            principal_tx
+        },
         event_cmd_tx,
         writer_tx,
     ));
@@ -35105,6 +35770,7 @@ async fn concurrent_request_semaphore_applies_backpressure_not_drops() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -35137,9 +35803,10 @@ async fn client_io_split_slow_request_does_not_block_event_forwarding() {
     let (_event_cmd_tx, event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (executor_tx, _executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (_, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner());
     let event_task = tokio::spawn(run_client_event_forwarder(
         ctx,
-        ClientPrincipal::owner(),
+        principal_rx,
         global_rx,
         event_cmd_rx,
         executor_tx,
@@ -35193,6 +35860,7 @@ async fn client_io_split_reader_eof_tears_down_all_tasks() {
         ClientPrincipal::owner(),
         Uuid::new_v4(),
         true,
+        None,
     ));
     drop(client);
     tokio::time::timeout(std::time::Duration::from_secs(2), task)
@@ -35213,6 +35881,7 @@ async fn hello_only_probe_does_not_claim_client_lifetime() {
         ClientPrincipal::owner(),
         Uuid::new_v4(),
         true,
+        None,
     ));
     let mut client = ProtoStream::new(client);
 
@@ -35293,6 +35962,7 @@ async fn attach_replay_precedes_live_events_under_task_split() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -35387,6 +36057,7 @@ async fn attach_replay_precedes_live_events_under_concurrency() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -35416,6 +36087,7 @@ async fn attach_replay_precedes_live_events_under_concurrency() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -35477,9 +36149,10 @@ async fn client_io_split_detach_silences_session_events() {
     let (event_cmd_tx, event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (executor_tx, _executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (_, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner());
     let event_task = tokio::spawn(run_client_event_forwarder(
         ctx,
-        ClientPrincipal::owner(),
+        principal_rx,
         global_rx,
         event_cmd_rx,
         executor_tx,
@@ -35548,9 +36221,10 @@ async fn broadcast_lag_emits_typed_event_not_internal_error() {
     let (event_cmd_tx, event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (executor_tx, _executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (_, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner());
     let event_task = tokio::spawn(run_client_event_forwarder(
         ctx,
-        ClientPrincipal::owner(),
+        principal_rx,
         global_rx,
         event_cmd_rx,
         executor_tx,
@@ -35657,6 +36331,8 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         redaction_key_resolver: base.redaction_key_resolver.clone(),
         paths: base.paths.clone(),
         owner_capability: base.owner_capability.clone(),
+        approved_client_executable: base.approved_client_executable.clone(),
+        peer_credential_registry: base.peer_credential_registry.clone(),
         canonical_cwd: base.canonical_cwd.clone(),
         fcor_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
         started_at: base.started_at,
@@ -35680,6 +36356,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         connector_wake: base.connector_wake.clone(),
         #[cfg(feature = "remote")]
         remote_operation_locks: base.remote_operation_locks.clone(),
+        #[cfg(feature = "extended")]
         scheduler: base.scheduler.clone(),
         promoted_persistent_services: StdMutex::new(PromotedPersistentServices::empty()),
         image_generation_boot_id: base.image_generation_boot_id,
@@ -35880,6 +36557,8 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         redaction_key_resolver: base.redaction_key_resolver.clone(),
         paths: base.paths.clone(),
         owner_capability: base.owner_capability.clone(),
+        approved_client_executable: base.approved_client_executable.clone(),
+        peer_credential_registry: base.peer_credential_registry.clone(),
         canonical_cwd: base.canonical_cwd.clone(),
         fcor_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
         started_at: base.started_at,
@@ -35903,6 +36582,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         connector_wake: base.connector_wake.clone(),
         #[cfg(feature = "remote")]
         remote_operation_locks: base.remote_operation_locks.clone(),
+        #[cfg(feature = "extended")]
         scheduler: base.scheduler.clone(),
         promoted_persistent_services: StdMutex::new(PromotedPersistentServices::empty()),
         image_generation_boot_id: base.image_generation_boot_id,
@@ -36311,7 +36991,11 @@ async fn btw_concurrent_with_parent_turn() {
         SessionWorkerHandle::test_handle_with_receiver(parent_session, ctx.registry.locks());
     let mut parent_state = MutableClientState {
         principal: ClientPrincipal::owner(),
+        socket_peer: None,
         has_owner_capability: true,
+        active_peer_credential: None,
+        peer_credential_expires_at_unix_ms: None,
+        presented_owner_capability: None,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "local-owner".into(),
             client_instance_id: Uuid::new_v4(),
@@ -36395,7 +37079,11 @@ async fn btw_concurrent_with_parent_turn() {
         SessionWorkerHandle::test_handle_with_receiver(btw_session, ctx.registry.locks());
     let mut btw_state = MutableClientState {
         principal: ClientPrincipal::owner(),
+        socket_peer: None,
         has_owner_capability: true,
+        active_peer_credential: None,
+        peer_credential_expires_at_unix_ms: None,
+        presented_owner_capability: None,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "local-owner".into(),
             client_instance_id: Uuid::new_v4(),
@@ -36991,6 +37679,7 @@ async fn attach_replays_drain_state_after_attached_response() {
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_cmd_tx,
         &writer_tx,
         &mut concurrent,
@@ -38170,6 +38859,7 @@ async fn server_answers_too_new_request_with_protocol_version_error() {
         ClientPrincipal::owner(),
         Uuid::new_v4(),
         false,
+        None,
     ));
     let mut client = ProtoStream::new(client_stream);
 
@@ -38286,6 +38976,7 @@ async fn server_responses_use_negotiated_client_protocol_version() {
         ClientPrincipal::owner(),
         Uuid::new_v4(),
         false,
+        None,
     ));
     let mut client =
         ProtoStream::with_version(client_stream, proto::MIN_SUPPORTED_PROTOCOL_VERSION);
@@ -38336,6 +39027,7 @@ async fn unknown_frame_request_gets_unsupported_error_and_connection_survives() 
         ClientPrincipal::owner(),
         Uuid::new_v4(),
         false,
+        None,
     ));
     let mut client = ProtoStream::new(client_stream);
 
@@ -38403,6 +39095,7 @@ async fn unknown_frame_event_is_dropped_and_connection_survives() {
         ClientPrincipal::owner(),
         Uuid::new_v4(),
         false,
+        None,
     ));
     let mut client = ProtoStream::new(client_stream);
 
@@ -40792,9 +41485,10 @@ async fn socket_live_interrupt_provenance_tracks_the_attachment_that_received_th
     let old_rendered = Arc::new(StdMutex::new(HashSet::new()));
     let new_rendered = Arc::new(StdMutex::new(HashSet::new()));
     let session_id = Uuid::new_v4();
+    let (_, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner());
     let task = tokio::spawn(run_client_event_forwarder(
         ctx.clone(),
-        ClientPrincipal::owner(),
+        principal_rx,
         ctx.subscribe_global(),
         event_cmd_rx,
         executor_tx,
@@ -40888,9 +41582,10 @@ async fn socket_live_interrupt_provenance_tracks_the_attachment_that_received_th
     drop(writer_rx);
     let failed_rendered = Arc::new(StdMutex::new(HashSet::new()));
     let failed_id = Uuid::new_v4();
+    let (_, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner());
     let failed_task = tokio::spawn(run_client_event_forwarder(
         ctx.clone(),
-        ClientPrincipal::owner(),
+        principal_rx,
         ctx.subscribe_global(),
         event_cmd_rx,
         executor_tx,

@@ -166,6 +166,7 @@ pub(crate) enum RootNodeId {
     ImageSpend,
     #[cfg(feature = "extended")]
     Generation,
+    #[cfg(feature = "extended")]
     ImageSidecar,
     Translation,
     Tools,
@@ -188,6 +189,7 @@ impl RootNodeId {
         Self::ImageSpend,
         #[cfg(feature = "extended")]
         Self::Generation,
+        #[cfg(feature = "extended")]
         Self::ImageSidecar,
         Self::Translation,
         Self::Tools,
@@ -210,6 +212,7 @@ impl RootNodeId {
             Self::ImageSpend => "Image spend budgets",
             #[cfg(feature = "extended")]
             Self::Generation => "Generation",
+            #[cfg(feature = "extended")]
             Self::ImageSidecar => "Image Sidecar",
             Self::Translation => "Translation",
             Self::Tools => "Tools",

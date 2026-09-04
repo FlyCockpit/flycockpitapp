@@ -145,6 +145,7 @@ pub mod models;
 pub mod packages;
 pub mod providers;
 pub mod run;
+#[cfg(feature = "extended")]
 pub mod schedule;
 pub mod session;
 pub mod setup;

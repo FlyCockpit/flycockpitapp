@@ -1735,6 +1735,7 @@ impl Approver {
     /// Fail-closed everywhere: a missing decision input (a grant that does not
     /// yet exist) never fakes an allow — Manual/Auto fall through to a human
     /// prompt rather than assume a grant.
+    #[cfg(feature = "extended")]
     pub(super) async fn approve_image_generation_inner(
         &self,
         facts: ImageGenerationAuthzFacts<'_>,
@@ -1823,6 +1824,7 @@ impl Approver {
     /// scope is checked first, then project scope (bound to the live session's
     /// machine-local `project_id`). Fails closed on any lookup error or when no
     /// session is attached: no grant ever fakes an allow.
+    #[cfg(feature = "extended")]
     async fn image_generation_grant_matches(
         &self,
         facts: &ImageGenerationAuthzFacts<'_>,
@@ -1852,6 +1854,7 @@ impl Approver {
     /// dismiss (deny). A session/project decision is persisted as a standing
     /// grant only after the dispatch service has durably queued the exact job,
     /// so a failed commit never leaves authorization behind.
+    #[cfg(feature = "extended")]
     async fn raise_image_generation_prompt(
         &self,
         facts: &ImageGenerationAuthzFacts<'_>,

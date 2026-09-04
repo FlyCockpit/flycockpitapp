@@ -1,16 +1,19 @@
-//! Signer-owned identity-status table.
+//! Signer-owned identity-status table (**reference contract**).
 //!
 //! Keyed by exact `(tenantId,authorityId,subjectKind,subjectId,generation)`
-//! and stores internal `active|superseded|revoked`, authority epoch, subject
-//! state generation, and safe timestamps, with exactly one active generation
-//! per subject. A successful `AuthorizeDeviceEnrollmentV1(action=enroll)`
-//! reserve/finalize transaction atomically inserts the one `active` row with
-//! the authorization result; the proposed subject supplies no FCTV. A
-//! successful `action=rotate` commit atomically CAS-closes the old active row
-//! as `superseded`, inserts the exact next active generation, and finalizes
-//! the same FCTO/audit/outbox; partial transition is impossible. Operation 10
-//! emits external `revoked` for a known superseded generation, never active,
-//! while unknown/wrong-scope remains non-enumerating.
+//! and is specified to store internal `active|superseded|revoked`, authority
+//! epoch, subject state generation, and safe timestamps, with exactly one
+//! active generation per subject. A successful
+//! `AuthorizeDeviceEnrollmentV1(action=enroll)` reserve/finalize transaction
+//! would atomically insert the one `active` row with the authorization result;
+//! the proposed subject supplies no FCTV. A successful `action=rotate` commit
+//! would atomically CAS-close the old active row as `superseded`, insert the
+//! exact next active generation, and finalize the same FCTO/audit/outbox;
+//! partial transition is impossible. Operation 10 emits external `revoked`
+//! for a known superseded generation, never active, while unknown/wrong-scope
+//! remains non-enumerating. **Durable persistence and atomic finalization are
+//! not implemented**; this module provides pure state-machine types and helpers
+//! only.
 
 pub use cockpit_proto::remote_identity_protocol::SubjectKind;
 

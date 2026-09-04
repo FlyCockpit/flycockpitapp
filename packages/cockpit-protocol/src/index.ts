@@ -907,6 +907,9 @@ export type PendingGuidanceProposal = z.infer<typeof pendingGuidanceProposalSche
 export const queueDeliveryClassSchema = z.enum(["steering", "held"]);
 export type QueueDeliveryClass = z.infer<typeof queueDeliveryClassSchema>;
 
+export const localClientRoleSchema = z.enum(["tui", "cli", "acp", "agent_child"]);
+export type LocalClientRole = z.infer<typeof localClientRoleSchema>;
+
 const requestParamSchemas = {
   get_storage_report: z.undefined(),
   get_app_flag: z
@@ -1145,6 +1148,7 @@ const requestParamSchemas = {
     .object({ interrupt_id: uuidSchema, response: resolveResponseSchema })
     .strict(),
   promote_to_persistent: z.undefined(),
+  exchange_local_peer_credential: z.undefined(),
   cancel_all_session_work: z.undefined(),
   exit_guard_status: z.undefined(),
   release_exit_guard: z.undefined(),
@@ -1487,6 +1491,7 @@ const clientRequestVariants = [
   requestVariant("rename_session", requestParamSchemas.rename_session),
   requestVariant("resolve_interrupt", requestParamSchemas.resolve_interrupt),
   requestVariantNoParams("promote_to_persistent"),
+  requestVariantNoParams("exchange_local_peer_credential"),
   requestVariantNoParams("cancel_all_session_work"),
   requestVariantNoParams("exit_guard_status"),
   requestVariantNoParams("release_exit_guard"),
@@ -1653,6 +1658,7 @@ export const responseNameSchema = z.enum([
   "run_invocation_status",
   "remote_operation_status",
   "run_invocation_cancel_result",
+  "local_peer_credential",
   "session_messages",
   "session_live_status",
   "storage_report",
@@ -2316,6 +2322,15 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
       .passthrough(),
   ),
   responseVariant(
+    "local_peer_credential",
+    z
+      .object({
+        token: z.string().min(1),
+        role: localClientRoleSchema,
+      })
+      .strict(),
+  ),
+  responseVariant(
     "subagent_history_page",
     z
       .object({
@@ -2766,6 +2781,7 @@ export const knownEventKindSchema = z.enum([
   "session_ended",
   "session_persist_failed",
   "skill_auto_injected",
+  "subagent_compacted",
   "subagent_report",
   "subagent_routing",
   "subagent_spawned",

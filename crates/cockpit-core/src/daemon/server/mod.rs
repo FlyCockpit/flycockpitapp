@@ -26,9 +26,7 @@ use tokio::net::windows::named_pipe::NamedPipeServer;
 
 #[cfg(any(unix, windows))]
 use crate::daemon::{DaemonListener, DaemonStream};
-#[cfg(feature = "remote")]
-use tokio::sync::watch;
-use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
@@ -41,6 +39,7 @@ use crate::daemon::proto::{
     RecvFrame, Request, Response,
 };
 use crate::daemon::registry::SessionRegistry;
+#[cfg(feature = "extended")]
 use crate::daemon::scheduler::DaemonSchedulerHandle;
 use crate::daemon::session_worker::{SessionWork, SessionWorkerHandle, UserMessageProbeResult};
 use crate::daemon::shutdown::ShutdownPhase;
@@ -70,41 +69,34 @@ const MAX_CONCURRENT_CLIENT_REQUESTS: usize = 16;
 static IN_PROCESS_CONTEXTS: OnceLock<StdMutex<HashMap<PathBuf, RegisteredInProcessContext>>> =
     OnceLock::new();
 
+#[cfg(feature = "extended")]
 fn start_persistent_scheduler(
     db: &Db,
     registry: &SessionRegistry,
     shutdown: &crate::daemon::shutdown::ShutdownSignal,
     start_gate: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Option<DaemonSchedulerHandle> {
-    #[cfg(feature = "extended")]
-    {
-        let executor = Arc::new(crate::daemon::scheduler::ProductionJobExecutor::new(
+    let executor = Arc::new(crate::daemon::scheduler::ProductionJobExecutor::new(
+        db.clone(),
+        registry.clone(),
+    ));
+    // Keep daemon-owned callbacks next to the production executor so every
+    // durable scheduler startup path (initial boot and in-place promotion)
+    // has the same callback inventory before it can dispatch work.
+    let keep_warm_registry = registry.clone();
+    executor.register_callback("keep_warm", move |job| {
+        let registry = keep_warm_registry.clone();
+        async move { registry.run_keep_warm_job(job).await }
+    });
+    let callbacks = executor.callback_registry();
+    Some(
+        Arc::new(crate::daemon::scheduler::DaemonScheduler::new(
             db.clone(),
-            registry.clone(),
-        ));
-        // Keep daemon-owned callbacks next to the production executor so every
-        // durable scheduler startup path (initial boot and in-place promotion)
-        // has the same callback inventory before it can dispatch work.
-        let keep_warm_registry = registry.clone();
-        executor.register_callback("keep_warm", move |job| {
-            let registry = keep_warm_registry.clone();
-            async move { registry.run_keep_warm_job(job).await }
-        });
-        let callbacks = executor.callback_registry();
-        Some(
-            Arc::new(crate::daemon::scheduler::DaemonScheduler::new(
-                db.clone(),
-                Arc::new(crate::daemon::scheduler::SystemClock),
-                executor,
-            ))
-            .start_with_callbacks_gated(shutdown.clone(), callbacks, start_gate),
-        )
-    }
-    #[cfg(not(feature = "extended"))]
-    {
-        let _ = (db, registry, shutdown, start_gate);
-        None
-    }
+            Arc::new(crate::daemon::scheduler::SystemClock),
+            executor,
+        ))
+        .start_with_callbacks_gated(shutdown.clone(), callbacks, start_gate),
+    )
 }
 
 fn daemon_process_env() -> HashMap<String, String> {
@@ -173,7 +165,7 @@ fn scrub_event_for_principal(
     principal: &ClientPrincipal,
     envelope: EventEnvelope,
 ) -> Option<proto::Event> {
-    if principal.is_owner() {
+    if principal.has_owner_level_authority() {
         return Some(envelope.event);
     }
     scrub_proto_event(envelope.event, &envelope.redact)
@@ -199,7 +191,7 @@ fn scrub_history_for_principal(
     history: Vec<proto::HistoryEntry>,
     redact: &RedactionTable,
 ) -> Vec<proto::HistoryEntry> {
-    if principal.is_owner() {
+    if principal.has_owner_level_authority() {
         return history;
     }
     history
@@ -635,13 +627,17 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             scrub_string(message, redact);
             scrub_resource_scheduler_snapshot(snapshot, redact);
         }
+        #[cfg(feature = "extended")]
         proto::Response::ScheduledJob { job } => scrub_scheduled_job_summary(job, redact),
+        #[cfg(feature = "extended")]
         proto::Response::ScheduledJobs { jobs } => {
             for job in jobs {
                 scrub_scheduled_job_summary(job, redact);
             }
         }
+        #[cfg(feature = "extended")]
         proto::Response::ScheduledJobDeleted { id: _, deleted: _ } => {}
+        #[cfg(feature = "extended")]
         proto::Response::ScheduledJobRunQueued { id: _ } => {}
         proto::Response::FsList {
             entries,
@@ -981,17 +977,20 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         // secret material and is likewise not re-scrubbed. The remaining strings
         // are non-secret config identifiers (display names, model names,
         // origins).
+        #[cfg(feature = "extended")]
         proto::Response::ImageControlRead(..) => {}
         // Redacted image-control config-mutation reply. Its change set carries
         // only `cockpit_proto::image_control` safe projections (credential_ref/
         // headers/graph_json/source_urls are dropped at the projection funnel,
         // exactly like the sibling `ImageControlRead` above), so there is no
         // secret free text to scrub.
+        #[cfg(feature = "extended")]
         proto::Response::ImageControlMutated(..) => {}
         // Image-sidecar authority projections contain only daemon-generated
         // ids, normalized destinations, closed enums, and timestamps.
         proto::Response::ImageSidecarAuthoritySnapshot(..)
         | proto::Response::ImageSidecarGrantMutated(..) => {}
+        proto::Response::LocalPeerCredential { .. } => {}
         proto::Response::Unknown => {}
     }
 }
@@ -1066,13 +1065,6 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             done: _,
             total: _,
         }
-        // Redacted LOCAL image-control `config_changed` event. Its change set
-        // carries only the `cockpit_proto::image_control` safe projections
-        // (every secret-bearing field — credential_ref/headers/graph_json/
-        // source_url — is dropped at the projection funnel, exactly like the
-        // sibling `ImageControlRead` response above), so there is no free text
-        // to scrub.
-        | proto::Event::ImageControlConfigChanged { event: _ }
         | proto::Event::ContextProjection {
             session_id: _,
             prunable_tokens: _,
@@ -1131,9 +1123,9 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             dropped: _,
         }
         | proto::Event::DaemonDraining { forced: _ }
-        | proto::Event::DaemonLifetimeChanged {
-            ephemeral_owner: _,
-        } => {}
+        | proto::Event::DaemonLifetimeChanged { ephemeral_owner: _ } => {}
+        #[cfg(feature = "extended")]
+        proto::Event::ImageControlConfigChanged { event: _ } => {}
         proto::Event::ThinkingStarted {
             session_id: _,
             agent: _,
@@ -1238,7 +1230,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             session_id: _,
             seq: _,
             client_submission_ids: _,
-        } => {},
+        } => {}
         proto::Event::QueuedUserMessagesFolded {
             session_id: _,
             text,
@@ -1417,6 +1409,23 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             scrub_string(label, redact);
             scrub_string(report, redact);
             scrub_json_strings(routing, redact);
+        }
+        proto::Event::SubagentCompacted {
+            session_id: _,
+            agent: _,
+            task_call_id: _,
+            label,
+            source,
+            trigger_ctx_pct: _,
+            tokens_before: _,
+            tokens_after: _,
+            turns_summarized: _,
+            tail_kept: _,
+            tail_trimmed: _,
+            window_index: _,
+        } => {
+            scrub_string(label, redact);
+            scrub_string(source, redact);
         }
         proto::Event::NestedTurn {
             session_id: _,
@@ -2133,6 +2142,7 @@ fn scrub_model_summary(model: &mut proto::ModelSummary, redact: &RedactionTable)
     scrub_option_string(display_name, redact);
 }
 
+#[cfg(feature = "extended")]
 fn scrub_scheduled_job_summary(job: &mut proto::ScheduledJobSummary, redact: &RedactionTable) {
     let proto::ScheduledJobSummary {
         id: _,
@@ -2165,6 +2175,7 @@ fn scrub_scheduled_job_summary(job: &mut proto::ScheduledJobSummary, redact: &Re
     scrub_option_string(disabled_notice, redact);
 }
 
+#[cfg(feature = "extended")]
 fn scrub_scheduled_job_last_result(
     result: &mut proto::ScheduledJobLastResult,
     redact: &RedactionTable,
@@ -2553,11 +2564,13 @@ pub struct DaemonContext {
     pub(crate) acp_catalog_composition:
         Option<Arc<dyn crate::daemon::acp_catalog_composition::AcpCatalogCompositionServiceV1>>,
     pub paths: DaemonPaths,
-    /// Process-local owner capability required for `owner_only` RPCs on the
-    /// Unix-socket path (issue #296). In-process clients possess the endpoint
-    /// itself. Follow-up #337 replaces blanket `Owner` with authenticated
-    /// per-peer identity.
+    /// Legacy boot-local owner capability file (issue #296 fence). Socket peers
+    /// authenticate with [`peer_credential_registry`] instead of this file.
     pub(crate) owner_capability: crate::daemon::owner_capability::OwnerCapability,
+    /// Canonical cockpit executable identity used to attest local socket peers.
+    pub(crate) approved_client_executable: PathBuf,
+    /// Minted peer-bound credentials for local socket clients (issue #337).
+    pub(crate) peer_credential_registry: Arc<crate::daemon::peer_authority::PeerCredentialRegistry>,
     /// Canonical process cwd captured once at daemon construction. Remote
     /// operation resources never trust a caller-supplied fallback cwd.
     pub canonical_cwd: PathBuf,
@@ -2619,6 +2632,7 @@ pub struct DaemonContext {
     remote_operation_locks: tokio::sync::Mutex<HashMap<(Uuid, Uuid), Weak<tokio::sync::Mutex<()>>>>,
     /// The durable scheduler is absent for an ephemeral owner and installed
     /// atomically before an in-place promotion publishes a persistent owner.
+    #[cfg(feature = "extended")]
     scheduler: Arc<StdMutex<Option<DaemonSchedulerHandle>>>,
     /// Services provisioned by an in-place ephemeral-to-persistent promotion.
     /// They are installed and removed under `restart_decision` with endpoint
@@ -2767,7 +2781,7 @@ impl DaemonContext {
     /// cannot race the user choice. Promotion is owner-only: weaker-authz
     /// requests must not reach this effect as a side path.
     pub(crate) fn promote_to_persistent(&self, principal: &ClientPrincipal) -> Result<bool> {
-        if !principal.is_owner() {
+        if !principal.has_owner_level_authority() {
             anyhow::bail!("promoting daemon lifetime requires the local owner");
         }
         let _decision = crate::sync::lock_or_recover(&self.restart_decision);
@@ -2847,6 +2861,7 @@ impl DaemonContext {
 
     /// Return the currently installed durable scheduler without retaining the
     /// installation lock across an async scheduler operation.
+    #[cfg(feature = "extended")]
     pub(crate) fn scheduler(&self) -> Option<DaemonSchedulerHandle> {
         // Prepared promotion services are deliberately not observable while
         // this owner still has ephemeral lifetime. This makes the lifetime
@@ -2872,6 +2887,7 @@ impl DaemonContext {
     /// Install the durable scheduler with a closed start gate. Its loop opens
     /// only from `start_persistent_service_tasks` after the lifetime store,
     /// so the scheduler cannot dispatch until admission is published.
+    #[cfg(feature = "extended")]
     fn install_persistent_scheduler(&self, start_gate: tokio::sync::watch::Receiver<bool>) {
         let mut scheduler = crate::sync::lock_or_recover(&self.scheduler);
         if scheduler.is_some() {
@@ -2929,6 +2945,7 @@ impl DaemonContext {
     fn activate_persistent_services(&self, services: PreparedPersistentServices) {
         self.registry
             .set_resource_scheduler(Some(services.resource_scheduler));
+        #[cfg(feature = "extended")]
         self.install_persistent_scheduler(services.service_start_gate.subscribe());
         self.registry
             .set_media_storage_recovery(Some(services.media_storage_recovery.clone()));
@@ -2973,7 +2990,9 @@ impl DaemonContext {
     /// of a never-published owner.
     fn deactivate_persistent_services(&self) {
         self.registry.set_resource_scheduler(None);
+        #[cfg(feature = "extended")]
         self.registry.clear_scheduler();
+        #[cfg(feature = "extended")]
         if let Some(scheduler) = crate::sync::lock_or_recover(&self.scheduler).take() {
             scheduler.abort();
         }
@@ -3193,9 +3212,11 @@ impl DaemonContext {
             .lsp_manager()
             .set_notice_bus(global_events.clone(), global_redaction.clone());
         registry.set_global_bus(global_events.clone());
+        #[cfg(feature = "extended")]
         let scheduler = (!paths.ephemeral)
             .then(|| start_persistent_scheduler(&db, &registry, &shutdown, None))
             .flatten();
+        #[cfg(feature = "extended")]
         if let Some(handle) = &scheduler {
             registry.set_scheduler(handle.clone());
         }
@@ -3236,6 +3257,7 @@ impl DaemonContext {
             boot_id: image_generation_boot_id,
             started_at,
         });
+        #[cfg(feature = "extended")]
         let image_generation_dispatch_registry = registry.image_generation_dispatch_registry();
         #[cfg(feature = "extended")]
         let image_generation_artifact_root = (!paths.ephemeral).then(|| {
@@ -3274,6 +3296,16 @@ impl DaemonContext {
         });
         #[cfg(not(feature = "extended"))]
         let image_generation_worker = None;
+        let peer_credential_registry =
+            Arc::new(crate::daemon::peer_authority::PeerCredentialRegistry::default());
+        // Trusted launch provenance (issue #337): a daemon spawned by a
+        // cockpit launcher inherits a one-time launch ticket through the
+        // spawn environment. Record it here, once at boot, bound to the
+        // launcher's exact process identity; the recording also scrubs the
+        // environment slot so daemon descendants never inherit the ticket.
+        // Human foreground starts and in-process boots carry no ticket and
+        // record no provenance: owner-class exchange fails closed.
+        peer_credential_registry.record_launch_provenance_from_environment();
         let mut ctx = Self {
             guidance_proposals: registry.guidance_proposals(),
             db,
@@ -3288,6 +3320,10 @@ impl DaemonContext {
             )),
             paths,
             owner_capability: crate::daemon::owner_capability::OwnerCapability::mint(),
+            approved_client_executable: std::env::current_exe()
+                .context("resolving approved local client executable")
+                .expect("resolving approved local client executable"),
+            peer_credential_registry,
             canonical_cwd: canonical_cwd.clone(),
             #[cfg(test)]
             fcor_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -3311,6 +3347,7 @@ impl DaemonContext {
             connector_wake,
             #[cfg(feature = "remote")]
             remote_operation_locks: tokio::sync::Mutex::new(HashMap::new()),
+            #[cfg(feature = "extended")]
             scheduler: Arc::new(StdMutex::new(scheduler)),
             promoted_persistent_services: StdMutex::new(PromotedPersistentServices::empty()),
             image_generation_boot_id,
@@ -4768,6 +4805,7 @@ pub(crate) async fn boot_with_db(
         tracing::warn!("media admission is closed until durable reservations are recovered");
         timer.phase("media_reservation_admission_blocked");
     }
+    #[cfg(feature = "extended")]
     if let Some(handle) = ctx.scheduler()
         && let Err(error) =
             crate::skills::curator::register_scheduler(&handle, ctx.db.clone()).await
@@ -4896,16 +4934,22 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup onboarding-agent publication recovery failed")?;
-    let recovered_image_config =
-        image_control_mutations::recover_image_config_mutation_journals(ctx, config_publication)
+    #[cfg(feature = "extended")]
+    {
+        let recovered_image_config =
+            image_control_mutations::recover_image_config_mutation_journals(
+                ctx,
+                config_publication,
+            )
             .await
             .map_err(|error| anyhow::anyhow!(error.message))
             .context("startup image-config mutation journal recovery failed")?;
-    if recovered_image_config > 0 {
-        tracing::info!(
-            count = recovered_image_config,
-            "reconciled committed image configuration before socket publication"
-        );
+        if recovered_image_config > 0 {
+            tracing::info!(
+                count = recovered_image_config,
+                "reconciled committed image configuration before socket publication"
+            );
+        }
     }
     crate::daemon::agent_management::recover_known_workspace_resets(ctx, config_publication)
         .await
@@ -4957,9 +5001,9 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup editor lease recovery failed")?;
-    ctx.owner_capability
-        .publish(&ctx.paths.socket)
-        .context("publishing daemon-private owner capability")?;
+    // Issue #337: socket peers authenticate with peer-bound credentials minted at
+    // connect time. The legacy owner-capability file is no longer published;
+    // sandbox deny paths for it remain as the #296 pre-launch fence.
     let recovered =
         crate::daemon::effective_default_recovery::recover_effective_default_journals_before_socket(
             &ctx.db,
@@ -5298,10 +5342,19 @@ fn validate_peer_uid(peer_uid: libc::uid_t, daemon_uid: libc::uid_t) -> Result<(
 
 struct MutableClientState {
     principal: ClientPrincipal,
-    /// Whether this connection has presented the daemon-private owner
-    /// capability. Socket peers start false; in-process clients start true.
-    /// Issue #296 / follow-up #337: this is not per-peer identity.
+    /// Captured at socket accept; used to verify peer-bound credentials.
+    socket_peer: Option<cockpit_host::peer_cred::PeerIdentity>,
+    /// Whether this connection has presented a valid peer-bound owner
+    /// credential. In-process clients start true; socket peers start false.
     has_owner_capability: bool,
+    /// Active peer-bound credential presented by this connection, if any.
+    active_peer_credential: Option<String>,
+    /// Wall-clock expiry for [`active_peer_credential`], when installed.
+    peer_credential_expires_at_unix_ms: Option<i64>,
+    /// Raw capability token carried by the current request envelope, before
+    /// any verification. Only the peer-credential exchange consumes it (as
+    /// its launch-ticket presentation); every envelope overwrites it.
+    presented_owner_capability: Option<String>,
     terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext,
     attached: Option<AttachedSession>,
     pending_replay: Vec<proto::Event>,
@@ -5327,6 +5380,9 @@ struct MutableClientState {
 pub(super) struct SharedClientState {
     principal: ClientPrincipal,
     has_owner_capability: bool,
+    socket_peer: Option<cockpit_host::peer_cred::PeerIdentity>,
+    client_instance_id: Uuid,
+    active_peer_credential: Option<String>,
     capability_owner: String,
     #[allow(dead_code)]
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
@@ -5402,6 +5458,7 @@ impl MutableClientState {
     fn detached_with_principal(
         upload_accounting: Arc<StdMutex<UploadAccounting>>,
         principal: ClientPrincipal,
+        socket_peer: Option<cockpit_host::peer_cred::PeerIdentity>,
         terminal_host: crate::daemon::terminal::TerminalHostHandle,
         client_instance_id: Uuid,
         connection_epoch: u64,
@@ -5409,7 +5466,11 @@ impl MutableClientState {
         let principal_id = principal.tag().unwrap_or_else(|| "local-owner".to_string());
         Self {
             principal,
+            socket_peer,
             has_owner_capability: false,
+            active_peer_credential: None,
+            peer_credential_expires_at_unix_ms: None,
+            presented_owner_capability: None,
             terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
                 principal_id,
                 client_instance_id,
@@ -5434,6 +5495,7 @@ impl MutableClientState {
         let mut state = Self::detached_with_principal(
             Arc::new(StdMutex::new(UploadAccounting::default())),
             ClientPrincipal::owner(),
+            None,
             test_terminal_host(),
             Uuid::new_v4(),
             next_terminal_connection_epoch(),
@@ -5446,6 +5508,9 @@ impl MutableClientState {
         Arc::new(SharedClientState {
             principal: self.principal.clone(),
             has_owner_capability: self.has_owner_capability,
+            socket_peer: self.socket_peer,
+            client_instance_id: self.terminal_context.client_instance_id,
+            active_peer_credential: self.active_peer_credential.clone(),
             // Capabilities survive the settings client's short transport
             // reconnects. Root, layer, identity and revision remain bound in
             // the capability itself; the owner is the stable authenticated
@@ -5666,6 +5731,7 @@ async fn run_in_process_client(
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         ClientPrincipal::owner(),
+        None,
         ctx.terminal_host.clone(),
         client_instance_id,
         next_terminal_connection_epoch(),
@@ -5878,6 +5944,8 @@ async fn run_in_process_client(
             "cancelled sealed capabilities at in-process client teardown"
         );
     }
+    ctx.peer_credential_registry
+        .revoke_for_connection(client_instance_id);
 }
 
 #[derive(Default)]
@@ -5945,12 +6013,31 @@ fn try_send_in_process_event(
     }
 }
 
+#[cfg(unix)]
+fn socket_peer_identity(stream: &DaemonStream) -> Result<cockpit_host::peer_cred::PeerIdentity> {
+    use std::os::fd::AsRawFd;
+    cockpit_host::peer_cred::peer_identity_from_unix_fd(stream.as_raw_fd())
+}
+
+#[cfg(windows)]
+fn socket_peer_identity(stream: &DaemonStream) -> Result<cockpit_host::peer_cred::PeerIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    cockpit_host::peer_cred::peer_identity_from_named_pipe(stream.as_raw_handle())
+}
+
 #[cfg(any(unix, windows))]
 async fn handle_client(stream: DaemonStream, ctx: Arc<DaemonContext>) -> Result<()> {
-    // Issue #296: socket peers are still Owner (follow-up #337) but start
-    // without the daemon-private capability. Secret RPCs fail closed until
-    // the peer presents the token a confined child cannot read.
-    handle_client_transport_as(stream, ctx, ClientPrincipal::owner(), Uuid::new_v4(), false).await
+    let socket_peer = socket_peer_identity(&stream)?;
+    let principal = ClientPrincipal::local_unauthenticated(socket_peer);
+    handle_client_transport_as(
+        stream,
+        ctx,
+        principal,
+        Uuid::new_v4(),
+        false,
+        Some(socket_peer),
+    )
+    .await
 }
 
 #[cfg(feature = "remote")]
@@ -5963,7 +6050,7 @@ pub(crate) async fn handle_relay_channel_as_with_instance<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    handle_client_transport_as(stream, ctx, principal, client_instance_id, false).await
+    handle_client_transport_as(stream, ctx, principal, client_instance_id, false, None).await
 }
 
 #[cfg(any(unix, test))]
@@ -5974,19 +6061,24 @@ where
     // Test helper: simulate a capability-bearing owner so existing socket
     // matrix tests keep exercising handlers. Production accept uses
     // `handle_client`, which starts without the capability.
-    handle_client_transport_as(stream, ctx, ClientPrincipal::owner(), Uuid::new_v4(), true).await
+    handle_client_transport_as(
+        stream,
+        ctx,
+        ClientPrincipal::owner(),
+        Uuid::new_v4(),
+        true,
+        None,
+    )
+    .await
 }
 
-/// Local socket peers are still `ClientPrincipal::Owner` (issue #296).
-/// `has_owner_capability` is the pre-launch fence: production accept passes
-/// `false` until the peer presents the daemon-private token. Follow-up #337
-/// replaces blanket Owner with authenticated per-peer identity.
 async fn handle_client_transport_as<S>(
     stream: S,
     ctx: Arc<DaemonContext>,
     principal: ClientPrincipal,
     client_instance_id: Uuid,
     has_owner_capability: bool,
+    socket_peer: Option<cockpit_host::peer_cred::PeerIdentity>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -6003,6 +6095,18 @@ where
     let (writer_tx, writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (executor_tx, executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (event_cmd_tx, event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (principal_tx, principal_rx) = watch::channel(principal.clone());
+    if let Some(peer) = socket_peer {
+        let invalidation_principal_tx = principal_tx.clone();
+        let invalidation_executor_tx = executor_tx.clone();
+        ctx.peer_credential_registry
+            .register_invalidation_hook(client_instance_id, move || {
+                let _ =
+                    invalidation_principal_tx.send(ClientPrincipal::local_unauthenticated(peer));
+                let _ = invalidation_executor_tx
+                    .try_send(ClientExecutorInput::PeerCredentialInvalidated);
+            });
+    }
 
     // Emit a "hello" envelope immediately so cheap probes
     // (`probe_blocking`, third-party reachability checks) can confirm
@@ -6051,13 +6155,12 @@ where
         Ok::<(), anyhow::Error>(())
     });
     let event_ctx = ctx.clone();
-    let event_principal = principal.clone();
     let event_executor_tx = executor_tx.clone();
     let event_writer_tx = writer_tx.clone();
     let event_task = tokio::spawn(async move {
         run_client_event_forwarder(
             event_ctx.clone(),
-            event_principal,
+            principal_rx,
             event_ctx.subscribe_global(),
             event_cmd_rx,
             event_executor_tx,
@@ -6072,7 +6175,9 @@ where
         client_instance_id,
         next_terminal_connection_epoch(),
         has_owner_capability,
+        socket_peer,
         executor_rx,
+        principal_tx.clone(),
         event_cmd_tx,
         writer_tx,
     ));
@@ -6121,6 +6226,10 @@ where
             "cancelled sealed capabilities at client transport teardown"
         );
     }
+    ctx.peer_credential_registry
+        .unregister_invalidation_hook(client_instance_id);
+    ctx.peer_credential_registry
+        .revoke_for_connection(client_instance_id);
     completed.result?;
     Ok(())
 }
@@ -6171,6 +6280,7 @@ fn flatten_client_task(
 enum ClientExecutorInput {
     Frame(RecvFrame),
     SessionEventsClosed,
+    PeerCredentialInvalidated,
 }
 
 enum ClientWriterMessage {
@@ -6352,7 +6462,7 @@ async fn run_client_writer<W>(
 
 async fn run_client_event_forwarder(
     ctx: Arc<DaemonContext>,
-    principal: ClientPrincipal,
+    mut principal_rx: watch::Receiver<ClientPrincipal>,
     mut global_rx: EventReceiver,
     mut event_cmd_rx: mpsc::Receiver<ClientEventCommand>,
     executor_tx: mpsc::Sender<ClientExecutorInput>,
@@ -6371,6 +6481,11 @@ async fn run_client_event_forwarder(
 
         tokio::select! {
             biased;
+            changed = principal_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
             cmd = event_cmd_rx.recv() => {
                 match cmd {
                     Some(ClientEventCommand::Attach { session_id: id, rx, rendered_interrupts: rendered }) => {
@@ -6387,6 +6502,7 @@ async fn run_client_event_forwarder(
                 }
             }
             global = global_rx.recv() => {
+                let principal = principal_rx.borrow().clone();
                 match global {
                     Ok(envelope) => {
                         let Some(event) = scrub_event_for_principal(&principal, envelope) else {
@@ -6435,6 +6551,7 @@ async fn run_client_event_forwarder(
                 }
             }
             event = session_branch => {
+                let principal = principal_rx.borrow().clone();
                 match event {
                     Some(Ok(envelope)) => {
                         let Some(event) = scrub_event_for_principal(&principal, envelope) else {
@@ -6485,13 +6602,16 @@ async fn run_client_executor(
     client_instance_id: Uuid,
     connection_epoch: u64,
     has_owner_capability: bool,
+    socket_peer: Option<cockpit_host::peer_cred::PeerIdentity>,
     mut executor_rx: mpsc::Receiver<ClientExecutorInput>,
+    principal_tx: watch::Sender<ClientPrincipal>,
     event_cmd_tx: mpsc::Sender<ClientEventCommand>,
     writer_tx: mpsc::Sender<ClientWriterMessage>,
 ) -> Result<()> {
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         principal,
+        socket_peer,
         ctx.terminal_host.clone(),
         client_instance_id,
         connection_epoch,
@@ -6499,9 +6619,22 @@ async fn run_client_executor(
     state.has_owner_capability = has_owner_capability;
     let mut shared = state.shared_snapshot();
     let mut concurrent = ConcurrentRequestRuntime::new();
+    let mut credential_expiry =
+        peer_credential_expiry_deadline(state.peer_credential_expires_at_unix_ms);
     loop {
         tokio::select! {
             biased;
+            () = async {
+                if let Some(deadline) = credential_expiry {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }, if credential_expiry.is_some() => {
+                ctx.peer_credential_registry.revoke_for_connection(client_instance_id);
+                downgrade_revoked_peer_authority(&mut state, &mut shared, &principal_tx);
+                credential_expiry = None;
+            }
             Some(joined) = concurrent.join_next(), if !concurrent.is_empty() => {
                 if let Err(error) = joined {
                     tracing::warn!(%error, "concurrent request task failed");
@@ -6521,6 +6654,7 @@ async fn run_client_executor(
                             &mut state,
                             &mut shared,
                             &ctx,
+                            &principal_tx,
                             &event_cmd_tx,
                             &writer_tx,
                             &mut concurrent,
@@ -6529,10 +6663,17 @@ async fn run_client_executor(
                         {
                             return Ok(());
                         }
+                        credential_expiry = peer_credential_expiry_deadline(
+                            state.peer_credential_expires_at_unix_ms,
+                        );
                     }
                     ClientExecutorInput::SessionEventsClosed => {
                         state.attached = None;
                         shared = state.shared_snapshot();
+                    }
+                    ClientExecutorInput::PeerCredentialInvalidated => {
+                        downgrade_revoked_peer_authority(&mut state, &mut shared, &principal_tx);
+                        credential_expiry = None;
                     }
                 }
             }
@@ -6540,11 +6681,70 @@ async fn run_client_executor(
     }
 }
 
+fn peer_credential_expiry_deadline(
+    expires_at_unix_ms: Option<i64>,
+) -> Option<tokio::time::Instant> {
+    expires_at_unix_ms.and_then(|expires_at_unix_ms| {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(0);
+        let delay_ms = expires_at_unix_ms.saturating_sub(now_ms);
+        Some(tokio::time::Instant::now() + std::time::Duration::from_millis(delay_ms.max(0) as u64))
+    })
+}
+
+fn downgrade_revoked_peer_authority(
+    state: &mut MutableClientState,
+    shared: &mut Arc<SharedClientState>,
+    principal_tx: &watch::Sender<ClientPrincipal>,
+) {
+    if state.active_peer_credential.is_none() {
+        return;
+    }
+    state.active_peer_credential = None;
+    state.peer_credential_expires_at_unix_ms = None;
+    state.has_owner_capability = false;
+    if let Some(peer) = state.socket_peer {
+        state.principal = ClientPrincipal::local_unauthenticated(peer);
+    }
+    *shared = state.shared_snapshot();
+    let _ = principal_tx.send(state.principal.clone());
+}
+
+fn reconcile_socket_peer_owner_authority(
+    state: &mut MutableClientState,
+    shared: &mut Arc<SharedClientState>,
+    ctx: &Arc<DaemonContext>,
+    principal_tx: &watch::Sender<ClientPrincipal>,
+) {
+    if state.socket_peer.is_none() || state.active_peer_credential.is_none() {
+        return;
+    }
+    let peer = state.socket_peer.expect("checked above");
+    let connection_id = state.terminal_context.client_instance_id;
+    let token = state
+        .active_peer_credential
+        .as_deref()
+        .expect("checked above");
+    if crate::daemon::peer_authority::socket_peer_owner_capability_live(
+        &ctx.peer_credential_registry,
+        Some(peer),
+        connection_id,
+        Some(token),
+        state.has_owner_capability,
+    ) {
+        return;
+    }
+    downgrade_revoked_peer_authority(state, shared, principal_tx);
+}
+
 async fn handle_client_frame(
     frame: RecvFrame,
     state: &mut MutableClientState,
     shared: &mut Arc<SharedClientState>,
     ctx: &Arc<DaemonContext>,
+    principal_tx: &watch::Sender<ClientPrincipal>,
     event_cmd_tx: &mpsc::Sender<ClientEventCommand>,
     writer_tx: &mpsc::Sender<ClientWriterMessage>,
     concurrent: &mut ConcurrentRequestRuntime,
@@ -6555,6 +6755,7 @@ async fn handle_client_frame(
             state,
             shared,
             ctx,
+            principal_tx,
             event_cmd_tx,
             writer_tx,
             concurrent,
@@ -6611,6 +6812,7 @@ async fn handle_envelope(
     state: &mut MutableClientState,
     shared: &mut Arc<SharedClientState>,
     ctx: &Arc<DaemonContext>,
+    principal_tx: &watch::Sender<ClientPrincipal>,
     event_cmd_tx: &mpsc::Sender<ClientEventCommand>,
     writer_tx: &mpsc::Sender<ClientWriterMessage>,
     concurrent: &mut ConcurrentRequestRuntime,
@@ -6623,8 +6825,37 @@ async fn handle_envelope(
             owner_capability,
             request,
         } => {
+            // The unverified token carried by THIS envelope. The exchange
+            // reads it as its launch-ticket presentation; every envelope
+            // overwrites it, so a stale token can never be replayed.
+            state.presented_owner_capability = owner_capability
+                .as_ref()
+                .map(|token| token.as_str().to_string());
+            reconcile_socket_peer_owner_authority(state, shared, ctx, principal_tx);
             if let Some(token) = owner_capability {
-                if ctx.owner_capability.verify(token.as_str()) {
+                if let Some(peer) = state.socket_peer {
+                    let connection_id = state.terminal_context.client_instance_id;
+                    if let Some((role, grants)) =
+                        ctx.peer_credential_registry
+                            .verify(peer, connection_id, token.as_str())
+                    {
+                        state.has_owner_capability = role.is_owner_class();
+                        state.principal = ClientPrincipal::local_authenticated(peer, role, grants);
+                        state.active_peer_credential = Some(token.as_str().to_string());
+                        state.peer_credential_expires_at_unix_ms = ctx
+                            .peer_credential_registry
+                            .expires_at_unix_ms(connection_id, token.as_str());
+                        *shared = state.shared_snapshot();
+                        let _ = principal_tx.send(state.principal.clone());
+                    } else {
+                        state.has_owner_capability = false;
+                        state.active_peer_credential = None;
+                        state.peer_credential_expires_at_unix_ms = None;
+                        state.principal = ClientPrincipal::local_unauthenticated(peer);
+                        *shared = state.shared_snapshot();
+                        let _ = principal_tx.send(state.principal.clone());
+                    }
+                } else if ctx.owner_capability.verify(token.as_str()) {
                     state.has_owner_capability = true;
                     *shared = state.shared_snapshot();
                 }
@@ -6716,6 +6947,11 @@ async fn handle_envelope(
             );
             if (is_attach && attached) || state.attached.is_none() {
                 *shared = state.shared_snapshot();
+            }
+            let principal_changed = matches!(&result, Ok(Response::LocalPeerCredential { .. }));
+            if principal_changed {
+                *shared = state.shared_snapshot();
+                let _ = principal_tx.send(state.principal.clone());
             }
             let envelope = response_envelope_for_shared(id, result, shared, ctx);
             let envelope_kind = envelope_kind(&envelope);
@@ -7058,7 +7294,7 @@ fn response_envelope_for_shared(
 ) -> Envelope {
     match result {
         Ok(response) => {
-            let response = if shared.principal.is_owner() {
+            let response = if shared.principal.has_owner_level_authority() {
                 // Owner responses are trusted, but still pass through the
                 // daemon-global redaction table as defense in depth: any known
                 // vault/env secret value that leaked into a response (for
@@ -7374,7 +7610,7 @@ fn scrub_replay_event_for_principal(
     shared: &SharedClientState,
     event: proto::Event,
 ) -> Option<proto::Event> {
-    if shared.principal.is_owner() {
+    if shared.principal.has_owner_level_authority() {
         return Some(event);
     }
     let Some(attached) = shared.attached.as_ref() else {
@@ -7459,7 +7695,9 @@ pub(crate) use dispatch::validate_and_normalize_mcp_credentials;
 mod remote_dispatch;
 #[cfg(feature = "remote")]
 pub(crate) use remote_dispatch::RemoteOperationContext;
+#[cfg(feature = "extended")]
 mod image_control_mutations;
+#[cfg(feature = "extended")]
 mod image_control_reads;
 mod run_invocation;
 mod sealed_capabilities;

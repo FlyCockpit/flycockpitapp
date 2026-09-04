@@ -3306,6 +3306,16 @@ impl DaemonContext {
         // Human foreground starts and in-process boots carry no ticket and
         // record no provenance: owner-class exchange fails closed.
         peer_credential_registry.record_launch_provenance_from_environment();
+        if let Some(ticket) = peer_credential_registry.recorded_launch_ticket() {
+            if let Err(error) =
+                crate::daemon::peer_authority::persist_launch_ticket(&paths.socket, &ticket)
+            {
+                tracing::warn!(
+                    %error,
+                    "persisting launch ticket for follower cockpit processes"
+                );
+            }
+        }
         let mut ctx = Self {
             guidance_proposals: registry.guidance_proposals(),
             db,

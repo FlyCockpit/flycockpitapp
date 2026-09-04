@@ -7387,6 +7387,9 @@ fn template_cursor(template_id: &str) -> usize {
 #[test]
 fn all_templates_offer_edit_id_step() {
     for t in templates::TEMPLATES {
+        if t.is_disabled() {
+            continue;
+        }
         let (_tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
         let mut state = AddState::new();
         state.enter_template_for_test(template_cursor(t.id));

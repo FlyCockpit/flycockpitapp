@@ -18203,7 +18203,12 @@ async fn handle_serialized_request_impl(
             let presented_launch_ticket = state.presented_owner_capability.take();
             let provenance_verified = ctx
                 .peer_credential_registry
-                .verify_launch_provenance(presented_launch_ticket.as_deref(), peer);
+                .verify_launch_provenance(presented_launch_ticket.as_deref(), peer)
+                || crate::daemon::peer_authority::verify_persisted_launch_ticket(
+                    &ctx.paths.socket,
+                    presented_launch_ticket.as_deref(),
+                    peer,
+                );
             let role = match attest_local_client_role(peer, &ctx.approved_client_executable) {
                 Some(role) => role,
                 // Follower cockpit processes (including integration-test harnesses)

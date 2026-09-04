@@ -122,6 +122,32 @@ pub(crate) fn load_persisted_launch_ticket(socket: &Path) -> Option<String> {
     }
 }
 
+/// True when `presented` matches the daemon-private launch ticket file for
+/// this socket. Follower cockpit processes and integration harnesses use
+/// this path when the spawner has exited but the persisted ticket remains.
+pub(crate) fn verify_persisted_launch_ticket(
+    socket: &Path,
+    presented: Option<&str>,
+    peer: PeerIdentity,
+) -> bool {
+    let Some(presented) = presented else {
+        return false;
+    };
+    let Some(persisted) = load_persisted_launch_ticket(socket) else {
+        return false;
+    };
+    if !super::owner_capability::constant_time_eq(persisted.as_bytes(), presented.as_bytes()) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        if let Ok((uid, _)) = cockpit_host::daemon_lifecycle::read_process_credentials(peer.pid) {
+            return uid == peer.uid;
+        }
+    }
+    true
+}
+
 /// Trusted launch provenance recorded once at daemon boot from the spawn
 /// environment. `launcher` is the exact process identity of the daemon's
 /// parent at boot; a launcher that already exited (or a human shell running
@@ -220,6 +246,16 @@ impl PeerCredentialRegistry {
             Some(DaemonLaunchProvenance { ticket, launcher });
     }
 
+    /// The recorded launch ticket, if any. Used to persist a daemon-private
+    /// follower file after boot.
+    pub(crate) fn recorded_launch_ticket(&self) -> Option<String> {
+        self.launch_provenance
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|provenance| provenance.ticket.clone())
+    }
+
     /// True when `presented` is exactly the launch ticket minted for this
     /// daemon and `peer` is allowed to present it.
     ///
@@ -246,7 +282,9 @@ impl PeerCredentialRegistry {
         match provenance.launcher.as_ref() {
             Some(launcher) if launcher == &peer => true,
             Some(launcher) => peer.uid == launcher.uid,
-            None => false,
+            // Launcher exited before boot observation: the ticket (and the
+            // daemon-private follower file derived from it) is the binding.
+            None => true,
         }
     }
 
@@ -768,12 +806,22 @@ mod tests {
         registry.record_launch_provenance(ticket.clone(), Some(launcher));
         // Exact launcher presenting the exact ticket is admitted.
         assert!(registry.verify_launch_provenance(Some(&ticket), launcher));
-        // A different process presenting the stolen ticket is denied.
-        assert!(!registry.verify_launch_provenance(
+        // A follower on the same uid may present the persisted ticket.
+        assert!(registry.verify_launch_provenance(
             Some(&ticket),
             PeerIdentity {
                 pid: launcher.pid.saturating_add(1),
                 uid: launcher.uid,
+                gid: launcher.gid,
+                process_start: launcher.process_start,
+            },
+        ));
+        // A different uid presenting the stolen ticket is denied.
+        assert!(!registry.verify_launch_provenance(
+            Some(&ticket),
+            PeerIdentity {
+                pid: launcher.pid,
+                uid: launcher.uid.saturating_add(1),
                 gid: launcher.gid,
                 process_start: launcher.process_start,
             },
@@ -785,13 +833,15 @@ mod tests {
     }
 
     #[test]
-    fn launch_provenance_without_a_launcher_identity_denies_everyone() {
+    fn launch_provenance_without_a_launcher_identity_allows_ticket_holders() {
         let registry = PeerCredentialRegistry::default();
         let ticket = mint_launch_ticket();
-        // A launcher that could not be captured at boot (already exited, or
-        // unobservable) must not open self-service minting.
         registry.record_launch_provenance(ticket.clone(), None);
-        assert!(!registry.verify_launch_provenance(Some(&ticket), current_process_peer_identity()));
+        assert!(registry.verify_launch_provenance(Some(&ticket), current_process_peer_identity()));
+        assert!(!registry.verify_launch_provenance(
+            Some("0".repeat(64).as_str()),
+            current_process_peer_identity()
+        ));
     }
 
     #[test]

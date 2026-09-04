@@ -1842,43 +1842,53 @@ mod tests {
         assert!(io.output.contains("third-party client"));
     }
 
-    fn write_model_wizard_provider(cwd: &std::path::Path) -> PathBuf {
-        let path = most_specific_config_write_target(cwd)
-            .unwrap_or_else(|| cwd.join(".cockpit").join(crate::config::dirs::CONFIG_FILE));
-        let Some(parent) = path.parent() else {
+    fn write_model_wizard_provider() -> PathBuf {
+        let config_path = global_config_file().expect("isolated global config path");
+        let Some(config_parent) = config_path.parent() else {
             panic!("config target has no parent");
         };
-        std::fs::create_dir_all(parent).unwrap();
-        std::fs::write(&path, "{}").unwrap();
-        let mut cfg = crate::config::providers::ProvidersConfig::default();
-        let mut provider = crate::config::providers::ProviderEntry {
+        std::fs::create_dir_all(config_parent.join("providers")).unwrap();
+        if !config_path.exists() {
+            std::fs::write(&config_path, "{}\n").unwrap();
+        }
+        let provider_path =
+            crate::config::providers::provider_file_path_for_config(&config_path, "p")
+                .expect("provider catalog path");
+        let provider = crate::config::providers::ProviderEntry {
             url: "http://localhost:1/v1".to_string(),
             subagent_invokable: Some(true),
             can_delegate: Some(true),
+            models: vec![crate::config::providers::ModelEntry {
+                id: "m".to_string(),
+                capabilities: crate::config::providers::ModelCapabilities {
+                    image_input: crate::config::providers::CapabilityStatus::Unsupported,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
             ..Default::default()
         };
-        provider.models.push(crate::config::providers::ModelEntry {
-            id: "m".to_string(),
-            capabilities: crate::config::providers::ModelCapabilities {
-                image_input: crate::config::providers::CapabilityStatus::Unsupported,
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-        cfg.providers.insert("p".to_string(), provider);
-        let mut doc = ConfigDoc::load(&path).unwrap();
-        doc.write(&cfg).unwrap();
-        path
+        std::fs::write(
+            &provider_path,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&provider).expect("serialize provider fixture")
+            ),
+        )
+        .unwrap();
+        config_path
     }
 
     #[tokio::test]
     async fn model_wizard_terminal_end_to_end() {
         let tmp = tempfile::tempdir().unwrap();
-        let _guard = CockpitConfigEnvGuard::set_async(&tmp.path().join("global-config.json")).await;
-        write_model_wizard_provider(tmp.path());
+        let state_home = tmp.path();
+        let config_path = state_home.join("xdg-config/cockpit/config.json");
+        let _guard = CockpitConfigEnvGuard::set_with_state_async(&config_path, state_home).await;
+        write_model_wizard_provider();
         trust_workspace_via_daemon(tmp.path()).await;
         let descriptor = descriptor_for_cwd(crate::wizard::MODEL_WIZARD_ID, tmp.path()).unwrap();
-        let mut io = ScriptIo::new(&["p", "p:m", "trusted", "images", "", "", "", "y", "skip"]);
+        let mut io = ScriptIo::new(&["p", "p:m", "trusted", "images", "", "", "none", "y", "skip"]);
         let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
 
         let run = run_terminal_wizard(descriptor, &mut io, &true, &mut actions)

@@ -1376,8 +1376,14 @@ fn spawn_detached_child(
             .ok()
             .map(|paths| paths.socket)
     });
-    if let Some(socket) = socket_for_ticket {
-        let _ = peer_authority::persist_launch_ticket(&socket, &launch_ticket);
+    if let Some(socket) = socket_for_ticket
+        && let Err(error) = peer_authority::persist_launch_ticket(&socket, &launch_ticket)
+    {
+        tracing::warn!(
+            %error,
+            socket = %socket.display(),
+            "persisting launch ticket for follower cockpit processes"
+        );
     }
     // The child now exists, so this process is the daemon launcher: retain
     // the matching launch ticket in memory for the peer-credential exchange.

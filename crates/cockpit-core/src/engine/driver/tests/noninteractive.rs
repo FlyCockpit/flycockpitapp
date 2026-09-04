@@ -7111,3 +7111,69 @@ async fn recursive_batch_checkpoint_refusal_retires_issued_managed_row() {
     );
     assert_managed_lease_not_active(&driver, owner, lease.id).await;
 }
+
+#[tokio::test]
+async fn noninteractive_auto_compact_gate_runs_only_on_continue_not_terminal_done() {
+    use cockpit_test_support::provider::{ScriptedProvider, Turn, WireDialect};
+
+    let final_answer = "x".repeat(60_000);
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text(final_answer.clone()))
+        .start()
+        .await;
+    let (mut driver, tmp) = test_driver_with_url_vnext(8, provider.base_url());
+    let config_dir = tmp.path().join(".cockpit");
+    let providers_dir = config_dir.join("providers");
+    std::fs::create_dir_all(&providers_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.json"),
+        r#"{"agent_chooses_subagent_model": true, "active_model": {"provider":"lmstudio","model":"local"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        providers_dir.join("lmstudio.json"),
+        serde_json::json!({
+            "url": provider.base_url(),
+            "context": { "auto_compact_pct": 50 },
+            "models": [{
+                "id": "local",
+                "subagent_invokable": true,
+                "context_length": 10_000
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    driver.set_config_handle(
+        crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(&driver.cwd),
+    );
+    seed_task_delegation(&driver, "task-done-gate", "default").await;
+    seed_task_payload(&driver, "task-done-gate", "default", "explore").await;
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+
+    let completion = driver
+        .execute_single_noninteractive_task(
+            single_task(&driver, "explore", "task-done-gate", None, None),
+            &tx,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(!completion.failed);
+    assert!(
+        completion.report.contains(&final_answer[..64]),
+        "terminal Done must return the final answer without compacting it away"
+    );
+    let events = driver
+        .session
+        .db
+        .list_session_events(driver.session.live_id())
+        .await
+        .unwrap();
+    assert!(
+        !events.iter().any(|ev| ev.kind == "subagent_compacted"),
+        "autocompact gate must not run on terminal Done even when history exceeds threshold"
+    );
+}

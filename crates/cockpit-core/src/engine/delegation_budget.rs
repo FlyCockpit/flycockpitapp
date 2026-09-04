@@ -20,6 +20,8 @@
 //! dimension `None`), not a bypass. The compact progress guard and retry
 //! pacing live on the same handle and are never lifted.
 
+use std::cell::RefCell;
+use std::future::Future;
 use std::ops::AddAssign;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -28,6 +30,90 @@ use cockpit_config::config::delegation_budget::{
     BudgetSpend, DEFAULT_COMPACT_NO_PROGRESS_LIMIT, DEFAULT_MAX_RETRIES_PER_TURN,
     ResolvedDelegationBudget,
 };
+
+tokio::task_local! {
+    static LANE_BUDGET_ACCUMULATOR: RefCell<LaneBudgetAccumulator>;
+}
+
+#[derive(Debug, Default)]
+struct LaneBudgetAccumulator {
+    uncharged: BudgetCharge,
+    forward_progress: bool,
+}
+
+/// Isolate usage and compact-progress signals to one noninteractive executor
+/// task. Concurrent background subagents each install their own scope so
+/// session-global drains cannot cross node boundaries.
+pub struct LaneBudgetScope;
+
+impl LaneBudgetScope {
+    pub async fn run<F, T>(future: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        LANE_BUDGET_ACCUMULATOR
+            .scope(RefCell::new(LaneBudgetAccumulator::default()), future)
+            .await
+    }
+}
+
+pub(crate) fn lane_budget_active() -> bool {
+    LANE_BUDGET_ACCUMULATOR.try_with(|_| ()).is_ok()
+}
+
+pub(crate) fn note_lane_budget_usage(charge: BudgetCharge, forward_progress: bool) {
+    let Ok(()) = LANE_BUDGET_ACCUMULATOR.try_with(|accumulator| {
+        let mut accumulator = accumulator.borrow_mut();
+        accumulator.uncharged += charge;
+        if forward_progress {
+            accumulator.forward_progress = true;
+        }
+    }) else {
+        return;
+    };
+}
+
+pub fn take_lane_budget_charge() -> BudgetCharge {
+    LANE_BUDGET_ACCUMULATOR
+        .try_with(|accumulator| std::mem::take(&mut accumulator.borrow_mut().uncharged))
+        .unwrap_or_default()
+}
+
+pub fn take_lane_forward_progress() -> bool {
+    LANE_BUDGET_ACCUMULATOR
+        .try_with(|accumulator| {
+            let progress = accumulator.borrow().forward_progress;
+            accumulator.borrow_mut().forward_progress = false;
+            progress
+        })
+        .unwrap_or(false)
+}
+
+/// Drain any residual lane-scoped usage into the owning budget when a
+/// noninteractive executor scope ends. Every recorded charge must land on
+/// exactly one drain; late utility paths such as explore fork seed-reads
+/// record after the per-round drain and must not escape the lane allotment.
+pub struct LaneBudgetExitDrain<'a> {
+    budget: &'a BudgetPool,
+}
+
+impl<'a> LaneBudgetExitDrain<'a> {
+    pub fn new(budget: &'a BudgetPool) -> Self {
+        Self { budget }
+    }
+}
+
+impl Drop for LaneBudgetExitDrain<'_> {
+    fn drop(&mut self) {
+        if !lane_budget_active() {
+            return;
+        }
+        let charge = take_lane_budget_charge();
+        if !charge.is_empty() {
+            let _ = self.budget.charge(charge);
+        }
+    }
+}
 
 use crate::sync::lock_or_recover;
 use crate::tokens::TokenUsage;
@@ -208,6 +294,16 @@ impl CompactProgressGuard {
 
     pub fn consecutive_no_progress(&self) -> u32 {
         self.consecutive_no_progress
+    }
+
+    /// Replay one durable compaction boundary when rehydrating a resumed lane.
+    /// Never fails: restores guard depth, including at the no-progress cap.
+    pub fn replay_compaction(&mut self, forward_progress: bool) {
+        if forward_progress {
+            self.consecutive_no_progress = 0;
+            return;
+        }
+        self.consecutive_no_progress = self.consecutive_no_progress.saturating_add(1);
     }
 
     /// Record a compaction. `tokens_after` is the post-compact token count
@@ -570,6 +666,24 @@ impl BudgetPool {
         lock_or_recover(&self.local)
             .compact_guard
             .consecutive_no_progress()
+    }
+
+    /// Restore compact-and-continue guard depth from durable subagent compaction
+    /// boundaries on lane resume. `compaction_forward_progress` is one flag per
+    /// `subagent_compacted` row in seq order; `forward_progress_since_last` resets
+    /// the guard when productive work occurred after the final boundary.
+    pub fn rehydrate_subagent_compact_guard(
+        &self,
+        compaction_forward_progress: &[bool],
+        forward_progress_since_last: bool,
+    ) {
+        let mut local = lock_or_recover(&self.local);
+        for &forward_progress in compaction_forward_progress {
+            local.compact_guard.replay_compaction(forward_progress);
+        }
+        if forward_progress_since_last {
+            local.compact_guard.replay_compaction(true);
+        }
     }
 
     pub fn allow_retry(&self) -> bool {

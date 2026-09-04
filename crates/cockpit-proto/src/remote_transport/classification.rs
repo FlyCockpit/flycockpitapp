@@ -2942,6 +2942,11 @@ pub const EVENT_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::TruncatedByCap,
     ),
     row(
+        "subagent_compacted",
+        RemoteMessageClass::BoundedEvent,
+        RemoteInlinePayloadBound::TruncatedByCap,
+    ),
+    row(
         "nested_turn",
         RemoteMessageClass::BoundedEvent,
         RemoteInlinePayloadBound::TruncatedByCap,
@@ -3248,6 +3253,7 @@ pub const OVERSIZED_MESSAGE_INVENTORY: &[(RemoteMessageKind, &str)] = &[
     (RemoteMessageKind::Event, "tool_error"),
     (RemoteMessageKind::Event, "subagent_spawned"),
     (RemoteMessageKind::Event, "subagent_report"),
+    (RemoteMessageKind::Event, "subagent_compacted"),
     (RemoteMessageKind::Event, "nested_turn"),
     (RemoteMessageKind::Event, "interrupt_raised"),
     (RemoteMessageKind::Event, "history_replay"),
@@ -3447,7 +3453,7 @@ mod tests {
         // Exact table sizes, so a silent shrink is caught.
         assert_eq!(REQUEST_CLASSIFICATION.len(), 289);
         assert_eq!(RESPONSE_CLASSIFICATION.len(), 202);
-        assert_eq!(EVENT_CLASSIFICATION.len(), 86);
+        assert_eq!(EVENT_CLASSIFICATION.len(), 87);
     }
 
     #[test]

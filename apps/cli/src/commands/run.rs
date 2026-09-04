@@ -1979,6 +1979,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | SubagentSpawned { session_id, .. }
         | SubagentRouting { session_id, .. }
         | SubagentReport { session_id, .. }
+        | SubagentCompacted { session_id, .. }
         | NestedTurn { session_id, .. }
         | Usage { session_id, .. }
         | InterruptRaised { session_id, .. }

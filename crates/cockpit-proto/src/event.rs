@@ -1254,6 +1254,32 @@ pub enum Event {
         routing: serde_json::Value,
     },
 
+    /// A noninteractive subagent autocompacted into a new linked window in its
+    /// own delegation lineage. Parent-visible signal only; never enters model
+    /// context.
+    SubagentCompacted {
+        session_id: Uuid,
+        agent: String,
+        task_call_id: String,
+        label: String,
+        #[serde(default)]
+        source: String,
+        #[serde(default)]
+        trigger_ctx_pct: Option<f64>,
+        #[serde(default)]
+        tokens_before: u64,
+        #[serde(default)]
+        tokens_after: u64,
+        #[serde(default)]
+        turns_summarized: usize,
+        #[serde(default)]
+        tail_kept: usize,
+        #[serde(default)]
+        tail_trimmed: usize,
+        #[serde(default)]
+        window_index: u32,
+    },
+
     /// A noninteractive child event forwarded through the parent session
     /// stream with enough lineage for clients to build a delegation tree.
     NestedTurn {
@@ -1778,6 +1804,7 @@ macro_rules! event_variants {
             (Event::SubagentSpawned { .. }, "subagent_spawned");
             (Event::SubagentRouting { .. }, "subagent_routing");
             (Event::SubagentReport { .. }, "subagent_report");
+            (Event::SubagentCompacted { .. }, "subagent_compacted");
             (Event::NestedTurn { .. }, "nested_turn");
             (Event::Usage { .. }, "usage");
             (Event::InterruptRaised { .. }, "interrupt_raised");

@@ -35,7 +35,7 @@ use crate::secure_key::{
 use super::{
     AuditErrorCode, AuditEventKind, AuditVerifyResult, AuditVerifyStatus, ChainEntry,
     ComputerAuditEntryV1, ComputerAuditSealedHeadV1, Disposition, ENTRY_LEN, GuidanceScope,
-    VerificationState, domain_digest, domains, present_bits, verify_chain,
+    VerificationState, present_bits, verify_chain,
 };
 
 const MAX_CAS_RETRIES: usize = 8;

@@ -5305,7 +5305,42 @@ impl Drop for ArmedAskWaitGuard<'_> {
     }
 }
 
+/// Live target identity captured at the dispatch gate before adopt or lease
+/// keying (issue #374: Yolo baseline advance mirrors Ask-gate adoption).
+struct LiveDispatchBaseline {
+    focus_generation: u64,
+    virtual_display_uuid: Option<[u8; 16]>,
+    prompt_target_window: Option<String>,
+    widget: TargetWidgetContext,
+    window: Option<OpaqueWindowId>,
+}
+
 impl ComputerActionCoordinator {
+    /// Capture the live target identity this dispatch gate will accept.
+    fn capture_live_dispatch_baseline(
+        &mut self,
+        virtual_display_uuid: Option<[u8; 16]>,
+    ) -> Result<LiveDispatchBaseline, TargetUnavailableReason> {
+        if let Some(adapter) = self.target_adapter.as_mut() {
+            let evidence = adapter.capture_snapshot()?;
+            Ok(LiveDispatchBaseline {
+                focus_generation: evidence.focus_generation,
+                virtual_display_uuid: evidence.virtual_display_uuid,
+                prompt_target_window: target_window_summary(&evidence),
+                widget: TargetWidgetContext::from_evidence(&evidence),
+                window: evidence.focused_window_id_value(),
+            })
+        } else {
+            Ok(LiveDispatchBaseline {
+                focus_generation: self.focus_generation.0,
+                virtual_display_uuid,
+                prompt_target_window: None,
+                widget: self.authorized_widget.clone(),
+                window: self.authorized_window_id,
+            })
+        }
+    }
+
     /// Check whether dispatch is authorized for the Ask tier. Dispatch
     /// requires both a current Ask delegation lease (Ask only) and the
     /// coordinator's current host/virtual input lease.
@@ -5336,8 +5371,29 @@ impl ComputerActionCoordinator {
         // creates no approval grant. No Ask lease is required. Focus-sensitive
         // actions still evaluate the identity this dispatch accepts (the
         // open-time pin); they must not skip the gate because Ask is unused.
+        // When keyboard identity is dirty, adopt the live snapshot like the
+        // Ask gate so re-proof can run again after the next dispatch (#374).
         if self.tier == ComputerApprovalTier::Yolo && !self.receiver_enter_requires_terminal_ask {
-            self.refuse_unfocused_dispatch(call_id, actions, self.focus_generation.0)?;
+            let authorized_focus = if self.keyboard_identity_dirty_since_proof {
+                let baseline = match self.capture_live_dispatch_baseline(virtual_display_uuid) {
+                    Ok(baseline) => baseline,
+                    Err(reason) => {
+                        self.dispatch_states
+                            .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
+                        return Err(CoordinatedOutcome::Invalidated { reason });
+                    }
+                };
+                self.adopt_authorized_live_identity(
+                    baseline.focus_generation,
+                    baseline.virtual_display_uuid,
+                    baseline.widget,
+                    baseline.window,
+                );
+                baseline.focus_generation
+            } else {
+                self.focus_generation.0
+            };
+            self.refuse_unfocused_dispatch(call_id, actions, authorized_focus)?;
             self.remember_authorized_action_classes(actions);
             return Ok(());
         }
@@ -5347,57 +5403,20 @@ impl ComputerActionCoordinator {
         // pre-await baseline for post-answer re-verification. Unverifiable
         // evidence is a fail-closed, non-sticky refusal — never prompt or
         // install on evidence we cannot read.
-        // Capture into locals first so the adapter borrow ends before any
-        // `&mut self` fail-closed bookkeeping below.
-        type PreCaptureSnapshot = Result<
-            (
-                u64,
-                Option<[u8; 16]>,
-                Option<String>,
-                TargetWidgetContext,
-                Option<OpaqueWindowId>,
-            ),
-            (),
-        >;
-        let pre_capture: Option<PreCaptureSnapshot> =
-            if let Some(adapter) = self.target_adapter.as_mut() {
-                match adapter.capture_snapshot() {
-                    Ok(evidence) => Some(Ok((
-                        evidence.focus_generation,
-                        evidence.virtual_display_uuid,
-                        // Prompt-safe focused target window summary
-                        // (issue #286): redacted title hint plus an opaque
-                        // window id prefix, captured from the same coherent
-                        // snapshot the pre-await baseline pins.
-                        target_window_summary(&evidence),
-                        // Widget role/subrole only — never field contents
-                        // (issue #290).
-                        TargetWidgetContext::from_evidence(&evidence),
-                        evidence.focused_window_id_value(),
-                    ))),
-                    Err(_reason) => Some(Err(())),
-                }
-            } else {
-                None
-            };
-        let (live_focus_generation, live_uuid, prompt_target_window, live_widget, live_window) =
-            match pre_capture {
-                Some(Ok(baseline)) => baseline,
-                Some(Err(())) => {
-                    self.dispatch_states
-                        .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
-                    return Err(CoordinatedOutcome::Invalidated {
-                        reason: TargetUnavailableReason::StaleTarget,
-                    });
-                }
-                None => (
-                    self.focus_generation.0,
-                    virtual_display_uuid,
-                    None,
-                    self.authorized_widget.clone(),
-                    self.authorized_window_id,
-                ),
-            };
+        let LiveDispatchBaseline {
+            focus_generation: live_focus_generation,
+            virtual_display_uuid: live_uuid,
+            prompt_target_window,
+            widget: live_widget,
+            window: live_window,
+        } = match self.capture_live_dispatch_baseline(virtual_display_uuid) {
+            Ok(baseline) => baseline,
+            Err(reason) => {
+                self.dispatch_states
+                    .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
+                return Err(CoordinatedOutcome::Invalidated { reason });
+            }
+        };
 
         // Focus-sensitive actions evaluate this live snapshot, never the
         // coordinator's previously stored generation. Refuse before adopt,
@@ -10878,10 +10897,10 @@ mod tests {
     // =====================================================================
 
     async fn reproof_audit_chain() -> (
-        crate::computer::audit::chain::TestAuditHarness,
+        crate::computer::audit::TestAuditHarness,
         Arc<ComputerAuditChain>,
     ) {
-        let harness = crate::computer::audit::chain::TestAuditHarness::new().await;
+        let harness = crate::computer::audit::TestAuditHarness::new().await;
         let chain = Arc::clone(&harness.chain);
         (harness, chain)
     }

@@ -1185,6 +1185,12 @@ CREATE INDEX idx_image_generation_artifact_security_recovery_audits_slot
  ON image_generation_artifact_security_recovery_audits(job_id, slot_id);
 CREATE INDEX idx_image_generation_artifact_security_recovery_audits_publication
  ON image_generation_artifact_security_recovery_audits(publication_operation_id);
+CREATE INDEX idx_image_generation_artifact_security_recovery_audits_retention
+ ON image_generation_artifact_security_recovery_audits(COALESCE(decided_at_unix_ms, created_at_unix_ms))
+ WHERE state IN ('applied', 'denied', 'proof_failed', 'stale');
+CREATE INDEX idx_image_generation_artifact_security_recovery_attempts_retention
+ ON image_generation_artifact_security_recovery_attempts(COALESCE(decided_at_unix_ms, created_at_unix_ms))
+ WHERE state IN ('validated', 'denied');
 CREATE INDEX idx_image_generation_artifact_security_recovery_components_component
  ON image_generation_artifact_security_recovery_components(artifact_id, component_id);
 

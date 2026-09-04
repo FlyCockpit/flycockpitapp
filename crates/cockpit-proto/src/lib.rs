@@ -1326,19 +1326,8 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// profiles, agent-dimensioned MCP scopes on the attached-session and
 /// daemon-owned setup inventory, bounded base64 media previews, the
 /// rolling-precompaction resume choice, and knowledge-dream completion
-/// receipts including ordered all-KB runs. Older fixtures remain frozen
-/// migration evidence, not a compatibility window.
+/// receipts including ordered all-KB runs.
 pub const PROTOCOL_VERSION: u32 = 22;
-
-/// Oldest protocol version whose daemon fixtures are frozen in the append-only
-/// archive ledger at `tests/fixtures/daemon_proto/archive.sha256`. Every
-/// version in `FIRST_ARCHIVED_PROTOCOL_VERSION..PROTOCOL_VERSION` must be
-/// recorded there, and recorded digests are append-only: they are never
-/// legitimately rewritten or removed. Freezing is not a remembered step —
-/// `tests/wire_schema_version.rs` derives the frozen range from this constant
-/// and `PROTOCOL_VERSION`, so minting a new version structurally fails until
-/// the retiring version is appended to the ledger.
-pub const FIRST_ARCHIVED_PROTOCOL_VERSION: u32 = 12;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -4220,9 +4209,6 @@ fn codec_error(err: LinesCodecError) -> io::Error {
 #[cfg(all(test, feature = "remote"))]
 mod proto_fixture_tests {
     //! Protocol fixtures cover the current wire version accepted by this build.
-    //! The archived range derives from `FIRST_ARCHIVED_PROTOCOL_VERSION..=
-    //! PROTOCOL_VERSION`, so a version mint cannot leave a stale hand-maintained
-    //! list behind.
 
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
@@ -4239,10 +4225,6 @@ mod proto_fixture_tests {
 
     fn supported_protocol_versions() -> std::ops::RangeInclusive<u32> {
         PROTOCOL_VERSION..=PROTOCOL_VERSION
-    }
-
-    fn archived_protocol_versions() -> std::ops::Range<u32> {
-        FIRST_ARCHIVED_PROTOCOL_VERSION..PROTOCOL_VERSION
     }
 
     #[test]
@@ -4312,9 +4294,7 @@ mod proto_fixture_tests {
 
     #[test]
     fn frozen_fixture_directories_are_well_formed_without_expanding_compatibility() {
-        let listed = supported_protocol_versions()
-            .chain(archived_protocol_versions())
-            .collect::<BTreeSet<_>>();
+        let listed = supported_protocol_versions().collect::<BTreeSet<_>>();
         assert!(
             !listed.is_empty(),
             "supported protocol version list is empty"
@@ -4328,10 +4308,9 @@ mod proto_fixture_tests {
             directories.is_superset(&listed),
             "every live protocol version needs a daemon_proto/vN fixture directory"
         );
-        // Older vN directories are migration archaeology. They deliberately
-        // remain in-tree as frozen wire evidence, but their presence must not
-        // widen the live protocol-compatibility window.
-        for version in directories {
+        // Older vN directories may remain in-tree as migration archaeology.
+        // Their presence must not widen the live protocol-compatibility window.
+        for version in listed {
             assert_fixture_directory_files(version);
         }
     }
@@ -4541,14 +4520,10 @@ mod proto_fixture_tests {
                 "the current daemon_proto v{version} must contain {WIRE_SCHEMA_DIGEST_FILE}"
             );
         }
-        // Versions retired after the canonical digest file landed keep their
-        // frozen `wire-schema.sha256`; the archive ledger owns its bytes.
-        allowed.insert(WIRE_SCHEMA_DIGEST_FILE.to_string());
         assert!(
             actual.is_subset(&allowed),
             "unexpected files under daemon_proto v{version}: only event.json, \
-             request.json, response.json, and a retired version's frozen \
-             wire-schema.sha256 belong there"
+             request.json, and response.json belong there"
         );
     }
 
@@ -5772,19 +5747,11 @@ mod errorcode_forward_tests {
 
 // ---- Tests -----------------------------------------------------------------
 
-/// Retained daemon-wire fixtures from versions this binary deliberately does
-/// not support, derived from the mint constants instead of hand-maintained.
-/// Keep this separate from the remote-gated supported-version table: fixture
-/// retention must never widen the live compatibility window.
-#[cfg(test)]
-const ARCHIVED_PROTOCOL_VERSIONS: std::ops::Range<u32> =
-    FIRST_ARCHIVED_PROTOCOL_VERSION..PROTOCOL_VERSION;
-
 /// Fixture-file reader shared by tests that run in the default (non-`remote`)
 /// profile. The full `proto_fixture_tests` module is `remote`-gated because its
 /// round-trip coverage deserializes remote-only variants; this thin reader has
-/// no remote-type dependency and stays available so local-protocol fixture
-/// freezing checks keep running without `--features remote`.
+/// no remote-type dependency and stays available for current-version fixture
+/// checks without `--features remote`.
 #[cfg(test)]
 mod proto_fixture_files {
     use serde_json::{Map, Value};
@@ -7486,16 +7453,6 @@ mod tests {
     }
 
     #[test]
-    fn protocol_history_range_derives_from_the_mint_constants() {
-        assert!(FIRST_ARCHIVED_PROTOCOL_VERSION >= 1);
-        assert!(
-            FIRST_ARCHIVED_PROTOCOL_VERSION <= PROTOCOL_VERSION,
-            "the frozen history range {FIRST_ARCHIVED_PROTOCOL_VERSION}..{PROTOCOL_VERSION} \
-             must stay anchored at or below the current version"
-        );
-    }
-
-    #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
         assert_eq!(PROTOCOL_VERSION, 22);
         let fixture = proto_fixture_files::read_fixture("response.json");
@@ -7724,16 +7681,5 @@ mod tests {
         assert!(receipt["status"]["result_revision"].is_string());
         assert!(receipt.get("markdown").is_none());
         assert!(receipt.get("snapshot").is_none());
-    }
-
-    #[test]
-    fn archived_fixtures_are_retained_but_not_in_the_live_compatibility_window() {
-        for version in ARCHIVED_PROTOCOL_VERSIONS {
-            assert!(!is_protocol_compatible(version));
-            let archived = proto_fixture_files::read_fixture_for(version, "response.json");
-            assert!(archived.contains_key("config_refreshed"));
-            assert!(archived.contains_key("goal_status"));
-            assert!(archived.contains_key("goal_updated"));
-        }
     }
 }

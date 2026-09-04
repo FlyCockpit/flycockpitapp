@@ -6,10 +6,12 @@
 //! insertion, tail deletion, and index-column relabeling. Typed rule values,
 //! rationale, pixels, OCR, and raw target text never enter this table.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
 use anyhow::{Context, Result, anyhow};
 use rusqlite::{ErrorCode, OptionalExtension, params};
 
-use crate::db::Db;
+use crate::db::{AppendOnlyDeleteFenceViolation, Db};
 
 /// Canonical ComputerAuditEntryV1 encoding length.
 pub const COMPUTER_AUDIT_ENTRY_LEN: usize = 424;
@@ -104,24 +106,38 @@ pub fn projected_prune_checkpoint_bounds(
 struct ImmutableDeleteTriggerGuard<'a> {
     conn: &'a rusqlite::Connection,
     restored: bool,
+    /// Set when restore failed and the caller returned
+    /// `AppendOnlyDeleteFenceViolation` so the writer is poisoned.
+    quarantined: bool,
 }
 
 impl ImmutableDeleteTriggerGuard<'_> {
     fn restore(&mut self) -> Result<()> {
-        if !self.restored {
-            self.conn
-                .execute_batch(COMPUTER_AUDIT_DELETE_TRIGGER_SQL)
-                .context("restoring computer audit delete trigger")?;
-            self.restored = true;
+        if self.restored {
+            return Ok(());
         }
+        self.conn
+            .execute_batch(COMPUTER_AUDIT_DELETE_TRIGGER_SQL)
+            .context("restoring computer audit delete trigger")?;
+        self.restored = true;
         Ok(())
+    }
+
+    fn acknowledge_quarantine(&mut self) {
+        self.quarantined = true;
     }
 }
 
 impl Drop for ImmutableDeleteTriggerGuard<'_> {
     fn drop(&mut self) {
-        if !self.restored {
-            panic!("computer audit delete trigger was not restored before writer release");
+        if self.restored || self.quarantined {
+            return;
+        }
+        if self.restore().is_err() {
+            tracing::error!(
+                "computer audit delete fence left unrestored without writer quarantine"
+            );
+            self.quarantined = true;
         }
     }
 }
@@ -137,6 +153,7 @@ fn drop_immutable_delete_trigger(
     Ok(ImmutableDeleteTriggerGuard {
         conn,
         restored: false,
+        quarantined: false,
     })
 }
 
@@ -146,11 +163,12 @@ fn merge_truncation_and_restore_errors(
 ) -> Result<u64> {
     match (truncation, restore) {
         (Ok(deleted), Ok(())) => Ok(deleted),
-        (Err(truncation), Err(restore)) => Err(anyhow!(
-            "{truncation}; also failed to restore computer audit delete trigger: {restore}"
-        )),
         (Err(truncation), Ok(())) => Err(truncation),
-        (Ok(_), Err(restore)) => Err(restore),
+        (truncation, Err(restore)) => Err(AppendOnlyDeleteFenceViolation {
+            restore,
+            truncation: truncation.err(),
+        }
+        .into()),
     }
 }
 
@@ -470,7 +488,7 @@ pub(crate) fn truncate_computer_audit_prefix_conn(
     let through = i64::try_from(through_sequence_inclusive)
         .context("computer audit truncate sequence overflow")?;
     let mut trigger_guard = drop_immutable_delete_trigger(conn)?;
-    let truncation = (|| {
+    let truncation = catch_unwind(AssertUnwindSafe(|| -> Result<u64> {
         let mut total = 0_u64;
         loop {
             let deleted = conn
@@ -492,8 +510,17 @@ pub(crate) fn truncate_computer_audit_prefix_conn(
             }
         }
         Ok(total)
-    })();
-    merge_truncation_and_restore_errors(truncation, trigger_guard.restore())
+    }));
+    let truncation = match truncation {
+        Ok(result) => result,
+        Err(_panic) => Err(anyhow!("truncating computer audit prefix panicked")),
+    };
+    let restore = trigger_guard.restore();
+    let result = merge_truncation_and_restore_errors(truncation, restore);
+    if restore.is_err() {
+        trigger_guard.acknowledge_quarantine();
+    }
+    result
 }
 
 #[cfg(test)]

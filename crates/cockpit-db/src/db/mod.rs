@@ -172,6 +172,23 @@ struct TransactionRollbackFailed {
     rollback: rusqlite::Error,
 }
 
+/// Returned when an append-only delete fence cannot be restored before the
+/// writer connection is released. The writer loop poisons on this error so an
+/// unfenced database is never reused.
+#[derive(Debug, thiserror::Error)]
+#[error("append-only delete fence could not be restored: {restore:#}")]
+pub(crate) struct AppendOnlyDeleteFenceViolation {
+    restore: anyhow::Error,
+    #[source]
+    truncation: Option<anyhow::Error>,
+}
+
+fn writer_error_poisoned(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<TransactionRollbackFailed>() || cause.is::<AppendOnlyDeleteFenceViolation>()
+    })
+}
+
 #[cfg(test)]
 static FORCED_ROLLBACK_FAILURE_DB: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
@@ -261,18 +278,15 @@ impl Writer {
                         .map_err(|_| anyhow::anyhow!("db writer job panicked"))
                         .and_then(|result| result)
                         .map_err(annotate_database_storage_failure);
-                    let poison = result.as_ref().err().is_some_and(|error| {
-                        error
-                            .chain()
-                            .any(|cause| cause.is::<TransactionRollbackFailed>())
-                    });
+                    let poison = result.as_ref().err().is_some_and(writer_error_poisoned);
                     let _ = request.reply.send(result);
                     if poison {
-                        // The connection may still own an unknown transaction.
-                        // Drop it and close the queue rather than serving a
-                        // later write from an unprovable state.
+                        // The connection may still own an unknown transaction
+                        // or an unrestored append-only delete fence. Drop it
+                        // and close the queue rather than serving a later write
+                        // from an unprovable state.
                         return Err(anyhow::anyhow!(
-                            "database writer poisoned after rollback failure"
+                            "database writer poisoned after unrecoverable writer fault"
                         ));
                     }
                 }

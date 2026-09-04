@@ -16,12 +16,17 @@
 //! | `sealed_value_acquisition_audit`, `sealed_action_invocation_audit`, `sealed_recovery_audit` | terminal_evidence | Terminal sealed audit metadata past the evidence window (`pending` acquisition rows are never age-deleted) |
 //! | `media_retained_https_audit`, `media_local_path_registration_audit`, `local_media_operation_audit` | terminal_evidence | Terminal media-operation audit rows past the evidence window |
 //! | `remote_principal_audit` | terminal_evidence | Remote principal request audit rows past the evidence window (remote profile only) |
+//! | `image_generation_artifact_security_recovery_audits` (+ cascaded components) | terminal_evidence | Terminal security-recovery audit rows past the evidence window (`recorded` rows are never age-deleted; extended profile only) |
+//! | `image_generation_artifact_security_recovery_attempts` | terminal_evidence | Terminal security-recovery attempt rows past the evidence window (`received` rows are never age-deleted; extended profile only) |
 //!
 //! `computer_audit_entries` remains append-only with SQL-enforced immutability;
 //! chain truncation is owned by the machine-local audit writer, not this sweep.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, params};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
+use super::AppendOnlyDeleteFenceViolation;
 
 /// Rows deleted per batched ledger sweep statement.
 pub const LEDGER_RETENTION_BATCH: usize = 256;
@@ -55,6 +60,9 @@ pub struct LedgerRetentionOutcome {
     pub media_local_path_registration_audit_deleted: u64,
     pub local_media_operation_audit_deleted: u64,
     pub remote_principal_audit_deleted: u64,
+    pub image_security_recovery_components_deleted: u64,
+    pub image_security_recovery_audits_deleted: u64,
+    pub image_security_recovery_attempts_deleted: u64,
 }
 
 impl LedgerRetentionOutcome {
@@ -72,6 +80,9 @@ impl LedgerRetentionOutcome {
             .saturating_add(self.media_local_path_registration_audit_deleted)
             .saturating_add(self.local_media_operation_audit_deleted)
             .saturating_add(self.remote_principal_audit_deleted)
+            .saturating_add(self.image_security_recovery_components_deleted)
+            .saturating_add(self.image_security_recovery_audits_deleted)
+            .saturating_add(self.image_security_recovery_attempts_deleted)
     }
 }
 
@@ -314,6 +325,16 @@ pub(crate) fn prune_append_only_ledgers_conn(
         0
     };
 
+    let (
+        image_security_recovery_components_deleted,
+        image_security_recovery_audits_deleted,
+        image_security_recovery_attempts_deleted,
+    ) = if table_exists(conn, "image_generation_artifact_security_recovery_audits")? {
+        prune_image_security_recovery_ledgers_conn(conn, cutoff_unix_ms, batch)?
+    } else {
+        (0, 0, 0)
+    };
+
     Ok(LedgerRetentionOutcome {
         external_journal_operations_deleted,
         external_journal_queue_entries_deleted,
@@ -328,7 +349,178 @@ pub(crate) fn prune_append_only_ledgers_conn(
         media_local_path_registration_audit_deleted,
         local_media_operation_audit_deleted,
         remote_principal_audit_deleted,
+        image_security_recovery_components_deleted,
+        image_security_recovery_audits_deleted,
+        image_security_recovery_attempts_deleted,
     })
+}
+
+const IMAGE_SECURITY_RECOVERY_COMPONENT_DELETE_TRIGGER_SQL: &str = "
+CREATE TRIGGER image_generation_security_recovery_component_delete_forbidden
+BEFORE DELETE ON image_generation_artifact_security_recovery_components
+BEGIN
+    SELECT RAISE(ABORT,'security recovery component identity is durable');
+END;
+";
+
+const IMAGE_SECURITY_RECOVERY_ATTEMPT_DELETE_TRIGGER_SQL: &str = "
+CREATE TRIGGER image_generation_security_recovery_attempt_delete_forbidden
+BEFORE DELETE ON image_generation_artifact_security_recovery_attempts
+BEGIN
+    SELECT RAISE(ABORT,'security recovery attempt audit is durable');
+END;
+";
+
+const IMAGE_SECURITY_RECOVERY_AUDIT_DELETE_TRIGGER_SQL: &str = "
+CREATE TRIGGER image_generation_security_recovery_audit_delete_forbidden
+BEFORE DELETE ON image_generation_artifact_security_recovery_audits
+BEGIN
+    SELECT RAISE(ABORT,'security recovery audit is durable');
+END;
+";
+
+struct ImageSecurityRecoveryDeleteTriggerGuard<'a> {
+    conn: &'a Connection,
+    restored: bool,
+    quarantined: bool,
+}
+
+impl ImageSecurityRecoveryDeleteTriggerGuard<'_> {
+    fn drop_triggers(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS image_generation_security_recovery_component_delete_forbidden;
+             DROP TRIGGER IF EXISTS image_generation_security_recovery_attempt_delete_forbidden;
+             DROP TRIGGER IF EXISTS image_generation_security_recovery_audit_delete_forbidden;",
+        )
+        .context("dropping image security recovery delete triggers")
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+        self.conn
+            .execute_batch(IMAGE_SECURITY_RECOVERY_COMPONENT_DELETE_TRIGGER_SQL)
+            .context("restoring image security recovery component delete trigger")?;
+        self.conn
+            .execute_batch(IMAGE_SECURITY_RECOVERY_ATTEMPT_DELETE_TRIGGER_SQL)
+            .context("restoring image security recovery attempt delete trigger")?;
+        self.conn
+            .execute_batch(IMAGE_SECURITY_RECOVERY_AUDIT_DELETE_TRIGGER_SQL)
+            .context("restoring image security recovery audit delete trigger")?;
+        self.restored = true;
+        Ok(())
+    }
+
+    fn acknowledge_quarantine(&mut self) {
+        self.quarantined = true;
+    }
+}
+
+impl Drop for ImageSecurityRecoveryDeleteTriggerGuard<'_> {
+    fn drop(&mut self) {
+        if self.restored || self.quarantined {
+            return;
+        }
+        if self.restore().is_err() {
+            tracing::error!(
+                "image security recovery delete fences left unrestored without writer quarantine"
+            );
+            self.quarantined = true;
+        }
+    }
+}
+
+fn prune_image_security_recovery_ledgers_conn(
+    conn: &Connection,
+    cutoff_unix_ms: i64,
+    batch: i64,
+) -> Result<(u64, u64, u64)> {
+    ImageSecurityRecoveryDeleteTriggerGuard::drop_triggers(conn)?;
+    let mut trigger_guard = ImageSecurityRecoveryDeleteTriggerGuard {
+        conn,
+        restored: false,
+        quarantined: false,
+    };
+    let pruning = catch_unwind(AssertUnwindSafe(|| -> Result<(u64, u64, u64)> {
+        let image_security_recovery_components_deleted = delete_in_batches(batch, || {
+            conn.execute(
+                "DELETE FROM image_generation_artifact_security_recovery_components
+                  WHERE (recovery_operation_id, component_id) IN (
+                      SELECT recovery_operation_id, component_id
+                        FROM image_generation_artifact_security_recovery_components
+                       WHERE recovery_operation_id IN (
+                           SELECT recovery_operation_id
+                             FROM image_generation_artifact_security_recovery_audits
+                            WHERE state IN ('applied', 'denied', 'proof_failed', 'stale')
+                              AND COALESCE(decided_at_unix_ms, created_at_unix_ms) < ?1
+                       )
+                       ORDER BY recovery_operation_id ASC, component_id ASC
+                       LIMIT ?2
+                  )",
+                params![cutoff_unix_ms, batch],
+            )
+            .context("pruning image security recovery components")
+        })?;
+
+        let image_security_recovery_audits_deleted = delete_in_batches(batch, || {
+            conn.execute(
+                "DELETE FROM image_generation_artifact_security_recovery_audits
+                  WHERE recovery_operation_id IN (
+                      SELECT recovery_operation_id
+                        FROM image_generation_artifact_security_recovery_audits
+                       WHERE state IN ('applied', 'denied', 'proof_failed', 'stale')
+                         AND COALESCE(decided_at_unix_ms, created_at_unix_ms) < ?1
+                       ORDER BY COALESCE(decided_at_unix_ms, created_at_unix_ms) ASC
+                       LIMIT ?2
+                  )",
+                params![cutoff_unix_ms, batch],
+            )
+            .context("pruning image security recovery audits")
+        })?;
+
+        let image_security_recovery_attempts_deleted = delete_in_batches(batch, || {
+            conn.execute(
+                "DELETE FROM image_generation_artifact_security_recovery_attempts
+                  WHERE recovery_operation_id IN (
+                      SELECT recovery_operation_id
+                        FROM image_generation_artifact_security_recovery_attempts
+                       WHERE state IN ('validated', 'denied')
+                         AND COALESCE(decided_at_unix_ms, created_at_unix_ms) < ?1
+                       ORDER BY COALESCE(decided_at_unix_ms, created_at_unix_ms) ASC
+                       LIMIT ?2
+                  )",
+                params![cutoff_unix_ms, batch],
+            )
+            .context("pruning image security recovery attempts")
+        })?;
+
+        Ok((
+            image_security_recovery_components_deleted,
+            image_security_recovery_audits_deleted,
+            image_security_recovery_attempts_deleted,
+        ))
+    }));
+    let pruning = match pruning {
+        Ok(result) => result,
+        Err(_panic) => Err(anyhow::anyhow!(
+            "pruning image security recovery ledgers panicked"
+        )),
+    };
+    let restore = trigger_guard.restore();
+    let result = match (pruning, restore) {
+        (Ok(counts), Ok(())) => Ok(counts),
+        (Err(pruning), Ok(())) => Err(pruning),
+        (pruning, Err(restore)) => Err(AppendOnlyDeleteFenceViolation {
+            restore,
+            truncation: pruning.err(),
+        }
+        .into()),
+    };
+    if restore.is_err() {
+        trigger_guard.acknowledge_quarantine();
+    }
+    result
 }
 
 fn delete_in_batches(batch: i64, mut delete_batch: impl FnMut() -> Result<usize>) -> Result<u64> {

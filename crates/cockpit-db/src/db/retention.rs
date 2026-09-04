@@ -442,9 +442,14 @@ impl Db {
     /// Bounded GC for append-only ledgers that would otherwise retain
     /// user-derived or operational evidence indefinitely.
     pub async fn prune_append_only_ledgers(&self, cutoff_unix_ms: i64) -> Result<u64> {
+        let cutoff_unix_secs = cutoff_unix_ms.div_euclid(1000);
         self.write(move |conn| {
-            super::ledger_retention::prune_append_only_ledgers_conn(conn, cutoff_unix_ms)
-                .map(|outcome| outcome.rows_deleted())
+            super::ledger_retention::prune_append_only_ledgers_conn(
+                conn,
+                cutoff_unix_ms,
+                cutoff_unix_secs,
+            )
+            .map(|outcome| outcome.rows_deleted())
         })
         .await
     }

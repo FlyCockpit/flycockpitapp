@@ -9,7 +9,7 @@
 //! | Table / family | Class | Policy |
 //! | --- | --- | --- |
 //! | `external_journal_operations` (+ cascaded events/queue) | terminal_evidence | Terminal operations past the evidence window, when no live media reservation still references the operation |
-//! | `external_journal_queue_entries` | terminal_evidence | Terminal queue rows past the evidence window |
+//! | `external_journal_queue_entries` | terminal_evidence | Terminal queue rows past the evidence window (`journaled` rows cascade when their operation is pruned) |
 //! | `decision_receipts`, `agent_transition_receipts` | terminal_evidence | Terminal audit receipts for closed sessions past the evidence window |
 //! | `guidance_proposal_receipts` | terminal_evidence | Terminal proposal receipts past the evidence window (`created` rows are never age-deleted) |
 //! | `intel_files` (+ cascaded symbol graph) | intel_index | Stale workspace index snapshots past the evidence window |
@@ -32,7 +32,7 @@ const EXTERNAL_JOURNAL_TERMINAL_STATES: &[&str] = &[
     "failed",
 ];
 
-const TERMINAL_QUEUE_STATES: &[&str] = &["cancelled", "expired"];
+const TERMINAL_QUEUE_STATES: &[&str] = &["cancelled", "expired", "journaled"];
 
 const GUIDANCE_TERMINAL_STATES: &[&str] =
     &["accepted", "rejected", "expired", "expired_on_restart"];
@@ -61,8 +61,9 @@ impl LedgerRetentionOutcome {
 pub(crate) fn prune_append_only_ledgers_conn(
     conn: &Connection,
     cutoff_unix_ms: i64,
+    cutoff_unix_secs: i64,
 ) -> Result<LedgerRetentionOutcome> {
-    if cutoff_unix_ms <= 0 {
+    if cutoff_unix_ms <= 0 || cutoff_unix_secs <= 0 {
         return Ok(LedgerRetentionOutcome::default());
     }
     let batch = i64::try_from(LEDGER_RETENTION_BATCH).context("ledger retention batch overflow")?;
@@ -70,7 +71,7 @@ pub(crate) fn prune_append_only_ledgers_conn(
     let queue_states = sql_in_list(TERMINAL_QUEUE_STATES);
     let guidance_states = sql_in_list(GUIDANCE_TERMINAL_STATES);
 
-    let external_journal_operations_deleted =
+    let external_journal_operations_deleted = delete_in_batches(batch, || {
         conn.execute(
             &format!(
                 "DELETE FROM external_journal_operations
@@ -90,9 +91,10 @@ pub(crate) fn prune_append_only_ledgers_conn(
             ),
             params![cutoff_unix_ms, batch],
         )
-        .context("pruning terminal external journal operations")? as u64;
+        .context("pruning terminal external journal operations")
+    })?;
 
-    let external_journal_queue_entries_deleted =
+    let external_journal_queue_entries_deleted = delete_in_batches(batch, || {
         conn.execute(
             &format!(
                 "DELETE FROM external_journal_queue_entries
@@ -107,7 +109,8 @@ pub(crate) fn prune_append_only_ledgers_conn(
             ),
             params![cutoff_unix_ms, batch],
         )
-        .context("pruning terminal external journal queue entries")? as u64;
+        .context("pruning terminal external journal queue entries")
+    })?;
 
     let closed_sessions = "session_id IN (
         SELECT session_id FROM sessions
@@ -115,8 +118,8 @@ pub(crate) fn prune_append_only_ledgers_conn(
            AND NOT EXISTS (SELECT 1 FROM pins WHERE pins.session_id = sessions.session_id)
     )";
 
-    let decision_receipts_deleted = conn
-        .execute(
+    let decision_receipts_deleted = delete_in_batches(batch, || {
+        conn.execute(
             &format!(
                 "DELETE FROM decision_receipts
                   WHERE decision_request_id IN (
@@ -130,9 +133,10 @@ pub(crate) fn prune_append_only_ledgers_conn(
             ),
             params![cutoff_unix_ms, batch],
         )
-        .context("pruning decision receipts")? as u64;
+        .context("pruning decision receipts")
+    })?;
 
-    let agent_transition_receipts_deleted =
+    let agent_transition_receipts_deleted = delete_in_batches(batch, || {
         conn.execute(
             &format!(
                 "DELETE FROM agent_transition_receipts
@@ -147,9 +151,10 @@ pub(crate) fn prune_append_only_ledgers_conn(
             ),
             params![cutoff_unix_ms, batch],
         )
-        .context("pruning agent transition receipts")? as u64;
+        .context("pruning agent transition receipts")
+    })?;
 
-    let guidance_proposal_receipts_deleted =
+    let guidance_proposal_receipts_deleted = delete_in_batches(batch, || {
         conn.execute(
             &format!(
                 "DELETE FROM guidance_proposal_receipts
@@ -164,10 +169,11 @@ pub(crate) fn prune_append_only_ledgers_conn(
             ),
             params![cutoff_unix_ms, batch],
         )
-        .context("pruning guidance proposal receipts")? as u64;
+        .context("pruning guidance proposal receipts")
+    })?;
 
-    let intel_files_deleted = conn
-        .execute(
+    let intel_files_deleted = delete_in_batches(batch, || {
+        conn.execute(
             "DELETE FROM intel_files
               WHERE (root, path) IN (
                   SELECT root, path
@@ -176,9 +182,10 @@ pub(crate) fn prune_append_only_ledgers_conn(
                    ORDER BY indexed_at ASC
                    LIMIT ?2
               )",
-            params![cutoff_unix_ms, batch],
+            params![cutoff_unix_secs, batch],
         )
-        .context("pruning stale intel index files")? as u64;
+        .context("pruning stale intel index files")
+    })?;
 
     Ok(LedgerRetentionOutcome {
         external_journal_operations_deleted,
@@ -188,6 +195,18 @@ pub(crate) fn prune_append_only_ledgers_conn(
         guidance_proposal_receipts_deleted,
         intel_files_deleted,
     })
+}
+
+fn delete_in_batches(batch: i64, mut delete_batch: impl FnMut() -> Result<usize>) -> Result<u64> {
+    let mut total = 0_u64;
+    loop {
+        let deleted = u64::try_from(delete_batch()?).context("ledger retention delete overflow")?;
+        total = total.saturating_add(deleted);
+        if deleted < batch as u64 {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 fn sql_in_list(values: &[&str]) -> String {
@@ -223,7 +242,7 @@ mod tests {
         .unwrap();
 
         let outcome = db
-            .write(move |conn| prune_append_only_ledgers_conn(conn, 2_000))
+            .write(move |conn| prune_append_only_ledgers_conn(conn, 2_000, 2))
             .await
             .unwrap();
         assert_eq!(outcome.external_journal_operations_deleted, 1);

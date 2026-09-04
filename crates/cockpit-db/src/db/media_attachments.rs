@@ -2310,7 +2310,7 @@ impl super::Db {
                 "discard admission conflict"
             );
         }
-        let expected_origin=conn.query_row("SELECT client_draft_id,upload_id,upload_generation FROM media_attachment_upload_origins WHERE attachment_id=?1",[request.attachment_id.to_string()],|row|Ok(MediaOriginUploadV1{client_draft_id:Uuid::parse_str(&row.get::<_,String>(0)?).map_err(|_|rusqlite::Error::InvalidQuery)?,upload_id:Uuid::parse_str(&row.get::<_,String>(1)?).map_err(|_|rusqlite::Error::InvalidQuery)?,upload_generation:row.get::<_,String>(2)?.parse().map_err(|_|rusqlite::Error::InvalidQuery)?})).optional()?;
+        let expected_origin=conn.query_row("SELECT client_draft_id,upload_id,upload_generation FROM media_attachment_upload_origins WHERE attachment_id=?1",[request.attachment_id.to_string()],|row|Ok(MediaOriginUploadV1{client_draft_id:Uuid::parse_str(&row.get::<_,String>(0)?).map_err(|_|rusqlite::Error::InvalidQuery)?,upload_id:Uuid::parse_str(&row.get::<_,String>(1)?).map_err(|_|rusqlite::Error::InvalidQuery)?,upload_generation:u64::try_from(row.get::<_,i64>(2)?).map_err(|_|rusqlite::Error::InvalidQuery)?})).optional()?;
         ensure!(
             request.origin_upload == expected_origin,
             "discard origin conflict"

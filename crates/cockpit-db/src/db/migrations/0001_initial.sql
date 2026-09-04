@@ -1025,6 +1025,7 @@ CREATE TABLE media_tool_publication_intents (
         json_valid(storage_ids_json)
         AND json_type(storage_ids_json) = 'array'
         AND json(storage_ids_json) = storage_ids_json
+        AND length(CAST(storage_ids_json AS BLOB)) <= 1048576
     ),
     created_at_unix_ms INTEGER NOT NULL
 );
@@ -1614,11 +1615,21 @@ CREATE TABLE agent_instances (
     -- reduce the immutable profile/host envelope; the daemon validates
     -- non-escalation before it is ever written here. Consumed into
     -- `effective_override_json` at the node's next model-turn boundary.
-    pending_override_json TEXT CHECK (pending_override_json IS NULL OR json_valid(pending_override_json)),
+    pending_override_json TEXT CHECK (
+        pending_override_json IS NULL OR (
+            json_valid(pending_override_json)
+            AND length(CAST(pending_override_json AS BLOB)) <= 1048576
+        )
+    ),
     -- The override consumed into effect at the last turn boundary (NULL until
     -- the first consumption). The engine reads this as the node's effective
     -- session override for the turn.
-    effective_override_json TEXT CHECK (effective_override_json IS NULL OR json_valid(effective_override_json)),
+    effective_override_json TEXT CHECK (
+        effective_override_json IS NULL OR (
+            json_valid(effective_override_json)
+            AND length(CAST(effective_override_json AS BLOB)) <= 1048576
+        )
+    ),
     created_at_unix_ms INTEGER NOT NULL,
     updated_at_unix_ms INTEGER NOT NULL,
     UNIQUE (agent_instance_id, session_id),
@@ -1653,7 +1664,10 @@ CREATE TABLE root_agent_continuations (
     session_id TEXT PRIMARY KEY,
     agent_instance_id TEXT NOT NULL,
     continuation_id TEXT,
-    snapshot_json TEXT NOT NULL CHECK (json_valid(snapshot_json)),
+    snapshot_json TEXT NOT NULL CHECK (
+        json_valid(snapshot_json)
+        AND length(CAST(snapshot_json AS BLOB)) <= 1048576
+    ),
     updated_at_unix_ms INTEGER NOT NULL,
     FOREIGN KEY (agent_instance_id, session_id)
         REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
@@ -1675,7 +1689,10 @@ CREATE TABLE turn_scheduler_continuations (
     provider_item_id TEXT,
     provider_call_id TEXT,
     resolved_tool TEXT NOT NULL,
-    wire_input_json TEXT NOT NULL CHECK (json_valid(wire_input_json)),
+    wire_input_json TEXT NOT NULL CHECK (
+        json_valid(wire_input_json)
+        AND length(CAST(wire_input_json AS BLOB)) <= 8388608
+    ),
     classification TEXT NOT NULL CHECK (classification IN ('parallel_lane', 'deferred_delegate', 'serial_barrier')),
     terminal_outcome TEXT CHECK (terminal_outcome IS NULL OR terminal_outcome IN ('completed', 'refused', 'transitioned', 'cancelled')),
     -- The canonical paired result body for a terminal scheduler-owned source
@@ -1702,8 +1719,16 @@ CREATE TABLE recursive_noninteractive_executors (
     agent_instance_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
     parent_agent_instance_id TEXT NOT NULL,
-    launch_json TEXT NOT NULL CHECK (json_valid(launch_json) AND json_type(launch_json) = 'object'),
-    snapshot_json TEXT NOT NULL CHECK (json_valid(snapshot_json) AND json_type(snapshot_json) = 'object'),
+    launch_json TEXT NOT NULL CHECK (
+        json_valid(launch_json)
+        AND json_type(launch_json) = 'object'
+        AND length(CAST(launch_json AS BLOB)) <= 65536
+    ),
+    snapshot_json TEXT NOT NULL CHECK (
+        json_valid(snapshot_json)
+        AND json_type(snapshot_json) = 'object'
+        AND length(CAST(snapshot_json AS BLOB)) <= 1048576
+    ),
     created_at_unix_ms INTEGER NOT NULL,
     updated_at_unix_ms INTEGER NOT NULL,
     FOREIGN KEY (agent_instance_id, session_id)
@@ -1891,7 +1916,10 @@ CREATE TABLE agent_host_approval_operations (
     -- authority: the exact operation class and canonical candidate facts must
     -- match again at the consume CAS immediately before the host resumes it.
     operation_kind TEXT NOT NULL CHECK (length(operation_kind) BETWEEN 1 AND 128),
-    canonical_input_json TEXT NOT NULL CHECK (json_valid(canonical_input_json)),
+    canonical_input_json TEXT NOT NULL CHECK (
+        json_valid(canonical_input_json)
+        AND length(CAST(canonical_input_json AS BLOB)) <= 1048576
+    ),
     input_digest TEXT NOT NULL CHECK (length(input_digest) = 64),
     -- The real host composition point reserves the final operation before an
     -- interactive decision exists. Binding it later is a one-way operation
@@ -1910,12 +1938,22 @@ CREATE TABLE agent_host_approval_operations (
     -- The exact response selected from the durable prompt. It is recorded in
     -- the same transaction that approves this operation, so candidate facts
     -- cannot be detached from the terminal selection during recovery.
-    selected_response_json TEXT CHECK (selected_response_json IS NULL OR json_valid(selected_response_json)),
+    selected_response_json TEXT CHECK (
+        selected_response_json IS NULL OR (
+            json_valid(selected_response_json)
+            AND length(CAST(selected_response_json AS BLOB)) <= 65536
+        )
+    ),
     -- The canonical candidate selected by that response. Persisting the
     -- candidate itself (rather than only its UI option id) binds both the
     -- exact final host effect and any persistent grant mutation/scope that
     -- choice authorizes.
-    selected_candidate_json TEXT CHECK (selected_candidate_json IS NULL OR json_valid(selected_candidate_json)),
+    selected_candidate_json TEXT CHECK (
+        selected_candidate_json IS NULL OR (
+            json_valid(selected_candidate_json)
+            AND length(CAST(selected_candidate_json AS BLOB)) <= 65536
+        )
+    ),
     created_at_unix_ms INTEGER NOT NULL,
     resolved_at_unix_ms INTEGER,
     FOREIGN KEY (agent_instance_id, session_id)
@@ -1933,9 +1971,15 @@ CREATE TABLE agent_host_approval_effect_handoffs (
     session_id TEXT NOT NULL,
     agent_instance_id TEXT NOT NULL,
     operation_kind TEXT NOT NULL CHECK (length(operation_kind) BETWEEN 1 AND 128),
-    canonical_input_json TEXT NOT NULL CHECK (json_valid(canonical_input_json)),
+    canonical_input_json TEXT NOT NULL CHECK (
+        json_valid(canonical_input_json)
+        AND length(CAST(canonical_input_json AS BLOB)) <= 1048576
+    ),
     input_digest TEXT NOT NULL CHECK (length(input_digest) = 64),
-    selected_candidate_json TEXT NOT NULL CHECK (json_valid(selected_candidate_json)),
+    selected_candidate_json TEXT NOT NULL CHECK (
+        json_valid(selected_candidate_json)
+        AND length(CAST(selected_candidate_json AS BLOB)) <= 65536
+    ),
     idempotency_key TEXT NOT NULL UNIQUE,
     -- `ready` means approval was accepted but no concrete host boundary has
     -- yet claimed this capability.  Only `dispatching` is an irrevocable
@@ -2602,7 +2646,7 @@ CREATE TABLE needs_attention (
     questions_json TEXT CHECK (
         questions_json IS NULL OR (
             json_valid(questions_json)
-            AND json_type(questions_json) = 'array'
+            AND json_type(questions_json) = 'object'
             AND length(CAST(questions_json AS BLOB)) <= 262144
         )
     ),                            -- serialized proto::InterruptQuestionSet or NULL
@@ -6610,7 +6654,7 @@ CREATE TABLE external_journal_queue_entries (
     state                TEXT    NOT NULL CHECK (state IN (
         'queued', 'journaled', 'cancelled', 'expired'
     )),
-    journal_operation_id TEXT,
+    journal_operation_id TEXT REFERENCES external_journal_operations (operation_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     created_at_wall_ms   INTEGER NOT NULL,
     updated_at_wall_ms   INTEGER NOT NULL,
     UNIQUE (operation_kind, owner_session_id, idempotency_key),
@@ -6620,6 +6664,9 @@ CREATE TABLE external_journal_queue_entries (
 CREATE INDEX idx_external_journal_queue_queued
     ON external_journal_queue_entries (created_at_wall_ms)
     WHERE state = 'queued';
+CREATE INDEX idx_external_journal_queue_terminal_retention
+    ON external_journal_queue_entries (updated_at_wall_ms)
+    WHERE state IN ('cancelled', 'expired', 'journaled');
 
 -- Session deletion tombstone. Writing one never deletes an unresolved
 -- operation; resolution afterwards emits owner-visible recovery status
@@ -7415,12 +7462,14 @@ CREATE TABLE provider_config_journals (
        AND (owner_digest IS NOT NULL) = (terminal_response_json IS NOT NULL)),
     CHECK (
         (action = 'save' AND provider_id <> '__provider_batch__'
-            AND entry_json IS NOT NULL AND json_valid(entry_json))
+            AND entry_json IS NOT NULL AND json_valid(entry_json)
+            AND length(CAST(entry_json AS BLOB)) <= 1048576)
         OR (action = 'delete' AND provider_id <> '__provider_batch__'
             AND entry_json IS NULL)
         OR (action = 'batch' AND provider_id = '__provider_batch__'
             AND entry_json IS NOT NULL AND json_valid(entry_json)
-            AND json_type(entry_json) = 'object')
+            AND json_type(entry_json) = 'object'
+            AND length(CAST(entry_json AS BLOB)) <= 1048576)
     ),
     CHECK (config_path IS NOT NULL
        AND consumed_revision IS NOT NULL
@@ -8365,6 +8414,9 @@ CREATE INDEX idx_guidance_proposal_receipts_delegation
     ON guidance_proposal_receipts(delegation_id);
 CREATE INDEX idx_guidance_proposal_receipts_state
     ON guidance_proposal_receipts(state, created_at_unix_ms);
+CREATE INDEX idx_guidance_proposal_receipts_terminal_retention
+    ON guidance_proposal_receipts(COALESCE(transitioned_at_unix_ms, created_at_unix_ms))
+    WHERE state IN ('accepted', 'rejected', 'expired', 'expired_on_restart');
 -- At most one live `created` receipt per pending-proposal scope. Terminal
 -- rows remain counted by the companion counters; they just leave this index
 -- so a later create on the same scope can reuse it.
@@ -8460,11 +8512,16 @@ CREATE TABLE computer_audit_entries (
     event_kind   INTEGER NOT NULL CHECK (event_kind BETWEEN 1 AND 29),
     proposal_id  BLOB    NOT NULL CHECK (typeof(proposal_id) = 'blob' AND length(proposal_id) = 16),
     key_version  INTEGER NOT NULL CHECK (key_version >= 1),
+    wall_unix_ms INTEGER NOT NULL,
     CHECK (printf('%016X', sequence) = hex(substr(entry_bytes, 11, 8))),
     CHECK (printf('%02X', event_kind) = hex(substr(entry_bytes, 6, 1))),
     CHECK (proposal_id = substr(entry_bytes, 115, 16)),
-    CHECK (printf('%08X', key_version) = hex(substr(entry_bytes, 421, 4)))
+    CHECK (printf('%08X', key_version) = hex(substr(entry_bytes, 421, 4))),
+    CHECK (printf('%016X', wall_unix_ms) = hex(substr(entry_bytes, 409, 8)))
 );
+
+CREATE INDEX idx_computer_audit_entries_retention_ts
+    ON computer_audit_entries (wall_unix_ms);
 
 -- At most one guidance-proposal audit event per authenticated (kind, proposal)
 -- taken from entry_bytes. The uniqueness key prevents a fork; it is not event

@@ -3970,7 +3970,7 @@ impl MediaStorageRecovery {
         }
         let rows = self.db.read(|conn| {
             let mut statement = conn.prepare("SELECT upload_id,temporary_storage_id,acknowledged_bytes,upload_generation,expires_at_unix_ms,reservation_id,state,terminal_reason FROM media_uploads WHERE state IN ('open','finalizing') ORDER BY creation_sequence")?;
-            let rows = statement.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,i64>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?,row.get::<_,Option<String>>(7)?)))?;
+            let rows = statement.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?,row.get::<_,i64>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?,row.get::<_,Option<String>>(7)?)))?;
             rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
         }).await?;
         for (
@@ -3984,8 +3984,8 @@ impl MediaStorageRecovery {
             terminal_reason,
         ) in rows
         {
-            let acknowledged = acknowledged.parse::<u64>()?;
-            let generation = generation.parse::<u64>()?;
+            let acknowledged = u64::try_from(acknowledged)?;
+            let generation = u64::try_from(generation)?;
             if state == "finalizing" {
                 let target = match terminal_reason.as_deref() {
                     Some("client_cancelled") => "cancelled",
@@ -4007,7 +4007,7 @@ impl MediaStorageRecovery {
                 }
                 let upload = upload_id.clone();
                 let reservation = reservation_id.clone();
-                self.db.transaction(move|conn|{let next=generation.checked_add(1).context("upload generation overflow")?;let changed=conn.execute("UPDATE media_uploads SET state=?1,upload_generation=?2,next_chunk_index=NULL,updated_at_unix_ms=?3 WHERE upload_id=?4 AND upload_generation=?5 AND state='finalizing'",params![target,next.to_string(),now_unix_ms,upload,generation.to_string()])?;ensure!(changed==1,"upload cleanup intent lost compare-and-swap");crate::media_reservation::cancel_reserved_media_conn(conn,&reservation,u64::try_from(now_unix_ms)?)?;Ok(())}).await?;
+                self.db.transaction(move|conn|{let next=generation.checked_add(1).context("upload generation overflow")?;let changed=conn.execute("UPDATE media_uploads SET state=?1,upload_generation=?2,next_chunk_index=NULL,updated_at_unix_ms=?3 WHERE upload_id=?4 AND upload_generation=?5 AND state='finalizing'",params![target,next,now_unix_ms,upload,generation])?;ensure!(changed==1,"upload cleanup intent lost compare-and-swap");crate::media_reservation::cancel_reserved_media_conn(conn,&reservation,u64::try_from(now_unix_ms)?)?;Ok(())}).await?;
                 repaired += 1;
                 continue;
             }
@@ -4076,7 +4076,7 @@ impl MediaStorageRecovery {
             let intent_transition = serde_json::to_string(&transition)?;
             let intent_evidence = evidence.clone();
             self.db.transaction(move |conn| {
-                let changed = conn.execute("UPDATE media_uploads SET state='finalizing',terminal_reason='draft_expired',cleanup_evidence_digest=?1,last_transition_json=?2,updated_at_unix_ms=?3 WHERE upload_id=?4 AND upload_generation=?5 AND state='open'",params![intent_evidence,intent_transition,now_unix_ms,intent_upload,generation.to_string()])?;
+                let changed = conn.execute("UPDATE media_uploads SET state='finalizing',terminal_reason='draft_expired',cleanup_evidence_digest=?1,last_transition_json=?2,updated_at_unix_ms=?3 WHERE upload_id=?4 AND upload_generation=?5 AND state='open'",params![intent_evidence,intent_transition,now_unix_ms,intent_upload,generation])?;
                 ensure!(changed == 1, "upload expiry intent lost compare-and-swap");
                 Ok(())
             }).await?;
@@ -4122,7 +4122,7 @@ impl MediaStorageRecovery {
             let next = generation.checked_add(1).context("upload generation overflow")?;
             let changed = conn.execute(
                 "UPDATE media_uploads SET state=?1,upload_generation=?2,next_chunk_index=NULL,terminal_reason=?3,cleanup_evidence_digest=?4,last_transition_json=?5,updated_at_unix_ms=?6 WHERE upload_id=?7 AND upload_generation=?8 AND state IN ('open','finalizing')",
-                params![state,next.to_string(),reason,evidence,serde_json::to_string(&transition)?,now_unix_ms,upload_id,generation.to_string()],
+                params![state,next,reason,evidence,serde_json::to_string(&transition)?,now_unix_ms,upload_id,generation],
             )?;
             ensure!(changed == 1, "upload reconcile lost compare-and-swap");
             crate::media_reservation::cancel_reserved_media_conn(conn, &reservation_id, u64::try_from(now_unix_ms)?)?;
@@ -4427,12 +4427,12 @@ impl MediaStorageRecovery {
             return Ok(receipt);
         }
         let query_project = project.clone();
-        let snapshot=self.db.read(move|conn|conn.query_row("SELECT temporary_storage_id,acknowledged_bytes,acknowledged_chunks,state,upload_generation,reservation_id,media_kind FROM media_uploads WHERE upload_id=?1 AND session_id=?2 AND canonical_project_digest=?3 AND client_draft_id=?4",params![upload.to_string(),session.to_string(),query_project,draft.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u32>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?))).optional().map_err(Into::into)).await?.context("media_attachment_unavailable")?;
+        let snapshot=self.db.read(move|conn|conn.query_row("SELECT temporary_storage_id,acknowledged_bytes,acknowledged_chunks,state,upload_generation,reservation_id,media_kind FROM media_uploads WHERE upload_id=?1 AND session_id=?2 AND canonical_project_digest=?3 AND client_draft_id=?4",params![upload.to_string(),session.to_string(),query_project,draft.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,u32>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?))).optional().map_err(Into::into)).await?.context("media_attachment_unavailable")?;
         ensure!(
             snapshot.3 == "open"
-                && snapshot.4.parse::<u64>()? == generation
+                && u64::try_from(snapshot.4)? == generation
                 && snapshot.2 == chunks
-                && snapshot.1.parse::<u64>()? == total,
+                && u64::try_from(snapshot.1)? == total,
             "finalize count or length conflict"
         );
         let mut held = self
@@ -4676,7 +4676,7 @@ impl MediaStorageRecovery {
         if final_availability==MediaAvailability::Failed{conn.execute("INSERT INTO media_attachment_failure_reasons(attachment_id,reason,recorded_at_unix_ms) VALUES(?1,'normalization_failed',?2)",params![attachment.to_string(),now_unix_ms])?;}
 
         if processed{let mut availability=MediaAvailability::Quarantined;let mut available_generation=1;for next_state in [MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,final_availability]{cockpit_db::Db::transition_media_attachment_conn(conn,attachment,1,available_generation,next_state,now_unix_ms)?;let next_generation=available_generation.checked_add(1).context("availability generation overflow")?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment.to_string(),next_generation.to_string(),availability.as_str(),next_state.as_str(),transition_operation_id.to_string(),now_unix_ms])?;availability=next_state;available_generation=next_generation;}ensure!(availability==final_availability,"media terminal transition failed");}
-        if processed && final_availability==MediaAvailability::Ready {crate::media_reservation::settle_and_publish_conn(conn,&reservation_id)?;}conn.execute("INSERT INTO media_attachment_upload_origins(attachment_id,client_draft_id,upload_id,upload_generation) VALUES(?1,?2,?3,?4)",params![attachment.to_string(),draft.to_string(),upload.to_string(),next.to_string()])?;let changed=conn.execute("UPDATE media_uploads SET state='materialized',upload_generation=?1,next_chunk_index=NULL,attachment_id=?2,attachment_version='1',last_transition_json=?3,updated_at_unix_ms=?4 WHERE upload_id=?5 AND upload_generation=?6 AND state='open'",params![next.to_string(),attachment.to_string(),serde_json::to_string(&transition)?,now_unix_ms,upload.to_string(),generation.to_string()])?;ensure!(changed==1,"upload finalize lost compare-and-swap");let receipt=LocalMediaMutationReceiptV1{schema_version:1,kind:"localMediaMutationReceipt".into(),receipt_id:Uuid::now_v7(),local_operation_id:mutation.local_operation_id,actor_principal_digest:mutation.actor_principal_digest,action:"finalize".into(),subject_kind:LocalMediaSubjectKindV1::Upload,subject_id:upload,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),outcome:LocalMediaMutationOutcomeV1::Applied,transition:LocalMediaMutationTransitionV1::UploadToAttachment{upload_generation_before:generation,upload_generation_after:next,attachment_version:1,availability_generation:if processed{5}else{1},reference_generation:1},discard_result:None,discard_result_digest:None,committed_at_unix_ms:now_unix_ms};commit_local_operation(conn,&receipt,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok((receipt,true))}).await;
+        if processed && final_availability==MediaAvailability::Ready {crate::media_reservation::settle_and_publish_conn(conn,&reservation_id)?;}conn.execute("INSERT INTO media_attachment_upload_origins(attachment_id,client_draft_id,upload_id,upload_generation) VALUES(?1,?2,?3,?4)",params![attachment.to_string(),draft.to_string(),upload.to_string(),next])?;let changed=conn.execute("UPDATE media_uploads SET state='materialized',upload_generation=?1,next_chunk_index=NULL,attachment_id=?2,attachment_version=1,last_transition_json=?3,updated_at_unix_ms=?4 WHERE upload_id=?5 AND upload_generation=?6 AND state='open'",params![next,attachment.to_string(),serde_json::to_string(&transition)?,now_unix_ms,upload.to_string(),generation])?;ensure!(changed==1,"upload finalize lost compare-and-swap");let receipt=LocalMediaMutationReceiptV1{schema_version:1,kind:"localMediaMutationReceipt".into(),receipt_id:Uuid::now_v7(),local_operation_id:mutation.local_operation_id,actor_principal_digest:mutation.actor_principal_digest,action:"finalize".into(),subject_kind:LocalMediaSubjectKindV1::Upload,subject_id:upload,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),outcome:LocalMediaMutationOutcomeV1::Applied,transition:LocalMediaMutationTransitionV1::UploadToAttachment{upload_generation_before:generation,upload_generation_after:next,attachment_version:1,availability_generation:if processed{5}else{1},reference_generation:1},discard_result:None,discard_result_digest:None,committed_at_unix_ms:now_unix_ms};commit_local_operation(conn,&receipt,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok((receipt,true))}).await;
         if result.as_ref().is_err() || result.as_ref().is_ok_and(|(_, applied)| !*applied) {
             self.owned_root
                 .rename_into_noreplace(&target, &self.owned_root, &snapshot.0)
@@ -4765,9 +4765,9 @@ impl MediaStorageRecovery {
             }
             return Ok(receipt);
         }
-        let snapshot=self.db.read(move|conn|conn.query_row("SELECT temporary_storage_id,acknowledged_bytes,state,upload_generation,reservation_id FROM media_uploads WHERE upload_id=?1 AND session_id=?2 AND canonical_project_digest=?3 AND client_draft_id=?4",params![upload.to_string(),session.to_string(),project,draft.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?))).optional().map_err(Into::into)).await?.context("media_attachment_unavailable")?;
+        let snapshot=self.db.read(move|conn|conn.query_row("SELECT temporary_storage_id,acknowledged_bytes,state,upload_generation,reservation_id FROM media_uploads WHERE upload_id=?1 AND session_id=?2 AND canonical_project_digest=?3 AND client_draft_id=?4",params![upload.to_string(),session.to_string(),project,draft.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?))).optional().map_err(Into::into)).await?.context("media_attachment_unavailable")?;
         ensure!(
-            snapshot.2 == "open" && snapshot.3.parse::<u64>()? == generation,
+            snapshot.2 == "open" && u64::try_from(snapshot.3)? == generation,
             "upload generation conflict"
         );
         let mut file = self
@@ -4776,7 +4776,7 @@ impl MediaStorageRecovery {
             .map_err(anyhow::Error::new)?;
         let (length, checksum) = read_full_digest(&mut file)?;
         ensure!(
-            length == snapshot.1.parse::<u64>()?,
+            length == u64::try_from(snapshot.1)?,
             "upload temporary length mismatch"
         );
         let identity = stable_identity_digest(&file)?;
@@ -4815,7 +4815,7 @@ impl MediaStorageRecovery {
         let intent_receipt = receipt.clone();
         let intent_transition = serde_json::to_string(&transition)?;
         let intent_evidence = evidence.clone();
-        self.db.transaction(move|conn|{if let Some(replay)=preflight_local_operation(conn,mutation.local_operation_id,"cancel",&domain,&request_digest,&semantic_digest,now_unix_ms)?{return Ok(replay)}let changed=conn.execute("UPDATE media_uploads SET state='finalizing',terminal_reason='client_cancelled',cleanup_evidence_digest=?1,last_transition_json=?2,updated_at_unix_ms=?3 WHERE upload_id=?4 AND upload_generation=?5 AND state='open'",params![intent_evidence,intent_transition,now_unix_ms,upload.to_string(),generation.to_string()])?;ensure!(changed==1,"upload cancel intent lost compare-and-swap");commit_local_operation(conn,&intent_receipt,"cancel",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok(intent_receipt)}).await?;
+        self.db.transaction(move|conn|{if let Some(replay)=preflight_local_operation(conn,mutation.local_operation_id,"cancel",&domain,&request_digest,&semantic_digest,now_unix_ms)?{return Ok(replay)}let changed=conn.execute("UPDATE media_uploads SET state='finalizing',terminal_reason='client_cancelled',cleanup_evidence_digest=?1,last_transition_json=?2,updated_at_unix_ms=?3 WHERE upload_id=?4 AND upload_generation=?5 AND state='open'",params![intent_evidence,intent_transition,now_unix_ms,upload.to_string(),generation])?;ensure!(changed==1,"upload cancel intent lost compare-and-swap");commit_local_operation(conn,&intent_receipt,"cancel",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok(intent_receipt)}).await?;
         self.owned_root
             .remove_file(&snapshot.0)
             .map_err(anyhow::Error::new)?;
@@ -4828,7 +4828,7 @@ impl MediaStorageRecovery {
             );
         }
         let reservation = snapshot.4;
-        self.db.transaction(move|conn|{let changed=conn.execute("UPDATE media_uploads SET state='cancelled',upload_generation=?1,next_chunk_index=NULL,updated_at_unix_ms=?2 WHERE upload_id=?3 AND upload_generation=?4 AND state='finalizing' AND terminal_reason='client_cancelled'",params![next.to_string(),now_unix_ms,upload.to_string(),generation.to_string()])?;ensure!(changed==1,"upload cancel completion lost compare-and-swap");crate::media_reservation::cancel_reserved_media_conn(conn,&reservation,u64::try_from(now_unix_ms)?)?;Ok(())}).await?;
+        self.db.transaction(move|conn|{let changed=conn.execute("UPDATE media_uploads SET state='cancelled',upload_generation=?1,next_chunk_index=NULL,updated_at_unix_ms=?2 WHERE upload_id=?3 AND upload_generation=?4 AND state='finalizing' AND terminal_reason='client_cancelled'",params![next,now_unix_ms,upload.to_string(),generation])?;ensure!(changed==1,"upload cancel completion lost compare-and-swap");crate::media_reservation::cancel_reserved_media_conn(conn,&reservation,u64::try_from(now_unix_ms)?)?;Ok(())}).await?;
         Ok(receipt)
     }
     pub(crate) async fn append_media_upload_chunk(
@@ -4895,13 +4895,13 @@ impl MediaStorageRecovery {
         {
             return Ok(receipt);
         }
-        let snapshot=self.db.read(move|conn|{conn.query_row("SELECT temporary_storage_id,acknowledged_bytes,next_chunk_index,state,upload_generation,declared_total_bytes FROM media_uploads WHERE upload_id=?1 AND session_id=?2 AND canonical_project_digest=?3 AND client_draft_id=?4",params![upload_id.to_string(),session_id.to_string(),project,draft.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u32>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?))).optional().map_err(Into::into)}).await?.context("media_attachment_unavailable")?;
+        let snapshot=self.db.read(move|conn|{conn.query_row("SELECT temporary_storage_id,acknowledged_bytes,next_chunk_index,state,upload_generation,declared_total_bytes FROM media_uploads WHERE upload_id=?1 AND session_id=?2 AND canonical_project_digest=?3 AND client_draft_id=?4",params![upload_id.to_string(),session_id.to_string(),project,draft.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,u32>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?,r.get::<_,i64>(5)?))).optional().map_err(Into::into)}).await?.context("media_attachment_unavailable")?;
         ensure!(
-            snapshot.3 == "open" && snapshot.4.parse::<u64>()? == generation && snapshot.2 == index,
+            snapshot.3 == "open" && u64::try_from(snapshot.4)? == generation && snapshot.2 == index,
             "upload generation or chunk index conflict"
         );
-        let offset = snapshot.1.parse::<u64>()?;
-        let declared = snapshot.5.parse::<u64>()?;
+        let offset = u64::try_from(snapshot.1)?;
+        let declared = u64::try_from(snapshot.5)?;
         let after = offset
             .checked_add(u64::from(length))
             .context("upload length overflow")?;
@@ -4923,7 +4923,7 @@ impl MediaStorageRecovery {
             local_operation_id: mutation.local_operation_id,
             outcome: RemoteMediaOperationOutcomeV1::Applied,
         };
-        let result=self.db.transaction(move|conn|{if let Some(receipt)=preflight_local_operation(conn,mutation.local_operation_id,"append",&domain,&request_digest,&semantic_digest,now_unix_ms)?{return Ok((receipt,false))}let next=generation.checked_add(1).context("upload generation overflow")?;let changed=conn.execute("UPDATE media_uploads SET upload_generation=?1,acknowledged_chunks=acknowledged_chunks+1,acknowledged_bytes=?2,next_chunk_index=?3,last_transition_json=?4,updated_at_unix_ms=?5 WHERE upload_id=?6 AND upload_generation=?7 AND next_chunk_index=?8 AND acknowledged_bytes=?9 AND state='open'",params![next.to_string(),after.to_string(),index.checked_add(1).context("chunk index overflow")?,serde_json::to_string(&transition)?,now_unix_ms,upload_id.to_string(),generation.to_string(),index,offset.to_string()])?;ensure!(changed==1,"upload append lost compare-and-swap");conn.execute("INSERT INTO media_upload_chunks(upload_id,chunk_index,byte_length,sha256,storage_offset,acknowledged_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![upload_id.to_string(),index,length,checksum,offset.to_string(),now_unix_ms])?;let receipt=LocalMediaMutationReceiptV1{schema_version:1,kind:"localMediaMutationReceipt".into(),receipt_id:Uuid::now_v7(),local_operation_id:mutation.local_operation_id,actor_principal_digest:mutation.actor_principal_digest,action:"append".into(),subject_kind:LocalMediaSubjectKindV1::Upload,subject_id:upload_id,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),outcome:LocalMediaMutationOutcomeV1::Applied,transition:LocalMediaMutationTransitionV1::Upload{generation_before:generation,generation_after:next},discard_result:None,discard_result_digest:None,committed_at_unix_ms:now_unix_ms};commit_local_operation(conn,&receipt,"append",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok((receipt,true))}).await;
+        let result=self.db.transaction(move|conn|{if let Some(receipt)=preflight_local_operation(conn,mutation.local_operation_id,"append",&domain,&request_digest,&semantic_digest,now_unix_ms)?{return Ok((receipt,false))}let next=generation.checked_add(1).context("upload generation overflow")?;let changed=conn.execute("UPDATE media_uploads SET upload_generation=?1,acknowledged_chunks=acknowledged_chunks+1,acknowledged_bytes=?2,next_chunk_index=?3,last_transition_json=?4,updated_at_unix_ms=?5 WHERE upload_id=?6 AND upload_generation=?7 AND next_chunk_index=?8 AND acknowledged_bytes=?9 AND state='open'",params![next,after,index.checked_add(1).context("chunk index overflow")?,serde_json::to_string(&transition)?,now_unix_ms,upload_id.to_string(),generation,index,offset])?;ensure!(changed==1,"upload append lost compare-and-swap");conn.execute("INSERT INTO media_upload_chunks(upload_id,chunk_index,byte_length,sha256,storage_offset,acknowledged_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![upload_id.to_string(),index,length,checksum,offset,now_unix_ms])?;let receipt=LocalMediaMutationReceiptV1{schema_version:1,kind:"localMediaMutationReceipt".into(),receipt_id:Uuid::now_v7(),local_operation_id:mutation.local_operation_id,actor_principal_digest:mutation.actor_principal_digest,action:"append".into(),subject_kind:LocalMediaSubjectKindV1::Upload,subject_id:upload_id,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),outcome:LocalMediaMutationOutcomeV1::Applied,transition:LocalMediaMutationTransitionV1::Upload{generation_before:generation,generation_after:next},discard_result:None,discard_result_digest:None,committed_at_unix_ms:now_unix_ms};commit_local_operation(conn,&receipt,"append",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok((receipt,true))}).await;
         if result.as_ref().is_err() || result.as_ref().is_ok_and(|(_, applied)| !*applied) {
             file.set_len(offset)?;
             file.sync_all()?
@@ -4994,7 +4994,7 @@ impl MediaStorageRecovery {
             crate::media_reservation::reserve_conn(conn,crate::media_reservation::ReserveRequest{reservation_id:reservation_id.clone(),recovery_id:reservation_id.clone(),owner:crate::media_reservation::MediaOwner{project_id:canonical_project_digest.clone(),session_id:session_id.to_string()},operation:"media_upload".into(),purpose:"authenticated_media".into(),plans,wall_ms:u64::try_from(now_unix_ms)?},monotonic_now_ms)?;
             let sequence:i64=conn.query_row("UPDATE media_creation_sequence SET next_value=next_value+1 WHERE singleton=1 RETURNING next_value-1",[],|r|r.get(0))?;let expires=now_unix_ms.checked_add(86_400_000).context("upload expiry overflow")?;
             let transition=MediaUploadLastTransitionV1::Local{action:MediaUploadActionV1::Begin,local_operation_id:request_for_tx.local_operation_id,outcome:RemoteMediaOperationOutcomeV1::Applied};
-            conn.execute("INSERT INTO media_uploads(upload_id,session_id,canonical_project_digest,client_draft_id,media_kind,state,upload_generation,declared_total_bytes,acknowledged_chunks,acknowledged_bytes,next_chunk_index,expires_at_unix_ms,reservation_id,reservation_digest,temporary_storage_id,last_transition_json,creation_sequence,created_at_unix_ms,updated_at_unix_ms) VALUES(?1,?2,?3,?4,?5,'open','1',?6,0,'0',0,?7,?8,?9,?10,?11,?12,?13,?13)",params![upload_id.to_string(),session_id.to_string(),canonical_project_digest,client_draft_id.to_string(),serde_json::to_value(media_kind)?.as_str().context("media kind")?,declared_total_bytes.to_string(),expires,reservation_id,evaluated_digest,storage_id.to_string(),serde_json::to_string(&transition)?,sequence,now_unix_ms])?;
+            conn.execute("INSERT INTO media_uploads(upload_id,session_id,canonical_project_digest,client_draft_id,media_kind,state,upload_generation,declared_total_bytes,acknowledged_chunks,acknowledged_bytes,next_chunk_index,expires_at_unix_ms,reservation_id,reservation_digest,temporary_storage_id,last_transition_json,creation_sequence,created_at_unix_ms,updated_at_unix_ms) VALUES(?1,?2,?3,?4,?5,'open',1,?6,0,0,0,?7,?8,?9,?10,?11,?12,?13,?13)",params![upload_id.to_string(),session_id.to_string(),canonical_project_digest,client_draft_id.to_string(),serde_json::to_value(media_kind)?.as_str().context("media kind")?,declared_total_bytes,expires,reservation_id,evaluated_digest,storage_id.to_string(),serde_json::to_string(&transition)?,sequence,now_unix_ms])?;
             let receipt=LocalMediaMutationReceiptV1{schema_version:1,kind:"localMediaMutationReceipt".into(),receipt_id:Uuid::now_v7(),local_operation_id:request_for_tx.local_operation_id,actor_principal_digest:request_for_tx.actor_principal_digest.clone(),action:"begin".into(),subject_kind:LocalMediaSubjectKindV1::Upload,subject_id:upload_id,operation_request_digest:request_for_digest.clone(),semantic_command_digest:semantic_for_tx.clone(),outcome:LocalMediaMutationOutcomeV1::Applied,transition:LocalMediaMutationTransitionV1::Upload{generation_before:0,generation_after:1},discard_result:None,discard_result_digest:None,committed_at_unix_ms:now_unix_ms};let json=serde_json::to_string(&receipt)?;
             conn.execute("INSERT INTO local_media_operations(local_operation_id,authoritative_operation_id,action,domain_key,operation_request_digest,semantic_command_digest,receipt_json,is_alias,committed_at_unix_ms) VALUES(?1,?1,'begin',?2,?3,?4,?5,0,?6)",params![request_for_tx.local_operation_id.to_string(),domain_key,request_for_digest,semantic_for_tx,json,now_unix_ms])?;conn.execute("INSERT INTO local_media_operation_audit(local_operation_id,outcome,committed_at_unix_ms) VALUES(?1,'applied',?2)",params![request_for_tx.local_operation_id.to_string(),now_unix_ms])?;Ok(receipt)
         }).await;

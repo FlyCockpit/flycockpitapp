@@ -26,6 +26,11 @@ pub const COMPUTER_AUDIT_SEQUENCE_LEN: usize = 8;
 pub const COMPUTER_AUDIT_PROPOSAL_ID_OFFSET: usize = 114;
 pub const COMPUTER_AUDIT_KEY_VERSION_OFFSET: usize = 420;
 pub const COMPUTER_AUDIT_KEY_VERSION_LEN: usize = 4;
+pub const COMPUTER_AUDIT_WALL_UNIX_MS_OFFSET: usize = 408;
+pub const COMPUTER_AUDIT_WALL_UNIX_MS_LEN: usize = 8;
+
+/// Prune-checkpoint event kind (`AuditEventKind::PruneCheckpoint`).
+pub const PRUNE_CHECKPOINT: u8 = 27;
 
 const _: () = {
     assert!(COMPUTER_AUDIT_EVENT_KIND_OFFSET + 1 == 6);
@@ -35,6 +40,7 @@ const _: () = {
     assert!(COMPUTER_AUDIT_SEQUENCE_OFFSET + COMPUTER_AUDIT_SEQUENCE_LEN == 18);
     assert!(COMPUTER_AUDIT_PROPOSAL_ID_OFFSET + COMPUTER_AUDIT_ID_LEN == 130);
     assert!(COMPUTER_AUDIT_KEY_VERSION_OFFSET + COMPUTER_AUDIT_KEY_VERSION_LEN == 424);
+    assert!(COMPUTER_AUDIT_WALL_UNIX_MS_OFFSET + COMPUTER_AUDIT_WALL_UNIX_MS_LEN == 416);
 };
 
 /// Guidance-proposal audit kinds (must stay aligned with
@@ -50,6 +56,14 @@ const GUIDANCE_BODY_LOOKUP_SQL: &str = concat!(
     "FROM computer_audit_entries WHERE ",
     "substr(entry_bytes, 6, 1) = ?1 AND substr(entry_bytes, 115, 16) = ?2"
 );
+
+const COMPUTER_AUDIT_DELETE_TRIGGER_SQL: &str = "
+CREATE TRIGGER computer_audit_entries_immutable_delete
+BEFORE DELETE ON computer_audit_entries
+BEGIN
+    SELECT RAISE(ABORT, 'computer_audit_entries is append-only');
+END;
+";
 
 /// One stored chain entry. `entry_bytes` is the sole canonical body.
 /// `sequence`, `event_kind`, `proposal_id`, and `key_version` are projections
@@ -91,6 +105,16 @@ pub fn projected_index_fields(
         proposal_id,
         u32::from_be_bytes(key_bytes),
     )
+}
+
+/// Project `wall_unix_ms` from the canonical body.
+pub fn projected_wall_unix_ms(entry_bytes: &[u8; COMPUTER_AUDIT_ENTRY_LEN]) -> i64 {
+    let mut wall_bytes = [0u8; COMPUTER_AUDIT_WALL_UNIX_MS_LEN];
+    wall_bytes.copy_from_slice(
+        &entry_bytes[COMPUTER_AUDIT_WALL_UNIX_MS_OFFSET
+            ..COMPUTER_AUDIT_WALL_UNIX_MS_OFFSET + COMPUTER_AUDIT_WALL_UNIX_MS_LEN],
+    );
+    i64::from_be_bytes(wall_bytes)
 }
 
 fn index_columns_match_entry_bytes(row: &ComputerAuditEntryRow) -> bool {
@@ -248,12 +272,13 @@ impl Db {
             index_columns_match_entry_bytes(&row),
             "computer audit index columns must match entry_bytes"
         );
+        let wall_unix_ms = projected_wall_unix_ms(&row.entry_bytes);
         let kind_blob = [row.event_kind];
         self.write(move |conn| {
             match conn.execute(
                 "INSERT INTO computer_audit_entries
-                     (sequence, entry_bytes, mac, event_kind, proposal_id, key_version)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                     (sequence, entry_bytes, mac, event_kind, proposal_id, key_version, wall_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     row.sequence as i64,
                     row.entry_bytes.as_slice(),
@@ -261,6 +286,7 @@ impl Db {
                     i64::from(row.event_kind),
                     row.proposal_id.as_slice(),
                     i64::from(row.key_version),
+                    wall_unix_ms,
                 ],
             ) {
                 Ok(1) => Ok(true),
@@ -293,6 +319,60 @@ impl Db {
         })
         .await
     }
+
+    /// Delete a bounded prefix of the audit log. Only the machine-local audit
+    /// writer may call this after appending a `PruneCheckpoint` entry.
+    pub async fn truncate_computer_audit_prefix(
+        &self,
+        through_sequence_inclusive: u64,
+    ) -> Result<u64> {
+        self.write(move |conn| {
+            truncate_computer_audit_prefix_conn(conn, through_sequence_inclusive)
+        })
+        .await
+    }
+}
+
+/// Delete `sequence <= through_sequence_inclusive` in bounded batches.
+pub(crate) fn truncate_computer_audit_prefix_conn(
+    conn: &rusqlite::Connection,
+    through_sequence_inclusive: u64,
+) -> Result<u64> {
+    if through_sequence_inclusive == 0 {
+        return Ok(0);
+    }
+    let batch = i64::try_from(super::ledger_retention::LEDGER_RETENTION_BATCH)
+        .context("computer audit truncate batch overflow")?;
+    let through = i64::try_from(through_sequence_inclusive)
+        .context("computer audit truncate sequence overflow")?;
+    let mut total = 0_u64;
+    loop {
+        conn.execute(
+            "DROP TRIGGER IF EXISTS computer_audit_entries_immutable_delete",
+            [],
+        )
+        .context("dropping computer audit delete trigger")?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM computer_audit_entries
+                  WHERE sequence IN (
+                      SELECT sequence
+                        FROM computer_audit_entries
+                       WHERE sequence <= ?1
+                       ORDER BY sequence ASC
+                       LIMIT ?2
+                  )",
+                params![through, batch],
+            )
+            .context("truncating computer audit prefix")? as u64;
+        conn.execute_batch(COMPUTER_AUDIT_DELETE_TRIGGER_SQL)
+            .context("restoring computer audit delete trigger")?;
+        total = total.saturating_add(deleted);
+        if deleted < batch as u64 {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -316,6 +396,10 @@ mod tests {
         entry_bytes[COMPUTER_AUDIT_KEY_VERSION_OFFSET
             ..COMPUTER_AUDIT_KEY_VERSION_OFFSET + COMPUTER_AUDIT_KEY_VERSION_LEN]
             .copy_from_slice(&key_version.to_be_bytes());
+        let wall_unix_ms = 1_700_000_000_000_i64;
+        entry_bytes[COMPUTER_AUDIT_WALL_UNIX_MS_OFFSET
+            ..COMPUTER_AUDIT_WALL_UNIX_MS_OFFSET + COMPUTER_AUDIT_WALL_UNIX_MS_LEN]
+            .copy_from_slice(&wall_unix_ms.to_be_bytes());
         let mut mac = [0u8; COMPUTER_AUDIT_MAC_LEN];
         mac[0] = sequence as u8;
         mac[31] = kind;
@@ -457,8 +541,8 @@ mod tests {
             .write(move |conn| {
                 conn.execute(
                     "INSERT INTO computer_audit_entries
-                         (sequence, entry_bytes, mac, event_kind, proposal_id, key_version)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                         (sequence, entry_bytes, mac, event_kind, proposal_id, key_version, wall_unix_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         row.sequence as i64,
                         row.entry_bytes.as_slice(),
@@ -466,6 +550,7 @@ mod tests {
                         i64::from(GUIDANCE_PROPOSAL_ACCEPTED),
                         row.proposal_id.as_slice(),
                         i64::from(row.key_version),
+                        projected_wall_unix_ms(&row.entry_bytes),
                     ],
                 )
                 .map_err(Into::into)

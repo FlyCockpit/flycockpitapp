@@ -4429,10 +4429,12 @@ async fn lane_budget_exit_drain_charges_residual_lane_usage() {
     );
     crate::engine::delegation_budget::LaneBudgetScope::run(async {
         crate::engine::delegation_budget::note_lane_budget_usage(
-            crate::engine::delegation_budget::BudgetCharge {
+            crate::engine::delegation_budget::BudgetCharge::from_usage(crate::tokens::TokenUsage {
                 input_tokens: 77,
-                ..Default::default()
-            },
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            }),
             false,
         );
         let _exit_drain = crate::engine::delegation_budget::LaneBudgetExitDrain::new(&budget);

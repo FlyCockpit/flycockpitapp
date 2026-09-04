@@ -87,8 +87,10 @@ pub trait TenantKeyProvider: Send + Sync {
 /// Reference PKCS#11 tenant key provider stub.
 ///
 /// Carries the intended configuration address and conformance contract. **Does
-/// not load a PKCS#11 module or sign.** [`TenantKeyProvider::sign_fixed`]
-/// always returns [`KeyProviderError::UnsupportedOperation`].
+/// not load a PKCS#11 module, perform conformance checks, or sign.**
+/// [`TenantKeyProvider::sign_fixed`] and [`TenantKeyProvider::conformance`]
+/// return [`KeyProviderError::UnsupportedOperation`] (empty module path returns
+/// [`KeyProviderError::ModuleUnavailable`]).
 #[derive(Debug)]
 pub struct Pkcs11TenantKeyProvider {
     module_path: std::path::PathBuf,
@@ -154,7 +156,11 @@ impl TenantKeyProvider for Pkcs11TenantKeyProvider {
         if self.module_path.as_os_str().is_empty() {
             return Err(KeyProviderError::ModuleUnavailable("empty path".into()));
         }
-        Ok(())
+        // The production provider loads the audited PKCS#11 crate and runs
+        // mechanism/curve/attribute/session/login/sign-verify checks. This
+        // stub returns UnsupportedOperation so readiness never passes against
+        // a developer token without the SoftHSM conformance harness.
+        Err(KeyProviderError::UnsupportedOperation)
     }
 
     fn supported_domains(&self) -> &'static [SigningDomain] {

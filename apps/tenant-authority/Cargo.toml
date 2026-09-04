@@ -30,6 +30,12 @@ name = "tenant_authority_service_acceptance"
 path = "tests/tenant_authority_service_acceptance.rs"
 required-features = ["remote"]
 
+# Process-boundary exit-code enforcement (outside the nine-test manifest).
+[[test]]
+name = "tenant_authority_binary_exit"
+path = "tests/tenant_authority_binary_exit.rs"
+required-features = ["remote"]
+
 [dependencies]
 cockpit-proto = { path = "../../crates/cockpit-proto", optional = true }
 anyhow = { workspace = true }

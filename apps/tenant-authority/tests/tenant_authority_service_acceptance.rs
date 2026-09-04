@@ -382,8 +382,11 @@ fn tenant_authority_pkcs11_conformance() {
         &SigningDomain::ALL,
     );
 
-    // Conformance passes for a nonempty module path.
-    provider.conformance().unwrap();
+    // Conformance is not wired: nonempty path fails closed like sign_fixed.
+    assert!(matches!(
+        provider.conformance(),
+        Err(key_provider::KeyProviderError::UnsupportedOperation)
+    ));
 
     // The durable object address components.
     assert_eq!(provider.module_digest(), [0xAB; 32]);

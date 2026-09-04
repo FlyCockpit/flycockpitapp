@@ -2649,6 +2649,27 @@ pub(super) fn test_fixture_workspace_scratch_path_for_session(
     test_support_workspace_scratch_path_for_session(&directory_id, session_id)
 }
 
+/// Resolve a persisted row's durable scratch directory for row-only readers
+/// (export, tandem tool-call validation). Production rows carry fixed-length
+/// workspace-object digests and take the production path; under test builds
+/// the same short fixture labels session construction recognizes keep their
+/// isolated fixture scratch namespace instead of failing project-id
+/// validation.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn workspace_scratch_path_for_session_allowing_test_fixture(
+    project_id: &str,
+    session_id: Uuid,
+) -> Result<PathBuf> {
+    if project_id.len() <= 24
+        && project_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return test_fixture_workspace_scratch_path_for_session(project_id, session_id);
+    }
+    workspace_scratch_path_for_session(project_id, session_id)
+}
+
 const TITLE_SCHEDULE_SLOTS: [u8; 5] = [1, 2, 4, 8, 16];
 const METADATA_SCHEDULE_SLOTS: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 
@@ -4558,7 +4579,10 @@ mod tests {
                 r#"{"tools":["read","bash"],"toolTiers":{}}"#.to_string(),
             ))
             .expect_err("missing durable row must reject the replacement");
-        assert!(error.to_string().contains("not found"), "{error:#}");
+        // The rejection travels as the cause under the generic persistence
+        // context, so assert against the full chain rather than the
+        // top-level message.
+        assert!(format!("{error:#}").contains("not found"), "{error:#}");
         assert_eq!(
             session.tool_surface_override_json().as_deref(),
             Some(original),

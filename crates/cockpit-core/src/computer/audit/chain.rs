@@ -333,7 +333,6 @@ impl ComputerAuditChain {
         inner: &mut ChainInner,
         event: &ReceiverReproofAuditAppend,
     ) -> Result<(), ReceiverReproofAppendError> {
-        let mut durable_write = false;
         for _ in 0..MAX_CAS_RETRIES {
             let loaded = self
                 .keys
@@ -357,10 +356,7 @@ impl ComputerAuditChain {
                         .await
                         .map_err(|_| ReceiverReproofAppendError::Unavailable)?;
                 }
-                other => {
-                    let _ = other;
-                    return Err(ReceiverReproofAppendError::ChainBroken);
-                }
+                _ => return Err(ReceiverReproofAppendError::ChainBroken),
             }
             let sequence = head
                 .confirmed_sequence
@@ -397,7 +393,6 @@ impl ComputerAuditChain {
             );
             match self.cas_head(&view, &pending).await {
                 Ok(pending_view) => {
-                    durable_write = true;
                     view = pending_view;
                 }
                 Err(CasOutcome::Conflict) => continue,
@@ -433,7 +428,6 @@ impl ComputerAuditChain {
                 }
             }
         }
-        let _ = durable_write;
         Err(ReceiverReproofAppendError::Unavailable)
     }
 
@@ -1160,6 +1154,7 @@ fn build_receiver_reproof_entry(
     let present_bits_mask = present_bits::SESSION_ID
         | present_bits::DELEGATION_ID
         | present_bits::OPERATION_ID
+        | present_bits::PROPOSAL_ID
         | present_bits::FOCUS_DIGEST
         | present_bits::VERIFICATION_STATE
         | present_bits::ERROR_CODE;
@@ -1170,9 +1165,9 @@ fn build_receiver_reproof_entry(
         previous_mac,
         session_id: event.session_id,
         delegation_id: event.delegation_id,
-        action_id: event.operation_id,
+        action_id: [0u8; 16],
         operation_id: event.operation_id,
-        proposal_id: [0u8; 16],
+        proposal_id: event.operation_id,
         disposition: 0,
         scope: 0,
         canonical_project_digest: [0u8; 32],

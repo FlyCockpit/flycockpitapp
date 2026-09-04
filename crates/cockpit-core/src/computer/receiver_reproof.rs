@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tracing::info;
 
-use super::audit::{AuditErrorCode, ComputerAuditChain};
+use super::audit::{AuditErrorCode, ComputerAuditChain, ReceiverReproofAuditAppend};
 use super::target::{OpaqueWindowId, TargetIdentityEvidence};
 use super::{ComputerAction, ComputerError, TypedInputLineModel};
 
@@ -103,7 +103,9 @@ pub(crate) fn batch_would_refuse_unproven_receiver_enter(
     let mut simulated = model.clone();
     for action in actions {
         match simulated.absorb_action(action) {
-            Err(ComputerError::Refused(reason)) if reason.contains("receiving object") => {
+            Err(ComputerError::Refused(_))
+                if action.is_enter_class_commit() && model.is_receiver_unproven() =>
+            {
                 return true;
             }
             Err(_) => return false,
@@ -156,11 +158,13 @@ pub(crate) async fn journal_receiver_reproof_attempt(
     append: ReceiverReproofAuditAppend,
 ) {
     let Some(chain) = chain else {
+        tracing::warn!("receiver re-proof audit chain is not installed; evidence receipt skipped");
         return;
     };
     if !chain.is_available() {
+        tracing::warn!("receiver re-proof audit chain is unavailable; evidence receipt skipped");
         return;
-    }
+    };
     if let Err(error) = chain.append_receiver_reproof(append).await {
         tracing::warn!(%error, "receiver re-proof audit append failed");
     }

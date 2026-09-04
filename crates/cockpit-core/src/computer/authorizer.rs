@@ -77,7 +77,11 @@ impl ComputerAuthorizer for ApproverComputerAuthorizer {
             session_id: &request.session_id,
             delegation_id: &request.delegation_id.0,
             action_id: &request.action_id,
-            tier: tier_str(request.tier),
+            tier: tier_str(if request.receiver_terminal_ask_required {
+                ComputerApprovalTier::Ask
+            } else {
+                request.tier
+            }),
             action_label: &request.action_label,
             backend_kind: request.backend_kind.diagnostic_label(),
             focus_generation: request.focus_generation.0,
@@ -164,6 +168,7 @@ mod tests {
             typed_text: None,
             batch_detail: None,
             target_window: None,
+            receiver_terminal_ask_required: false,
         }
     }
 

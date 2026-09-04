@@ -46,7 +46,7 @@ use tokio::sync::oneshot;
 
 use super::audit::{
     AuditErrorCode, AuditEventKind, ComputerAuditChain, ReceiverReproofAuditAppend,
-    VerificationState, domain_digest, domains,
+    VerificationState, audit_rfc4122_id_bytes, domain_digest, domains,
 };
 use super::frame::{
     ActionId, CaptureEpoch, FrameDimensions, InMemoryReservationHandle, LiveComputerFrame,
@@ -944,13 +944,6 @@ mod computer_action_prompt_summary_tests {
             Some("(window 0909090909090909…)")
         );
     }
-}
-
-fn audit_id_bytes(label: &str) -> [u8; 16] {
-    let digest = Sha256::digest(label.as_bytes());
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&digest[..16]);
-    out
 }
 
 fn canonicalization_failure(index: usize, error: ComputerError) -> CoordinatedOutcome {
@@ -2266,6 +2259,9 @@ pub struct ComputerActionAuthorization {
     /// prompt (issue #286): action kind, coordinates, keys, scroll deltas.
     /// Typed text is excluded; it travels in `typed_text`.
     pub action_detail: String,
+    /// When true, window-level receiver re-proof requires a human Ask prompt
+    /// even if [`Self::tier`] is Yolo (issue #374).
+    pub receiver_terminal_ask_required: bool,
     /// Typed text of a pending TypeText action, for prompt rendering at the
     /// approval seam (issue #286). The full, untruncated text travels so the
     /// seam can scrub registered literals before bounding the render;
@@ -3895,7 +3891,6 @@ pub struct ComputerActionCoordinator {
     outcome_store: Option<Arc<dyn super::outcome_store::ComputerOutcomeStore>>,
     /// Handoff journal for ambiguous physical handoff lifecycle (AC15/AC16).
     handoff_journal: Option<Arc<dyn HandoffJournal>>,
-    audit_chain: None,
     /// Per-item outcomes from the most recent batch dispatch (AC12). One
     /// `BatchItemOutcome` per canonical backend item, including
     /// `NotDispatched` tails on early stop.
@@ -3980,7 +3975,6 @@ pub struct CoordinatorParams {
     pub outcome_store: Option<Arc<dyn super::outcome_store::ComputerOutcomeStore>>,
     /// Handoff journal for ambiguous physical handoff lifecycle (AC15/AC16).
     pub handoff_journal: Option<Arc<dyn HandoffJournal>>,
-    audit_chain: None,
     /// Optional tamper-evident audit chain for receiver re-proof receipts
     /// (issue #374). Production daemon wiring is deferred post-launch.
     pub audit_chain: Option<Arc<ComputerAuditChain>>,
@@ -4399,7 +4393,6 @@ impl ComputerActionCoordinator {
             last_live_frame: None,
             outcome_store: params.outcome_store,
             handoff_journal: params.handoff_journal,
-            audit_chain: None,
             batch_item_outcomes: Vec::new(),
             // Review cycle 2, finding 4: a receiver that predates this
             // coordinator — every real desktop, which survives coordinator
@@ -4614,6 +4607,25 @@ impl ComputerActionCoordinator {
         };
         self.backend.bind_evidenced_window(window)?;
         self.backend.recheck_evidenced_window()
+    }
+
+    /// Deliver one normalized backend action through the same per-item fences
+    /// as [`Self::dispatch_backend_batch`]: pre-handoff identity/widget class,
+    /// evidenced-window binding, then `execute_normalized_one`.
+    async fn execute_fenced_backend_one(
+        &mut self,
+        actions_suffix: &[ComputerAction],
+        class_offset: usize,
+        normalized: &NormalizedComputerAction,
+    ) -> Result<(), ComputerError> {
+        if let Err(fence) = self.pre_handoff_for_dispatch(actions_suffix, class_offset) {
+            return Err(fence.batch_error());
+        }
+        self.bind_backend_target_window(&actions_suffix[class_offset])?;
+        self.backend
+            .as_mut()
+            .execute_normalized_one(normalized)
+            .await
     }
 
     /// Recapture focused widget evidence between authorization awaits.
@@ -4832,20 +4844,10 @@ impl ComputerActionCoordinator {
                         let mut completed = Vec::new();
                         let mut failure = None;
                         for (index, action) in normalized.iter().enumerate() {
-                            if let Err(fence) =
-                                self.pre_handoff_for_dispatch(&actions[index..], index)
+                            match self
+                                .execute_fenced_backend_one(&actions[index..], index, action)
+                                .await
                             {
-                                failure = Some(ComputerFailure {
-                                    index,
-                                    error: fence.batch_error(),
-                                });
-                                break;
-                            }
-                            if let Err(error) = self.bind_backend_target_window(&actions[index]) {
-                                failure = Some(ComputerFailure { index, error });
-                                break;
-                            }
-                            match self.backend.as_mut().execute_normalized_one(action).await {
                                 Ok(outcome) => completed.push(outcome),
                                 Err(error) => {
                                     failure = Some(ComputerFailure { index, error });
@@ -5110,6 +5112,8 @@ impl ComputerActionCoordinator {
             });
         }
         let mut prompted_classes = Vec::with_capacity(actions.len());
+        let receiver_terminal_ask_required = self.receiver_enter_requires_terminal_ask
+            && actions.iter().any(ComputerAction::is_enter_class_commit);
         // Prompt-level batch summary (issue #286): each per-action approval
         // prompt also summarizes the whole pending batch.
         let mut batch_detail =
@@ -5169,6 +5173,7 @@ impl ComputerActionCoordinator {
                 ),
                 batch_detail: batch_detail.clone(),
                 target_window: target_window.map(str::to_string),
+                receiver_terminal_ask_required,
             };
             match self.authorizer.authorize(&request).await {
                 Ok(ComputerAuthorizationDecision::Allow) => {}
@@ -6218,7 +6223,12 @@ impl ComputerActionCoordinator {
                     call_id,
                     operation_id,
                     AuditEventKind::ActionVerificationFailed,
-                    VerificationState::Mismatch,
+                    match failure {
+                        ReceiverReproofFailure::EvidenceUnavailable => {
+                            VerificationState::Unavailable
+                        }
+                        _ => VerificationState::Mismatch,
+                    },
                     failure.audit_error_code(),
                 ),
             ),
@@ -6244,16 +6254,16 @@ impl ComputerActionCoordinator {
         verification_state: VerificationState,
         error_code: AuditErrorCode,
     ) -> ReceiverReproofAuditAppend {
-        let window = self
+        let focus_generation = self
             .journaled_receiver_proof
-            .map(|proof| *proof.window.as_bytes())
-            .unwrap_or([0u8; 16]);
+            .map(|proof| proof.focus_generation)
+            .unwrap_or(0);
         ReceiverReproofAuditAppend {
             kind,
-            session_id: audit_id_bytes(&self.session_id),
-            delegation_id: audit_id_bytes(&self.delegation_id.0),
+            session_id: audit_rfc4122_id_bytes(&self.session_id),
+            delegation_id: audit_rfc4122_id_bytes(&self.delegation_id.0),
             operation_id,
-            focus_digest: domain_digest(domains::FOCUS_GENERATION, &window),
+            focus_digest: domain_digest(domains::FOCUS_GENERATION, &focus_generation.to_be_bytes()),
             verification_state,
             error_code,
         }
@@ -6274,14 +6284,15 @@ impl ComputerActionCoordinator {
     }
 
     async fn deliver_receiver_reproof_line_clear(&mut self) -> Result<(), ReceiverReproofFailure> {
-        if !self.typed_input_line.needs_line_clear_for_reproof() {
-            return Ok(());
-        }
         let action = line_clear_action();
-        let normalized = normalize_action(&action, &self.geometry)
+        let geometry = self
+            .backend
+            .geometry()
+            .await
             .map_err(|_| ReceiverReproofFailure::LineClearFailed)?;
-        self.backend
-            .execute_normalized_one(&normalized)
+        let normalized = normalize_action(&action, &geometry)
+            .map_err(|_| ReceiverReproofFailure::LineClearFailed)?;
+        self.execute_fenced_backend_one(std::slice::from_ref(&action), 0, &normalized)
             .await
             .map_err(|_| ReceiverReproofFailure::LineClearFailed)?;
         self.typed_input_line
@@ -7536,7 +7547,6 @@ mod tests {
     struct PhysicalTestSinks {
         outcome_store: Arc<dyn super::super::outcome_store::ComputerOutcomeStore>,
         handoff_journal: Arc<dyn HandoffJournal>,
-        audit_chain: None,
         // Declared last so the live DB/journal handles above close before the
         // temporary directory attempts removal.
         _root: tempfile::TempDir,
@@ -10779,7 +10789,7 @@ mod tests {
                 &vec![OpenAiComputerAction::Screenshot],
             )
             .await;
-        adapter.lock().unwrap().mutate_window([0xBB; 16]);
+        adapter.lock().unwrap().snapshot.focus_generation = 2;
         let outcome = coordinator
             .execute_openai_call(
                 "call-mismatch-enter",
@@ -15420,14 +15430,21 @@ mod tests {
             .find("DispatchState::Dispatching")
             .expect("Dispatching commit in dispatch_backend_batch");
         let execute = body
-            .find("self.backend.as_mut().execute_normalized_one(action)")
-            .expect("normalized backend handoff in dispatch_backend_batch");
-        let between = body
-            .find("self.pre_handoff_for_dispatch(&actions[index..], index)")
-            .expect("per-item widget class fence in dispatch_backend_batch");
-        let bind = body
-            .find("self.bind_backend_target_window(&actions[index])")
-            .expect("per-item evidenced window bind in dispatch_backend_batch");
+            .find("self.execute_fenced_backend_one(&actions[index..], index, action)")
+            .expect("fenced backend handoff in dispatch_backend_batch");
+        let fenced_fn = src
+            .find("async fn execute_fenced_backend_one")
+            .expect("execute_fenced_backend_one");
+        let fenced_body = &src[fenced_fn..fenced_fn + 900];
+        let between = fenced_body
+            .find("self.pre_handoff_for_dispatch(actions_suffix, class_offset)")
+            .expect("per-item widget class fence in execute_fenced_backend_one");
+        let bind = fenced_body
+            .find("self.bind_backend_target_window(&actions_suffix[class_offset])")
+            .expect("per-item evidenced window bind in execute_fenced_backend_one");
+        let handoff = fenced_body
+            .find("self.backend.as_mut().execute_normalized_one(normalized)")
+            .expect("normalized backend handoff in execute_fenced_backend_one");
         assert!(
             pre < dispatching,
             "pre_handoff_for_dispatch must run before Dispatching is committed"
@@ -15441,7 +15458,7 @@ mod tests {
             "widget class must be re-fenced after Dispatching and before each item"
         );
         assert!(
-            between < bind && bind < execute,
+            between < bind && bind < handoff,
             "evidenced window must be bound after the per-item fence and before each item"
         );
         let bind_fn = src

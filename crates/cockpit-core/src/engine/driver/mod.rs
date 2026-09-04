@@ -2130,6 +2130,10 @@ impl Driver {
                 frame.computer_ask_denial.take(),
             )
         };
+        let computer_audit_chain = match &self.guidance_proposals {
+            Some(service) => service.lock().await.computer_audit_chain(),
+            None => None,
+        };
         let result = computer_native::reconcile_native_computer_for_delegation(
             &mut agent,
             &self.session,
@@ -2140,6 +2144,7 @@ impl Driver {
             &mut coordinator_config,
             &mut pending,
             &mut sticky_ask_denial,
+            computer_audit_chain,
         )
         .await;
         // Write the slot back even when replacement fails: sticky Ask denial

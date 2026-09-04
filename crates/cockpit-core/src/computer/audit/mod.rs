@@ -461,6 +461,19 @@ pub fn domain_digest(domain: &str, value: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// Parse a hyphenated RFC 4122 session or delegation id into network-order
+/// bytes for audit entries. Non-UUID test labels fall back to a truncated
+/// SHA-256 digest so hermetic fixtures can still journal when needed.
+pub fn audit_rfc4122_id_bytes(label: &str) -> [u8; 16] {
+    if let Ok(id) = Uuid::parse_str(label) {
+        return *id.as_bytes();
+    }
+    let digest = Sha256::digest(label.as_bytes());
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    out
+}
+
 /// The eight closed digest domains.
 pub mod domains {
     pub const PROJECT: &str = "project";

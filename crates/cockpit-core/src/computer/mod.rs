@@ -1004,12 +1004,6 @@ impl TypedInputLineModel {
         self.receiver_unproven
     }
 
-    /// True when re-proof must deliver a line clear before evidence can
-    /// restore a proven receiver.
-    pub(crate) fn needs_line_clear_for_reproof(&self) -> bool {
-        self.untracked || !self.pending.is_empty()
-    }
-
     /// Clear `receiver_unproven` only from the coordinator evidence re-proof
     /// choke point (issue #374). No other code path may call this.
     pub(crate) fn prove_receiver_on_evidence(&mut self) {

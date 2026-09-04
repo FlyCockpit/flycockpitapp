@@ -1845,6 +1845,7 @@ pub struct ToolCtx {
     /// owner context (lands with the upstream adapter-map reconciliation); a
     /// missing funnel makes the tool report that dispatch is unavailable in this
     /// session rather than fabricating an outcome.
+    #[cfg(feature = "extended")]
     pub(crate) image_generation_dispatch:
         Option<std::sync::Arc<crate::image_generation_job::ImageGenerationDispatchService>>,
     /// Session-scoped audio-transcription dispatch: journal plus a provider
@@ -1982,6 +1983,7 @@ impl ToolCtx {
             cancel: self.cancel.clone(),
             shutdown_gate: self.shutdown_gate.clone(),
             approver: self.approver.clone(),
+            #[cfg(feature = "extended")]
             image_generation_dispatch: self.image_generation_dispatch.clone(),
             transcription_dispatch: self.transcription_dispatch.clone(),
             deferred_log: self.deferred_log.clone(),

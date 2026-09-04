@@ -13,7 +13,7 @@ workspace = true
 # Remote signaling, tenant authority, continuity, and transport wire contracts
 # are opt-in and propagate the same capability to their persistence DTOs.
 default = []
-extended = ["cockpit-db/extended"]
+extended = ["cockpit-db/extended", "cockpit-config/extended"]
 remote = [
     "cockpit-db/remote",
     "dep:hmac",

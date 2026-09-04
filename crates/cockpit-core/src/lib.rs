@@ -44,10 +44,15 @@ mod global_layer_mkdir_ratchet;
 pub mod harness;
 pub mod host_capabilities;
 pub mod image_generation;
+#[cfg(feature = "extended")]
 pub mod image_generation_agent_tools;
+#[cfg(feature = "extended")]
 pub mod image_generation_artifact_routes;
+#[cfg(feature = "extended")]
 pub mod image_generation_comfyui;
+#[cfg(feature = "extended")]
 pub mod image_generation_control_plane;
+#[cfg(feature = "extended")]
 pub mod image_generation_job;
 pub mod image_generation_runtime;
 pub mod image_sidecar;
@@ -65,6 +70,7 @@ pub mod media_reservation;
 mod media_storage;
 pub mod model_system_prompt;
 pub mod onboarding_agent;
+#[cfg(feature = "extended")]
 pub mod openai_images_adapter;
 pub mod packages;
 pub mod policy;

@@ -937,19 +937,23 @@ pub enum Response {
         snapshot: ResourceSchedulerSnapshot,
     },
 
+    #[cfg(feature = "extended")]
     ScheduledJob {
         job: ScheduledJobSummary,
     },
 
+    #[cfg(feature = "extended")]
     ScheduledJobs {
         jobs: Vec<ScheduledJobSummary>,
     },
 
+    #[cfg(feature = "extended")]
     ScheduledJobDeleted {
         id: String,
         deleted: bool,
     },
 
+    #[cfg(feature = "extended")]
     ScheduledJobRunQueued {
         id: String,
     },
@@ -1068,12 +1072,14 @@ pub enum Response {
 
     /// Redacted LOCAL image-generation control-plane read reply
     /// (endpoint/target/workflow list/get). Carries only safe projections.
+    #[cfg(feature = "extended")]
     ImageControlRead(crate::image_control::ImageControlReadResponseV1),
 
     /// LOCAL image-generation control-plane config-mutation reply
     /// (endpoint/target create/update/delete/set_default). Carries the new
     /// authoritative config generation and the safe change set that was applied
     /// and emitted; never raw credential/header/workflow material.
+    #[cfg(feature = "extended")]
     ImageControlMutated(crate::image_control::ImageControlMutationResponseV1),
 
     GitStatus {
@@ -1766,9 +1772,13 @@ macro_rules! response_variants {
             (Response::AgentSessionOverrideOutcome { .. }, "agent_session_override_outcome");
             (Response::ResourceSnapshot { .. }, "resource_snapshot");
             (Response::PromoteResourceResult { .. }, "promote_resource_result");
+            #[cfg(feature = "extended")]
             (Response::ScheduledJob { .. }, "scheduled_job");
+            #[cfg(feature = "extended")]
             (Response::ScheduledJobs { .. }, "scheduled_jobs");
+            #[cfg(feature = "extended")]
             (Response::ScheduledJobDeleted { .. }, "scheduled_job_deleted");
+            #[cfg(feature = "extended")]
             (Response::ScheduledJobRunQueued { .. }, "scheduled_job_run_queued");
             (Response::FsList { .. }, "fs_list");
             (Response::FsStat { .. }, "fs_stat");
@@ -1792,7 +1802,9 @@ macro_rules! response_variants {
             (Response::ImageSpendPolicy { .. }, "image_spend_policy");
             #[cfg(feature = "extended")]
             (Response::ImageSpendPolicySaved { .. }, "image_spend_policy_saved");
+            #[cfg(feature = "extended")]
             (Response::ImageControlRead(..), "image_control_read");
+            #[cfg(feature = "extended")]
             (Response::ImageControlMutated(..), "image_control_mutated");
             (Response::GitStatus { .. }, "git_status");
             (Response::GitDiffFile { .. }, "git_diff_file");

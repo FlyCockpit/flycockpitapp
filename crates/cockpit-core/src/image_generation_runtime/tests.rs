@@ -1317,6 +1317,7 @@ fn resolve_ephemeral_headers_fail_closed_without_store() {
 }
 
 #[tokio::test]
+#[cfg(feature = "extended")]
 async fn list_target_projections_redacts_and_filters_disabled() {
     use super::dispatch_proof_support::{FixedClock, dispatchable_registry, loopback_endpoint};
     use crate::image_generation_agent_tools::LocationClass;
@@ -1380,6 +1381,7 @@ async fn list_target_projections_redacts_and_filters_disabled() {
 }
 
 #[tokio::test]
+#[cfg(feature = "extended")]
 async fn list_target_projections_empty_when_unconfigured() {
     use super::dispatch_proof_support::{FixedClock, dispatchable_registry, loopback_endpoint};
 

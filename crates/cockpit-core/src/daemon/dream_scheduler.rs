@@ -509,20 +509,30 @@ fn is_due(
             consumer_id,
         ));
     }
-    let schedule = crate::daemon::proto::ScheduledJobSchedule::Cron {
-        expr: schedule.expect("checked above").to_owned(),
-    };
-    crate::daemon::scheduler::validate_schedule(&schedule)?;
-    let next = crate::daemon::scheduler::compute_next_run(
-        &schedule,
-        last_scheduled_at_unix_ms.div_euclid(1_000),
-        Some(last_scheduled_at_unix_ms.div_euclid(1_000)),
-        last_scheduled_at_unix_ms.div_euclid(1_000),
-        last_scheduled_at_unix_ms.div_euclid(1_000),
-        crate::daemon::proto::MissedRunPolicy::Skip,
-        None,
-    )?;
-    Ok(next.is_some_and(|next| next <= now_seconds))
+    #[cfg(feature = "extended")]
+    {
+        let schedule = crate::daemon::proto::ScheduledJobSchedule::Cron {
+            expr: schedule.expect("checked above").to_owned(),
+        };
+        crate::daemon::scheduler::validate_schedule(&schedule)?;
+        let next = crate::daemon::scheduler::compute_next_run(
+            &schedule,
+            last_scheduled_at_unix_ms.div_euclid(1_000),
+            Some(last_scheduled_at_unix_ms.div_euclid(1_000)),
+            last_scheduled_at_unix_ms.div_euclid(1_000),
+            last_scheduled_at_unix_ms.div_euclid(1_000),
+            crate::daemon::proto::MissedRunPolicy::Skip,
+            None,
+        )?;
+        return Ok(next.is_some_and(|next| next <= now_seconds));
+    }
+    #[cfg(not(feature = "extended"))]
+    {
+        let schedule = schedule.expect("checked above");
+        Err(anyhow::anyhow!(
+            "custom dream_schedule `{schedule}` requires the opt-in extended local capability profile"
+        ))
+    }
 }
 
 fn default_daily_is_due(last_scheduled_at: i64, now: i64, kb_id: &str, consumer_id: &str) -> bool {
@@ -711,6 +721,19 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "extended"))]
+    fn custom_cron_schedule_fails_closed_without_extended_profile() {
+        let error = is_due(Some("@hourly"), Some(1_704_067_230_000), 1, "kb", "machine")
+            .expect_err("custom cron must not downgrade to daily semantics");
+        assert!(
+            error
+                .to_string()
+                .contains("opt-in extended local capability profile")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "extended")]
     fn custom_cron_skip_uses_cursor_and_does_not_replay_stale_elapsed_fires() {
         let last_scheduled_at_unix_ms = 1_704_067_230_000;
         assert!(

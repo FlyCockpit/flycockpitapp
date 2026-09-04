@@ -76,6 +76,7 @@ pub use config_management::{
 };
 pub mod bulk_transfer;
 pub mod host_capabilities;
+#[cfg(feature = "extended")]
 pub mod image_control;
 pub mod image_sidecar_authority;
 pub mod media_egress_authority;
@@ -164,8 +165,10 @@ use tokio_util::codec::{Framed, FramedRead, FramedWrite, LinesCodec, LinesCodecE
 use uuid::Uuid;
 
 /// Source-preserving image spend settings shared by daemon clients.
+#[cfg(feature = "extended")]
 pub type ImageSpendPolicyView = cockpit_config::config::image_spend::ImageSpendSettings;
 
+#[cfg(feature = "extended")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageSpendPreflightView {
     pub policy: ImageSpendPolicyView,
@@ -742,6 +745,7 @@ pub struct ResourceQueuedSnapshot {
     pub state: ResourceQueuedState,
 }
 
+#[cfg(feature = "extended")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScheduledJobSchedule {
@@ -760,6 +764,7 @@ pub enum ScheduledJobSchedule {
     },
 }
 
+#[cfg(feature = "extended")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScheduledJobPayload {
@@ -773,6 +778,7 @@ pub enum ScheduledJobPayload {
     },
 }
 
+#[cfg(feature = "extended")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MissedRunPolicy {
@@ -781,6 +787,7 @@ pub enum MissedRunPolicy {
     RunOnceOnStart,
 }
 
+#[cfg(feature = "extended")]
 impl MissedRunPolicy {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -790,6 +797,7 @@ impl MissedRunPolicy {
     }
 }
 
+#[cfg(feature = "extended")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduledJobCreate {
     pub id: String,
@@ -802,10 +810,7 @@ pub struct ScheduledJobCreate {
     pub missed_run_policy: MissedRunPolicy,
 }
 
-fn default_true() -> bool {
-    true
-}
-
+#[cfg(feature = "extended")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduledJobLastResult {
     pub ok: bool,
@@ -813,6 +818,7 @@ pub struct ScheduledJobLastResult {
     pub finished_at: i64,
 }
 
+#[cfg(feature = "extended")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduledJobSummary {
     pub id: String,
@@ -2195,6 +2201,10 @@ pub enum ResumeRepairAction {
     RepairSyntheticToolResults,
     ExportDebugBundle,
     Cancel,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_daemon_version() -> String {

@@ -798,6 +798,7 @@ pub enum Event {
     /// committed a new config generation. SECURITY: the carried
     /// [`ImageControlEventV1`](crate::image_control::ImageControlEventV1) holds
     /// only safe projections — never a raw credential, header, or workflow blob.
+    #[cfg(feature = "extended")]
     ImageControlConfigChanged {
         event: crate::image_control::ImageControlEventV1,
     },
@@ -1767,6 +1768,7 @@ macro_rules! event_variants {
             (Event::ActiveModelState { .. }, "active_model_state");
             (Event::ModelSelectionResult { .. }, "model_selection_result");
             (Event::DefaultModelUpdateResult { .. }, "default_model_update_result");
+            #[cfg(feature = "extended")]
             (Event::ImageControlConfigChanged { .. }, "image_control_config_changed");
             (Event::ThinkingStarted { .. }, "thinking_started");
             (Event::Reconnecting { .. }, "reconnecting");

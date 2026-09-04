@@ -2700,7 +2700,9 @@ pub(crate) fn spawn(
     lsp: Arc<crate::daemon::lsp::LspManager>,
     initial_lsp_session_protection: Option<crate::daemon::lsp::LspSessionProtection>,
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
-    scheduler: Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
+    #[cfg(feature = "extended")] scheduler: Arc<
+        std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>,
+    >,
     write_scope: crate::write_scope::WriteScopeSource,
     global_bus: Option<EventSender>,
     trust_policy: crate::config::trust::WorkspaceTrustPolicy,
@@ -2713,6 +2715,7 @@ pub(crate) fn spawn(
     image_generation_boot_id: Uuid,
     image_generation_started_at: std::time::Instant,
     media_storage_recovery: Option<Arc<crate::media_storage::MediaStorageRecovery>>,
+    #[cfg(feature = "extended")]
     image_generation_dispatch_registry: crate::daemon::image_runtime::DaemonImageDispatchRegistry,
     config_snapshot: SessionConfigSnapshot,
 ) -> Result<(
@@ -2769,10 +2772,13 @@ pub(crate) fn spawn(
     session.set_shell_compression(extended_cfg.shell_compression);
     let (work_tx, work_rx) = mpsc::channel::<SessionWork>(WORK_QUEUE_CAPACITY);
     let (idle_activity_tx, _) = tokio::sync::watch::channel(tokio::time::Instant::now());
+    #[cfg(feature = "extended")]
     let idle_activity_gate = crate::sync::lock_or_recover(&scheduler)
         .as_ref()
         .map(crate::daemon::scheduler::DaemonSchedulerHandle::activity_gate)
         .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
+    #[cfg(not(feature = "extended"))]
+    let idle_activity_gate = Arc::new(tokio::sync::Mutex::new(()));
     let (event_tx, _initial_rx) =
         broadcast::channel::<crate::daemon::EventEnvelope>(EVENT_BROADCAST_CAPACITY);
     let legacy_disk_origins = match session.persisted_disk_redaction_origins() {
@@ -2909,6 +2915,7 @@ pub(crate) fn spawn(
             lsp,
             initial_lsp_session_protection,
             resource_scheduler,
+            #[cfg(feature = "extended")]
             scheduler,
             write_scope,
             global_bus,
@@ -2919,6 +2926,7 @@ pub(crate) fn spawn(
             image_generation_boot_id,
             image_generation_started_at,
             media_storage_recovery,
+            #[cfg(feature = "extended")]
             image_generation_dispatch_registry,
             reserved_root_agent_instance_id,
         ));

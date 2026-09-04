@@ -5578,6 +5578,7 @@ pub(super) async fn execute_remote_staged_rename_with_hook(
 /// concurrent surface; the arm is duplicated on the (exhaustive) serialized
 /// surface for match completeness. Every reply is a redacted safe projection
 /// assembled through the single `cockpit_proto::image_control` funnel.
+#[cfg(feature = "extended")]
 async fn dispatch_image_control_read(
     ctx: &Arc<DaemonContext>,
     request: Request,
@@ -5593,6 +5594,7 @@ async fn dispatch_image_control_read(
     // `.cockpit/` (secret-bearing). `project_root` is only a config cwd here,
     // never authority — the RPC is already `owner_only`-gated.
     let project_root = match &request {
+        #[cfg(feature = "extended")]
         Request::ImageEndpointList { project_root, .. }
         | Request::ImageEndpointGet { project_root, .. }
         | Request::ImageTargetList { project_root, .. }
@@ -5641,6 +5643,7 @@ async fn dispatch_image_control_read(
         config_generation,
     };
     let response = match request {
+        #[cfg(feature = "extended")]
         Request::ImageEndpointList { limit, cursor, .. } => image_control_reads::endpoint_list(
             cfg,
             &generation,
@@ -5648,15 +5651,19 @@ async fn dispatch_image_control_read(
             limit,
             cursor.as_deref(),
         ),
+        #[cfg(feature = "extended")]
         Request::ImageEndpointGet { endpoint_id, .. } => {
             image_control_reads::endpoint_get(cfg, &generation, &authority, &endpoint_id)
         }
+        #[cfg(feature = "extended")]
         Request::ImageTargetList { limit, cursor, .. } => {
             image_control_reads::target_list(cfg, &generation, &authority, limit, cursor.as_deref())
         }
+        #[cfg(feature = "extended")]
         Request::ImageTargetGet { target_id, .. } => {
             image_control_reads::target_get(cfg, &generation, &authority, &target_id)
         }
+        #[cfg(feature = "extended")]
         Request::ImageWorkflowList { limit, cursor, .. } => image_control_reads::workflow_list(
             cfg,
             &generation,
@@ -5664,6 +5671,7 @@ async fn dispatch_image_control_read(
             limit,
             cursor.as_deref(),
         ),
+        #[cfg(feature = "extended")]
         Request::ImageWorkflowGet { workflow_id, .. } => {
             image_control_reads::workflow_get(cfg, &generation, &authority, &workflow_id)
         }
@@ -11379,6 +11387,7 @@ async fn handle_serialized_request_impl(
         // LOCAL owner image-control reads are `concurrent`, so they normally
         // route to the concurrent surface; this arm keeps the exhaustive
         // serialized match complete and shares the one redacting handler.
+        #[cfg(feature = "extended")]
         Request::ImageEndpointList { .. }
         | Request::ImageEndpointGet { .. }
         | Request::ImageTargetList { .. }
@@ -11390,6 +11399,7 @@ async fn handle_serialized_request_impl(
         // serialized). No remote operation is ever reserved for a local_only
         // request, so these run the load → validate(`ImageGenerationConfig::new`)
         // → generation-CAS → write → `config_changed` sequence directly.
+        #[cfg(feature = "extended")]
         Request::ImageEndpointCreate { .. }
         | Request::ImageEndpointUpdate { .. }
         | Request::ImageEndpointDelete { .. }
@@ -11401,6 +11411,7 @@ async fn handle_serialized_request_impl(
         | Request::ImageWorkflowBind { .. }
         | Request::ImageWorkflowDelete { .. } => {
             let client_operation_id = match &request {
+                #[cfg(feature = "extended")]
                 Request::ImageEndpointCreate {
                     client_operation_id,
                     ..
@@ -12471,11 +12482,13 @@ async fn handle_serialized_request_impl(
             session_id,
         } => promote_resource_request(ctx, &request_id, session_id).await,
 
+        #[cfg(feature = "extended")]
         Request::CreateScheduledJob { job } => {
             let scheduler = require_scheduler(ctx)?;
             let job = scheduler.create_job(job).await.map_err(internal)?;
             Ok(Response::ScheduledJob { job })
         }
+        #[cfg(feature = "extended")]
         Request::ListScheduledJobs { owner } => {
             let scheduler = require_scheduler(ctx)?;
             let jobs = scheduler
@@ -12484,11 +12497,13 @@ async fn handle_serialized_request_impl(
                 .map_err(internal)?;
             Ok(Response::ScheduledJobs { jobs })
         }
+        #[cfg(feature = "extended")]
         Request::DeleteScheduledJob { id } => {
             let scheduler = require_scheduler(ctx)?;
             let deleted = scheduler.delete_job(&id).await.map_err(internal)?;
             Ok(Response::ScheduledJobDeleted { id, deleted })
         }
+        #[cfg(feature = "extended")]
         Request::SetScheduledJobEnabled { id, enabled } => {
             let scheduler = require_scheduler(ctx)?;
             let job = scheduler
@@ -12501,6 +12516,7 @@ async fn handle_serialized_request_impl(
                 })?;
             Ok(Response::ScheduledJob { job })
         }
+        #[cfg(feature = "extended")]
         Request::RunScheduledJob { id } => {
             let scheduler = require_scheduler(ctx)?;
             scheduler.run_now(&id).await.map_err(internal)?;
@@ -20124,6 +20140,7 @@ async fn handle_concurrent_request_impl(
         Request::ResourceSnapshot => Ok(Response::ResourceSnapshot {
             snapshot: resource_scheduler_snapshot(&ctx),
         }),
+        #[cfg(feature = "extended")]
         Request::ListScheduledJobs { owner } => {
             let scheduler = require_scheduler(&ctx)?;
             let jobs = scheduler
@@ -20356,6 +20373,7 @@ async fn handle_concurrent_request_impl(
         }
         // LOCAL owner image-generation control-plane reads (declared
         // `concurrent`). Redacted safe projections only.
+        #[cfg(feature = "extended")]
         Request::ImageEndpointList { .. }
         | Request::ImageEndpointGet { .. }
         | Request::ImageTargetList { .. }
@@ -22242,16 +22260,17 @@ fn client_operation_id_from_response(
             client_operation_id,
             ..
         }
-        | Response::ImageControlMutated(
-            cockpit_proto::image_control::ImageControlMutationResponseV1 {
-                client_operation_id,
-                ..
-            },
-        )
         | Response::AgentMutated(cockpit_proto::AgentMutationResult {
             client_operation_id,
             ..
         }) => Ok(client_operation_id.clone()),
+        #[cfg(feature = "extended")]
+        Response::ImageControlMutated(
+            cockpit_proto::image_control::ImageControlMutationResponseV1 {
+                client_operation_id,
+                ..
+            },
+        ) => Ok(client_operation_id.clone()),
         _ => Err(internal(anyhow::anyhow!(
             "local operation produced an unbound receipt"
         ))),
@@ -31504,14 +31523,21 @@ pub(super) async fn curator_request(
         .map_err(workspace_trust_error)?;
     let db = ctx.db.clone();
     let run_cron_refs = if matches!(action, proto::CuratorAction::Run { .. }) {
-        Some(
-            crate::skills::curator::cron_referenced_skills(&db)
-                .await
-                .map_err(|error| ErrorPayload {
-                    code: ErrorCode::BadRequest,
-                    message: error.to_string(),
-                })?,
-        )
+        Some({
+            #[cfg(feature = "extended")]
+            {
+                crate::skills::curator::cron_referenced_skills(&db)
+                    .await
+                    .map_err(|error| ErrorPayload {
+                        code: ErrorCode::BadRequest,
+                        message: error.to_string(),
+                    })?
+            }
+            #[cfg(not(feature = "extended"))]
+            {
+                std::collections::HashSet::new()
+            }
+        })
     } else {
         None
     };

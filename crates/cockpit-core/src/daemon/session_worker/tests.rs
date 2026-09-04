@@ -1295,6 +1295,7 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
             Arc::new(crate::daemon::lsp::LspManager::new()),
             None,
             None,
+            #[cfg(feature = "extended")]
             Arc::new(StdMutex::new(None)),
             Arc::new(StdMutex::new(None)),
             None,
@@ -1311,6 +1312,7 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
             Uuid::now_v7(),
             std::time::Instant::now(),
             None,
+            #[cfg(feature = "extended")]
             crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
             SessionConfigSnapshot::new(0, providers, extended.clone()),
         )
@@ -1708,6 +1710,7 @@ fn daemon_origin_submissions_drive_the_real_worker_to_completion() {
             Arc::new(crate::daemon::lsp::LspManager::new()),
             None,
             None,
+            #[cfg(feature = "extended")]
             Arc::new(StdMutex::new(None)),
             Arc::new(StdMutex::new(None)),
             None,
@@ -1724,6 +1727,7 @@ fn daemon_origin_submissions_drive_the_real_worker_to_completion() {
             Uuid::now_v7(),
             std::time::Instant::now(),
             None,
+            #[cfg(feature = "extended")]
             crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
             SessionConfigSnapshot::new(0, providers, extended.clone()),
         )
@@ -1918,6 +1922,7 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
             Arc::new(crate::daemon::lsp::LspManager::new()),
             None,
             None,
+            #[cfg(feature = "extended")]
             Arc::new(StdMutex::new(None)),
             Arc::new(StdMutex::new(None)),
             None,
@@ -1934,6 +1939,7 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
             Uuid::now_v7(),
             std::time::Instant::now(),
             None,
+            #[cfg(feature = "extended")]
             crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
             SessionConfigSnapshot::new(0, providers, extended.clone()),
         )
@@ -2244,6 +2250,7 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
             Arc::new(crate::daemon::lsp::LspManager::new()),
             None,
             None,
+            #[cfg(feature = "extended")]
             Arc::new(StdMutex::new(None)),
             Arc::new(StdMutex::new(None)),
             None,
@@ -2260,6 +2267,7 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
             Uuid::now_v7(),
             std::time::Instant::now(),
             None,
+            #[cfg(feature = "extended")]
             crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
             SessionConfigSnapshot::new(0, providers, extended.clone()),
         )
@@ -3339,6 +3347,7 @@ async fn absent_scheduler_is_not_an_error() {
         Arc::new(crate::daemon::lsp::LspManager::new()),
         None,
         None,
+        #[cfg(feature = "extended")]
         Arc::new(StdMutex::new(None)),
         Arc::new(StdMutex::new(None)),
         None,
@@ -3355,6 +3364,7 @@ async fn absent_scheduler_is_not_an_error() {
         Uuid::now_v7(),
         std::time::Instant::now(),
         None,
+        #[cfg(feature = "extended")]
         crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
         SessionConfigSnapshot::new(0, providers, extended.clone()),
     )
@@ -3448,6 +3458,7 @@ async fn computer_entry_mode_boots_a_native_computer_primary_after_snapshot_rebu
         Arc::new(crate::daemon::lsp::LspManager::new()),
         None,
         None,
+        #[cfg(feature = "extended")]
         Arc::new(StdMutex::new(None)),
         Arc::new(StdMutex::new(None)),
         None,
@@ -3464,6 +3475,7 @@ async fn computer_entry_mode_boots_a_native_computer_primary_after_snapshot_rebu
         Uuid::now_v7(),
         std::time::Instant::now(),
         None,
+        #[cfg(feature = "extended")]
         crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
         SessionConfigSnapshot::new(0, providers, extended.clone()),
     )
@@ -3583,6 +3595,7 @@ async fn worker_driver_respects_attached_ignore_config_policy() {
         Arc::new(crate::daemon::lsp::LspManager::new()),
         None,
         None,
+        #[cfg(feature = "extended")]
         Arc::new(StdMutex::new(None)),
         Arc::new(StdMutex::new(None)),
         None,
@@ -3599,6 +3612,7 @@ async fn worker_driver_respects_attached_ignore_config_policy() {
         Uuid::now_v7(),
         std::time::Instant::now(),
         None,
+        #[cfg(feature = "extended")]
         crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
         SessionConfigSnapshot::new(0, providers, extended.clone()),
     )
@@ -3768,6 +3782,7 @@ async fn resumed_worker_rederives_disk_redaction_markers_and_warns_when_source_d
             Arc::new(crate::daemon::lsp::LspManager::new()),
             None,
             None,
+            #[cfg(feature = "extended")]
             Arc::new(StdMutex::new(None)),
             Arc::new(StdMutex::new(None)),
             None,
@@ -3784,6 +3799,7 @@ async fn resumed_worker_rederives_disk_redaction_markers_and_warns_when_source_d
             Uuid::now_v7(),
             std::time::Instant::now(),
             None,
+            #[cfg(feature = "extended")]
             crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
             SessionConfigSnapshot::new(0, providers.clone(), extended.clone()),
         )
@@ -3957,6 +3973,7 @@ async fn spawn_fails_closed_when_persisted_redaction_table_cannot_load() {
         Arc::new(crate::daemon::lsp::LspManager::new()),
         None,
         None,
+        #[cfg(feature = "extended")]
         Arc::new(StdMutex::new(None)),
         Arc::new(StdMutex::new(None)),
         None,
@@ -3973,6 +3990,7 @@ async fn spawn_fails_closed_when_persisted_redaction_table_cannot_load() {
         Uuid::now_v7(),
         std::time::Instant::now(),
         None,
+        #[cfg(feature = "extended")]
         crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
         SessionConfigSnapshot::new(0, providers, extended.clone()),
     )
@@ -4042,6 +4060,7 @@ async fn spawn_fails_closed_when_persisted_redaction_table_is_missing() {
         Arc::new(crate::daemon::lsp::LspManager::new()),
         None,
         None,
+        #[cfg(feature = "extended")]
         Arc::new(StdMutex::new(None)),
         Arc::new(StdMutex::new(None)),
         None,
@@ -4058,6 +4077,7 @@ async fn spawn_fails_closed_when_persisted_redaction_table_is_missing() {
         Uuid::now_v7(),
         std::time::Instant::now(),
         None,
+        #[cfg(feature = "extended")]
         crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
         SessionConfigSnapshot::new(0, providers, extended.clone()),
     )

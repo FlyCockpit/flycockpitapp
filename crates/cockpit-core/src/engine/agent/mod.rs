@@ -1602,6 +1602,7 @@ mod redaction_placeholder_guard_tests {
             cancel: tokio_util::sync::CancellationToken::new(),
             shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
             approver: None,
+            #[cfg(feature = "extended")]
             image_generation_dispatch: None,
             transcription_dispatch: None,
             deferred_log: crate::engine::deferred::DeferredLog::new(),

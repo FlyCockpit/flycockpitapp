@@ -2301,8 +2301,16 @@ fn is_global_event(event: &proto::Event) -> bool {
             | proto::Event::InterruptResolved { .. }
             | proto::Event::InterruptQueueChanged { .. }
             | proto::Event::HostCapabilitiesChanged { .. }
-            | proto::Event::ImageControlConfigChanged { .. }
     ) || {
+        #[cfg(feature = "extended")]
+        {
+            matches!(event, proto::Event::ImageControlConfigChanged { .. })
+        }
+        #[cfg(not(feature = "extended"))]
+        {
+            false
+        }
+    } || {
         #[cfg(feature = "remote")]
         {
             matches!(event, proto::Event::ConnectorStatus { .. })
@@ -4033,10 +4041,9 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         } => *session_id,
         // Daemon-global events carry no session_id: they reach every
         // client regardless of attachment.
-        CaffeinateState { .. } | DaemonDraining { .. } | DaemonLifetimeChanged { .. }
-        // Image-control configuration changes are daemon-global: they are
-        // keyed by project, not by an attached chat session.
-        | ImageControlConfigChanged { .. }
+        CaffeinateState { .. }
+        | DaemonDraining { .. }
+        | DaemonLifetimeChanged { .. }
         | TerminalOutput { .. }
         | TerminalClipboard { .. }
         | TerminalViewers { .. }
@@ -4049,6 +4056,8 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         }
         | EnvDriftWarning { .. }
         | Unknown => return None,
+        #[cfg(feature = "extended")]
+        ImageControlConfigChanged { .. } => return None,
         #[cfg(feature = "remote")]
         ConnectorStatus { .. } => return None,
     })
@@ -5116,11 +5125,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             proto::WorkspaceTrustReconciliationState::Applied
             | proto::WorkspaceTrustReconciliationState::StopRetrying => return None,
         },
-        // This daemon-global, project-scoped invalidation has no image-control
-        // TUI state to refresh yet. Consume its safe projection explicitly so
-        // it is neither treated as a session event nor rendered as history.
-        ImageControlConfigChanged { .. }
-        | InterruptRaised { .. }
+        InterruptRaised { .. }
         | EventStreamLagged { .. }
         | SessionEnded { .. }
         | TerminalOutput { .. }
@@ -5129,6 +5134,8 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         | TerminalClosed { .. }
         | Osc52ProtocolViolation { .. }
         | Unknown => return None,
+        #[cfg(feature = "extended")]
+        ImageControlConfigChanged { .. } => return None,
         // The chrome's active-agent slot is updated directly in
         // `update_active_agent`; the swap needs no history-stream entry.
         PrimarySwapped { .. } => return None,
@@ -7419,24 +7426,27 @@ mod tests {
             "a second attached TUI must stop using its stale ephemeral policy"
         );
 
-        let image_config_changed = proto::Event::ImageControlConfigChanged {
-            event: proto::image_control::ImageControlEventV1::config_changed(
-                "daemon".into(),
-                "project".into(),
-                "/canonical/project".into(),
-                "/canonical/project/config.json".into(),
-                "revision".into(),
-                proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)),
-                1,
-                proto::image_control::ImageConfigChangeSetSafeV1::new("1".into(), vec![]),
-            ),
-        };
-        assert!(event_session(&image_config_changed).is_none());
-        assert!(is_global_event(&image_config_changed));
-        assert!(
-            proto_event_to_turn_event(image_config_changed).is_none(),
-            "image-control config changes are not chat-history events"
-        );
+        #[cfg(feature = "extended")]
+        {
+            let image_config_changed = proto::Event::ImageControlConfigChanged {
+                event: proto::image_control::ImageControlEventV1::config_changed(
+                    "daemon".into(),
+                    "project".into(),
+                    "/canonical/project".into(),
+                    "/canonical/project/config.json".into(),
+                    "revision".into(),
+                    proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)),
+                    1,
+                    proto::image_control::ImageConfigChangeSetSafeV1::new("1".into(), vec![]),
+                ),
+            };
+            assert!(event_session(&image_config_changed).is_none());
+            assert!(is_global_event(&image_config_changed));
+            assert!(
+                proto_event_to_turn_event(image_config_changed).is_none(),
+                "image-control config changes are not chat-history events"
+            );
+        }
 
         let meta = cockpit_proto::EnvSnapshotMeta {
             source: cockpit_proto::EnvSnapshotSource::DaemonStart,

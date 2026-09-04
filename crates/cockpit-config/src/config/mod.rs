@@ -34,6 +34,7 @@ pub mod extended;
 pub mod files;
 pub mod image_generation;
 pub mod image_sidecar;
+#[cfg(feature = "extended")]
 pub mod image_spend;
 pub mod media_budget;
 pub(crate) mod merge;

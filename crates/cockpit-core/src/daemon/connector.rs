@@ -778,10 +778,15 @@ fn principal_from_relay_wire(principal: RelayPrincipal) -> ClientPrincipal {
             // NOT inherit the `None`-matches-any-project wildcard that the four
             // access scopes use, so it is dropped here rather than admitted as a
             // rootless (project-wide) image-admin grant.
+            #[cfg(feature = "extended")]
             if !crate::image_generation_control_plane::scope_project_root_is_valid(
                 scope,
                 grant.project_root.as_deref(),
             ) {
+                return None;
+            }
+            #[cfg(not(feature = "extended"))]
+            if scope == PrincipalScope::ImageGenerationAdmin {
                 return None;
             }
             Some(PrincipalGrant {

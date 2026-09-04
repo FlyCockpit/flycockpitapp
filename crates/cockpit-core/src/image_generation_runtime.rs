@@ -1506,6 +1506,7 @@ impl ImageRuntimeRegistry {
     /// cached [`ImageHealthSnapshot`] when one is available; otherwise the
     /// health state is `unknown` and the capability fields are empty. An empty
     /// configuration yields an empty list (not an error).
+    #[cfg(feature = "extended")]
     pub fn list_target_projections(
         &self,
         include_disabled: bool,
@@ -1686,6 +1687,7 @@ impl ImageRuntimeRegistry {
 
     /// Resolve a configured target into the redacted authorization projection
     /// and hard-gate facts backed by its current sealed health snapshot.
+    #[cfg(feature = "extended")]
     pub fn resolve_dispatch_target(
         &self,
         target_id: &str,
@@ -2613,7 +2615,7 @@ impl ImageRuntimeRegistry {
 /// Test-only scaffolding shared with the dispatcher's prepare-time proof tests
 /// (`image_generation_job`). It lives here because `ImageRuntimeAdapter` is a
 /// sealed trait -- a fake adapter can only be implemented inside this module.
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 pub(crate) mod dispatch_proof_support {
     use super::*;
     use cockpit_config::config::image_generation::ImageLocationClass;

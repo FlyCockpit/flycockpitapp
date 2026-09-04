@@ -609,6 +609,7 @@ pub enum TrustCommand {
 }
 
 #[derive(Debug, Subcommand)]
+#[cfg(feature = "extended")]
 pub enum ScheduleCommand {
     /// Create or replace a durable scheduler job.
     Create(ScheduleCreateArgs),
@@ -632,6 +633,7 @@ pub enum ScheduleCommand {
 }
 
 #[derive(Debug, clap::Args)]
+#[cfg(feature = "extended")]
 pub struct ScheduleCreateArgs {
     #[arg(value_name = "ID")]
     pub id: String,
@@ -653,6 +655,7 @@ pub struct ScheduleCreateArgs {
 }
 
 #[derive(Debug, clap::Args)]
+#[cfg(feature = "extended")]
 pub struct ScheduleListArgs {
     /// Exact owner filter, e.g. assistant:alice or system:dreamer.
     #[arg(long, value_name = "OWNER")]

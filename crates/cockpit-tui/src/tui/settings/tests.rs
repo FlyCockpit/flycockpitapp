@@ -1286,8 +1286,11 @@ pub(super) fn run_pointer_dialog_regression_matrix() {
     pointer_instruction_list_actions_dispatch_from_fresh_sources();
     pointer_redact_pattern_rows_dispatch_from_fresh_sources();
     pointer_string_list_action_families_dispatch_from_fresh_sources();
-    pointer_generation_action_family_dispatches_from_fresh_sources();
-    pointer_sidecar_action_family_dispatches_from_fresh_sources();
+    #[cfg(feature = "extended")]
+    {
+        pointer_generation_action_family_dispatches_from_fresh_sources();
+        pointer_sidecar_action_family_dispatches_from_fresh_sources();
+    }
     root_settings_pointer_uses_rendered_semantic_targets_and_clamped_wheel();
     category_short_viewport_keeps_bottom_reset_row_visible();
     nav_stack_restores_behavior_cursor_and_scroll_from_instructions();
@@ -1303,6 +1306,7 @@ pub(super) fn run_pointer_dialog_regression_matrix() {
     category_reset_pending_cancelled_by_navigation();
 }
 
+#[cfg(feature = "extended")]
 fn dialog_with_generation_page(tmp: &TempDir, page: PageBox) -> SettingsDialog {
     let mut dialog = fresh_dialog(tmp);
     dialog.extended.tui.mouse_capture = true;
@@ -1310,6 +1314,7 @@ fn dialog_with_generation_page(tmp: &TempDir, page: PageBox) -> SettingsDialog {
     dialog
 }
 
+#[cfg(feature = "extended")]
 fn generation_pointer_job_reducer() -> image_generation::JobReducer {
     let mut reducer = image_generation::JobReducer::new("d".into(), "p".into(), "s".into());
     reducer.jobs.push(image_generation::JobCard {
@@ -1323,6 +1328,7 @@ fn generation_pointer_job_reducer() -> image_generation::JobReducer {
     reducer
 }
 
+#[cfg(feature = "extended")]
 fn pointer_generation_action_family_dispatches_from_fresh_sources() {
     use pointer_actions::SettingsPointerAction;
 
@@ -1496,6 +1502,7 @@ fn pointer_generation_action_family_dispatches_from_fresh_sources() {
     }
 }
 
+#[cfg(feature = "extended")]
 fn dialog_with_sidecar_page(tmp: &TempDir, page: PageBox) -> SettingsDialog {
     let mut dialog = fresh_dialog(tmp);
     dialog.extended.tui.mouse_capture = true;
@@ -1503,6 +1510,7 @@ fn dialog_with_sidecar_page(tmp: &TempDir, page: PageBox) -> SettingsDialog {
     dialog
 }
 
+#[cfg(feature = "extended")]
 fn sidecar_pointer_session() -> image_sidecar::SidecarSession {
     let mut session =
         image_sidecar::SidecarSession::new(image_sidecar::SidecarPrincipal::local_owner());
@@ -1559,6 +1567,7 @@ fn sidecar_pointer_session() -> image_sidecar::SidecarSession {
     session
 }
 
+#[cfg(feature = "extended")]
 fn sidecar_grantable_pointer_session() -> image_sidecar::SidecarSession {
     let mut session = sidecar_pointer_session();
     session.reducer.resolution = Some(image_sidecar::SidecarEffectiveTrace {
@@ -1586,6 +1595,7 @@ fn sidecar_grantable_pointer_session() -> image_sidecar::SidecarSession {
     session
 }
 
+#[cfg(feature = "extended")]
 #[test]
 fn sidecar_child_page_mutations_propagate_back_to_the_parent_session() {
     use pointer_actions::{SettingsPointerAction, SidecarAction, SidecarModeChoice};
@@ -1619,6 +1629,7 @@ fn sidecar_child_page_mutations_propagate_back_to_the_parent_session() {
     assert_eq!(parent.session.form.mode, SidecarModeChoice::Always);
 }
 
+#[cfg(feature = "extended")]
 fn pointer_sidecar_action_family_dispatches_from_fresh_sources() {
     use pointer_actions::SettingsPointerAction;
 
@@ -3900,6 +3911,7 @@ fn render_all_non_provider_pointer_surface_variants() {
         ("LSP", SettingsPointerSurfaceKind::Lsp),
         #[cfg(feature = "extended")]
         ("Generation", SettingsPointerSurfaceKind::GenerationList),
+        #[cfg(feature = "extended")]
         ("Image Sidecar", SettingsPointerSurfaceKind::SidecarOverview),
     ] {
         let tmp = TempDir::new().unwrap();
@@ -3936,6 +3948,7 @@ fn render_all_non_provider_pointer_surface_variants() {
                 );
             }
         }
+        #[cfg(feature = "extended")]
         if title == "Image Sidecar" {
             for node in [
                 pointer_actions::SidecarNodeId::Mode,
@@ -3960,7 +3973,7 @@ fn render_all_non_provider_pointer_surface_variants() {
         }
     }
 
-    for (page, expected_surface) in [
+    let mut page_fixtures = vec![
         (
             instructions_page(InstructionsPage::new()),
             SettingsPointerSurfaceKind::Instructions,
@@ -3969,6 +3982,9 @@ fn render_all_non_provider_pointer_surface_variants() {
             Box::new(RedactPatternsPage::new()) as PageBox,
             SettingsPointerSurfaceKind::RedactPatterns,
         ),
+    ];
+    #[cfg(feature = "extended")]
+    page_fixtures.extend([
         (
             image_generation::generation_list_page(
                 image_generation::GenerationPrincipal::local_owner(),
@@ -4107,7 +4123,8 @@ fn render_all_non_provider_pointer_surface_variants() {
             ),
             SettingsPointerSurfaceKind::SidecarInvocationDetail,
         ),
-    ] {
+    ]);
+    for (page, expected_surface) in page_fixtures {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
         d.page = page;
@@ -6325,7 +6342,7 @@ fn root_menu_exposes_the_default_model_row_first() {
 #[test]
 fn root_menu_inventory_matches_the_default_profile() {
     let nodes = root_nodes();
-    assert_eq!(nodes.len(), 15);
+    assert_eq!(nodes.len(), 14);
     assert_eq!(nodes[0].id, pointer_actions::RootNodeId::DefaultModel);
 }
 
@@ -6344,6 +6361,11 @@ fn root_menu_inventory_adds_image_spend_in_extended_profile() {
         nodes
             .iter()
             .any(|node| node.id == pointer_actions::RootNodeId::Generation)
+    );
+    assert!(
+        nodes
+            .iter()
+            .any(|node| node.id == pointer_actions::RootNodeId::ImageSidecar)
     );
 }
 

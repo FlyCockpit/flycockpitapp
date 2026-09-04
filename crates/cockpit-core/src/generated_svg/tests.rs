@@ -931,6 +931,7 @@ fn generated_svg_fuzz_harness_smoke() {
     }
 }
 
+#[cfg(feature = "extended")]
 #[test]
 fn generated_svg_sentinel_raw_malicious_svg_cannot_reach_artifact_boundary() {
     // The provider-response ingestion boundary

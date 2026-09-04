@@ -199,14 +199,17 @@ fn disambiguate_name(
     if !taken(base)? {
         return Ok(base.to_string());
     }
-    // Suffix until free. Bounded by row count + 2 so it always terminates.
-    for i in 2.. {
+    // Suffix until free. SQLite note names are bounded, so this terminates.
+    let mut i = 2_u64;
+    loop {
         let candidate = format!("{base} ({i})");
         if !taken(&candidate)? {
             return Ok(candidate);
         }
+        i = i
+            .checked_add(1)
+            .context("project note name disambiguation overflow")?;
     }
-    unreachable!("disambiguation loop is unbounded and always finds a free name")
 }
 
 #[cfg(test)]

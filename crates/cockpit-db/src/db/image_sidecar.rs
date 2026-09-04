@@ -205,11 +205,7 @@ fn canonical_grant_destination(raw: &str) -> Result<String> {
         !host.is_empty() && !host.contains('/'),
         "invalid destination"
     );
-    let default_port = match scheme.as_str() {
-        "http" => 80,
-        "https" => 443,
-        _ => unreachable!(),
-    };
+    let default_port = if scheme == "http" { 80 } else { 443 };
     let host_disp = if host.contains(':') {
         format!("[{host}]")
     } else {

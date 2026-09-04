@@ -1486,15 +1486,15 @@ pub enum SecurityRecoverySnapshotResult {
 
 struct MediaUploadStatusRow {
     state: String,
-    generation: String,
+    generation: i64,
     kind: String,
     chunks: u32,
-    bytes: String,
+    bytes: i64,
     expires: i64,
     transition: String,
     draft: String,
     attachment: Option<String>,
-    attachment_version: Option<String>,
+    attachment_version: Option<i64>,
 }
 
 pub struct AcquireMediaReferenceInput<'a> {
@@ -1549,7 +1549,7 @@ impl super::Db {
         else {
             return Ok(None);
         };
-        let generation = generation.parse::<u64>()?;
+        let generation = u64::try_from(generation).context("invalid upload generation")?;
         ensure!(
             generation == request.upload_generation,
             "media_attachment_unavailable"
@@ -1571,9 +1571,10 @@ impl super::Db {
                 attachment_id: Uuid::parse_str(
                     &attachment.context("materialized attachment missing")?,
                 )?,
-                attachment_version: attachment_version
-                    .context("materialized version missing")?
-                    .parse()?,
+                attachment_version: u64::try_from(
+                    attachment_version.context("materialized version missing")?,
+                )
+                .context("invalid materialized attachment version")?,
             },
             "cancelled" => MediaUploadStateDetailV1::Cancelled {
                 reason: reason.unwrap(),
@@ -1595,7 +1596,7 @@ impl super::Db {
             media_kind,
             expires_at_unix_ms: expires,
             acknowledged_chunks: chunks,
-            acknowledged_bytes: bytes.parse()?,
+            acknowledged_bytes: u64::try_from(bytes).context("invalid acknowledged bytes")?,
             last_transition: serde_json::from_str(&transition)?,
             detail,
         }))

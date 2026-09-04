@@ -163,17 +163,7 @@ impl Db {
                 )
                 .context("conditionally updating scheduled job enabled state")?;
             if changed == 0 {
-                return conditional_scheduled_job_result(conn, &expected.id, changed, ()).map(
-                    |result| match result {
-                        ConditionalScheduledJob::Missing => ConditionalScheduledJob::Missing,
-                        ConditionalScheduledJob::Current(row) => {
-                            ConditionalScheduledJob::Current(row)
-                        }
-                        ConditionalScheduledJob::Applied(()) => {
-                            unreachable!("zero changed rows cannot apply a conditional update")
-                        }
-                    },
-                );
+                return conditional_scheduled_job_result(conn, &expected.id, changed, ());
             }
             let row = get_scheduled_job_conn(conn, &expected.id)?
                 .ok_or_else(|| anyhow::anyhow!("scheduled job missing after conditional update"))?;
@@ -199,17 +189,7 @@ impl Db {
                 )
                 .context("conditionally claiming scheduled job manual run")?;
             if changed == 0 {
-                return conditional_scheduled_job_result(conn, &expected.id, changed, ()).map(
-                    |result| match result {
-                        ConditionalScheduledJob::Missing => ConditionalScheduledJob::Missing,
-                        ConditionalScheduledJob::Current(row) => {
-                            ConditionalScheduledJob::Current(row)
-                        }
-                        ConditionalScheduledJob::Applied(()) => {
-                            unreachable!("zero changed rows cannot apply a conditional claim")
-                        }
-                    },
-                );
+                return conditional_scheduled_job_result(conn, &expected.id, changed, ());
             }
             let row = get_scheduled_job_conn(conn, &expected.id)?
                 .ok_or_else(|| anyhow::anyhow!("scheduled job missing after conditional claim"))?;

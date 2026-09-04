@@ -77,11 +77,7 @@ impl ComputerAuthorizer for ApproverComputerAuthorizer {
             session_id: &request.session_id,
             delegation_id: &request.delegation_id.0,
             action_id: &request.action_id,
-            tier: tier_str(if request.receiver_terminal_ask_required {
-                ComputerApprovalTier::Ask
-            } else {
-                request.tier
-            }),
+            tier: tier_str(effective_computer_authorization_tier(request)),
             action_label: &request.action_label,
             backend_kind: request.backend_kind.diagnostic_label(),
             focus_generation: request.focus_generation.0,
@@ -109,6 +105,16 @@ impl ComputerAuthorizer for ApproverComputerAuthorizer {
                 "computer action authorization unavailable".to_string(),
             )),
         }
+    }
+}
+
+fn effective_computer_authorization_tier(
+    request: &ComputerActionAuthorization,
+) -> ComputerApprovalTier {
+    if request.receiver_terminal_ask_required {
+        ComputerApprovalTier::Ask
+    } else {
+        request.tier
     }
 }
 
@@ -194,6 +200,21 @@ mod tests {
             }),
             ComputerAuthorizationDecision::Deny { .. }
         ));
+    }
+
+    #[test]
+    fn computer_receiver_reproof_terminal_ask_forces_ask_tier_on_yolo() {
+        let mut request = authorization(ComputerApprovalTier::Yolo);
+        request.receiver_terminal_ask_required = false;
+        assert_eq!(
+            effective_computer_authorization_tier(&request),
+            ComputerApprovalTier::Yolo
+        );
+        request.receiver_terminal_ask_required = true;
+        assert_eq!(
+            effective_computer_authorization_tier(&request),
+            ComputerApprovalTier::Ask
+        );
     }
 
     /// The adapter builds the central request and, for the computer `yolo`

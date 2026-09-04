@@ -167,7 +167,11 @@ pub struct ReceiverReproofAuditAppend {
     pub session_id: [u8; 16],
     pub delegation_id: [u8; 16],
     pub operation_id: [u8; 16],
+    /// Domain-separated digest of the authenticated receiver window object.
+    pub physical_target_digest: [u8; 32],
     pub focus_digest: [u8; 32],
+    /// Domain-separated digest of the evidence line-clear action delivered.
+    pub record_digest: [u8; 32],
     pub verification_state: VerificationState,
     pub error_code: AuditErrorCode,
 }
@@ -1155,7 +1159,9 @@ fn build_receiver_reproof_entry(
         | present_bits::DELEGATION_ID
         | present_bits::OPERATION_ID
         | present_bits::PROPOSAL_ID
+        | present_bits::PHYSICAL_TARGET_DIGEST
         | present_bits::FOCUS_DIGEST
+        | present_bits::RECORD_DIGEST
         | present_bits::VERIFICATION_STATE
         | present_bits::ERROR_CODE;
     ComputerAuditEntryV1 {
@@ -1173,11 +1179,11 @@ fn build_receiver_reproof_entry(
         canonical_project_digest: [0u8; 32],
         provider_digest: [0u8; 32],
         model_digest: [0u8; 32],
-        physical_target_digest: [0u8; 32],
+        physical_target_digest: event.physical_target_digest,
         focus_digest: event.focus_digest,
         observation_digest: [0u8; 32],
         host_lease_digest: [0u8; 32],
-        record_digest: [0u8; 32],
+        record_digest: event.record_digest,
         ask_yolo: 0,
         action_class: 0,
         journal_state: 0,
@@ -1355,6 +1361,26 @@ fn sample_event(kind: AuditEventKind, proposal: u8) -> GuidanceAuditAppend {
             AuditEventKind::GuidanceProposalAccepted => Some(GuidanceScope::ProjectProviderModel),
             _ => None,
         },
+    }
+}
+
+#[cfg(test)]
+fn sample_receiver_reproof_event() -> ReceiverReproofAuditAppend {
+    let mut id = [0u8; 16];
+    id[0] = 0x42;
+    let mut digest = [0u8; 32];
+    digest[0] = 0x11;
+    digest[31] = 0x22;
+    ReceiverReproofAuditAppend {
+        kind: AuditEventKind::ActionVerified,
+        session_id: id,
+        delegation_id: id,
+        operation_id: id,
+        physical_target_digest: digest,
+        focus_digest: digest,
+        record_digest: digest,
+        verification_state: VerificationState::Verified,
+        error_code: AuditErrorCode::None,
     }
 }
 
@@ -1981,5 +2007,33 @@ mod tests {
             assert_eq!(result.confirmed_sequence, 1, "{observe:?}");
             assert_eq!(result.entry_count, 1, "{observe:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn receiver_reproof_append_records_window_and_line_clear_digests() {
+        let harness = TestAuditHarness::new().await;
+        harness
+            .chain
+            .append_receiver_reproof(sample_receiver_reproof_event())
+            .await
+            .unwrap();
+        let rows = harness.db.list_computer_audit_entries().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let decoded = ComputerAuditEntryV1::decode(&rows[0].entry_bytes).unwrap();
+        assert_eq!(decoded.event_kind, AuditEventKind::ActionVerified);
+        assert_ne!(decoded.physical_target_digest, [0u8; 32]);
+        assert_ne!(decoded.focus_digest, [0u8; 32]);
+        assert_ne!(decoded.record_digest, [0u8; 32]);
+        assert_eq!(
+            decoded.present_bits
+                & (present_bits::PHYSICAL_TARGET_DIGEST
+                    | present_bits::FOCUS_DIGEST
+                    | present_bits::RECORD_DIGEST),
+            present_bits::PHYSICAL_TARGET_DIGEST
+                | present_bits::FOCUS_DIGEST
+                | present_bits::RECORD_DIGEST
+        );
+        let result = harness.chain.verify().await;
+        assert_eq!(result.status, AuditVerifyStatus::Verified);
     }
 }

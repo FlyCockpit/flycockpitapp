@@ -412,6 +412,39 @@ impl ComputerAction {
         }
     }
 
+    /// True when a successfully delivered action commits the modeled terminal
+    /// line. Broader than [`Self::is_enter_class_commit`]: `ctrl+shift+j`
+    /// prompts as Enter-class but untracks without committing.
+    pub(crate) fn delivers_terminal_line_commit(&self) -> bool {
+        match self {
+            Self::KeyChord { chord } => {
+                let keys = chord.keys();
+                let has_control = keys.iter().any(key_is_control);
+                let has_alt = keys.iter().any(key_is_alt);
+                let has_shift = keys.iter().any(|key| key.as_str() == "SHIFT");
+                let plain: Vec<&KeyCode> = keys
+                    .iter()
+                    .filter(|key| {
+                        !key_is_control(key)
+                            && !key_is_alt(key)
+                            && !key_is_meta(key)
+                            && key.as_str() != "SHIFT"
+                    })
+                    .collect();
+                if plain.iter().any(|key| key.as_str() == "ENTER") {
+                    return true;
+                }
+                has_control
+                    && !has_alt
+                    && !has_shift
+                    && plain.len() == 1
+                    && matches!(plain[0].as_str(), "J" | "M")
+            }
+            Self::HoldKey { key, .. } => key.as_str() == "ENTER",
+            _ => false,
+        }
+    }
+
     /// True when delivered keyboard input can change receiver identity per the
     /// closed allowlist (issue #373).
     pub(crate) fn marks_keyboard_identity_dirty(&self) -> bool {

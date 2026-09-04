@@ -14,8 +14,8 @@ use super::audit::{AuditErrorCode, ComputerAuditChain, ReceiverReproofAuditAppen
 use super::target::{OpaqueWindowId, TargetIdentityEvidence};
 use super::{ComputerAction, ComputerError, TypedInputLineModel};
 
-/// Receiver window identity journaled at the last successful proof (coordinator
-/// open or a prior evidence re-proof).
+/// Receiver window identity journaled at coordinator open, at Ask-gate identity
+/// adoption, or after a prior successful evidence re-proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct JournaledReceiverProof {
     pub window: OpaqueWindowId,
@@ -115,8 +115,8 @@ pub(crate) fn batch_would_refuse_unproven_receiver_enter(
     false
 }
 
-/// Compare live evidence against the journaled receiver proof from open or
-/// the prior successful re-proof.
+/// Compare live evidence against the journaled receiver proof from coordinator
+/// open, Ask-gate identity adoption, or the prior successful re-proof.
 pub(crate) fn evidence_matches_journaled_proof(
     evidence: &TargetIdentityEvidence,
     journaled: &JournaledReceiverProof,
@@ -156,18 +156,22 @@ pub(crate) fn emit_receiver_reproof_telemetry(
 pub(crate) async fn journal_receiver_reproof_attempt(
     chain: Option<&Arc<ComputerAuditChain>>,
     append: ReceiverReproofAuditAppend,
-) {
+) -> Result<(), ReceiverReproofFailure> {
     let Some(chain) = chain else {
-        tracing::warn!("receiver re-proof audit chain is not installed; evidence receipt skipped");
-        return;
+        tracing::warn!("receiver re-proof audit chain is not installed; evidence receipt refused");
+        return Err(ReceiverReproofFailure::EvidenceUnavailable);
     };
     if !chain.is_available() {
-        tracing::warn!("receiver re-proof audit chain is unavailable; evidence receipt skipped");
-        return;
-    };
-    if let Err(error) = chain.append_receiver_reproof(append).await {
-        tracing::warn!(%error, "receiver re-proof audit append failed");
+        tracing::warn!("receiver re-proof audit chain is unavailable; evidence receipt refused");
+        return Err(ReceiverReproofFailure::EvidenceUnavailable);
     }
+    chain
+        .append_receiver_reproof(append)
+        .await
+        .map_err(|error| {
+            tracing::warn!(?error, "receiver re-proof audit append failed");
+            ReceiverReproofFailure::EvidenceUnavailable
+        })
 }
 
 pub(crate) fn line_clear_action() -> ComputerAction {

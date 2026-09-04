@@ -783,6 +783,8 @@ fn gitignore_allow_round_trips_and_clears() {
 /// `.cockpit/config.json`, de-duplicates, and preserves sibling keys.
 #[test]
 fn append_gitignore_allow_targets_project_and_dedups() {
+    let isolated = TempDir::new().unwrap();
+    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(isolated.path());
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("proj");
     std::fs::create_dir_all(project.join(".cockpit")).unwrap();

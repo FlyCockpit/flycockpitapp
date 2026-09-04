@@ -48,6 +48,12 @@ fn trusted_load_for_cwd(root: &std::path::Path) -> ExtendedConfig {
     load_for_cwd(root)
 }
 
+fn trusted_load_for_cwd_for_daemon_contract(
+    root: &std::path::Path,
+) -> Result<DaemonExtendedConfigLoad> {
+    super::load_for_cwd_for_daemon_contract(root)
+}
+
 #[test]
 fn knowledge_base_registry_round_trips_through_extended_config_doc() {
     let tmp = TempDir::new().unwrap();
@@ -161,6 +167,8 @@ fn configured_knowledge_attachment_id_is_not_accepted_from_workspace_config() {
 
 #[test]
 fn overlapping_local_knowledge_roots_are_rejected() {
+    let isolated = TempDir::new().unwrap();
+    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(isolated.path());
     let tmp = TempDir::new().unwrap();
     std::fs::create_dir_all(tmp.path().join(".cockpit/knowledge/nested")).unwrap();
     std::fs::write(
@@ -191,7 +199,7 @@ fn overlapping_local_knowledge_roots_are_rejected() {
     .unwrap();
 
     let _trust = enter_trusted_workspace(tmp.path());
-    let error = load_for_cwd_for_daemon_contract(tmp.path()).unwrap_err();
+    let error = trusted_load_for_cwd_for_daemon_contract(tmp.path()).unwrap_err();
     let diagnostic = format!("{error:#}");
     assert!(diagnostic.contains("overlapping roots"), "{diagnostic}");
 }
@@ -202,6 +210,8 @@ fn overlapping_local_knowledge_roots_fail_closed_when_a_symlinked_child_root_is_
  {
     use std::os::unix::fs::symlink;
 
+    let isolated = TempDir::new().unwrap();
+    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(isolated.path());
     let tmp = TempDir::new().unwrap();
     let real = tmp.path().join("knowledge");
     std::fs::create_dir_all(real.join("nested")).unwrap();
@@ -235,7 +245,7 @@ fn overlapping_local_knowledge_roots_fail_closed_when_a_symlinked_child_root_is_
     .unwrap();
 
     let _trust = enter_trusted_workspace(tmp.path());
-    let error = load_for_cwd_for_daemon_contract(tmp.path()).unwrap_err();
+    let error = trusted_load_for_cwd_for_daemon_contract(tmp.path()).unwrap_err();
     let diagnostic = format!("{error:#}");
     assert!(diagnostic.contains("overlapping roots"), "{diagnostic}");
     assert!(diagnostic.contains("future-child"), "{diagnostic}");
@@ -1109,6 +1119,8 @@ fn partial_redact_and_tui_objects_parse_with_defaults_and_preserve_lists() {
 
 #[test]
 fn project_writes_target_nearest_project_layer() {
+    let isolated = TempDir::new().unwrap();
+    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(isolated.path());
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("repo");
     let nested = project.join("nested");
@@ -2585,7 +2597,7 @@ fn daemon_effective_load_rejects_invalid_response_metrics_tokenizer() {
     .unwrap();
     let _trust = enter_trusted_workspace(&project);
     assert!(
-        load_for_cwd_for_daemon_contract(&project)
+        trusted_load_for_cwd_for_daemon_contract(&project)
             .unwrap()
             .response_metrics_tokenizer_validation
             .is_err()
@@ -2604,7 +2616,7 @@ fn invalid_response_metrics_tokenizer_fails_effective_load() {
     )
     .unwrap();
     let _trust = enter_trusted_workspace(&project);
-    let load = load_for_cwd_for_daemon_contract(&project).unwrap();
+    let load = trusted_load_for_cwd_for_daemon_contract(&project).unwrap();
     assert_eq!(load.participating_layers.len(), 1);
     assert!(load.response_metrics_tokenizer_validation.is_err());
 }
@@ -2628,7 +2640,7 @@ fn daemon_load_projects_provider_and_extended_values_from_one_layer_snapshot() {
     let _trust = enter_trusted_workspace(&project);
     crate::config::providers::reset_load_effective_call_count();
 
-    let load = load_for_cwd_for_daemon_contract(&project).unwrap();
+    let load = trusted_load_for_cwd_for_daemon_contract(&project).unwrap();
 
     let active = load.providers.active_model.unwrap();
     assert_eq!(active.provider, "snapshot-provider");
@@ -2663,7 +2675,7 @@ fn response_metrics_tokenizer_daemon_load_respects_layered_trust_policy() {
     .unwrap();
     {
         let _trust = enter_trusted_workspace(&project);
-        let load = load_for_cwd_for_daemon_contract(&project).unwrap();
+        let load = trusted_load_for_cwd_for_daemon_contract(&project).unwrap();
         assert!(load.response_metrics_tokenizer_validation.is_err());
         assert_eq!(load.participating_layers.len(), 2);
     }
@@ -2680,7 +2692,7 @@ fn response_metrics_tokenizer_daemon_load_respects_layered_trust_policy() {
             mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
         },
     );
-    let load = load_for_cwd_for_daemon_contract(&project).unwrap();
+    let load = trusted_load_for_cwd_for_daemon_contract(&project).unwrap();
     assert!(load.response_metrics_tokenizer_validation.is_ok());
     assert_eq!(load.participating_layers, vec![global]);
 }
@@ -2695,7 +2707,7 @@ fn daemon_tokenizer_validation_keeps_whole_document_failures_advisory() {
     let _trust = enter_trusted_workspace(&project);
     for contents in ["not json", "[]"] {
         std::fs::write(&path, contents).unwrap();
-        let load = load_for_cwd_for_daemon_contract(&project).unwrap();
+        let load = trusted_load_for_cwd_for_daemon_contract(&project).unwrap();
         assert!(load.response_metrics_tokenizer_validation.is_ok());
         assert_eq!(
             load.config.response_metrics_tokenizer,
@@ -3706,6 +3718,8 @@ fn image_sidecar_selection_is_a_typed_local_config_field() {
 
 #[test]
 fn extended_config_ignores_secret_store_key() {
+    let isolated = TempDir::new().unwrap();
+    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(isolated.path());
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("proj");
     std::fs::create_dir_all(project.join(".cockpit")).unwrap();
@@ -3735,6 +3749,8 @@ fn extended_config_ignores_secret_store_key() {
 
 #[test]
 fn two_projects_conflicting_layered_secret_store_cannot_override_authority() {
+    let isolated = TempDir::new().unwrap();
+    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(isolated.path());
     let tmp = TempDir::new().unwrap();
     let db = crate::db::Db::open(&tmp.path().join("cockpit.db")).unwrap();
     db.blocking_write_for_sync_maintenance(|conn| {

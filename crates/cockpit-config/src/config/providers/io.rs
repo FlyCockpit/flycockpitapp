@@ -1751,7 +1751,7 @@ fn merge_provider_files_for_layer(
 /// Machine-local per-cwd, project `.cockpit`, attached workspace snapshots,
 /// and `COCKPIT_CONFIG` are project scoped for executable configuration.
 fn config_path_is_global_user_layer(config_path: &Path) -> bool {
-    crate::config::dirs::global_config_file().is_ok_and(|global| config_path == global)
+    crate::config::dirs::global_config_file_unchecked().is_ok_and(|global| config_path == global)
 }
 
 fn strip_project_auth_command(

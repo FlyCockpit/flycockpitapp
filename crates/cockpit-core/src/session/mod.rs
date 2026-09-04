@@ -2615,6 +2615,25 @@ pub(crate) fn workspace_scratch_path_for_session(
         .join(session_id.to_string()))
 }
 
+#[cfg(any(test, feature = "test-support"))]
+fn test_session_scratch_root() -> PathBuf {
+    std::env::temp_dir().join("cockpit-test-session-workspace-scratch")
+}
+
+/// Durable scratch for synthetic test-support sessions. These paths live under
+/// a process-local temp namespace so they never publish production workspace
+/// markers or touch the developer `cockpit_state_dir`.
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn test_support_workspace_scratch_path_for_session(
+    project_id: &str,
+    session_id: Uuid,
+) -> Result<PathBuf> {
+    Ok(test_session_scratch_root()
+        .join(project_id)
+        .join("sessions")
+        .join(session_id.to_string()))
+}
+
 /// Isolate direct, pre-identity test fixtures from the production workspace
 /// namespace.  These rows deliberately retain their short labels in the
 /// ledger, so using the label as a directory component would bypass the
@@ -2627,11 +2646,7 @@ pub(super) fn test_fixture_workspace_scratch_path_for_session(
     let directory_id = project_id_from_workspace_object(&format!(
         "cockpit-legacy-test-fixture-workspace-v1\\0{fixture_project_id}"
     ));
-    Ok(cockpit_config::config::resolve::cockpit_state_dir()?
-        .join("test-workspaces")
-        .join(directory_id)
-        .join("sessions")
-        .join(session_id.to_string()))
+    test_support_workspace_scratch_path_for_session(&directory_id, session_id)
 }
 
 const TITLE_SCHEDULE_SLOTS: [u8; 5] = [1, 2, 4, 8, 16];

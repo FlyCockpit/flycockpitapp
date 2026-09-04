@@ -486,11 +486,11 @@ fn is_cockpit_owned_config_dir(path: &Path) -> bool {
         return false;
     }
 
-    if crate::config::dirs::global_config_dir().is_ok_and(|global| path == global) {
+    if crate::config::dirs::global_config_dir_unchecked().is_ok_and(|global| path == global) {
         return true;
     }
 
-    crate::config::resolve::cockpit_data_dir()
+    crate::config::resolve::cockpit_data_dir_unchecked()
         .map(|data_dir| path.starts_with(data_dir.join("local-configs")))
         .unwrap_or(false)
 }

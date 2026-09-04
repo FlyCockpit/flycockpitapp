@@ -48,20 +48,20 @@ fn real_developer_state_dir() -> PathBuf {
 /// Panic when `path` resolves under the captured real developer Cockpit
 /// config/data/state roots. Production code never calls this.
 pub fn assert_not_real_developer_cockpit_path(path: &Path) {
-    let roots = REAL_DEVELOPER_COCKPIT_ROOTS.get();
-    if roots.is_none() {
-        return;
-    }
-    let roots = roots.expect("checked is_some");
+    ensure_real_developer_roots_captured();
+    let roots = REAL_DEVELOPER_COCKPIT_ROOTS
+        .get()
+        .expect("real developer cockpit roots captured above");
     if contained_under(&roots.config, path)
         || contained_under(&roots.data, path)
         || contained_under(&roots.state, path)
     {
         panic!(
             "test resolved a Cockpit home path under the real developer profile \
-             ({path}); call TestEnvGuard::isolated_cockpit_home[_async] or \
+             ({}); call TestEnvGuard::isolated_cockpit_home[_async] or \
              isolate_cockpit_home_at[_async] and keep the returned guard alive \
-             for the whole test before reading or writing config/data/state paths"
+             for the whole test before reading or writing config/data/state paths",
+            path.display()
         );
     }
 }

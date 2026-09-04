@@ -151,6 +151,7 @@ fn run_private_atomic_write_umask_case(root: &Path) {
         },
     );
 
+    crate::config::dirs::ensure_global_config_dir().unwrap();
     doc.write(&cfg).unwrap();
     assert_private_mode(&config_path, 0o600);
     assert_private_mode(&provider_path, 0o600);

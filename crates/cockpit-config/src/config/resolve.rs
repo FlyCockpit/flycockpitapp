@@ -17,6 +17,39 @@ fn guard_resolved_cockpit_path(path: &Path) {
 #[cfg(not(any(test, feature = "test-support")))]
 fn guard_resolved_cockpit_path(_path: &Path) {}
 
+pub(crate) fn cockpit_config_dir_unchecked() -> Result<PathBuf> {
+    let base = dirs::config_dir().context("could not locate user config dir")?;
+    Ok(base.join("cockpit"))
+}
+
+pub(crate) fn cockpit_data_dir_unchecked() -> Result<PathBuf> {
+    if let Ok(s) = std::env::var("XDG_DATA_HOME")
+        && !s.trim().is_empty()
+    {
+        return Ok(PathBuf::from(s).join("cockpit"));
+    }
+    let base = dirs::data_dir().context("could not locate user data dir")?;
+    Ok(base.join("cockpit"))
+}
+
+pub(crate) fn cockpit_state_dir_unchecked() -> Result<PathBuf> {
+    if let Ok(s) = std::env::var("XDG_STATE_HOME")
+        && !s.trim().is_empty()
+    {
+        return Ok(PathBuf::from(s).join("cockpit"));
+    }
+    #[cfg(unix)]
+    {
+        let home = dirs::home_dir().context("could not locate home dir")?;
+        Ok(home.join(".local/state/cockpit"))
+    }
+    #[cfg(not(unix))]
+    {
+        let base = dirs::data_local_dir().context("could not locate local data dir")?;
+        Ok(base.join("cockpit").join("state"))
+    }
+}
+
 /// Platform-default global configuration directory.
 ///
 /// This is `~/.config/cockpit` on Linux (respecting `XDG_CONFIG_HOME`) and
@@ -24,14 +57,7 @@ fn guard_resolved_cockpit_path(_path: &Path) {}
 /// separate from workspace `.cockpit/` directories: workspace trust controls
 /// only those project-local layers, never this user-owned global directory.
 pub fn cockpit_config_dir() -> Result<PathBuf> {
-    let base = if let Ok(value) = std::env::var("XDG_CONFIG_HOME")
-        && !value.trim().is_empty()
-    {
-        PathBuf::from(value)
-    } else {
-        dirs::config_dir().context("could not locate user config dir")?
-    };
-    let path = base.join("cockpit");
+    let path = cockpit_config_dir_unchecked()?;
     guard_resolved_cockpit_path(&path);
     Ok(path)
 }
@@ -40,15 +66,7 @@ pub fn cockpit_config_dir() -> Result<PathBuf> {
 /// `%APPDATA%\cockpit` on Windows. Holds the session SQLite database
 /// and any other durable user data the daemon writes between runs.
 pub fn cockpit_data_dir() -> Result<PathBuf> {
-    if let Ok(s) = std::env::var("XDG_DATA_HOME")
-        && !s.trim().is_empty()
-    {
-        let path = PathBuf::from(s).join("cockpit");
-        guard_resolved_cockpit_path(&path);
-        return Ok(path);
-    }
-    let base = dirs::data_dir().context("could not locate user data dir")?;
-    let path = base.join("cockpit");
+    let path = cockpit_data_dir_unchecked()?;
     guard_resolved_cockpit_path(&path);
     Ok(path)
 }
@@ -61,27 +79,9 @@ pub fn cockpit_data_dir() -> Result<PathBuf> {
 /// notes §5) and by the TUI's private clipboard recovery artifact
 /// directory (`crates/cockpit-tui/src/clipboard/recovery`).
 pub fn cockpit_state_dir() -> Result<PathBuf> {
-    if let Ok(s) = std::env::var("XDG_STATE_HOME")
-        && !s.trim().is_empty()
-    {
-        let path = PathBuf::from(s).join("cockpit");
-        guard_resolved_cockpit_path(&path);
-        return Ok(path);
-    }
-    #[cfg(unix)]
-    {
-        let home = dirs::home_dir().context("could not locate home dir")?;
-        let path = home.join(".local/state/cockpit");
-        guard_resolved_cockpit_path(&path);
-        Ok(path)
-    }
-    #[cfg(not(unix))]
-    {
-        let base = dirs::data_local_dir().context("could not locate local data dir")?;
-        let path = base.join("cockpit").join("state");
-        guard_resolved_cockpit_path(&path);
-        Ok(path)
-    }
+    let path = cockpit_state_dir_unchecked()?;
+    guard_resolved_cockpit_path(&path);
+    Ok(path)
 }
 
 #[cfg(test)]

@@ -811,7 +811,8 @@ mod tests {
     /// Build a `ToolCtx` rooted at `cwd` with sandboxing ON and an
     /// approver wired to a detached interrupt hub, so a prompt can be
     /// resolved from a sibling task.
-    fn sandboxed_ctx(cwd: &std::path::Path) -> ToolCtx {
+    async fn sandboxed_ctx(cwd: &std::path::Path) -> (crate::test_env::TestEnvGuard, ToolCtx) {
+        let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = crate::session::Session::create_for_test(
             db.clone(),
@@ -833,57 +834,63 @@ mod tests {
             crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
         );
         let approver = Arc::new(Approver::new(store, db, sid, "builder", hub.clone()));
-        ToolCtx {
-            agent_id: "builder".to_string(),
-            allowed_knowledge_bases: None,
-            executing_model_trusted: false,
-            knowledge_access_trusted: false,
-            caller_model: None,
-            agent_instance_id: None,
-            lock_identity: "builder".to_string().clone(),
-            write_scope: None,
-            dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
-            workspace_lease: None,
-            current_tool_call_id: None,
-            current_tool_call_scope: None,
-            tool_steering: crate::agents::ToolSteering::Terse,
-            locks,
-            session: Arc::new(session),
-            cwd: cwd.to_path_buf(),
-            redact,
-            interrupts: hub,
-            cancel: tokio_util::sync::CancellationToken::new(),
-            shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
-            approver: Some(approver),
-            #[cfg(feature = "extended")]
-            image_generation_dispatch: None,
-            transcription_dispatch: None,
-            deferred_log: crate::engine::deferred::DeferredLog::new(),
-            root_agent_frame: true,
-            skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
-            review_cage: None,
-            context_usage: None,
-            available_tools: Arc::new(std::collections::HashSet::new()),
-            mcp_builtin_registry: Arc::new(crate::mcp::builtin::BuiltinRegistry::default_with(
-                Vec::new(),
-            )),
-            has_tree: false,
-            has_bash: false,
-            events: None,
-            lsp: None,
-            resource_scheduler: None,
-            media_authority: None,
-            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
-            config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
-            env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(cwd),
-        }
+        (
+            env,
+            ToolCtx {
+                agent_id: "builder".to_string(),
+                allowed_knowledge_bases: None,
+                executing_model_trusted: false,
+                knowledge_access_trusted: false,
+                caller_model: None,
+                agent_instance_id: None,
+                lock_identity: "builder".to_string().clone(),
+                write_scope: None,
+                dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                workspace_lease: None,
+                current_tool_call_id: None,
+                current_tool_call_scope: None,
+                tool_steering: crate::agents::ToolSteering::Terse,
+                locks,
+                session: Arc::new(session),
+                cwd: cwd.to_path_buf(),
+                redact,
+                interrupts: hub,
+                cancel: tokio_util::sync::CancellationToken::new(),
+                shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
+                approver: Some(approver),
+                #[cfg(feature = "extended")]
+                image_generation_dispatch: None,
+                transcription_dispatch: None,
+                deferred_log: crate::engine::deferred::DeferredLog::new(),
+                root_agent_frame: true,
+                skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
+                review_cage: None,
+                context_usage: None,
+                available_tools: Arc::new(std::collections::HashSet::new()),
+                mcp_builtin_registry: Arc::new(crate::mcp::builtin::BuiltinRegistry::default_with(
+                    Vec::new(),
+                )),
+                has_tree: false,
+                has_bash: false,
+                events: None,
+                lsp: None,
+                resource_scheduler: None,
+                media_authority: None,
+                media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(
+                ),
+                config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
+                    cwd,
+                ),
+                env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(cwd),
+            },
+        )
     }
 
     #[tokio::test]
     async fn native_inside_cwd_allowed_without_prompt() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         // A path under cwd is allowed silently — no client attached, so a
         // prompt would block forever; this returns immediately.
         let inside = tmp.path().join("src/main.rs");
@@ -895,7 +902,7 @@ mod tests {
     #[tokio::test]
     async fn native_inside_session_tmp_allowed_without_prompt() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         // The per-session tmp dir counts as inside the boundary.
         let tmp_dir = ctx.session.tmp_dir().expect("session tmp dir");
         let scratch = tmp_dir.join("scratch.txt");
@@ -907,7 +914,7 @@ mod tests {
     #[tokio::test]
     async fn leased_native_access_allows_durable_workspace_scratch() {
         let lease_root = tempfile::tempdir().unwrap();
-        let mut ctx = sandboxed_ctx(lease_root.path());
+        let (_env, mut ctx) = sandboxed_ctx(lease_root.path()).await;
         ctx.workspace_lease = Some(Arc::new(crate::workspace_lease::WorkspaceLease::ephemeral(
             crate::workspace_lease::WorkspaceLeaseKind::SameRoot,
             lease_root.path().to_path_buf(),
@@ -924,7 +931,7 @@ mod tests {
     #[tokio::test]
     async fn native_parent_traversal_stays_inside() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         // `cwd/sub/../keep.txt` resolves back inside cwd when the traversed
         // parent exists — no prompt.
         std::fs::create_dir(tmp.path().join("sub")).unwrap();
@@ -937,7 +944,7 @@ mod tests {
     #[tokio::test]
     async fn native_missing_inside_path_allowed_without_prompt() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         let target = tmp.path().join("new/nested/file.txt");
         check_native_access(&ctx, &target, SandboxPathAccess::Read)
             .await
@@ -951,7 +958,7 @@ mod tests {
         std::fs::create_dir(&knowledge_root).unwrap();
         let target = knowledge_root.join("notes.md");
 
-        let mut ctx = sandboxed_ctx(tmp.path());
+        let (_env, mut ctx) = sandboxed_ctx(tmp.path()).await;
         let mut extended = crate::config::extended::ExtendedConfig::default();
         extended
             .knowledge_bases
@@ -1003,7 +1010,7 @@ mod tests {
         std::fs::write(&attached_note, "attached").unwrap();
         std::fs::write(&withheld_note, "withheld").unwrap();
 
-        let mut ctx = sandboxed_ctx(workspace.path());
+        let (_env, mut ctx) = sandboxed_ctx(workspace.path()).await;
         ctx.allowed_knowledge_bases =
             Some(std::collections::BTreeSet::from(["attached".to_string()]));
         let mut extended = crate::config::extended::ExtendedConfig::default();
@@ -1065,7 +1072,7 @@ mod tests {
         let note = nested.join("note.md");
         std::fs::write(&note, "private").unwrap();
 
-        let mut ctx = sandboxed_ctx(workspace.path());
+        let (_env, mut ctx) = sandboxed_ctx(workspace.path()).await;
         ctx.allowed_knowledge_bases = Some(std::collections::BTreeSet::from(["outer".to_string()]));
         let mut extended = crate::config::extended::ExtendedConfig::default();
         for (id, path) in [
@@ -1109,7 +1116,7 @@ mod tests {
         let knowledge = tempfile::tempdir().unwrap();
         let note = knowledge.path().join("note.md");
         std::fs::write(&note, "protected").unwrap();
-        let mut ctx = sandboxed_ctx(workspace.path());
+        let (_env, mut ctx) = sandboxed_ctx(workspace.path()).await;
         ctx.executing_model_trusted = false;
         ctx.knowledge_access_trusted = true;
         let mut extended = crate::config::extended::ExtendedConfig::default();
@@ -1152,7 +1159,7 @@ mod tests {
         let knowledge = tempfile::tempdir().unwrap();
         let note = knowledge.path().join("note.md");
         std::fs::write(&note, "attached").unwrap();
-        let mut ctx = sandboxed_ctx(workspace.path());
+        let (_env, mut ctx) = sandboxed_ctx(workspace.path()).await;
         ctx.review_cage = Some(
             crate::engine::tool::ReviewCage::skills_review_with_package_roots([package
                 .path()
@@ -1202,7 +1209,7 @@ mod tests {
     #[tokio::test]
     async fn remote_knowledge_contributes_no_native_read_root() {
         let workspace = tempfile::tempdir().unwrap();
-        let mut ctx = sandboxed_ctx(workspace.path());
+        let (_env, mut ctx) = sandboxed_ctx(workspace.path()).await;
         let mut extended = crate::config::extended::ExtendedConfig::default();
         extended
             .knowledge_bases
@@ -1241,7 +1248,8 @@ mod tests {
         let skills = tempfile::tempdir().unwrap();
         let package = skills.path().join("reviewed");
         std::fs::create_dir_all(&package).unwrap();
-        let mut ctx = crate::tools::common::test_ctx(cwd.path());
+        let (_env, mut ctx) = sandboxed_ctx(cwd.path()).await;
+        ctx.cwd = cwd.path().to_path_buf();
         ctx.review_cage = Some(
             crate::engine::tool::ReviewCage::skills_review_with_package_roots([package.clone()]),
         );
@@ -1274,7 +1282,7 @@ mod tests {
         std::fs::write(&secret, "secret").unwrap();
         let link = tmp.path().join("link.txt");
         symlink_file(&secret, &link);
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
 
         let resolver = spawn_cancel_next_path_prompt(&ctx);
         let err = check_native_access(&ctx, &link, SandboxPathAccess::Read)
@@ -1295,7 +1303,7 @@ mod tests {
         std::fs::write(&secret, "secret").unwrap();
         let link = tmp.path().join("link.txt");
         symlink_file(&secret, &link);
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         ctx.session.set_sandbox_enabled(false);
 
         let resolver = spawn_cancel_next_path_prompt(&ctx);
@@ -1319,7 +1327,7 @@ mod tests {
         #[cfg(windows)]
         std::os::windows::fs::symlink_dir(outside.path(), &link).unwrap();
         let target = link.join("new-file.txt");
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
 
         let resolver = spawn_cancel_next_path_prompt(&ctx);
         let err = check_native_access(&ctx, &target, SandboxPathAccess::Read)
@@ -1347,7 +1355,7 @@ mod tests {
         let target = link.join("../secret.txt");
 
         for surface in ["read", "write", "edit"] {
-            let ctx = sandboxed_ctx(tmp.path());
+            let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
             let resolver = spawn_cancel_next_path_prompt(&ctx);
             let err = check_native_access(&ctx, &target, SandboxPathAccess::Read)
                 .await
@@ -1364,7 +1372,7 @@ mod tests {
     async fn native_access_parent_traversal_still_rejected_with_sandbox_off() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let mut ctx = sandboxed_ctx(tmp.path());
+        let (_env, mut ctx) = sandboxed_ctx(tmp.path()).await;
         ctx.session.set_sandbox_enabled(false);
         ctx.approver = None;
         let target = outside.path().join("missing/../secret.txt");
@@ -1399,7 +1407,7 @@ mod tests {
     async fn native_access_prompts_outside_boundary_with_sandbox_off() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         ctx.session.set_sandbox_enabled(false);
         let target = outside.path().join("secret.txt");
         std::fs::write(&target, "secret").unwrap();
@@ -1420,7 +1428,7 @@ mod tests {
     async fn native_access_granted_path_is_silent_with_sandbox_off() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         ctx.session.set_sandbox_enabled(false);
         let target = outside.path().join("notes.txt");
         std::fs::write(&target, "notes").unwrap();
@@ -1448,7 +1456,7 @@ mod tests {
     async fn native_access_unprovable_path_prompts_with_sandbox_off() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         ctx.session.set_sandbox_enabled(false);
         let broken = outside.path().join("broken-link");
         #[cfg(unix)]
@@ -1472,7 +1480,7 @@ mod tests {
     async fn native_access_behavior_unchanged_with_sandbox_on() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         assert!(ctx.session.sandbox_enabled());
 
         check_native_access(
@@ -1502,7 +1510,7 @@ mod tests {
         for sandbox_enabled in [true, false] {
             let tmp = tempfile::tempdir().unwrap();
             let outside = tempfile::tempdir().unwrap();
-            let mut ctx = sandboxed_ctx(tmp.path());
+            let (_env, mut ctx) = sandboxed_ctx(tmp.path()).await;
             ctx.session.set_sandbox_enabled(sandbox_enabled);
             ctx.approver = None;
             let target = outside.path().join("x.txt");
@@ -1522,7 +1530,7 @@ mod tests {
     async fn native_outside_granted_allows_and_persists() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         let target = outside.path().join("notes.txt");
 
         // Resolve the raised prompt with a Session-scope grant.
@@ -1560,7 +1568,7 @@ mod tests {
     async fn native_read_grant_does_not_authorize_write_access() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         let target = outside.path().join("notes.txt");
         std::fs::write(&target, "notes").unwrap();
         let store = GrantStore::new(
@@ -1597,7 +1605,7 @@ mod tests {
     async fn native_outside_denied_refuses() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         let target = outside.path().join("secret.txt");
 
         let db = ctx.session.db.clone();
@@ -1630,7 +1638,7 @@ mod tests {
     #[tokio::test]
     async fn native_no_approver_allows_proven_inside_but_fails_closed_outside() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut ctx = sandboxed_ctx(tmp.path());
+        let (_env, mut ctx) = sandboxed_ctx(tmp.path()).await;
         ctx.approver = None;
 
         check_native_access(
@@ -1656,7 +1664,7 @@ mod tests {
 
     /// Build a git worktree with a `.gitignore` ignoring `target/` + `.env`,
     /// plus a tracked source file, and a ctx rooted there.
-    fn gitignore_ctx(cwd: &std::path::Path) -> ToolCtx {
+    async fn gitignore_ctx(cwd: &std::path::Path) -> (crate::test_env::TestEnvGuard, ToolCtx) {
         std::fs::create_dir_all(cwd.join(".git")).unwrap();
         std::fs::write(cwd.join(".gitignore"), "target/\n.env\n").unwrap();
         std::fs::create_dir_all(cwd.join("target/debug")).unwrap();
@@ -1664,7 +1672,9 @@ mod tests {
         std::fs::write(cwd.join(".env"), "SECRET=x").unwrap();
         std::fs::create_dir_all(cwd.join("src")).unwrap();
         std::fs::write(cwd.join("src/main.rs"), "fn main() {}").unwrap();
-        sandboxed_ctx(cwd)
+        let (env, mut ctx) = sandboxed_ctx(cwd).await;
+        ctx.session.set_sandbox_enabled(false);
+        (env, ctx)
     }
 
     /// A non-gitignored path reads silently — the gate returns `None` with no
@@ -1672,7 +1682,7 @@ mod tests {
     #[tokio::test]
     async fn gitignore_gate_permits_tracked_file_silently() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gitignore_ctx(tmp.path());
+        let (_env, ctx) = gitignore_ctx(tmp.path()).await;
         let out = check_gitignore_read(&ctx, &tmp.path().join("src/main.rs"))
             .await
             .unwrap();
@@ -1683,7 +1693,7 @@ mod tests {
     #[tokio::test]
     async fn secret_path_gate_denies_non_gitignored_env_file_headless() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut ctx = gitignore_ctx(tmp.path());
+        let (_env, mut ctx) = gitignore_ctx(tmp.path()).await;
         ctx.approver = None;
         let path = tmp.path().join(".env.production");
         std::fs::write(&path, "TOKEN=long-secret-value").unwrap();
@@ -1698,7 +1708,7 @@ mod tests {
     #[tokio::test]
     async fn secret_path_gate_honors_explicit_session_allow() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut ctx = gitignore_ctx(tmp.path());
+        let (_env, mut ctx) = gitignore_ctx(tmp.path()).await;
         ctx.approver = None;
         let path = tmp.path().join(".env.production");
         std::fs::write(&path, "TOKEN=long-secret-value").unwrap();
@@ -1710,7 +1720,7 @@ mod tests {
     #[tokio::test]
     async fn gitignore_gate_permits_session_allowlisted() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gitignore_ctx(tmp.path());
+        let (_env, ctx) = gitignore_ctx(tmp.path()).await;
         ctx.session.add_gitignore_session_allow("target/");
         let out = check_gitignore_read(&ctx, &tmp.path().join("target/debug/app"))
             .await
@@ -1723,7 +1733,7 @@ mod tests {
     #[tokio::test]
     async fn gitignore_gate_headless_denies_with_refusal() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut ctx = gitignore_ctx(tmp.path());
+        let (_env, mut ctx) = gitignore_ctx(tmp.path()).await;
         ctx.approver = None;
         let out = check_gitignore_read(&ctx, &tmp.path().join(".env"))
             .await
@@ -1736,7 +1746,7 @@ mod tests {
     #[tokio::test]
     async fn gitignore_gate_uses_canonical_symlink_target() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut ctx = gitignore_ctx(tmp.path());
+        let (_env, mut ctx) = gitignore_ctx(tmp.path()).await;
         ctx.approver = None;
         let link = tmp.path().join("visible-env");
         symlink_file(&tmp.path().join(".env"), &link);
@@ -1752,7 +1762,7 @@ mod tests {
     #[tokio::test]
     async fn gitignore_gate_remembered_rejection_refuses_without_prompt() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gitignore_ctx(tmp.path());
+        let (_env, ctx) = gitignore_ctx(tmp.path()).await;
         let display = std::fs::canonicalize(tmp.path().join(".env"))
             .unwrap_or_else(|_| tmp.path().join(".env"))
             .display()
@@ -1774,7 +1784,7 @@ mod tests {
         use crate::approval::{ID_APPROVE_SESSION, ID_GITIGNORE_FILE};
         use crate::daemon::proto::ResolveResponse;
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gitignore_ctx(tmp.path());
+        let (_env, ctx) = gitignore_ctx(tmp.path()).await;
         let db = ctx.session.db.clone();
         let sid = ctx.session.id;
         let hub = ctx.interrupts.clone();
@@ -1826,7 +1836,7 @@ mod tests {
     async fn gitignore_gate_preserves_noninteractive_run_denial_and_audit_source() {
         use crate::daemon::proto::ResolveResponse;
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gitignore_ctx(tmp.path());
+        let (_env, ctx) = gitignore_ctx(tmp.path()).await;
         let db = ctx.session.db.clone();
         let sid = ctx.session.id;
         let hub = ctx.interrupts.clone();

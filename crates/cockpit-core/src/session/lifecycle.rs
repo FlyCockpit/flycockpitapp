@@ -544,6 +544,12 @@ fn capture_model_system_prompt_snapshot_json(project_root: &std::path::Path) -> 
     ModelSystemPromptSnapshot::capture(&providers).to_json_string()
 }
 
+#[cfg(any(test, feature = "test-support"))]
+fn default_test_model_system_prompt_snapshot_json() -> String {
+    ModelSystemPromptSnapshot::capture(&crate::config::providers::ProvidersConfig::default())
+        .to_json_string()
+}
+
 fn capture_knowledge_base_prompt_snapshot_json(
     db: &Db,
     config: &crate::config::extended::ExtendedConfig,
@@ -654,8 +660,7 @@ impl Session {
                 &active_agent_for_db,
             )
         })?;
-        row.model_system_prompt_snapshot_json =
-            capture_model_system_prompt_snapshot_json(&project_root);
+        row.model_system_prompt_snapshot_json = default_test_model_system_prompt_snapshot_json();
         let row_for_db = row.clone();
         let vault_for_insert = Arc::clone(&vault);
         let row = persist_built_session_row_with_redaction_custody(
@@ -701,8 +706,7 @@ impl Session {
                 )
             })
             .context("building deferred test session row")?;
-        row.model_system_prompt_snapshot_json =
-            capture_model_system_prompt_snapshot_json(&project_root);
+        row.model_system_prompt_snapshot_json = default_test_model_system_prompt_snapshot_json();
         let session = Self::from_row(
             db,
             project_root,
@@ -745,8 +749,7 @@ impl Session {
                 )
             })
             .context("building deferred assistant test session row")?;
-        row.model_system_prompt_snapshot_json =
-            capture_model_system_prompt_snapshot_json(&project_root);
+        row.model_system_prompt_snapshot_json = default_test_model_system_prompt_snapshot_json();
         let session = Self::from_row(
             db,
             project_root,
@@ -1379,17 +1382,20 @@ impl Session {
             workspace_scratch_dir_for_session(&row.project_id, &project_root, row.session_id)
                 .context("initializing required durable workspace scratch")?
         } else {
-            let path = workspace_scratch_path_for_session(&row.project_id, row.session_id)
-                .or_else(|error| {
-                    #[cfg(any(test, feature = "test-support"))]
-                    if legacy_short_fixture_project_id {
-                        return super::test_fixture_workspace_scratch_path_for_session(
-                            &row.project_id,
-                            row.session_id,
-                        );
-                    }
-                    Err(error)
-                })?;
+            #[cfg(any(test, feature = "test-support"))]
+            let path = if legacy_short_fixture_project_id {
+                super::test_fixture_workspace_scratch_path_for_session(
+                    &row.project_id,
+                    row.session_id,
+                )?
+            } else {
+                super::test_support_workspace_scratch_path_for_session(
+                    &row.project_id,
+                    row.session_id,
+                )?
+            };
+            #[cfg(not(any(test, feature = "test-support")))]
+            let path = workspace_scratch_path_for_session(&row.project_id, row.session_id)?;
             std::fs::create_dir_all(&path)
                 .with_context(|| format!("creating test workspace scratch `{}`", path.display()))?;
             path

@@ -316,6 +316,20 @@ mod tests {
     }
 
     #[test]
+    fn home_isolation_guard_lazy_capture_rejects_real_paths_without_test_env_guard() {
+        let real_state = dirs::home_dir()
+            .expect("real developer home dir")
+            .join(".local/state/cockpit");
+        let panic = std::panic::catch_unwind(|| {
+            home_isolation::assert_not_real_developer_cockpit_path(&real_state);
+        });
+        assert!(
+            panic.is_err(),
+            "lazy capture must reject real developer paths even without TestEnvGuard"
+        );
+    }
+
+    #[test]
     fn home_isolation_guard_rejects_real_developer_cockpit_paths() {
         let setup = test_env_mutex().blocking_lock();
         home_isolation::ensure_real_developer_roots_captured();

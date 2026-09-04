@@ -382,6 +382,8 @@ fn hooks_config_trust_excludes_project_layer() {
     if std::env::var_os(COCKPIT_CONFIG_ENV).is_some() {
         return;
     }
+    let isolated_home = TempDir::new().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(isolated_home.path());
     let temp = TempDir::new().unwrap();
     std::fs::create_dir(temp.path().join(".git")).unwrap();
     let path = temp.path().join(".cockpit/config.json");

@@ -72,9 +72,39 @@ struct PeerCredentialRecord {
 #[derive(Default)]
 pub struct PeerCredentialRegistry {
     records: Mutex<HashMap<String, PeerCredentialRecord>>,
+    invalidation_hooks: Mutex<HashMap<Uuid, Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl PeerCredentialRegistry {
+    pub fn register_invalidation_hook(
+        &self,
+        connection_id: Uuid,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) {
+        self.invalidation_hooks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(connection_id, Box::new(hook));
+    }
+
+    pub fn unregister_invalidation_hook(&self, connection_id: Uuid) {
+        self.invalidation_hooks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&connection_id);
+    }
+
+    fn notify_invalidated(&self, connection_ids: impl IntoIterator<Item = Uuid>) {
+        let hooks = self
+            .invalidation_hooks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for connection_id in connection_ids {
+            if let Some(hook) = hooks.get(&connection_id) {
+                hook();
+            }
+        }
+    }
     pub fn mint(
         &self,
         peer: PeerIdentity,
@@ -101,6 +131,7 @@ impl PeerCredentialRegistry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         records.retain(|_, existing| existing.expires_at_unix_ms > now_unix_ms());
+        let mut evicted_connection_ids = Vec::new();
         if records.len() >= MAX_PEER_CREDENTIAL_RECORDS {
             records.retain(|_, existing| {
                 existing.expires_at_unix_ms
@@ -114,10 +145,14 @@ impl PeerCredentialRegistry {
                 else {
                     break;
                 };
-                records.remove(&oldest_key);
+                if let Some(record) = records.remove(&oldest_key) {
+                    evicted_connection_ids.push(record.connection_id);
+                }
             }
         }
         records.insert(token.0.clone(), record);
+        drop(records);
+        self.notify_invalidated(evicted_connection_ids);
         token
     }
 
@@ -177,6 +212,11 @@ pub fn peer_identity_matches_live_process(peer: PeerIdentity) -> bool {
     }
     if !cockpit_host::daemon_lifecycle::process_exists(peer.pid) {
         return false;
+    }
+    match cockpit_host::daemon_lifecycle::process_start_identity(peer.pid) {
+        Ok(start) if start != peer.process_start => return false,
+        Err(_) => return false,
+        Ok(_) => {}
     }
     #[cfg(unix)]
     {
@@ -283,7 +323,13 @@ mod tests {
             cockpit_host::daemon_lifecycle::read_process_credentials(pid).expect("uid/gid");
         #[cfg(windows)]
         let (uid, gid) = (0_u32, 0_u32);
-        let peer = PeerIdentity { pid, uid, gid };
+        let peer = PeerIdentity {
+            pid,
+            uid,
+            gid,
+            process_start: cockpit_host::daemon_lifecycle::process_start_identity(pid)
+                .expect("process start"),
+        };
         let connection_id = Uuid::new_v4();
         let token = registry.mint(peer, connection_id, LocalClientRole::Cli, Vec::new());
         assert!(
@@ -298,6 +344,7 @@ mod tests {
                         pid: peer.pid.saturating_add(1),
                         uid,
                         gid,
+                        process_start: peer.process_start,
                     },
                     connection_id,
                     token.as_str()

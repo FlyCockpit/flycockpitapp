@@ -6052,6 +6052,18 @@ where
     let (writer_tx, writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (executor_tx, executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (event_cmd_tx, event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (principal_tx, principal_rx) = watch::channel(principal.clone());
+    if let Some(peer) = socket_peer {
+        let invalidation_principal_tx = principal_tx.clone();
+        let invalidation_executor_tx = executor_tx.clone();
+        ctx.peer_credential_registry
+            .register_invalidation_hook(client_instance_id, move || {
+                let _ =
+                    invalidation_principal_tx.send(ClientPrincipal::local_unauthenticated(peer));
+                let _ = invalidation_executor_tx
+                    .try_send(ClientExecutorInput::PeerCredentialInvalidated);
+            });
+    }
 
     // Emit a "hello" envelope immediately so cheap probes
     // (`probe_blocking`, third-party reachability checks) can confirm
@@ -6100,13 +6112,12 @@ where
         Ok::<(), anyhow::Error>(())
     });
     let event_ctx = ctx.clone();
-    let event_principal = principal.clone();
     let event_executor_tx = executor_tx.clone();
     let event_writer_tx = writer_tx.clone();
     let event_task = tokio::spawn(async move {
         run_client_event_forwarder(
             event_ctx.clone(),
-            event_principal,
+            principal_rx,
             event_ctx.subscribe_global(),
             event_cmd_rx,
             event_executor_tx,
@@ -6123,6 +6134,7 @@ where
         has_owner_capability,
         socket_peer,
         executor_rx,
+        principal_tx.clone(),
         event_cmd_tx,
         writer_tx,
     ));
@@ -6171,6 +6183,8 @@ where
             "cancelled sealed capabilities at client transport teardown"
         );
     }
+    ctx.peer_credential_registry
+        .unregister_invalidation_hook(client_instance_id);
     ctx.peer_credential_registry
         .revoke_for_connection(client_instance_id);
     completed.result?;
@@ -6223,6 +6237,7 @@ fn flatten_client_task(
 enum ClientExecutorInput {
     Frame(RecvFrame),
     SessionEventsClosed,
+    PeerCredentialInvalidated,
 }
 
 enum ClientWriterMessage {
@@ -6241,7 +6256,6 @@ enum ClientEventCommand {
         rendered_interrupts: Arc<StdMutex<HashSet<Uuid>>>,
     },
     Detach,
-    PrincipalChanged(ClientPrincipal),
 }
 
 async fn send_writer_envelope(
@@ -6405,7 +6419,7 @@ async fn run_client_writer<W>(
 
 async fn run_client_event_forwarder(
     ctx: Arc<DaemonContext>,
-    mut principal: ClientPrincipal,
+    mut principal_rx: watch::Receiver<ClientPrincipal>,
     mut global_rx: EventReceiver,
     mut event_cmd_rx: mpsc::Receiver<ClientEventCommand>,
     executor_tx: mpsc::Sender<ClientExecutorInput>,
@@ -6424,6 +6438,11 @@ async fn run_client_event_forwarder(
 
         tokio::select! {
             biased;
+            changed = principal_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
             cmd = event_cmd_rx.recv() => {
                 match cmd {
                     Some(ClientEventCommand::Attach { session_id: id, rx, rendered_interrupts: rendered }) => {
@@ -6436,13 +6455,11 @@ async fn run_client_event_forwarder(
                         session_event_rx = None;
                         rendered_interrupts = None;
                     }
-                    Some(ClientEventCommand::PrincipalChanged(updated)) => {
-                        principal = updated;
-                    }
                     None => return,
                 }
             }
             global = global_rx.recv() => {
+                let principal = principal_rx.borrow().clone();
                 match global {
                     Ok(envelope) => {
                         let Some(event) = scrub_event_for_principal(&principal, envelope) else {
@@ -6491,6 +6508,7 @@ async fn run_client_event_forwarder(
                 }
             }
             event = session_branch => {
+                let principal = principal_rx.borrow().clone();
                 match event {
                     Some(Ok(envelope)) => {
                         let Some(event) = scrub_event_for_principal(&principal, envelope) else {
@@ -6543,6 +6561,7 @@ async fn run_client_executor(
     has_owner_capability: bool,
     socket_peer: Option<cockpit_host::peer_cred::PeerIdentity>,
     mut executor_rx: mpsc::Receiver<ClientExecutorInput>,
+    principal_tx: watch::Sender<ClientPrincipal>,
     event_cmd_tx: mpsc::Sender<ClientEventCommand>,
     writer_tx: mpsc::Sender<ClientWriterMessage>,
 ) -> Result<()> {
@@ -6570,7 +6589,7 @@ async fn run_client_executor(
                 }
             }, if credential_expiry.is_some() => {
                 ctx.peer_credential_registry.revoke_for_connection(client_instance_id);
-                downgrade_expired_peer_authority(&mut state, &mut shared, &event_cmd_tx);
+                downgrade_revoked_peer_authority(&mut state, &mut shared, &principal_tx);
                 credential_expiry = None;
             }
             Some(joined) = concurrent.join_next(), if !concurrent.is_empty() => {
@@ -6592,6 +6611,7 @@ async fn run_client_executor(
                             &mut state,
                             &mut shared,
                             &ctx,
+                            &principal_tx,
                             &event_cmd_tx,
                             &writer_tx,
                             &mut concurrent,
@@ -6607,6 +6627,10 @@ async fn run_client_executor(
                     ClientExecutorInput::SessionEventsClosed => {
                         state.attached = None;
                         shared = state.shared_snapshot();
+                    }
+                    ClientExecutorInput::PeerCredentialInvalidated => {
+                        downgrade_revoked_peer_authority(&mut state, &mut shared, &principal_tx);
+                        credential_expiry = None;
                     }
                 }
             }
@@ -6627,10 +6651,10 @@ fn peer_credential_expiry_sleep(expires_at_unix_ms: Option<i64>) -> Option<tokio
     })
 }
 
-fn downgrade_expired_peer_authority(
+fn downgrade_revoked_peer_authority(
     state: &mut MutableClientState,
     shared: &mut Arc<SharedClientState>,
-    event_cmd_tx: &mpsc::Sender<ClientEventCommand>,
+    principal_tx: &watch::Sender<ClientPrincipal>,
 ) {
     if state.active_peer_credential.is_none() {
         return;
@@ -6642,9 +6666,7 @@ fn downgrade_expired_peer_authority(
         state.principal = ClientPrincipal::local_unauthenticated(peer);
     }
     *shared = state.shared_snapshot();
-    let _ = event_cmd_tx.try_send(ClientEventCommand::PrincipalChanged(
-        state.principal.clone(),
-    ));
+    let _ = principal_tx.send(state.principal.clone());
 }
 
 async fn handle_client_frame(
@@ -6652,6 +6674,7 @@ async fn handle_client_frame(
     state: &mut MutableClientState,
     shared: &mut Arc<SharedClientState>,
     ctx: &Arc<DaemonContext>,
+    principal_tx: &watch::Sender<ClientPrincipal>,
     event_cmd_tx: &mpsc::Sender<ClientEventCommand>,
     writer_tx: &mpsc::Sender<ClientWriterMessage>,
     concurrent: &mut ConcurrentRequestRuntime,
@@ -6662,6 +6685,7 @@ async fn handle_client_frame(
             state,
             shared,
             ctx,
+            principal_tx,
             event_cmd_tx,
             writer_tx,
             concurrent,
@@ -6718,6 +6742,7 @@ async fn handle_envelope(
     state: &mut MutableClientState,
     shared: &mut Arc<SharedClientState>,
     ctx: &Arc<DaemonContext>,
+    principal_tx: &watch::Sender<ClientPrincipal>,
     event_cmd_tx: &mpsc::Sender<ClientEventCommand>,
     writer_tx: &mpsc::Sender<ClientWriterMessage>,
     concurrent: &mut ConcurrentRequestRuntime,
@@ -6744,22 +6769,14 @@ async fn handle_envelope(
                             .peer_credential_registry
                             .expires_at_unix_ms(connection_id, token.as_str());
                         *shared = state.shared_snapshot();
-                        let _ = event_cmd_tx
-                            .send(ClientEventCommand::PrincipalChanged(
-                                state.principal.clone(),
-                            ))
-                            .await;
+                        let _ = principal_tx.send(state.principal.clone());
                     } else {
                         state.has_owner_capability = false;
                         state.active_peer_credential = None;
                         state.peer_credential_expires_at_unix_ms = None;
                         state.principal = ClientPrincipal::local_unauthenticated(peer);
                         *shared = state.shared_snapshot();
-                        let _ = event_cmd_tx
-                            .send(ClientEventCommand::PrincipalChanged(
-                                state.principal.clone(),
-                            ))
-                            .await;
+                        let _ = principal_tx.send(state.principal.clone());
                     }
                 } else if ctx.owner_capability.verify(token.as_str()) {
                     state.has_owner_capability = true;
@@ -6857,11 +6874,7 @@ async fn handle_envelope(
             let principal_changed = matches!(&result, Ok(Response::LocalPeerCredential { .. }));
             if principal_changed {
                 *shared = state.shared_snapshot();
-                let _ = event_cmd_tx
-                    .send(ClientEventCommand::PrincipalChanged(
-                        state.principal.clone(),
-                    ))
-                    .await;
+                let _ = principal_tx.send(state.principal.clone());
             }
             let envelope = response_envelope_for_shared(id, result, shared, ctx);
             let envelope_kind = envelope_kind(&envelope);

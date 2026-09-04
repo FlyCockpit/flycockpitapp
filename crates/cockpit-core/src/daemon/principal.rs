@@ -8,6 +8,8 @@ use cockpit_proto::capability_ceiling::{RemoteAttachmentCapabilityV1, RemoteProj
 
 use crate::daemon::proto::{self, Request};
 
+use cockpit_host::daemon_lifecycle::ProcessStartIdentity;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalClientRole {
@@ -31,8 +33,17 @@ pub struct LocalPrincipal {
     pub peer_pid: u32,
     pub peer_uid: u32,
     pub peer_gid: u32,
+    #[serde(default = "default_peer_process_start")]
+    pub peer_process_start: ProcessStartIdentity,
     #[serde(default)]
     pub grants: Vec<PrincipalGrant>,
+}
+
+fn default_peer_process_start() -> ProcessStartIdentity {
+    ProcessStartIdentity {
+        primary: 0,
+        secondary: 0,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +209,7 @@ impl ClientPrincipal {
             peer_pid: peer.pid,
             peer_uid: peer.uid,
             peer_gid: peer.gid,
+            peer_process_start: peer.process_start,
             grants: Vec::new(),
         })
     }
@@ -212,6 +224,7 @@ impl ClientPrincipal {
             peer_pid: peer.pid,
             peer_uid: peer.uid,
             peer_gid: peer.gid,
+            peer_process_start: peer.process_start,
             grants,
         })
     }
@@ -229,6 +242,7 @@ impl ClientPrincipal {
                 pid: local.peer_pid,
                 uid: local.peer_uid,
                 gid: local.peer_gid,
+                process_start: local.peer_process_start,
             })
     }
 

@@ -5,12 +5,17 @@
 
 use anyhow::{Context, Result};
 
+use crate::daemon_lifecycle::ProcessStartIdentity;
+
 /// Stable peer identity captured at socket accept time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PeerIdentity {
     pub pid: u32,
     pub uid: u32,
     pub gid: u32,
+    /// Kernel process-start identity for this pid at accept time. Compared on
+    /// every credential verification so a recycled pid cannot inherit authority.
+    pub process_start: ProcessStartIdentity,
 }
 
 #[cfg(unix)]
@@ -20,7 +25,14 @@ pub fn peer_identity_from_unix_stream(
     use std::os::fd::AsRawFd;
 
     let (uid, gid, pid) = peer_ucred(stream.as_raw_fd())?;
-    Ok(PeerIdentity { pid, uid, gid })
+    let process_start = crate::daemon_lifecycle::process_start_identity(pid)
+        .context("reading unix socket peer process start identity")?;
+    Ok(PeerIdentity {
+        pid,
+        uid,
+        gid,
+        process_start,
+    })
 }
 
 #[cfg(unix)]
@@ -106,7 +118,8 @@ fn peer_pid_from_unix_socket(fd: std::os::fd::RawFd) -> Result<u32> {
         }
         // SAFETY: `getsockopt` succeeded and initialized the `xucred` struct.
         let cred = unsafe { cred.assume_init() };
-        return u32::try_from(cred.cr_pid).context("unix socket peer pid out of range");
+        return u32::try_from(unsafe { cred.cr_pid__c_anonymous_union.cr_pid })
+            .context("unix socket peer pid out of range");
     }
     #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
     {
@@ -129,9 +142,12 @@ pub fn peer_identity_from_named_pipe(
         return Err(std::io::Error::last_os_error())
             .context("reading named-pipe client process id");
     }
+    let process_start = crate::daemon_lifecycle::process_start_identity(client_pid)
+        .context("reading named-pipe client process start identity")?;
     Ok(PeerIdentity {
         pid: client_pid,
         uid: 0,
         gid: 0,
+        process_start,
     })
 }

@@ -96,6 +96,11 @@ name = "cockpit-daemon-spawn-harness"
 path = "src/bin/cockpit-daemon-spawn-harness.rs"
 test = false
 
+[[bin]]
+name = "cockpit-peer-auth-test-child"
+path = "src/bin/cockpit-peer-auth-test-child.rs"
+test = false
+
 [[test]]
 name = "remote_transport_selection_fixtures"
 required-features = ["remote"]

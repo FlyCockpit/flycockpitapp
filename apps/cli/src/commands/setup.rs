@@ -1878,10 +1878,7 @@ mod tests {
         write_model_wizard_provider(tmp.path());
         trust_workspace_via_daemon(tmp.path()).await;
         let descriptor = descriptor_for_cwd(crate::wizard::MODEL_WIZARD_ID, tmp.path()).unwrap();
-        let mut io = ScriptIo::new(&[
-            "p", "p:m", "frontier", "trusted", "images", "", "", "inherit", "y", "skip", "", "",
-            "", "", "", "", "", "",
-        ]);
+        let mut io = ScriptIo::new(&["p", "p:m", "trusted", "images", "", "", "", "y", "skip"]);
         let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
 
         let run = run_terminal_wizard(descriptor, &mut io, &true, &mut actions)

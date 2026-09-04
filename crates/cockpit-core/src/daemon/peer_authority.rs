@@ -15,10 +15,11 @@
 //! peer.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context as _;
 use rand::RngExt as _;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -77,6 +78,48 @@ fn launch_ticket_is_well_formed(ticket: &str) -> bool {
         && ticket
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Same derivation the daemon and socket client use for the launch-ticket
+/// file. Confined children are denied this path.
+pub(crate) fn launch_ticket_path_for_socket(control_socket: &Path) -> PathBuf {
+    let stem = control_socket
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("cockpit");
+    let file_name = format!("{stem}.launch-ticket");
+    match control_socket.parent() {
+        Some(parent) => parent.join(file_name),
+        None => PathBuf::from(file_name),
+    }
+}
+
+/// Persist the launch ticket for follower cockpit CLI processes on the same
+/// uid. The file is daemon-private and denied to confined children.
+pub(crate) fn persist_launch_ticket(socket: &Path, ticket: &str) -> anyhow::Result<()> {
+    if !launch_ticket_is_well_formed(ticket) {
+        anyhow::bail!("refusing to persist malformed launch ticket");
+    }
+    let path = launch_ticket_path_for_socket(socket);
+    if let Some(parent) = path.parent() {
+        cockpit_host::private_fs::ensure_private_dir(parent)
+            .with_context(|| format!("securing {}", parent.display()))?;
+    }
+    cockpit_host::private_fs::write_private_file(&path, ticket.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// Load the persisted launch ticket for follower cockpit CLI processes.
+pub(crate) fn load_persisted_launch_ticket(socket: &Path) -> Option<String> {
+    let path = launch_ticket_path_for_socket(socket);
+    let bytes = std::fs::read(&path).ok()?;
+    let ticket = String::from_utf8(bytes).ok()?;
+    let ticket = ticket.trim();
+    if launch_ticket_is_well_formed(ticket) {
+        Some(ticket.to_string())
+    } else {
+        None
+    }
 }
 
 /// Trusted launch provenance recorded once at daemon boot from the spawn
@@ -178,9 +221,11 @@ impl PeerCredentialRegistry {
     }
 
     /// True when `presented` is exactly the launch ticket minted for this
-    /// daemon and `peer` is exactly the launcher process that spawned it.
-    /// The token alone is not enough: a ticket read out of another process's
-    /// environment cannot be replayed from a different process identity.
+    /// daemon and `peer` is allowed to present it.
+    ///
+    /// The spawning cockpit process may exchange while it is still live. Later
+    /// cockpit CLI processes from the same uid read the daemon-private launch
+    /// ticket file and exchange as followers.
     pub fn verify_launch_provenance(&self, presented: Option<&str>, peer: PeerIdentity) -> bool {
         let Some(presented) = presented else {
             return false;
@@ -192,13 +237,17 @@ impl PeerCredentialRegistry {
         let Some(provenance) = provenance.as_ref() else {
             return false;
         };
-        if provenance.launcher.as_ref() != Some(&peer) {
-            return false;
-        }
-        super::owner_capability::constant_time_eq(
+        if !super::owner_capability::constant_time_eq(
             provenance.ticket.as_bytes(),
             presented.as_bytes(),
-        )
+        ) {
+            return false;
+        }
+        match provenance.launcher.as_ref() {
+            Some(launcher) if launcher == &peer => true,
+            Some(launcher) => peer.uid == launcher.uid,
+            None => false,
+        }
     }
 
     /// Test seam for the in-process daemon fixtures: install provenance
@@ -497,8 +546,8 @@ fn classify_cockpit_cmdline(cmdline: &[String]) -> Option<LocalClientRole> {
     if args.first() == Some(&"acp") {
         return Some(LocalClientRole::Acp);
     }
-    if args.first() == Some(&"daemon") {
-        return Some(LocalClientRole::Cli);
+    if args.is_empty() {
+        return Some(LocalClientRole::Tui);
     }
     if args
         .iter()
@@ -506,10 +555,13 @@ fn classify_cockpit_cmdline(cmdline: &[String]) -> Option<LocalClientRole> {
     {
         return Some(LocalClientRole::Tui);
     }
-    if args.is_empty() {
+    if matches!(
+        args.first(),
+        Some(&"code") | Some(&"assistant") | Some(&"computer")
+    ) {
         return Some(LocalClientRole::Tui);
     }
-    None
+    Some(LocalClientRole::Cli)
 }
 
 pub fn default_agent_child_grants() -> Vec<PrincipalGrant> {
@@ -540,7 +592,11 @@ mod tests {
         );
         assert_eq!(
             classify_cockpit_cmdline(&["cockpit".into(), "evil".into()]),
-            None
+            Some(LocalClientRole::Cli)
+        );
+        assert_eq!(
+            classify_cockpit_cmdline(&["cockpit".into(), "trust".into(), "set".into()]),
+            Some(LocalClientRole::Cli)
         );
     }
 

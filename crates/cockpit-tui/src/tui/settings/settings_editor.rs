@@ -3526,9 +3526,12 @@ mod tests {
         e.handle_key(press(KeyCode::Enter));
         assert_eq!(e.value_str(ProviderSettingId::WireApi), "responses");
         e.handle_key(press(KeyCode::Enter));
+        assert_eq!(e.value_str(ProviderSettingId::WireApi), "anthropic");
+        e.handle_key(press(KeyCode::Enter));
         assert_eq!(e.value_str(ProviderSettingId::WireApi), "auto");
 
         e.handle_key(press(KeyCode::Enter));
+        assert_eq!(e.value_str(ProviderSettingId::WireApi), "completions");
         let mut entry2 = entry.clone();
         e.write_into(&mut entry2);
         assert_eq!(entry2.wire_api, WireApi::Completions);
@@ -3556,6 +3559,8 @@ mod tests {
         assert!(e.is_overridden(ProviderSettingId::WireApi));
         e.handle_key(press(KeyCode::Enter));
         assert_eq!(e.value_str(ProviderSettingId::WireApi), "responses");
+        e.handle_key(press(KeyCode::Enter));
+        assert_eq!(e.value_str(ProviderSettingId::WireApi), "anthropic");
         e.handle_key(press(KeyCode::Enter));
         assert_eq!(e.value_str(ProviderSettingId::WireApi), "auto (inherit)");
         assert!(!e.is_overridden(ProviderSettingId::WireApi));

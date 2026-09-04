@@ -511,6 +511,10 @@ impl DaemonPaths {
         push_unique_deny_path(&mut paths, self.socket.clone());
         push_unique_deny_path(&mut paths, self.leak_reveal_socket());
         push_unique_deny_path(&mut paths, self.owner_capability_path());
+        push_unique_deny_path(
+            &mut paths,
+            peer_authority::launch_ticket_path_for_socket(&self.socket),
+        );
         if let Some(parent) = self.socket.parent() {
             push_unique_deny_path(&mut paths, parent.to_path_buf());
         }
@@ -1367,6 +1371,14 @@ fn spawn_detached_child(
         command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
     let child = command.spawn().context("spawning daemon child")?;
+    let socket_for_ticket = ephemeral.map(|paths| paths.socket.clone()).or_else(|| {
+        DaemonPaths::resolve_canonical()
+            .ok()
+            .map(|paths| paths.socket)
+    });
+    if let Some(socket) = socket_for_ticket {
+        let _ = peer_authority::persist_launch_ticket(&socket, &launch_ticket);
+    }
     // The child now exists, so this process is the daemon launcher: retain
     // the matching launch ticket in memory for the peer-credential exchange.
     cockpit_client::launch_provenance::set_process_launch_ticket(launch_ticket);

@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
 publish = false
-description = "Customer-operated tenant-authority reference service implementing the eleven closed canonical operations over submit-only mTLS with non-exportable PKCS#11-backed keys"
+description = "Reference-only tenant-authority contract: codecs, schemas, and closed-handler surface; mTLS listener, PKCS#11 signing, and evidence verification are not wired"
 
 [lints]
 workspace = true
@@ -17,10 +17,8 @@ remote = ["dep:cockpit-proto", "cockpit-proto/remote"]
 [lib]
 path = "src/lib.rs"
 
-# Production binary: opens the submit-only mTLS listener on Unix; exits before
-# opening a listener with typed `unsupported_platform` on non-Unix targets so
-# the codec/validator/state-machine surface stays compilable on the workspace
-# MSRV and Windows CI target.
+# Reference binary: `serve` fails closed (not implemented on Unix; unsupported
+# platform elsewhere). Offline subcommands compile the surface only.
 [[bin]]
 name = "tenant-authority"
 path = "src/bin/tenant-authority.rs"

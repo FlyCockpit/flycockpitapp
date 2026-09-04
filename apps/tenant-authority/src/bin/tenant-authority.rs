@@ -1,11 +1,12 @@
 //! `tenant-authority` binary.
 //!
-//! Production deployment is Linux: the peer-credential/admin-socket adapter is
-//! `cfg(unix)`. The binary supports the fixed-purpose offline subcommands
-//! `bootstrap`, `prepare-policy-revision`, `prepare-authority-rotation`, and
-//! `replica seed`, none of which open a listener. The default invocation
-//! opens the submit-only mTLS listener on Unix and exits with typed
-//! [`UnsupportedPlatform`] on non-Unix targets before binding.
+//! **Reference-only:** this crate documents the customer-operated tenant-authority
+//! contract but does not yet implement the production listener, PKCS#11 signing,
+//! or per-handler evidence verification. The fixed-purpose offline subcommands
+//! (`bootstrap`, `prepare-policy-revision`, `prepare-authority-rotation`, `replica
+//! seed`) compile the subcommand surface but are not wired. The default `serve`
+//! subcommand fails closed with a typed not-implemented error on Unix and with
+//! [`tenant_authority::UnsupportedPlatform`] on non-Unix targets.
 
 #![forbid(unsafe_code)]
 
@@ -14,22 +15,22 @@ fn main() -> std::process::ExitCode {
     let sub = args.get(1).map(String::as_str).unwrap_or("serve");
 
     match sub {
-        // Fixed-purpose offline initializer: opens no listener.
+        // Fixed-purpose offline initializer: opens no listener (not wired).
         "bootstrap" => {
             eprintln!("tenant-authority bootstrap: fixed-purpose offline initializer");
             std::process::ExitCode::from(run_offline())
         }
-        // Fixed-purpose candidate preparation: no network route.
+        // Fixed-purpose candidate preparation: no network route (not wired).
         "prepare-policy-revision" | "prepare-authority-rotation" => {
             eprintln!("tenant-authority {sub}: fixed-purpose candidate preparation");
             std::process::ExitCode::from(run_offline())
         }
-        // Replica seed: local OS-owner/PKCS#11-authenticated, no listener.
+        // Replica seed: local OS-owner/PKCS#11-authenticated, no listener (not wired).
         "replica" => {
             eprintln!("tenant-authority replica: local replica administration");
             std::process::ExitCode::from(run_offline())
         }
-        // Default (including "serve"): open the submit-only mTLS listener.
+        // Default (including "serve"): submit-only mTLS listener (not implemented).
         _ => run_service(),
     }
 }
@@ -43,21 +44,11 @@ fn run_offline() -> u8 {
 
 fn run_service() -> std::process::ExitCode {
     let service = tenant_authority::Service::new();
-    #[cfg(unix)]
-    {
-        if let Err(err) = service.listen("0.0.0.0:8443") {
+    match service.listen("0.0.0.0:8443") {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => {
             eprintln!("tenant-authority: {err}");
-            return std::process::ExitCode::FAILURE;
+            std::process::ExitCode::FAILURE
         }
-        // Production startup performs conformance, config validation, and
-        // watermark anchoring before serving.
-        std::process::ExitCode::SUCCESS
-    }
-    #[cfg(not(unix))]
-    {
-        let err: tenant_authority::UnsupportedPlatform =
-            service.listen("0.0.0.0:8443").unwrap_err();
-        eprintln!("tenant-authority: {err}");
-        std::process::ExitCode::FAILURE
     }
 }

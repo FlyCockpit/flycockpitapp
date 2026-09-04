@@ -1,13 +1,13 @@
-//! Non-exportable fixed-statement tenant key provider.
+//! Non-exportable fixed-statement tenant key provider (**reference contract**).
 //!
-//! Production v1 uses a concrete Rust [`Pkcs11TenantKeyProvider`] that loads
-//! one explicitly configured PKCS#11 module, selects token/key by exact
+//! Production v1 is specified to use a concrete Rust [`Pkcs11TenantKeyProvider`]
+//! that loads one explicitly configured PKCS#11 module, selects token/key by exact
 //! labels and CKA_ID, reads the PIN only from an absolute owner-readable
 //! nonsymlink file or injected secret-file descriptor, generates P-256 keys
 //! on-token with `CKA_SENSITIVE=true` and `CKA_EXTRACTABLE=false`, and permits
-//! only ECDSA signing in the fixed service-constructed domains. Its interface
-//! has no export, private import, decrypt, derive, caller-digest-sign,
-//! arbitrary mechanism, or generic object operation.
+//! only ECDSA signing in the fixed service-constructed domains. **This crate does
+//! not load a PKCS#11 module or perform signing**; [`Pkcs11TenantKeyProvider`]
+//! is a configuration and conformance stub only.
 //!
 //! Future cloud KMS/HSM support is limited to separately reviewed narrow
 //! adapters implementing the same non-exporting fixed-statement provider;
@@ -84,18 +84,11 @@ pub trait TenantKeyProvider: Send + Sync {
     fn supported_domains(&self) -> &'static [SigningDomain];
 }
 
-/// Production v1 concrete PKCS#11 tenant key provider.
+/// Reference PKCS#11 tenant key provider stub.
 ///
-/// Loads one explicitly configured PKCS#11 module, selects token/key by exact
-/// labels and CKA_ID, reads the PIN only from an absolute owner-readable
-/// nonsymlink file or injected secret-file descriptor, generates P-256 keys
-/// on-token with `CKA_SENSITIVE=true` and `CKA_EXTRACTABLE=false`, and permits
-/// only ECDSA signing in the fixed service-constructed domains.
-///
-/// The actual PKCS#11 FFI is bound behind a separately reviewed audited crate
-/// compatible with Rust 1.95; this type carries the configuration address and
-/// conformance contract. Tests exercise the same interface with fixture
-/// credentials via a pinned SoftHSM profile and never probe a developer token.
+/// Carries the intended configuration address and conformance contract. **Does
+/// not load a PKCS#11 module or sign.** [`TenantKeyProvider::sign_fixed`]
+/// always returns [`KeyProviderError::UnsupportedOperation`].
 #[derive(Debug)]
 pub struct Pkcs11TenantKeyProvider {
     module_path: std::path::PathBuf,

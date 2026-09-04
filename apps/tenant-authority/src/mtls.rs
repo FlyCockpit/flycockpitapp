@@ -1,14 +1,10 @@
-//! Submit-only mTLS selection.
+//! Submit-only mTLS selection (**reference contract**).
 //!
-//! mTLS selection occurs before request parsing from SNI host plus the
+//! Production mTLS selection occurs before request parsing from SNI host plus the
 //! validated certificate, yields exactly one `(tenantId,authorityId)`, and
-//! then requires the envelope aliases to match. The client certificate chain
-//! must validate to the configured tenant submit CA and the leaf must have
-//! EKU clientAuth, validity/current revocation, and exactly one URI SAN
-//! `spiffe://flycockpit/tenant-authority-submit/<deploymentId>/<tenantAlias>/
-//! <authorityAlias>`. Unknown/wrong/revoked certificates and tenants share
-//! one non-enumerating 401 envelope; a valid submit certificate remains
-//! insufficient to authorize any statement.
+//! then requires the envelope aliases to match. **This crate does not terminate
+//! TLS or perform certificate selection**; only the SPIFFE SAN shape validator
+//! [`validate_spiffe_san`] is implemented.
 
 use crate::config::TenantState;
 

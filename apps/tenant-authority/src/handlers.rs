@@ -1,11 +1,13 @@
-//! Closed handler surface: exactly eleven handlers, one per operation.
+//! Closed handler surface: exactly eleven handlers, one per operation
+//! (**reference contract**).
 //!
-//! Each handler independently verifies complete canonical evidence, public
-//! credential-registry generation, OWNER/SECURITY_ADMIN WebAuthn signatures,
+//! Each handler is specified to independently verify complete canonical evidence,
+//! public credential-registry generation, OWNER/SECURITY_ADMIN WebAuthn signatures,
 //! possession, governance/policy/quota/revocation state and exact epochs.
-//! Submit-only mTLS is transport authentication, not authorization to sign;
-//! a valid submit certificate remains insufficient to authorize any
-//! statement.
+//! **Evidence verification beyond header parsing is not implemented**; dispatch
+//! fails closed with [`HandlerError::NotReady`]. Submit-only mTLS is transport
+//! authentication, not authorization to sign; a valid submit certificate remains
+//! insufficient to authorize any statement.
 
 use cockpit_proto::remote_tenant_authority_protocol::{
     self as proto, FctaEnvelope, FctoEnvelope, FctoReasonCode, TenantAuthorityOperation,

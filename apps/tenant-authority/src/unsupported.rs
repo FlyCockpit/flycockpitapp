@@ -1,10 +1,10 @@
 //! Platform-support boundary.
 //!
 //! Non-Unix workspace builds retain every codec, validator, pure state-machine
-//! test and bootstrap parser, but the service binary exits before opening a
-//! listener with typed [`crate::UnsupportedPlatform`]. This module is the
-//! home for any non-Unix-only shims needed to keep the workspace MSRV and
-//! Windows CI target compiling.
+//! test and bootstrap parser, but `serve` fails with
+//! [`crate::ServiceListenError::UnsupportedPlatform`] before opening a listener.
+//! This module is the home for any non-Unix-only shims needed to keep the
+//! workspace MSRV and Windows CI target compiling.
 
 pub use crate::UnsupportedPlatform;
 

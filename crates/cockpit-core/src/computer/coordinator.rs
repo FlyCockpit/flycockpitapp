@@ -6165,7 +6165,7 @@ impl ComputerActionCoordinator {
     ) -> Result<(), ReceiverReproofFailure> {
         let operation_id = reproof_operation_id(call_id);
         let Some(journaled) = self.journaled_receiver_proof else {
-            let failure = ReceiverReproofFailure::EvidenceUnavailable;
+            let failure = ReceiverReproofFailure::JournaledProofUnset;
             let _ = self
                 .finish_receiver_reproof_attempt(call_id, operation_id, Err(failure), None)
                 .await;
@@ -6322,7 +6322,9 @@ impl ComputerActionCoordinator {
             focus_digest: domain_digest(domains::FOCUS_GENERATION, &focus_generation.to_be_bytes()),
             record_digest: domain_digest(domains::AUDIT_RECORD, line_clear_hex.as_bytes()),
             verification_state: match failure {
-                ReceiverReproofFailure::EvidenceUnavailable => VerificationState::Unavailable,
+                ReceiverReproofFailure::EvidenceUnavailable
+                | ReceiverReproofFailure::JournaledProofUnset
+                | ReceiverReproofFailure::AuditJournalUnavailable => VerificationState::Unavailable,
                 _ => VerificationState::Mismatch,
             },
             error_code: failure.audit_error_code(),
@@ -6830,6 +6832,13 @@ impl ComputerActionCoordinator {
             window,
             focus_generation: live_focus,
         });
+        if self.journaled_receiver_proof.is_some() {
+            // Human-approved Ask adoption re-journals the receiver proof baseline
+            // (issue #374 req 1). Identity-changing keyboard since the prior
+            // proof is superseded by this adoption, so re-proof can run again
+            // after the next observation gate advances the baseline.
+            self.keyboard_identity_dirty_since_proof = false;
+        }
     }
 
     /// True when `evidence` is still the currently authorized live identity.
@@ -11136,6 +11145,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn computer_receiver_reproof_identity_changing_chord_recovers_after_observation() {
+        let (_audit, audit_chain) = reproof_audit_chain().await;
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let params = ask_coordinator_params(
+            authorizer.clone(),
+            Box::new(FakeTargetEvidenceAdapter::new(ask_virtual_evidence())),
+            Some(audit_chain),
+        );
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+
+        coordinator
+            .execute_openai_call(
+                "call-recover-type",
+                &vec![OpenAiComputerAction::TypeText("# note".to_string())],
+            )
+            .await;
+        coordinator
+            .execute_openai_call(
+                "call-recover-capture",
+                &vec![OpenAiComputerAction::Screenshot],
+            )
+            .await;
+        coordinator
+            .execute_openai_call(
+                "call-recover-enter",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["enter".to_string()],
+                })],
+            )
+            .await;
+        coordinator
+            .execute_openai_call(
+                "call-recover-tab",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["TAB".to_string()],
+                })],
+            )
+            .await;
+        coordinator
+            .execute_openai_call(
+                "call-recover-capture-again",
+                &vec![OpenAiComputerAction::Screenshot],
+            )
+            .await;
+        coordinator
+            .execute_openai_call(
+                "call-recover-type-again",
+                &vec![OpenAiComputerAction::TypeText("more".to_string())],
+            )
+            .await;
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-recover-enter-again",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["enter".to_string()],
+                })],
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Completed { .. }),
+            "tab chord must not permanently brick Enter; observation Ask adoption \
+             must advance the keyboard-identity baseline: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn computer_receiver_reproof_forces_ask_on_yolo_enter() {
         let (_audit, audit_chain) = reproof_audit_chain().await;
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
@@ -11220,9 +11297,9 @@ mod tests {
             matches!(
                 &failure.error,
                 ComputerError::Refused(reason)
-                if reason.contains("evidence")
+                if reason.contains("audit chain")
             ),
-            "the refusal must name missing evidence receipt: {:?}",
+            "the refusal must name missing audit journal wiring: {:?}",
             failure.error
         );
     }

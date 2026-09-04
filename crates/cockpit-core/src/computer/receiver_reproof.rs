@@ -43,6 +43,8 @@ pub(crate) enum ReceiverReproofOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReceiverReproofFailure {
     EvidenceUnavailable,
+    JournaledProofUnset,
+    AuditJournalUnavailable,
     WindowMismatch,
     GenerationMismatch,
     FocusElsewhere,
@@ -54,6 +56,8 @@ impl ReceiverReproofFailure {
     pub fn refusal_message(self) -> &'static str {
         match self {
             Self::EvidenceUnavailable => RECEIVER_REPROOF_EVIDENCE_UNAVAILABLE_REFUSAL,
+            Self::JournaledProofUnset => RECEIVER_REPROOF_JOURNALED_PROOF_UNSET_REFUSAL,
+            Self::AuditJournalUnavailable => RECEIVER_REPROOF_AUDIT_JOURNAL_UNAVAILABLE_REFUSAL,
             Self::WindowMismatch => RECEIVER_REPROOF_WINDOW_MISMATCH_REFUSAL,
             Self::GenerationMismatch => RECEIVER_REPROOF_GENERATION_MISMATCH_REFUSAL,
             Self::FocusElsewhere => RECEIVER_REPROOF_FOCUS_ELSEWHERE_REFUSAL,
@@ -64,7 +68,10 @@ impl ReceiverReproofFailure {
 
     pub(crate) fn audit_error_code(self) -> AuditErrorCode {
         match self {
-            Self::EvidenceUnavailable => AuditErrorCode::VerificationUnavailable,
+            Self::EvidenceUnavailable | Self::JournaledProofUnset => {
+                AuditErrorCode::VerificationUnavailable
+            }
+            Self::AuditJournalUnavailable => AuditErrorCode::StorageFailure,
             Self::WindowMismatch | Self::GenerationMismatch | Self::FocusElsewhere => {
                 AuditErrorCode::VerificationMismatch
             }
@@ -75,6 +82,12 @@ impl ReceiverReproofFailure {
 
 pub(crate) const RECEIVER_REPROOF_EVIDENCE_UNAVAILABLE_REFUSAL: &str = "computer use cannot press Enter: receiver re-proof could not capture live window evidence; \
      the receiving object stays unproven";
+
+pub(crate) const RECEIVER_REPROOF_JOURNALED_PROOF_UNSET_REFUSAL: &str = "computer use cannot press Enter: receiver re-proof has no journaled window identity from \
+     coordinator open or prior proof; the receiving object stays unproven";
+
+pub(crate) const RECEIVER_REPROOF_AUDIT_JOURNAL_UNAVAILABLE_REFUSAL: &str = "computer use cannot press Enter: receiver re-proof could not journal the evidence \
+     receipt on the computer audit chain; the receiving object stays unproven";
 
 pub(crate) const RECEIVER_REPROOF_WINDOW_MISMATCH_REFUSAL: &str = "computer use cannot press Enter: receiver re-proof found a different authenticated window \
      than the one journaled at proof time; the receiving object stays unproven";
@@ -159,18 +172,18 @@ pub(crate) async fn journal_receiver_reproof_attempt(
 ) -> Result<(), ReceiverReproofFailure> {
     let Some(chain) = chain else {
         tracing::warn!("receiver re-proof audit chain is not installed; evidence receipt refused");
-        return Err(ReceiverReproofFailure::EvidenceUnavailable);
+        return Err(ReceiverReproofFailure::AuditJournalUnavailable);
     };
     if !chain.is_available() {
         tracing::warn!("receiver re-proof audit chain is unavailable; evidence receipt refused");
-        return Err(ReceiverReproofFailure::EvidenceUnavailable);
+        return Err(ReceiverReproofFailure::AuditJournalUnavailable);
     }
     chain
         .append_receiver_reproof(append)
         .await
         .map_err(|error| {
             tracing::warn!(?error, "receiver re-proof audit append failed");
-            ReceiverReproofFailure::EvidenceUnavailable
+            ReceiverReproofFailure::AuditJournalUnavailable
         })
 }
 

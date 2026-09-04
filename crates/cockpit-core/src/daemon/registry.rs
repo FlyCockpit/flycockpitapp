@@ -3906,6 +3906,15 @@ mod tests {
             )
             .await
             .expect("durable session for resume");
+        // The raw fixture row owns no redaction-table vault custody; the
+        // fail-closed resume path requires it (issue #293).
+        let table = crate::redact::RedactionTable::empty();
+        crate::session::lifecycle::write_redaction_table_json_to_vault(
+            &reg.inner.db,
+            persisted.session_id,
+            &table.to_persisted_json().unwrap(),
+        )
+        .unwrap();
         env.set_cockpit_config(&config_a);
         let resumed = reg
             .attach(
@@ -3973,6 +3982,15 @@ mod tests {
             .create_session(&project_id, project.to_str().unwrap(), "Build")
             .await
             .unwrap();
+        // The raw fixture row owns no redaction-table vault custody; the
+        // fail-closed resume path requires it (issue #293).
+        let table = crate::redact::RedactionTable::empty();
+        crate::session::lifecycle::write_redaction_table_json_to_vault(
+            &reg.inner.db,
+            persisted.session_id,
+            &table.to_persisted_json().unwrap(),
+        )
+        .unwrap();
         let error = reg
             .attach(
                 None,

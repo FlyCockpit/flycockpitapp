@@ -1516,9 +1516,23 @@ mod tests {
 
         // A lost acknowledgement is retried with the same reference and body.
         // It reports the same durable staging frontier and does not duplicate
-        // bytes, which makes 64KiB..8MiB remote submission replay safe.
+        // bytes, which makes 64KiB..8MiB remote submission replay safe. The
+        // advertised lease is recomputed from `now` on every response, so it
+        // is bounded rather than compared for equality.
         let replay = write_owned(&reference, &owner, 0, &first).unwrap();
-        assert_eq!(replay, accepted);
+        assert_eq!(
+            (
+                replay.next_chunk_index,
+                replay.received_bytes,
+                replay.complete
+            ),
+            (
+                accepted.next_chunk_index,
+                accepted.received_bytes,
+                accepted.complete
+            )
+        );
+        assert!(replay.lease_remaining_ms <= accepted.lease_remaining_ms);
         assert!(matches!(
             write_owned(&reference, &owner, 0, &first[..1]),
             Err(BulkStagingError::ChunkReplayMismatch)
@@ -1531,7 +1545,19 @@ mod tests {
         let complete = write_owned(&reference, &owner, 1, &second).unwrap();
         assert!(complete.complete);
         let completed_replay = write_owned(&reference, &owner, 1, &second).unwrap();
-        assert_eq!(completed_replay, complete);
+        assert_eq!(
+            (
+                completed_replay.next_chunk_index,
+                completed_replay.received_bytes,
+                completed_replay.complete
+            ),
+            (
+                complete.next_chunk_index,
+                complete.received_bytes,
+                complete.complete
+            )
+        );
+        assert!(completed_replay.lease_remaining_ms <= complete.lease_remaining_ms);
         assert_eq!(take_owned(&reference, &owner).unwrap(), payload);
     }
 

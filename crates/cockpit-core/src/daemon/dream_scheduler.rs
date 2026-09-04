@@ -851,7 +851,11 @@ mod tests {
         .expect("detached empty-fire task should persist its cursor");
     }
 
+    // `@hourly`/`@daily` custom cron schedules require the opt-in extended
+    // local capability profile; without it `is_due` fails closed and the
+    // knowledge base is skipped (the same gating as the `is_due` unit tests).
     #[tokio::test]
+    #[cfg(feature = "extended")]
     async fn independently_scheduled_knowledge_bases_fire_only_when_their_own_cursor_is_due() {
         let db = Db::open_in_memory().unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -917,7 +921,10 @@ mod tests {
         .expect("the due hourly KB should fire while its not-due daily sibling does not");
     }
 
+    // `@hourly` custom cron schedules require the opt-in extended local
+    // capability profile (same gating as the `is_due` unit tests).
     #[tokio::test]
+    #[cfg(feature = "extended")]
     async fn durable_schedule_cursor_catches_up_after_daemon_restart() {
         let state_dir = tempfile::tempdir().unwrap();
         let database_path = state_dir.path().join("cockpit.sqlite3");

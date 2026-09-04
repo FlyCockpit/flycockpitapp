@@ -242,6 +242,37 @@ mod tests {
                 .await
                 .expect("confirm bulk-upload client lifetime");
 
+            // The native client presents its launch ticket for an owner-class
+            // peer credential right after lifetime confirmation (issue #337).
+            // Model the real daemon and mint the credential before the
+            // transfer begins.
+            let credential_id = match daemon
+                .recv()
+                .await
+                .expect("read peer credential exchange")
+                .expect("bulk-upload client stays connected")
+            {
+                RecvFrame::Envelope(envelope) => match envelope.body {
+                    Body::Request {
+                        id,
+                        request: Request::ExchangeLocalPeerCredential,
+                        ..
+                    } => id,
+                    other => panic!("expected peer credential exchange, got {other:?}"),
+                },
+                other => panic!("expected peer credential exchange envelope, got {other:?}"),
+            };
+            daemon
+                .send(&Envelope::response(
+                    credential_id,
+                    Response::LocalPeerCredential {
+                        token: crate::daemon::proto::OwnerCapabilityToken::new("fixture-owner"),
+                        role: crate::daemon::proto::LocalClientRole::Cli,
+                    },
+                ))
+                .await
+                .expect("mint bulk-upload peer credential");
+
             let mut uploaded = Vec::new();
             let mut reference = None;
             for expected_index in 0..expected_chunk_count {

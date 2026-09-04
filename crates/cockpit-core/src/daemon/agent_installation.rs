@@ -7313,7 +7313,11 @@ pub(crate) mod session_setup_test_support {
             db.prepare_agent_session(PrepareAgentSessionInput {
                 session_id,
                 session_create: AgentSessionCreateInput {
-                    project_id: "session-setup-fixture-project".into(),
+                    // Short human label (<= 24 chars, alnum/-/_): the strict
+                    // durable-resume identity check admits only these legacy
+                    // raw-fixture labels; production rows use workspace
+                    // digests.
+                    project_id: "session-setup-fixture".into(),
                     project_root: workspace.to_string_lossy().into_owned(),
                     active_agent: "reviewer".into(),
                     started_at_unix_ms: 4,

@@ -609,9 +609,9 @@ pub struct DaemonClient {
     /// `Clone` — clones of `DaemonClient` share access to the
     /// receiver they were spawned with.
     events: Arc<tokio::sync::Mutex<mpsc::Receiver<proto::Event>>>,
-    /// Daemon-private owner capability loaded from the 0600 file next to
-    /// the control socket. In-process clients do not need it: possession of
-    /// the endpoint is the capability. Issue #296 / follow-up #337.
+    /// Peer-bound credential minted during socket connect (issue #337). Sent on
+    /// secret-bearing RPCs. In-process clients do not need it: possession of
+    /// the endpoint is the capability.
     owner_capability: Option<proto::OwnerCapabilityToken>,
 }
 
@@ -654,9 +654,8 @@ impl DaemonClient {
             proto.set_negotiated_version(negotiated.version);
             let mut initial_events =
                 confirm_client_lifetime(&mut proto, negotiated.version).await?;
-            let file_capability = load_owner_capability(socket);
             let (exchange_events, owner_capability) =
-                exchange_peer_credential(&mut proto, negotiated.version, file_capability).await?;
+                exchange_peer_credential(&mut proto, negotiated.version).await?;
             initial_events.extend(exchange_events);
             Ok(Self::from_proto_negotiated(
                 proto,
@@ -691,9 +690,8 @@ impl DaemonClient {
         }
     }
 
-    /// True when this client can present the daemon-private owner capability
-    /// (in-process endpoint, or a loaded socket token). ACP stdio ingress
-    /// requires this (issue #296).
+    /// True when this client holds a peer-bound owner credential (wire) or
+    /// in-process endpoint possession. ACP stdio ingress requires this.
     pub fn has_owner_capability(&self) -> bool {
         match &self.backend {
             ClientBackend::InProcess(_) => true,
@@ -978,7 +976,6 @@ where
 async fn exchange_peer_credential<S>(
     proto_stream: &mut ProtoStream<S>,
     version: u32,
-    file_capability: Option<proto::OwnerCapabilityToken>,
 ) -> Result<(Vec<proto::Event>, Option<proto::OwnerCapabilityToken>)>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
@@ -989,7 +986,7 @@ where
             version,
             id,
             Request::ExchangeLocalPeerCredential,
-            file_capability,
+            None,
         ))
         .await
         .context("sending peer credential exchange")?;

@@ -1,8 +1,8 @@
 //! Daemon-private owner capability for in-process clients.
 //!
 //! Pre-launch mitigation for issue #296: confined children are denied the
-//! control-plane paths. Issue #337 replaces the socket-side file token with
-//! peer-bound credentials minted for `SO_PEERCRED` / named-pipe client PIDs.
+//! control-plane paths via sandbox deny lists. Socket admission (issue #337)
+//! uses peer-bound credentials from `SO_PEERCRED` attestation, not this file.
 
 use std::path::Path;
 
@@ -40,10 +40,9 @@ impl OwnerCapability {
         &self.token
     }
 
-    /// Write the token to the 0600 file next to the control socket. Called
-    /// after the parent directory is private and before the socket is
-    /// published, so a client that can discover the socket can also load the
-    /// capability — and a confined child that cannot reach the parent cannot.
+    /// Write the token to the 0600 file next to the control socket for
+    /// sandbox deny-path tests and fixtures. Socket peers must not use this
+    /// file for owner admission (issue #337).
     pub fn publish(&self, socket: &Path) -> Result<()> {
         let path = DaemonPaths::owner_capability_path_for_socket(socket);
         if let Some(parent) = path.parent() {

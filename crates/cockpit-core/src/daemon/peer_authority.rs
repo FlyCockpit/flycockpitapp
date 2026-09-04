@@ -171,6 +171,9 @@ impl PeerCredentialRegistry {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             invalidated.extend(self.prune_expired_records(&mut records));
+            // Re-exchange on the same connection must replace its prior token
+            // without evicting unrelated live credentials.
+            records.retain(|_, existing| existing.connection_id != connection_id);
             if records.len() >= MAX_PEER_CREDENTIAL_RECORDS {
                 let near_expiry_cutoff = now_unix_ms() + PEER_CREDENTIAL_TTL.as_millis() as i64 / 2;
                 records.retain(|_, existing| {
@@ -268,8 +271,7 @@ impl PeerCredentialRegistry {
 }
 
 /// True when a socket peer's cached owner capability still matches a live
-/// registry record. In-process clients and file-capability-only paths keep
-/// the cached flag.
+/// peer-bound registry record. In-process clients keep the cached flag.
 pub fn socket_peer_owner_capability_live(
     registry: &PeerCredentialRegistry,
     socket_peer: Option<PeerIdentity>,
@@ -280,11 +282,11 @@ pub fn socket_peer_owner_capability_live(
     if !cached_has_owner_capability {
         return false;
     }
-    match (socket_peer, active_peer_credential) {
-        (Some(peer), Some(token)) => registry
-            .verify_without_prune(peer, connection_id, token)
+    match socket_peer {
+        None => true,
+        Some(peer) => active_peer_credential
+            .and_then(|token| registry.verify_without_prune(peer, connection_id, token))
             .is_some_and(|(role, _)| role.is_owner_class()),
-        _ => true,
     }
 }
 
@@ -407,6 +409,83 @@ mod tests {
             classify_cockpit_cmdline(&["cockpit".into(), "evil".into()]),
             None
         );
+    }
+
+    #[test]
+    fn repeated_mint_on_one_connection_does_not_evict_unrelated_credentials() {
+        let registry = PeerCredentialRegistry::default();
+        let pid = std::process::id();
+        #[cfg(unix)]
+        let (uid, gid) =
+            cockpit_host::daemon_lifecycle::read_process_credentials(pid).expect("uid/gid");
+        #[cfg(windows)]
+        let (uid, gid) = (0_u32, 0_u32);
+        let peer = PeerIdentity {
+            pid,
+            uid,
+            gid,
+            process_start: cockpit_host::daemon_lifecycle::process_start_identity(pid)
+                .expect("process start"),
+        };
+        let mut unrelated = Vec::new();
+        for _ in 0..MAX_PEER_CREDENTIAL_RECORDS {
+            let connection_id = Uuid::new_v4();
+            unrelated.push((
+                connection_id,
+                registry.mint(peer, connection_id, LocalClientRole::Cli, Vec::new()),
+            ));
+        }
+        let attacker_connection = unrelated[0].0;
+        for _ in 0..32 {
+            registry.mint(
+                peer,
+                attacker_connection,
+                LocalClientRole::AgentChild,
+                Vec::new(),
+            );
+        }
+        for (connection_id, token) in unrelated.iter().skip(1) {
+            assert!(
+                registry
+                    .verify(peer, *connection_id, token.as_str())
+                    .is_some(),
+                "unrelated credential must survive repeated exchange on another connection"
+            );
+        }
+    }
+
+    #[test]
+    fn socket_peer_owner_capability_live_requires_peer_bound_token() {
+        let registry = PeerCredentialRegistry::default();
+        let pid = std::process::id();
+        #[cfg(unix)]
+        let (uid, gid) =
+            cockpit_host::daemon_lifecycle::read_process_credentials(pid).expect("uid/gid");
+        #[cfg(windows)]
+        let (uid, gid) = (0_u32, 0_u32);
+        let peer = PeerIdentity {
+            pid,
+            uid,
+            gid,
+            process_start: cockpit_host::daemon_lifecycle::process_start_identity(pid)
+                .expect("process start"),
+        };
+        let connection_id = Uuid::new_v4();
+        assert!(!socket_peer_owner_capability_live(
+            &registry,
+            Some(peer),
+            connection_id,
+            None,
+            true,
+        ));
+        let token = registry.mint(peer, connection_id, LocalClientRole::Cli, Vec::new());
+        assert!(socket_peer_owner_capability_live(
+            &registry,
+            Some(peer),
+            connection_id,
+            Some(token.as_str()),
+            true,
+        ));
     }
 
     #[test]

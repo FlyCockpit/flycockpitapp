@@ -8815,6 +8815,60 @@ async fn socket_peer_without_owner_capability_cannot_call_secret_rpc() {
     let _ = server.await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn socket_peer_legacy_owner_capability_file_token_is_not_admitted() {
+    let ctx = test_ctx();
+    let (server_stream, client_stream) = test_stream_pair();
+    let mut client = ProtoStream::new(client_stream);
+    let peer = test_socket_peer();
+    let client_instance_id = Uuid::new_v4();
+    let server = tokio::spawn(handle_client_transport_as(
+        server_stream,
+        ctx.clone(),
+        ClientPrincipal::local_unauthenticated(peer),
+        client_instance_id,
+        false,
+        Some(peer),
+    ));
+    match recv_body(&mut client).await {
+        Body::Response { id, response } => {
+            assert_eq!(id, Uuid::nil());
+            assert!(matches!(*response, Response::DaemonStatus { .. }));
+        }
+        other => panic!("expected daemon hello, got {other:?}"),
+    }
+
+    let denied_id = Uuid::now_v7();
+    client
+        .send(&Envelope::request_with_owner_capability(
+            denied_id,
+            Request::PutNamedSecret {
+                name: "k".into(),
+                value: "v".into(),
+            },
+            Some(proto::OwnerCapabilityToken::new(
+                ctx.owner_capability.token().to_string(),
+            )),
+        ))
+        .await
+        .expect("send secret RPC with legacy file token");
+    match recv_body(&mut client).await {
+        Body::Error { id, error } => {
+            assert_eq!(id, Some(denied_id));
+            assert_eq!(error.code, ErrorCode::Authorization);
+            assert!(
+                error.message.contains("daemon-private owner capability"),
+                "{}",
+                error.message
+            );
+        }
+        other => panic!("expected authorization error, got {other:?}"),
+    }
+
+    drop(client);
+    let _ = server.await;
+}
+
 #[tokio::test]
 async fn unauthenticated_local_socket_peer_is_denied_owner_rpcs() {
     let ctx = test_ctx();
@@ -8912,9 +8966,6 @@ async fn run_legitimate_peer_auth_admission_test(role: &str, child_args: &[&str]
     let ctx = peer_auth_admission_test_ctx(child_executable.clone());
     let socket_dir = tempfile::tempdir().expect("socket tempdir");
     let socket_path = socket_dir.path().join("peer-auth.sock");
-    ctx.owner_capability
-        .publish(&socket_path)
-        .expect("publish owner capability for peer auth admission");
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind peer auth socket");
 
     let server_ctx = ctx.clone();

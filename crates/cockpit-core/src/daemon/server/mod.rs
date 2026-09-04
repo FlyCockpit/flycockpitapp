@@ -6804,9 +6804,6 @@ async fn handle_envelope(
                             .expires_at_unix_ms(connection_id, token.as_str());
                         *shared = state.shared_snapshot();
                         let _ = principal_tx.send(state.principal.clone());
-                    } else if ctx.owner_capability.verify(token.as_str()) {
-                        state.has_owner_capability = true;
-                        *shared = state.shared_snapshot();
                     } else {
                         state.has_owner_capability = false;
                         state.active_peer_credential = None;

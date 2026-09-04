@@ -3139,6 +3139,7 @@ impl std::fmt::Debug for TestPageMut<'_> {
             Self::JobDetail(_) => f.write_str("JobDetail"),
             #[cfg(feature = "extended")]
             Self::LateResultAction(_) => f.write_str("LateResultAction"),
+            #[cfg(feature = "extended")]
             Self::Sidecar(_) => f.write_str("Sidecar"),
         }
     }

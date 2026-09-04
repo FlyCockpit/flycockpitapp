@@ -8050,8 +8050,10 @@ fn failed_persistent_endpoint_publication_never_exposes_persistent_services() {
     // Write fails before activation; rollback must stay a no-op.
     ctx.deactivate_persistent_services();
     assert!(ctx.is_ephemeral_lifetime());
+    #[cfg(feature = "extended")]
     assert!(ctx.scheduler().is_none());
     assert!(ctx.resource_scheduler().is_none());
+    #[cfg(feature = "extended")]
     assert!(ctx.registry.scheduler().is_none());
     assert!(ctx.registry.resource_scheduler().is_none());
     assert!(ctx.active_media_storage_recovery().is_none());
@@ -8100,6 +8102,7 @@ fn remote_principal_cannot_promote_daemon_lifetime() {
         "owner-only promotion must fail closed, got {error}"
     );
     assert!(ctx.is_ephemeral_lifetime());
+    #[cfg(feature = "extended")]
     assert!(ctx.scheduler().is_none());
     assert!(ctx.resource_scheduler().is_none());
 }
@@ -8378,6 +8381,7 @@ async fn remote_reader_assistant_attach_cannot_promote_ephemeral_owner() {
         error.message
     );
     assert!(ctx.is_ephemeral_lifetime());
+    #[cfg(feature = "extended")]
     assert!(ctx.scheduler().is_none());
     assert!(ctx.resource_scheduler().is_none());
 }
@@ -35692,6 +35696,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         connector_wake: base.connector_wake.clone(),
         #[cfg(feature = "remote")]
         remote_operation_locks: base.remote_operation_locks.clone(),
+        #[cfg(feature = "extended")]
         scheduler: base.scheduler.clone(),
         promoted_persistent_services: StdMutex::new(PromotedPersistentServices::empty()),
         image_generation_boot_id: base.image_generation_boot_id,
@@ -35915,6 +35920,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         connector_wake: base.connector_wake.clone(),
         #[cfg(feature = "remote")]
         remote_operation_locks: base.remote_operation_locks.clone(),
+        #[cfg(feature = "extended")]
         scheduler: base.scheduler.clone(),
         promoted_persistent_services: StdMutex::new(PromotedPersistentServices::empty()),
         image_generation_boot_id: base.image_generation_boot_id,

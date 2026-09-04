@@ -3305,6 +3305,7 @@ mod tests {
         insecure_transport_allowed: bool,
     }
 
+    #[cfg(feature = "extended")]
     impl ImgGenScenario {
         fn base() -> Self {
             use crate::image_generation_agent_tools::{

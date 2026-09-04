@@ -811,11 +811,6 @@ pub struct ScheduledJobCreate {
 }
 
 #[cfg(feature = "extended")]
-fn default_true() -> bool {
-    true
-}
-
-#[cfg(feature = "extended")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduledJobLastResult {
     pub ok: bool,
@@ -2206,6 +2201,10 @@ pub enum ResumeRepairAction {
     RepairSyntheticToolResults,
     ExportDebugBundle,
     Cancel,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_daemon_version() -> String {

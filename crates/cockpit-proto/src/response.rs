@@ -1140,6 +1140,12 @@ pub enum Response {
         schema_version: i64,
     },
 
+    /// Peer-bound credential minted for the connecting local socket peer.
+    LocalPeerCredential {
+        token: crate::OwnerCapabilityToken,
+        role: crate::LocalClientRole,
+    },
+
     /// The three 30-day autocomplete count maps. `models` and `slash`
     /// are global; `tags` is scoped to the requested project. Answer to
     /// [`Request::GetUsageCounts`].
@@ -1815,6 +1821,7 @@ macro_rules! response_variants {
             (Response::TerminalOpened { .. }, "terminal_opened");
             (Response::LspControlResult { .. }, "lsp_control_result");
             (Response::DaemonStatus { .. }, "daemon_status");
+            (Response::LocalPeerCredential { .. }, "local_peer_credential");
             (Response::UsageCounts { .. }, "usage_counts");
             (Response::StatsRollup { .. }, "stats_rollup");
             (Response::GuidanceEstimate { .. }, "guidance_estimate");

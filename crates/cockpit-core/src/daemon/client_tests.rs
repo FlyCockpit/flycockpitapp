@@ -151,6 +151,31 @@ async fn confirm_client_lifetime(daemon: &mut ProtoStream<UnixStream>) {
         .unwrap();
 }
 
+async fn complete_wire_connect_handshake(daemon: &mut ProtoStream<UnixStream>) {
+    confirm_client_lifetime(daemon).await;
+    let id = match daemon.recv().await.unwrap().unwrap() {
+        cockpit_proto::RecvFrame::Envelope(envelope) => match envelope.body {
+            Body::Request {
+                id,
+                request: Request::ExchangeLocalPeerCredential,
+                ..
+            } => id,
+            other => panic!("expected peer credential exchange, got {other:?}"),
+        },
+        other => panic!("expected peer credential exchange envelope, got {other:?}"),
+    };
+    daemon
+        .send(&Envelope::response(
+            id,
+            Response::LocalPeerCredential {
+                token: proto::OwnerCapabilityToken::new("test-peer-token"),
+                role: proto::LocalClientRole::Cli,
+            },
+        ))
+        .await
+        .unwrap();
+}
+
 async fn accept_restart_if_idle(daemon: &mut ProtoStream<UnixStream>) {
     let id = match daemon.recv().await.unwrap().unwrap() {
         cockpit_proto::RecvFrame::Envelope(envelope) => match envelope.body {
@@ -253,7 +278,7 @@ async fn negotiation_parses_daemon_hello_on_connect() {
         let (stream, _) = listener.accept().await.unwrap();
         let mut daemon = ProtoStream::new(stream);
         send_daemon_hello(&mut daemon, "0.1.handshake", proto::PROTOCOL_VERSION).await;
-        confirm_client_lifetime(&mut daemon).await;
+        complete_wire_connect_handshake(&mut daemon).await;
     });
 
     let client = DaemonClient::connect(&socket).await.unwrap();
@@ -333,7 +358,7 @@ async fn negotiation_sends_attach_with_negotiated_client_protocol_version() {
         )
         .await;
         daemon.set_negotiated_version(proto::MIN_SUPPORTED_PROTOCOL_VERSION);
-        confirm_client_lifetime(&mut daemon).await;
+        complete_wire_connect_handshake(&mut daemon).await;
         let request_id = match daemon.recv().await.unwrap().unwrap() {
             proto::RecvFrame::Envelope(env) => match env.body {
                 Body::Request { id, request, .. } => {
@@ -476,7 +501,7 @@ async fn accepted_assistant_promotion_keeps_the_live_owner_in_place() {
         let (stream, _) = listener.accept().await.expect("accept promotion client");
         let mut daemon = ProtoStream::new(stream);
         send_daemon_hello(&mut daemon, "0.1.ephemeral", proto::PROTOCOL_VERSION).await;
-        confirm_client_lifetime(&mut daemon).await;
+        complete_wire_connect_handshake(&mut daemon).await;
         accept_in_place_promotion(&mut daemon, &listener, &predecessor_paths).await;
         drop(daemon);
         drop(listener);
@@ -549,7 +574,7 @@ async fn accepted_promotion_terminal_failure_releases_the_lifecycle_host() {
         let (stream, _) = listener.accept().await.expect("accept promotion client");
         let mut daemon = ProtoStream::new(stream);
         send_daemon_hello(&mut daemon, "0.1.ephemeral", proto::PROTOCOL_VERSION).await;
-        confirm_client_lifetime(&mut daemon).await;
+        complete_wire_connect_handshake(&mut daemon).await;
         accept_restart_if_idle(&mut daemon).await;
         drop(daemon);
         drop(listener);

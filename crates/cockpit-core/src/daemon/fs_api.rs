@@ -2115,7 +2115,7 @@ fn secret_blocked_for_sharee(
     root: &Path,
     path: &Path,
 ) -> Result<bool, ErrorPayload> {
-    if principal.is_owner() {
+    if principal.has_owner_level_authority() {
         return Ok(false);
     }
     Ok(crate::gitignore::is_gitignored(path) || dotenv_pattern_matches(ctx, root, path)?)

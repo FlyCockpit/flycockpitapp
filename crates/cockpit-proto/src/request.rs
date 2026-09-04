@@ -2658,6 +2658,12 @@ pub enum Request {
     /// Cheap liveness probe. Replaces the legacy `"ok\n"` greeting.
     DaemonStatus,
 
+    /// Mint a peer-bound local credential for the connecting process. The daemon
+    /// attests the peer's role from `SO_PEERCRED` / `getpeereid` (or the Windows
+    /// named-pipe client PID) and returns a short-lived token the peer must
+    /// present on secret-bearing RPCs.
+    ExchangeLocalPeerCredential,
+
     /// Explicitly remove a retained daemon-managed task worktree. This is a
     /// local owner-only lifecycle operation; normal task completion retains
     /// worktrees and remote clients can never invoke cleanup.
@@ -4681,6 +4687,7 @@ macro_rules! request_variants {
             #[cfg(feature = "remote")]
             (Request::SetProviderLayerMetadata { .. }, "set_provider_layer_metadata");
             (Request::DaemonStatus, "daemon_status");
+            (Request::ExchangeLocalPeerCredential, "exchange_local_peer_credential");
             (Request::CleanManagedWorkspaceLease { .. }, "clean_managed_workspace_lease");
             (Request::RefreshEnv { .. }, "refresh_env");
             (Request::RefreshConfig, "refresh_config");
@@ -5056,6 +5063,7 @@ macro_rules! command {
             #[cfg(feature = "remote")]
             (Request::SetProviderLayerMetadata { project_root, category_defaults_json, on_unlisted_models_fetch }, "set_provider_layer_metadata", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|category_defaults_json:String|on_unlisted_models_fetch:cockpit_config::config::providers::OnUnlistedModelsFetch", [project_root: String => project_root, category_defaults_json: String => param, on_unlisted_models_fetch: cockpit_config::config::providers::OnUnlistedModelsFetch => param]);
             (Request::DaemonStatus, "daemon_status", public_read, none, false, read_only, none, concurrent, none, "-", []);
+            (Request::ExchangeLocalPeerCredential, "exchange_local_peer_credential", public_read, none, false, read_only, none, serialized, none, "-", []);
             (Request::CleanManagedWorkspaceLease { session_id, owner_agent_instance_id, lease_id }, "clean_managed_workspace_lease", owner_only, none, true, local_only, none, serialized, none, "session_id:Uuid|owner_agent_instance_id:Uuid|lease_id:Uuid", [session_id: Uuid => session, owner_agent_instance_id: Uuid => param, lease_id: Uuid => param]);
             (Request::RefreshEnv { vars }, "refresh_env", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "vars:HashMap<String,String>", [vars: HashMap<String,String> => param]);
             (Request::RefreshConfig, "refresh_config", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);

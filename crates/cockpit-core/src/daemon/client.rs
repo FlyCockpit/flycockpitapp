@@ -118,8 +118,9 @@ pub async fn acquire_acp_socket_daemon(background_agents: bool) -> Result<Daemon
     }
 }
 
-/// ACP stdio ingress requires a discoverable wire owner with the daemon-private
-/// owner capability. In-process auto-promote is intentionally excluded.
+/// ACP stdio ingress requires a discoverable wire owner with a peer-bound
+/// credential from `ExchangeLocalPeerCredential`. In-process auto-promote is
+/// intentionally excluded.
 fn validate_acp_connected_daemon(connected: &ConnectedDaemon) -> Result<()> {
     if !connected.endpoint.is_discoverable_wire_owner() {
         anyhow::bail!("ACP requires a discoverable wire ledger owner");
@@ -128,7 +129,7 @@ fn validate_acp_connected_daemon(connected: &ConnectedDaemon) -> Result<()> {
         anyhow::bail!("ACP requires a wire-backed ledger client");
     }
     if !connected.client.has_owner_capability() {
-        anyhow::bail!("ACP stdio ingress requires the daemon-private owner capability");
+        anyhow::bail!("ACP stdio ingress requires a peer-bound owner credential");
     }
     Ok(())
 }
@@ -1420,9 +1421,8 @@ pub(super) fn temp_ephemeral_paths(root: &std::path::Path, stem: &str) -> super:
 #[cfg(all(test, any(unix, windows)))]
 mod acp_wire_owner_tests {
     use super::*;
-    use crate::daemon::owner_capability::OwnerCapability;
     use cockpit_client::{ClientEndpoint, InProcessConnection, InProcessEndpoint};
-    use cockpit_proto::{Body, Envelope, RecvFrame, Response};
+    use cockpit_proto::{Body, Envelope, ErrorCode, ErrorPayload, RecvFrame, Response};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
@@ -1557,6 +1557,34 @@ mod acp_wire_owner_tests {
             .expect("lifetime confirmation");
     }
 
+    async fn complete_test_wire_connect_handshake<S>(daemon: &mut cockpit_proto::ProtoStream<S>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    {
+        confirm_test_client_lifetime(daemon).await;
+        let id = match daemon.recv().await.expect("recv").expect("frame") {
+            RecvFrame::Envelope(envelope) => match envelope.body {
+                Body::Request {
+                    id,
+                    request: Request::ExchangeLocalPeerCredential,
+                    ..
+                } => id,
+                other => panic!("expected peer credential exchange, got {other:?}"),
+            },
+            other => panic!("expected peer credential exchange envelope, got {other:?}"),
+        };
+        daemon
+            .send(&Envelope::response(
+                id,
+                Response::LocalPeerCredential {
+                    token: proto::OwnerCapabilityToken::new("test-peer-token"),
+                    role: proto::LocalClientRole::Cli,
+                },
+            ))
+            .await
+            .expect("peer credential exchange");
+    }
+
     async fn serve_wire_owner_connection<S>(
         daemon: &mut cockpit_proto::ProtoStream<S>,
         state: &WireOwnerFixtureState,
@@ -1570,6 +1598,10 @@ mod acp_wire_owner_tests {
                     Body::Request { id, request, .. } => {
                         let response = match request {
                             Request::DaemonStatus => test_daemon_status_response(),
+                            Request::ExchangeLocalPeerCredential => Response::LocalPeerCredential {
+                                token: proto::OwnerCapabilityToken::new("test-peer-token"),
+                                role: proto::LocalClientRole::Cli,
+                            },
                             Request::RestartIfIdle => {
                                 state.restart_if_idle_observed.store(true, Ordering::SeqCst);
                                 Response::RestartDecision {
@@ -1671,9 +1703,6 @@ mod acp_wire_owner_tests {
     #[tokio::test]
     async fn validate_acp_connected_daemon_accepts_wire_owner_with_capability() {
         let (dir, socket, listener) = bind_test_pipe_listener().await;
-        OwnerCapability::mint()
-            .publish(&socket)
-            .expect("publish owner capability");
 
         let server = tokio::spawn(async move {
             #[cfg(unix)]
@@ -1685,7 +1714,7 @@ mod acp_wire_owner_tests {
             };
             let mut daemon = cockpit_proto::ProtoStream::new(stream);
             send_test_daemon_hello(&mut daemon).await;
-            confirm_test_client_lifetime(&mut daemon).await;
+            complete_test_wire_connect_handshake(&mut daemon).await;
         });
 
         let client = cockpit_client::DaemonClient::connect(&socket)
@@ -1716,19 +1745,41 @@ mod acp_wire_owner_tests {
             let mut daemon = cockpit_proto::ProtoStream::new(stream);
             send_test_daemon_hello(&mut daemon).await;
             confirm_test_client_lifetime(&mut daemon).await;
+            let id = match daemon.recv().await.expect("recv").expect("frame") {
+                RecvFrame::Envelope(envelope) => match envelope.body {
+                    Body::Request {
+                        id,
+                        request: Request::ExchangeLocalPeerCredential,
+                        ..
+                    } => id,
+                    other => panic!("expected peer credential exchange, got {other:?}"),
+                },
+                other => panic!("expected peer credential exchange envelope, got {other:?}"),
+            };
+            daemon
+                .send(&Envelope::error(
+                    Some(id),
+                    ErrorPayload {
+                        code: ErrorCode::Authorization,
+                        message: "peer role attestation failed".into(),
+                    },
+                ))
+                .await
+                .expect("deny peer credential exchange");
         });
 
+        // An exchange denied for missing launch provenance keeps the client
+        // connected as an unauthenticated, table-governed peer (public RPCs
+        // stay reachable); it just never holds an owner-class credential.
         let client = cockpit_client::DaemonClient::connect(&socket)
             .await
-            .expect("wire connect");
+            .expect("authorization denial must not fail the wire connect");
         let connected = connected_with_endpoint(client, ClientEndpoint::Wire(socket.clone()));
 
-        let error = validate_acp_connected_daemon(&connected).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("daemon-private owner capability")
-        );
+        let error = validate_acp_connected_daemon(&connected)
+            .expect_err("ACP ingress requires the peer-bound owner credential");
+        assert!(error.to_string().contains("owner credential"), "{error:#}");
+        assert!(!connected.client.has_owner_capability());
 
         drop(connected);
         server.await.expect("server");
@@ -1745,9 +1796,6 @@ mod acp_wire_owner_tests {
         let (mut owner_child, executable) = spawn_fixture_owner_child();
         publish_test_ephemeral_owner(&paths, &owner_child, &executable);
         let listener = crate::daemon::bind_private_socket(&paths.socket).expect("bind owner");
-        OwnerCapability::mint()
-            .publish(&paths.socket)
-            .expect("publish owner capability");
         crate::daemon::skew_restart::reset_skew_restart_cooldown_for_tests();
         let (server, fixture) = spawn_wire_owner_server(listener, false);
 
@@ -1787,9 +1835,6 @@ mod acp_wire_owner_tests {
         let (mut owner_child, executable) = spawn_fixture_owner_child();
         publish_test_ephemeral_owner(&paths, &owner_child, &executable);
         let listener = crate::daemon::bind_private_socket(&paths.socket).expect("bind owner");
-        OwnerCapability::mint()
-            .publish(&paths.socket)
-            .expect("publish owner capability");
         crate::daemon::skew_restart::reset_skew_restart_cooldown_for_tests();
         let (server, fixture) = spawn_wire_owner_server(listener, true);
 

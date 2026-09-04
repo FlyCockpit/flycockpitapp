@@ -1,14 +1,8 @@
-//! Daemon-private owner capability for secret-bearing RPCs.
+//! Daemon-private owner capability for in-process clients.
 //!
-//! Pre-launch mitigation for issue #296: every wire-transport peer (Unix
-//! socket or Windows named pipe) is still granted `ClientPrincipal::Owner`.
-//! Secret-bearing (`owner_only`) RPCs and ACP stdio ingress
-//! additionally require this process-local token, which lives in a 0600 file
-//! next to the control socket. Confined children are denied that path.
-//!
-//! This is **not** authenticated per-peer identity. Follow-up #337
-//! ("Daemon socket: authenticated per-peer authority (peer-cred/mTLS)")
-//! replaces blanket Owner with a peer-bound credential.
+//! Pre-launch mitigation for issue #296: confined children are denied the
+//! control-plane paths via sandbox deny lists. Socket admission (issue #337)
+//! uses peer-bound credentials from `SO_PEERCRED` attestation, not this file.
 
 use std::path::Path;
 
@@ -46,10 +40,9 @@ impl OwnerCapability {
         &self.token
     }
 
-    /// Write the token to the 0600 file next to the control socket. Called
-    /// after the parent directory is private and before the socket is
-    /// published, so a client that can discover the socket can also load the
-    /// capability — and a confined child that cannot reach the parent cannot.
+    /// Write the token to the 0600 file next to the control socket for
+    /// sandbox deny-path tests and fixtures. Socket peers must not use this
+    /// file for owner admission (issue #337).
     pub fn publish(&self, socket: &Path) -> Result<()> {
         let path = DaemonPaths::owner_capability_path_for_socket(socket);
         if let Some(parent) = path.parent() {
@@ -61,7 +54,7 @@ impl OwnerCapability {
     }
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
     }

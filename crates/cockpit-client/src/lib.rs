@@ -40,6 +40,7 @@ type WireStream = NamedPipeClient;
 
 pub mod bulk_upload;
 pub mod image_upload;
+pub mod launch_provenance;
 pub mod presentation;
 pub mod submission;
 
@@ -609,9 +610,9 @@ pub struct DaemonClient {
     /// `Clone` — clones of `DaemonClient` share access to the
     /// receiver they were spawned with.
     events: Arc<tokio::sync::Mutex<mpsc::Receiver<proto::Event>>>,
-    /// Daemon-private owner capability loaded from the 0600 file next to
-    /// the control socket. In-process clients do not need it: possession of
-    /// the endpoint is the capability. Issue #296 / follow-up #337.
+    /// Peer-bound credential minted during socket connect (issue #337). Sent on
+    /// secret-bearing RPCs. In-process clients do not need it: possession of
+    /// the endpoint is the capability.
     owner_capability: Option<proto::OwnerCapabilityToken>,
 }
 
@@ -652,12 +653,16 @@ impl DaemonClient {
             let mut proto = ProtoStream::new(stream);
             let negotiated = negotiate_hello(&mut proto).await?;
             proto.set_negotiated_version(negotiated.version);
-            let initial_events = confirm_client_lifetime(&mut proto, negotiated.version).await?;
+            let mut initial_events =
+                confirm_client_lifetime(&mut proto, negotiated.version).await?;
+            let (exchange_events, owner_capability) =
+                exchange_peer_credential(&mut proto, negotiated.version).await?;
+            initial_events.extend(exchange_events);
             Ok(Self::from_proto_negotiated(
                 proto,
                 negotiated,
                 initial_events,
-                load_owner_capability(socket),
+                owner_capability,
             ))
         }
         #[cfg(not(any(unix, windows)))]
@@ -686,9 +691,8 @@ impl DaemonClient {
         }
     }
 
-    /// True when this client can present the daemon-private owner capability
-    /// (in-process endpoint, or a loaded socket token). ACP stdio ingress
-    /// requires this (issue #296).
+    /// True when this client holds a peer-bound owner credential (wire) or
+    /// in-process endpoint possession. ACP stdio ingress requires this.
     pub fn has_owner_capability(&self) -> bool {
         match &self.backend {
             ClientBackend::InProcess(_) => true,
@@ -965,6 +969,96 @@ where
     };
 
     proto::NegotiatedProtocol::from_hello(&hello).map_err(anyhow::Error::new)
+}
+
+/// Exchange a peer-bound credential after lifetime confirmation. Socket peers
+/// must present this token on secret-bearing RPCs (issue #337).
+///
+/// The exchange presents this process's daemon launch ticket in the
+/// envelope capability slot. The daemon mints an owner-class credential only
+/// for the exact launcher process holding the ticket; a denial is not a
+/// connect failure — the client stays connected as an unauthenticated,
+/// table-governed peer (public RPCs still work).
+#[cfg(any(unix, windows))]
+async fn exchange_peer_credential<S>(
+    proto_stream: &mut ProtoStream<S>,
+    version: u32,
+) -> Result<(Vec<proto::Event>, Option<proto::OwnerCapabilityToken>)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    let id = Uuid::now_v7();
+    let launch_ticket =
+        launch_provenance::process_launch_ticket().map(proto::OwnerCapabilityToken::new);
+    proto_stream
+        .send(&Envelope::request_with_owner_capability_at(
+            version,
+            id,
+            Request::ExchangeLocalPeerCredential,
+            launch_ticket,
+        ))
+        .await
+        .context("sending peer credential exchange")?;
+
+    let exchange = async {
+        let mut initial_events = Vec::new();
+        loop {
+            let frame = proto_stream.recv().await?;
+            let Some(frame) = frame else {
+                return Err(protocol_handshake_error(
+                    "daemon closed before peer credential exchange",
+                ));
+            };
+            match frame {
+                RecvFrame::Envelope(envelope) => match envelope.body {
+                    Body::Event { event } => initial_events.push(event),
+                    Body::Response {
+                        id: response_id,
+                        response,
+                    } if response_id == id => match *response {
+                        Response::LocalPeerCredential { token, .. } => {
+                            return Ok((initial_events, Some(token)));
+                        }
+                        _ => {
+                            return Err(protocol_handshake_error(
+                                "daemon returned an invalid peer credential exchange response",
+                            ));
+                        }
+                    },
+                    Body::Error {
+                        id: Some(response_id),
+                        error,
+                    } if response_id == id => {
+                        if error.code == proto::ErrorCode::Authorization {
+                            // No trusted launch provenance: keep the
+                            // connection as an unauthenticated peer instead
+                            // of failing the public RPC surface.
+                            tracing::debug!(
+                                message = %error.message,
+                                "peer credential exchange denied; continuing unauthenticated"
+                            );
+                            return Ok((initial_events, None));
+                        }
+                        return Err(anyhow::Error::new(error));
+                    }
+                    _ => {
+                        return Err(protocol_handshake_error(
+                            "daemon sent an invalid peer credential exchange frame",
+                        ));
+                    }
+                },
+                RecvFrame::Unknown { .. } | RecvFrame::VersionMismatch { .. } => {
+                    return Err(protocol_handshake_error(
+                        "daemon rejected the peer credential exchange version",
+                    ));
+                }
+            }
+        }
+    };
+
+    tokio::time::timeout(REQUEST_TIMEOUT, exchange)
+        .await
+        .map_err(|_| protocol_handshake_error("peer credential exchange timed out"))?
 }
 
 /// Confirm that a peer which parsed the daemon's hello is an actual client,
@@ -1583,6 +1677,34 @@ mod tests {
             .unwrap();
     }
 
+    async fn complete_wire_connect_handshake<S>(daemon: &mut ProtoStream<S>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    {
+        confirm_client_lifetime(daemon).await;
+        let id = match daemon.recv().await.unwrap().unwrap() {
+            RecvFrame::Envelope(envelope) => match envelope.body {
+                Body::Request {
+                    id,
+                    request: Request::ExchangeLocalPeerCredential,
+                    ..
+                } => id,
+                other => panic!("expected peer credential exchange, got {other:?}"),
+            },
+            other => panic!("expected peer credential exchange envelope, got {other:?}"),
+        };
+        daemon
+            .send(&Envelope::response(
+                id,
+                Response::LocalPeerCredential {
+                    token: proto::OwnerCapabilityToken::new("test-peer-token"),
+                    role: proto::LocalClientRole::Cli,
+                },
+            ))
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn nil_daemon_status_is_known_hello() {
         assert!(is_nil_daemon_status_hello(
@@ -1629,16 +1751,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wire_connect_loads_owner_capability_for_acp_ingress() {
+    async fn wire_connect_exchanges_peer_credential_for_acp_ingress() {
         let (dir, socket, mut listener) = bind_test_socket();
-        let capability_path = owner_capability_path(&socket);
-        std::fs::write(&capability_path, b"test-owner-capability-token").unwrap();
 
         let server = tokio::spawn(async move {
             let stream = accept_test(&mut listener).await;
             let mut daemon = ProtoStream::new(stream);
             send_daemon_hello(&mut daemon, "0.1.capability", proto::PROTOCOL_VERSION).await;
-            confirm_client_lifetime(&mut daemon).await;
+            complete_wire_connect_handshake(&mut daemon).await;
         });
 
         let client = DaemonClient::connect(&socket).await.unwrap();
@@ -1652,13 +1772,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exchange_presents_the_process_launch_ticket() {
+        let ticket = "f".repeat(64);
+        launch_provenance::set_process_launch_ticket(ticket.clone());
+        let (_dir, socket, mut listener) = bind_test_socket();
+        let expected = ticket;
+        let server = tokio::spawn(async move {
+            let stream = accept_test(&mut listener).await;
+            let mut daemon = ProtoStream::new(stream);
+            send_daemon_hello(&mut daemon, "0.1.ticket", proto::PROTOCOL_VERSION).await;
+            confirm_client_lifetime(&mut daemon).await;
+            let id = match daemon.recv().await.unwrap().unwrap() {
+                RecvFrame::Envelope(envelope) => match envelope.body {
+                    Body::Request {
+                        id,
+                        owner_capability,
+                        request: Request::ExchangeLocalPeerCredential,
+                    } => {
+                        assert_eq!(
+                            owner_capability
+                                .as_ref()
+                                .map(proto::OwnerCapabilityToken::as_str),
+                            Some(expected.as_str()),
+                            "the exchange must present the process-held launch ticket"
+                        );
+                        id
+                    }
+                    other => panic!("expected peer credential exchange, got {other:?}"),
+                },
+                other => panic!("expected envelope, got {other:?}"),
+            };
+            daemon
+                .send(&Envelope::response(
+                    id,
+                    Response::LocalPeerCredential {
+                        token: proto::OwnerCapabilityToken::new("test-peer-token"),
+                        role: proto::LocalClientRole::Cli,
+                    },
+                ))
+                .await
+                .unwrap();
+        });
+
+        let client = DaemonClient::connect(&socket).await.unwrap();
+        assert!(client.has_owner_capability());
+        launch_provenance::clear_process_launch_ticket();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exchange_authorization_denial_keeps_the_client_connected_unauthenticated() {
+        let (_dir, socket, mut listener) = bind_test_socket();
+        let server = tokio::spawn(async move {
+            let stream = accept_test(&mut listener).await;
+            let mut daemon = ProtoStream::new(stream);
+            send_daemon_hello(&mut daemon, "0.1.denied", proto::PROTOCOL_VERSION).await;
+            confirm_client_lifetime(&mut daemon).await;
+            let id = match daemon.recv().await.unwrap().unwrap() {
+                RecvFrame::Envelope(envelope) => match envelope.body {
+                    Body::Request {
+                        id,
+                        request: Request::ExchangeLocalPeerCredential,
+                        ..
+                    } => id,
+                    other => panic!("expected peer credential exchange, got {other:?}"),
+                },
+                other => panic!("expected envelope, got {other:?}"),
+            };
+            daemon
+                .send(&Envelope::error(
+                    Some(id),
+                    ErrorPayload {
+                        code: proto::ErrorCode::Authorization,
+                        message: "owner-class credential requires a daemon launch ticket".into(),
+                    },
+                ))
+                .await
+                .unwrap();
+        });
+
+        // A peer without launch provenance is denied an owner-class credential
+        // but must keep the connection: public RPCs stay reachable for
+        // unauthenticated table-governed peers.
+        let client = DaemonClient::connect(&socket)
+            .await
+            .expect("authorization denial must not fail the connect");
+        assert!(!client.has_owner_capability());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn negotiation_parses_daemon_hello_on_connect() {
         let (_dir, socket, mut listener) = bind_test_socket();
         let server = tokio::spawn(async move {
             let stream = accept_test(&mut listener).await;
             let mut daemon = ProtoStream::new(stream);
             send_daemon_hello(&mut daemon, "0.1.handshake", proto::PROTOCOL_VERSION).await;
-            confirm_client_lifetime(&mut daemon).await;
+            complete_wire_connect_handshake(&mut daemon).await;
         });
 
         let client = DaemonClient::connect(&socket).await.unwrap();
@@ -1738,7 +1948,7 @@ mod tests {
             )
             .await;
             daemon.set_negotiated_version(proto::MIN_SUPPORTED_PROTOCOL_VERSION);
-            confirm_client_lifetime(&mut daemon).await;
+            complete_wire_connect_handshake(&mut daemon).await;
             let request_id = match daemon.recv().await.unwrap().unwrap() {
                 proto::RecvFrame::Envelope(env) => match env.body {
                     Body::Request { id, request, .. } => {

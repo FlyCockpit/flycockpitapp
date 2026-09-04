@@ -692,6 +692,20 @@ impl ConfigMutationLock {
     fn is_held_identity(identity: &str) -> bool {
         MUTATION_LOCK_DEPTHS.with(|depths| depths.borrow().get(identity).copied().unwrap_or(0) > 0)
     }
+
+    /// Whether this thread currently holds the mutation lock for `target`,
+    /// including vacuous first-write guards taken before the parent exists.
+    #[cfg(test)]
+    pub(crate) fn is_held_by_current_thread(target: &Path) -> Result<bool> {
+        let target_identity = mutation_lock_identity(target);
+        let held = if let Some((parent, _, _)) = try_open_mutation_lock_parent(target)? {
+            let identity = mutation_lock_runtime_identity(&parent, &target_identity)?;
+            Self::is_held_identity(&identity)
+        } else {
+            Self::is_held_identity(&missing_parent_mutation_lock_identity(&target_identity))
+        };
+        Ok(held)
+    }
 }
 
 impl Drop for ConfigMutationLock {
@@ -3889,7 +3903,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let backup = temp.path().join(".cockpit-active-model.backup");
-        super::write_private_file(&backup, b"prior config bytes").unwrap();
+        cockpit_host::private_fs::write_private_file(&backup, b"prior config bytes").unwrap();
         assert_eq!(std::fs::read(&backup).unwrap(), b"prior config bytes");
         assert_eq!(
             std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
@@ -3901,9 +3915,11 @@ mod tests {
         std::fs::create_dir(&attacker).unwrap();
         let link = temp.path().join("linked-config-dir");
         symlink(&attacker, &link).unwrap();
-        let error =
-            super::write_private_file(&link.join(".cockpit-active-model.backup"), b"secret")
-                .unwrap_err();
+        let error = cockpit_host::private_fs::write_private_file(
+            &link.join(".cockpit-active-model.backup"),
+            b"secret",
+        )
+        .unwrap_err();
         assert!(
             format!("{error:#}").contains("no-follow directory component"),
             "{error:#}"
@@ -4044,16 +4060,18 @@ mod windows_tests {
         let config_dir = temp.path().join(".cockpit");
         std::fs::create_dir(&config_dir).unwrap();
         let backup = config_dir.join(".cockpit-active-model.backup");
-        super::write_private_file(&backup, b"prior config bytes").unwrap();
+        cockpit_host::private_fs::write_private_file(&backup, b"prior config bytes").unwrap();
         assert_eq!(std::fs::read(&backup).unwrap(), b"prior config bytes");
 
         let attacker = temp.path().join("attacker");
         std::fs::create_dir(&attacker).unwrap();
         let junction = temp.path().join("linked-config-dir");
         symlink_dir(&attacker, &junction).unwrap();
-        let error =
-            super::write_private_file(&junction.join(".cockpit-active-model.backup"), b"secret")
-                .unwrap_err();
+        let error = cockpit_host::private_fs::write_private_file(
+            &junction.join(".cockpit-active-model.backup"),
+            b"secret",
+        )
+        .unwrap_err();
         assert!(format!("{error:#}").contains("reparse-point component"));
         assert!(!attacker.join(".cockpit-active-model.backup").exists());
     }

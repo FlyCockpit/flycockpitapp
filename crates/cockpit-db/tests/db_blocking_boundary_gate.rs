@@ -523,7 +523,7 @@ impl<'ast> Visit<'ast> for BodyWalker<'_> {
         // become real call edges; external-crate imports resolve to an
         // out-of-boundary target like any other external path) instead of
         // leaving their calls as unresolved indirect callables.
-        if let syn::Stmt::Use(item_use) = stmt {
+        if let syn::Stmt::Item(Item::Use(item_use)) = stmt {
             let mut imports = Vec::new();
             let mut globs: Vec<Vec<String>> = Vec::new();
             flatten_use_tree(&item_use.tree, &[], &mut imports, &mut globs);

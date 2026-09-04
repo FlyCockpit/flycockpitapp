@@ -1489,6 +1489,8 @@ CREATE TABLE tool_call_events (
         REFERENCES tool_call_events(session_id, call_id)
         ON DELETE CASCADE ON UPDATE RESTRICT
 );
+-- Leading-timestamp index for retention sweeps (issue #308): deletes filter on timestamp alone for closed sessions; a session_id-leading index cannot satisfy that predicate without a full scan.
+CREATE INDEX idx_tool_call_events_retention_ts ON tool_call_events (timestamp);
 
 CREATE INDEX idx_tce_session_ts ON tool_call_events (session_id, timestamp);
 CREATE INDEX idx_tce_project_ts ON tool_call_events (project_id, timestamp);
@@ -1526,18 +1528,12 @@ CREATE TABLE inference_calls (
 
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
+-- Leading-timestamp index for retention sweeps (issue #308): deletes filter on timestamp alone for closed sessions; a session_id-leading index cannot satisfy that predicate without a full scan.
+CREATE INDEX idx_inference_calls_retention_ts ON inference_calls (timestamp);
 
 CREATE INDEX idx_ic_session_ts ON inference_calls (session_id, timestamp);
 CREATE INDEX idx_ic_project_ts ON inference_calls (project_id, timestamp);
 CREATE INDEX idx_ic_model_ts   ON inference_calls (model, timestamp);
-
--- Leading-timestamp indexes for retention sweeps (issue #308). Deletes filter on
--- timestamp alone for closed sessions; session_id-leading indexes cannot satisfy
--- those predicates without a full scan.
-CREATE INDEX idx_session_events_retention_ts ON session_events (ts_ms);
-CREATE INDEX idx_inference_requests_retention_ts ON inference_requests (ts_ms);
-CREATE INDEX idx_tool_call_events_retention_ts ON tool_call_events (timestamp);
-CREATE INDEX idx_inference_calls_retention_ts ON inference_calls (timestamp);
 
 -- ---- file-lock mirror (plan §4.1) -------------------------------------------
 
@@ -3092,6 +3088,8 @@ CREATE TABLE inference_requests (
     PRIMARY KEY (call_id, ordinal),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
+-- Leading-timestamp index for retention sweeps (issue #308): deletes filter on timestamp alone for closed sessions; a session_id-leading index cannot satisfy that predicate without a full scan.
+CREATE INDEX idx_inference_requests_retention_ts ON inference_requests (ts_ms);
 
 CREATE INDEX idx_ireq_session ON inference_requests (session_id);
 CREATE INDEX idx_ireq_goal_provenance
@@ -3133,6 +3131,8 @@ CREATE TABLE session_events (
     model_trust TEXT,                              -- write-time resolved model trust, NULL for model-less events
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
+-- Leading-timestamp index for retention sweeps (issue #308): deletes filter on timestamp alone for closed sessions; a session_id-leading index cannot satisfy that predicate without a full scan.
+CREATE INDEX idx_session_events_retention_ts ON session_events (ts_ms);
 
 CREATE UNIQUE INDEX uq_session_events_session_seq ON session_events (session_id, seq);
 CREATE INDEX idx_sevents_call        ON session_events (call_id);

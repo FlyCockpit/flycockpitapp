@@ -5465,7 +5465,8 @@ mod tests {
         // decision with a repair-oriented error instead of reading as "no
         // rule" and running the repeated effect unattended.
         let env = tempfile::tempdir().unwrap();
-        cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(env.path()).await;
+        let _home =
+            cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(env.path()).await;
         let approver = approver_with_mode(env.path(), crate::config::extended::ApprovalMode::Yolo);
         let global = crate::approval::store::global_approvals_dir().unwrap();
         std::fs::create_dir_all(&global).unwrap();

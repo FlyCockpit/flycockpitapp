@@ -1527,6 +1527,7 @@ dependencies = [
 name = "cockpit-test-support"
 version = "0.1.0"
 dependencies = [
+ "dirs",
  "serde_json",
  "tempfile",
  "tokio",

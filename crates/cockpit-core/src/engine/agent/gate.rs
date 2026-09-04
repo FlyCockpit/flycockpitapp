@@ -889,7 +889,8 @@ mod safety_gate_tests {
         // of dropping standing rejects and letting the utility-model path
         // judge with them missing.
         let env = tempfile::tempdir().unwrap();
-        cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(env.path()).await;
+        let _home =
+            cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(env.path()).await;
         let ctx = gate_ctx(env.path(), ApprovalMode::Auto, true);
         let global = crate::approval::store::global_approvals_dir().unwrap();
         std::fs::create_dir_all(&global).unwrap();

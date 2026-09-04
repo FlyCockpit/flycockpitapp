@@ -5,9 +5,17 @@
 //! `.cockpit/` configs lives in [`crate::config::dirs`]; this module
 //! is only for the fixed system-level paths.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+
+#[cfg(any(test, feature = "test-support"))]
+fn guard_resolved_cockpit_path(path: &Path) {
+    cockpit_test_support::home_isolation::assert_not_real_developer_cockpit_path(path);
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn guard_resolved_cockpit_path(_path: &Path) {}
 
 /// Platform-default global configuration directory.
 ///
@@ -16,8 +24,16 @@ use anyhow::{Context, Result};
 /// separate from workspace `.cockpit/` directories: workspace trust controls
 /// only those project-local layers, never this user-owned global directory.
 pub fn cockpit_config_dir() -> Result<PathBuf> {
-    let base = dirs::config_dir().context("could not locate user config dir")?;
-    Ok(base.join("cockpit"))
+    let base = if let Ok(value) = std::env::var("XDG_CONFIG_HOME")
+        && !value.trim().is_empty()
+    {
+        PathBuf::from(value)
+    } else {
+        dirs::config_dir().context("could not locate user config dir")?
+    };
+    let path = base.join("cockpit");
+    guard_resolved_cockpit_path(&path);
+    Ok(path)
 }
 
 /// `~/.local/share/cockpit/` on Unix (`$XDG_DATA_HOME/cockpit` if set),
@@ -27,10 +43,14 @@ pub fn cockpit_data_dir() -> Result<PathBuf> {
     if let Ok(s) = std::env::var("XDG_DATA_HOME")
         && !s.trim().is_empty()
     {
-        return Ok(PathBuf::from(s).join("cockpit"));
+        let path = PathBuf::from(s).join("cockpit");
+        guard_resolved_cockpit_path(&path);
+        return Ok(path);
     }
     let base = dirs::data_dir().context("could not locate user data dir")?;
-    Ok(base.join("cockpit"))
+    let path = base.join("cockpit");
+    guard_resolved_cockpit_path(&path);
+    Ok(path)
 }
 
 /// `~/.local/state/cockpit/` on Unix (`$XDG_STATE_HOME/cockpit` if
@@ -44,17 +64,23 @@ pub fn cockpit_state_dir() -> Result<PathBuf> {
     if let Ok(s) = std::env::var("XDG_STATE_HOME")
         && !s.trim().is_empty()
     {
-        return Ok(PathBuf::from(s).join("cockpit"));
+        let path = PathBuf::from(s).join("cockpit");
+        guard_resolved_cockpit_path(&path);
+        return Ok(path);
     }
     #[cfg(unix)]
     {
         let home = dirs::home_dir().context("could not locate home dir")?;
-        Ok(home.join(".local/state/cockpit"))
+        let path = home.join(".local/state/cockpit");
+        guard_resolved_cockpit_path(&path);
+        Ok(path)
     }
     #[cfg(not(unix))]
     {
         let base = dirs::data_local_dir().context("could not locate local data dir")?;
-        Ok(base.join("cockpit").join("state"))
+        let path = base.join("cockpit").join("state");
+        guard_resolved_cockpit_path(&path);
+        Ok(path)
     }
 }
 

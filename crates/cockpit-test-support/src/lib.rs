@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 
 use tokio::sync::{Mutex, MutexGuard};
 
+pub mod home_isolation;
 pub mod provider;
 
 #[cfg(test)]
@@ -90,6 +91,7 @@ impl TestEnvGuard {
     }
 
     fn from_guard(guard: MutexGuard<'static, ()>) -> Self {
+        home_isolation::ensure_real_developer_roots_captured();
         Self {
             _guard: guard,
             snapshots: RefCell::new(
@@ -311,6 +313,32 @@ mod tests {
         first.await.unwrap();
         second.await.unwrap();
         assert!(second_entered_while_first_held.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn home_isolation_guard_rejects_real_developer_cockpit_paths() {
+        let setup = test_env_mutex().blocking_lock();
+        home_isolation::ensure_real_developer_roots_captured();
+        let real_config = dirs::config_dir()
+            .expect("real developer config dir")
+            .join("cockpit");
+        let panic = std::panic::catch_unwind(|| {
+            home_isolation::assert_not_real_developer_cockpit_path(&real_config);
+        });
+        assert!(
+            panic.is_err(),
+            "real developer config path must be rejected"
+        );
+        drop(setup);
+    }
+
+    #[test]
+    fn home_isolation_guard_allows_isolated_cockpit_paths() {
+        let tempdir = tempfile::tempdir().expect("isolated home tempdir");
+        let guard = TestEnvGuard::isolate_cockpit_home_at(tempdir.path());
+        let isolated_config = tempdir.path().join("home/.config/cockpit");
+        home_isolation::assert_not_real_developer_cockpit_path(&isolated_config);
+        drop(guard);
     }
 
     #[test]

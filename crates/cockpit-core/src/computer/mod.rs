@@ -445,6 +445,15 @@ impl ComputerAction {
         }
     }
 
+    /// True when delivering this action commits the modeled terminal line:
+    /// Enter-class keys/holds or typed text containing an embedded line feed.
+    pub(crate) fn commits_typed_line(&self) -> bool {
+        match self {
+            Self::TypeText { text } => text.contains(['\n', '\r']),
+            _ => self.delivers_terminal_line_commit(),
+        }
+    }
+
     /// True when delivered keyboard input can change receiver identity per the
     /// closed allowlist (issue #373).
     pub(crate) fn marks_keyboard_identity_dirty(&self) -> bool {

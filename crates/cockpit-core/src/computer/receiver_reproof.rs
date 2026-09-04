@@ -1,7 +1,8 @@
 //! Window-level terminal receiver re-proof (issue #374, stage 1).
 //!
-//! Evidence-based re-authentication before Enter-class commits on an unproven
-//! receiver. Re-proof is evidence (target snapshot through the authenticated
+//! Evidence-based re-authentication before typed-line commits on an unproven
+//! receiver (Enter-class keys or embedded line feeds in typed text). Re-proof
+//! is evidence (target snapshot through the authenticated
 //! window fence), never an action. A window-level pass alone is never
 //! sufficient for unattended commit: the coordinator still routes the Enter
 //! through Ask (even on Yolo) so a human confirms tab/pane residual.
@@ -104,7 +105,7 @@ pub(crate) const RECEIVER_REPROOF_KEYBOARD_DIRTY_REFUSAL: &str = "computer use c
 pub(crate) const RECEIVER_REPROOF_LINE_CLEAR_FAILED_REFUSAL: &str = "computer use cannot press Enter: receiver re-proof could not deliver a line clear to the \
      journaled receiver; the receiving object stays unproven";
 
-/// True when simulating `actions` on `model` would refuse an Enter-class commit
+/// True when simulating `actions` on `model` would refuse a typed-line commit
 /// because the receiver is unproven.
 pub(crate) fn batch_would_refuse_unproven_receiver_enter(
     model: &TypedInputLineModel,
@@ -116,11 +117,7 @@ pub(crate) fn batch_would_refuse_unproven_receiver_enter(
     let mut simulated = model.clone();
     for action in actions {
         match simulated.absorb_action(action) {
-            Err(ComputerError::Refused(_))
-                if action.is_enter_class_commit() && model.is_receiver_unproven() =>
-            {
-                return true;
-            }
+            Err(ComputerError::Refused(_)) if action.commits_typed_line() => return true,
             Err(_) => return false,
             Ok(()) => {}
         }

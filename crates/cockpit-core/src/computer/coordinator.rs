@@ -3911,7 +3911,8 @@ pub struct ComputerActionCoordinator {
     journaled_receiver_proof: Option<JournaledReceiverProof>,
     /// True after identity-changing keyboard input since the last proof.
     keyboard_identity_dirty_since_proof: bool,
-    /// When set, the next Enter-class commit requires Ask even on Yolo so a
+    /// When set, the next typed-line commit (Enter-class or embedded newline)
+    /// requires Ask even on Yolo so a
     /// human confirms tab/pane residual after window-level re-proof (#374).
     receiver_enter_requires_terminal_ask: bool,
     /// Optional audit chain for receiver re-proof evidence receipts (#374).
@@ -3975,8 +3976,10 @@ pub struct CoordinatorParams {
     pub outcome_store: Option<Arc<dyn super::outcome_store::ComputerOutcomeStore>>,
     /// Handoff journal for ambiguous physical handoff lifecycle (AC15/AC16).
     pub handoff_journal: Option<Arc<dyn HandoffJournal>>,
-    /// Optional tamper-evident audit chain for receiver re-proof receipts
-    /// (issue #374). Production daemon wiring is deferred post-launch.
+    /// Tamper-evident audit chain for receiver re-proof evidence receipts
+    /// (issue #374). Wired in production by the engine driver; when absent or
+    /// unavailable, post-capture typed-line commits fail closed with
+    /// [`ReceiverReproofFailure::AuditJournalUnavailable`].
     pub audit_chain: Option<Arc<ComputerAuditChain>>,
 }
 
@@ -5108,7 +5111,7 @@ impl ComputerActionCoordinator {
         }
         let mut prompted_classes = Vec::with_capacity(actions.len());
         let receiver_terminal_ask_required = self.receiver_enter_requires_terminal_ask
-            && actions.iter().any(ComputerAction::is_enter_class_commit);
+            && actions.iter().any(ComputerAction::commits_typed_line);
         // Prompt-level batch summary (issue #286): each per-action approval
         // prompt also summarizes the whole pending batch.
         let mut batch_detail =
@@ -6039,7 +6042,7 @@ impl ComputerActionCoordinator {
                     failure: ComputerFailure {
                         index: backend_actions
                             .iter()
-                            .position(|action| action.is_enter_class_commit())
+                            .position(|action| action.commits_typed_line())
                             .unwrap_or(0),
                         error: ComputerError::Refused(failure.refusal_message().to_string()),
                     },
@@ -6142,7 +6145,7 @@ impl ComputerActionCoordinator {
                     if self.typed_input_line.absorb_action(action).is_err() {
                         self.typed_input_line.mark_untracked();
                     }
-                    if action.delivers_terminal_line_commit() {
+                    if action.commits_typed_line() {
                         self.receiver_enter_requires_terminal_ask = false;
                     }
                     if action.marks_keyboard_identity_dirty() {
@@ -6175,7 +6178,7 @@ impl ComputerActionCoordinator {
         }
     }
 
-    /// Evidence-based window re-proof before an Enter-class commit on an
+    /// Evidence-based window re-proof before a typed-line commit on an
     /// unproven receiver (issue #374). Clears [`TypedInputLineModel`]'s
     /// `receiver_unproven` only through [`TypedInputLineModel::prove_receiver_on_evidence`].
     async fn receiver_window_reproof_before_enter(
@@ -11228,6 +11231,114 @@ mod tests {
             matches!(outcome, CoordinatedOutcome::Completed { .. }),
             "tab chord must not permanently brick Enter; observation Ask adoption \
              must advance the keyboard-identity baseline: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_receiver_reproof_identity_changing_chord_recovers_after_observation_yolo() {
+        let (_audit, audit_chain) = reproof_audit_chain().await;
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let mut params = make_coordinator_params_with_focus(authorizer.clone());
+        params.tier = ComputerApprovalTier::Yolo;
+        params.audit_chain = Some(audit_chain);
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+
+        coordinator
+            .execute_openai_call(
+                "call-yolo-recover-type",
+                &vec![OpenAiComputerAction::TypeText("# note".to_string())],
+            )
+            .await;
+        coordinator
+            .execute_openai_call(
+                "call-yolo-recover-capture",
+                &vec![OpenAiComputerAction::Screenshot],
+            )
+            .await;
+        coordinator
+            .execute_openai_call(
+                "call-yolo-recover-enter",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["enter".to_string()],
+                })],
+            )
+            .await;
+        coordinator
+            .execute_openai_call(
+                "call-yolo-recover-tab",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["TAB".to_string()],
+                })],
+            )
+            .await;
+        let authorized_before_observation = authorizer.call_count();
+        coordinator
+            .execute_openai_call(
+                "call-yolo-recover-capture-again",
+                &vec![OpenAiComputerAction::Screenshot],
+            )
+            .await;
+        assert_eq!(
+            authorizer.call_count(),
+            authorized_before_observation,
+            "Yolo observation must advance the keyboard-identity baseline without Ask"
+        );
+        coordinator
+            .execute_openai_call(
+                "call-yolo-recover-type-again",
+                &vec![OpenAiComputerAction::TypeText("more".to_string())],
+            )
+            .await;
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-yolo-recover-enter-again",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["enter".to_string()],
+                })],
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Completed { .. }),
+            "tab chord must not permanently brick Enter on Yolo; observation gate adoption \
+             must advance the keyboard-identity baseline: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_receiver_reproof_embedded_newline_commit_after_screenshot() {
+        let (_audit, audit_chain) = reproof_audit_chain().await;
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let params = ask_coordinator_params(
+            authorizer.clone(),
+            Box::new(FakeTargetEvidenceAdapter::new(ask_virtual_evidence())),
+            Some(audit_chain),
+        );
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+
+        coordinator
+            .execute_openai_call(
+                "call-newline-capture",
+                &vec![OpenAiComputerAction::Screenshot],
+            )
+            .await;
+        let authorized_before_commit = authorizer.call_count();
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-newline-commit",
+                &vec![OpenAiComputerAction::TypeText("# note\n".to_string())],
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Completed { .. }),
+            "embedded newline commit after capture must re-proof and complete via Ask: {outcome:?}"
+        );
+        assert!(
+            authorizer.call_count() > authorized_before_commit,
+            "embedded newline commit after re-proof must still go through Ask"
         );
     }
 

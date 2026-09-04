@@ -4,8 +4,9 @@
 //! contract but does not yet implement the production listener, PKCS#11 signing,
 //! or per-handler evidence verification. The fixed-purpose offline subcommands
 //! (`bootstrap`, `prepare-policy-revision`, `prepare-authority-rotation`, `replica
-//! seed`) compile the subcommand surface but are not wired. The default `serve`
-//! subcommand fails closed with a typed not-implemented error on Unix and with
+//! seed`) compile the subcommand surface but are not wired and fail closed with
+//! a not-implemented exit status. The default `serve` subcommand fails closed
+//! with a typed not-implemented error on Unix and with
 //! [`tenant_authority::UnsupportedPlatform`] on non-Unix targets.
 
 #![forbid(unsafe_code)]
@@ -16,30 +17,28 @@ fn main() -> std::process::ExitCode {
 
     match sub {
         // Fixed-purpose offline initializer: opens no listener (not wired).
-        "bootstrap" => {
-            eprintln!("tenant-authority bootstrap: fixed-purpose offline initializer");
-            std::process::ExitCode::from(run_offline())
-        }
+        "bootstrap" => run_offline(sub),
         // Fixed-purpose candidate preparation: no network route (not wired).
-        "prepare-policy-revision" | "prepare-authority-rotation" => {
-            eprintln!("tenant-authority {sub}: fixed-purpose candidate preparation");
-            std::process::ExitCode::from(run_offline())
-        }
+        "prepare-policy-revision" | "prepare-authority-rotation" => run_offline(sub),
         // Replica seed: local OS-owner/PKCS#11-authenticated, no listener (not wired).
-        "replica" => {
-            eprintln!("tenant-authority replica: local replica administration");
-            std::process::ExitCode::from(run_offline())
+        "replica" => run_offline(sub),
+        // Default (no subcommand) and explicit "serve": submit-only mTLS listener.
+        "serve" => run_service(),
+        _ => {
+            eprintln!("tenant-authority: unknown subcommand '{sub}'");
+            std::process::ExitCode::FAILURE
         }
-        // Default (including "serve"): submit-only mTLS listener (not implemented).
-        _ => run_service(),
     }
 }
 
-fn run_offline() -> u8 {
+fn run_offline(subcommand: &str) -> std::process::ExitCode {
     // The offline subcommands require OS-owner safe-path and PKCS#11
     // authentication; they open no listener and never accept submit
     // credentials. The stub confirms the subcommand surface compiles.
-    0
+    eprintln!(
+        "tenant-authority {subcommand}: not implemented: offline subcommand is not wired yet"
+    );
+    std::process::ExitCode::FAILURE
 }
 
 fn run_service() -> std::process::ExitCode {

@@ -23,14 +23,17 @@
 //! - Handler dispatch: evidence verification beyond header parsing is stubbed;
 //!   no statement is authorized.
 //!
-//! Standalone Rust service implementing the eleven closed canonical tenant-
-//! authority operations over submit-only mTLS (HTTP/2 over TLS 1.3 with
-//! mandatory client certificates), backed by non-exportable PKCS#11 tenant
-//! ES256 private keys. It imports the paired Rust protocol crate
-//! [`cockpit_proto::remote_tenant_authority_protocol`] and never control-plane
-//! API internals, TypeScript API code, or a generic signing surface.
+//! ## Intended production contract
 //!
-//! # Surface contract
+//! The reference crate targets a standalone Rust service that would implement
+//! the eleven closed canonical tenant-authority operations over submit-only
+//! mTLS (HTTP/2 over TLS 1.3 with mandatory client certificates), backed by
+//! non-exportable PKCS#11 tenant ES256 private keys. It imports the paired
+//! Rust protocol crate [`cockpit_proto::remote_tenant_authority_protocol`]
+//! and would never depend on control-plane API internals, TypeScript API code,
+//! or a generic signing surface.
+//!
+//! # Surface contract (reference)
 //!
 //! - Exactly eleven public mTLS routes; no raw sign/JWS/JWK endpoint.
 //! - mTLS selection occurs before request parsing from SNI host plus the
@@ -44,14 +47,14 @@
 //!   fixed-purpose local OS-owner/PKCS#11-authenticated commands with no
 //!   public route (subcommand surface only; not wired).
 //!
-//! This crate owns the closed handler surface, strict config/replica/
+//! This crate defines the closed handler surface, strict config/replica/
 //! credential file schemas, the fixed-statement provider trait, the pure
-//! policy reducer, durable idempotency/epoch/preparation stores, mTLS
-//! adapter types, and readiness/shutdown. Production persistence is one
-//! customer-operated PostgreSQL database. The non-Unix build retains every
-//! codec, validator, pure state-machine test, and bootstrap parser; the
-//! `serve` subcommand fails closed with [`ServiceListenError`] (not
-//! implemented on Unix, unsupported platform elsewhere).
+//! policy reducer, mTLS adapter types, and readiness/shutdown. Durable
+//! idempotency/epoch/preparation stores and production PostgreSQL persistence
+//! are specified but not wired. The non-Unix build retains every codec,
+//! validator, pure state-machine test, and bootstrap parser; the `serve`
+//! subcommand fails closed with [`ServiceListenError`] (not implemented on
+//! Unix, unsupported platform elsewhere).
 
 #![forbid(unsafe_code)]
 

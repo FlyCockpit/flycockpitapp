@@ -42,9 +42,9 @@ pub enum ServiceReadiness {
     NotReady,
 }
 
-/// The tenant-authority service. Owns the closed handler table, key provider,
-/// mTLS selection, and durable stores. The listener is not implemented yet;
-/// [`Self::listen`] fails closed on every target.
+/// The tenant-authority service. Tracks readiness state only; the closed
+/// handler table, key provider, mTLS selection, and durable stores are not
+/// wired yet. [`Self::listen`] fails closed on every target.
 #[derive(Debug)]
 pub struct Service {
     readiness: ServiceReadiness,

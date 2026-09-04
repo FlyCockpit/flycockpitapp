@@ -105,6 +105,9 @@ pub struct RetentionOutcome {
     /// Verification envelopes transitioned to `retention_state = 'cleaned'`;
     /// their rows survive digest-only, so they are not deletions.
     pub verification_envelopes_cleaned: u64,
+    /// Rows deleted from append-only ledgers (`external_journal_*`, `intel_*`,
+    /// terminal audit receipts) during the ledger retention sweep.
+    pub append_only_ledger_rows_deleted: u64,
     pub vacuumed: bool,
 }
 
@@ -414,6 +417,9 @@ impl Db {
                     now_secs.saturating_mul(1000),
                 )
                 .await?;
+            outcome.append_only_ledger_rows_deleted = self
+                .prune_append_only_ledgers(terminal_evidence_cutoff.saturating_mul(1000))
+                .await?;
         }
 
         let deleted = outcome
@@ -421,6 +427,7 @@ impl Db {
             .saturating_add(outcome.payload_rows_deleted)
             .saturating_add(outcome.goal_tombstones_purged);
         let deleted = deleted.saturating_add(outcome.local_authority_rows_purged);
+        let deleted = deleted.saturating_add(outcome.append_only_ledger_rows_deleted);
         if self.path.is_some()
             && self.should_vacuum(deleted, now_secs, cfg).await
             && self.vacuum_retention_database().await?
@@ -430,6 +437,16 @@ impl Db {
         }
 
         Ok(outcome)
+    }
+
+    /// Bounded GC for append-only ledgers that would otherwise retain
+    /// user-derived or operational evidence indefinitely.
+    pub async fn prune_append_only_ledgers(&self, cutoff_unix_ms: i64) -> Result<u64> {
+        self.write(move |conn| {
+            super::ledger_retention::prune_append_only_ledgers_conn(conn, cutoff_unix_ms)
+                .map(|outcome| outcome.rows_deleted())
+        })
+        .await
     }
 
     async fn vacuum_retention_database(&self) -> Result<bool> {

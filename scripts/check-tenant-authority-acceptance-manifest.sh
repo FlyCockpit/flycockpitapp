@@ -3,12 +3,15 @@ set -euo pipefail
 
 # Tenant-authority acceptance-manifest ratchet.
 #
-# Within the package-scoped `cargo nextest list -p tenant-authority
-# --features remote --message-format json` stream, every `tenant_authority_*`
-# name must come from binary `tenant_authority_service_acceptance`, the complete
-# lexicographically sorted manifest must match exactly the nine names in
-# `verify_tenant_authority_acceptance_manifest.mjs`, and none may have
-# `ignored=true`.
+# 1. Source scan: every `#[test] fn tenant_authority_*` in this package must
+#    live only in `tests/tenant_authority_service_acceptance.rs` (feature-
+#    independent; closes prefixed tests gated on a future non-remote feature).
+# 2. Nextest list: within `cargo nextest list -p tenant-authority --features
+#    remote --message-format json`, every `tenant_authority_*` name must come
+#    from binary `tenant_authority_service_acceptance`, the complete
+#    lexicographically sorted manifest must match exactly the nine names in
+#    `verify_tenant_authority_acceptance_manifest.mjs`, and none may have
+#    `ignored=true`.
 #
 # This script must itself run as an unconditional `run:` step of a blocking
 # pull_request/push job. A comment in the verifier or acceptance suite
@@ -181,7 +184,29 @@ def assert_manifest_ratchet_is_blocking() -> None:
         )
 
 
+def assert_prefix_reserved_in_acceptance_only() -> None:
+    pkg = Path("apps/tenant-authority")
+    acceptance = pkg / "tests" / "tenant_authority_service_acceptance.rs"
+    pattern = re.compile(
+        r"(?m)^\s*#\[test\]\s*\n\s*fn\s+(tenant_authority_[A-Za-z0-9_]+)\s*\("
+    )
+    violations: list[str] = []
+    for path in sorted(pkg.rglob("*.rs")):
+        if path == acceptance:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for match in pattern.finditer(text):
+            violations.append(f"{path}:{match.group(1)}")
+    if violations:
+        die(
+            "tenant_authority_* test-name prefix is reserved for the nine "
+            "acceptance suites in tests/tenant_authority_service_acceptance.rs; "
+            f"found elsewhere: {', '.join(violations)}"
+        )
+
+
 assert_manifest_ratchet_is_blocking()
+assert_prefix_reserved_in_acceptance_only()
 PY
 
 cargo nextest list --locked \

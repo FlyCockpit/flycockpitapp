@@ -3,7 +3,8 @@
 //! Spawns the built binary via `CARGO_BIN_EXE_tenant-authority` and asserts
 //! every subcommand surface fails closed with a non-zero exit. Test names
 //! intentionally avoid the `tenant_authority_` prefix reserved for the nine
-//! acceptance suites in `tenant_authority_service_acceptance.rs`.
+//! acceptance suites in `tenant_authority_service_acceptance.rs` (enforced
+//! by `scripts/check-tenant-authority-acceptance-manifest.sh`).
 
 fn tenant_authority_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_tenant-authority"))

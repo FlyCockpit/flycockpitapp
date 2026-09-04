@@ -21,10 +21,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use cockpit_db::computer_audit::{
     COMPUTER_AUDIT_ENTRY_LEN, COMPUTER_AUDIT_EVENT_KIND_OFFSET, COMPUTER_AUDIT_KEY_VERSION_OFFSET,
     COMPUTER_AUDIT_PROPOSAL_ID_OFFSET, COMPUTER_AUDIT_SEQUENCE_OFFSET, ComputerAuditEntryRow,
-    GUIDANCE_PROPOSAL_ACCEPTED, GUIDANCE_PROPOSAL_CREATED, GUIDANCE_PROPOSAL_EXPIRED,
-    GUIDANCE_PROPOSAL_REJECTED,
+    ComputerAuditPruneAuthorization, GUIDANCE_PROPOSAL_ACCEPTED, GUIDANCE_PROPOSAL_CREATED,
+    GUIDANCE_PROPOSAL_EXPIRED, GUIDANCE_PROPOSAL_REJECTED,
 };
 use cockpit_db::installation_identity::InstallationIdentity;
+use uuid::Uuid;
 
 use crate::db::Db;
 use crate::secure_key::{
@@ -434,6 +435,229 @@ impl ComputerAuditChain {
         Err(ReceiverReproofAppendError::Unavailable)
     }
 
+    /// Bounded retention for aged audit bodies. Appends a `PruneCheckpoint`
+    /// entry, then truncates the documented prefix from SQLite.
+    pub async fn prune_retained_entries(&self, cutoff_unix_ms: i64) -> Result<u64> {
+        if cutoff_unix_ms <= 0 || !self.is_available() {
+            return Ok(0);
+        }
+        let mut guard = self.inner.lock().await;
+        let inner = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("computer audit chain is not available"))?;
+        let status = self.verify_loaded(inner).await?;
+        if !matches!(
+            status.status,
+            AuditVerifyStatus::Verified | AuditVerifyStatus::PendingRecovery
+        ) {
+            bail!("computer audit chain is not verified");
+        }
+        let rows = self
+            .db
+            .list_computer_audit_entries()
+            .await
+            .context("listing computer audit entries for retention")?;
+        if rows.len() <= 1 {
+            return Ok(0);
+        }
+        let resumed = self
+            .resume_incomplete_prune_truncations(&rows)
+            .await
+            .context("resuming incomplete computer audit prune truncations")?;
+        let rows = if resumed > 0 {
+            self.db
+                .list_computer_audit_entries()
+                .await
+                .context("reloading computer audit entries after prune resume")?
+        } else {
+            rows
+        };
+        if rows.len() <= 1 {
+            return Ok(resumed);
+        }
+        let prefix_start = next_prune_prefix_start(&rows);
+        let mut prefix_end = None;
+        for row in &rows {
+            let entry = authenticated_entry(row).context("authenticating prune candidate")?;
+            if entry.sequence < prefix_start {
+                continue;
+            }
+            if entry.sequence >= status.confirmed_sequence {
+                break;
+            }
+            if entry.event_kind == AuditEventKind::PruneCheckpoint {
+                break;
+            }
+            if entry.wall_unix_millis >= cutoff_unix_ms {
+                break;
+            }
+            prefix_end = Some(entry.sequence);
+        }
+        let Some(prefix_end) = prefix_end else {
+            return Ok(resumed);
+        };
+        let first_mac = rows
+            .iter()
+            .find_map(|row| (row.sequence == prefix_start).then_some(row.mac))
+            .context("missing prune prefix start entry")?;
+        let last_mac = rows
+            .iter()
+            .find_map(|row| (row.sequence == prefix_end).then_some(row.mac))
+            .context("missing prune prefix end entry")?;
+        let entry_count = prefix_end
+            .checked_sub(prefix_start)
+            .and_then(|delta| delta.checked_add(1))
+            .context("prune prefix range overflow")?;
+        let prior_checkpoint_digest = latest_prune_checkpoint_digest(&rows);
+        let export_id = Uuid::new_v4();
+        let mut export_material = Vec::with_capacity(64);
+        export_material.extend_from_slice(&first_mac);
+        export_material.extend_from_slice(&last_mac);
+        let export_digest = {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(&export_material);
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&digest);
+            out
+        };
+        let operation_id = Uuid::new_v4();
+        let record_digest = super::prune_checkpoint_record_digest(
+            &operation_id,
+            prefix_start,
+            prefix_end,
+            &first_mac,
+            &last_mac,
+            entry_count,
+            &export_id,
+            &export_digest,
+            &prior_checkpoint_digest,
+        )
+        .context("digesting prune checkpoint record")?;
+        self.append_prune_checkpoint_locked(
+            inner,
+            &PruneCheckpointAppend {
+                operation_id,
+                prefix_start,
+                prefix_end,
+                first_mac,
+                last_mac,
+                export_id,
+                export_digest,
+                prior_checkpoint_digest,
+                record_digest,
+            },
+        )
+        .await
+        .map(|deleted| deleted.saturating_add(resumed))
+    }
+
+    async fn append_prune_checkpoint_locked(
+        &self,
+        inner: &mut ChainInner,
+        event: &PruneCheckpointAppend,
+    ) -> Result<u64> {
+        for _ in 0..MAX_CAS_RETRIES {
+            let mut view = self
+                .keys
+                .sealed_load(COMPUTER_AUDIT_HEAD_V1_NAMESPACE)
+                .await
+                .context("loading computer audit sealed head")?;
+            let head = decode_head(view.payload.as_slice())
+                .context("decoding computer audit sealed head")?;
+            let sequence = head
+                .confirmed_sequence
+                .checked_add(1)
+                .context("computer audit sequence overflow")?;
+            let monotonic = next_monotonic(inner.last_monotonic);
+            let wall_unix_millis = chrono::Utc::now().timestamp_millis();
+            let entry = build_prune_checkpoint_entry(
+                event,
+                sequence,
+                head.confirmed_mac,
+                inner.current_key_version,
+                monotonic,
+                wall_unix_millis,
+            );
+            let entry_bytes = entry.encode();
+            let hmac_key = inner
+                .hmac_keys
+                .get(&inner.current_key_version)
+                .context("computer audit HMAC key missing")?;
+            let mac = super::entry_mac(hmac_key.as_ref(), &entry_bytes);
+            let pending = ComputerAuditSealedHeadV1::with_pending(
+                head.sealed_generation,
+                head.confirmed_sequence,
+                head.confirmed_mac,
+                head.confirmed_key_version,
+                inner.database_instance_id,
+                entry_bytes,
+                mac,
+                head.confirmed_sequence,
+                head.confirmed_mac,
+                inner.current_key_version,
+                inner.database_instance_id,
+            );
+            match self.cas_head(&view, &pending).await {
+                Ok(pending_view) => view = pending_view,
+                Err(CasOutcome::Conflict) => continue,
+                Err(CasOutcome::Fatal(error)) => return Err(error),
+            }
+            let row = ComputerAuditEntryRow {
+                sequence,
+                entry_bytes,
+                mac,
+                event_kind: AuditEventKind::PruneCheckpoint.as_byte(),
+                proposal_id: *event.operation_id.as_bytes(),
+                key_version: inner.current_key_version,
+            };
+            self.db
+                .insert_computer_audit_entry(row)
+                .await
+                .context("inserting prune checkpoint entry")?;
+            let confirmed = ComputerAuditSealedHeadV1::confirmed_only(
+                head.sealed_generation.saturating_add(1).max(1),
+                sequence,
+                mac,
+                inner.current_key_version,
+                inner.database_instance_id,
+            );
+            match self.cas_head(&view, &confirmed).await {
+                Ok(_) => {
+                    inner.last_monotonic = monotonic;
+                    return self
+                        .truncate_prune_checkpoint_prefix(event.prefix_end)
+                        .await
+                        .context("truncating pruned computer audit prefix");
+                }
+                Err(CasOutcome::Conflict) => continue,
+                Err(CasOutcome::Fatal(error)) => return Err(error),
+            }
+        }
+        Err(anyhow!(
+            "computer audit prune checkpoint CAS exhausted retries"
+        ))
+    }
+
+    async fn truncate_prune_checkpoint_prefix(&self, prefix_end: u64) -> Result<u64> {
+        self.db
+            .truncate_computer_audit_prefix_verified(ComputerAuditPruneAuthorization {
+                prefix_end_inclusive: prefix_end,
+            })
+            .await
+    }
+
+    async fn resume_incomplete_prune_truncations(
+        &self,
+        rows: &[ComputerAuditEntryRow],
+    ) -> Result<u64> {
+        let Some(prefix_end) = incomplete_prune_truncation_end(rows) else {
+            return Ok(0);
+        };
+        self.truncate_prune_checkpoint_prefix(prefix_end)
+            .await
+            .context("resuming incomplete computer audit prune truncation")
+    }
+
     #[cfg(test)]
     pub(crate) fn inject_append_fault(&self, fault: AppendFault) {
         self.append_fault
@@ -528,6 +752,10 @@ impl ComputerAuditChain {
             AuditVerifyStatus::PendingRecovery => {
                 self.recover_pending(&mut inner, &view, &head, &rows)
                     .await?;
+                let rows = self.db.list_computer_audit_entries().await?;
+                self.resume_incomplete_prune_truncations(&rows)
+                    .await
+                    .context("resuming prune truncation after pending recovery")?;
                 let rows = self.db.list_computer_audit_entries().await?;
                 let head = decode_head(
                     self.keys
@@ -903,6 +1131,11 @@ impl ComputerAuditChain {
         match self.cas_head(view, &confirmed).await {
             Ok(_) => {
                 inner.last_monotonic = inner.last_monotonic.max(pending_entry.monotonic_nanos);
+                if pending_entry.event_kind == AuditEventKind::PruneCheckpoint {
+                    self.truncate_prune_checkpoint_prefix(pending_entry.monotonic_nanos)
+                        .await
+                        .context("truncating prune checkpoint prefix after pending recovery")?;
+                }
                 Ok(())
             }
             Err(CasOutcome::Conflict) => {
@@ -1191,6 +1424,97 @@ fn build_receiver_reproof_entry(
         monotonic_nanos,
         wall_unix_millis,
         error_code: event.error_code.as_u16(),
+        rule_kind_bits: 0,
+        key_version,
+    }
+}
+
+struct PruneCheckpointAppend {
+    operation_id: Uuid,
+    prefix_start: u64,
+    prefix_end: u64,
+    first_mac: [u8; 32],
+    last_mac: [u8; 32],
+    export_id: Uuid,
+    export_digest: [u8; 32],
+    prior_checkpoint_digest: [u8; 32],
+    record_digest: [u8; 32],
+}
+
+fn next_prune_prefix_start(rows: &[ComputerAuditEntryRow]) -> u64 {
+    rows.iter()
+        .filter_map(|row| authenticated_entry(row).ok())
+        .filter(|entry| entry.event_kind == AuditEventKind::PruneCheckpoint)
+        .map(|entry| entry.monotonic_nanos.saturating_add(1))
+        .max()
+        .unwrap_or(1)
+}
+
+fn incomplete_prune_truncation_end(rows: &[ComputerAuditEntryRow]) -> Option<u64> {
+    let prefix_end = rows
+        .iter()
+        .filter_map(|row| authenticated_entry(row).ok())
+        .filter(|entry| entry.event_kind == AuditEventKind::PruneCheckpoint)
+        .map(|entry| entry.monotonic_nanos)
+        .last()?;
+    rows.iter()
+        .any(|row| row.sequence <= prefix_end)
+        .then_some(prefix_end)
+}
+
+fn latest_prune_checkpoint_digest(rows: &[ComputerAuditEntryRow]) -> [u8; 32] {
+    rows.iter()
+        .filter_map(|row| authenticated_entry(row).ok())
+        .filter(|entry| entry.event_kind == AuditEventKind::PruneCheckpoint)
+        .map(|entry| entry.record_digest)
+        .last()
+        .unwrap_or([0u8; 32])
+}
+
+fn build_prune_checkpoint_entry(
+    event: &PruneCheckpointAppend,
+    sequence: u64,
+    previous_mac: [u8; 32],
+    key_version: u32,
+    monotonic_nanos: u64,
+    wall_unix_millis: i64,
+) -> ComputerAuditEntryV1 {
+    let present_bits_mask = present_bits::OPERATION_ID
+        | present_bits::RECORD_DIGEST
+        | present_bits::JOURNAL_VERSION
+        | present_bits::SESSION_ID
+        | present_bits::CANONICAL_PROJECT_DIGEST
+        | present_bits::MODEL_DIGEST
+        | present_bits::OBSERVATION_DIGEST
+        | present_bits::HOST_LEASE_DIGEST;
+    ComputerAuditEntryV1 {
+        event_kind: AuditEventKind::PruneCheckpoint,
+        present_bits: present_bits_mask,
+        sequence,
+        previous_mac,
+        session_id: *event.export_id.as_bytes(),
+        delegation_id: [0u8; 16],
+        action_id: [0u8; 16],
+        operation_id: *event.operation_id.as_bytes(),
+        proposal_id: [0u8; 16],
+        disposition: 0,
+        scope: 0,
+        canonical_project_digest: event.export_digest,
+        provider_digest: [0u8; 32],
+        model_digest: event.prior_checkpoint_digest,
+        physical_target_digest: [0u8; 32],
+        focus_digest: [0u8; 32],
+        observation_digest: event.first_mac,
+        host_lease_digest: event.last_mac,
+        record_digest: event.record_digest,
+        ask_yolo: 0,
+        action_class: 0,
+        journal_state: 0,
+        verification_state: 0,
+        journal_version: event.prefix_start,
+        monotonic_nanos: event.prefix_end,
+        wall_unix_millis,
+        error_code: 0,
         rule_kind_bits: 0,
         key_version,
     }

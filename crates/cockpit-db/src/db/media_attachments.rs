@@ -1486,15 +1486,15 @@ pub enum SecurityRecoverySnapshotResult {
 
 struct MediaUploadStatusRow {
     state: String,
-    generation: String,
+    generation: i64,
     kind: String,
     chunks: u32,
-    bytes: String,
+    bytes: i64,
     expires: i64,
     transition: String,
     draft: String,
     attachment: Option<String>,
-    attachment_version: Option<String>,
+    attachment_version: Option<i64>,
 }
 
 pub struct AcquireMediaReferenceInput<'a> {
@@ -1549,7 +1549,7 @@ impl super::Db {
         else {
             return Ok(None);
         };
-        let generation = generation.parse::<u64>()?;
+        let generation = u64::try_from(generation).context("invalid upload generation")?;
         ensure!(
             generation == request.upload_generation,
             "media_attachment_unavailable"
@@ -1571,9 +1571,10 @@ impl super::Db {
                 attachment_id: Uuid::parse_str(
                     &attachment.context("materialized attachment missing")?,
                 )?,
-                attachment_version: attachment_version
-                    .context("materialized version missing")?
-                    .parse()?,
+                attachment_version: u64::try_from(
+                    attachment_version.context("materialized version missing")?,
+                )
+                .context("invalid materialized attachment version")?,
             },
             "cancelled" => MediaUploadStateDetailV1::Cancelled {
                 reason: reason.unwrap(),
@@ -1595,7 +1596,7 @@ impl super::Db {
             media_kind,
             expires_at_unix_ms: expires,
             acknowledged_chunks: chunks,
-            acknowledged_bytes: bytes.parse()?,
+            acknowledged_bytes: u64::try_from(bytes).context("invalid acknowledged bytes")?,
             last_transition: serde_json::from_str(&transition)?,
             detail,
         }))
@@ -1783,7 +1784,7 @@ impl super::Db {
             MediaAvailability::Ready => {
                 let checksum:Option<String>=conn.query_row("SELECT sha256 FROM media_attachment_components WHERE attachment_id=?1 AND attachment_version=?2 AND component_kind IN ('image_model','audio_model','video_model') AND lifecycle_state='ready' ORDER BY component_kind LIMIT 1",params![record.attachment_id.to_string(),decimal(record.attachment_version)?],|row|row.get(0)).optional()?;
                 let preview = if record.media_kind == MediaKind::Image {
-                    conn.query_row("SELECT c.component_generation,c.sha256,d.width,d.height,c.byte_length FROM media_attachment_components c JOIN media_image_component_dimensions d ON d.component_id=c.component_id WHERE c.attachment_id=?1 AND c.attachment_version=?2 AND c.component_kind='browser_thumbnail' AND c.lifecycle_state='ready'",params![record.attachment_id.to_string(),decimal(record.attachment_version)?],|row|Ok(MediaAttachmentPreviewSummaryV1{generation:row.get::<_,String>(0)?.parse().map_err(|_|rusqlite::Error::InvalidQuery)?,checksum:row.get(1)?,width:row.get(2)?,height:row.get(3)?,byte_length:row.get::<_,String>(4)?.parse().map_err(|_|rusqlite::Error::InvalidQuery)?})).optional()?.map(Some).context("ready image preview missing")?
+                    conn.query_row("SELECT c.component_generation,c.sha256,d.width,d.height,c.byte_length FROM media_attachment_components c JOIN media_image_component_dimensions d ON d.component_id=c.component_id WHERE c.attachment_id=?1 AND c.attachment_version=?2 AND c.component_kind='browser_thumbnail' AND c.lifecycle_state='ready'",params![record.attachment_id.to_string(),decimal(record.attachment_version)?],|row|Ok(MediaAttachmentPreviewSummaryV1{generation:u64::try_from(row.get::<_,i64>(0)?).map_err(|_|rusqlite::Error::InvalidQuery)?,checksum:row.get(1)?,width:row.get(2)?,height:row.get(3)?,byte_length:u64::try_from(row.get::<_,i64>(4)?).map_err(|_|rusqlite::Error::InvalidQuery)?})).optional()?.map(Some).context("ready image preview missing")?
                 } else {
                     None
                 };
@@ -1973,9 +1974,9 @@ impl super::Db {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, Option<String>>(7)?,
@@ -1998,9 +1999,9 @@ impl super::Db {
                     component: VerifiedBlockedComponent {
                         component_id: Uuid::parse_str(&id)?,
                         component_kind: kind,
-                        component_generation: parse_decimal(generation, "component generation")?,
+                        component_generation: positive_u64(generation, "component generation")?,
                         stable_identity_digest: identity,
-                        byte_length: parse_decimal(length, "component byte length")?,
+                        byte_length: positive_u64(length, "component byte length")?,
                         sha256: checksum,
                         reservation_id: reservation,
                         deletion_evidence_digest: deletion,
@@ -2309,7 +2310,7 @@ impl super::Db {
                 "discard admission conflict"
             );
         }
-        let expected_origin=conn.query_row("SELECT client_draft_id,upload_id,upload_generation FROM media_attachment_upload_origins WHERE attachment_id=?1",[request.attachment_id.to_string()],|row|Ok(MediaOriginUploadV1{client_draft_id:Uuid::parse_str(&row.get::<_,String>(0)?).map_err(|_|rusqlite::Error::InvalidQuery)?,upload_id:Uuid::parse_str(&row.get::<_,String>(1)?).map_err(|_|rusqlite::Error::InvalidQuery)?,upload_generation:row.get::<_,String>(2)?.parse().map_err(|_|rusqlite::Error::InvalidQuery)?})).optional()?;
+        let expected_origin=conn.query_row("SELECT client_draft_id,upload_id,upload_generation FROM media_attachment_upload_origins WHERE attachment_id=?1",[request.attachment_id.to_string()],|row|Ok(MediaOriginUploadV1{client_draft_id:Uuid::parse_str(&row.get::<_,String>(0)?).map_err(|_|rusqlite::Error::InvalidQuery)?,upload_id:Uuid::parse_str(&row.get::<_,String>(1)?).map_err(|_|rusqlite::Error::InvalidQuery)?,upload_generation:u64::try_from(row.get::<_,i64>(2)?).map_err(|_|rusqlite::Error::InvalidQuery)?})).optional()?;
         ensure!(
             request.origin_upload == expected_origin,
             "discard origin conflict"
@@ -2735,9 +2736,14 @@ fn component_kind_compatible(
             || matches!(component_kind, "upload_temporary" | "quarantined_original"))
 }
 
-fn decimal(value: u64) -> Result<String> {
+fn decimal(value: u64) -> Result<i64> {
     ensure!(value > 0, "media u64 value must be positive");
-    Ok(value.to_string())
+    i64::try_from(value).context("media value exceeds i64")
+}
+
+fn positive_u64(value: i64, field: &'static str) -> Result<u64> {
+    ensure!(value > 0, "{field} must be positive");
+    u64::try_from(value).with_context(|| format!("{field} exceeds u64"))
 }
 
 fn parse_decimal(value: String, field: &'static str) -> Result<u64> {
@@ -2774,8 +2780,12 @@ fn component_decimal(
     column: usize,
     field: &'static str,
 ) -> rusqlite::Result<u64> {
-    parse_decimal(row.get(column)?, field).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, error.into())
+    positive_u64(row.get(column)?, field).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Integer,
+            error.into(),
+        )
     })
 }
 
@@ -2831,15 +2841,15 @@ fn decode_record_fallible(row: &rusqlite::Row<'_>) -> Result<MediaAttachmentReco
         canonical_container: row.get(5)?,
         canonical_mime: row.get(6)?,
         availability: MediaAvailability::parse(&row.get::<_, String>(7)?)?,
-        attachment_version: parse_decimal(row.get(8)?, "attachment version")?,
-        availability_generation: parse_decimal(row.get(9)?, "availability generation")?,
-        reference_generation: parse_decimal(row.get(10)?, "reference generation")?,
-        captured_capability_generation: parse_decimal(
+        attachment_version: positive_u64(row.get(8)?, "attachment version")?,
+        availability_generation: positive_u64(row.get(9)?, "availability generation")?,
+        reference_generation: positive_u64(row.get(10)?, "reference generation")?,
+        captured_capability_generation: positive_u64(
             row.get(11)?,
             "captured capability generation",
         )?,
         source_identity_digest: row.get(12)?,
-        source_byte_length: parse_decimal(row.get(13)?, "source byte length")?,
+        source_byte_length: positive_u64(row.get(13)?, "source byte length")?,
         source_sha256: row.get(14)?,
         selected_video_stream: parse_stream(row.get(15)?)?,
         selected_audio_stream: parse_stream(row.get(16)?)?,
@@ -2863,7 +2873,7 @@ fn existing_reference(
 ) -> Result<Option<AcquiredMediaReference>> {
     conn.query_row("SELECT reference_id,acquired_generation FROM media_attachment_references WHERE attachment_id=?1 AND attachment_version=?2 AND consumer_kind=?3 AND consumer_id=?4", params![attachment_id.to_string(), decimal(version)?, kind.as_str(), consumer_id], |row| {
         let reference_id = Uuid::parse_str(&row.get::<_, String>(0)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error)))?;
-        let generation = parse_decimal(row.get(1)?, "acquired generation").map_err(|error| rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, error.into()))?;
+        let generation = positive_u64(row.get(1)?, "acquired generation").map_err(|error| rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Integer, error.into()))?;
         Ok(AcquiredMediaReference { reference_id, attachment_id, attachment_version: version, reference_generation: generation, inserted: false })
     }).optional().context("loading media attachment reference")
 }

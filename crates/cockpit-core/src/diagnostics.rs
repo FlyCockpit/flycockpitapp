@@ -738,7 +738,6 @@ fn is_absent_database(message: &str) -> bool {
 fn is_schema_rejection(message: &str) -> bool {
     [
         crate::db::SCHEMA_PROFILE_MISMATCH_CODE,
-        crate::db::SCHEMA_REJECTION_AFTER_OPEN_CODE,
         "incompatible prerelease database schema",
         "incompatible legacy prerelease database schema",
         "database migration ledger is corrupt",

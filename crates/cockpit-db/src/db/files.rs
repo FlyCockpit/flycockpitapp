@@ -730,24 +730,21 @@ pub(crate) fn delete_relative_file_durable_nofollow(base: &Path, relative: &Path
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
 
-    let components = relative.components().collect::<Vec<_>>();
-    anyhow::ensure!(!components.is_empty(), "sidecar cleanup path is empty");
-    anyhow::ensure!(
-        components
-            .iter()
-            .all(|component| matches!(component, std::path::Component::Normal(_))),
-        "sidecar cleanup path must be relative and normalized"
-    );
+    let names: Vec<&std::ffi::OsStr> = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(name) => Ok(name),
+            _ => anyhow::bail!("sidecar cleanup path must be relative and normalized"),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(!names.is_empty(), "sidecar cleanup path is empty");
     let mut directory = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(base)
         .with_context(|| format!("opening sidecar cleanup base {}", base.display()))?;
     let mut durable_parent = base.to_path_buf();
-    for component in &components[..components.len() - 1] {
-        let std::path::Component::Normal(name) = component else {
-            unreachable!("components were validated")
-        };
+    for name in &names[..names.len() - 1] {
         durable_parent.push(name);
         let name = CString::new(name.as_bytes()).context("sidecar directory contains NUL")?;
         // SAFETY: `directory` is a live directory fd and `name` contains one
@@ -770,10 +767,7 @@ pub(crate) fn delete_relative_file_durable_nofollow(base: &Path, relative: &Path
         // SAFETY: successful `openat` returned a newly owned descriptor.
         directory = unsafe { std::fs::File::from_raw_fd(fd) };
     }
-    let std::path::Component::Normal(name) = components.last().expect("nonempty validated path")
-    else {
-        unreachable!("components were validated")
-    };
+    let name = names.last().expect("nonempty validated path");
     let name = CString::new(name.as_bytes()).context("sidecar filename contains NUL")?;
     // SAFETY: held parent fd plus a single literal filename; unlinkat never
     // follows a symlink in the final component.

@@ -1326,24 +1326,8 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// profiles, agent-dimensioned MCP scopes on the attached-session and
 /// daemon-owned setup inventory, bounded base64 media previews, the
 /// rolling-precompaction resume choice, and knowledge-dream completion
-/// receipts including ordered all-KB runs. Older fixtures remain frozen
-/// migration evidence, not a compatibility window.
+/// receipts including ordered all-KB runs.
 pub const PROTOCOL_VERSION: u32 = 22;
-
-/// Oldest wire schema version this binary accepts. Exact-match only until a
-/// compacted v1 ships. v22 is current-only: all pre-launch wire changes are
-/// edited in place, with no compatibility shim.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 22;
-
-/// Oldest protocol version whose daemon fixtures are frozen in the append-only
-/// archive ledger at `tests/fixtures/daemon_proto/archive.sha256`. Every
-/// version in `FIRST_ARCHIVED_PROTOCOL_VERSION..PROTOCOL_VERSION` must be
-/// recorded there, and recorded digests are append-only: they are never
-/// legitimately rewritten or removed. Freezing is not a remembered step —
-/// `tests/wire_schema_version.rs` derives the frozen range from this constant
-/// and `PROTOCOL_VERSION`, so minting a new version structurally fails until
-/// the retiring version is appended to the ledger.
-pub const FIRST_ARCHIVED_PROTOCOL_VERSION: u32 = 12;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1430,13 +1414,12 @@ pub const IMAGE_ATTACHMENT_MIME_PNG: &str = "image/png";
 pub const IMAGE_PART_SENTINEL: &str = "\u{0}<cockpit-image-part>\u{0}";
 
 pub fn is_protocol_compatible(v: u32) -> bool {
-    (MIN_SUPPORTED_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&v)
+    v == PROTOCOL_VERSION
 }
 
 pub fn version_mismatch_message(v: u32) -> String {
     format!(
-        "wire protocol version mismatch: peer sent v{v}, this binary speaks v{} (supported {}..={})",
-        PROTOCOL_VERSION, MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION
+        "wire protocol version mismatch: peer sent v{v}, this binary speaks v{PROTOCOL_VERSION} only"
     )
 }
 
@@ -1479,8 +1462,7 @@ impl NegotiatedProtocol {
 
 pub fn incompatible_daemon_protocol_message(daemon_protocol_version: u32) -> String {
     format!(
-        "daemon speaks protocol v{daemon_protocol_version}; this client supports v{}..=v{}. run `cockpit daemon restart`",
-        MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION
+        "daemon speaks protocol v{daemon_protocol_version}; this client requires v{PROTOCOL_VERSION} exactly. run `cockpit daemon restart`"
     )
 }
 
@@ -2222,7 +2204,7 @@ fn default_daemon_version() -> String {
 }
 
 fn default_client_protocol_version() -> u32 {
-    MIN_SUPPORTED_PROTOCOL_VERSION
+    PROTOCOL_VERSION
 }
 
 // (The wire event variant for the same state change lives on `Event`
@@ -3964,210 +3946,6 @@ pub enum InterruptRaiseReason {
     Rehydration,
 }
 
-/// Return the first protocol version that can carry a typed body. This gate
-/// is intentionally applied after negotiation and before serialization: a
-/// A compatibility-window client must never serialize a newer RPC with an
-/// older envelope and leave an older daemon to interpret it.
-fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
-    match body {
-        Body::Request { request, .. } => {
-            let tag = request.wire_tag();
-            let version = match tag {
-                "begin_provider_oauth"
-                | "complete_provider_oauth"
-                | "cancel_provider_oauth"
-                | "begin_mcp_oauth"
-                | "complete_mcp_oauth"
-                | "cancel_mcp_oauth"
-                | "put_provider_credential"
-                | "delete_provider_credential"
-                | "save_mcp_config"
-                | "apply_extended_config_patch"
-                | "get_local_operation_settlement"
-                | "setup_copilot_auth"
-                | "put_subscription_ack"
-                | "apply_provider_mutation"
-                | "save_image_spend_policy"
-                | "begin_agent_editor_lease"
-                | "complete_agent_editor_lease"
-                | "get_agent_editor_lease_settlement" => 17,
-                "mutate_agent" | "save_assistant_definition" | "delete_assistant" => 17,
-                "cancel_leak_reveal" => 16,
-                "get_provider_catalog_snapshot" => 15,
-                "list_secret_inventory"
-                | "put_named_secret"
-                | "delete_named_secret"
-                | "get_flycockpit_account"
-                | "set_flycockpit_connector_enabled"
-                | "sync_flycockpit_org_policy"
-                | "enroll_flycockpit_org_sync"
-                | "fetch_provider_models"
-                | "get_provider_usage_snapshot"
-                | "upsert_provider_config"
-                | "delete_provider_config"
-                | "set_provider_layer_metadata"
-                | "save_provider_config"
-                | "apply_setup_wizard"
-                | "get_agent_inventory"
-                | "get_agent_edit_snapshot"
-                | "get_extended_config_snapshot"
-                | "get_image_sidecar_authority_snapshot"
-                | "create_image_sidecar_grant"
-                | "revoke_image_sidecar_grant"
-                | "save_extended_config"
-                | "export_policy"
-                | "import_policy"
-                | "get_image_spend_policy"
-                | "list_packages"
-                | "add_package"
-                | "import_package"
-                | "prune_packages"
-                | "import_kcl_packages"
-                | "get_connector_state"
-                | "get_org_sync_status"
-                | "list_failed_tool_calls"
-                | "get_session_compactions"
-                | "list_media_egress_verdicts"
-                | "revoke_media_egress_verdict"
-                | "purge_ended_sessions"
-                | "get_assistant"
-                | "diagnose_media_reservation"
-                | "repair_media_reservation"
-                | "get_doctor_snapshot"
-                | "docs_ask"
-                | "agent_installation_begin"
-                | "agent_installation_submit_choice"
-                | "agent_installation_list"
-                | "agent_installation_inspect"
-                // The reclassified session export now returns the v10-only
-                // `redacted_export` bulk kind and requires the v10-only
-                // `ReadRedactedExportChunk` reader, so the WHOLE tag is v10: a v9
-                // peer is refused rather than handed an enum value it cannot
-                // decode / a transfer it cannot read.
-                | "export_session_data"
-                | "read_redacted_export_chunk"
-                | "begin_sealed_owner_operation"
-                | "apply_sealed_owner_operation"
-                | "cancel_sealed_owner_operation"
-                | "sealed_owner_inventory"
-                | "edit_sealed_owner_description"
-                | "list_sealed_actions"
-                | "create_sealed_action"
-                | "revise_sealed_action_description"
-                | "revise_sealed_action_enabled"
-                | "retire_sealed_action" => 10,
-                _ => 9,
-            };
-            // Extended v10-only shapes on existing v9 tags: the base tag
-            // remains v9-compatible, but the new optional field bumps the
-            // required version when present so a v9 envelope carrying the
-            // extended body is rejected by the gate.
-            if version == 9
-                && let Request::ListSessions {
-                    assistant_id: Some(_),
-                    ..
-                } = request
-            {
-                return (10, tag);
-            }
-            (version, tag)
-        }
-        Body::Response { response, .. } => {
-            let tag = response.wire_tag();
-            let version = match tag {
-                "provider_oauth_started"
-                | "provider_oauth_completed"
-                | "provider_oauth_cancelled"
-                | "mcp_oauth_started"
-                | "mcp_oauth_completed"
-                | "mcp_oauth_cancelled"
-                | "provider_credential_committed"
-                | "subscription_ack_committed"
-                | "local_operation_settlement"
-                | "copilot_auth_committed"
-                | "mcp_config_committed"
-                | "provider_catalog_snapshot"
-                | "provider_mutation_committed"
-                | "image_spend_policy_saved"
-                | "agent_editor_lease_begun"
-                | "agent_editor_lease_completed"
-                | "extended_config_saved" => 17,
-                "agent_mutated" | "assistant_definition_saved" | "assistant_deleted" => 17,
-                "leak_reveal_cancelled" => 16,
-                "flycockpit_org_sync"
-                | "provider_models_fetched"
-                | "provider_usage_snapshot"
-                | "provider_config_upserted"
-                | "secret_inventory"
-                | "flycockpit_account"
-                | "setup_wizard_applied"
-                | "policy_exported"
-                | "policy_imported"
-                | "image_spend_policy"
-                | "packages"
-                | "package_added"
-                | "package_imported"
-                | "packages_pruned"
-                | "kcl_packages_imported"
-                | "connector_state"
-                | "org_sync_status"
-                | "failed_tool_calls"
-                | "session_compactions"
-                | "ended_sessions_purged"
-                | "assistant"
-                | "media_reservation_diagnosis"
-                | "media_reservation_repaired"
-                | "doctor_snapshot"
-                | "docs_answer"
-                | "agent_installation"
-                | "sealed_owner_operation_begun"
-                | "sealed_owner_operation_applied"
-                | "sealed_owner_operation_cancelled"
-                | "sealed_owner_inventory"
-                | "sealed_owner_description_edited"
-                | "sealed_actions"
-                | "sealed_action_created"
-                | "sealed_action_revised"
-                | "sealed_action_retired"
-                // The export response carries the v10-only `redacted_export`
-                // bulk kind; refuse to hand a v9 peer a transfer reference it
-                // cannot read back through the v10-only reader.
-                | "export_session_data" => 10,
-                _ => 9,
-            };
-            // Extended v10-only shapes on existing v9 response tags: the base
-            // tag remains v9-compatible, but the new optional field bumps the
-            // required version when present so a v9 envelope carrying the
-            // extended body is rejected by the gate.
-            if version == 9
-                && let Response::SessionLiveStatus { statuses } = &**response
-                && statuses.iter().any(|status| status.project_root.is_some())
-            {
-                return (10, tag);
-            }
-            (version, tag)
-        }
-        Body::Event { event } => (9, event.wire_tag()),
-        Body::Error { .. } => (9, "unknown"),
-        #[cfg(feature = "remote")]
-        Body::RemoteReplayRequest(_)
-        | Body::RemoteReplayResponse(_)
-        | Body::RemoteReplayAck(_)
-        | Body::RemoteReplayAckResponse(_) => (9, "unknown"),
-        Body::Unknown => (9, "unknown"),
-    }
-}
-
-fn ensure_body_supported(version: u32, body: &Body) -> Result<()> {
-    let (required, tag) = body_required_protocol_version(body);
-    if required > version {
-        bail!(
-            "protocol payload {tag:?} requires v{required}, but negotiated daemon protocol is v{version}; run `cockpit daemon restart`"
-        );
-    }
-    Ok(())
-}
-
 // ---- Codec -----------------------------------------------------------------
 
 /// NDJSON framed codec over an arbitrary byte stream. Use the same
@@ -4230,7 +4008,6 @@ where
     pub async fn send(&mut self, env: &Envelope) -> Result<()> {
         let mut env = env.clone();
         env.v = self.version;
-        ensure_body_supported(self.version, &env.body)?;
         let line = serde_json::to_string(&env).context("serializing envelope")?;
         self.framed
             .send(line)
@@ -4293,7 +4070,6 @@ where
     pub async fn send(&mut self, env: &Envelope) -> Result<()> {
         let mut env = env.clone();
         env.v = self.version;
-        ensure_body_supported(self.version, &env.body)?;
         let line = serde_json::to_string(&env).context("serializing envelope")?;
         self.framed
             .send(line)
@@ -4338,7 +4114,7 @@ where
                 .and_then(serde_json::Value::as_u64)
                 .and_then(|n| u32::try_from(n).ok())
                 .context("deserializing envelope: missing or invalid v")?;
-            if !is_protocol_compatible(v) {
+            if v != PROTOCOL_VERSION {
                 let kind = value
                     .get("kind")
                     .and_then(serde_json::Value::as_str)
@@ -4366,12 +4142,6 @@ where
             let env: Envelope = serde_json::from_value(value).context("deserializing envelope")?;
             if envelope_contains_unknown(&env) {
                 return Ok(Some(RecvFrame::Unknown { v, kind, tag, id }));
-            }
-            // Negotiation permits a v10 peer to keep a v9 connection alive
-            // for the frozen v9 surface.  Do not let a raw/skewed peer label a
-            // v10-only body as v9 and bypass the corresponding send gate.
-            if body_required_protocol_version(&env.body).0 > v {
-                return Ok(Some(RecvFrame::VersionMismatch { v, kind, id }));
             }
             Ok(Some(RecvFrame::Envelope(Box::new(env))))
         }
@@ -4438,13 +4208,7 @@ fn codec_error(err: LinesCodecError) -> io::Error {
 
 #[cfg(all(test, feature = "remote"))]
 mod proto_fixture_tests {
-    //! Protocol fixtures cover every version accepted by this build. The
-    //! supported range derives from `MIN_SUPPORTED_PROTOCOL_VERSION..=
-    //! PROTOCOL_VERSION` and the archived range from
-    //! `FIRST_ARCHIVED_PROTOCOL_VERSION..PROTOCOL_VERSION`, so a version mint
-    //! cannot leave a stale hand-maintained list behind. Byte-level
-    //! immutability of archived fixtures is owned by the append-only archive
-    //! ledger checked in `tests/wire_schema_version.rs`.
+    //! Protocol fixtures cover the current wire version accepted by this build.
 
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
@@ -4460,11 +4224,7 @@ mod proto_fixture_tests {
     const WIRE_SCHEMA_DIGEST_FILE: &str = "wire-schema.sha256";
 
     fn supported_protocol_versions() -> std::ops::RangeInclusive<u32> {
-        MIN_SUPPORTED_PROTOCOL_VERSION..=PROTOCOL_VERSION
-    }
-
-    fn archived_protocol_versions() -> std::ops::Range<u32> {
-        FIRST_ARCHIVED_PROTOCOL_VERSION..PROTOCOL_VERSION
+        PROTOCOL_VERSION..=PROTOCOL_VERSION
     }
 
     #[test]
@@ -4533,19 +4293,8 @@ mod proto_fixture_tests {
     }
 
     #[test]
-    fn frozen_fixture_every_supported_version_still_deserializes() {
-        for version in supported_protocol_versions() {
-            assert_frozen_fixture_deserializes::<Request>(version, "request.json");
-            assert_frozen_fixture_deserializes::<Response>(version, "response.json");
-            assert_frozen_fixture_deserializes::<Event>(version, "event.json");
-        }
-    }
-
-    #[test]
     fn frozen_fixture_directories_are_well_formed_without_expanding_compatibility() {
-        let listed = supported_protocol_versions()
-            .chain(archived_protocol_versions())
-            .collect::<BTreeSet<_>>();
+        let listed = supported_protocol_versions().collect::<BTreeSet<_>>();
         assert!(
             !listed.is_empty(),
             "supported protocol version list is empty"
@@ -4559,10 +4308,9 @@ mod proto_fixture_tests {
             directories.is_superset(&listed),
             "every live protocol version needs a daemon_proto/vN fixture directory"
         );
-        // Older vN directories are migration archaeology. They deliberately
-        // remain in-tree as frozen wire evidence, but their presence must not
-        // widen the live protocol-compatibility window.
-        for version in directories {
+        // Older vN directories may remain in-tree as migration archaeology.
+        // Their presence must not widen the live protocol-compatibility window.
+        for version in listed {
             assert_fixture_directory_files(version);
         }
     }
@@ -4604,19 +4352,6 @@ mod proto_fixture_tests {
                 canonical(value),
                 "{file_name}:{kind} must round-trip byte-equivalent after canonicalization"
             );
-        }
-    }
-
-    fn assert_frozen_fixture_deserializes<T>(version: u32, file_name: &str)
-    where
-        T: DeserializeOwned,
-    {
-        for (kind, value) in read_fixture_for(version, file_name) {
-            let _: T = serde_json::from_value(value).unwrap_or_else(|error| {
-                panic!(
-                    "frozen fixture v{version}/{file_name}:{kind} no longer deserializes — this is a breaking wire change; bump MIN_SUPPORTED_PROTOCOL_VERSION deliberately or restore compatibility: {error}"
-                )
-            });
         }
     }
 
@@ -4785,14 +4520,10 @@ mod proto_fixture_tests {
                 "the current daemon_proto v{version} must contain {WIRE_SCHEMA_DIGEST_FILE}"
             );
         }
-        // Versions retired after the canonical digest file landed keep their
-        // frozen `wire-schema.sha256`; the archive ledger owns its bytes.
-        allowed.insert(WIRE_SCHEMA_DIGEST_FILE.to_string());
         assert!(
             actual.is_subset(&allowed),
             "unexpected files under daemon_proto v{version}: only event.json, \
-             request.json, response.json, and a retired version's frozen \
-             wire-schema.sha256 belong there"
+             request.json, and response.json belong there"
         );
     }
 
@@ -6016,19 +5747,11 @@ mod errorcode_forward_tests {
 
 // ---- Tests -----------------------------------------------------------------
 
-/// Retained daemon-wire fixtures from versions this binary deliberately does
-/// not support, derived from the mint constants instead of hand-maintained.
-/// Keep this separate from the remote-gated supported-version table: fixture
-/// retention must never widen the live compatibility window.
-#[cfg(test)]
-const ARCHIVED_PROTOCOL_VERSIONS: std::ops::Range<u32> =
-    FIRST_ARCHIVED_PROTOCOL_VERSION..PROTOCOL_VERSION;
-
 /// Fixture-file reader shared by tests that run in the default (non-`remote`)
 /// profile. The full `proto_fixture_tests` module is `remote`-gated because its
 /// round-trip coverage deserializes remote-only variants; this thin reader has
-/// no remote-type dependency and stays available so local-protocol fixture
-/// freezing checks keep running without `--features remote`.
+/// no remote-type dependency and stays available for current-version fixture
+/// checks without `--features remote`.
 #[cfg(test)]
 mod proto_fixture_files {
     use serde_json::{Map, Value};
@@ -6146,15 +5869,6 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_version_below_min_supported_is_rejected() {
-        let below_min = MIN_SUPPORTED_PROTOCOL_VERSION.saturating_sub(1);
-        let err = NegotiatedProtocol::from_hello(&hello(below_min))
-            .expect_err("below-min daemon protocol must be rejected");
-        assert_eq!(err.code, ErrorCode::ProtocolVersion);
-        assert_eq!(err.message, incompatible_daemon_protocol_message(below_min));
-    }
-
-    #[test]
     fn set_active_model_rejects_unknown_thinking_mode_during_deserialization() {
         let raw = json!({
             "request": "set_active_model",
@@ -6254,7 +5968,7 @@ mod tests {
 
     #[tokio::test]
     async fn envelope_constructors_stamp_the_negotiated_version() {
-        let negotiated = MIN_SUPPORTED_PROTOCOL_VERSION;
+        let negotiated = PROTOCOL_VERSION;
         let (left, right) = duplex(4096);
         let mut sender = ProtoStream::with_version(left, negotiated);
         let mut receiver = ProtoStream::new(right);
@@ -7620,886 +7334,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn list_sessions_assistant_filter_requires_v10() {
-        // The base shape (assistant_id = None) is v9-compatible.
-        assert_eq!(
-            body_required_protocol_version(&Body::Request {
-                id: Uuid::nil(),
-                #[cfg(feature = "remote")]
-                operation: None,
-                owner_capability: None,
-                request: Request::ListSessions {
-                    project_id: None,
-                    parent_session_id: None,
-                    assistant_id: None,
-                    compaction_lineage_root_id: None,
-                },
-            })
-            .0,
-            9
-        );
-        // The extended shape (assistant_id = Some) requires v10.
-        assert_eq!(
-            body_required_protocol_version(&Body::Request {
-                id: Uuid::nil(),
-                #[cfg(feature = "remote")]
-                operation: None,
-                owner_capability: None,
-                request: Request::ListSessions {
-                    project_id: None,
-                    parent_session_id: None,
-                    assistant_id: Some("helper-bot".into()),
-                    compaction_lineage_root_id: None,
-                },
-            })
-            .0,
-            10
-        );
-    }
-
-    #[test]
-    fn current_protocol_gates_provider_catalog_leak_and_oauth_cancellation() {
-        let provider_requests = [
-            (
-                Request::GetProviderCatalogSnapshot {
-                    project_root: "/project".into(),
-                    provider_id: None,
-                    snapshot_session_id: "snapshot".into(),
-                },
-                15,
-            ),
-            (
-                Request::ApplyProviderMutation {
-                    snapshot_session_id: "snapshot".into(),
-                    layer_id: "layer".into(),
-                    expected_revision: "revision".into(),
-                    client_operation_id: "operation".into(),
-                    mutation_intent_hash: "00".repeat(32),
-                    mutation: ProviderMutationBatch {
-                        upserts: Vec::new(),
-                        deletes: Vec::new(),
-                        metadata: None,
-                    },
-                },
-                17,
-            ),
-        ];
-        for (request, expected_version) in provider_requests {
-            assert_eq!(
-                body_required_protocol_version(&Body::Request {
-                    id: Uuid::nil(),
-                    #[cfg(feature = "remote")]
-                    operation: None,
-                    owner_capability: None,
-                    request,
-                })
-                .0,
-                expected_version
-            );
-        }
-        for (response, expected_version) in [
-            (
-                Response::ProviderCatalogSnapshot {
-                    config: ProviderConfigView::default(),
-                    snapshot_session_id: "snapshot".into(),
-                    layer_id: "layer".into(),
-                    owner_root: "/project".into(),
-                    base_revision: "revision".into(),
-                    config_generation: 1,
-                },
-                17,
-            ),
-            (
-                Response::ProviderMutationCommitted {
-                    client_operation_id: "operation".into(),
-                    snapshot_session_id: "snapshot".into(),
-                    layer_id: "layer".into(),
-                    owner_root: "/project".into(),
-                    mutation_intent_hash: "00".repeat(32),
-                    consumed_revision: "revision".into(),
-                    result_revision: "next".into(),
-                    config_generation: 2,
-                    config: ProviderConfigView::default(),
-                    status: ConfigCommitStatus::Committed,
-                    publication: ConfigPublicationStatus::Published,
-                },
-                17,
-            ),
-        ] {
-            assert_eq!(
-                body_required_protocol_version(&Body::Response {
-                    id: Uuid::nil(),
-                    response: Box::new(response),
-                })
-                .0,
-                expected_version
-            );
-        }
-
-        assert_eq!(
-            body_required_protocol_version(&Body::Request {
-                id: Uuid::nil(),
-                #[cfg(feature = "remote")]
-                operation: None,
-                owner_capability: None,
-                request: Request::CancelLeakReveal {
-                    capability: LeakRevealToken::new("00".repeat(32)),
-                },
-            })
-            .0,
-            16
-        );
-        assert_eq!(
-            body_required_protocol_version(&Body::Request {
-                id: Uuid::nil(),
-                #[cfg(feature = "remote")]
-                operation: None,
-                owner_capability: None,
-                request: Request::CancelProviderOAuth {
-                    client_operation_id: "cancel".into(),
-                    begin_client_operation_id: "begin".into(),
-                    flow_id: Some("flow".into()),
-                },
-            })
-            .0,
-            17
-        );
-        assert_eq!(
-            body_required_protocol_version(&Body::Response {
-                id: Uuid::nil(),
-                response: Box::new(Response::LeakRevealCancelled {
-                    report_id: "report".into(),
-                }),
-            })
-            .0,
-            16
-        );
-    }
-
-    #[test]
-    fn redacted_export_request_response_and_reader_require_v10() {
-        // #3: even the DEFAULT (redacted) export request is v10-only now — it
-        // returns the v10-only `redacted_export` bulk kind and requires the
-        // v10-only reader — so a v9 peer is refused rather than handed an
-        // undecodable enum value / an unreadable transfer.
-        let default_export = Request::ExportSessionData {
-            session_id: Uuid::nil(),
-            kind: ExportSessionKind::DebugBundle,
-            include_generated_artifacts: false,
-            include_sensitive: false,
-        };
-        assert_eq!(
-            body_required_protocol_version(&Body::Request {
-                id: Uuid::nil(),
-                #[cfg(feature = "remote")]
-                operation: None,
-                owner_capability: None,
-                request: default_export,
-            })
-            .0,
-            10,
-            "the default redacted export request must be v10-only"
-        );
-
-        let reader = Request::ReadRedactedExportChunk {
-            transfer_id: crate::bulk_transfer::transfer_id_from_bytes([3u8; 16]).unwrap(),
-            chunk_index: 0,
-        };
-        assert_eq!(
-            body_required_protocol_version(&Body::Request {
-                id: Uuid::nil(),
-                #[cfg(feature = "remote")]
-                operation: None,
-                owner_capability: None,
-                request: reader,
-            })
-            .0,
-            10
-        );
-
-        let transfer_id = crate::bulk_transfer::transfer_id_from_bytes([7u8; 16]).unwrap();
-        let response = Response::ExportSessionData {
-            data: ExportSessionData {
-                session_id: Uuid::nil(),
-                kind: ExportSessionKind::TranscriptJson,
-                filename_extension: "json".into(),
-                mime: "application/json".into(),
-                transfer: crate::bulk_transfer::BulkTransferRef::new(
-                    transfer_id,
-                    5,
-                    [0u8; 32],
-                    crate::bulk_transfer::BulkMimeClass::RedactedExport,
-                )
-                .unwrap(),
-                session_count: Some(1),
-                redacted: true,
-            },
-        };
-        assert_eq!(
-            body_required_protocol_version(&Body::Response {
-                id: Uuid::nil(),
-                response: Box::new(response),
-            })
-            .0,
-            10,
-            "the export response carrying redacted_export must be v10-only"
-        );
-    }
-
-    #[test]
-    fn durable_owner_receipts_and_mutations_require_v17() {
-        for request in [
-            Request::PutProviderCredential {
-                client_operation_id: "put-provider".into(),
-                provider_id: "example".into(),
-                record: SensitiveWirePayload::new("{}".into()),
-            },
-            Request::DeleteProviderCredential {
-                client_operation_id: "delete-provider".into(),
-                provider_id: "example".into(),
-                project_root: None,
-            },
-            Request::GetLocalOperationSettlement {
-                client_operation_id: "settlement".into(),
-            },
-            Request::SaveMcpConfig {
-                client_operation_id: "save-mcp".into(),
-                project_root: "/tmp/project".into(),
-                snapshot_capability: "snapshot".into(),
-                owner_root: "/tmp/project".into(),
-                config_path: "/tmp/project/.cockpit/mcp.json".into(),
-                expected_revision: "00".repeat(32),
-                mutation_intent_hash: "11".repeat(32),
-                patch: r#"{"operations":[]}"#.into(),
-                secret_values_json: SensitiveWirePayload::new("{}".into()),
-                target_scope: None,
-            },
-            Request::ApplyExtendedConfigPatch {
-                client_operation_id: "patch-config".into(),
-                project_root: "/tmp/project".into(),
-                layer_id: "layer".into(),
-                patch: ExtendedConfigPatch {
-                    operations: Vec::new(),
-                    materialize: true,
-                    denylist: Vec::new(),
-                    redacted_mutations: Vec::new(),
-                },
-                expected_revision: "00".repeat(32),
-                snapshot_session_id: "snapshot".into(),
-            },
-            Request::BeginProviderOAuth {
-                client_operation_id: "begin-provider".into(),
-                provider_id: "codex-oauth".into(),
-            },
-            Request::CompleteProviderOAuth {
-                client_operation_id: "complete-provider".into(),
-                flow_id: "flow".into(),
-                input: None,
-            },
-            Request::CancelProviderOAuth {
-                client_operation_id: "cancel-provider".into(),
-                begin_client_operation_id: "begin-provider".into(),
-                flow_id: Some("flow".into()),
-            },
-            Request::BeginMcpOAuth {
-                client_operation_id: "begin-mcp".into(),
-                project_root: "/tmp/project".into(),
-                server: "server".into(),
-                profile: String::new(),
-                agent: None,
-            },
-            Request::CompleteMcpOAuth {
-                client_operation_id: "complete-mcp".into(),
-                flow_id: "flow".into(),
-                input: None,
-            },
-            Request::CancelMcpOAuth {
-                client_operation_id: "cancel-mcp".into(),
-                begin_client_operation_id: "begin-mcp".into(),
-                flow_id: Some("flow".into()),
-            },
-            #[cfg(feature = "extended")]
-            Request::SaveImageSpendPolicy {
-                client_operation_id: "save-image-spend".into(),
-                project_key: "project".into(),
-                settings_json: "{}".into(),
-                expected_policy_version: None,
-            },
-            Request::SetupCopilotAuth {
-                client_operation_id: "setup-copilot".into(),
-                project_root: "/tmp/project".into(),
-                provider_id: "copilot".into(),
-            },
-            Request::BeginAgentEditorLease {
-                client_operation_id: "begin-editor".into(),
-                project_root: "/tmp/project".into(),
-                name: "build".into(),
-                expected_revision: "00".repeat(32),
-            },
-            Request::CompleteAgentEditorLease {
-                client_operation_id: "complete-editor".into(),
-                project_root: "/tmp/project".into(),
-                lease_id: Uuid::nil().to_string(),
-                markdown: Some(SensitiveWirePayload::new(
-                    "---\nschemaVersion: 1\n---\nBe helpful.\n".into(),
-                )),
-            },
-            Request::GetAgentEditorLeaseSettlement {
-                client_operation_id: "complete-editor".into(),
-                project_root: "/tmp/project".into(),
-                lease_id: Uuid::nil().to_string(),
-            },
-            Request::MutateAgent {
-                client_operation_id: "mutate-agent".into(),
-                mutation_intent_hash: agent_mutation_intent_hash(
-                    "/tmp/project",
-                    &AgentMutation::ResetAllBuiltins,
-                    Some(&"00".repeat(32)),
-                ),
-                project_root: "/tmp/project".into(),
-                mutation: AgentMutation::ResetAllBuiltins,
-                expected_revision: Some("00".repeat(32)),
-            },
-            Request::SaveAssistantDefinition {
-                client_operation_id: "save-assistant".into(),
-                mutation_intent_hash: assistant_mutation_intent_hash(
-                    "/tmp/project",
-                    "save",
-                    "build",
-                    &"00".repeat(32),
-                    Some("# build"),
-                ),
-                project_root: "/tmp/project".into(),
-                name: "build".into(),
-                markdown: "# build".into(),
-                expected_revision: "00".repeat(32),
-                expected_config_generation: 7,
-            },
-            Request::DeleteAssistant {
-                client_operation_id: "delete-assistant".into(),
-                mutation_intent_hash: assistant_mutation_intent_hash(
-                    "/tmp/project",
-                    "delete",
-                    "build",
-                    &"00".repeat(32),
-                    None,
-                ),
-                project_root: "/tmp/project".into(),
-                name: "build".into(),
-                expected_revision: "00".repeat(32),
-                expected_config_generation: 7,
-            },
-        ] {
-            assert_eq!(
-                body_required_protocol_version(&Body::Request {
-                    id: Uuid::nil(),
-                    #[cfg(feature = "remote")]
-                    operation: None,
-                    owner_capability: None,
-                    request,
-                })
-                .0,
-                17
-            );
-        }
-        for response in [
-            Response::ProviderOAuthStarted {
-                client_operation_id: "begin-provider".into(),
-                request_hash: "00".repeat(32),
-                flow_id: "flow".into(),
-                authorize_url: "https://example.test".into(),
-                user_code: None,
-            },
-            Response::ProviderOAuthCompleted {
-                client_operation_id: "complete-provider".into(),
-                request_hash: "00".repeat(32),
-                flow_id: "flow".into(),
-                logged_in: true,
-                retry_after_seconds: None,
-            },
-            Response::ProviderOAuthCancelled {
-                client_operation_id: "cancel-provider".into(),
-                request_hash: "00".repeat(32),
-                flow_id: Some("flow".into()),
-                cancelled: true,
-            },
-            Response::McpOAuthStarted {
-                client_operation_id: "begin-mcp".into(),
-                request_hash: "00".repeat(32),
-                flow_id: "flow".into(),
-                authorize_url: "https://example.test".into(),
-                user_code: None,
-                verification_uri: None,
-                verification_uri_complete: None,
-            },
-            Response::McpOAuthCompleted {
-                client_operation_id: "complete-mcp".into(),
-                request_hash: "00".repeat(32),
-                flow_id: "flow".into(),
-                authenticated: true,
-            },
-            Response::McpOAuthCancelled {
-                client_operation_id: "cancel-mcp".into(),
-                request_hash: "00".repeat(32),
-                flow_id: Some("flow".into()),
-                cancelled: true,
-            },
-            Response::McpConfigCommitted {
-                client_operation_id: "save-mcp".into(),
-                request_hash: "22".repeat(32),
-                mutation_intent_hash: "33".repeat(32),
-                project_root: "/workspace".into(),
-                owner_root: "/workspace".into(),
-                config_path: "/workspace/.cockpit/mcp.json".into(),
-                consumed_revision: "00".repeat(32),
-                result_revision: "11".repeat(32),
-                config_generation: 7,
-                credential_count: 0,
-            },
-            #[cfg(feature = "extended")]
-            Response::ImageSpendPolicySaved {
-                client_operation_id: "save-image-spend".into(),
-                project_key: "project".into(),
-                request_hash: "99".repeat(32),
-                consumed_policy_version: None,
-                result_policy_version: 1,
-            },
-            Response::ProviderCredentialCommitted {
-                client_operation_id: "delete-provider".into(),
-                mutation_intent_hash: "22".repeat(32),
-                provider_id: "example".into(),
-                project_root: None,
-                owner_root: None,
-                owner_scope: "global".into(),
-                stored: false,
-                changed: true,
-                consumed_vault_generation: 6,
-                result_vault_generation: 7,
-                config_generation: 7,
-            },
-            Response::SubscriptionAckCommitted {
-                client_operation_id: "subscription-ack".into(),
-                provider_id: "codex-oauth".into(),
-                request_hash: "33".repeat(32),
-                changed: true,
-                consumed_vault_generation: 6,
-                result_vault_generation: 7,
-            },
-            Response::ExtendedConfigSaved {
-                client_operation_id: "patch-config".into(),
-                request_hash: "44".repeat(32),
-                mutation_intent_hash: "45".repeat(32),
-                hash: "55".repeat(32),
-                config_generation: 7,
-                layer_id: "layer".into(),
-                layer: CockpitConfigLayer::Project,
-                consumed_revision: "66".repeat(32),
-                result_revision: "77".repeat(32),
-                status: ConfigCommitStatus::Committed,
-                publication: ConfigPublicationStatus::Published,
-                denylist: Vec::new(),
-            },
-            Response::CopilotAuthCommitted {
-                client_operation_id: "setup-copilot".into(),
-                mutation_intent_hash: "78".repeat(32),
-                project_root: "/tmp/project".into(),
-                owner_root: "/tmp/project".into(),
-                owner_scope: "project:/tmp/project".into(),
-                provider_id: "copilot".into(),
-                consumed_vault_generation: 6,
-                result_vault_generation: 7,
-                config_generation: 7,
-            },
-            Response::LocalOperationSettlement {
-                client_operation_id: "settlement".into(),
-                operation_kind: "save_mcp_config".into(),
-                request_hash: "88".repeat(32),
-                pending: true,
-                response: None,
-                terminal_error: None,
-                terminal_cancelled: false,
-            },
-            Response::AgentMutated(AgentMutationResult {
-                client_operation_id: "mutate-agent".into(),
-                mutation_intent_hash: "98".repeat(32),
-                project_root: "/tmp/project".into(),
-                requested_project_root: "/tmp/project".into(),
-                owner_scope: "project:/tmp/project".into(),
-                agent_name: None,
-                changed: true,
-                affected: 1,
-                snapshot: None,
-                consumed_config_generation: 6,
-                result_config_generation: 7,
-                config_generation: 7,
-                inventory_revision: Some("99".repeat(32)),
-                consumed_revision: Some("00".repeat(32)),
-                result_revision: "99".repeat(32),
-                completed_lease_id: None,
-                outcome: AgentMutationOutcome::Reconciled,
-            }),
-            Response::AssistantDefinitionSaved {
-                client_operation_id: "save-assistant".into(),
-                mutation_intent_hash: "aa".repeat(32),
-                project_root: "/tmp/project".into(),
-                requested_project_root: "/tmp/project".into(),
-                name: "build".into(),
-                assistant: None,
-                consumed_revision: "00".repeat(32),
-                result_revision: "11".repeat(32),
-                consumed_config_generation: 6,
-                result_config_generation: 7,
-                outcome: AgentMutationOutcome::Reconciled,
-            },
-            Response::AssistantDeleted {
-                client_operation_id: "delete-assistant".into(),
-                mutation_intent_hash: "bb".repeat(32),
-                project_root: "/tmp/project".into(),
-                requested_project_root: "/tmp/project".into(),
-                name: "build".into(),
-                consumed_revision: "00".repeat(32),
-                result_revision: "22".repeat(32),
-                consumed_config_generation: 6,
-                result_config_generation: 7,
-                outcome: AgentMutationOutcome::Reconciled,
-            },
-        ] {
-            assert_eq!(
-                body_required_protocol_version(&Body::Response {
-                    id: Uuid::nil(),
-                    response: Box::new(response),
-                })
-                .0,
-                17
-            );
-        }
-    }
-
-    #[test]
-    fn every_new_cli_surface_shape_requires_v10() {
-        #[cfg_attr(not(feature = "remote"), allow(unused_mut))]
-        let mut requests: Vec<Request> = vec![
-            Request::ListPackages,
-            Request::AddPackage {
-                project_root: "/tmp/project".into(),
-                identifier: "tokio".into(),
-                git: None,
-                branch: None,
-                local_path: Some("/tmp/pkg".into()),
-                deep: false,
-            },
-            Request::ImportPackage {
-                project_root: "/tmp/project".into(),
-                dir: Some("deps".into()),
-                package: None,
-                id: None,
-                as_path: false,
-            },
-            Request::PrunePackages {
-                project_root: "/tmp/project".into(),
-                days: 30,
-                dry_run: false,
-            },
-            Request::ImportKclPackages {
-                project_root: "/tmp/project".into(),
-            },
-            Request::ListFailedToolCalls {
-                since_epoch: 0,
-                tool: None,
-                model: None,
-                project_id: None,
-                include_recovered: false,
-                limit: 50,
-            },
-            Request::GetSessionCompactions {
-                session_id: Uuid::nil(),
-            },
-            Request::PurgeEndedSessions { before: 0 },
-            Request::GetAssistant {
-                name: "helper-bot".into(),
-            },
-            Request::DiagnoseMediaReservation {
-                scope: "session".into(),
-                id: "abc".into(),
-            },
-            Request::RepairMediaReservation {
-                scope: "session".into(),
-                id: "abc".into(),
-                expected_block_generation: 1,
-                repair_plan_digest: "digest".into(),
-                idempotency_key: "key".into(),
-            },
-            Request::GetDoctorSnapshot {
-                project_root: None,
-                no_sandbox: false,
-                offline: false,
-            },
-            Request::DocsAsk {
-                question: "how do tasks work?".into(),
-                package: Some("tokio".into()),
-                project_root: None,
-            },
-        ];
-        #[cfg(feature = "remote")]
-        {
-            requests.extend([Request::GetConnectorState, Request::GetOrgSyncStatus]);
-        }
-        for request in requests {
-            let tag = request.wire_tag();
-            assert_eq!(
-                body_required_protocol_version(&Body::Request {
-                    id: Uuid::nil(),
-                    #[cfg(feature = "remote")]
-                    operation: None,
-                    owner_capability: None,
-                    request,
-                })
-                .0,
-                10,
-                "{tag} must be gated to v10"
-            );
-        }
-        #[cfg_attr(not(feature = "remote"), allow(unused_mut))]
-        let mut responses: Vec<Response> = vec![
-            Response::Packages {
-                packages_json: "[]".into(),
-            },
-            Response::PackageAdded {
-                package_json: "{}".into(),
-            },
-            Response::PackageImported {
-                summary_json: "{}".into(),
-            },
-            Response::PackagesPruned {
-                report_json: "{}".into(),
-            },
-            Response::KclPackagesImported {
-                result_json: "{}".into(),
-            },
-            Response::FailedToolCalls {
-                calls_json: "[]".into(),
-            },
-            Response::SessionCompactions {
-                session_id: Uuid::nil(),
-                compactions_json: "[]".into(),
-            },
-            Response::EndedSessionsPurged {
-                purged: 0,
-                session_ids_json: "[]".into(),
-            },
-            Response::Assistant { assistant: None },
-            Response::MediaReservationDiagnosis {
-                diagnosis_json: "{}".into(),
-            },
-            Response::MediaReservationRepaired {
-                outcome: "accounting_repair_committed".into(),
-            },
-            Response::DoctorSnapshot {
-                rendered: String::new(),
-                has_failures: false,
-            },
-            Response::DocsAnswer {
-                answer: String::new(),
-            },
-        ];
-        #[cfg(feature = "remote")]
-        {
-            responses.extend([
-                Response::ConnectorState {
-                    connector_json: "null".into(),
-                },
-                Response::OrgSyncStatus {
-                    org_states_json: "[]".into(),
-                    audit_states_json: "[]".into(),
-                },
-            ]);
-        }
-        for response in responses {
-            let tag = response.wire_tag();
-            assert_eq!(
-                body_required_protocol_version(&Body::Response {
-                    id: Uuid::nil(),
-                    response: Box::new(response),
-                })
-                .0,
-                10,
-                "{tag} must be gated to v10"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn recv_rejects_v10_only_get_doctor_snapshot_labeled_as_v9() {
-        let (a, b) = duplex(4096);
-        let mut sender = ProtoStream::with_version(a, 9);
-        let mut receiver = ProtoStream::with_version(b, 9);
-        let id = Uuid::new_v4();
-        let forged = Envelope {
-            v: 9,
-            body: Body::Request {
-                id,
-                #[cfg(feature = "remote")]
-                operation: None,
-                owner_capability: None,
-                request: Request::GetDoctorSnapshot {
-                    project_root: None,
-                    no_sandbox: false,
-                    offline: false,
-                },
-            },
-        };
-        sender
-            .framed
-            .send(serde_json::to_string(&forged).unwrap())
-            .await
-            .unwrap();
-        assert!(matches!(
-            receiver.recv().await.unwrap(),
-            Some(RecvFrame::VersionMismatch { v: 9, id: Some(actual), .. }) if actual == id
-        ));
-    }
-
-    #[tokio::test]
-    async fn recv_rejects_v10_only_docs_ask_labeled_as_v9() {
-        let (a, b) = duplex(4096);
-        let mut sender = ProtoStream::with_version(a, 9);
-        let mut receiver = ProtoStream::with_version(b, 9);
-        let id = Uuid::new_v4();
-        let forged = Envelope {
-            v: 9,
-            body: Body::Request {
-                id,
-                #[cfg(feature = "remote")]
-                operation: None,
-                owner_capability: None,
-                request: Request::DocsAsk {
-                    question: "how do tasks work?".into(),
-                    package: Some("tokio".into()),
-                    project_root: None,
-                },
-            },
-        };
-        sender
-            .framed
-            .send(serde_json::to_string(&forged).unwrap())
-            .await
-            .unwrap();
-        assert!(matches!(
-            receiver.recv().await.unwrap(),
-            Some(RecvFrame::VersionMismatch { v: 9, id: Some(actual), .. }) if actual == id
-        ));
-    }
-
-    #[test]
-    fn every_new_sealed_owner_shape_requires_v10() {
-        // AC1/AC3: every new sealed-owner request and response shape is gated to
-        // protocol v10 (a v9 envelope carrying it is rejected — see the
-        // `recv_rejects_v10_only_*` test below).
-        for request in [
-            Request::BeginSealedOwnerOperation {
-                disposition: "create".into(),
-                record_id: None,
-                name: Some("token".into()),
-                description: Some("safe".into()),
-                scope_kind: Some("global".into()),
-                scope_key: Some(String::new()),
-            },
-            Request::ApplySealedOwnerOperation {
-                capability_id: "cap".into(),
-                literal: Some(SensitiveWireLiteral::new("s3cr3t".into())),
-            },
-            Request::CancelSealedOwnerOperation {
-                capability_id: "cap".into(),
-            },
-            Request::SealedOwnerInventory {
-                scope_kind: None,
-                scope_key: None,
-            },
-            Request::EditSealedOwnerDescription {
-                record_id: "rec".into(),
-                description: "desc".into(),
-            },
-            Request::ListSealedActions,
-            Request::CreateSealedAction {
-                kind_id: "k".into(),
-                project_id: "p".into(),
-                description: "d".into(),
-                origin_id: "0".into(),
-                projection_id: "none".into(),
-            },
-            Request::ReviseSealedActionDescription {
-                action_id: "a".into(),
-                description: "d".into(),
-            },
-            Request::ReviseSealedActionEnabled {
-                action_id: "a".into(),
-                enabled: false,
-            },
-            Request::RetireSealedAction {
-                action_id: "a".into(),
-                confirm: "a".into(),
-            },
-        ] {
-            let tag = request.wire_tag();
-            assert_eq!(
-                body_required_protocol_version(&Body::Request {
-                    id: Uuid::nil(),
-                    #[cfg(feature = "remote")]
-                    operation: None,
-                    owner_capability: None,
-                    request,
-                })
-                .0,
-                10,
-                "{tag} must be gated to v10"
-            );
-        }
-        for response in [
-            Response::SealedOwnerOperationBegun {
-                capability_id: "cap".into(),
-                expires_at_ms: 1,
-            },
-            Response::SealedOwnerOperationApplied {
-                revealed_literal: Some(SensitiveWireLiteral::new("s3cr3t".into())),
-            },
-            Response::SealedOwnerOperationCancelled { spent: true },
-            Response::SealedOwnerInventory {
-                items: Vec::new(),
-                acquisitions: Vec::new(),
-            },
-            Response::SealedOwnerDescriptionEdited {
-                record_id: "rec".into(),
-            },
-            Response::SealedActions {
-                actions: Vec::new(),
-            },
-            Response::SealedActionCreated {
-                action_id: "a".into(),
-                revision: 1,
-            },
-            Response::SealedActionRevised {
-                action_id: "a".into(),
-                revision: 2,
-            },
-            Response::SealedActionRetired {
-                action_id: "a".into(),
-                retired: true,
-            },
-        ] {
-            let tag = response.wire_tag();
-            assert_eq!(
-                body_required_protocol_version(&Body::Response {
-                    id: Uuid::nil(),
-                    response: Box::new(response),
-                })
-                .0,
-                10,
-                "{tag} must be gated to v10"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn recv_rejects_v10_only_apply_sealed_owner_operation_labeled_as_v9() {
         let (a, b) = duplex(4096);
@@ -8612,29 +7446,15 @@ mod tests {
     }
 
     #[test]
-    fn is_protocol_compatible_window() {
-        assert!(is_protocol_compatible(MIN_SUPPORTED_PROTOCOL_VERSION));
+    fn is_protocol_compatible_requires_exact_protocol_version() {
         assert!(is_protocol_compatible(PROTOCOL_VERSION));
         assert!(!is_protocol_compatible(PROTOCOL_VERSION + 1));
-        if MIN_SUPPORTED_PROTOCOL_VERSION > 0 {
-            assert!(!is_protocol_compatible(MIN_SUPPORTED_PROTOCOL_VERSION - 1));
-        }
-    }
-
-    #[test]
-    fn protocol_history_range_derives_from_the_mint_constants() {
-        assert!(FIRST_ARCHIVED_PROTOCOL_VERSION >= 1);
-        assert!(
-            FIRST_ARCHIVED_PROTOCOL_VERSION <= PROTOCOL_VERSION,
-            "the frozen history range {FIRST_ARCHIVED_PROTOCOL_VERSION}..{PROTOCOL_VERSION} \
-             must stay anchored at or below the current version"
-        );
+        assert!(!is_protocol_compatible(PROTOCOL_VERSION - 1));
     }
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
         assert_eq!(PROTOCOL_VERSION, 22);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 22);
         let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
@@ -8655,7 +7475,6 @@ mod tests {
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
         assert_eq!(PROTOCOL_VERSION, 22);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 22);
         let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
@@ -8862,20 +7681,5 @@ mod tests {
         assert!(receipt["status"]["result_revision"].is_string());
         assert!(receipt.get("markdown").is_none());
         assert!(receipt.get("snapshot").is_none());
-    }
-
-    #[test]
-    fn archived_fixtures_are_retained_but_not_in_the_live_compatibility_window() {
-        for version in ARCHIVED_PROTOCOL_VERSIONS {
-            assert!(
-                version < MIN_SUPPORTED_PROTOCOL_VERSION,
-                "archived fixture v{version} must remain older than the live support window"
-            );
-            assert!(!is_protocol_compatible(version));
-            let archived = proto_fixture_files::read_fixture_for(version, "response.json");
-            assert!(archived.contains_key("config_refreshed"));
-            assert!(archived.contains_key("goal_status"));
-            assert!(archived.contains_key("goal_updated"));
-        }
     }
 }

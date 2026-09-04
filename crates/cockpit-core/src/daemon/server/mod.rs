@@ -5256,7 +5256,26 @@ async fn run_retention_tick(ctx: Arc<DaemonContext>, cfg: RetentionConfig) {
 #[cfg(any(unix, windows, test))]
 async fn run_retention_tick_at(ctx: &DaemonContext, cfg: RetentionConfig, now_unix_ms: i64) {
     run_media_retention_periodic(ctx, now_unix_ms).await;
-    run_retention_pass(ctx.db.clone(), cfg, now_unix_ms.div_euclid(1000)).await;
+    let now_secs = now_unix_ms.div_euclid(1000);
+    run_retention_pass(ctx.db.clone(), cfg, now_secs).await;
+    let terminal_evidence_cutoff_secs =
+        i64::from(cfg.terminal_evidence_window_days).saturating_mul(86_400);
+    if terminal_evidence_cutoff_secs > 0 {
+        let cutoff_unix_ms = now_secs
+            .saturating_sub(terminal_evidence_cutoff_secs)
+            .saturating_mul(1000);
+        if let Some(chain) = ctx.guidance_proposals.lock().await.computer_audit_chain() {
+            match chain.prune_retained_entries(cutoff_unix_ms).await {
+                Ok(deleted) if deleted > 0 => {
+                    tracing::debug!(deleted, "computer audit retention pruned aged entries")
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "computer audit retention pass failed")
+                }
+            }
+        }
+    }
 }
 
 #[cfg(any(unix, windows, test))]

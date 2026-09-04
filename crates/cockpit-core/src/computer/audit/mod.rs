@@ -1516,6 +1516,22 @@ fn corrupt_result(sealed: &ComputerAuditSealedHeadV1, entry_count: u64) -> Audit
     }
 }
 
+/// When a prefix was pruned, the first retained entry links to the last pruned
+/// MAC recorded on the newest matching `PruneCheckpoint`.
+fn prune_anchor_mac(entries: &[ChainEntry], first_sequence: u64) -> Option<[u8; 32]> {
+    let mut anchor = None;
+    for entry in entries {
+        let decoded = ComputerAuditEntryV1::decode(&entry.entry_bytes).ok()?;
+        if decoded.event_kind != AuditEventKind::PruneCheckpoint {
+            continue;
+        }
+        if decoded.monotonic_nanos.saturating_add(1) == first_sequence {
+            anchor = Some(decoded.host_lease_digest);
+        }
+    }
+    anchor
+}
+
 /// Verify a chain of entries against a sealed head and a key resolver.
 ///
 /// The resolver must not copy HMAC key material into an unzeroized buffer.
@@ -1560,6 +1576,20 @@ where
 
     let mut prev_seq: u64 = 0;
     let mut prev_mac: [u8; 32] = [0u8; 32];
+    if let Some(first) = entries.first() {
+        if let Ok(decoded) = ComputerAuditEntryV1::decode(&first.entry_bytes) {
+            if decoded.sequence > 1 {
+                if let Some(anchor_mac) = prune_anchor_mac(entries, decoded.sequence) {
+                    prev_seq = decoded.sequence.saturating_sub(1);
+                    prev_mac = anchor_mac;
+                } else {
+                    return corrupt_result(sealed, 0);
+                }
+            }
+        } else {
+            return corrupt_result(sealed, 0);
+        }
+    }
     let mut last_valid_seq: u64 = 0;
     let mut db_confirmed_seq: u64 = 0;
     let mut db_confirmed_mac: [u8; 32] = [0u8; 32];

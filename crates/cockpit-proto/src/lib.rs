@@ -1540,8 +1540,8 @@ pub enum RecvFrame {
 /// Daemon-private owner capability presented on secret-bearing (`owner_only`)
 /// requests. The token is never logged: `Debug` is a fixed redaction.
 ///
-/// Pre-launch mitigation for issue #296. Follow-up #337 replaces this file
-/// token with authenticated per-peer identity (peer-cred/mTLS).
+/// Issue #337: on wire socket peers this field carries a peer-bound credential
+/// minted for the connecting process, not the legacy file next to the socket.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct OwnerCapabilityToken(String);
@@ -1560,6 +1560,16 @@ impl std::fmt::Debug for OwnerCapabilityToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("OwnerCapabilityToken([redacted])")
     }
+}
+
+/// Role attested for a local socket peer after `ExchangeLocalPeerCredential`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalClientRole {
+    Tui,
+    Cli,
+    Acp,
+    AgentChild,
 }
 
 #[cfg(test)]

@@ -2625,8 +2625,9 @@ fn oauth_owner(state: &MutableClientState) -> String {
 ///
 /// Both inputs are assigned by the daemon, never by the caller:
 /// - `state.principal` is set at connection authentication from the transport
-///   (a local unix-domain socket yields `ClientPrincipal::Owner`; a relay /
-///   attempt-grant connection yields `ClientPrincipal::Remote` via the daemon's
+///   (a local unix-domain socket yields `ClientPrincipal::Local` after peer
+///   credential exchange; a relay / attempt-grant connection yields
+///   `ClientPrincipal::Remote` via the daemon's
 ///   verified constructors). A caller cannot present itself as `Owner`.
 ///   Issue #296: socket Owner is still blanket; secret RPCs additionally
 ///   require the daemon-private capability. Follow-up #337 replaces this with
@@ -2643,7 +2644,7 @@ fn is_local_owner_action(
     state: &MutableClientState,
     #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> bool {
-    state.principal.is_owner() && {
+    state.principal.has_owner_level_authority() && {
         #[cfg(feature = "remote")]
         {
             remote_operation.is_none()
@@ -2665,7 +2666,7 @@ fn is_local_owner_action_shared(
     shared: &SharedClientState,
     remote_operation: Option<&super::RemoteOperationContext>,
 ) -> bool {
-    shared.principal.is_owner() && remote_operation.is_none()
+    shared.principal.has_owner_level_authority() && remote_operation.is_none()
 }
 
 #[cfg(test)]
@@ -3258,7 +3259,7 @@ pub(super) fn oversized_text_artifact_admission(
                 remote_request_hash(ctx, &fcor),
             )
         }
-        None if principal.is_owner() => {
+        None if principal.has_owner_level_authority() => {
             let operation_id = Uuid::new_v5(
                 &session_id,
                 format!("typed-session-artifacts-v1:{client_submission_id}").as_bytes(),
@@ -3278,7 +3279,7 @@ pub(super) fn oversized_text_artifact_admission(
         }
     };
     #[cfg(not(feature = "remote"))]
-    let (operation_id, actor, request_hash) = if principal.is_owner() {
+    let (operation_id, actor, request_hash) = if principal.has_owner_level_authority() {
         let operation_id = Uuid::new_v5(
             &session_id,
             format!("typed-session-artifacts-v1:{client_submission_id}").as_bytes(),
@@ -3354,7 +3355,7 @@ async fn handle_send_user_message_v2(
             });
         }
     };
-    if !state.principal.is_owner() {
+    if !state.principal.has_owner_level_authority() {
         return Err(ErrorPayload {
             code: ErrorCode::Authorization,
             message: "local_owner_direct ingress requires the local owner".into(),
@@ -4248,7 +4249,7 @@ fn bulk_user_message_transfer_owner_impl(
             ),
         );
     }
-    if principal.is_owner() {
+    if principal.has_owner_level_authority() {
         identity.extend_from_slice(b"\0local-owner");
     } else {
         return Err(ErrorPayload {
@@ -4304,7 +4305,7 @@ fn bulk_user_message_replay_actor_impl(
             },
         );
     }
-    if principal.is_owner() {
+    if principal.has_owner_level_authority() {
         Ok(crate::db::message_attachments::MessageActor::LocalOwner)
     } else {
         Err(ErrorPayload {
@@ -5849,7 +5850,8 @@ async fn handle_serialized_request_impl(
     #[cfg(feature = "remote")]
     let audit_path = request_audit_path(&request);
     #[cfg(feature = "remote")]
-    let audit_remote = !state.principal.is_owner() && is_remote_mutating_request(&request);
+    let audit_remote =
+        !state.principal.has_owner_level_authority() && is_remote_mutating_request(&request);
     #[cfg(feature = "remote")]
     let authorized_request = match authorize_request_context(&request, state, ctx).await {
         Ok(authorized) => authorized,
@@ -7235,7 +7237,7 @@ async fn handle_serialized_request_impl(
                 })
                 .await
                 .map_err(internal)?;
-            if !state.principal.is_owner() {
+            if !state.principal.has_owner_level_authority() {
                 let redact = if let Some(handle) = ctx.registry.live_handle(session_id) {
                     handle.redaction_table()
                 } else {
@@ -7339,7 +7341,7 @@ async fn handle_serialized_request_impl(
                 let operation_id = operation.operation_id.to_string();
                 let device_id = operation.authenticated_device_id.to_string();
                 let digest = principal_digest(&state.principal);
-                let is_owner = state.principal.is_owner();
+                let is_owner = state.principal.has_owner_level_authority();
                 let now = wall_ms_now();
                 let outcome = ctx.db.execute_transactional_remote_operation(
                     crate::db::remote_attachment_operations::ReserveRemoteOperation {
@@ -12229,7 +12231,7 @@ async fn handle_serialized_request_impl(
         Request::SessionLiveStatus { session_ids } => {
             let mut visible_ids = Vec::new();
             for id in session_ids {
-                if state.principal.is_owner() {
+                if state.principal.has_owner_level_authority() {
                     visible_ids.push(id);
                     continue;
                 }
@@ -18189,6 +18191,54 @@ async fn handle_serialized_request_impl(
             schema_version: ctx.db.schema_version().await.map_err(internal)?,
         }),
 
+        Request::ExchangeLocalPeerCredential => {
+            use crate::daemon::peer_authority::{
+                attest_local_client_role, default_agent_child_grants, proto_local_role,
+            };
+            use crate::daemon::principal::LocalClientRole;
+
+            let peer = state
+                .socket_peer
+                .ok_or_else(|| authorization_error("socket peer identity is required"))?;
+            let role = attest_local_client_role(peer, &ctx.approved_client_executable)
+                .ok_or_else(|| authorization_error("local peer role attestation failed"))?;
+            // Owner-class admission is never self-service from the peer's
+            // executable image alone (issue #337): the peer must present the
+            // one-time launch ticket this daemon minted at spawn, and it must
+            // be the exact launcher process the ticket is bound to. Fail
+            // closed — the peer stays unauthenticated and table-governed.
+            let presented_launch_ticket = state.presented_owner_capability.take();
+            if role.is_owner_class()
+                && !ctx
+                    .peer_credential_registry
+                    .verify_launch_provenance(presented_launch_ticket.as_deref(), peer)
+            {
+                return Err(authorization_error(
+                    "owner-class peer credential requires the daemon launch ticket \
+                     presented by the spawning process",
+                ));
+            }
+            let grants = if role == LocalClientRole::AgentChild {
+                default_agent_child_grants()
+            } else {
+                Vec::new()
+            };
+            let connection_id = state.terminal_context.client_instance_id;
+            let token =
+                ctx.peer_credential_registry
+                    .mint(peer, connection_id, role, grants.clone());
+            state.has_owner_capability = role.is_owner_class();
+            state.principal = ClientPrincipal::local_authenticated(peer, role, grants);
+            state.active_peer_credential = Some(token.as_str().to_string());
+            state.peer_credential_expires_at_unix_ms = ctx
+                .peer_credential_registry
+                .expires_at_unix_ms(connection_id, token.as_str());
+            Ok(Response::LocalPeerCredential {
+                token: proto::OwnerCapabilityToken::new(token.0),
+                role: proto_local_role(role),
+            })
+        }
+
         Request::RefreshEnv { vars } => {
             let att = require_attached(state)?;
             #[cfg(feature = "remote")]
@@ -19411,7 +19461,7 @@ pub(super) async fn begin_leak_reveal(
     principal: &ClientPrincipal,
     report_id: String,
 ) -> std::result::Result<Response, ErrorPayload> {
-    if !principal.is_owner() {
+    if !principal.has_owner_level_authority() {
         return Err(authorization_error("leak reveal requires local owner"));
     }
     let unauthorized = || ErrorPayload {
@@ -19450,7 +19500,7 @@ fn cancel_leak_reveal(
     principal: &ClientPrincipal,
     capability: proto::LeakRevealToken,
 ) -> std::result::Result<Response, ErrorPayload> {
-    if !principal.is_owner() {
+    if !principal.has_owner_level_authority() {
         return Err(authorization_error(
             "leak reveal cancel requires local owner",
         ));
@@ -19535,7 +19585,8 @@ async fn handle_concurrent_request_impl(
     #[cfg(feature = "remote")]
     let audit_path = request_audit_path(&request);
     #[cfg(feature = "remote")]
-    let audit_remote = !shared.principal.is_owner() && is_remote_mutating_request(&request);
+    let audit_remote =
+        !shared.principal.has_owner_level_authority() && is_remote_mutating_request(&request);
     authorize_request_shared(&request, &shared, &ctx).await?;
     #[cfg(feature = "remote")]
     if audit_remote {
@@ -19595,7 +19646,7 @@ async fn handle_concurrent_request_impl(
                 })
                 .await
                 .map_err(internal)?;
-            if !shared.principal.is_owner() {
+            if !shared.principal.has_owner_level_authority() {
                 let redact = if let Some(handle) = ctx.registry.live_handle(session_id) {
                     handle.redaction_table()
                 } else {
@@ -19721,7 +19772,7 @@ async fn handle_concurrent_request_impl(
             let local_owner_action =
                 is_local_owner_action_shared(&shared, remote_operation.as_ref());
             #[cfg(not(feature = "remote"))]
-            let local_owner_action = shared.principal.is_owner();
+            let local_owner_action = shared.principal.has_owner_level_authority();
             export_session_data(
                 &ctx,
                 session_id,
@@ -20078,7 +20129,7 @@ async fn handle_concurrent_request_impl(
         Request::SessionLiveStatus { session_ids } => {
             let mut visible_ids = Vec::new();
             for id in session_ids {
-                if shared.principal.is_owner() {
+                if shared.principal.has_owner_level_authority() {
                     visible_ids.push(id);
                     continue;
                 }
@@ -29412,7 +29463,7 @@ pub(super) async fn attach(
     // busy ephemeral daemon. A pending exit-guard prompt is settled by
     // the promotion — persistence is the "run in background" outcome.
     if session_entry_mode == proto::SessionEntryMode::Assistant && ctx.is_ephemeral_lifetime() {
-        if !principal.is_owner() {
+        if !principal.has_owner_level_authority() {
             return Err(authorization_error(
                 "promoting daemon lifetime requires the local owner",
             ));
@@ -29451,7 +29502,7 @@ pub(super) async fn attach(
                 }
             })?;
     }
-    let remote_readonly_attach = !principal.is_owner()
+    let remote_readonly_attach = !principal.has_owner_level_authority()
         && !principal.can_agent_write_project(&cfg_root.to_string_lossy())
         && principal.can_agent_read_project(&cfg_root.to_string_lossy());
     let client_no_sandbox = client_no_sandbox && !remote_readonly_attach;
@@ -29467,7 +29518,7 @@ pub(super) async fn attach(
     // authority. Authorization rejects the global UpdateDaemon mutation; this
     // dispatch boundary also ignores every non-owner snapshot/policy so a
     // future authz regression cannot inject values into a cold worker.
-    let (client_snapshot, env_policy) = if principal.is_owner() {
+    let (client_snapshot, env_policy) = if principal.has_owner_level_authority() {
         (env_snapshot.map(EnvSnapshot::from_wire), env_policy)
     } else {
         (None, EnvDriftPolicy::Daemon)

@@ -25,6 +25,7 @@ pub fn wall_ms_now() -> i64 {
 pub fn principal_digest(principal: &ClientPrincipal) -> String {
     let tag = match principal {
         ClientPrincipal::Owner => "owner".to_string(),
+        ClientPrincipal::Local(local) => format!("local:{}:{}", local.role_tag(), local.peer_pid),
         #[cfg(feature = "remote")]
         ClientPrincipal::Remote(remote) => format!("flycockpit:{}", remote.user_id),
     };
@@ -273,7 +274,7 @@ async fn handle_get_run_invocation_status_for(
     now_wall_ms: i64,
 ) -> std::result::Result<Response, ErrorPayload> {
     let digest = principal_digest(principal);
-    let is_owner = principal.is_owner();
+    let is_owner = principal.has_owner_level_authority();
     let outcome = ctx
         .db
         .lookup_or_tombstone_run_invocation(client_submission_id, digest, now_wall_ms, is_owner)
@@ -363,7 +364,7 @@ pub(super) async fn handle_cancel_run_invocation(
 ) -> std::result::Result<Response, ErrorPayload> {
     let now = wall_ms_now();
     let digest = principal_digest(&state.principal);
-    let is_owner = state.principal.is_owner();
+    let is_owner = state.principal.has_owner_level_authority();
     let outcome = ctx
         .db
         .lookup_or_tombstone_run_invocation(client_submission_id, digest, now, is_owner)

@@ -4796,7 +4796,7 @@ pub struct DaemonLocalOwnerRecoveryAuthority(());
 impl DaemonLocalOwnerRecoveryAuthority {
     pub(crate) fn from_local_direct(principal: &ClientPrincipal) -> Result<Self> {
         ensure!(
-            principal.is_owner(),
+            principal.has_owner_level_authority(),
             "image artifact recovery is unavailable"
         );
         Ok(Self(()))

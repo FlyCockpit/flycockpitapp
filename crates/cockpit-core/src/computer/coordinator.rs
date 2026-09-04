@@ -6057,9 +6057,10 @@ impl ComputerActionCoordinator {
                     // effect; untrack only if the action could inject
                     // input into the receiver's line. An action that can
                     // change focus (wait, capture, pointer motion,
-                    // scroll) also leaves the receiving object unproven
-                    // even when it injects no text (issue #289 remaining
-                    // finding 2).
+                    // scroll, or keyboard chords outside the closed
+                    // identity-preserving set) also leaves the receiving
+                    // object unproven even when it injects no text (issue
+                    // #289 remaining finding 2).
                     if action.injects_synthetic_input() {
                         self.typed_input_line.mark_untracked();
                     }
@@ -9650,6 +9651,477 @@ mod tests {
             "call-wait-after",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn computer_typed_line_model_unproves_receiver_on_delivered_focus_chords() {
+        // Issue #289 remaining finding: delivered tab-family and
+        // page-up/down chords can move keyboard focus. ctrl+c must not
+        // restore commits afterward.
+        async fn assert_identity_lost_after_chord(
+            coordinator: &mut ComputerActionCoordinator,
+            authorizer: &FakeComputerAuthorizer,
+            chord_keys: Vec<&str>,
+            prefix: &str,
+        ) {
+            let outcome = coordinator
+                .execute_openai_call(
+                    &format!("{prefix}-type"),
+                    &vec![OpenAiComputerAction::TypeText("# note".to_string())],
+                )
+                .await;
+            assert!(
+                matches!(outcome, CoordinatedOutcome::Completed { .. }),
+                "typing stays usable: {outcome:?}"
+            );
+            let outcome = coordinator
+                .execute_openai_call(
+                    &format!("{prefix}-chord"),
+                    &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                        keys: chord_keys.iter().map(|key| key.to_string()).collect(),
+                    })],
+                )
+                .await;
+            assert!(
+                matches!(outcome, CoordinatedOutcome::Completed { .. }),
+                "focus chord stays usable: {outcome:?}"
+            );
+            let authorized_before_enter = authorizer.call_count();
+            let outcome = coordinator
+                .execute_openai_call(
+                    &format!("{prefix}-enter"),
+                    &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                        keys: vec!["enter".to_string()],
+                    })],
+                )
+                .await;
+            let failure = match outcome {
+                CoordinatedOutcome::Failed { failure, .. } => failure,
+                other => panic!("a focus chord must leave the receiver unproven, got {other:?}"),
+            };
+            assert!(
+                matches!(&failure.error, ComputerError::Refused(reason) if reason.contains("receiving object")),
+                "the refusal must name the unproven receiver: {:?}",
+                failure.error
+            );
+            assert_eq!(
+                authorizer.call_count(),
+                authorized_before_enter,
+                "the refusal must precede authorization"
+            );
+            let outcome = coordinator
+                .execute_openai_call(
+                    &format!("{prefix}-cancel"),
+                    &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                        keys: vec!["ctrl".to_string(), "c".to_string()],
+                    })],
+                )
+                .await;
+            assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
+            let outcome = coordinator
+                .execute_openai_call(
+                    &format!("{prefix}-after"),
+                    &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                        keys: vec!["enter".to_string()],
+                    })],
+                )
+                .await;
+            let failure = match outcome {
+                CoordinatedOutcome::Failed { failure, .. } => failure,
+                other => {
+                    panic!("ctrl+c must not restore commits after a focus chord, got {other:?}")
+                }
+            };
+            assert!(
+                matches!(&failure.error, ComputerError::Refused(reason) if reason.contains("receiving object")),
+                "ctrl+c must not rebind an unproven receiver: {:?}",
+                failure.error
+            );
+        }
+
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let mut coordinator =
+            make_coordinator(Box::new(FakeBackend::new()), authorizer.clone()).await;
+        assert_identity_lost_after_chord(
+            &mut coordinator,
+            authorizer.as_ref(),
+            vec!["ctrl", "PAGEUP"],
+            "call-delivered-ctrl-pageup",
+        )
+        .await;
+        assert_identity_lost_after_chord(
+            &mut coordinator,
+            authorizer.as_ref(),
+            vec!["ctrl", "d"],
+            "call-delivered-ctrl-d",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn computer_typed_line_model_unproves_receiver_on_delivered_non_enter_hold() {
+        // Issue #289: delivered non-Enter holds are identity-changing; ctrl+c
+        // must not restore commits afterward.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let mut coordinator =
+            make_coordinator(Box::new(FakeBackend::new()), authorizer.clone()).await;
+
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-hold-type",
+                &vec![OpenAiComputerAction::TypeText("# note".to_string())],
+            )
+            .await;
+        assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
+
+        let outcome = coordinator
+            .execute_anthropic_20251124_call(
+                "call-hold-a",
+                &Anthropic20251124ComputerAction::HoldKey {
+                    key: "a".to_string(),
+                    duration: Duration::from_millis(10),
+                },
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Completed { .. }),
+            "non-Enter hold stays usable: {outcome:?}"
+        );
+
+        let authorized_before_enter = authorizer.call_count();
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-hold-enter",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["enter".to_string()],
+                })],
+            )
+            .await;
+        let failure = match outcome {
+            CoordinatedOutcome::Failed { failure, .. } => failure,
+            other => panic!("a non-Enter hold must leave the receiver unproven, got {other:?}"),
+        };
+        assert!(
+            matches!(&failure.error, ComputerError::Refused(reason) if reason.contains("receiving object")),
+            "the refusal must name the unproven receiver: {:?}",
+            failure.error
+        );
+        assert_eq!(
+            authorizer.call_count(),
+            authorized_before_enter,
+            "the refusal must precede authorization"
+        );
+
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-hold-cancel",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["ctrl".to_string(), "c".to_string()],
+                })],
+            )
+            .await;
+        assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
+
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-hold-after",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["enter".to_string()],
+                })],
+            )
+            .await;
+        let failure = match outcome {
+            CoordinatedOutcome::Failed { failure, .. } => failure,
+            other => {
+                panic!("ctrl+c must not restore commits after a non-Enter hold, got {other:?}")
+            }
+        };
+        assert!(
+            matches!(&failure.error, ComputerError::Refused(reason) if reason.contains("receiving object")),
+            "ctrl+c must not rebind an unproven receiver: {:?}",
+            failure.error
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_typed_line_model_enter_hold_commits_when_identity_preserved() {
+        // Enter holds must still commit through the same choke point as bare Enter.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let mut coordinator =
+            make_coordinator(Box::new(FakeBackend::new()), authorizer.clone()).await;
+
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-enter-hold-type",
+                &vec![OpenAiComputerAction::TypeText("hello".to_string())],
+            )
+            .await;
+        assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
+
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-enter-hold-cancel",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["ctrl".to_string(), "c".to_string()],
+                })],
+            )
+            .await;
+        assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
+
+        let outcome = coordinator
+            .execute_anthropic_20251124_call(
+                "call-enter-hold",
+                &Anthropic20251124ComputerAction::HoldKey {
+                    key: "enter".to_string(),
+                    duration: Duration::from_millis(10),
+                },
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Completed { .. }),
+            "an Enter hold must commit a proven empty line: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_typed_line_model_unproves_receiver_on_ambiguous_focus_chords() {
+        // Ambiguous delivery of an identity-changing chord must mark the
+        // receiver unproven at least as conservatively as delivered
+        // delivery — never only untracked.
+        fn is_alt_tab_effect(effect: &NormalizedComputerEffect) -> bool {
+            matches!(
+                effect,
+                NormalizedComputerEffect::KeyChord { chord }
+                    if chord.keys().iter().any(|key| {
+                        matches!(key.x11_name(), "Alt" | "Alt_L" | "Alt_R")
+                    }) && chord.keys().iter().any(|key| key.x11_name() == "Tab")
+            )
+        }
+
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let mut coordinator = make_coordinator(
+            Box::new(FailMatchingEffectBackend::new(is_alt_tab_effect, 0)),
+            authorizer.clone(),
+        )
+        .await;
+
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-ambiguous-type",
+                &vec![OpenAiComputerAction::TypeText("# note".to_string())],
+            )
+            .await;
+        assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
+
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-ambiguous-alt-tab",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["alt".to_string(), "tab".to_string()],
+                })],
+            )
+            .await;
+        assert!(
+            matches!(
+                &outcome,
+                CoordinatedOutcome::Failed { failure, .. } if failure.index == 0
+            ),
+            "ambiguous alt+tab delivery must fail at the chord: {outcome:?}"
+        );
+
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-ambiguous-cancel",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["ctrl".to_string(), "c".to_string()],
+                })],
+            )
+            .await;
+        assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
+
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-ambiguous-enter",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["enter".to_string()],
+                })],
+            )
+            .await;
+        let failure = match outcome {
+            CoordinatedOutcome::Failed { failure, .. } => failure,
+            other => panic!(
+                "ambiguous alt+tab must leave the receiver unproven after ctrl+c, got {other:?}"
+            ),
+        };
+        assert!(
+            matches!(&failure.error, ComputerError::Refused(reason) if reason.contains("receiving object")),
+            "ctrl+c must not restore commits after ambiguous focus change: {:?}",
+            failure.error
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_typed_line_model_preserves_receiver_identity_for_line_editing_chords() {
+        // The positive identity-preserving set must not over-reach: unmodified
+        // arrows and ctrl+c still allow benign commits after a proven reset.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let mut coordinator =
+            make_coordinator(Box::new(FakeBackend::new()), authorizer.clone()).await;
+
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-line-type",
+                &vec![OpenAiComputerAction::TypeText("hello".to_string())],
+            )
+            .await;
+        assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
+
+        for (call_id, keys) in [
+            ("call-line-left", vec!["left".to_string()]),
+            ("call-line-right", vec!["right".to_string()]),
+        ] {
+            let outcome = coordinator
+                .execute_openai_call(
+                    call_id,
+                    &vec![OpenAiComputerAction::KeyChord(KeyChord { keys })],
+                )
+                .await;
+            assert!(
+                matches!(outcome, CoordinatedOutcome::Completed { .. }),
+                "line-editing chord {call_id} stays usable: {outcome:?}"
+            );
+        }
+
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-line-cancel",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["ctrl".to_string(), "c".to_string()],
+                })],
+            )
+            .await;
+        assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
+
+        let outcome = coordinator
+            .execute_openai_call(
+                "call-line-enter",
+                &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                    keys: vec!["enter".to_string()],
+                })],
+            )
+            .await;
+        assert!(
+            matches!(outcome, CoordinatedOutcome::Completed { .. }),
+            "a proven reset must still allow benign commits: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_typed_line_model_unproves_receiver_on_overbroad_chords() {
+        // Konsole shift+arrow tab chords, GNU screen's `ctrl+a` prefix,
+        // shift+F10, and PrintScreen must leave the receiver unproven.
+        async fn assert_identity_lost_after_chord(
+            coordinator: &mut ComputerActionCoordinator,
+            authorizer: &FakeComputerAuthorizer,
+            chord_keys: Vec<&str>,
+            prefix: &str,
+        ) {
+            let outcome = coordinator
+                .execute_openai_call(
+                    &format!("{prefix}-type"),
+                    &vec![OpenAiComputerAction::TypeText("# note".to_string())],
+                )
+                .await;
+            assert!(
+                matches!(outcome, CoordinatedOutcome::Completed { .. }),
+                "typing stays usable: {outcome:?}"
+            );
+            let outcome = coordinator
+                .execute_openai_call(
+                    &format!("{prefix}-chord"),
+                    &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                        keys: chord_keys.iter().map(|key| key.to_string()).collect(),
+                    })],
+                )
+                .await;
+            assert!(
+                matches!(outcome, CoordinatedOutcome::Completed { .. }),
+                "focus chord stays usable: {outcome:?}"
+            );
+            let authorized_before_enter = authorizer.call_count();
+            let outcome = coordinator
+                .execute_openai_call(
+                    &format!("{prefix}-enter"),
+                    &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                        keys: vec!["enter".to_string()],
+                    })],
+                )
+                .await;
+            let failure = match outcome {
+                CoordinatedOutcome::Failed { failure, .. } => failure,
+                other => {
+                    panic!("an overbroad chord must leave the receiver unproven, got {other:?}")
+                }
+            };
+            assert!(
+                matches!(&failure.error, ComputerError::Refused(reason) if reason.contains("receiving object")),
+                "the refusal must name the unproven receiver: {:?}",
+                failure.error
+            );
+            assert_eq!(
+                authorizer.call_count(),
+                authorized_before_enter,
+                "the refusal must precede authorization"
+            );
+            let outcome = coordinator
+                .execute_openai_call(
+                    &format!("{prefix}-cancel"),
+                    &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                        keys: vec!["ctrl".to_string(), "c".to_string()],
+                    })],
+                )
+                .await;
+            assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
+            let outcome = coordinator
+                .execute_openai_call(
+                    &format!("{prefix}-after"),
+                    &vec![OpenAiComputerAction::KeyChord(KeyChord {
+                        keys: vec!["enter".to_string()],
+                    })],
+                )
+                .await;
+            let failure = match outcome {
+                CoordinatedOutcome::Failed { failure, .. } => failure,
+                other => {
+                    panic!(
+                        "ctrl+c must not restore commits after an overbroad chord, got {other:?}"
+                    )
+                }
+            };
+            assert!(
+                matches!(&failure.error, ComputerError::Refused(reason) if reason.contains("receiving object")),
+                "ctrl+c must not rebind an unproven receiver: {:?}",
+                failure.error
+            );
+        }
+
+        for (prefix, chord_keys) in [
+            ("call-shift-arrow", vec!["shift", "left"]),
+            ("call-ctrl-a", vec!["ctrl", "a"]),
+            ("call-shift-f10", vec!["shift", "F10"]),
+            ("call-printscreen", vec!["PRINTSCREEN"]),
+        ] {
+            let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+            let mut coordinator =
+                make_coordinator(Box::new(FakeBackend::new()), authorizer.clone()).await;
+            assert_identity_lost_after_chord(
+                &mut coordinator,
+                authorizer.as_ref(),
+                chord_keys,
+                prefix,
+            )
+            .await;
+        }
     }
 
     /// Backend that fails the delivery of the `fail_at_seen`-th (0-based)

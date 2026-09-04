@@ -1,12 +1,19 @@
 #!/usr/bin/env node
 // verify_tenant_authority_acceptance_manifest.mjs
 //
-// Consumes the prefix-wide `cargo nextest list --message-format json` stream,
-// requires the recognized Nextest schema and exact test binary, and compares
-// the complete lexicographically sorted `tenant_authority_*` manifest to
-// exactly the nine names below. It rejects an empty stream, malformed/unknown
-// schema, wrong binary, missing/renamed/extra/duplicate name, or any entry
-// with `ignored=true`; it must not filter to the allowlist before comparison.
+// Consumes a package-scoped Nextest list stream and compares the complete
+// lexicographically sorted `tenant_authority_*` manifest to exactly the nine
+// names below. Required invocation (remote feature enabled):
+//
+//   cargo nextest list -p tenant-authority --features remote \
+//     --message-format json \
+//     | node apps/tenant-authority/tests/verify_tenant_authority_acceptance_manifest.mjs
+//
+// Within that stream, every `tenant_authority_*` name must come from binary
+// `tenant_authority_service_acceptance`. Rejects an empty stream,
+// malformed/unknown schema, wrong binary, missing/renamed/extra/duplicate name,
+// or any entry with `ignored=true`; it must not filter to the allowlist before
+// comparison.
 
 const EXACT_NINE = [
   "tenant_authority_fixed_preparation_and_identity_rotation",

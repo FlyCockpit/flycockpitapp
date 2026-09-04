@@ -1,8 +1,9 @@
 //! Process-boundary exit-code enforcement for the `tenant-authority` binary.
 //!
 //! Spawns the built binary via `CARGO_BIN_EXE_tenant-authority` and asserts
-//! every subcommand surface fails closed with a non-zero exit. Separate from
-//! the nine-test acceptance manifest ratchet.
+//! every subcommand surface fails closed with a non-zero exit. Test names
+//! intentionally avoid the `tenant_authority_` prefix reserved for the nine
+//! acceptance suites in `tenant_authority_service_acceptance.rs`.
 
 fn tenant_authority_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_tenant-authority"))
@@ -25,7 +26,7 @@ fn assert_exits_failure(label: &str, args: &[&str]) {
 }
 
 #[test]
-fn tenant_authority_default_and_serve_exit_nonzero() {
+fn binary_exit_default_and_serve_nonzero() {
     assert_exits_failure("default (serve)", &[]);
     assert_exits_failure("explicit serve", &["serve"]);
 
@@ -44,7 +45,7 @@ fn tenant_authority_default_and_serve_exit_nonzero() {
 }
 
 #[test]
-fn tenant_authority_offline_subcommands_exit_nonzero() {
+fn binary_exit_offline_subcommands_nonzero() {
     for sub in [
         "bootstrap",
         "prepare-policy-revision",
@@ -62,7 +63,7 @@ fn tenant_authority_offline_subcommands_exit_nonzero() {
 }
 
 #[test]
-fn tenant_authority_unknown_subcommand_exits_nonzero() {
+fn binary_exit_unknown_subcommand_nonzero() {
     assert_exits_failure("unknown subcommand", &["definitely-not-a-subcommand"]);
     let output = run_tenant_authority(&["definitely-not-a-subcommand"]);
     let stderr = String::from_utf8_lossy(&output.stderr);

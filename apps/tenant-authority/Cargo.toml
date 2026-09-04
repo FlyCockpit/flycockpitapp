@@ -30,7 +30,8 @@ name = "tenant_authority_service_acceptance"
 path = "tests/tenant_authority_service_acceptance.rs"
 required-features = ["remote"]
 
-# Process-boundary exit-code enforcement (outside the nine-test manifest).
+# Process-boundary exit-code enforcement; test names avoid the
+# `tenant_authority_` prefix reserved for the nine acceptance suites.
 [[test]]
 name = "tenant_authority_binary_exit"
 path = "tests/tenant_authority_binary_exit.rs"

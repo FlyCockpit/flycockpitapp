@@ -3,6 +3,7 @@
 //! Connects through the production daemon accept path, exchanges a peer-bound
 //! credential, and proves owner-class RPC admission with the returned token.
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
@@ -59,10 +60,12 @@ async fn run() -> Result<()> {
     }
 
     let exchange_id = Uuid::now_v7();
+    let file_capability = load_owner_capability(&socket_path);
     client
-        .send(&Envelope::request(
+        .send(&Envelope::request_with_owner_capability(
             exchange_id,
             Request::ExchangeLocalPeerCredential,
+            file_capability,
         ))
         .await
         .context("send peer credential exchange")?;
@@ -124,4 +127,28 @@ async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn owner_capability_path(control_socket: &Path) -> PathBuf {
+    let stem = control_socket
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("cockpit");
+    let file_name = format!("{stem}.owner-capability");
+    match control_socket.parent() {
+        Some(parent) => parent.join(file_name),
+        None => PathBuf::from(file_name),
+    }
+}
+
+fn load_owner_capability(control_socket: &Path) -> Option<proto::OwnerCapabilityToken> {
+    let path = owner_capability_path(control_socket);
+    let bytes = std::fs::read(&path).ok()?;
+    let token = String::from_utf8(bytes).ok()?;
+    let token = token.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(proto::OwnerCapabilityToken::new(token.to_string()))
+    }
 }

@@ -18186,6 +18186,11 @@ async fn handle_serialized_request_impl(
                 .ok_or_else(|| authorization_error("socket peer identity is required"))?;
             let role = attest_local_client_role(peer, &ctx.approved_client_executable)
                 .ok_or_else(|| authorization_error("local peer role attestation failed"))?;
+            if role.is_owner_class() && !state.has_owner_capability {
+                return Err(authorization_error(
+                    "owner-class peer exchange requires the daemon-private owner capability",
+                ));
+            }
             let grants = if role == LocalClientRole::AgentChild {
                 default_agent_child_grants()
             } else {

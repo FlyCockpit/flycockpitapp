@@ -8625,6 +8625,8 @@ fn remote_state_with_grants(
         }),
         socket_peer: None,
         has_owner_capability: false,
+        active_peer_credential: None,
+        peer_credential_expires_at_unix_ms: None,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "flycockpit:user-1".into(),
             client_instance_id: Uuid::new_v4(),
@@ -8910,6 +8912,9 @@ async fn run_legitimate_peer_auth_admission_test(role: &str, child_args: &[&str]
     let ctx = peer_auth_admission_test_ctx(child_executable.clone());
     let socket_dir = tempfile::tempdir().expect("socket tempdir");
     let socket_path = socket_dir.path().join("peer-auth.sock");
+    ctx.owner_capability
+        .publish(&socket_path)
+        .expect("publish owner capability for peer auth admission");
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind peer auth socket");
 
     let server_ctx = ctx.clone();

@@ -1451,10 +1451,19 @@ pub(super) async fn authorize_request(
 ) -> std::result::Result<(), ErrorPayload> {
     let principal = &state.principal;
     if principal.has_owner_level_authority() {
-        if principal::request_requires_owner_capability(request) && !state.has_owner_capability {
-            return Err(authorization_error(
-                "request requires the daemon-private owner capability",
-            ));
+        if principal::request_requires_owner_capability(request) {
+            let admitted = crate::daemon::peer_authority::socket_peer_owner_capability_live(
+                &ctx.peer_credential_registry,
+                state.socket_peer,
+                state.terminal_context.client_instance_id,
+                state.active_peer_credential.as_deref(),
+                state.has_owner_capability,
+            );
+            if !admitted {
+                return Err(authorization_error(
+                    "request requires the daemon-private owner capability",
+                ));
+            }
         }
         return Ok(());
     }
@@ -1570,10 +1579,19 @@ pub(super) async fn authorize_request_shared(
 ) -> std::result::Result<(), ErrorPayload> {
     let principal = &shared.principal;
     if principal.has_owner_level_authority() {
-        if principal::request_requires_owner_capability(request) && !shared.has_owner_capability {
-            return Err(authorization_error(
-                "request requires the daemon-private owner capability",
-            ));
+        if principal::request_requires_owner_capability(request) {
+            let admitted = crate::daemon::peer_authority::socket_peer_owner_capability_live(
+                &ctx.peer_credential_registry,
+                shared.socket_peer,
+                shared.client_instance_id,
+                shared.active_peer_credential.as_deref(),
+                shared.has_owner_capability,
+            );
+            if !admitted {
+                return Err(authorization_error(
+                    "request requires the daemon-private owner capability",
+                ));
+            }
         }
         return Ok(());
     }

@@ -105,6 +105,44 @@ impl PeerCredentialRegistry {
             }
         }
     }
+
+    fn remove_records<F>(&self, keep: F) -> Vec<Uuid>
+    where
+        F: FnMut(&PeerCredentialRecord) -> bool,
+    {
+        let mut records = self
+            .records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut invalidated = Vec::new();
+        records.retain(|_, record| {
+            if keep(record) {
+                true
+            } else {
+                invalidated.push(record.connection_id);
+                false
+            }
+        });
+        invalidated
+    }
+
+    fn prune_expired_records(
+        &self,
+        records: &mut HashMap<String, PeerCredentialRecord>,
+    ) -> Vec<Uuid> {
+        let now = now_unix_ms();
+        let mut invalidated = Vec::new();
+        records.retain(|_, record| {
+            if record.expires_at_unix_ms > now {
+                true
+            } else {
+                invalidated.push(record.connection_id);
+                false
+            }
+        });
+        invalidated
+    }
+
     pub fn mint(
         &self,
         peer: PeerIdentity,
@@ -126,33 +164,39 @@ impl PeerCredentialRegistry {
             grants,
             expires_at_unix_ms,
         };
-        let mut records = self
-            .records
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        records.retain(|_, existing| existing.expires_at_unix_ms > now_unix_ms());
-        let mut evicted_connection_ids = Vec::new();
-        if records.len() >= MAX_PEER_CREDENTIAL_RECORDS {
-            records.retain(|_, existing| {
-                existing.expires_at_unix_ms
-                    > now_unix_ms() + PEER_CREDENTIAL_TTL.as_millis() as i64 / 2
-            });
-            while records.len() >= MAX_PEER_CREDENTIAL_RECORDS {
-                let Some(oldest_key) = records
-                    .iter()
-                    .min_by_key(|(_, existing)| existing.expires_at_unix_ms)
-                    .map(|(key, _)| key.clone())
-                else {
-                    break;
-                };
-                if let Some(record) = records.remove(&oldest_key) {
-                    evicted_connection_ids.push(record.connection_id);
+        let mut invalidated = Vec::new();
+        {
+            let mut records = self
+                .records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            invalidated.extend(self.prune_expired_records(&mut records));
+            if records.len() >= MAX_PEER_CREDENTIAL_RECORDS {
+                let near_expiry_cutoff = now_unix_ms() + PEER_CREDENTIAL_TTL.as_millis() as i64 / 2;
+                records.retain(|_, existing| {
+                    if existing.expires_at_unix_ms > near_expiry_cutoff {
+                        true
+                    } else {
+                        invalidated.push(existing.connection_id);
+                        false
+                    }
+                });
+                while records.len() >= MAX_PEER_CREDENTIAL_RECORDS {
+                    let Some(oldest_key) = records
+                        .iter()
+                        .min_by_key(|(_, existing)| existing.expires_at_unix_ms)
+                        .map(|(key, _)| key.clone())
+                    else {
+                        break;
+                    };
+                    if let Some(record) = records.remove(&oldest_key) {
+                        invalidated.push(record.connection_id);
+                    }
                 }
             }
+            records.insert(token.0.clone(), record);
         }
-        records.insert(token.0.clone(), record);
-        drop(records);
-        self.notify_invalidated(evicted_connection_ids);
+        self.notify_invalidated(invalidated);
         token
     }
 
@@ -165,12 +209,41 @@ impl PeerCredentialRegistry {
         if !peer_identity_matches_live_process(peer) {
             return None;
         }
-        let mut records = self
+        let (invalidated, verified) = {
+            let mut records = self
+                .records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let invalidated = self.prune_expired_records(&mut records);
+            let verified = records.get(presented).and_then(|record| {
+                if record.peer != peer || record.connection_id != connection_id {
+                    return None;
+                }
+                Some((record.role, record.grants.clone()))
+            });
+            (invalidated, verified)
+        };
+        self.notify_invalidated(invalidated);
+        verified
+    }
+
+    pub fn verify_without_prune(
+        &self,
+        peer: PeerIdentity,
+        connection_id: Uuid,
+        presented: &str,
+    ) -> Option<(LocalClientRole, Vec<PrincipalGrant>)> {
+        if !peer_identity_matches_live_process(peer) {
+            return None;
+        }
+        let records = self
             .records
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        records.retain(|_, existing| existing.expires_at_unix_ms > now_unix_ms());
         let record = records.get(presented)?;
+        if record.expires_at_unix_ms <= now_unix_ms() {
+            return None;
+        }
         if record.peer != peer || record.connection_id != connection_id {
             return None;
         }
@@ -189,11 +262,29 @@ impl PeerCredentialRegistry {
     }
 
     pub fn revoke_for_connection(&self, connection_id: Uuid) {
-        let mut records = self
-            .records
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        records.retain(|_, record| record.connection_id != connection_id);
+        let invalidated = self.remove_records(|record| record.connection_id != connection_id);
+        self.notify_invalidated(invalidated);
+    }
+}
+
+/// True when a socket peer's cached owner capability still matches a live
+/// registry record. In-process clients and file-capability-only paths keep
+/// the cached flag.
+pub fn socket_peer_owner_capability_live(
+    registry: &PeerCredentialRegistry,
+    socket_peer: Option<PeerIdentity>,
+    connection_id: Uuid,
+    active_peer_credential: Option<&str>,
+    cached_has_owner_capability: bool,
+) -> bool {
+    if !cached_has_owner_capability {
+        return false;
+    }
+    match (socket_peer, active_peer_credential) {
+        (Some(peer), Some(token)) => registry
+            .verify_without_prune(peer, connection_id, token)
+            .is_some_and(|(role, _)| role.is_owner_class()),
+        _ => true,
     }
 }
 
@@ -244,7 +335,7 @@ pub fn attest_local_client_role(
         return attest_agent_child_role(peer, approved_executable);
     }
     let cmdline = cockpit_host::daemon_lifecycle::read_process_cmdline(peer.pid).ok()?;
-    Some(classify_cockpit_cmdline(&cmdline))
+    classify_cockpit_cmdline(&cmdline)
 }
 
 fn attest_agent_child_role(
@@ -262,28 +353,28 @@ fn attest_agent_child_role(
     None
 }
 
-fn classify_cockpit_cmdline(cmdline: &[String]) -> LocalClientRole {
+fn classify_cockpit_cmdline(cmdline: &[String]) -> Option<LocalClientRole> {
     let args = cmdline
         .iter()
         .skip(1)
         .map(|arg| arg.as_str())
         .collect::<Vec<_>>();
     if args.first() == Some(&"acp") {
-        return LocalClientRole::Acp;
+        return Some(LocalClientRole::Acp);
     }
     if args.first() == Some(&"daemon") {
-        return LocalClientRole::Cli;
+        return Some(LocalClientRole::Cli);
     }
     if args
         .iter()
         .any(|arg| matches!(*arg, "tui" | "attach" | "run"))
     {
-        return LocalClientRole::Tui;
+        return Some(LocalClientRole::Tui);
     }
     if args.is_empty() {
-        return LocalClientRole::Tui;
+        return Some(LocalClientRole::Tui);
     }
-    LocalClientRole::Cli
+    None
 }
 
 pub fn default_agent_child_grants() -> Vec<PrincipalGrant> {
@@ -298,19 +389,23 @@ mod tests {
     fn classify_cockpit_cmdline_maps_roles() {
         assert_eq!(
             classify_cockpit_cmdline(&["cockpit".into()]),
-            LocalClientRole::Tui
+            Some(LocalClientRole::Tui)
         );
         assert_eq!(
             classify_cockpit_cmdline(&["cockpit".into(), "acp".into()]),
-            LocalClientRole::Acp
+            Some(LocalClientRole::Acp)
         );
         assert_eq!(
             classify_cockpit_cmdline(&["cockpit".into(), "daemon".into(), "status".into()]),
-            LocalClientRole::Cli
+            Some(LocalClientRole::Cli)
         );
         assert_eq!(
             classify_cockpit_cmdline(&["cockpit".into(), "run".into(), "task".into()]),
-            LocalClientRole::Tui
+            Some(LocalClientRole::Tui)
+        );
+        assert_eq!(
+            classify_cockpit_cmdline(&["cockpit".into(), "evil".into()]),
+            None
         );
     }
 

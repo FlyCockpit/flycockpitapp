@@ -1289,7 +1289,21 @@ pub fn exact_executable_identity(observed: &Path, approved: &Path) -> bool {
     let Ok(approved) = std::fs::canonicalize(approved) else {
         return false;
     };
-    observed == approved
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(&observed), std::fs::metadata(&approved)) {
+            (Ok(observed_meta), Ok(approved_meta)) => {
+                observed_meta.dev() == approved_meta.dev()
+                    && observed_meta.ino() == approved_meta.ino()
+            }
+            _ => false,
+        }
+    }
+    #[cfg(windows)]
+    {
+        observed == approved
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

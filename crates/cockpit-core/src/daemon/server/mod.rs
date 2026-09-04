@@ -5339,6 +5339,9 @@ struct MutableClientState {
 pub(super) struct SharedClientState {
     principal: ClientPrincipal,
     has_owner_capability: bool,
+    socket_peer: Option<cockpit_host::peer_cred::PeerIdentity>,
+    client_instance_id: Uuid,
+    active_peer_credential: Option<String>,
     capability_owner: String,
     #[allow(dead_code)]
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
@@ -5463,6 +5466,9 @@ impl MutableClientState {
         Arc::new(SharedClientState {
             principal: self.principal.clone(),
             has_owner_capability: self.has_owner_capability,
+            socket_peer: self.socket_peer,
+            client_instance_id: self.terminal_context.client_instance_id,
+            active_peer_credential: self.active_peer_credential.clone(),
             // Capabilities survive the settings client's short transport
             // reconnects. Root, layer, identity and revision remain bound in
             // the capability itself; the owner is the stable authenticated
@@ -6669,6 +6675,33 @@ fn downgrade_revoked_peer_authority(
     let _ = principal_tx.send(state.principal.clone());
 }
 
+fn reconcile_socket_peer_owner_authority(
+    state: &mut MutableClientState,
+    shared: &mut Arc<SharedClientState>,
+    ctx: &Arc<DaemonContext>,
+    principal_tx: &watch::Sender<ClientPrincipal>,
+) {
+    if state.socket_peer.is_none() || state.active_peer_credential.is_none() {
+        return;
+    }
+    let peer = state.socket_peer.expect("checked above");
+    let connection_id = state.terminal_context.client_instance_id;
+    let token = state
+        .active_peer_credential
+        .as_deref()
+        .expect("checked above");
+    if crate::daemon::peer_authority::socket_peer_owner_capability_live(
+        &ctx.peer_credential_registry,
+        Some(peer),
+        connection_id,
+        Some(token),
+        state.has_owner_capability,
+    ) {
+        return;
+    }
+    downgrade_revoked_peer_authority(state, shared, principal_tx);
+}
+
 async fn handle_client_frame(
     frame: RecvFrame,
     state: &mut MutableClientState,
@@ -6755,6 +6788,7 @@ async fn handle_envelope(
             owner_capability,
             request,
         } => {
+            reconcile_socket_peer_owner_authority(state, shared, ctx, principal_tx);
             if let Some(token) = owner_capability {
                 if let Some(peer) = state.socket_peer {
                     let connection_id = state.terminal_context.client_instance_id;
@@ -6770,6 +6804,9 @@ async fn handle_envelope(
                             .expires_at_unix_ms(connection_id, token.as_str());
                         *shared = state.shared_snapshot();
                         let _ = principal_tx.send(state.principal.clone());
+                    } else if ctx.owner_capability.verify(token.as_str()) {
+                        state.has_owner_capability = true;
+                        *shared = state.shared_snapshot();
                     } else {
                         state.has_owner_capability = false;
                         state.active_peer_credential = None;

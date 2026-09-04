@@ -2353,6 +2353,7 @@ impl Driver {
         {
             Ok(prepared) => prepared,
             Err(error) => {
+                eprintln!("AUTOCOMPACT-DEBUG prepare error: {error:#}");
                 self.stack[0].history = saved_history;
                 let _ = tx
                     .send(TurnEvent::Notice {
@@ -2383,6 +2384,10 @@ impl Driver {
     > {
         let actual = prepared_compaction_coverage(&self.stack[0].history);
         if actual != prepared.coverage {
+            eprintln!(
+                "AUTOCOMPACT-DEBUG stale coverage: actual={actual:?} prepared={:?}",
+                prepared.coverage
+            );
             let _ = tx
                 .send(TurnEvent::Notice {
                     text: "/compact: prepared subagent compaction is stale; history was left unchanged"
@@ -2458,6 +2463,7 @@ impl Driver {
         )
         .await;
         if let Err(error) = record_result {
+            eprintln!("AUTOCOMPACT-DEBUG record error: {error:#}");
             let _ = tx
                 .send(TurnEvent::Notice {
                     text: format!(

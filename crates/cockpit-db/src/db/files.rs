@@ -86,13 +86,21 @@ impl DatabaseDiagnosticLock {
 }
 
 pub(crate) fn cockpit_data_dir() -> Result<PathBuf> {
-    if let Ok(s) = std::env::var("XDG_DATA_HOME")
+    let path = if let Ok(s) = std::env::var("XDG_DATA_HOME")
         && !s.trim().is_empty()
     {
-        return Ok(PathBuf::from(s).join("cockpit"));
+        PathBuf::from(s).join("cockpit")
+    } else {
+        let base = dirs::data_dir().context("could not locate user data dir")?;
+        base.join("cockpit")
+    };
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        use cockpit_test_support::home_isolation::{CockpitHomeKind, finalize_test_cockpit_path};
+        return Ok(finalize_test_cockpit_path(path, CockpitHomeKind::Data));
     }
-    let base = dirs::data_dir().context("could not locate user data dir")?;
-    Ok(base.join("cockpit"))
+    #[cfg(not(any(test, feature = "test-support")))]
+    Ok(path)
 }
 
 pub(crate) struct PhaseTimer {

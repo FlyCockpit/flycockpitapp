@@ -176,19 +176,7 @@ impl TestEnvGuard {
         let config = home.join(".config");
         let state = root.join("state");
         let runtime = root.join("runtime");
-        let config_cockpit = config.join("cockpit");
-        let data_cockpit = data.join("cockpit");
-        let state_cockpit = state.join("cockpit");
-        for dir in [
-            &home,
-            &data,
-            &config,
-            &state,
-            &runtime,
-            &config_cockpit,
-            &data_cockpit,
-            &state_cockpit,
-        ] {
+        for dir in [&home, &data, &config, &state, &runtime] {
             std::fs::create_dir_all(dir).expect("create isolated env directory");
         }
         self.set_var("HOME", &home);

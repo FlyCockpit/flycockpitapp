@@ -46,6 +46,7 @@ zeroize = { workspace = true }
 quote = "1"
 sha2 = { workspace = true }
 syn = { version = "2", features = ["full"] }
+cockpit-config = { path = "../cockpit-config", features = ["test-support"] }
 
 [[test]]
 name = "remote_attempt_grant_fixtures"

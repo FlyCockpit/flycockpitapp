@@ -29,6 +29,8 @@ pub enum CockpitHomeKind {
 }
 
 struct RealDeveloperCockpitRoots {
+    home: PathBuf,
+    xdg_data: PathBuf,
     config: PathBuf,
     data: PathBuf,
     state: PathBuf,
@@ -36,6 +38,11 @@ struct RealDeveloperCockpitRoots {
 
 struct ProcessIsolatedHome {
     _tempdir: tempfile::TempDir,
+    home: PathBuf,
+    xdg_data: PathBuf,
+    _xdg_config: PathBuf,
+    _xdg_state: PathBuf,
+    _runtime: PathBuf,
     config: PathBuf,
     data: PathBuf,
     state: PathBuf,
@@ -48,11 +55,14 @@ static PROCESS_ISOLATED_HOME: OnceLock<ProcessIsolatedHome> = OnceLock::new();
 /// `HOME` / XDG variables through [`TestEnvGuard`].
 pub fn ensure_real_developer_roots_captured() {
     REAL_DEVELOPER_COCKPIT_ROOTS.get_or_init(|| {
+        let home = dirs::home_dir().expect("locate real developer home dir");
+        let xdg_data = dirs::data_dir().expect("locate real developer data dir");
         let config_base = dirs::config_dir().expect("locate real developer config dir");
-        let data_base = dirs::data_dir().expect("locate real developer data dir");
         RealDeveloperCockpitRoots {
+            home,
+            xdg_data: xdg_data.clone(),
             config: config_base.join("cockpit"),
-            data: data_base.join("cockpit"),
+            data: xdg_data.join("cockpit"),
             state: real_developer_state_dir(),
         }
     });
@@ -81,17 +91,26 @@ fn process_isolated_home() -> &'static ProcessIsolatedHome {
         let tempdir = tempfile::TempDir::new().expect("create process-isolated cockpit home");
         let root = tempdir.path();
         let home = root.join("home");
-        let data = root.join("data");
-        let config = home.join(".config");
-        let state = root.join("state");
-        for dir in [&home, &data, &config, &state] {
+        let xdg_data = root.join("data");
+        let xdg_config = home.join(".config");
+        let xdg_state = root.join("state");
+        let runtime = root.join("runtime");
+        let config_cockpit = xdg_config.join("cockpit");
+        let data_cockpit = xdg_data.join("cockpit");
+        let state_cockpit = xdg_state.join("cockpit");
+        for dir in [&home, &xdg_data, &xdg_config, &xdg_state, &runtime] {
             std::fs::create_dir_all(dir).expect("create process-isolated env directory");
         }
         ProcessIsolatedHome {
             _tempdir: tempdir,
-            config: config.join("cockpit"),
-            data: data.join("cockpit"),
-            state: state.join("cockpit"),
+            home,
+            xdg_data,
+            _xdg_config: xdg_config,
+            _xdg_state: xdg_state,
+            _runtime: runtime,
+            config: config_cockpit,
+            data: data_cockpit,
+            state: state_cockpit,
         }
     })
 }
@@ -106,9 +125,74 @@ fn is_under_real_developer_roots(path: &Path) -> bool {
     let roots = REAL_DEVELOPER_COCKPIT_ROOTS
         .get()
         .expect("real developer cockpit roots captured above");
-    contained_under(&roots.config, path)
+    path == roots.home
+        || contained_under(&roots.home, path)
+        || contained_under(&roots.xdg_data, path)
+        || contained_under(&roots.config, path)
         || contained_under(&roots.data, path)
         || contained_under(&roots.state, path)
+}
+
+fn replace_path_prefix(path: &Path, from: &Path, to: &Path) -> PathBuf {
+    let suffix = path.strip_prefix(from).unwrap_or_else(|_| {
+        panic!(
+            "path {} must be under prefix {}",
+            path.display(),
+            from.display()
+        )
+    });
+    to.join(suffix)
+}
+
+/// Redirect a developer-profile home directory to the per-process isolated
+/// mirror when redirect is active.
+pub fn finalize_test_profile_home(home: PathBuf) -> PathBuf {
+    ensure_real_developer_roots_captured();
+    let roots = REAL_DEVELOPER_COCKPIT_ROOTS
+        .get()
+        .expect("real developer cockpit roots captured above");
+    if home != roots.home && !contained_under(&roots.home, &home) {
+        return home;
+    }
+    if allows_real_developer_home() {
+        return home;
+    }
+    if home == roots.home {
+        return process_isolated_home().home.clone();
+    }
+    replace_path_prefix(&home, &roots.home, &process_isolated_home().home)
+}
+
+/// Redirect a developer-profile path to the per-process isolated mirror when
+/// redirect is active.
+pub fn finalize_test_profile_path(path: PathBuf) -> PathBuf {
+    ensure_real_developer_roots_captured();
+    if !is_under_real_developer_roots(&path) {
+        return path;
+    }
+    if allows_real_developer_home() {
+        return path;
+    }
+    let roots = REAL_DEVELOPER_COCKPIT_ROOTS
+        .get()
+        .expect("real developer cockpit roots captured above");
+    let isolated = process_isolated_home();
+    if contained_under(&roots.config, &path) || path == roots.config {
+        return replace_path_prefix(&path, &roots.config, &isolated.config);
+    }
+    if contained_under(&roots.data, &path) || path == roots.data {
+        return replace_path_prefix(&path, &roots.data, &isolated.data);
+    }
+    if contained_under(&roots.state, &path) || path == roots.state {
+        return replace_path_prefix(&path, &roots.state, &isolated.state);
+    }
+    if path == roots.home || contained_under(&roots.home, &path) {
+        return replace_path_prefix(&path, &roots.home, &isolated.home);
+    }
+    if contained_under(&roots.xdg_data, &path) || path == roots.xdg_data {
+        return replace_path_prefix(&path, &roots.xdg_data, &isolated.xdg_data);
+    }
+    path
 }
 
 /// Finalize a resolver result in test builds.

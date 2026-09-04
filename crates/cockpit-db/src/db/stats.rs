@@ -21,6 +21,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 use crate::db::sql::SqlColumn;
 
@@ -273,11 +274,22 @@ impl PriceTable {
     /// Load from `~/.cockpit/prices.json`. Missing file → empty table.
     /// Malformed file → warn (`tracing::warn!`) and empty table.
     pub fn load_default() -> Self {
-        let Some(home) = dirs::home_dir() else {
+        let Some(home) = Self::default_prices_home_dir() else {
             tracing::warn!("could not locate home dir; skipping `prices.json`");
             return Self::empty();
         };
         Self::load_from(&home.join(".cockpit").join("prices.json"))
+    }
+
+    fn default_prices_home_dir() -> Option<PathBuf> {
+        let home = dirs::home_dir()?;
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            use cockpit_test_support::home_isolation::finalize_test_profile_home;
+            Some(finalize_test_profile_home(home))
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        Some(home)
     }
 
     /// Load from an explicit path. Same missing/malformed semantics as

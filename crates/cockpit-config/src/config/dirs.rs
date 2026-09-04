@@ -216,7 +216,7 @@ fn global_provider_write_target(provider_id: &str) -> Option<PathBuf> {
 pub fn discover_config_dirs(cwd: &Path) -> Vec<ConfigDir> {
     let mut out = Vec::new();
 
-    if let Ok(global) = global_config_dir_unchecked()
+    if let Ok(global) = global_config_dir()
         && global.is_dir()
     {
         out.push(ConfigDir {

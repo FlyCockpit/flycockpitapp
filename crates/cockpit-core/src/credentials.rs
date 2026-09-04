@@ -31,13 +31,9 @@ const SUBSCRIPTION_ACK_PREFIX: &str = "subscription-oauth-ack:";
 /// Default credentials path: `~/.local/state/cockpit/credentials.json`.
 /// Honors `XDG_STATE_HOME` per the XDG spec.
 pub fn default_path() -> Option<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_STATE_HOME")
-        && !xdg.trim().is_empty()
-    {
-        return Some(PathBuf::from(xdg).join("cockpit/credentials.json"));
-    }
-    let home = dirs::home_dir()?;
-    Some(home.join(".local/state/cockpit/credentials.json"))
+    cockpit_config::config::resolve::cockpit_state_dir()
+        .ok()
+        .map(|dir| dir.join("credentials.json"))
 }
 
 #[derive(Clone)]

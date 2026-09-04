@@ -25,11 +25,11 @@
 //! per test. Under `cargo test` one binary shares it across threads; creation is
 //! thread-safe via `OnceLock`.
 //!
-//! **Perimeter:** the guard is compiled into every workspace test binary that
+//! **Perimeter:** the redirect is compiled into every workspace test binary that
 //! links `cockpit-config` with `cfg(test)` (this crate's own unit tests) or with
 //! the `test-support` feature enabled from `[dev-dependencies]` (`cockpit-core`,
-//! `cockpit-tui`, `apps/cli`, …). Production dependents never enable
-//! `test-support`.
+//! `cockpit-tui`, `apps/cli`, `cockpit-proto`, `apps/tenant-authority`, …).
+//! Production dependents never enable `test-support`.
 
 use std::path::PathBuf;
 
@@ -135,5 +135,18 @@ mod tests {
         env.set_var("XDG_STATE_HOME", "/tmp/xdg-state-test");
         let p = cockpit_state_dir().unwrap();
         assert_eq!(p, PathBuf::from("/tmp/xdg-state-test/cockpit"));
+    }
+
+    #[test]
+    fn config_dir_redirects_without_explicit_override() {
+        use cockpit_test_support::home_isolation;
+
+        let path = cockpit_config_dir().expect("resolve global config dir");
+        home_isolation::assert_not_real_developer_cockpit_path(&path);
+        assert!(
+            path.ends_with(std::path::Path::new(".config").join("cockpit")),
+            "redirected config dir should mirror the platform layout: {}",
+            path.display()
+        );
     }
 }

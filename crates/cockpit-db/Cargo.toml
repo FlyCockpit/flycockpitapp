@@ -29,7 +29,7 @@ host-approval-test-support = []
 # `SessionRedactionCustody`. Other crates' tests enable this from
 # `[dev-dependencies]` so FK fixtures keep compiling; a normal or release
 # consumer cannot construct a visible session without proving custody.
-test-support = []
+test-support = ["dep:cockpit-test-support"]
 # Host-capability refresh decision creation is likewise an internal daemon
 # composition capability.  A generic Db caller must not be able to persist an
 # automatically resolvable `low_risk` request merely by choosing that string.
@@ -53,6 +53,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
+cockpit-test-support = { path = "../cockpit-test-support", optional = true }
 
 [dev-dependencies]
 cockpit-test-support = { path = "../cockpit-test-support" }

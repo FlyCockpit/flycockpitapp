@@ -486,7 +486,7 @@ fn is_cockpit_owned_config_dir(path: &Path) -> bool {
         return false;
     }
 
-    if crate::config::dirs::global_config_dir_unchecked().is_ok_and(|global| path == global) {
+    if crate::config::dirs::global_config_dir().is_ok_and(|global| path == global) {
         return true;
     }
 

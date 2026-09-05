@@ -129,7 +129,7 @@ impl Tool for GrepTool {
         if let Some(effective) = sandbox::outside_session_boundary(
             &search_root,
             &ctx.cwd,
-            ctx.session.tmp_dir(),
+            ctx.session.tmp_dir().as_deref(),
             Some(&ctx.session.workspace_scratch_dir()),
         ) && !attached_knowledge_roots
             .iter()

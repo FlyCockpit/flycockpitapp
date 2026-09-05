@@ -132,7 +132,7 @@ pub(crate) fn with_inherited_acquisition_runtime<F>(
     future: F,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + Send>>
 where
-    F: std::future::Future + Send,
+    F: std::future::Future + Send + 'static,
 {
     match CURRENT_ACQUISITION_RUNTIME.try_with(Clone::clone) {
         Ok(runtime) => Box::pin(CURRENT_ACQUISITION_RUNTIME.scope(runtime, future)),

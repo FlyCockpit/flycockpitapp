@@ -87,7 +87,7 @@ fn queued_secret_payloads_have_redacted_debug_and_single_owners() {
 
     let settings = include_str!("mod.rs");
     let mcp = include_str!("mcp_page.rs");
-    assert!(settings.contains("Vec<Option<zeroize::Zeroizing<String>>>"));
+    assert!(settings.contains("Vec<Option<cockpit_proto::ProviderSecretValue>>"));
     assert!(mcp.contains("SecretPayload::new(secret_values_json)"));
 }
 
@@ -885,17 +885,17 @@ fn save_extended_repairs_private_config_permissions() {
 
     let tmp = TempDir::new().unwrap();
     let _env = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-    let config_dir = tmp.path().join("config/cockpit");
+    let config_dir = tmp.path().join(".config/cockpit");
     std::fs::create_dir_all(&config_dir).unwrap();
     let config_path = config_dir.join("config.json");
     std::fs::write(&config_path, "{}").unwrap();
-    let mut d = SettingsDialog::open(config_path);
-    d.settle_test_effects();
+    let mut d = open_fixture_dialog(&config_path);
     std::fs::set_permissions(&d.extended_path, std::fs::Permissions::from_mode(0o644)).unwrap();
     std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     d.extended.redact.denylist = vec!["secret-value".to_string()];
     d.save_extended().unwrap();
+    d.settle_test_effects();
 
     let file_mode = std::fs::metadata(&d.extended_path)
         .unwrap()
@@ -8439,12 +8439,18 @@ fn create_config_success_opens_settings_editor() {
 
 #[test]
 fn scoped_create_scaffold_failure_still_returns_to_picker_with_path_status() {
+    let _env = cockpit_test_support::TestEnvGuard::isolated_cockpit_home();
     let tmp = TempDir::new().unwrap();
     let existing = tmp.path().join(".cockpit");
     std::fs::create_dir_all(&existing).unwrap();
     std::fs::write(existing.join("config.json"), "{}").unwrap();
     let blocked = tmp.path().join("not-a-dir");
     std::fs::write(&blocked, "file blocks directory creation").unwrap();
+    let policy = cockpit_config::trust::WorkspaceTrustPolicy {
+        root: cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap(),
+        mode: cockpit_config::WorkspaceTrustMode::Trust,
+    };
+    let _trust = cockpit_config::trust::enter_workspace_trust_policy(policy);
     let mut d = Dialog::CreateScopedConfig {
         choices: vec![ConfigDir {
             kind: ConfigDirKind::Project,

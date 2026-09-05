@@ -5167,6 +5167,65 @@ fn queue_target_from_proto(target: proto::QueueTarget) -> proto::QueueTarget {
 }
 
 #[cfg(test)]
+pub(crate) async fn complete_mock_daemon_handshake<S>(daemon: &mut cockpit_proto::ProtoStream<S>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    use cockpit_proto::{Body, Envelope, RecvFrame, Request, Response};
+
+    let status_id = match daemon.recv().await.unwrap().unwrap() {
+        RecvFrame::Envelope(envelope) => match envelope.body {
+            Body::Request {
+                id,
+                request: Request::DaemonStatus,
+                ..
+            } => id,
+            other => panic!("expected daemon status handshake request, got {other:?}"),
+        },
+        other => panic!("expected daemon status handshake envelope, got {other:?}"),
+    };
+    daemon
+        .send(&Envelope::response(
+            status_id,
+            Response::DaemonStatus {
+                pid: 1,
+                uptime_secs: 0,
+                active_sessions: 0,
+                socket_path: "test.sock".to_string(),
+                daemon_version: "test".to_string(),
+                protocol_version: cockpit_proto::PROTOCOL_VERSION,
+                paused_sessions: 0,
+                database_path: "test.db".to_string(),
+                schema_version: 0,
+            },
+        ))
+        .await
+        .unwrap();
+
+    let peer_id = match daemon.recv().await.unwrap().unwrap() {
+        RecvFrame::Envelope(envelope) => match envelope.body {
+            Body::Request {
+                id,
+                request: Request::ExchangeLocalPeerCredential,
+                ..
+            } => id,
+            other => panic!("expected peer credential exchange, got {other:?}"),
+        },
+        other => panic!("expected peer credential exchange envelope, got {other:?}"),
+    };
+    daemon
+        .send(&Envelope::response(
+            peer_id,
+            Response::LocalPeerCredential {
+                token: cockpit_proto::OwnerCapabilityToken::new("test-peer-token"),
+                role: cockpit_proto::LocalClientRole::Cli,
+            },
+        ))
+        .await
+        .unwrap();
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -5306,39 +5365,7 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            let status = match proto.recv().await.unwrap().unwrap() {
-                RecvFrame::Envelope(env) => env,
-                RecvFrame::Unknown { .. } => panic!("unexpected unknown frame"),
-                RecvFrame::VersionMismatch { .. } => panic!("unexpected version mismatch"),
-            };
-            let Body::Request {
-                id: status_id,
-                request: Request::DaemonStatus,
-                ..
-            } = status.body
-            else {
-                panic!("expected daemon status handshake request");
-            };
-            proto
-                .send(&Envelope::response(
-                    status_id,
-                    Response::DaemonStatus {
-                        pid: 1,
-                        uptime_secs: 0,
-                        active_sessions: 0,
-                        socket_path: "test.sock".to_string(),
-                        daemon_version: "test".to_string(),
-                        protocol_version: cockpit_proto::PROTOCOL_VERSION,
-                        paused_sessions: 0,
-                        database_path: "test.db".to_string(),
-                        // Handshake negotiation intentionally ignores database
-                        // metadata; keep this socket fixture independent of
-                        // cockpit-core's private storage implementation.
-                        schema_version: 0,
-                    },
-                ))
-                .await
-                .unwrap();
+            super::complete_mock_daemon_handshake(&mut proto).await;
             let env = match proto.recv().await.unwrap().unwrap() {
                 RecvFrame::Envelope(env) => env,
                 RecvFrame::Unknown { .. } => panic!("unexpected unknown frame"),

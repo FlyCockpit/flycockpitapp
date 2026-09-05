@@ -3921,7 +3921,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            format!("{error:#}").contains("no-follow directory component"),
+            format!("{error:#}").contains("symlink or non-directory"),
             "{error:#}"
         );
         assert!(!attacker.join(".cockpit-active-model.backup").exists());

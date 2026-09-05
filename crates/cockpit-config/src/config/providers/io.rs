@@ -1584,6 +1584,25 @@ fn models_by_id(value: Option<&Value>) -> BTreeMap<String, Map<String, Value>> {
         .collect()
 }
 
+pub fn is_native_anthropic_provider(provider_id: &str, entry: &ProviderEntry) -> bool {
+    if provider_id.eq_ignore_ascii_case("anthropic") {
+        return true;
+    }
+    is_anthropic_host_url(&entry.url)
+}
+
+pub fn is_anthropic_host_url(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|u| {
+            u.host_str().map(|host| {
+                let host = host.to_ascii_lowercase();
+                host == "api.anthropic.com" || host.ends_with(".anthropic.com")
+            })
+        })
+        .unwrap_or(false)
+}
+
 pub fn is_xai_grok_provider(provider_id: &str, entry: &ProviderEntry) -> bool {
     let provider_id = provider_id.to_ascii_lowercase();
     provider_id == "grok"

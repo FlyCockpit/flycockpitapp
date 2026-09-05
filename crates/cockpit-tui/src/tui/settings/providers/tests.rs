@@ -3783,6 +3783,43 @@ fn pointer_enabled_list_and_edit_actions_dispatch_through_dialog_impl() {
         click_rendered_provider_action(&mut dialog, &action);
     }
 
+    let grok_oauth = oauth_provider_config("grok-oauth", "oauth:test");
+    let (_tmp, mut source) = dialog_with_config(grok_oauth.clone());
+    source.page = super::super::providers_page(standalone_oauth_page(
+        OAuthProvider::Grok,
+        OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok),
+    ));
+    let _ = render_provider_rows(&source, 110, 60);
+    let grok_actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ super::super::pointer_actions::SettingsPointerAction::Providers(
+                        super::super::pointer_actions::ProvidersAction::OAuthOption(_, _),
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !grok_actions.is_empty(),
+        "Grok OAuth source row must render its setup actions"
+    );
+    for action in grok_actions {
+        let (_tmp, mut dialog) = dialog_with_config(grok_oauth.clone());
+        dialog.page = super::super::providers_page(standalone_oauth_page(
+            OAuthProvider::Grok,
+            OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok),
+        ));
+        click_rendered_provider_action(&mut dialog, &action);
+    }
+
     let oauth = oauth_provider_config("codex-oauth", "oauth:test");
     let (_tmp, mut source) = dialog_with_config(oauth.clone());
     source.page = super::super::providers_page(standalone_oauth_page(

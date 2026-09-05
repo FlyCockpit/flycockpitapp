@@ -42,6 +42,16 @@ impl App {
         if self.first_run_flow == FirstRunFlow::None {
             return;
         }
+        // A provisional generation-zero attach seed clears provider chrome while
+        // waiting for the daemon snapshot. Do not treat that empty projection as
+        // a provider-less launch that should reopen onboarding.
+        if !self.config_snapshot.from_daemon
+            && self.config_snapshot.generation == 0
+            && self.config_snapshot.providers.providers.is_empty()
+            && !self.has_no_providers_at_startup
+        {
+            return;
+        }
         self.dialog = match self.first_run_flow {
             FirstRunFlow::AwaitWelcome => {
                 crate::tui::settings::Dialog::open_onboarding_welcome(&self.launch.cwd)

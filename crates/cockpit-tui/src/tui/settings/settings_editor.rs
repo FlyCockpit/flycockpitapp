@@ -62,8 +62,8 @@ use cockpit_config::providers::{
     ClientSideToolsCapability, ContextConfig, MODEL_SYSTEM_PROMPT_MAX_BYTES,
     ModelCapabilityOverrides, ModelEntry, ModelLocation, ModelTrust, PromptCacheRetention,
     ProviderEntry, ProvidersConfig, ShrinkConfig, ShrinkStrategy, ThinkingMode, TimeoutConfig,
-    WireApi, WireApiProvenance, XAI_MULTI_AGENT_TOOLS_ENTITLEMENT, is_xai_grok_provider,
-    model_system_prompt_too_large, normalize_model_system_prompt,
+    WireApi, WireApiProvenance, XAI_MULTI_AGENT_TOOLS_ENTITLEMENT, is_native_anthropic_provider,
+    is_xai_grok_provider, model_system_prompt_too_large, normalize_model_system_prompt,
 };
 
 use super::multimodal_capability_editor::{
@@ -471,7 +471,7 @@ impl SettingsEditor {
     pub(super) fn for_provider(provider_id: &str, entry: &ProviderEntry) -> Self {
         let xai_multi_agent_tools_beta =
             tools_entitlement_enabled(&entry.capabilities.client_side_tools);
-        let show_wire_api = true;
+        let show_wire_api = !is_native_anthropic_provider(provider_id, entry);
         let show_xai_multi_agent_tools_beta = is_xai_grok_provider(provider_id, entry);
         Self {
             scope: SettingsScope::Provider,
@@ -583,7 +583,7 @@ impl SettingsEditor {
         let detected_capabilities = model
             .map(|m| detected_model_capabilities(entry, m))
             .unwrap_or_default();
-        let show_wire_api = true;
+        let show_wire_api = !is_native_anthropic_provider(provider_id, entry);
         let show_xai_multi_agent_tools_beta = is_xai_grok_provider(provider_id, entry);
         Self {
             scope: SettingsScope::Model {
@@ -3077,11 +3077,8 @@ mod tests {
         assert_eq!(e.value_str(ProviderSettingId::TrustPolicy), "trusted");
         assert!(e.is_overridden(ProviderSettingId::TrustPolicy));
         let status = e.status.as_deref().unwrap_or("");
-        assert!(status.contains("sent raw"), "{status}");
-        assert!(
-            status.contains("secrets and environment values"),
-            "{status}"
-        );
+        assert!(status.contains("host-mediated capture"), "{status}");
+        assert!(status.contains("inference remains redacted"), "{status}");
         let mut entry_off = entry.clone();
         e.write_into(&mut entry_off);
         let m = entry_off.models.iter().find(|m| m.id == "m1").unwrap();

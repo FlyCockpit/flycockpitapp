@@ -299,7 +299,7 @@ fn selection_clears_when_header_visibility_flips() {
     app.selection = Some(Selection {
         anchor: (0, 4),
         focus: (8, 6),
-        active: false,
+        active: true,
     });
     app.sticky_user_message = false;
     render_sticky(&mut app, 40, 10);

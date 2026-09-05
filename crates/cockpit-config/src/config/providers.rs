@@ -223,7 +223,8 @@ pub use io::{
     ActiveModelWriteMode, ConfigDoc, RetainedProviderModelFavoriteLock,
     RetainedProviderModelFavoritePostWriteVerifier, RetainedProviderModelFavoritePreWriteVerifier,
     RetainedProviderModelFavoriteTarget, RetainedProviderModelFavoriteWriteError,
-    RetainedProviderModelFavoriteWriteReceipt, RetainedProviderModelSource, is_xai_grok_provider,
+    RetainedProviderModelFavoriteWriteReceipt, RetainedProviderModelSource,
+    is_native_anthropic_provider, is_xai_grok_provider,
     retained_provider_model_source_from_workspace_layer_snapshots,
 };
 

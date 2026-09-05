@@ -104,7 +104,11 @@ pub(crate) fn drop_front_margin<'a>(
     }
     let margin = max_match - 1;
     if margin >= seg.len() {
-        return "";
+        let cut = table.straddle_fixpoint_cut(seg, 0);
+        if cut >= seg.len() {
+            return "";
+        }
+        return &seg[cut..];
     }
     let cut = table.straddle_fixpoint_cut(seg, margin);
     if cut >= seg.len() {
@@ -126,7 +130,11 @@ pub(crate) fn drop_back_margin<'a>(table: &crate::redact::RedactionTable, seg: &
     }
     let margin = max_match - 1;
     if margin >= seg.len() {
-        return "";
+        let cut = table.straddle_fixpoint_cut_back(seg, seg.len());
+        if cut == 0 {
+            return "";
+        }
+        return &seg[..cut];
     }
     let start = seg.len() - margin;
     let cut = table.straddle_fixpoint_cut_back(seg, start);

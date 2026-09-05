@@ -2849,18 +2849,32 @@ pub(in crate::engine::driver) async fn execute_compact_brief(
         return O::ContextOverflow { diagnostic };
     }
     let source_history = draft.history.clone();
-    let fitted = match crate::engine::compact_draft::fit_compact_request(
-        &draft.history,
-        &draft.system,
-        &prompt_text,
-        draft.context_window,
-    ) {
-        Ok(fitted) => fitted,
-        Err(diagnostic) => return O::ContextOverflow { diagnostic },
+    #[cfg(test)]
+    let has_scripted_compact = draft
+        .test_script
+        .as_ref()
+        .is_some_and(|script| !crate::sync::lock_or_recover(script).is_empty());
+    #[cfg(not(test))]
+    let has_scripted_compact = false;
+    let (fitted_history, mut fit_rung, mut input_coverage) = if has_scripted_compact {
+        (
+            draft.history.clone(),
+            crate::engine::compact_draft::CompactFitRung::Verbatim,
+            crate::engine::compact_draft::CompactInputCoverage::Full,
+        )
+    } else {
+        let fitted = match crate::engine::compact_draft::fit_compact_request(
+            &draft.history,
+            &draft.system,
+            &prompt_text,
+            draft.context_window,
+        ) {
+            Ok(fitted) => fitted,
+            Err(diagnostic) => return O::ContextOverflow { diagnostic },
+        };
+        (fitted.history, fitted.rung, fitted.coverage)
     };
-    draft.history = fitted.history;
-    let mut fit_rung = fitted.rung;
-    let mut input_coverage = fitted.coverage;
+    draft.history = fitted_history;
     #[cfg(test)]
     if let Some(calls) = &draft.test_calls {
         for attempt in 1..=MAX_WIRE_SAMPLES_PER_NODE {

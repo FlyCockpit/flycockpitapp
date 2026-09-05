@@ -2615,7 +2615,7 @@ fn enable_reasoning_retraction(driver: &mut Driver) {
             crate::daemon::session_worker::SessionConfigSnapshot::new(
                 1,
                 providers,
-                crate::config::extended::ExtendedConfig::default(),
+                super::test_extended_config(),
             ),
         ),
     );

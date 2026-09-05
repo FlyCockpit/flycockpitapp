@@ -1284,10 +1284,25 @@ impl Model {
 
     pub(crate) fn resolve_live_wire_api_for_base_url(
         &self,
-        _base_url: &str,
+        base_url: &str,
     ) -> crate::config::providers::WireApi {
         match self {
-            Model::OpenAi { wire_api, .. } => {
+            Model::OpenAi {
+                wire_api,
+                live_wire_api,
+                ..
+            } => {
+                let state = live_wire_api
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if !state.explicit {
+                    if let Some(confirmed) = state
+                        .session_confirmed
+                        .get(&normalize_probe_base_url(base_url))
+                    {
+                        return *confirmed;
+                    }
+                }
                 if wire_api.is_auto() {
                     crate::config::providers::WireApi::Completions
                 } else {

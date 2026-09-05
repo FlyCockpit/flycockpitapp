@@ -10725,6 +10725,68 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
         },
         None => None,
     };
+    if let Some(target) = steer_target.as_ref() {
+        let task_call_id = target.task_call_id().to_string();
+        let label = target.label().to_string();
+        let child_exists = match session
+            .db
+            .read({
+                let task_call_id = task_call_id.clone();
+                let label = label.clone();
+                move |conn| {
+                    let count: i64 = conn.query_row(
+                        "SELECT COUNT(1) FROM task_delegation_children
+                          WHERE task_call_id = ?1 AND label = ?2",
+                        rusqlite::params![task_call_id, label],
+                        |row| row.get(0),
+                    )?;
+                    Ok(count > 0)
+                }
+            })
+            .await
+        {
+            Ok(exists) => exists,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    task_call_id = %task_call_id,
+                    label = %label,
+                    "checking inline noninteractive task delegation child failed"
+                );
+                false
+            }
+        };
+        if !child_exists {
+            let parent_agent = agent.name.clone();
+            if let Err(error) = session
+                .db
+                .upsert_task_delegation_job(
+                    session.live_id(),
+                    &task_call_id,
+                    None,
+                    &parent_agent,
+                    None,
+                    &[crate::db::task_delegations::DelegationChildInit {
+                        label: &label,
+                        child_agent: &parent_agent,
+                        model: None,
+                        output_dir: None,
+                        requested_cwd: None,
+                        resolved_cwd: None,
+                        todo_ids_json: None,
+                    }],
+                )
+                .await
+            {
+                tracing::warn!(
+                    %error,
+                    task_call_id = %task_call_id,
+                    label = %label,
+                    "seeding durable task delegation child for inline noninteractive executor failed"
+                );
+            }
+        }
+    }
     // Create stamps this UUID as `coordinator.delegation_id`. Drop (including
     // `JoinHandle::abort`) expires that scope even when this future never
     // reaches a Driver-side stop site.

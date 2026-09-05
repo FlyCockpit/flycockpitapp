@@ -1,6 +1,23 @@
 use super::*;
 use rig::providers::{anthropic, chatgpt, openai};
 
+fn resolved_build_wire_api(
+    cfg: &ProvidersConfig,
+    provider_id: &str,
+    model_id: &str,
+    wire_api_explicit: bool,
+) -> crate::config::providers::WireApi {
+    let resolved = cfg.resolve_wire_api(provider_id, model_id);
+    if wire_api_explicit {
+        return resolved;
+    }
+    cfg.providers
+        .get(provider_id)
+        .and_then(|entry| entry.models.iter().find(|model| model.id == model_id))
+        .and_then(|model| model.capabilities.preferred_wire_api())
+        .unwrap_or(resolved)
+}
+
 impl Model {
     /// Resolve the active model from the user's config + credentials and
     /// build a concrete `Model`. Returns a descriptive error when nothing
@@ -78,8 +95,9 @@ impl Model {
         let cache = cfg.resolve_cache(&active.provider, &active.model);
         let timeout = cfg.resolve_timeout(&active.provider, &active.model);
         let hard_timeout_on_stall = true;
-        let wire_api = cfg.resolve_wire_api(&active.provider, &active.model);
         let wire_api_explicit = cfg.is_wire_api_explicit(&active.provider, &active.model);
+        let wire_api =
+            resolved_build_wire_api(cfg, &active.provider, &active.model, wire_api_explicit);
         let client_side_tools =
             cfg.resolve_effective_client_side_tools(&active.provider, &active.model);
         let location = cfg.resolve_location(&active.provider, &active.model);
@@ -262,8 +280,8 @@ impl Model {
         let cache = cfg.resolve_cache(provider_id, model_id);
         let timeout = cfg.resolve_timeout(provider_id, model_id);
         let hard_timeout_on_stall = true;
-        let wire_api = cfg.resolve_wire_api(provider_id, model_id);
         let wire_api_explicit = cfg.is_wire_api_explicit(provider_id, model_id);
+        let wire_api = resolved_build_wire_api(cfg, provider_id, model_id, wire_api_explicit);
         let client_side_tools = cfg.resolve_effective_client_side_tools(provider_id, model_id);
         let location = cfg.resolve_location(provider_id, model_id);
         let quality_rank = cfg.resolve_quality_rank(provider_id, model_id);

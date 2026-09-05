@@ -3394,10 +3394,19 @@ impl ProvidersConfig {
         entry.resolve_wire_api(provider, model)
     }
 
-    /// Whether a configured provider has a fixed effective wire. Resolution is
-    /// total for configured providers, so template defaults are fixed too.
-    pub fn is_wire_api_explicit(&self, provider: &str, _model: &str) -> bool {
-        self.providers.contains_key(provider)
+    /// Whether the effective wire for `(provider, model)` is pinned in config
+    /// rather than left on the conservative auto default. Template/provider
+    /// defaults and catalog metadata do not count as explicit pins.
+    pub fn is_wire_api_explicit(&self, provider: &str, model: &str) -> bool {
+        let Some(entry) = self.providers.get(provider) else {
+            return false;
+        };
+        if let Some(model_entry) = entry.models.iter().find(|m| m.id == model) {
+            if !model_entry.wire_api.is_auto() {
+                return true;
+            }
+        }
+        !entry.wire_api.is_auto()
     }
 }
 

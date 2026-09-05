@@ -38,9 +38,7 @@ fn paths() -> Result<()> {
     let cwd = cwd()?;
     let db = Db::default_path()?;
     let daemon = crate::daemon::DaemonPaths::resolve_canonical()?;
-    let log = dirs::cache_dir()
-        .ok_or_else(|| anyhow::anyhow!("could not locate cache directory"))?
-        .join("cockpit/cockpit.log");
+    let log = cockpit_config::config::resolve::cockpit_cache_dir()?.join("cockpit.log");
     println!("database: {} ({})", db.display(), exists(&db));
     println!("config directories (least to most specific):");
     for path in config_dirs_in_precedence(&cwd) {

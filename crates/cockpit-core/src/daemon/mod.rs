@@ -558,22 +558,13 @@ fn push_unique_deny_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 }
 
 fn state_dir() -> Option<PathBuf> {
-    if let Ok(s) = std::env::var("XDG_STATE_HOME")
-        && !s.trim().is_empty()
-    {
-        return Some(PathBuf::from(s).join("cockpit"));
-    }
-    let home = dirs::home_dir()?;
-    Some(home.join(".local/state/cockpit"))
+    cockpit_config::config::resolve::cockpit_state_dir().ok()
 }
 
 fn runtime_dir() -> Option<PathBuf> {
-    if let Ok(s) = std::env::var("XDG_RUNTIME_DIR")
-        && !s.trim().is_empty()
-    {
-        return Some(PathBuf::from(s).join("cockpit"));
-    }
-    None
+    cockpit_config::config::resolve::cockpit_runtime_dir()
+        .ok()
+        .flatten()
 }
 
 /// Restores the process umask on drop, so a scoped tightening around a single
@@ -1392,8 +1383,13 @@ fn spawn_detached_child(
 }
 
 #[cfg(any(unix, windows))]
+pub(crate) fn detach_child_log_dir() -> Option<PathBuf> {
+    cockpit_config::config::resolve::cockpit_cache_dir().ok()
+}
+
+#[cfg(any(unix, windows))]
 fn open_detach_child_log() -> Option<std::fs::File> {
-    let dir = dirs::cache_dir()?.join("cockpit");
+    let dir = detach_child_log_dir()?;
     cockpit_host::private_fs::ensure_private_dir(&dir).ok()?;
     std::fs::OpenOptions::new()
         .create(true)
@@ -2718,6 +2714,29 @@ mod tests {
 
     fn canonical_in(state_home: &Path, runtime_dir: &Path) -> DaemonPaths {
         DaemonPaths::resolve_canonical_in(state_home, Some(runtime_dir)).expect("canonical paths")
+    }
+
+    #[test]
+    fn resolve_canonical_paths_stay_outside_real_developer_roots() {
+        use cockpit_test_support::home_isolation;
+
+        let paths = DaemonPaths::resolve_canonical().expect("canonical daemon paths");
+        let state = paths
+            .pid_file
+            .parent()
+            .expect("state dir from pid file parent");
+        home_isolation::assert_not_real_developer_cockpit_path(state);
+        let socket_parent = paths.socket.parent().expect("socket parent directory");
+        home_isolation::assert_not_real_developer_cockpit_path(socket_parent);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn detach_child_log_dir_stays_outside_real_developer_roots() {
+        use cockpit_test_support::home_isolation;
+
+        let dir = detach_child_log_dir().expect("detach child log directory");
+        home_isolation::assert_not_real_developer_cockpit_path(&dir);
     }
 
     #[test]

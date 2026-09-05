@@ -73,7 +73,9 @@ pub fn cache_dir() -> Option<PathBuf> {
     {
         return Some(PathBuf::from(over));
     }
-    dirs::cache_dir().map(|d| d.join("cockpit/mcp"))
+    cockpit_config::config::resolve::cockpit_cache_dir()
+        .ok()
+        .map(|d| d.join("mcp"))
 }
 
 fn now_unix() -> u64 {
@@ -221,5 +223,18 @@ mod tests {
     fn load_miss_on_absent_key() {
         let tmp = tempfile::TempDir::new().unwrap();
         assert!(load_in(tmp.path(), "does-not-exist", 3600).is_none());
+    }
+
+    #[test]
+    fn default_cache_dir_stays_outside_real_developer_roots() {
+        use cockpit_test_support::home_isolation;
+
+        let dir = cache_dir().expect("default mcp cache directory");
+        home_isolation::assert_not_real_developer_cockpit_path(&dir);
+        assert!(
+            dir.ends_with(std::path::Path::new("cockpit").join("mcp")),
+            "mcp cache should live under the cockpit cache root: {}",
+            dir.display()
+        );
     }
 }

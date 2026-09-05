@@ -1049,7 +1049,7 @@ impl Write for RotatingLogWriter {
 }
 
 fn open_log_file() -> Option<RotatingLog> {
-    open_log_file_at(dirs::cache_dir()?.join("cockpit"))
+    open_log_file_at(cockpit_config::config::resolve::cockpit_cache_dir().ok()?)
 }
 fn open_log_file_at(dir: PathBuf) -> Option<RotatingLog> {
     // Logging stays non-fatal: an insecure cache directory disables logging

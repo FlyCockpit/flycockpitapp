@@ -10,8 +10,17 @@
 //! Production [`cockpit_config_dir`] semantics are unchanged: platform defaults
 //! via `dirs::config_dir()` / XDG env vars, with no redirect.
 //!
-//! In test builds (`cfg(any(test, feature = "test-support"))`), the three public
-//! resolvers below pass through [`cockpit_test_support::home_isolation`]:
+//! Public resolvers (all choke points for Cockpit-owned user roots):
+//!
+//! - [`cockpit_config_dir`]
+//! - [`cockpit_data_dir`]
+//! - [`cockpit_state_dir`]
+//! - [`cockpit_cache_dir`]
+//! - [`cockpit_runtime_dir`] (`Option` — `None` when `XDG_RUNTIME_DIR` is unset)
+//!
+//! In test builds (`cfg(any(test, feature = "test-support"))`), those five pass
+//! through [`cockpit_test_support::home_isolation`] (`CockpitHomeKind` includes
+//! `Cache` and `Runtime` for the two newest roots):
 //!
 //! 1. Explicit env overrides installed by [`cockpit_test_support::TestEnvGuard`]
 //!    (XDG/HOME pointing away from the real developer profile) win unchanged.
@@ -19,7 +28,8 @@
 //!    opts into the real path (manual smokes only).
 //! 3. Otherwise redirect to a lazy per-process isolated home mirroring
 //!    `TestEnvGuard::set_isolated_home` (`{root}/home/.config/cockpit`,
-//!    `{root}/data/cockpit`, `{root}/state/cockpit`).
+//!    `{root}/data/cockpit`, `{root}/state/cockpit`, `{root}/cache/cockpit`,
+//!    `{root}/runtime/cockpit`).
 //!
 //! Under `cargo nextest` each test is its own process, so the isolated root is
 //! per test. Under `cargo test` one binary shares it across threads; creation is
@@ -71,6 +81,25 @@ pub(crate) fn cockpit_state_dir_unchecked() -> Result<PathBuf> {
     }
 }
 
+pub(crate) fn cockpit_cache_dir_unchecked() -> Result<PathBuf> {
+    if let Ok(s) = std::env::var("XDG_CACHE_HOME")
+        && !s.trim().is_empty()
+    {
+        return Ok(PathBuf::from(s).join("cockpit"));
+    }
+    let base = dirs::cache_dir().context("could not locate user cache dir")?;
+    Ok(base.join("cockpit"))
+}
+
+pub(crate) fn cockpit_runtime_dir_unchecked() -> Option<PathBuf> {
+    if let Ok(s) = std::env::var("XDG_RUNTIME_DIR")
+        && !s.trim().is_empty()
+    {
+        return Some(PathBuf::from(s).join("cockpit"));
+    }
+    None
+}
+
 /// Platform-default global configuration directory.
 ///
 /// This is `~/.config/cockpit` on Linux (respecting `XDG_CONFIG_HOME`) and
@@ -108,6 +137,24 @@ pub fn cockpit_state_dir() -> Result<PathBuf> {
     Ok(path)
 }
 
+/// `$XDG_CACHE_HOME/cockpit` when set, otherwise the platform cache directory
+/// with a `cockpit` suffix (for example `~/.cache/cockpit` on Linux).
+pub fn cockpit_cache_dir() -> Result<PathBuf> {
+    let path = cockpit_cache_dir_unchecked()?;
+    #[cfg(any(test, feature = "test-support"))]
+    let path = finalize_test_cockpit_path(path, CockpitHomeKind::Cache);
+    Ok(path)
+}
+
+/// `$XDG_RUNTIME_DIR/cockpit` when `XDG_RUNTIME_DIR` is set and non-blank;
+/// `None` when the runtime directory is unavailable.
+pub fn cockpit_runtime_dir() -> Result<Option<PathBuf>> {
+    let path = cockpit_runtime_dir_unchecked();
+    #[cfg(any(test, feature = "test-support"))]
+    let path = path.map(|path| finalize_test_cockpit_path(path, CockpitHomeKind::Runtime));
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +185,30 @@ mod tests {
     }
 
     #[test]
+    fn cache_dir_respects_xdg() {
+        let env = crate::test_env::lock();
+        env.set_var("XDG_CACHE_HOME", "/tmp/xdg-cache-test");
+        let p = cockpit_cache_dir().unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/xdg-cache-test/cockpit"));
+    }
+
+    #[test]
+    fn runtime_dir_respects_xdg() {
+        let env = crate::test_env::lock();
+        env.set_var("XDG_RUNTIME_DIR", "/tmp/xdg-runtime-test");
+        let p = cockpit_runtime_dir().unwrap();
+        assert_eq!(p, Some(PathBuf::from("/tmp/xdg-runtime-test/cockpit")));
+    }
+
+    #[test]
+    fn runtime_dir_is_none_when_unset() {
+        let env = crate::test_env::lock();
+        env.remove_var("XDG_RUNTIME_DIR");
+        let p = cockpit_runtime_dir().unwrap();
+        assert_eq!(p, None);
+    }
+
+    #[test]
     fn config_dir_redirects_without_explicit_override() {
         use cockpit_test_support::home_isolation;
 
@@ -146,6 +217,37 @@ mod tests {
         assert!(
             path.ends_with(std::path::Path::new(".config").join("cockpit")),
             "redirected config dir should mirror the platform layout: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn cache_dir_redirects_without_explicit_override() {
+        use cockpit_test_support::home_isolation;
+
+        let path = cockpit_cache_dir().expect("resolve global cache dir");
+        home_isolation::assert_not_real_developer_cockpit_path(&path);
+        assert!(
+            path.ends_with(std::path::Path::new("cache").join("cockpit")),
+            "redirected cache dir should mirror the platform layout: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn runtime_dir_redirects_without_explicit_override() {
+        use cockpit_test_support::home_isolation;
+
+        if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+            return;
+        }
+        let path = cockpit_runtime_dir()
+            .expect("resolve runtime dir")
+            .expect("runtime dir should be set when XDG_RUNTIME_DIR is set");
+        home_isolation::assert_not_real_developer_cockpit_path(&path);
+        assert!(
+            path.ends_with(std::path::Path::new("runtime").join("cockpit")),
+            "redirected runtime dir should mirror the platform layout: {}",
             path.display()
         );
     }

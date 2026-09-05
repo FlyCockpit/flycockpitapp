@@ -21,6 +21,7 @@ const MANAGED_ENV_VARS: &[&str] = &[
     "XDG_DATA_HOME",
     "XDG_STATE_HOME",
     "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
     "XDG_RUNTIME_DIR",
     COCKPIT_CONFIG_ENV,
     COCKPIT_TRUST_ROOT_ENV,
@@ -175,14 +176,16 @@ impl TestEnvGuard {
         // the canonical `~/.config/cockpit` layer without a second root.
         let config = home.join(".config");
         let state = root.join("state");
+        let cache = root.join("cache");
         let runtime = root.join("runtime");
-        for dir in [&home, &data, &config, &state, &runtime] {
+        for dir in [&home, &data, &config, &state, &cache, &runtime] {
             std::fs::create_dir_all(dir).expect("create isolated env directory");
         }
         self.set_var("HOME", &home);
         self.set_var("XDG_DATA_HOME", &data);
         self.set_var("XDG_CONFIG_HOME", &config);
         self.set_var("XDG_STATE_HOME", &state);
+        self.set_var("XDG_CACHE_HOME", &cache);
         self.set_var("XDG_RUNTIME_DIR", &runtime);
         self.remove_cockpit_config();
         self.remove_var(COCKPIT_TRUST_ROOT_ENV);

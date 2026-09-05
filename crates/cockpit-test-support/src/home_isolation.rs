@@ -1,4 +1,4 @@
-//! Test-build enforcement for Cockpit config/data/state path resolution.
+//! Test-build enforcement for Cockpit config/data/state/cache/runtime path resolution.
 //!
 //! [`TestEnvGuard::set_isolated_home`] installs explicit XDG/HOME overrides that
 //! point away from the developer profile; those win unchanged.
@@ -6,7 +6,8 @@
 //! When no such override is active, resolver functions in `cockpit-config`
 //! redirect to a lazy per-process isolated home that mirrors
 //! [`TestEnvGuard::set_isolated_home`]'s directory layout:
-//! `{root}/home/.config/cockpit`, `{root}/data/cockpit`, `{root}/state/cockpit`.
+//! `{root}/home/.config/cockpit`, `{root}/data/cockpit`, `{root}/state/cockpit`,
+//! `{root}/cache/cockpit`, and `{root}/runtime/cockpit`.
 //!
 //! Under `cargo nextest`, each test is its own process so the isolated root is
 //! per test. Under `cargo test`, one binary shares a single isolated root across
@@ -26,6 +27,8 @@ pub enum CockpitHomeKind {
     Config,
     Data,
     State,
+    Cache,
+    Runtime,
 }
 
 struct RealDeveloperCockpitRoots {
@@ -34,6 +37,8 @@ struct RealDeveloperCockpitRoots {
     config: PathBuf,
     data: PathBuf,
     state: PathBuf,
+    cache: PathBuf,
+    runtime: Option<PathBuf>,
 }
 
 struct ProcessIsolatedHome {
@@ -42,10 +47,12 @@ struct ProcessIsolatedHome {
     xdg_data: PathBuf,
     _xdg_config: PathBuf,
     _xdg_state: PathBuf,
-    _runtime: PathBuf,
+    _xdg_cache: PathBuf,
     config: PathBuf,
     data: PathBuf,
     state: PathBuf,
+    cache: PathBuf,
+    runtime: PathBuf,
 }
 
 static REAL_DEVELOPER_COCKPIT_ROOTS: OnceLock<RealDeveloperCockpitRoots> = OnceLock::new();
@@ -64,8 +71,30 @@ pub fn ensure_real_developer_roots_captured() {
             config: config_base.join("cockpit"),
             data: xdg_data.join("cockpit"),
             state: real_developer_state_dir(),
+            cache: real_developer_cache_dir(),
+            runtime: real_developer_runtime_dir(),
         }
     });
+}
+
+fn real_developer_cache_dir() -> PathBuf {
+    if let Ok(value) = std::env::var("XDG_CACHE_HOME")
+        && !value.trim().is_empty()
+    {
+        return PathBuf::from(value).join("cockpit");
+    }
+    dirs::cache_dir()
+        .expect("locate real developer cache dir")
+        .join("cockpit")
+}
+
+fn real_developer_runtime_dir() -> Option<PathBuf> {
+    if let Ok(value) = std::env::var("XDG_RUNTIME_DIR")
+        && !value.trim().is_empty()
+    {
+        return Some(PathBuf::from(value).join("cockpit"));
+    }
+    None
 }
 
 fn real_developer_state_dir() -> PathBuf {
@@ -94,11 +123,21 @@ fn process_isolated_home() -> &'static ProcessIsolatedHome {
         let xdg_data = root.join("data");
         let xdg_config = home.join(".config");
         let xdg_state = root.join("state");
+        let xdg_cache = root.join("cache");
         let runtime = root.join("runtime");
         let config_cockpit = xdg_config.join("cockpit");
         let data_cockpit = xdg_data.join("cockpit");
         let state_cockpit = xdg_state.join("cockpit");
-        for dir in [&home, &xdg_data, &xdg_config, &xdg_state, &runtime] {
+        let cache_cockpit = xdg_cache.join("cockpit");
+        let runtime_cockpit = runtime.join("cockpit");
+        for dir in [
+            &home,
+            &xdg_data,
+            &xdg_config,
+            &xdg_state,
+            &xdg_cache,
+            &runtime,
+        ] {
             std::fs::create_dir_all(dir).expect("create process-isolated env directory");
         }
         ProcessIsolatedHome {
@@ -107,10 +146,12 @@ fn process_isolated_home() -> &'static ProcessIsolatedHome {
             xdg_data,
             _xdg_config: xdg_config,
             _xdg_state: xdg_state,
-            _runtime: runtime,
+            _xdg_cache: xdg_cache,
             config: config_cockpit,
             data: data_cockpit,
             state: state_cockpit,
+            cache: cache_cockpit,
+            runtime: runtime_cockpit,
         }
     })
 }
@@ -131,6 +172,12 @@ fn is_under_real_developer_roots(path: &Path) -> bool {
         || contained_under(&roots.config, path)
         || contained_under(&roots.data, path)
         || contained_under(&roots.state, path)
+        || contained_under(&roots.cache, path)
+        || path == roots.cache
+        || roots
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| path == *runtime || contained_under(runtime, path))
 }
 
 fn replace_path_prefix(path: &Path, from: &Path, to: &Path) -> PathBuf {
@@ -186,6 +233,17 @@ pub fn finalize_test_profile_path(path: PathBuf) -> PathBuf {
     if contained_under(&roots.state, &path) || path == roots.state {
         return replace_path_prefix(&path, &roots.state, &isolated.state);
     }
+    if contained_under(&roots.cache, &path) || path == roots.cache {
+        return replace_path_prefix(&path, &roots.cache, &isolated.cache);
+    }
+    if roots
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| path == *runtime || contained_under(runtime, &path))
+    {
+        let runtime = roots.runtime.as_ref().expect("runtime root checked above");
+        return replace_path_prefix(&path, runtime, &isolated.runtime);
+    }
     if path == roots.home || contained_under(&roots.home, &path) {
         return replace_path_prefix(&path, &roots.home, &isolated.home);
     }
@@ -214,6 +272,8 @@ pub fn finalize_test_cockpit_path(path: PathBuf, kind: CockpitHomeKind) -> PathB
         CockpitHomeKind::Config => isolated.config.clone(),
         CockpitHomeKind::Data => isolated.data.clone(),
         CockpitHomeKind::State => isolated.state.clone(),
+        CockpitHomeKind::Cache => isolated.cache.clone(),
+        CockpitHomeKind::Runtime => isolated.runtime.clone(),
     };
     if is_under_real_developer_roots(&redirected) {
         panic!(
@@ -225,7 +285,7 @@ pub fn finalize_test_cockpit_path(path: PathBuf, kind: CockpitHomeKind) -> PathB
 }
 
 /// Panic when `path` resolves under the captured real developer Cockpit
-/// config/data/state roots without an explicit opt-in. Production code never
+/// config/data/state/cache/runtime roots without an explicit opt-in. Production code never
 /// calls this; it covers the unreachable case where redirect did not run.
 pub fn assert_not_real_developer_cockpit_path(path: &Path) {
     ensure_real_developer_roots_captured();

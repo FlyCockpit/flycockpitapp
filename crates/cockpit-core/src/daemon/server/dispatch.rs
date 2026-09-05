@@ -23880,11 +23880,24 @@ mod provider_atomic_authority_tests {
     #[test]
     fn descriptor_credential_mutations_use_a_private_record_namespace() {
         let source = include_str!("dispatch.rs");
-        let completion = source
-            .rsplit("Request::CompleteProviderOAuth {")
-            .next()
-            .and_then(|tail| tail.split("Request::CancelProviderOAuth {").next())
+        // Source scans must not be confused by other tests quoting the same
+        // request markers, or by remote-operation arm bodies that reconstruct
+        // `let request = Request::PutProviderCredential { .. }` inside the arm
+        // itself. Slice the serialized dispatch impl once, then locate each
+        // arm from its first production occurrence to the next production arm
+        // marker.
+        let serialized = source
+            .split("async fn handle_serialized_request_impl(")
+            .nth(1)
+            .and_then(|impl_body| impl_body.split("fn agent_editor_lease_owner").next())
+            .expect("serialized dispatch impl body");
+        let completion_start = serialized
+            .find("Request::CompleteProviderOAuth {")
             .expect("complete-provider-oauth dispatch arm");
+        let completion = serialized[completion_start..]
+            .split("Request::CancelProviderOAuth {")
+            .next()
+            .expect("cancel-provider-oauth dispatch arm follows completion");
         let completion_descriptor_lock = completion
             .find("credential_mutation_lock(provider_id)")
             .expect("descriptor completion shares the credential fence");
@@ -23900,21 +23913,27 @@ mod provider_atomic_authority_tests {
             "descriptor completion must persist under its private record id"
         );
 
-        let put = source
-            .split("Request::PutProviderCredential {")
-            .nth(1)
-            .and_then(|tail| tail.split("Request::GetLocalOperationSettlement").next())
+        let put_start = serialized
+            .find("Request::PutProviderCredential {")
             .expect("put-provider-credential dispatch arm");
+        let put_end = serialized[put_start..]
+            .find("Request::GetLocalOperationSettlement")
+            .map(|offset| put_start + offset)
+            .expect("put-provider-credential arm ends at the settlement arm");
+        let put = &serialized[put_start..put_end];
         assert!(
             !put.contains("credential_mutation_lock(&provider_id)"),
             "generic provider writes must not reach descriptor-owned records"
         );
 
-        let delete = source
-            .split("Request::DeleteProviderCredential {")
-            .nth(1)
-            .and_then(|tail| tail.split("Request::GetProviderCatalogSnapshot").next())
+        let delete_start = serialized
+            .find("Request::DeleteProviderCredential {")
             .expect("delete-provider-credential dispatch arm");
+        let delete_end = serialized[delete_start..]
+            .find("Request::GetProviderCatalogSnapshot")
+            .map(|offset| delete_start + offset)
+            .expect("delete-provider-credential arm ends at the catalog snapshot arm");
+        let delete = &serialized[delete_start..delete_end];
         let delete_config_lock = delete
             .find("CONFIG_PUBLICATION_RPC_LOCK.lock().await")
             .expect("delete takes the config-publication lock");

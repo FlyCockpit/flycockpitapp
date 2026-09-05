@@ -564,7 +564,7 @@ mod tests {
         let home = tempfile::tempdir().expect("isolated Cockpit home");
         let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(home.path());
         let workspace = tempfile::tempdir().expect("workspace");
-        let global_config = home.path().join("config/cockpit/config.json");
+        let global_config = home.path().join("home/.config/cockpit/config.json");
         let replacement_config = home.path().join("replacement-config.json");
         std::fs::create_dir_all(global_config.parent().expect("global config parent")).unwrap();
         std::fs::write(&global_config, r#"{"maxPrimaryRounds":22}"#).unwrap();
@@ -747,7 +747,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(home.path());
         let workspace = tempfile::tempdir().unwrap();
-        let global_config = home.path().join("config/cockpit/config.json");
+        let global_config = home.path().join("home/.config/cockpit/config.json");
         let project_config = workspace.path().join(".cockpit/config.json");
         let explicit_config = workspace.path().join("override.json");
         let literal_global = "Bearer sk-global-preparation-1234567890";

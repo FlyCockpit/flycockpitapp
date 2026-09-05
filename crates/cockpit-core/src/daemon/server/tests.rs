@@ -8810,8 +8810,11 @@ async fn socket_peer_without_owner_capability_cannot_call_secret_rpc() {
         Body::Error { id, error } => {
             assert_eq!(id, Some(denied_id));
             assert_eq!(error.code, ErrorCode::Authorization);
+            // A peer that has not exchanged a credential is not owner-class
+            // (#337), so the owner_only command-table arm denies it before
+            // the daemon-private capability gate is ever consulted.
             assert!(
-                error.message.contains("daemon-private owner capability"),
+                error.message.contains("request requires the local owner"),
                 "{}",
                 error.message
             );
@@ -8897,8 +8900,12 @@ async fn socket_peer_legacy_owner_capability_file_token_is_not_admitted() {
         Body::Error { id, error } => {
             assert_eq!(id, Some(denied_id));
             assert_eq!(error.code, ErrorCode::Authorization);
+            // The legacy file token is not admitted (issue #337 dropped
+            // file-capability admission), so the peer stays unauthenticated
+            // and the owner_only command-table arm denies it before the
+            // daemon-private capability gate is ever consulted.
             assert!(
-                error.message.contains("daemon-private owner capability"),
+                error.message.contains("request requires the local owner"),
                 "{}",
                 error.message
             );
@@ -19866,6 +19873,10 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "get_doctor_snapshot"
         | "get_agent_inventory"
         | "get_extended_config_snapshot" => AuthzAllowedOutcome::Response,
+        // The matrix probe revokes a fabricated verdict digest on the seeded
+        // live session. The session-writer gate passes, then the store lookup
+        // maps a missing media-egress verdict to the typed `NotFound`.
+        "revoke_media_egress_verdict" => AuthzAllowedOutcome::Error(ErrorCode::NotFound),
         // Image-sidecar Get is a concurrent handler with its own attach
         // gate (`BadRequest`). Create/Revoke go through serialized
         // `require_attached` (`NotAttached`). The default owner matrix
@@ -33360,7 +33371,7 @@ async fn set_model_favorite_writes_global_retained_source_and_is_idempotent() {
     let home = tempfile::tempdir().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(home.path()).await;
     let project = tempfile::tempdir().unwrap();
-    let global_config = home.path().join("config/cockpit/config.json");
+    let global_config = home.path().join("home/.config/cockpit/config.json");
     std::fs::create_dir_all(global_config.parent().unwrap()).unwrap();
     std::fs::write(&global_config, r#"{"providers":{"global":{}}}"#).unwrap();
     let global_provider =
@@ -33859,9 +33870,8 @@ async fn modes_session_setup_clear_default_records_retained_inherited_selection(
         thinking_mode: None,
         prompt_cache_retention: None,
     };
-    let write_layer = |root: &Path, active: &crate::config::providers::ActiveModelRef| {
-        let cockpit_dir = root.join(".cockpit");
-        std::fs::create_dir_all(&cockpit_dir).unwrap();
+    let write_layer = |cockpit_dir: &Path, active: &crate::config::providers::ActiveModelRef| {
+        std::fs::create_dir_all(cockpit_dir).unwrap();
         let config = cockpit_dir.join("config.json");
         std::fs::write(
             &config,
@@ -33884,8 +33894,12 @@ async fn modes_session_setup_clear_default_records_retained_inherited_selection(
         .unwrap();
         config
     };
-    let lower_config = write_layer(&home.path().join("home"), &lower);
-    let upper_config = write_layer(project.path(), &upper);
+    // The lower layer is the user-owned global layer: the isolated home maps
+    // the canonical `~/.config/cockpit` to `{root}/home/.config/cockpit`, and
+    // only a discovered layer can supply the inherited default that a
+    // project-target clear must record.
+    let lower_config = write_layer(&home.path().join("home/.config/cockpit"), &lower);
+    let upper_config = write_layer(&project.path().join(".cockpit"), &upper);
 
     let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::production());
     let (mut state, _, mut work_rx) =
@@ -39731,6 +39745,9 @@ async fn modes_session_setup_endpoint_keeps_last_good_config_then_refreshes_dura
     )
     .await
     .expect("durable prepared session setup fixture");
+    // The raw fixture row owns no redaction-table vault custody; the
+    // fail-closed resume path requires it (issue #293).
+    establish_fixture_redaction_custody(&ctx.db, fixture.session_id);
     ctx.db
         .set_workspace_trust(
             &workspace,
@@ -41601,6 +41618,27 @@ fn interrupt_provenance_requires_successful_event_enqueue() {
     );
 }
 
+/// Interrupt forwarding records the interrupt id only after the writer's
+/// delivery ack resolves on the forwarder task. A test that just received
+/// the forwarded body must let that ack continuation run before asserting
+/// on the rendered set.
+async fn await_interrupt_marked_rendered(
+    rendered: &Arc<StdMutex<HashSet<Uuid>>>,
+    interrupt_id: Uuid,
+    label: &str,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if crate::sync::lock_or_recover(rendered).contains(&interrupt_id) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {label} interrupt to be marked rendered"));
+}
+
 #[tokio::test]
 async fn socket_live_interrupt_provenance_tracks_the_attachment_that_received_the_event() {
     let ctx = test_ctx();
@@ -41664,6 +41702,10 @@ async fn socket_live_interrupt_provenance_tracks_the_attachment_that_received_th
         Body::Event { event: proto::Event::InterruptRaised { interrupt_id, .. } }
             if interrupt_id == old_interrupt_id
     ));
+    // Interrupt forwarding marks the rendered set only after the writer's
+    // delivery ack resolves, which happens off this task. Wait for the mark
+    // instead of racing the forwarder's ack continuation.
+    await_interrupt_marked_rendered(&old_rendered, old_interrupt_id, "old attachment").await;
     assert!(crate::sync::lock_or_recover(&old_rendered).contains(&old_interrupt_id));
 
     let new_session_rx = session_tx.subscribe();
@@ -41695,6 +41737,7 @@ async fn socket_live_interrupt_provenance_tracks_the_attachment_that_received_th
         Body::Event { event: proto::Event::InterruptRaised { interrupt_id, .. } }
             if interrupt_id == new_interrupt_id
     ));
+    await_interrupt_marked_rendered(&new_rendered, new_interrupt_id, "new attachment").await;
     assert!(!crate::sync::lock_or_recover(&new_rendered).contains(&old_interrupt_id));
     assert!(crate::sync::lock_or_recover(&new_rendered).contains(&new_interrupt_id));
 

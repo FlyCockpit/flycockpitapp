@@ -475,6 +475,7 @@ async fn agent_cli_management_socket_invalid_manifest_is_typed_and_has_zero_muta
             "owner/repo@main:agents/helper.md",
             "--scope",
             "global",
+            "--trust-third-party",
             "--operation-key",
             "invalid-manifest-socket",
         ])
@@ -520,6 +521,7 @@ async fn agent_cli_management_socket_bind_choice_defer_rebind_yes_and_capability
             "owner/repo@main:agents/helper.md",
             "--scope",
             "global",
+            "--trust-third-party",
         ])
         .output()
         .expect("install fixture agent");
@@ -698,6 +700,7 @@ async fn agent_cli_management_socket_submit_choice_transcript_replays_the_same_r
             "owner/repo@main:agents/helper.md",
             "--scope",
             "global",
+            "--trust-third-party",
         ])
         .output()
         .expect("install transcript fixture");
@@ -795,6 +798,7 @@ async fn agent_cli_management_socket_yes_only_accepts_exact_author_choice() {
             "owner/repo@main:agents/helper.md",
             "--scope",
             "global",
+            "--trust-third-party",
             "--yes",
         ])
         .output()
@@ -840,6 +844,7 @@ async fn agent_cli_management_socket_hard_capability_refusal_preserves_primary_a
             "owner/repo@main:agents/helper.md",
             "--scope",
             "global",
+            "--trust-third-party",
         ])
         .output()
         .expect("install hard-capability fixture");
@@ -878,6 +883,7 @@ async fn agent_cli_management_socket_update_targets_exact_installation_and_never
             "owner/repo@main:agents/helper.md",
             "--scope",
             "global",
+            "--trust-third-party",
         ])
         .output()
         .expect("install initial update fixture");
@@ -900,6 +906,7 @@ async fn agent_cli_management_socket_update_targets_exact_installation_and_never
             &installation,
             "--source",
             "owner/repo@next:agents/helper.md",
+            "--trust-third-party",
         ])
         .output()
         .expect("require update replacement acknowledgement");
@@ -917,6 +924,7 @@ async fn agent_cli_management_socket_update_targets_exact_installation_and_never
             "--replace",
             "--scope",
             "global",
+            "--trust-third-party",
         ])
         .output()
         .expect("reject mismatched target provenance");
@@ -950,6 +958,7 @@ async fn agent_cli_management_socket_update_targets_exact_installation_and_never
             "--replace",
             "--scope",
             "global",
+            "--trust-third-party",
             "--operation-key",
             "changed-agent-id-refusal",
         ])
@@ -986,6 +995,7 @@ async fn agent_cli_management_socket_update_targets_exact_installation_and_never
             "--replace",
             "--scope",
             "global",
+            "--trust-third-party",
         ])
         .output()
         .expect("update exact target");
@@ -1029,6 +1039,7 @@ async fn agent_cli_management_socket_update_targets_exact_installation_and_never
             "--replace",
             "--scope",
             "global",
+            "--trust-third-party",
         ])
         .output()
         .expect("refuse dirty owned copy update");

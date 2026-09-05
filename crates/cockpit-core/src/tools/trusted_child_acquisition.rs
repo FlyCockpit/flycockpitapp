@@ -122,13 +122,21 @@ where
 /// Tokio task-locals are not inherited by `tokio::spawn`. Every scheduler lane
 /// enters through this wrapper, preserving the exact acquisition capability
 /// when one is active while leaving ordinary non-acquisition turns unchanged.
-pub(crate) async fn with_inherited_acquisition_runtime<F>(future: F) -> F::Output
+///
+/// This is a plain function, not an `async fn`, on purpose: the capture must
+/// run at the call site — the last place the parent task's task-local still
+/// exists. An `async fn` body first runs when the returned future is polled,
+/// which for a spawned lane is already inside the child task, where
+/// `CURRENT_ACQUISITION_RUNTIME` is absent and nothing would be inherited.
+pub(crate) fn with_inherited_acquisition_runtime<F>(
+    future: F,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + Send>>
 where
-    F: std::future::Future,
+    F: std::future::Future + Send,
 {
     match CURRENT_ACQUISITION_RUNTIME.try_with(Clone::clone) {
-        Ok(runtime) => CURRENT_ACQUISITION_RUNTIME.scope(runtime, future).await,
-        Err(_) => future.await,
+        Ok(runtime) => Box::pin(CURRENT_ACQUISITION_RUNTIME.scope(runtime, future)),
+        Err(_) => Box::pin(future),
     }
 }
 

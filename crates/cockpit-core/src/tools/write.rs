@@ -468,6 +468,11 @@ pub(crate) fn enforce_requested_write_scope(
 /// umask-derived; applied through the held staged-directory inode.
 #[cfg(unix)]
 const CREATED_DIR_MODE: libc::mode_t = 0o755;
+/// Explicit final mode for a newly created regular file. Creation must not
+/// depend on the process umask: a restrictive umask (e.g. `0o700`) would
+/// otherwise strip the owner's read bit from the `0o666` creation mode and
+/// block reading a file this tool just created.
+const CREATED_FILE_MODE: libc::mode_t = 0o644;
 #[cfg(unix)]
 const CREATED_DIR_INITIAL_MODE: libc::mode_t = 0o700;
 
@@ -916,16 +921,12 @@ fn create_parent_components(
         match component {
             std::path::Component::Normal(name) => {
                 built.push(name);
-                let (next, binding) = open_or_create_directory_child(
-                    &current, name, &built, created,
-                )
-                .with_context(|| {
-                    format!(
-                        "create parent directories for `{}` under `{}`",
-                        path.display(),
-                        parent.display()
-                    )
-                })?;
+                // Refusal-class errors (symlink/`not a directory`/identity
+                // changes) must stay the top-level message: callers and tests
+                // match on those exact texts, so no generic context may wrap
+                // them. The per-step errors already name the component path.
+                let (next, binding) =
+                    open_or_create_directory_child(&current, name, &built, created)?;
                 bindings.push(binding);
                 current = next;
             }
@@ -1200,6 +1201,9 @@ fn create_new_file(
         libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         0o666,
     )?;
+    // Pin the explicit final mode through the held descriptor so a
+    // restrictive umask cannot silently strip the owner's read bit.
+    cockpit_host::private_fs::held_fd::fchmod(file.as_raw_fd(), CREATED_FILE_MODE)?;
     let metadata = file.metadata()?;
     let identity = CreatedFileIdentity {
         device: metadata.dev(),

@@ -104,6 +104,31 @@ impl Tool for GlobTool {
             crate::tools::shell_sandbox::SandboxPathAccess::Read,
         )
         .await?;
+        let attached_knowledge_roots =
+            crate::knowledge::attached_local_knowledge_roots(ctx).await?;
+        // Hard confinement, after the boundary admission and before any
+        // walk: the walk is hard-confined to the session boundary (the
+        // cwd root plus the session scratch dirs) and to attached local
+        // KB roots. Any other admitted root — one the escalate-on-miss
+        // path would have prompted for, or auto-approved under a Yolo
+        // approver — is refused here, never routed through the
+        // approval/escalation path. This mirrors the `confine`
+        // hard-deny stance the module docs promise: the walk can never
+        // reach outside the root.
+        if let Some(effective) = sandbox::outside_session_boundary(
+            &walk_root,
+            &ctx.cwd,
+            ctx.session.tmp_dir(),
+            Some(&ctx.session.workspace_scratch_dir()),
+        ) && !attached_knowledge_roots
+            .iter()
+            .any(|kb| cockpit_host::path_containment::contained_under(kb, &effective))
+        {
+            return Err(invalid_input(format!(
+                "`{}` resolves outside the package sandbox; access denied",
+                effective.display()
+            )));
+        }
         let canonical_root = sandbox::canonical_root(&walk_root)?;
 
         if let Some(refusal) = sandbox::check_gitignore_read(ctx, &walk_root).await? {
@@ -127,8 +152,6 @@ impl Tool for GlobTool {
             .session
             .secret_path_matcher(&ctx.config.extended().redact)
             .clone();
-        let attached_knowledge_roots =
-            crate::knowledge::attached_local_knowledge_roots(ctx).await?;
         let denied_knowledge_roots =
             crate::knowledge::denied_native_local_knowledge_roots(ctx).await?;
         let root = canonical_root.clone();

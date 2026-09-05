@@ -570,9 +570,11 @@ impl ModelAnswersOutcome {
 pub fn apply_model_answers(_cwd: &Path, run: &WizardRun) -> Result<ModelAnswersOutcome> {
     let (provider_id, model_id) = model_ref_answer(run).context("model answer")?;
     let global_config = global_config_file().context("resolving global config for model setup")?;
+    // Provider-id resolution is the fail-closed gate for the model write:
+    // an id that cannot name a provider config file must surface its own
+    // `invalid provider id` error, not a generic wrapper message.
     let model_target =
-        crate::config::providers::provider_file_path_for_config(&global_config, &provider_id)
-            .context("resolving global provider config for model setup")?;
+        crate::config::providers::provider_file_path_for_config(&global_config, &provider_id)?;
     // Model onboarding is authored against the global layer alone; resolving
     // workspace overlays here would make an untrusted project influence the
     // user's durable provider/model defaults.

@@ -495,7 +495,12 @@ fn extract_jpeg_exif(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
     let mut exif = None;
     while offset + 4 <= bytes.len() {
         if bytes[offset] != 0xff {
-            return Ok(None);
+            // The marker stream is broken here. Any EXIF evidence already
+            // collected must still be parsed: dropping it would silently
+            // downgrade malformed EXIF to identity orientation and let the
+            // failure surface later as a raw decoder error instead of the
+            // fail-closed `media_orientation_unsupported` gate.
+            return Ok(exif);
         }
         let marker = bytes[offset + 1];
         offset += 2;
@@ -511,11 +516,12 @@ fn extract_jpeg_exif(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
         let length = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
         if length < 2 || offset + length > bytes.len() {
             // A truncated APP1 Exif is fail-closed; other truncated markers
-            // are left to the decoder.
+            // are left to the decoder. Either way, EXIF evidence collected
+            // before the truncation is still parsed rather than dropped.
             if marker == 0xe1 {
                 return Err(orientation_unsupported());
             }
-            return Ok(None);
+            return Ok(exif);
         }
         let payload = &bytes[offset + 2..offset + length];
         if marker == 0xe1 && payload.starts_with(b"Exif") {

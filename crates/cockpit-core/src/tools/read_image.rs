@@ -457,6 +457,19 @@ pub fn encode_image(img: &image::DynamicImage, format: OutputFormat) -> Result<V
 // Transform pipeline: decode → orient → crop → scale → encode
 // ---------------------------------------------------------------------------
 
+/// Decode/scale profile for an admitted read-image source. The durable
+/// dimension charge is reserved against the planned transform output before
+/// decode, so the source decode itself keeps only the pixel-count and
+/// allocation bomb guards — a source whose header edge exceeds the durable
+/// cap (for example an 8193-pixel-wide image that downscales to the 2048
+/// default) is admitted and downscaled rather than rejected at the decoder.
+fn source_admission_profile() -> media_image::ImageProfile {
+    let mut profile = media_image::ImageProfile::read_image();
+    profile.max_width = None;
+    profile.max_height = None;
+    profile
+}
+
 /// The result of a successful transform.
 #[derive(Debug, Clone)]
 pub struct TransformResult {
@@ -483,7 +496,15 @@ pub fn transform_bytes(
 ) -> Result<TransformResult> {
     let orientation =
         media_image::preflight_exif_orientation(input).map_err(|e| invalid_input(e.to_string()))?;
-    transform_bytes_with_orientation(input, orientation, region, max_width, max_height, format)
+    transform_bytes_with_orientation(
+        input,
+        orientation,
+        region,
+        max_width,
+        max_height,
+        format,
+        &media_image::ImageProfile::read_image(),
+    )
 }
 
 fn transform_bytes_with_orientation(
@@ -493,10 +514,10 @@ fn transform_bytes_with_orientation(
     max_width: Option<u32>,
     max_height: Option<u32>,
     format: OutputFormat,
+    profile: &media_image::ImageProfile,
 ) -> Result<TransformResult> {
-    let profile = ImageProfile::read_image();
     let additional_frames_ignored = media_image::is_animated_gif(input);
-    let oriented = media_image::decode_with_orientation(input, &profile, orientation)
+    let oriented = media_image::decode_with_orientation(input, profile, orientation)
         .map_err(|e| invalid_input(e.to_string()))?;
 
     let source_width = oriented.width();
@@ -515,7 +536,7 @@ fn transform_bytes_with_orientation(
     )
     .map_err(|e| invalid_input(e.to_string()))?;
 
-    let scaled = media_image::scale(cropped, plan.output_width, plan.output_height, &profile);
+    let scaled = media_image::scale(cropped, plan.output_width, plan.output_height, profile);
 
     let bytes = encode_image(&scaled, format)?;
     if bytes.len() > MAX_OUTPUT_BYTES {
@@ -771,6 +792,7 @@ impl Tool for ReadImageTool {
             parsed.max_width,
             parsed.max_height,
             parsed.format,
+            &source_admission_profile(),
         ) {
             Ok(result) => result,
             Err(e) => {

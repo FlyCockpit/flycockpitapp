@@ -110,7 +110,7 @@ pub async fn check_native_access(
     let cage_path = effective_native_path(path).unwrap_or_else(|_| path.to_path_buf());
     if let Some(cage) = &ctx.review_cage
         && cage.auto_deny_approvals()
-        && !cage.preauthorizes_package_path(&cage_path)
+        && !cage.admits_caged_path(&cage_path)
     {
         return Err(invalid_input(format!(
             "`{}` is outside the session boundary and background review cannot approve it",
@@ -288,7 +288,7 @@ pub(crate) async fn check_native_human_knowledge_write_access(
     }
     if let Some(cage) = &ctx.review_cage
         && cage.auto_deny_approvals()
-        && !cage.preauthorizes_package_path(&effective)
+        && !cage.admits_caged_path(&effective)
     {
         return Err(invalid_input(format!(
             "`{}` is outside the session boundary and background review cannot approve it",
@@ -421,13 +421,17 @@ pub async fn check_gitignore_read(
         return Ok(Some(gitignore_refusal(&display)));
     }
 
-    // No approver (headless / background) must settle through the shared
-    // machine-readable denial. This keeps synthetic seed reads and ordinary
-    // tool calls on the same noninteractive approval contract.
+    // No approver (headless / background) → deny with the same clear,
+    // gate-naming refusal an explicit rejection produces, never the
+    // generic noninteractive denial: the refusal must tell the caller
+    // WHICH gate stopped the read (`secret-bearing` / `gitignored`) so a
+    // headless run cannot mistake a secret-path stop for a generic
+    // approval failure. The shared machine-readable
+    // [`crate::approval::NONINTERACTIVE_RUN_DENIAL`] stays the contract
+    // of the approver-driven noninteractive path below, where an
+    // approval surface exists to auto-deny through.
     let Some(approver) = ctx.approver.as_ref() else {
-        return Ok(Some(ToolOutput::text(
-            crate::approval::NONINTERACTIVE_RUN_DENIAL,
-        )));
+        return Ok(Some(gitignore_refusal(&display)));
     };
 
     // Build the glob shapes + the project-relative parent label for stage 1.

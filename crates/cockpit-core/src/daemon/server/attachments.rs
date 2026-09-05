@@ -1314,6 +1314,14 @@ pub(super) async fn finish_attachment_upload_admitted(
             let session_id = upload
                 .session_id
                 .ok_or_else(|| bad_request("user-message image upload is missing its session"))?;
+            // Receipt tables foreign-key to `sessions`. Lazy attach holds
+            // the row in memory only; flush before the image ingest writes
+            // session-bound media rows so a first image paste cannot commit
+            // against a missing parent row (same contract as the send path).
+            require_attached(state)?
+                .handle
+                .persist_if_needed()
+                .map_err(internal)?;
             let project_text = {
                 let attached = require_attached(state)?;
                 attached

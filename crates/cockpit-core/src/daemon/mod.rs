@@ -3289,7 +3289,11 @@ mod tests {
         assert!(reaped.load(std::sync::atomic::Ordering::Acquire));
     }
 
-    #[tokio::test]
+    // The reaper task blocks its thread inside the std-sync decision mutex
+    // while promotion holds it; on a current_thread runtime that would starve
+    // the only thread and deadlock against the release signal. Run the
+    // multi-thread runtime so the blocking sides each own a worker thread.
+    #[tokio::test(flavor = "multi_thread")]
     async fn promotion_holds_the_last_client_reaper_decision_until_lifetime_changes() {
         let (presence_tx, presence_rx) =
             tokio::sync::watch::channel(server::ClientPresence::default());
@@ -3404,6 +3408,16 @@ mod tests {
             .expect("trust project");
 
         let paths = harness.ephemeral_paths("two-socket-clients");
+        // The in-process daemon boots without a spawn-time launch ticket, so
+        // issue #337's per-peer authority would otherwise deny these socket
+        // clients owner-class exchange and fail closed on every Attach. Mint
+        // and persist the daemon-private launch-ticket file exactly as
+        // `spawn_detached_child` does for a detached daemon: the socket
+        // clients resolve it as same-uid followers and the daemon's exchange
+        // handler verifies against it (`verify_persisted_launch_ticket`).
+        let launch_ticket = peer_authority::mint_launch_ticket();
+        peer_authority::persist_launch_ticket(&paths.socket, &launch_ticket)
+            .expect("persist daemon launch ticket");
         let daemon_paths = paths.clone();
         let daemon_db = harness.db.clone();
         let daemon_task = tokio::spawn(async move {

@@ -33,7 +33,8 @@ pub struct RetentionConfig {
     pub vacuum_interval_days: u32,
     /// Number of most-recent compaction windows in a lineage whose
     /// transcripts stay verbatim. Older windows past the transcript
-    /// horizon may be rolled up. Zero means keep every window verbatim.
+    /// horizon may be rolled up. Zero disables the verbatim guard so
+    /// only the transcript horizon applies.
     #[serde(default = "default_compaction_lineage_keep_windows")]
     pub compaction_lineage_keep_windows: u32,
 }

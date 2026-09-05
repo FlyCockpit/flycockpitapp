@@ -470,14 +470,19 @@ async fn action_admin_unknown_ids_reject_before_persist() {
     }
 
     // Positive control: an owner-declared fixed sink persists a daemon-minted
-    // action instance.
+    // action instance. Sealed local executors pin an absolute executable path
+    // (canonicalized and identity-hashed), so the fixture must provide one.
+    let exe_dir = tempfile::tempdir().unwrap();
+    let exe = exe_dir.path().join("notify");
+    std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+    let exe_arg = exe.canonicalize().unwrap().to_string_lossy().into_owned();
     let mut state = owner_state();
     let response = handle_request(
         Request::CreateDeclaredSealedAction {
             project_id: "proj".into(),
             description: "notify".into(),
             declaration: proto::SealedActionDeclaration::CommandArgument {
-                argv: vec!["notify".into(), "{{sealed_value}}".into()],
+                argv: vec![exe_arg, "{{sealed_value}}".into()],
             },
         },
         &mut state,
@@ -6657,6 +6662,7 @@ async fn auto_title_rpc_generates_title() {
         .create_session("p", project.path().to_str().unwrap(), "Build")
         .await
         .unwrap();
+    establish_fixture_redaction_custody(&ctx.db, session.session_id);
     ctx.db
         .insert_session_event(
             session.session_id,
@@ -6713,6 +6719,7 @@ async fn auto_title_failure_leaves_session_unrenamed() {
         .create_session("p", project.path().to_str().unwrap(), "Build")
         .await
         .unwrap();
+    establish_fixture_redaction_custody(&ctx.db, session.session_id);
     let mut state = owner_state();
 
     let err = handle_request(
@@ -6756,6 +6763,7 @@ async fn auto_title_rpc_omits_provider_request_id_and_body_from_error() {
         .create_session("p", project.path().to_str().unwrap(), "Build")
         .await
         .unwrap();
+    establish_fixture_redaction_custody(&ctx.db, session.session_id);
     let mut state = owner_state();
 
     let error = handle_request(
@@ -6791,6 +6799,7 @@ async fn concurrent_auto_title_second_attempt_is_rejected() {
         .create_session("p", project.path().to_str().unwrap(), "Build")
         .await
         .unwrap();
+    establish_fixture_redaction_custody(&ctx.db, session.session_id);
     let mut first_state = owner_state();
     let mut second_state = owner_state();
     let first_request = Request::AutoTitle {
@@ -6836,6 +6845,7 @@ async fn concurrent_auto_title_second_attempt_is_rejected() {
 async fn export_rpc_returns_redacted_data() {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+    establish_fixture_redaction_custody(&ctx.db, session.session_id);
     let call_id = Uuid::new_v4().to_string();
     ctx.db
         .insert_session_event(
@@ -6946,6 +6956,7 @@ async fn daemon_export_rpc_has_no_raw_bypass() {
     // context — the state the local unix-socket owner actually produces).
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+    establish_fixture_redaction_custody(&ctx.db, session.session_id);
 
     let state = owner_state();
     let shared = state.shared_snapshot();
@@ -7002,6 +7013,7 @@ async fn owner_assembles_and_reads_redacted_export_via_type_bound_reader() {
     // see `export_and_redacted_reader_reject_a_real_remote_principal`).
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+    establish_fixture_redaction_custody(&ctx.db, session.session_id);
     ctx.db
         .insert_session_event(
             session.session_id,
@@ -7274,6 +7286,11 @@ async fn rotated_disk_secret_is_scrubbed_from_redacted_export_via_journal() {
     const SECRET: &str = "sk-rotated-DISK-only-in-journal-42x";
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+    // Empty custody only: the session deliberately owns no persisted redaction
+    // literals — the encrypted journal is the only inventory that still holds
+    // the rotated secret. Custody (the vault item) must still exist so the
+    // fail-closed export path can traverse the session.
+    establish_fixture_redaction_custody(&ctx.db, session.session_id);
 
     // Journal the secret. Deliberately DO NOT set the session's persisted
     // redaction table and DO NOT plant it in any env, so the encrypted journal
@@ -8071,6 +8088,12 @@ fn write_curator_skill(skill_root: &Path, name: &str) {
 }
 
 fn persistent_test_ctx() -> Arc<DaemonContext> {
+    persistent_test_ctx_with_config_source(stub_config_source())
+}
+
+fn persistent_test_ctx_with_config_source(
+    config_source: crate::daemon::config_source::ConfigSource,
+) -> Arc<DaemonContext> {
     let db = Db::open_in_memory().expect("in-memory db");
     let locks = Arc::new(LockManager::in_memory(db.clone()));
     let paths = DaemonPaths {
@@ -8083,7 +8106,7 @@ fn persistent_test_ctx() -> Arc<DaemonContext> {
         locks,
         paths,
         crate::daemon::terminal::test_host_factory(),
-        stub_config_source(),
+        config_source,
     ))
 }
 
@@ -8692,6 +8715,18 @@ fn owner_state() -> MutableClientState {
     }
 }
 
+/// Give a fixture session created through the raw `Db::create_session`
+/// primitive the empty redaction-table vault custody that production
+/// fail-closed resume/export/attach paths require (issue #293: a durable
+/// session owns its redaction table before it can be resumed).
+fn establish_fixture_redaction_custody(db: &crate::db::Db, session_id: Uuid) {
+    let json = crate::redact::RedactionTable::empty()
+        .to_persisted_json()
+        .expect("empty redaction table JSON");
+    crate::session::lifecycle::write_redaction_table_json_to_vault(db, session_id, &json)
+        .expect("fixture redaction-table vault custody");
+}
+
 #[tokio::test]
 async fn owner_without_capability_is_denied_secret_rpcs() {
     let ctx = test_ctx();
@@ -8769,7 +8804,9 @@ async fn socket_peer_without_owner_capability_cannot_call_secret_rpc() {
         ))
         .await
         .expect("send secret RPC without capability");
-    match recv_body(&mut client).await {
+    // Skip the connect-time CaffeinateState replay: every socket client
+    // receives the daemon-global caffeinate snapshot after the hello.
+    match recv_non_event_body(&mut client).await {
         Body::Error { id, error } => {
             assert_eq!(id, Some(denied_id));
             assert_eq!(error.code, ErrorCode::Authorization);
@@ -8800,7 +8837,7 @@ async fn socket_peer_without_owner_capability_cannot_call_secret_rpc() {
         ))
         .await
         .expect("send secret RPC with capability");
-    match recv_body(&mut client).await {
+    match recv_non_event_body(&mut client).await {
         Body::Error { id, error } if id == Some(allowed_id) => {
             assert_ne!(
                 error.code,
@@ -8854,7 +8891,9 @@ async fn socket_peer_legacy_owner_capability_file_token_is_not_admitted() {
         ))
         .await
         .expect("send secret RPC with legacy file token");
-    match recv_body(&mut client).await {
+    // Skip the connect-time CaffeinateState replay every socket client
+    // receives after the hello.
+    match recv_non_event_body(&mut client).await {
         Body::Error { id, error } => {
             assert_eq!(id, Some(denied_id));
             assert_eq!(error.code, ErrorCode::Authorization);
@@ -17043,6 +17082,10 @@ async fn retention_tick_runs_one_pass_without_sleep() {
         raw_wire_window_days: 0,
         terminal_evidence_window_days: 0,
         vacuum_interval_days: 0,
+        // Isolate the transcript-window behavior: the compaction-lineage
+        // keep-windows guard would otherwise keep the single (most recent)
+        // window verbatim regardless of age.
+        compaction_lineage_keep_windows: 0,
         ..RetentionConfig::default()
     };
 
@@ -18519,6 +18562,14 @@ fn dispatch_matrix_class_for_command(
 ) -> DispatchMatrixClass {
     match (kind, authz, mutating) {
         ("unknown", "owner_only", false) => DispatchMatrixClass::NonDispatchable,
+        // Connection-lifecycle request: it attests the connecting OS socket
+        // peer (SO_PEERCRED / named-pipe identity), which the generic in-
+        // process matrix harness cannot fabricate (`socket_peer: None`).
+        // It is dispatched on the real wire path and covered by the dedicated
+        // peer-authority socket tests instead of the matrix scaffolds.
+        ("exchange_local_peer_credential", "public_read", false) => {
+            DispatchMatrixClass::NonDispatchable
+        }
         (_, "owner_only", _) => DispatchMatrixClass::AccessControlled,
         ("fs_list", "project_files", false)
         | ("fs_stat", "project_files", false)
@@ -26724,6 +26775,7 @@ async fn assert_auto_title_mutating_happy() {
         .create_session("p", project.path().to_str().unwrap(), "Build")
         .await
         .unwrap();
+    establish_fixture_redaction_custody(&ctx.db, session.session_id);
     let response = dispatch_matrix_request(
         &ctx,
         Request::AutoTitle {
@@ -26766,6 +26818,7 @@ async fn assert_auto_title_mutating_malformed() {
         .create_session("p", project.path().to_str().unwrap(), "Build")
         .await
         .unwrap();
+    establish_fixture_redaction_custody(&ctx.db, session.session_id);
     let err = dispatch_matrix_request(
         &ctx,
         Request::AutoTitle {
@@ -27838,7 +27891,24 @@ fn attach_existing_request(session_id: Uuid, project_root: &Path) -> Request {
 #[tokio::test]
 async fn modes_session_setup_lazy_live_reattach_uses_daemon_mode_before_first_message() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
-    let ctx = persistent_test_ctx();
+    // Computer's attach-time model authority requires a configured
+    // vision-capable model with a native computer_use contract: give the
+    // stub provider's vision model that contract so the Computer iteration
+    // can attach. The Assistant iteration is unaffected.
+    let mut providers = stub_providers_config();
+    let entry = providers
+        .providers
+        .get_mut("lmstudio")
+        .expect("stub provider entry");
+    entry.models[0].capabilities.computer_use = crate::config::providers::ComputerUseCapability {
+        contract: Some(crate::config::providers::ComputerUseContract::OpenAiResponses),
+        source: None,
+    };
+    let ctx =
+        persistent_test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+            providers,
+            crate::config::extended::ExtendedConfig::default(),
+        ));
     let project = tempfile::tempdir().unwrap();
     ctx.db
         .set_workspace_trust(
@@ -27968,6 +28038,7 @@ async fn dispatch_attach_delivers_config_snapshot_event() {
         .create_session("p", project.path().to_str().unwrap(), "Build")
         .await
         .unwrap();
+    establish_fixture_redaction_custody(&ctx.db, session.session_id);
     let (result, events) = dispatch_matrix_request_after_collect_events(
         &ctx,
         vec![],
@@ -28042,6 +28113,7 @@ async fn dispatch_invalid_reresolve_keeps_last_good_snapshot() {
         .create_session("p", project.path().to_str().unwrap(), "Build")
         .await
         .unwrap();
+    establish_fixture_redaction_custody(&ctx.db, session.session_id);
     let (result, events) = dispatch_matrix_request_after_collect_events(
         &ctx,
         vec![attach_existing_request(session.session_id, project.path())],
@@ -28130,11 +28202,20 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "get_agent_effective_settings",
         "get_session_setup_snapshot",
         "get_guidance_enablement_trace",
+        // The image_* surfaces and scheduled jobs are opt-in extended
+        // capability rows in the proto command table, mirroring the
+        // get_image_spend_policy gate above.
+        #[cfg(feature = "extended")]
         "image_endpoint_list",
+        #[cfg(feature = "extended")]
         "image_endpoint_get",
+        #[cfg(feature = "extended")]
         "image_target_list",
+        #[cfg(feature = "extended")]
         "image_target_get",
+        #[cfg(feature = "extended")]
         "image_workflow_list",
+        #[cfg(feature = "extended")]
         "image_workflow_get",
         "get_provider_catalog_snapshot",
         "get_run_invocation_status",
@@ -28151,6 +28232,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         "list_pinned_message_seqs",
         "list_pinned_messages_with_text",
         "list_conversation_rules",
+        #[cfg(feature = "extended")]
         "list_scheduled_jobs",
         "sealed_owner_inventory",
         "list_sealed_actions",
@@ -30822,6 +30904,15 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
     let Response::Attached { session_id, .. } = attached else {
         panic!("expected Attached response");
     };
+    // Receipt tables foreign-key to `sessions`. The Assistant-mode lazy
+    // attach holds the session row in memory only; flush it before the
+    // fixture inserts the FK-bound terminal receipt rows (production paths
+    // always run after a flush).
+    ctx.registry
+        .live_handle(session_id)
+        .expect("live worker for receipt fixture")
+        .persist_if_needed()
+        .unwrap();
 
     let client_submission_id = Uuid::now_v7();
     let text = "must remain removed";
@@ -35808,7 +35899,10 @@ async fn client_io_split_slow_request_does_not_block_event_forwarding() {
     let (_event_cmd_tx, event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (executor_tx, _executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
-    let (_, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner());
+    // Keep the watch sender alive: `run_client_event_forwarder` exits when it
+    // closes (the executor owns it in production), so a wildcard drop here
+    // would tear the forwarder down before any event is forwarded.
+    let (_principal_tx, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner());
     let event_task = tokio::spawn(run_client_event_forwarder(
         ctx,
         principal_rx,
@@ -36120,6 +36214,19 @@ async fn attach_replay_precedes_live_events_under_concurrency() {
         saw_drain,
         "attach should enqueue drain replay before slow read response"
     );
+    // The attach path also replays the daemon-global lifetime snapshot
+    // (DaemonLifetimeChanged) after the drain replay so a client cannot
+    // retain a stale ephemeral exit policy; consume it before the slow
+    // response.
+    assert!(
+        matches!(
+            recv_writer_body(&mut writer_rx, "attach lifetime replay").await,
+            Body::Event {
+                event: proto::Event::DaemonLifetimeChanged { .. }
+            }
+        ),
+        "attach should deliver the lifetime snapshot after the drain replay"
+    );
     assert!(matches!(
         event_cmd_rx
             .recv()
@@ -36154,7 +36261,10 @@ async fn client_io_split_detach_silences_session_events() {
     let (event_cmd_tx, event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (executor_tx, _executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
-    let (_, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner());
+    // Keep the watch sender alive: `run_client_event_forwarder` exits when it
+    // closes (the executor owns it in production), so a wildcard drop here
+    // would tear the forwarder down before any event is forwarded.
+    let (_principal_tx, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner());
     let event_task = tokio::spawn(run_client_event_forwarder(
         ctx,
         principal_rx,
@@ -36226,7 +36336,10 @@ async fn broadcast_lag_emits_typed_event_not_internal_error() {
     let (event_cmd_tx, event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (executor_tx, _executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
-    let (_, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner());
+    // Keep the watch sender alive: `run_client_event_forwarder` exits when it
+    // closes (the executor owns it in production), so a wildcard drop here
+    // would tear the forwarder down before any event is forwarded.
+    let (_principal_tx, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner());
     let event_task = tokio::spawn(run_client_event_forwarder(
         ctx,
         principal_rx,
@@ -36848,6 +36961,7 @@ async fn discard_live_ephemeral_session_timeout_leaves_row_intact() {
         .create_ephemeral_fork(parent.session_id, None)
         .await
         .unwrap();
+    establish_fixture_redaction_custody(&ctx.db, side.session_id);
     insert_hung_worker(&ctx, side.session_id);
 
     let err = handle_request(
@@ -36887,6 +37001,7 @@ async fn discard_predecessor_window_stops_the_live_tip_worker() {
         .create_compaction_successor(side.session_id)
         .await
         .unwrap();
+    establish_fixture_redaction_custody(&ctx.db, successor.session_id);
     insert_hung_worker(&ctx, successor.session_id);
 
     let err = handle_request(
@@ -37300,6 +37415,7 @@ async fn cascaded_delete_timeout_stops_before_any_db_mutation() {
     .await
     .unwrap();
     let child = ctx.db.create_fork(root.session_id, None).await.unwrap();
+    establish_fixture_redaction_custody(&ctx.db, child.session_id);
     insert_hung_worker(&ctx, child.session_id);
 
     let err = handle_request(
@@ -40530,6 +40646,12 @@ async fn sealed_action_channel_create_list_revise_retire_roundtrip() {
 
     // Create through the owner-declared fixed sink. Models never receive this
     // declaration; they later interact only through the minted action id.
+    // Sealed local executors pin an absolute executable path (canonicalized
+    // and identity-hashed), so the fixture must provide one.
+    let exe_dir = tempfile::tempdir().unwrap();
+    let exe = exe_dir.path().join("notify");
+    std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+    let exe_arg = exe.canonicalize().unwrap().to_string_lossy().into_owned();
     let created = dispatch_sealed_owner(
         &ctx,
         &mut state,
@@ -40537,7 +40659,7 @@ async fn sealed_action_channel_create_list_revise_retire_roundtrip() {
             project_id: "proj".into(),
             description: "notify deploy".into(),
             declaration: proto::SealedActionDeclaration::CommandArgument {
-                argv: vec!["notify".into(), "{{sealed_value}}".into()],
+                argv: vec![exe_arg, "{{sealed_value}}".into()],
             },
         },
     )
@@ -41489,7 +41611,10 @@ async fn socket_live_interrupt_provenance_tracks_the_attachment_that_received_th
     let old_rendered = Arc::new(StdMutex::new(HashSet::new()));
     let new_rendered = Arc::new(StdMutex::new(HashSet::new()));
     let session_id = Uuid::new_v4();
-    let (_, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner());
+    // Keep the watch sender alive: `run_client_event_forwarder` exits when it
+    // closes (the executor owns it in production), so a wildcard drop here
+    // would tear the forwarder down before any event is forwarded.
+    let (_principal_tx, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner());
     let task = tokio::spawn(run_client_event_forwarder(
         ctx.clone(),
         principal_rx,
@@ -41586,7 +41711,10 @@ async fn socket_live_interrupt_provenance_tracks_the_attachment_that_received_th
     drop(writer_rx);
     let failed_rendered = Arc::new(StdMutex::new(HashSet::new()));
     let failed_id = Uuid::new_v4();
-    let (_, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner());
+    // Keep the watch sender alive: `run_client_event_forwarder` exits when it
+    // closes (the executor owns it in production), so a wildcard drop here
+    // would tear the forwarder down before any event is forwarded.
+    let (_principal_tx, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner());
     let failed_task = tokio::spawn(run_client_event_forwarder(
         ctx.clone(),
         principal_rx,

@@ -3287,6 +3287,11 @@ impl Driver {
         match self.budget.charge_round() {
             Ok(()) => Ok(true),
             Err(exhaustion) => {
+                if std::env::var("DRIVER_DEBUG_ADMIT").is_ok() {
+                    eprintln!(
+                        "ADMIT-DEBUG: round refused is_root={is_root} max_rounds={max_primary_rounds} exhaustion={exhaustion:?}"
+                    );
+                }
                 if is_root
                     && max_primary_rounds > 0
                     && exhaustion.dimension
@@ -13693,7 +13698,12 @@ impl Driver {
                     // ReplayParkedInterrupt can enter persist-on-re-entry.
                     return Ok(());
                 }
-                PendingScheduledReentry::WaitForStartedSiblings => return Ok(()),
+                PendingScheduledReentry::WaitForStartedSiblings => {
+                    if std::env::var("DRIVER_DEBUG_ADMIT").is_ok() {
+                        eprintln!("ADMIT-DEBUG: reentry WaitForStartedSiblings");
+                    }
+                    return Ok(());
+                }
                 PendingScheduledReentry::Advanced(result) => Some(result),
             };
             // Per-turn backup-model fallback (`per-model-backup-
@@ -13862,11 +13872,17 @@ impl Driver {
                     .admit_provider_round(is_root, max_primary_rounds, tx)
                     .await?
             {
+                if std::env::var("DRIVER_DEBUG_ADMIT").is_ok() {
+                    eprintln!("ADMIT-DEBUG: provider round refused");
+                }
                 return Ok(());
             }
             let turn_result = if let Some(result) = scheduled_turn_result {
                 result
             } else {
+                if std::env::var("DRIVER_DEBUG_ADMIT").is_ok() {
+                    eprintln!("ADMIT-DEBUG: dispatching foreground turn");
+                }
                 if is_root && let Some(work) = metadata_work.take() {
                     // The turn phase consumes this only after it has assembled
                     // and successfully dispatched the foreground request. That
@@ -14262,6 +14278,9 @@ impl Driver {
                     .map(|frame| frame.history.as_slice())
                     .unwrap_or(&[]),
             );
+            if std::env::var("DRIVER_DEBUG_ADMIT").is_ok() {
+                eprintln!("ADMIT-DEBUG: turn outcome = {outcome:?}");
+            }
             if let Err(exhaustion) = self.charge_recorded_usage() {
                 self.on_budget_exhausted(&exhaustion, tx).await;
                 return Ok(());

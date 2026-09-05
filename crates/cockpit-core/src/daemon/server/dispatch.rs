@@ -30326,17 +30326,19 @@ async fn get_doctor_snapshot_response(
     let canonical_root = crate::secret_ownership::canonical_owner_root(&path.display().to_string());
     // Doctor intentionally does not require workspace trust. This mirrors its
     // bootstrap config projection (which reads configuration without resolving
-    // credentials) solely to enumerate the references the diagnostic may use.
-    let config = crate::config::providers::ConfigDoc::load_effective(&path);
+    // credentials) solely to enumerate the references the diagnostic may use;
+    // the load itself stays inside the session-less diagnostics module.
+    let (named_secret_refs, credential_record_refs) =
+        crate::diagnostics::provider_secret_reference_ids(&path);
     let foreign_refs = foreign_provider_named_references(ctx, &canonical_root)
         .await
         .ok();
     let store = crate::credentials::CredentialStore::from_vault_provider_owner_scoped(
         ctx.secret_vault.clone(),
         &canonical_root,
-        &crate::secret_ref::provider_named_secret_references(&config),
+        &named_secret_refs,
         foreign_refs.as_ref(),
-        &crate::secret_ref::provider_credential_record_references(&config),
+        &credential_record_refs,
     )
     .map_err(internal)?;
     let db = ctx.db.clone();

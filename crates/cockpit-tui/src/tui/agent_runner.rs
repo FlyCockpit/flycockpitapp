@@ -135,6 +135,32 @@ impl AttachedRequestBinding {
             .await
             .map_err(|_| "daemon client dropped reply channel".to_string())?
     }
+
+    pub(crate) async fn request_with_shutdown(
+        &self,
+        request: Request,
+        shutdown: &crate::tui::async_action::AsyncActionCancellation,
+    ) -> Result<Response, String> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(AttachedRequest {
+                request,
+                intended_session_id: self.intended_session_id,
+                intended_attachment_epoch: self.intended_attachment_epoch,
+                response_tx,
+            })
+            .await
+            .map_err(|_| "daemon client task has stopped".to_string())?;
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                Err("daemon client dropped reply channel".to_string())
+            }
+            response = response_rx => {
+                response.map_err(|_| "daemon client dropped reply channel".to_string())?
+            }
+        }
+    }
 }
 
 pub struct ControlRequest {
@@ -5335,6 +5361,29 @@ mod tests {
                         // metadata; keep this socket fixture independent of
                         // cockpit-core's private storage implementation.
                         schema_version: 0,
+                    },
+                ))
+                .await
+                .unwrap();
+            let credential = match proto.recv().await.unwrap().unwrap() {
+                RecvFrame::Envelope(env) => env,
+                RecvFrame::Unknown { .. } => panic!("unexpected unknown frame"),
+                RecvFrame::VersionMismatch { .. } => panic!("unexpected version mismatch"),
+            };
+            let Body::Request {
+                id: credential_id,
+                request: Request::ExchangeLocalPeerCredential,
+                ..
+            } = credential.body
+            else {
+                panic!("expected peer credential exchange request");
+            };
+            proto
+                .send(&Envelope::response(
+                    credential_id,
+                    Response::LocalPeerCredential {
+                        token: cockpit_proto::OwnerCapabilityToken::new("test-peer-token"),
+                        role: cockpit_proto::LocalClientRole::Cli,
                     },
                 ))
                 .await

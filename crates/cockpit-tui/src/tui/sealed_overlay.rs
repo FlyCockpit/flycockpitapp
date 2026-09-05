@@ -1524,7 +1524,7 @@ mod tests {
                     description: None,
                     scope_kind: Some(ref scope_kind),
                     scope_key: Some(ref scope_key),
-                } if disposition == "promote" && scope_kind == "project" && scope_key == "project-a"
+                } if disposition == "promote" && scope_kind == "project" && scope_key == "proj-key"
             )),
             other => panic!("promote must be a control operation, got {other:?}"),
         }

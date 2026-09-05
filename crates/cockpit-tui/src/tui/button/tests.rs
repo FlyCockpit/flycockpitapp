@@ -628,6 +628,9 @@ fn classify_highlight_role(rel: &str, line: &str) -> String {
     if rel.contains("oauth_flow.rs") && line.contains("UNDERLINED") {
         return "oauth wizard noninteractive emphasis".into();
     }
+    if rel.contains("rules_overlay.rs") && line.contains("REVERSED") {
+        return "rules overlay REVERSED row → row selection".into();
+    }
     panic!("unclassified highlight role in {rel}: {line}");
 }
 

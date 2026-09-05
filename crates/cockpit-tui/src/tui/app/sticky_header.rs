@@ -74,7 +74,10 @@ impl App {
             // while the sticky header carves (or restores) its two rows.
             // An in-progress drag must still be cancelled: its pointer
             // coordinates can no longer describe a valid gesture.
-            let completed_selection = self.selection.filter(|selection| !selection.active);
+            let completed_selection = self
+                .sticky_user_message
+                .then(|| self.selection.filter(|selection| !selection.active))
+                .flatten();
             let completed_spans = completed_selection.and_then(|_| self.selection_spans.clone());
             self.invalidate_mouse_gesture(
                 MouseGestureInvalidation::ViewChange,

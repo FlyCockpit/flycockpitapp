@@ -1174,6 +1174,29 @@ mod tests {
                 ))
                 .await
                 .unwrap();
+            let credential = match proto.recv().await.unwrap().unwrap() {
+                RecvFrame::Envelope(env) => env,
+                RecvFrame::Unknown { .. } => panic!("unexpected unknown frame"),
+                RecvFrame::VersionMismatch { .. } => panic!("unexpected version mismatch"),
+            };
+            let Body::Request {
+                id: credential_id,
+                request: Request::ExchangeLocalPeerCredential,
+                ..
+            } = credential.body
+            else {
+                panic!("expected peer credential exchange request");
+            };
+            proto
+                .send(&Envelope::response(
+                    credential_id,
+                    Response::LocalPeerCredential {
+                        token: cockpit_proto::OwnerCapabilityToken::new("test-peer-token"),
+                        role: cockpit_proto::LocalClientRole::Cli,
+                    },
+                ))
+                .await
+                .unwrap();
             let env = match proto.recv().await.unwrap().unwrap() {
                 RecvFrame::Envelope(env) => env,
                 RecvFrame::Unknown { .. } => panic!("unexpected unknown frame"),

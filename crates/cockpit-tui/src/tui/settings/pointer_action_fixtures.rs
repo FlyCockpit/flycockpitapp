@@ -482,16 +482,25 @@ pub(super) fn all_payload_keys() -> Vec<PayloadFixtureKey> {
         WizardPayloadControlKey::ALL
             .iter()
             .copied()
+            .filter(|control| match control {
+                #[cfg(not(feature = "grok-subscription"))]
+                WizardPayloadControlKey::OAuthManualPaste => false,
+                _ => true,
+            })
             .map(PayloadFixtureKey::WizardControl),
     );
-    all.extend([OAuthProvider::Grok, OAuthProvider::Codex].map(PayloadFixtureKey::OAuthProvider));
+    all.extend([OAuthProvider::Codex].map(PayloadFixtureKey::OAuthProvider));
+    #[cfg(feature = "grok-subscription")]
+    all.push(PayloadFixtureKey::OAuthProvider(OAuthProvider::Grok));
     all.extend(
         [
             OAuthOption::Login,
+            #[cfg(feature = "grok-subscription")]
             OAuthOption::ManualPaste,
             OAuthOption::Poll,
             OAuthOption::SkipContinue,
             OAuthOption::Continue,
+            #[cfg(feature = "grok-subscription")]
             OAuthOption::Acknowledge,
         ]
         .map(PayloadFixtureKey::OAuthOption),
@@ -513,6 +522,8 @@ pub(super) fn wizard_pointer_source_steps() -> impl Iterator<Item = ProviderWiza
             | ProviderWizardStep::Saving
             | ProviderWizardStep::TestKey
             | ProviderWizardStep::Fetching => false,
+            #[cfg(not(feature = "grok-subscription"))]
+            ProviderWizardStep::GrokOAuth => false,
             ProviderWizardStep::Template
             | ProviderWizardStep::WireApi
             | ProviderWizardStep::ProviderId
@@ -664,6 +675,20 @@ pub(super) fn all_keys() -> Vec<ActionFixtureKey> {
         ProvidersFixture::ALL
             .iter()
             .copied()
+            .filter(|fixture| match fixture {
+                #[cfg(not(feature = "grok-subscription"))]
+                ProvidersFixture::BeginOAuthGrok
+                | ProvidersFixture::OAuthManualPaste
+                | ProvidersFixture::OAuthAcknowledge
+                | ProvidersFixture::WizardGrokLogin
+                | ProvidersFixture::WizardGrokManualPaste
+                | ProvidersFixture::WizardGrokPoll
+                | ProvidersFixture::WizardGrokSkipContinue
+                | ProvidersFixture::WizardGrokContinue
+                | ProvidersFixture::WizardGrokAcknowledge
+                | ProvidersFixture::CopyAuthorizationUrl => false,
+                _ => true,
+            })
             .map(ActionFixtureKey::Providers),
     );
     all.extend(LspFixture::ALL.iter().copied().map(ActionFixtureKey::Lsp));
@@ -680,18 +705,21 @@ pub(super) fn all_keys() -> Vec<ActionFixtureKey> {
             .copied()
             .map(ActionFixtureKey::DefaultModel),
     );
-    all.extend(
-        GenerationFixture::ALL
-            .iter()
-            .copied()
-            .map(ActionFixtureKey::Generation),
-    );
-    all.extend(
-        SidecarFixture::ALL
-            .iter()
-            .copied()
-            .map(ActionFixtureKey::Sidecar),
-    );
+    #[cfg(feature = "extended")]
+    {
+        all.extend(
+            GenerationFixture::ALL
+                .iter()
+                .copied()
+                .map(ActionFixtureKey::Generation),
+        );
+        all.extend(
+            SidecarFixture::ALL
+                .iter()
+                .copied()
+                .map(ActionFixtureKey::Sidecar),
+        );
+    }
     all
 }
 

@@ -810,7 +810,13 @@ fn validate_text_artifact_graph(
         };
         let has_source_artifact =
             source_by_event.contains_key(&(event.source_session_id, event.seq));
-        if has_source_artifact && user_event_has_media_or_file_parts(&data) {
+        // An oversized event is spill-eligible only when it is text-only: a
+        // legacy/corrupt long event with media parts stays artifact-ineligible
+        // no matter whether a source sidecar happens to accompany it, so the
+        // media rejection is checked before the missing-source rejection.
+        if (has_source_artifact || text.len() > INLINE_USER_TEXT_BYTES)
+            && user_event_has_media_or_file_parts(&data)
+        {
             bail!("oversized user event cannot carry media/file parts");
         }
         if text.len() > INLINE_USER_TEXT_BYTES && !has_source_artifact {
@@ -1203,19 +1209,36 @@ fn validate_tool_artifact_projection_state(
             if artifact_provenance != Value::Object(provenance.clone()) {
                 bail!("available tool artifact projection provenance differs from its sidecar");
             }
-            let preview_lines = provenance
-                .get("preview_lines")
-                .and_then(Value::as_u64)
-                .and_then(|value| usize::try_from(value).ok())
-                .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES);
-            let expected_head = crate::engine::text_artifact_frame::utf8_preview_lines(
-                &artifact.content,
-                preview_lines,
-            );
+            // Mirror the durable projection contract the DB layer enforces
+            // (`validate_available_durable_projection`): an ingress
+            // line-preview artifact (provenance carries `preview_lines`)
+            // stores the selected line preview with an empty tail; every other
+            // artifact stores the 2KiB/2KiB UTF-8 preview pair, whose tail is
+            // nonempty for a long body. Comparing a line preview against the
+            // pair, or demanding an empty tail for a long non-ingress body,
+            // would reject every valid archive of that shape.
+            let (expected_head, expected_tail) = if provenance.contains_key("preview_lines") {
+                let preview_lines = provenance
+                    .get("preview_lines")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES);
+                (
+                    crate::engine::text_artifact_frame::utf8_preview_lines(
+                        &artifact.content,
+                        preview_lines,
+                    ),
+                    String::new(),
+                )
+            } else {
+                let (head, tail) =
+                    crate::engine::text_artifact_frame::utf8_preview_pair(&artifact.content);
+                (head.to_owned(), tail.to_owned())
+            };
             if projection.get("line_count").and_then(Value::as_u64)
                 != Some(artifact.content.lines().count() as u64)
                 || preview_head != expected_head
-                || !preview_tail.is_empty()
+                || preview_tail != expected_tail
             {
                 bail!("available tool artifact projection previews differ from its sidecar");
             }
@@ -1499,6 +1522,17 @@ mod tests {
     use rusqlite::OptionalExtension;
     use zip::write::{SimpleFileOptions, ZipWriter};
 
+    /// The default export path fails closed when a bundled session lacks
+    /// redaction-table vault custody. Fixture rows inserted without custody
+    /// must install an empty table before a test re-exports them.
+    fn persist_test_redaction_custody(db: &Db, session_id: Uuid) {
+        let json = crate::redact::RedactionTable::empty()
+            .to_persisted_json()
+            .unwrap();
+        crate::session::lifecycle::write_redaction_table_json_to_vault(db, session_id, &json)
+            .unwrap();
+    }
+
     #[test]
     fn import_parser_accepts_every_closed_durable_event_kind() {
         for kind in SessionEventKind::ALL {
@@ -1726,6 +1760,7 @@ mod tests {
             let mut row =
                 Db::build_new_session_row_conn(conn, "import-test", "/tmp/import-test", "Build")?;
             row.session_id = id;
+            row.compaction_lineage_root_id = Some(id);
             Db::insert_session_row_without_redaction_custody_conn(conn, &row)?;
             Ok(())
         })
@@ -1757,6 +1792,7 @@ mod tests {
             let mut row =
                 Db::build_new_session_row_conn(conn, "import-test", "/tmp/import-test", "Build")?;
             row.session_id = id;
+            row.compaction_lineage_root_id = Some(id);
             Db::insert_session_row_without_redaction_custody_conn(conn, &row)?;
             Ok(())
         })
@@ -2247,6 +2283,7 @@ mod tests {
             })
             .await
             .unwrap();
+        persist_test_redaction_custody(&source, row.session_id);
         let source_id = row.session_id;
         source
             .transaction(move |conn| {
@@ -2308,6 +2345,7 @@ mod tests {
             })
             .await
             .unwrap();
+        persist_test_redaction_custody(&source, row.session_id);
         let source_id = row.session_id;
         source
             .transaction(move |conn| {

@@ -261,16 +261,21 @@ pub(crate) fn persist_btw_fork_with_redaction_custody_on_conn(
 }
 
 #[cfg(test)]
-thread_local! {
-    static FAIL_NEXT_REDACTION_VAULT_WRITE: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-}
+static FAIL_NEXT_REDACTION_VAULT_WRITE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
-/// Arm the next session redaction vault write in this thread to fail before
+/// Arm the next session redaction vault write in this process to fail before
 /// committing, so tests can assert cache identity after a failed persist.
+///
+/// The flag is process-global, not thread-local: `Db::transaction` runs its
+/// closure on a database worker thread, so a thread-local seam is invisible to
+/// the very vault writes this must cover (session inserts inside
+/// `db.transaction`). One-shot semantics (`swap`) keep a single armed write
+/// failing; nextest isolates each test in its own process, so the flag never
+/// leaks between tests in CI.
 #[cfg(test)]
 pub(crate) fn fail_next_redaction_vault_write_for_test() {
-    FAIL_NEXT_REDACTION_VAULT_WRITE.with(|flag| flag.set(true));
+    FAIL_NEXT_REDACTION_VAULT_WRITE.store(true, std::sync::atomic::Ordering::Release);
 }
 
 pub(crate) fn persist_empty_redaction_table_on_conn(
@@ -402,7 +407,7 @@ fn persist_redaction_table_to_vault(
     json: &[u8],
 ) -> Result<()> {
     #[cfg(test)]
-    if FAIL_NEXT_REDACTION_VAULT_WRITE.with(|flag| flag.replace(false)) {
+    if FAIL_NEXT_REDACTION_VAULT_WRITE.swap(false, std::sync::atomic::Ordering::AcqRel) {
         return Err(anyhow::anyhow!("injected redaction vault write failure"));
     }
     let item_id = crate::secure_key::redaction_table_item_id(&session_id.to_string());
@@ -422,7 +427,7 @@ fn persist_redaction_table_to_vault_on_conn(
     json: &[u8],
 ) -> Result<()> {
     #[cfg(test)]
-    if FAIL_NEXT_REDACTION_VAULT_WRITE.with(|flag| flag.replace(false)) {
+    if FAIL_NEXT_REDACTION_VAULT_WRITE.swap(false, std::sync::atomic::Ordering::AcqRel) {
         return Err(anyhow::anyhow!("injected redaction vault write failure"));
     }
     let item_id = crate::secure_key::redaction_table_item_id(&session_id.to_string());

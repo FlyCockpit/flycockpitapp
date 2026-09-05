@@ -623,17 +623,35 @@ mod tests {
         .unwrap();
     }
 
+    /// History search fails closed when a target session lacks redaction-table
+    /// vault custody. Sibling fixture sessions must therefore be created with
+    /// custody (like production sessions) rather than through the
+    /// custody-free `Db::create_session` fixture constructor.
+    async fn create_custodied_session(
+        db: &crate::db::Db,
+        project_id: &str,
+        project_root: &str,
+        active_agent: &str,
+    ) -> crate::db::sessions::SessionRow {
+        let vault = crate::secure_key::vault_for_db(db).expect("test vault");
+        crate::session::lifecycle::persist_session_with_redaction_custody(
+            db,
+            vault,
+            project_id,
+            project_root,
+            active_agent,
+        )
+        .await
+        .expect("custodied test session")
+    }
+
     #[tokio::test]
     async fn search_returns_ranked_threads_with_snippets() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
         // A sibling session in the same project with a matching message.
-        let other = ctx
-            .session
-            .db
-            .create_session(&ctx.session.project_id, "/x", "Build")
-            .await
-            .unwrap();
+        let other =
+            create_custodied_session(&ctx.session.db, &ctx.session.project_id, "/x", "Build").await;
         ctx.session
             .db
             .insert_session_event(
@@ -647,7 +665,7 @@ mod tests {
             .unwrap();
 
         let out = HistorySearchTool
-            .call(json!({ "query": "peregrine" }), &ctx)
+            .call(json!({ "scope": "past", "query": "peregrine" }), &ctx)
             .await
             .unwrap();
         assert!(out.content.contains(other.short_id.as_ref().unwrap()));
@@ -729,7 +747,12 @@ mod tests {
             .call(json!({ "query": "nothingmatchesthis" }), &ctx)
             .await
             .unwrap();
-        assert!(out.content.contains("No past sessions"));
+        assert!(
+            out.content
+                .contains("No accessible lineage history matches"),
+            "empty default-scope match must be a clean message: {}",
+            out.content
+        );
     }
 
     #[tokio::test]
@@ -749,7 +772,7 @@ mod tests {
             .await
             .unwrap();
         let out = HistorySearchTool
-            .call(json!({ "query": "wombat" }), &ctx)
+            .call(json!({ "scope": "past", "query": "wombat" }), &ctx)
             .await
             .unwrap();
         assert!(
@@ -763,12 +786,13 @@ mod tests {
     async fn dream_scoped_history_search_fences_hostile_source_snippets() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
-        let source = ctx
-            .session
-            .db
-            .create_session(&ctx.session.project_id, "/source", "Source")
-            .await
-            .unwrap();
+        let source = create_custodied_session(
+            &ctx.session.db,
+            &ctx.session.project_id,
+            "/source",
+            "Source",
+        )
+        .await;
         ctx.session
             .db
             .insert_session_event(
@@ -804,12 +828,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
         let secret = "target-session-history-secret";
-        let other = ctx
-            .session
-            .db
-            .create_session(&ctx.session.project_id, "/x", "Build")
-            .await
-            .unwrap();
+        let other =
+            create_custodied_session(&ctx.session.db, &ctx.session.project_id, "/x", "Build").await;
         ctx.session
             .db
             .insert_session_event(
@@ -832,7 +852,7 @@ mod tests {
         .unwrap();
 
         let found = HistorySearchTool
-            .call(json!({ "query": secret }), &ctx)
+            .call(json!({ "scope": "past", "query": secret }), &ctx)
             .await
             .unwrap();
         assert!(!found.content.contains(secret), "{}", found.content);
@@ -882,7 +902,7 @@ mod tests {
         assert!(lineage.content.contains("moonstone"), "{}", lineage.content);
 
         let cross_thread = HistorySearchTool
-            .call(json!({ "query": "moonstone" }), &ctx)
+            .call(json!({ "scope": "past", "query": "moonstone" }), &ctx)
             .await
             .unwrap();
         assert!(
@@ -898,12 +918,9 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
-        let other = ctx
-            .session
-            .db
-            .create_session("other-workspace", "/other", "Elsewhere")
-            .await
-            .unwrap();
+        let other =
+            create_custodied_session(&ctx.session.db, "other-workspace", "/other", "Elsewhere")
+                .await;
         ctx.session
             .db
             .insert_session_event(

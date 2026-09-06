@@ -1043,7 +1043,7 @@ impl Model {
                             // with no retry (layer-3 persist). Only after an
                             // actual swap, and only when we know where to write.
                             if approved_swap {
-                                self.confirm_wire_api_for_base_url(&base_url, endpoint);
+                                self.confirm_wire_api_for_routing(&base_url, endpoint);
                                 record_endpoint_observation(
                                     provider_id,
                                     model_id,

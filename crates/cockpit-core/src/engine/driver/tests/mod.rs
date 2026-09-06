@@ -173,6 +173,19 @@ async fn recovered_interactive_task_admission_replays_durable_seed_before_infere
             )
             .expect("scripted parent and child model"),
         );
+        Arc::make_mut(&mut driver.stack[0].agent).tools =
+            driver.stack[0].agent.tools.clone().with(Arc::new(
+                crate::tools::task::TaskTool::with_subagents(&["explore", "builder"]),
+            ));
+        driver.set_config_handle(
+            crate::daemon::session_worker::SessionConfigHandle::detached(
+                crate::daemon::session_worker::SessionConfigSnapshot::new(
+                    driver.config.generation(),
+                    config,
+                    test_extended_config(),
+                ),
+            ),
+        );
     }
 
     let session = driver.session.clone();
@@ -631,6 +644,20 @@ fn test_driver_with_url(max_schedules: usize, provider_url: String) -> (Driver, 
     test_driver_with_url_and_grant(max_schedules, provider_url, false)
 }
 
+fn test_extended_config() -> crate::config::extended::ExtendedConfig {
+    use cockpit_config::config::delegation_budget::{DelegationBudgetConfig, SpendLimit};
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.delegation_budget = DelegationBudgetConfig {
+        max_rounds: Some(SpendLimit::Unlimited),
+        max_input_tokens: Some(SpendLimit::Unlimited),
+        max_output_tokens: Some(SpendLimit::Unlimited),
+        max_cost_microusd: Some(SpendLimit::Unlimited),
+        max_wall_clock_secs: Some(SpendLimit::Unlimited),
+        ..DelegationBudgetConfig::default()
+    };
+    extended
+}
+
 fn test_driver_with_url_and_grant(
     max_schedules: usize,
     provider_url: String,
@@ -718,7 +745,7 @@ fn test_driver_with_url_and_grant(
             crate::daemon::session_worker::SessionConfigSnapshot::new(
                 0,
                 pcfg,
-                crate::config::extended::ExtendedConfig::default(),
+                test_extended_config(),
             ),
         ),
     );
@@ -866,6 +893,13 @@ fn learn_driver(
             "skills": {
                 "scan_dirs": [root.to_string_lossy()],
                 "write_approval": approval
+            },
+            "delegationBudget": {
+                "maxRounds": "unlimited",
+                "maxInputTokens": "unlimited",
+                "maxOutputTokens": "unlimited",
+                "maxCostMicrousd": "unlimited",
+                "maxWallClockSecs": "unlimited"
             },
             "active_model": {
                 "provider": "scripted",
@@ -2165,7 +2199,7 @@ fn inject_hooks(driver: &mut Driver, reg: crate::config::extended::hooks::HookRe
             crate::daemon::session_worker::SessionConfigSnapshot::with_hooks(
                 1,
                 crate::config::providers::ProvidersConfig::default(),
-                crate::config::extended::ExtendedConfig::default(),
+                test_extended_config(),
                 reg,
             ),
         ),
@@ -2488,7 +2522,7 @@ fn model_switch_driver() -> (Driver, tempfile::TempDir) {
             crate::daemon::session_worker::SessionConfigSnapshot::new(
                 0,
                 cfg,
-                crate::config::extended::ExtendedConfig::default(),
+                test_extended_config(),
             ),
         ),
     );

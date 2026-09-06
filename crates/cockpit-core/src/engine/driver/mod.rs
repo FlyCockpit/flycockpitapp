@@ -3579,12 +3579,34 @@ impl Driver {
     /// through the snapshot handle exactly as a worker re-resolution would.
     #[cfg(test)]
     pub(crate) fn refresh_config_from_disk_for_tests(&mut self) {
+        use cockpit_config::config::delegation_budget::{DelegationBudgetConfig, SpendLimit};
+
         let cwd = self.cwd.clone();
         let generation = self.config.generation().saturating_add(1);
-        self.set_config_handle(
+        let handle =
             crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests_at_generation(
                 &cwd, generation,
-            ),
+            );
+        let mut snapshot = (*handle.snapshot()).clone();
+        let previous = self.config.snapshot();
+        if snapshot.providers.providers.is_empty() && !previous.providers.providers.is_empty() {
+            snapshot.providers = previous.providers.clone();
+            snapshot.provider_model_sources = previous.provider_model_sources.clone();
+        }
+        if snapshot.extended.delegation_budget.is_empty()
+            && snapshot.extended.max_primary_rounds == 0
+        {
+            snapshot.extended.delegation_budget = DelegationBudgetConfig {
+                max_rounds: Some(SpendLimit::Unlimited),
+                max_input_tokens: Some(SpendLimit::Unlimited),
+                max_output_tokens: Some(SpendLimit::Unlimited),
+                max_cost_microusd: Some(SpendLimit::Unlimited),
+                max_wall_clock_secs: Some(SpendLimit::Unlimited),
+                ..DelegationBudgetConfig::default()
+            };
+        }
+        self.set_config_handle(
+            crate::daemon::session_worker::SessionConfigHandle::detached(snapshot),
         );
     }
 

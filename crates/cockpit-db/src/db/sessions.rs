@@ -2639,6 +2639,11 @@ impl Db {
             params![session_id.to_string(), predecessor_session_id.to_string()],
         )
         .context("moving session-scoped sealed records onto compaction successor")?;
+        conn.execute(
+            "UPDATE sealed_values SET session_id = ?1 WHERE session_id = ?2",
+            params![session_id.to_string(), predecessor_session_id.to_string()],
+        )
+        .context("moving legacy sealed values onto compaction successor")?;
         {
             let grants: Vec<(
                 String,

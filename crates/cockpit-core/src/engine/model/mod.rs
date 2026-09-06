@@ -450,6 +450,9 @@ pub(crate) fn has_retained_native_computer_items() -> bool {
 pub struct LiveWireApiState {
     explicit: bool,
     session_confirmed: HashMap<String, crate::config::providers::WireApi>,
+    /// Endpoints confirmed by a successful in-session endpoint-recovery swap.
+    /// Manual/test confirmations populate `session_confirmed` only.
+    session_routing_confirmed: HashMap<String, crate::config::providers::WireApi>,
 }
 
 impl LiveWireApiState {
@@ -457,6 +460,7 @@ impl LiveWireApiState {
         Self {
             explicit,
             session_confirmed: HashMap::new(),
+            session_routing_confirmed: HashMap::new(),
         }
     }
 }
@@ -1272,6 +1276,12 @@ impl Model {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             fresh_state.explicit
         };
+        let donor_explicit = {
+            let donor_state = donor_live_wire_api
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            donor_state.explicit
+        };
         {
             let mut donor_state = donor_live_wire_api
                 .lock()
@@ -1279,6 +1289,23 @@ impl Model {
             donor_state.explicit = explicit;
         }
         *fresh_live_wire_api = donor_live_wire_api.clone();
+        if !explicit && !donor_explicit {
+            let base_url = {
+                let Model::OpenAi { client, .. } = &self else {
+                    return self;
+                };
+                client.base_url().to_string()
+            };
+            let confirmed = self.confirmed_wire_api_for_base_url(&base_url);
+            let Model::OpenAi { wire_api, .. } = &mut self else {
+                return self;
+            };
+            if !wire_api.is_auto() {
+                if let Some(confirmed) = confirmed {
+                    *wire_api = confirmed;
+                }
+            }
+        }
         self
     }
 
@@ -1287,11 +1314,26 @@ impl Model {
         base_url: &str,
     ) -> crate::config::providers::WireApi {
         match self {
-            Model::OpenAi { wire_api, .. } => {
-                if let Some(confirmed) = self.confirmed_wire_api_for_base_url(base_url) {
-                    return confirmed;
+            Model::OpenAi {
+                provider_id,
+                model_id,
+                wire_api,
+                ..
+            } => {
+                if self.is_live_wire_api_explicit() && !wire_api.is_auto() {
+                    return *wire_api;
+                }
+                if !self.is_live_wire_api_explicit() {
+                    if let Some(confirmed) = self.routing_wire_api_for_base_url(base_url) {
+                        return confirmed;
+                    }
                 }
                 if wire_api.is_auto() {
+                    if let Some(learned) =
+                        wire::learned_working_endpoint(provider_id, model_id, base_url)
+                    {
+                        return learned;
+                    }
                     crate::config::providers::WireApi::Completions
                 } else {
                     *wire_api
@@ -1329,6 +1371,21 @@ impl Model {
             .copied()
     }
 
+    pub(crate) fn routing_wire_api_for_base_url(
+        &self,
+        base_url: &str,
+    ) -> Option<crate::config::providers::WireApi> {
+        let Model::OpenAi { live_wire_api, .. } = self else {
+            return None;
+        };
+        live_wire_api
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .session_routing_confirmed
+            .get(&normalize_probe_base_url(base_url))
+            .copied()
+    }
+
     pub(crate) fn confirm_wire_api_for_base_url(
         &self,
         base_url: &str,
@@ -1340,10 +1397,29 @@ impl Model {
         if endpoint.is_auto() {
             return;
         }
+        let mut state = live_wire_api
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = normalize_probe_base_url(base_url);
+        state.session_confirmed.insert(key, endpoint);
+    }
+
+    pub(crate) fn confirm_wire_api_for_routing(
+        &self,
+        base_url: &str,
+        endpoint: crate::config::providers::WireApi,
+    ) {
+        self.confirm_wire_api_for_base_url(base_url, endpoint);
+        let Model::OpenAi { live_wire_api, .. } = self else {
+            return;
+        };
+        if endpoint.is_auto() {
+            return;
+        }
         live_wire_api
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .session_confirmed
+            .session_routing_confirmed
             .insert(normalize_probe_base_url(base_url), endpoint);
     }
 

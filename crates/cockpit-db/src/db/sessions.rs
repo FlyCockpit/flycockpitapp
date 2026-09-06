@@ -2785,6 +2785,39 @@ impl Db {
         Ok(get_session_inner(conn, session_id)?)
     }
 
+    /// Follow a linear compaction chain from `session_id` to the live window.
+    /// Returns the durable row for the active successor when the requested
+    /// session was ended by compaction.
+    pub fn resolve_live_compaction_session_conn(
+        conn: &Connection,
+        session_id: Uuid,
+    ) -> Result<Option<SessionRow>> {
+        let mut current_id = session_id;
+        let mut row = get_session_inner(conn, current_id)?;
+        while let Some(current) = row {
+            if current.ended_at_unix_ms.is_none() {
+                return Ok(Some(current));
+            }
+            let successor_id: Option<Uuid> = conn
+                .query_row(
+                    "SELECT session_id FROM sessions
+                      WHERE compaction_predecessor_session_id = ?1",
+                    [current_id.to_string()],
+                    |row| parse_uuid(&row.get::<_, String>(0)?),
+                )
+                .optional()
+                .context("reading compaction successor for live window resolution")?;
+            match successor_id {
+                Some(successor_id) => {
+                    current_id = successor_id;
+                    row = get_session_inner(conn, current_id)?;
+                }
+                None => return Ok(Some(current)),
+            }
+        }
+        Ok(None)
+    }
+
     /// Compare-and-swap the durable session active model. Succeeds only when
     /// `active_model_revision` still equals `expected_revision`, then advances
     /// the revision by one. Returns `Ok(true)` on success, `Ok(false)` on a

@@ -832,17 +832,19 @@ impl Session {
         vault: Arc<crate::secure_key::SecretVault>,
         allow_unbound_test_fixture_project_id: bool,
     ) -> Result<Option<Self>> {
+        let requested_id = session_id;
         let Some(row) = db
             .blocking_write_for_sync_maintenance(move |conn| {
-                crate::db::Db::get_session_conn(conn, session_id)
+                crate::db::Db::resolve_live_compaction_session_conn(conn, requested_id)
             })
             .context("fetching test session")?
         else {
             return Ok(None);
         };
+        let live_id = row.session_id;
         let (project_root, initialize_workspace_scratch) =
             Self::test_workspace_root(PathBuf::from(&row.project_root));
-        Ok(Some(Self::from_row(
+        let mut session = Self::from_row(
             db,
             project_root,
             row,
@@ -851,7 +853,15 @@ impl Session {
             false,
             initialize_workspace_scratch,
             allow_unbound_test_fixture_project_id,
-        )?))
+        )?;
+        if live_id != session_id {
+            session.id = session_id;
+            *session
+                .live_id
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = live_id;
+        }
+        Ok(Some(session))
     }
 
     /// Create a brand-new session, inserting its row in the DB.
@@ -1231,25 +1241,27 @@ impl Session {
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Option<Self>> {
+        let requested_id = session_id;
         let Some(row) = db
             .blocking_write_for_sync_maintenance(move |conn| {
-                crate::db::Db::get_session_conn(conn, session_id)
+                crate::db::Db::resolve_live_compaction_session_conn(conn, requested_id)
             })
             .context("fetching session")?
         else {
             return Ok(None);
         };
+        let live_id = row.session_id;
         let project_root = PathBuf::from(&row.project_root);
-        Ok(Some(Self::from_row(
-            db,
-            project_root,
-            row,
-            resolver,
-            vault,
-            false,
-            true,
-            false,
-        )?))
+        let mut session =
+            Self::from_row(db, project_root, row, resolver, vault, false, true, false)?;
+        if live_id != session_id {
+            session.id = session_id;
+            *session
+                .live_id
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = live_id;
+        }
+        Ok(Some(session))
     }
 
     fn from_row(

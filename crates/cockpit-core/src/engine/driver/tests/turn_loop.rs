@@ -28,7 +28,7 @@ async fn insert_pending_assistant_inbox_item(driver: &Driver, delivery: &str, su
         )
         .await
         .unwrap();
-    let main_session_id = driver.session.id;
+    let main_session_id = driver.session.live_id();
     let source_session_id = source.session_id;
     let delivery = delivery.to_owned();
     let summary = summary.to_owned();
@@ -570,6 +570,7 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
     let run =
         tokio::spawn(async move { driver.run_main_loop(run_queue, control_rx, &run_tx).await });
 
+    tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_millis(250)).await;
     for _ in 0..100 {
         if provider_posts(&provider).len() == 1 {

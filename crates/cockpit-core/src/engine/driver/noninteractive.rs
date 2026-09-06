@@ -12169,6 +12169,25 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                     continue 'turns;
                 }
                 let pending = std::mem::take(&mut pending_computer_continuations);
+                scheduled_lane_driver.repin_config_for_turn();
+                match scheduled_lane_driver.build_live_model_for_running(
+                    &agent.model,
+                    agent.model.provider_id(),
+                    agent.model.model_id_ref(),
+                ) {
+                    Ok(refreshed) => {
+                        let mut refreshed_agent = (*agent).clone();
+                        refreshed_agent.model = Arc::new(refreshed);
+                        agent = Arc::new(refreshed_agent);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            agent = %agent.name,
+                            "refreshing noninteractive model from config failed"
+                        );
+                    }
+                }
                 let mut turn_agent =
                     super::computer_native::with_live_loop_native_computer_geometry(
                         agent.as_ref().clone(),

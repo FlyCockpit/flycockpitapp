@@ -14939,7 +14939,15 @@ mod tests {
                 "call-batch-widget-upgrade",
                 &[
                     OpenAiComputerAction::TypeText("user".to_string()),
-                    OpenAiComputerAction::TypeText("secret".to_string()),
+                    // The payload must stay secret-shape-free so the
+                    // authorization-time class for this item is
+                    // `StateChanging` and the fence below is exercised by the
+                    // WIDGET upgrade alone: since #286 the shared
+                    // secret-shape fence (which includes credential words)
+                    // classifies a credential-shaped payload as
+                    // `CredentialEntry` even in a plain text field, which
+                    // would mask the widget-class change this test observes.
+                    OpenAiComputerAction::TypeText("banana".to_string()),
                 ],
             )
             .await;

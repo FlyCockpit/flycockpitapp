@@ -455,6 +455,16 @@ async fn call_bash_inner(
             write_denied_knowledge_paths.push(root);
         }
     }
+    // The assistant's implicit knowledge tree is governed by the assistant
+    // identity layer (SOUL.md/USER.md authority plus the identity shell
+    // gate), not by this configured-KB write fence. Keep its root out of the
+    // fence list so an assistant session's dynamic shell writes reach the
+    // identity gate instead of the blanket dynamic-target refusal.
+    if let Some(assistant_root) =
+        crate::knowledge::assistant_local_knowledge_root(&ctx.session).await
+    {
+        write_denied_knowledge_paths.retain(|root| root != &assistant_root);
+    }
     if let Some(message) =
         refuse_configured_knowledge_shell_writes(command, &cwd, &write_denied_knowledge_paths)
     {

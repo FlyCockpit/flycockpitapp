@@ -476,10 +476,12 @@ fn build_def() -> AgentDef {
             "search",
             "change_impact",
             "lsp",
-            // write/lock set (arbitrated by the lock authority)
+            // write/lock set (arbitrated by the lock authority). The def-layer
+            // coding surfaces deliberately omit `delete` (bash covers removal);
+            // see `build_def_tool_set_unchanged_by_defensive_role` and
+            // `defensive_role_def_covers_every_build_tool_by_grant_or_discovery`.
             "write",
             "edit",
-            "delete",
             "unlock",
             "schedule",
             "question",

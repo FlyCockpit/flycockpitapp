@@ -2006,13 +2006,19 @@ mod approval_mode_tests {
             approver.approval_mode(),
             crate::config::extended::ApprovalMode::Yolo
         );
+        // External MCP tool invokes deliberately require an explicit durable
+        // approval even in Yolo mode ("Require approval for external MCP
+        // tools", pinned by `external_mcp_invoke_prompts_in_yolo_mode` in
+        // `mcp::sandbox`). The custom-tool gate still follows the approval
+        // ladder, so it is the observable that proves the shared mode has an
+        // effect on this approver.
         assert_eq!(
             approver
-                .approve_mcp_tool(
-                    "untrusted",
-                    "run",
+                .approve_custom_tool_inner(
+                    "webfetch",
+                    "curl",
                     &serde_json::json!({"query": "x"}),
-                    &serde_json::json!({"endpoint": "https://example.invalid/mcp"}),
+                    tmp.path(),
                 )
                 .await
                 .unwrap(),

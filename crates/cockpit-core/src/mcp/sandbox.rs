@@ -2794,7 +2794,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("configured local knowledge base with a filesystem fence"),
+                .contains("contains a local knowledge base with a filesystem fence"),
             "{error}"
         );
         assert!(

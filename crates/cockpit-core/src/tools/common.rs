@@ -104,11 +104,12 @@ pub(crate) fn drop_front_margin<'a>(
     }
     let margin = max_match - 1;
     if margin >= seg.len() {
-        let cut = table.straddle_fixpoint_cut(seg, 0);
-        if cut >= seg.len() {
-            return "";
-        }
-        return &seg[cut..];
+        // The whole segment lies inside the unsafe margin: fail closed (issue
+        // #294). The fixpoint cut is a no-op at offset 0 (no occurrence can
+        // straddle a cut it cannot start before), so retaining any of `seg`
+        // would leak a boundary partial that the downstream whole-value scrub
+        // cannot match.
+        return "";
     }
     let cut = table.straddle_fixpoint_cut(seg, margin);
     if cut >= seg.len() {
@@ -130,11 +131,11 @@ pub(crate) fn drop_back_margin<'a>(table: &crate::redact::RedactionTable, seg: &
     }
     let margin = max_match - 1;
     if margin >= seg.len() {
-        let cut = table.straddle_fixpoint_cut_back(seg, seg.len());
-        if cut == 0 {
-            return "";
-        }
-        return &seg[..cut];
+        // The whole segment lies inside the unsafe margin: fail closed (issue
+        // #294). The back fixpoint cut is a no-op at `seg.len()` (no occurrence
+        // can end past the end), so retaining any of `seg` would leak a
+        // boundary partial that the downstream whole-value scrub cannot match.
+        return "";
     }
     let start = seg.len() - margin;
     let cut = table.straddle_fixpoint_cut_back(seg, start);

@@ -438,13 +438,14 @@ pub fn validate_invariants(def: &AgentDef) -> Result<()> {
         }
     }
     if let Some(vnext) = &def.vnext {
-        // Host/session tool-tier overrides still apply to launch-v1 definitions;
-        // validate them before the closed schema gate so illegal placements
-        // cannot bypass the legacy tier rules via the vnext early return.
-        validate_tool_tier_overrides(def)?;
         // launch-v1 declarations are deliberately authority-free. Their own closed
         // schema is the only applicable definition-level invariant; legacy
-        // tool/role checks below must not accidentally reinterpret them.
+        // tool/role checks below must not accidentally reinterpret them
+        // (their ignored legacy `tools:`/`tool_tiers` fields are not author
+        // authority). Host-projected surfaces are still checked against every
+        // legacy grant rule via the legacy clone in
+        // `agents::validate_host_tool_surface`, so illegal placements cannot
+        // bypass those rules through the host override path.
         return vnext.validate();
     }
     def.goal_supervision.validate()?;

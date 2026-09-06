@@ -97,8 +97,11 @@ impl Tool for HarnessListTool {
             .as_deref()
             .map(|raw| normalize_harness_selector(raw, &ctx.config))
             .transpose()?;
-        require_workspace_trust_for_harness_spawn()?;
+        // The local-KB fence runs before the workspace-trust gate so a
+        // configured knowledge base is refused on its own terms even when the
+        // trust policy is not yet resolved for the session.
         ensure_harness_cannot_reach_local_knowledge_bases(ctx).await?;
+        require_workspace_trust_for_harness_spawn()?;
         // Listing can launch each configured harness's auth probe, and a
         // refresh launches its model-list command. Keep direct callers from
         // bypassing the dispatcher fence and handing an ambient filesystem
@@ -377,8 +380,11 @@ impl Tool for HarnessInvokeTool {
         };
 
         let cwd = ctx.cwd.clone();
-        require_workspace_trust_for_harness_spawn()?;
+        // The local-KB fence runs before the workspace-trust gate so a
+        // configured knowledge base is refused on its own terms even when the
+        // trust policy is not yet resolved for the session.
         ensure_harness_cannot_reach_local_knowledge_bases(ctx).await?;
+        require_workspace_trust_for_harness_spawn()?;
         // The dispatcher normally applies this fence, but direct tool callers
         // must not be able to hand ambient filesystem access to a harness.
         crate::knowledge::ensure_workspace_tool_access(ctx, self.name())
@@ -703,7 +709,7 @@ async fn ensure_harness_cannot_reach_local_knowledge_bases(ctx: &ToolCtx) -> Res
         return Ok(());
     }
     Err(invalid_input(
-        "external harnesses are unavailable while local knowledge bases are configured because their subprocesses do not have OS-enforced knowledge-base confinement",
+        "external harnesses are unavailable while local knowledge bases are configured because their subprocesses do not have OS-enforced knowledge-base confinement; attached knowledge bases are read-only and cannot be delegated to an external process",
     ))
 }
 

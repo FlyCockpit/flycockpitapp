@@ -1039,6 +1039,22 @@ impl Approver {
             .await;
             return Ok(decision);
         }
+        if self
+            .store
+            .any_mcp_tool_allow_for_server(agent, profile, server)
+            .await?
+        {
+            let decision = Decision::Allow { scope: Scope::Once };
+            self.record_permission_decision(
+                "mcp_server_connect",
+                &target,
+                &offered,
+                decision,
+                DecisionSource::AlreadyGranted,
+            )
+            .await;
+            return Ok(decision);
+        }
         if self.yolo_mode()
             || self
                 .auto_allows(crate::agent_tree::HostEffectClass::ExternalAction, &target)

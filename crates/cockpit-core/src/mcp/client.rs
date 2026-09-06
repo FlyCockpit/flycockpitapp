@@ -36,6 +36,10 @@ pub struct McpConnectContext {
     credential_profile: String,
     agent_id: String,
     agent_bound: bool,
+    /// When true, discovery-only catalog paths may list tools without a
+    /// separate server-connect approval prompt. Invoke and other concrete
+    /// host effects still require connect authorization.
+    skip_connect_approval: bool,
     /// A local-KB filesystem-fence decision captured from the live tool context. It
     /// is checked before any configured MCP connection can initialize a
     /// server, enumerate its tools, or issue a tools/call request.
@@ -55,6 +59,7 @@ impl Default for McpConnectContext {
             credential_profile: crate::mcp::config::DEFAULT_PROFILE.to_string(),
             agent_id: String::new(),
             agent_bound: false,
+            skip_connect_approval: false,
             host_access_denial: None,
         }
     }
@@ -76,12 +81,18 @@ impl McpConnectContext {
             credential_profile: crate::mcp::config::DEFAULT_PROFILE.to_string(),
             agent_id: ctx.agent_id.clone(),
             agent_bound: false,
+            skip_connect_approval: false,
             // The complete KB registry includes the asynchronously resolved
             // assistant source. Assistant sessions are conservatively fenced
             // here too, while the async dispatcher adds the exact root before
             // any host process is reached.
             host_access_denial: crate::knowledge::configured_mcp_host_access_denial(ctx),
         }
+    }
+
+    pub fn for_discovery(mut self) -> Self {
+        self.skip_connect_approval = true;
+        self
     }
 
     pub fn with_profile(mut self, profile: impl Into<String>) -> Self {
@@ -120,7 +131,7 @@ impl McpConnectContext {
     }
 
     async fn authorize_connect(&self, name: &str, cfg: &ServerConfig) -> Result<()> {
-        if matches!(self.approval_mode, ApprovalMode::Yolo) {
+        if self.skip_connect_approval || matches!(self.approval_mode, ApprovalMode::Yolo) {
             return Ok(());
         }
         let Some(approver) = self.approver.as_ref() else {
@@ -151,6 +162,7 @@ impl McpConnectContext {
     pub(crate) fn yolo_for_tests() -> Self {
         Self {
             approval_mode: ApprovalMode::Yolo,
+            skip_connect_approval: true,
             ..Self::default()
         }
     }

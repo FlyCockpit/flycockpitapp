@@ -1393,7 +1393,7 @@ async fn wait_for_shared_daemon(
     let mut backoff = Duration::from_millis(2);
 
     loop {
-        if crate::daemon::server::in_process_context(socket).is_some() || socket.exists() {
+        if daemon_transport_ready(socket) {
             // A connect error just means the socket exists but accept hasn't
             // started yet — fall through to the backoff retry. A registered
             // in-process owner hellos here without an OS socket.
@@ -1415,6 +1415,18 @@ async fn wait_for_shared_daemon(
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_millis(50));
     }
+}
+
+fn daemon_transport_ready(socket: &Path) -> bool {
+    if crate::daemon::server::in_process_context(socket).is_some() {
+        return true;
+    }
+    if let Ok(canonical) = crate::daemon::DaemonPaths::resolve_canonical() {
+        if canonical.socket == socket {
+            return crate::daemon::canonical_socket_endpoint_published(socket);
+        }
+    }
+    socket.exists()
 }
 
 #[cfg(test)]

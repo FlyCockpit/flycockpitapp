@@ -273,6 +273,18 @@ fn read_endpoint_record(canonical: &DaemonPaths) -> Option<DaemonEndpointRecord>
     read_published_endpoint_record_from(&configured_path, canonical)
 }
 
+/// True when a persistent canonical owner has published its endpoint for `socket`.
+pub fn canonical_socket_endpoint_published(socket: &Path) -> bool {
+    let canonical = match DaemonPaths::resolve_canonical() {
+        Ok(paths) => paths,
+        Err(_) => return false,
+    };
+    if canonical.socket != socket {
+        return false;
+    }
+    read_endpoint_record(&canonical).is_some()
+}
+
 fn read_endpoint_record_from(path: &Path) -> Option<DaemonEndpointRecord> {
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
@@ -2092,6 +2104,8 @@ async fn run_foreground_inner_with_boot_db(
         };
     }
     boot_dbg!("entry");
+    #[cfg(not(test))]
+    crate::daemon::server::begin_early_keyring_probe();
     // The global config layer belongs to the user, not the workspace. Make it
     // durable and writable before a persistent daemon can accept onboarding
     // work. Ephemeral diagnostic owners (notably `cockpit doctor`) stay
@@ -2208,6 +2222,7 @@ async fn run_foreground_inner_with_boot_db(
         write_endpoint_record(&paths)?;
     }
     timer.phase("bind_publish");
+    server::spawn_deferred_boot_maintenance(ctx.clone());
 
     // Signal task: SIGINT/SIGTERM (or Ctrl-C / console-close on Windows)
     // route into the single graceful-shutdown path. The **first** signal

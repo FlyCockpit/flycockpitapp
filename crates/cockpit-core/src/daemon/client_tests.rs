@@ -18,7 +18,7 @@ fn ephemeral_spawn_arms_raii_before_the_first_wait() {
         .map(|offset| spawn + offset)
         .expect("provisional owner armed after spawn");
     let wait = source[spawn..]
-        .find("wait_for_daemon(&paths.socket).await")
+        .find("wait_for_owned_daemon(&paths.socket, pid).await")
         .map(|offset| spawn + offset)
         .expect("daemon readiness wait");
     assert!(

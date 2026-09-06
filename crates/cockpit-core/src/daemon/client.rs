@@ -1244,7 +1244,7 @@ async fn probe_or_spawn_with_spawn_authorization(
     // Wait for the socket + a successful handshake. In-process auto-promote
     // returns above after a registered-owner hello; this wait is only for
     // a spawned child (or an in-process attach that already published).
-    let client = wait_for_daemon(&paths.socket).await?;
+    let client = wait_for_owned_daemon(&paths.socket, pid).await?;
     if let Some(guard) = provisional_ephemeral_guard.as_ref() {
         guard.bind_published_receipt()?;
         guard.disarm();
@@ -1284,7 +1284,7 @@ async fn attach_running_with_skew_check(
     match crate::daemon::skew_restart::restart_skewed_daemon_if_idle(&paths).await {
         Ok(crate::daemon::skew_restart::SkewRestartOutcome::Restarted { pid, reason }) => {
             tracing::info!(pid, "daemon version skew auto-restart completed");
-            let client = wait_for_daemon(&paths.socket).await?;
+            let client = wait_for_owned_daemon(&paths.socket, pid).await?;
             return Ok(ConnectedDaemon {
                 endpoint: local_daemon_endpoint(&paths.socket),
                 client,
@@ -1369,14 +1369,41 @@ enum SharedWaitError {
     Wedged,
 }
 
-/// Poll for the daemon socket and an actual DaemonStatus response.
-/// 2ms initial backoff, doubling up to a 50ms ceiling; total cap 30s.
-async fn wait_for_daemon(socket: &Path) -> Result<DaemonClient> {
-    match wait_for_shared_daemon(socket, None).await {
-        Ok(client) => Ok(client),
-        Err(SharedWaitError::Released | SharedWaitError::Wedged) => {
-            anyhow::bail!("timed out waiting for daemon at {}", socket.display())
+/// Wait for a daemon process this caller spawned (or whose replacement spawn
+/// this caller owns). Completion is signalled two ways: the socket answers a
+/// `DaemonStatus` handshake, or the child exits. A live child is making
+/// progress by definition — boot cost is unbounded on a loaded machine, so the
+/// wait carries no wall-clock budget; a dead child can never become ready and
+/// fails immediately. The detached child cannot be reaped here, so liveness is
+/// the only available completion signal for the failure case.
+async fn wait_for_owned_daemon(socket: &Path, pid: u32) -> Result<DaemonClient> {
+    let mut timer = crate::startup::PhaseTimer::start("wait_for_daemon");
+    // A freshly-spawned daemon child binds and starts accepting quickly when
+    // the machine is idle; ramp from 2ms to a 50ms ceiling so a slow spawn
+    // does not busy-spin.
+    let mut backoff = Duration::from_millis(2);
+    loop {
+        if crate::daemon::server::in_process_context(socket).is_some() || socket.exists() {
+            // A connect error just means the socket exists but accept hasn't
+            // started yet — fall through to the backoff retry.
+            if let Ok(client) = connect_local_daemon(socket).await {
+                // Sanity check — first request after connect.
+                if client.request_ok(Request::DaemonStatus).await.is_ok() {
+                    timer.phase("spawn_to_ready");
+                    timer.done();
+                    return Ok(client);
+                }
+            }
         }
+        if !cockpit_host::daemon_lifecycle::process_exists(pid) {
+            anyhow::bail!(
+                "spawned daemon process {} exited before publishing its socket at {}",
+                pid,
+                socket.display()
+            );
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_millis(50));
     }
 }
 

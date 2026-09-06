@@ -1083,6 +1083,23 @@ pub fn restart_release_timeout(grace_secs: Option<u64>) -> Duration {
     drain.saturating_add(RESTART_RELEASE_CLEANUP_GRACE)
 }
 
+/// Wait for a stopping/restarting previous owner to release its pid receipt
+/// and socket, using explicit completion signals instead of a wall-clock
+/// budget.
+///
+/// Shutdown cost is unbounded on a loaded machine (drain commits fsync on
+/// every durable write), so a fixed deadline only converts slow machines
+/// into failed restarts. The signals are:
+///
+/// * the metadata (pid receipt, socket, boot lock) is released — done;
+/// * the previous owner process is alive — it is still draining; keep
+///   waiting. Its own shutdown watchdog bounds the drain (grace then
+///   forced), so liveness is a safe progress signal;
+/// * the previous owner process is dead — its metadata can no longer
+///   change, so the released state is final right now.
+///
+/// `timeout` bounds only the degenerate call without a known previous pid
+/// (no liveness signal available). Callers with `expected_pid` never hit it.
 pub async fn wait_for_restart_release(
     paths: &DaemonPaths,
     expected_pid: Option<u32>,
@@ -1093,8 +1110,18 @@ pub async fn wait_for_restart_release(
         if restart_metadata_released(paths, expected_pid) {
             return true;
         }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
+        match expected_pid {
+            Some(pid) => {
+                if !cockpit_host::daemon_lifecycle::process_exists(pid) {
+                    // The previous owner is gone; its metadata is final.
+                    return restart_metadata_released(paths, expected_pid);
+                }
+            }
+            None => {
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+            }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

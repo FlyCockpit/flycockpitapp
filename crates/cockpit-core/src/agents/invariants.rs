@@ -438,6 +438,7 @@ pub fn validate_invariants(def: &AgentDef) -> Result<()> {
         }
     }
     if let Some(vnext) = &def.vnext {
+        validate_tool_tier_overrides(def)?;
         // launch-v1 declarations are deliberately authority-free. Their own closed
         // schema is the only applicable definition-level invariant; legacy
         // tool/role checks below must not accidentally reinterpret them

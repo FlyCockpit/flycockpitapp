@@ -2638,6 +2638,19 @@ fn rebuild_history(
                                 crate::engine::tool::CanonicalToolResultContents::new(parts).ok()
                             })
                             .and_then(|parts| parts.to_rig_contents().ok());
+                        let model_canonical_result = ev
+                            .data
+                            .get("model_canonical_output")
+                            .and_then(|value| {
+                                serde_json::from_value::<
+                                    Vec<crate::typed_media_result::CanonicalToolResultContent>,
+                                >(value.clone())
+                                .ok()
+                            })
+                            .and_then(|parts| {
+                                crate::engine::tool::CanonicalToolResultContents::new(parts).ok()
+                            })
+                            .and_then(|parts| parts.to_rig_contents().ok());
                         let projection_required = ev
                             .data
                             .get("model_projection_required")
@@ -2649,7 +2662,7 @@ fn rebuild_history(
                             .and_then(serde_json::Value::as_str)
                             .map(|text| vec![ToolResultContent::text(text.to_string())]);
                         let result_content = if projection_required {
-                            canonical_text.or(canonical_result)
+                            model_canonical_result.or(canonical_text)
                         } else if !tc.output.is_empty() {
                             Some(vec![ToolResultContent::text(tc.output.clone())])
                         } else {

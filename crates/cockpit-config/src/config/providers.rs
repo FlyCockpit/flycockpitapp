@@ -3403,7 +3403,9 @@ impl ProvidersConfig {
             return false;
         };
         if let Some(model_entry) = entry.models.iter().find(|m| m.id == model) {
-            if !model_entry.wire_api.is_auto() {
+            if model_entry.wire_api_provenance.is_user_configured()
+                && !model_entry.wire_api.is_auto()
+            {
                 return true;
             }
         }

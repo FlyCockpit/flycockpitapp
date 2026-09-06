@@ -5655,12 +5655,16 @@ pub(crate) mod tests {
             );
         }
 
+        // `delete` is deliberately absent from the def-based Build surface: no
+        // embedded coding def grants it (bash covers removal), and the def
+        // snapshot plus the Careful small-surface coverage invariant in
+        // `agents::builtin_defs` tests pin `build_def` without it. This
+        // supersedes the earlier factory-mirroring expectation for `delete`.
         for tool in [
             "read",
             "bash",
             "write",
             "edit",
-            "delete",
             "unlock",
             "search",
             "code",

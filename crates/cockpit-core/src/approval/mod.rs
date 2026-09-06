@@ -1004,14 +1004,12 @@ pub(crate) fn decode_option_response(
     let Some(option) = ApprovalOptionId::from_str(id) else {
         return Err(ForeignOptionId::new(set, id));
     };
-    let option = if option == ApprovalOptionId::ApproveOnce
-        && !set.contains(option)
-        && set.contains(ApprovalOptionId::Approve)
-    {
-        ApprovalOptionId::Approve
-    } else {
-        option
-    };
+    // No blanket normalization here: a globally known id is not authority for
+    // a different approval set, so `approve_once` stays foreign to wrapper
+    // sets that only offer `approve`. Wrapper prompts that must accept a
+    // legacy `approve_once` answer normalize at the offered-prompt seam
+    // (`normalize_selected_id_for_offered_prompt`), which checks the actual
+    // offered options.
     if !set.contains(option) {
         return Err(ForeignOptionId::new(set, id));
     }

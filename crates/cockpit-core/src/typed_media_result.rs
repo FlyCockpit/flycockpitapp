@@ -637,7 +637,12 @@ impl<'a> MediaReferenceResolver<'a> {
                     && lease.canonical_project_digest == self.auth.canonical_project_digest
                     && lease.component.sha256 == reference.checksum
                     && lease.component.byte_length == reference.byte_count
-                    && lease.lease_purpose == "model"
+                    // `Db::acquire_media_component_lease_conn` stamps model
+                    // leases with the schema-legal `model_input` purpose (the
+                    // `media_attachment_component_leases` CHECK constraint
+                    // only allows 'preview'/'model_input'); `image_generation`
+                    // checks the same spelling.
+                    && lease.lease_purpose == "model_input"
             });
         self.resolve_checked(reference, live, route, tool_call_id, call_id, lease_valid)
     }

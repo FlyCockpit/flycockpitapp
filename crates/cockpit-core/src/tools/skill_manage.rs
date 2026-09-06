@@ -572,9 +572,22 @@ mod tests {
             verification: None,
         };
         let task_ctx = ctx.clone_for_dispatch();
+        // Task-local state (the workspace trust policy) does not cross
+        // `tokio::spawn`; re-scope the trusted policy inside the spawned
+        // task so the tool call sees the same trust decision the outer
+        // test scope established and reaches the approval park instead of
+        // failing closed on an unresolved policy.
+        let trust_policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(&task_ctx.cwd).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
         let task = tokio::spawn(async move {
             crate::engine::interrupt::with_interrupt_park_payload(payload, async {
-                SkillManageTool.call(args, &task_ctx).await
+                crate::config::trust::scope_workspace_trust_policy(
+                    trust_policy,
+                    SkillManageTool.call(args, &task_ctx),
+                )
+                .await
             })
             .await
         });
@@ -1377,9 +1390,19 @@ mod tests {
             };
             let task_ctx = ctx.clone_for_dispatch();
             let task_args = args.clone();
+            // Task-local trust policy does not cross `tokio::spawn`; re-scope
+            // it inside the spawned task (see `assert_parks_without_writing`).
+            let trust_policy = crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(&task_ctx.cwd).unwrap(),
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            };
             let task = tokio::spawn(async move {
                 crate::engine::interrupt::with_interrupt_park_payload(payload, async {
-                    SkillManageTool.call(task_args, &task_ctx).await
+                    crate::config::trust::scope_workspace_trust_policy(
+                        trust_policy,
+                        SkillManageTool.call(task_args, &task_ctx),
+                    )
+                    .await
                 })
                 .await
             });

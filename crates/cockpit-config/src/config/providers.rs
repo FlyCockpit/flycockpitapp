@@ -2363,7 +2363,8 @@ impl ProviderEntry {
         if !self.wire_api.is_auto() {
             return self.wire_api;
         }
-        default_wire_api_for_template(self.effective_template(provider_id))
+        let template = self.effective_template(provider_id).unwrap_or(provider_id);
+        default_wire_api_for_template(Some(template))
     }
 
     /// Whether this entry is GitHub Copilot, including renamed connections.

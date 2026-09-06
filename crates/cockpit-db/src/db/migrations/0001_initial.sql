@@ -1499,7 +1499,7 @@ CREATE INDEX idx_tce_project_ts ON tool_call_events (project_id, timestamp);
 CREATE INDEX idx_tce_model_ts   ON tool_call_events (model, timestamp);
 CREATE INDEX idx_tce_tool_ts    ON tool_call_events (tool, timestamp);
 CREATE INDEX idx_tce_lang_ts    ON tool_call_events (language, timestamp);
-CREATE UNIQUE INDEX uq_tce_session_call ON tool_call_events(session_id, call_id);
+CREATE INDEX idx_tce_session_call ON tool_call_events(session_id, call_id);
 CREATE INDEX idx_tce_parent     ON tool_call_events (session_id, parent_call_id);
 
 -- ---- inference_calls -------------------------------------------------------

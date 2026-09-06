@@ -851,6 +851,17 @@ pub(super) fn build_openai_model(
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
     let resolved = models_fetch::resolve_provider_request(provider_id, entry)?;
+    let wire_api = if entry.wire_api.is_auto()
+        && !entry
+            .models
+            .iter()
+            .find(|model| model.id == model_id)
+            .is_some_and(|model| model.wire_api_provenance.is_user_configured())
+    {
+        crate::config::providers::WireApi::Auto
+    } else {
+        entry.resolve_wire_api(provider_id, model_id)
+    };
     build_openai_model_from_resolved_with_utility_limit(
         provider_id,
         &resolved,
@@ -859,7 +870,7 @@ pub(super) fn build_openai_model(
         &crate::config::providers::TimeoutConfig::default(),
         false,
         ClientSideToolsCapability::default(),
-        crate::config::providers::WireApi::Auto,
+        wire_api,
         false,
         false,
         None,
@@ -975,7 +986,13 @@ pub(super) fn build_openai_model_from_resolved_with_utility_limit_and_can_delega
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
     let resolved_wire_api = if wire_api.is_auto() {
-        crate::config::providers::WireApi::Completions
+        let default = crate::config::providers::default_wire_api_for_template(Some(provider_id));
+        if wire_api_explicit {
+            default
+        } else {
+            super::wire::learned_working_endpoint(provider_id, model_id, &resolved.base_url)
+                .unwrap_or(default)
+        }
     } else {
         wire_api
     };

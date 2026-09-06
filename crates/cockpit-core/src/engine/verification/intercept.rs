@@ -435,49 +435,50 @@ async fn run_verification(
                 },
             })
             .collect::<Vec<_>>();
-        let adjudicator_prompt = super::adjudicate::adjudication_prompt(
+        if let Ok(adjudicator_prompt) = super::adjudicate::adjudication_prompt(
             input.resolved_name,
             input.args,
             &candidate_envelopes,
-        )?;
-        let (adjudicator_system, adjudicator_tools, _) =
-            super::inference::effective_verification_route(
-                super::adjudicate::ADJUDICATOR_SYSTEM,
-                model,
-                &std::slice::from_ref(&super::adjudicate::verdict_tool()),
-            );
-        let adjudicator_tools = serde_json::to_string(&adjudicator_tools)?;
-        let adjudicator_fixed = serde_json::to_string(&serde_json::json!({
-            "system": adjudicator_system,
-            "history": input.history,
-            "prompt": adjudicator_prompt,
-            "tools": adjudicator_tools,
-        }))?;
-        let estimate = estimate_candidate_set(CandidateSetEstimateInput {
-            assembled_texts: std::slice::from_ref(&adjudicator_fixed),
-            encoding: encoding_for_model_id(model.model_id_ref()),
-            input_price_per_mtok: price.map(|price| price.0),
-            output_price_per_mtok: price.map(|price| price.1),
-            max_candidates: 1,
-            max_collection_millis: requested.max_collection_millis,
-        });
-        // A candidate body is bounded by its completion cap. Re-encoding that
-        // JSON inside the pretty adjudication envelope can expand control
-        // characters to a six-byte escape, so reserve the full 6x expansion.
-        let candidate_input_tokens = (generators.len() as u64)
-            .saturating_mul(crate::engine::model::UTILITY_MAX_TOKENS_CAP)
-            .saturating_mul(6);
-        estimated_tokens = estimated_tokens
-            .saturating_add(estimate.tokens)
-            .saturating_add(candidate_input_tokens);
-        let candidate_input_cost =
-            price.map(|price| input_cost_microusd(candidate_input_tokens, price.0));
-        estimated_cost = match (estimated_cost, estimate.cost_microusd, candidate_input_cost) {
-            (Some(total), Some(cost), Some(candidate_cost)) => {
-                Some(total.saturating_add(cost).saturating_add(candidate_cost))
-            }
-            _ => None,
-        };
+        ) {
+            let (adjudicator_system, adjudicator_tools, _) =
+                super::inference::effective_verification_route(
+                    super::adjudicate::ADJUDICATOR_SYSTEM,
+                    model,
+                    &std::slice::from_ref(&super::adjudicate::verdict_tool()),
+                );
+            let adjudicator_tools = serde_json::to_string(&adjudicator_tools)?;
+            let adjudicator_fixed = serde_json::to_string(&serde_json::json!({
+                "system": adjudicator_system,
+                "history": input.history,
+                "prompt": adjudicator_prompt,
+                "tools": adjudicator_tools,
+            }))?;
+            let estimate = estimate_candidate_set(CandidateSetEstimateInput {
+                assembled_texts: std::slice::from_ref(&adjudicator_fixed),
+                encoding: encoding_for_model_id(model.model_id_ref()),
+                input_price_per_mtok: price.map(|price| price.0),
+                output_price_per_mtok: price.map(|price| price.1),
+                max_candidates: 1,
+                max_collection_millis: requested.max_collection_millis,
+            });
+            // A candidate body is bounded by its completion cap. Re-encoding that
+            // JSON inside the pretty adjudication envelope can expand control
+            // characters to a six-byte escape, so reserve the full 6x expansion.
+            let candidate_input_tokens = (generators.len() as u64)
+                .saturating_mul(crate::engine::model::UTILITY_MAX_TOKENS_CAP)
+                .saturating_mul(6);
+            estimated_tokens = estimated_tokens
+                .saturating_add(estimate.tokens)
+                .saturating_add(candidate_input_tokens);
+            let candidate_input_cost =
+                price.map(|price| input_cost_microusd(candidate_input_tokens, price.0));
+            estimated_cost = match (estimated_cost, estimate.cost_microusd, candidate_input_cost) {
+                (Some(total), Some(cost), Some(candidate_cost)) => {
+                    Some(total.saturating_add(cost).saturating_add(candidate_cost))
+                }
+                _ => None,
+            };
+        }
     } else {
         estimated_cost = None;
     }
@@ -664,7 +665,7 @@ async fn run_verification(
         let projection_ready = trusted_minimal_projection_ready(
             input.resolved_name,
             input.args,
-            &collected,
+            &[],
             collection_error.as_ref(),
         );
         let adjudicator = match adjudicator_model {
@@ -1678,7 +1679,11 @@ mod tests {
         };
         let call = tool_call(
             name,
-            serde_json::json!({ "path": "src/lib.rs", "content": "fn x() {}" }),
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "old_string": "fn old() {}",
+                "new_string": "fn x() {}"
+            }),
         );
         let mut history = Vec::new();
         push_assistant_call(&mut history, &call);
@@ -1727,7 +1732,11 @@ mod tests {
 
     #[test]
     fn collection_failure_disables_original_only_projection() {
-        let args = serde_json::json!({ "path": "src/lib.rs", "content": "fn x() {}" });
+        let args = serde_json::json!({
+            "path": "src/lib.rs",
+            "old_string": "fn old() {}",
+            "new_string": "fn x() {}"
+        });
         let error = anyhow::anyhow!("tool-call evidence storage is unavailable");
 
         assert!(
@@ -1871,6 +1880,13 @@ mod tests {
                 critique: "x".into(),
             },
         ]);
+        crate::engine::verification::adjudicate::set_adjudicator_override(
+            crate::engine::verification::adjudicate::AdjudicatorVerdict {
+                decision: crate::engine::verification::adjudicate::AdjudicatorDecision::Approve,
+                selected: None,
+                feedback: String::new(),
+            },
+        );
         let definition = VnextAgentDef {
             schema_version: crate::agents::SCHEMA_VERSION,
             agent_id: "authored/reviewer".to_string(),
@@ -1929,7 +1945,11 @@ mod tests {
         };
         let call = tool_call(
             "edit",
-            serde_json::json!({ "path": "src/lib.rs", "content": "fn x() {}" }),
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "old_string": "fn old() {}",
+                "new_string": "fn x() {}"
+            }),
         );
         let mut history = Vec::new();
         push_assistant_call(&mut history, &call);
@@ -1937,6 +1957,7 @@ mod tests {
             .await
             .unwrap();
         crate::engine::verification::generate::clear_generator_override();
+        crate::engine::verification::adjudicate::clear_adjudicator_override();
         crate::engine::verification::estimate::set_test_model_price(None);
         assert!(called.load(Ordering::SeqCst));
         assert_eq!(last_tool_result_text(&history), "applied");

@@ -442,13 +442,6 @@ pub async fn run_trusted_child_acquisition(
         match result {
             Ok(outcome) => {
                 history = outcome.history;
-                agent = match crate::engine::builtin::load(ACQUISITION_AGENT, &spawn_args) {
-                    Ok(agent) => agent,
-                    Err(_) => {
-                        run_failed = true;
-                        break;
-                    }
-                };
             }
             Err(_) => {
                 run_failed = true;
@@ -458,13 +451,20 @@ pub async fn run_trusted_child_acquisition(
         if runtime.terminal().is_some() {
             break;
         }
+        agent = match crate::engine::builtin::load(ACQUISITION_AGENT, &spawn_args) {
+            Ok(agent) => agent,
+            Err(_) => {
+                run_failed = true;
+                break;
+            }
+        };
         if nudge == MAX_TERMINAL_NUDGES {
             break;
         }
         prompt = Message::user(TERMINAL_NUDGE);
     }
 
-    if run_failed {
+    if run_failed && runtime.terminal().is_none() {
         let completed_at_ms = completion_time_ms(request.now_ms, started_at);
         if terminalize_audit_failed(&execution.session, request.acquisition_id, completed_at_ms)
             .await

@@ -384,6 +384,7 @@ async fn metadata_fork_rejects_mixed_native_and_monty_calls_atomically() {
 #[tokio::test]
 async fn metadata_fork_retry_retains_the_initial_call_skeleton() {
     let provider = ScriptedProvider::builder()
+        .turn(Turn::Text("foreground ok.".into()))
         .turn(Turn::Text("I will provide metadata shortly.".into()))
         .turn(Turn::ToolCall {
             id: "metadata-call".into(),

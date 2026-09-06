@@ -9493,8 +9493,22 @@ impl Db {
 /// allowlisted projections below instead: they retain only what a restart may
 /// safely render or resolve.
 fn redact_receipt_json(raw: &str) -> Result<String> {
-    let _: serde_json::Value =
+    let value: serde_json::Value =
         serde_json::from_str(raw).context("decision payload must be valid JSON")?;
+    if let Some(object) = value.as_object()
+        && object.contains_key("boundary")
+        && object.contains_key("outcome")
+    {
+        // Host-approval effect receipts only carry the typed boundary name and
+        // terminal outcome. Preserve those audit markers while dropping any
+        // future extension fields that might carry user-visible text.
+        return Ok(serde_json::json!({
+            "boundary": object.get("boundary").cloned().unwrap_or(Value::Null),
+            "outcome": object.get("outcome").cloned().unwrap_or(Value::Null),
+            "redacted": true,
+        })
+        .to_string());
+    }
     Ok(redacted_marker(raw))
 }
 

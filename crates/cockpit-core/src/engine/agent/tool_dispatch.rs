@@ -64,35 +64,6 @@ fn capability_guard_denial_output(denial: Value) -> Result<ToolOutput> {
     .context("capability guard denial must form a canonical tool result")
 }
 
-/// The sole ordinary-tool host-effect boundary. Verification may select
-/// original or revised arguments (including a parked replay), but every
-/// authorized selection reaches this helper before any toolbox `Tool::call`.
-async fn dispatch_authorized_tool(
-    env: &DispatchEnv<'_>,
-    resolved_name: &str,
-    args: Value,
-    call_id: &str,
-) -> (Result<ToolOutput>, u64) {
-    if resolved_name == "acquire_sealed_value" {
-        let started = std::time::Instant::now();
-        let result =
-            crate::engine::trusted_child_acquisition_coordinator::run_parent_acquisition_tool(
-                env, &args,
-            )
-            .await;
-        (result, started.elapsed().as_millis() as u64)
-    } else {
-        dispatch_one_timed(
-            env.active_tools,
-            resolved_name,
-            args,
-            env.ctx,
-            Some(call_id),
-        )
-        .await
-    }
-}
-
 fn ordinary_ledger_args(env: &DispatchEnv<'_>, resolved_name: &str, args: &Value) -> Value {
     crate::tools::knowledge_sealed::ledger_args_for_sensitive_tool(resolved_name, args)
         .or_else(|| {
@@ -951,18 +922,20 @@ pub(crate) async fn execute_ordinary_call(
     // actual `ToolOutput` outcome below; the inner scope owns approvals raised
     // from within the tool itself. Without this enclosing scope a gate could
     // consume a host approval before any effect boundary existed to own it.
-    crate::engine::interrupt::with_host_approval_effect_scope(
-        "ordinary_tool_dispatch_gate",
-        env.ctx.cancel.clone(),
-        Box::pin(execute_ordinary_call_unscoped(
-            env,
-            history,
-            tc,
-            resolved_name,
-            name_recovery,
-            text_recovery_marker,
-        )),
-        |_| None,
+    crate::tools::trusted_child_acquisition::scope_inherited_acquisition_runtime(
+        crate::engine::interrupt::with_host_approval_effect_scope(
+            "ordinary_tool_dispatch_gate",
+            env.ctx.cancel.clone(),
+            Box::pin(execute_ordinary_call_unscoped(
+                env,
+                history,
+                tc,
+                resolved_name,
+                name_recovery,
+                text_recovery_marker,
+            )),
+            |_| None,
+        ),
     )
     .await
 }
@@ -2300,35 +2273,36 @@ async fn execute_ordinary_call_unscoped(
             )
         })
     });
-    let mut artifact_captures = (!hard_fail && canonical_result_is_text_only)
-        .then(|| {
-            let mut captures = result
-                .as_ref()
-                .ok()
-                .map(|output| output.text_artifact_captures.clone())
-                .unwrap_or_default();
+    let has_explicit_text_artifact = result
+        .as_ref()
+        .ok()
+        .is_some_and(|output| output.text_artifact_capture.is_some());
+    let mut artifact_captures =
+        if !hard_fail && (canonical_result_is_text_only || has_explicit_text_artifact) {
+            let mut captures = if canonical_result_is_text_only {
+                result
+                    .as_ref()
+                    .ok()
+                    .map(|output| output.text_artifact_captures.clone())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             if let Some(capture) = result
                 .as_ref()
                 .ok()
                 .and_then(|output| output.text_artifact_capture.clone())
             {
                 captures.push(crate::engine::tool::ToolTextArtifactCapture {
-                    lane: if result
-                        .as_ref()
-                        .ok()
-                        .is_some_and(|output| output.text_artifact_model_ephemeral)
-                    {
-                        crate::engine::tool::ToolArtifactLane::Display
-                    } else {
-                        crate::engine::tool::ToolArtifactLane::Model
-                    },
+                    lane: crate::engine::tool::ToolArtifactLane::Model,
                     capture,
                     explicit: true,
                 });
             }
             captures
-        })
-        .unwrap_or_default();
+        } else {
+            Vec::new()
+        };
     // Artifacts are durable and retrievable, so every lane crosses the
     // outbound redaction boundary before admission. A replacement that grows
     // the body fails closed rather than corrupting host capture accounting.
@@ -2520,6 +2494,16 @@ async fn execute_ordinary_call_unscoped(
         tracing::warn!(error = %e, tool = %resolved_name, "persisting tool_call_event failed");
     }
 
+    let event_canonical_output = result.as_ref().ok().and_then(|output| {
+        (!hard_fail
+            && output.content.has_non_text_content()
+            && output
+                .content
+                .parts()
+                .iter()
+                .all(|part| !part.is_media_reference()))
+        .then(|| serde_json::to_value(output.content.parts()))
+    });
     let canonical_history_output = result.as_ref().ok().and_then(|output| {
         (!hard_fail
             && output.content.has_non_text_content()
@@ -2538,6 +2522,13 @@ async fn execute_ordinary_call_unscoped(
             )
         })
     });
+    let event_canonical_output = match event_canonical_output.transpose() {
+        Ok(output) => output,
+        Err(error) => {
+            release_tool_media_handoffs(&mut resolved_media_handoffs).await;
+            return Err(error.into());
+        }
+    };
     let canonical_history_output = match canonical_history_output.transpose() {
         Ok(output) => output,
         Err(error) => {
@@ -2573,7 +2564,7 @@ async fn execute_ordinary_call_unscoped(
         "truncated": truncated,
         "duration_ms": duration_ms,
     });
-    if let Some(canonical_output) = &canonical_history_output {
+    if let Some(canonical_output) = &event_canonical_output {
         event_data["canonical_output"] = canonical_output.clone();
     }
     if let Some(canonical_output_text) = &canonical_history_text {
@@ -2631,6 +2622,10 @@ async fn execute_ordinary_call_unscoped(
     }
     let mut model_artifact_frame = None;
     let mut human_artifact_notes = Vec::new();
+    let suppress_model_artifact_frame = result
+        .as_ref()
+        .ok()
+        .is_some_and(|output| output.text_artifact_model_ephemeral);
     let tool_call_seq = if !artifact_captures.is_empty() {
         let mut display_slot = 0_i64;
         let mut attachment_slot = 0_i64;
@@ -2662,28 +2657,48 @@ async fn execute_ordinary_call_unscoped(
                 }
             };
             let staged_at = chrono::Utc::now().timestamp_millis();
-            let staged_blob_path = crate::text_artifact_blob::new_path(env.session.id);
-            env.session
-                .db
-                .stage_text_artifact_blob_cleanup_intent(
-                    staged_blob_path.clone(),
-                    env.session.id,
-                    staged_at,
-                )
-                .await
-                .context("staging tool artifact blob cleanup")?;
-            let blob_path =
-                crate::text_artifact_blob::write_at(&staged_blob_path, &retained.capture.content)
+            let (provenance_json, blob_cleanup_path) =
+                if suppress_model_artifact_frame && retained.explicit {
+                    (
+                        serde_json::json!({
+                            "agent_id": &env.agent.name,
+                            "tool": resolved_name,
+                            "call_id": &tc.id,
+                            "source": "tool_result",
+                            "preview_lines": artifact_preview_lines,
+                        })
+                        .to_string(),
+                        None,
+                    )
+                } else {
+                    let staged_blob_path = crate::text_artifact_blob::new_path(env.session.id);
+                    env.session
+                        .db
+                        .stage_text_artifact_blob_cleanup_intent(
+                            staged_blob_path.clone(),
+                            env.session.id,
+                            staged_at,
+                        )
+                        .await
+                        .context("staging tool artifact blob cleanup")?;
+                    let blob_path = crate::text_artifact_blob::write_at(
+                        &staged_blob_path,
+                        &retained.capture.content,
+                    )
                     .with_context(|| format!("spilling tool result for {resolved_name}"))?;
-            let provenance_json = serde_json::json!({
-                "agent_id": &env.agent.name,
-                "tool": resolved_name,
-                "call_id": &tc.id,
-                "source": "tool_result",
-                "preview_lines": artifact_preview_lines,
-                "blob_path": blob_path,
-            })
-            .to_string();
+                    (
+                        serde_json::json!({
+                            "agent_id": &env.agent.name,
+                            "tool": resolved_name,
+                            "call_id": &tc.id,
+                            "source": "tool_result",
+                            "preview_lines": artifact_preview_lines,
+                            "blob_path": blob_path,
+                        })
+                        .to_string(),
+                        Some(staged_blob_path),
+                    )
+                };
             staged.push((
                 crate::db::text_artifacts::TextArtifactCandidate {
                     relation,
@@ -2698,14 +2713,14 @@ async fn execute_ordinary_call_unscoped(
                     provenance_json,
                     created_at: chrono::Utc::now().timestamp_millis(),
                 },
-                staged_blob_path,
+                blob_cleanup_path,
             ));
         }
         let candidates = staged
             .iter()
             .map(|(candidate, _)| candidate.clone())
             .collect();
-        let staged_blob_paths = staged.iter().map(|(_, path)| path.clone()).collect();
+        let staged_blob_paths = staged.iter().filter_map(|(_, path)| path.clone()).collect();
         let event = crate::db::text_artifacts::TextArtifactEventInput {
             session_id: env.session.id,
             kind: crate::db::session_log::SessionEventKind::ToolCall,
@@ -2744,6 +2759,7 @@ async fn execute_ordinary_call_unscoped(
                             }
                             if candidate.relation
                                 == crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult
+                                && !suppress_model_artifact_frame
                             {
                                 let preview_head = crate::engine::text_artifact_frame::utf8_preview_lines(
                                     &candidate.content,
@@ -2996,7 +3012,7 @@ async fn execute_ordinary_call_unscoped(
             "truncated": truncated,
             "duration_ms": duration_ms,
         });
-        if let Some(canonical_output) = &canonical_history_output {
+        if let Some(canonical_output) = &event_canonical_output {
             completed_data["canonical_output"] = canonical_output.clone();
         } else if let Ok(output) = &result
             && output
@@ -3124,6 +3140,12 @@ async fn execute_ordinary_call_unscoped(
             wire_output.push('\n');
         }
         wire_output.push_str(&format!("\n--- hint({}): {}\n", hint.kind, hint.wire_text));
+    }
+    if let Some(disclosure) = &verification_disclosure {
+        if !wire_output.ends_with('\n') {
+            wire_output.push('\n');
+        }
+        wire_output.push_str(disclosure);
     }
     // A typed artifact projection replaces the entire model body.  Resume
     // rebuilds the same tool result from the durable frame alone; appending a
@@ -3348,6 +3370,35 @@ async fn execute_ordinary_call_unscoped(
     // always left intact until a later turn settles it.
     crate::engine::write_edit_arg_elision::elide_applied_write_edit_args(history);
     Ok(())
+}
+
+/// The sole ordinary-tool host-effect boundary. Verification may select
+/// original or revised arguments (including a parked replay), but every
+/// authorized selection reaches this helper before any toolbox `Tool::call`.
+async fn dispatch_authorized_tool(
+    env: &DispatchEnv<'_>,
+    resolved_name: &str,
+    args: Value,
+    call_id: &str,
+) -> (Result<ToolOutput>, u64) {
+    if resolved_name == "acquire_sealed_value" {
+        let started = std::time::Instant::now();
+        let result =
+            crate::engine::trusted_child_acquisition_coordinator::run_parent_acquisition_tool(
+                env, &args,
+            )
+            .await;
+        (result, started.elapsed().as_millis() as u64)
+    } else {
+        dispatch_one_timed(
+            env.active_tools,
+            resolved_name,
+            args,
+            env.ctx,
+            Some(call_id),
+        )
+        .await
+    }
 }
 
 fn render_unavailable_tool_artifact_frame(

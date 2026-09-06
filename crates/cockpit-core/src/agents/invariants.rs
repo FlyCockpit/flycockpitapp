@@ -325,6 +325,92 @@ pub(crate) fn small_model_capability_warning(def: &AgentDef) -> Option<String> {
     ))
 }
 
+fn validate_tool_tier_overrides(def: &AgentDef) -> Result<()> {
+    let known = known_tool_names();
+    for (tool, tier) in &def.tool_tiers {
+        if let Some(replacement) = retired_lock_verb_replacement(tool) {
+            bail!(
+                "agent `{}` tiers retired lock tool `{tool}`; use `{replacement}` instead",
+                def.name
+            );
+        }
+        if !known.contains(&tool.as_str()) && *tier != ToolTier::Disabled {
+            bail!("agent `{}` tiers unknown tool `{tool}`", def.name);
+        }
+        if let Some(grant) = &def.tools
+            && !grant.iter().any(|g| g == tool)
+            && !matches!(
+                tool.as_str(),
+                "read_image"
+                    | "inspect_audio"
+                    | "inspect_video"
+                    | "extract_audio"
+                    | "extract_video_clip"
+                    | "transcribe_audio"
+            )
+        {
+            bail!(
+                "agent `{}` tiers tool `{tool}` it does not grant in `tools:`",
+                def.name
+            );
+        }
+        if *tier == ToolTier::Discoverable && STRUCTURAL_TOOLS.contains(&tool.as_str()) {
+            bail!(
+                "agent `{}` may not tier structural tool `{tool}` as `discoverable`",
+                def.name
+            );
+        }
+        if *tier == ToolTier::Disabled && STRUCTURAL_TOOLS.contains(&tool.as_str()) {
+            bail!(
+                "agent `{}` may not tier structural tool `{tool}` as `disabled`",
+                def.name
+            );
+        }
+        if *tier == ToolTier::Discoverable && LOCK_WRITE_TOOLS.contains(&tool.as_str()) {
+            bail!(
+                "agent `{}` may not tier write/lock tool `{tool}` as `discoverable`",
+                def.name
+            );
+        }
+        if *tier == ToolTier::Discoverable && tool == "transcribe_audio" {
+            bail!(
+                "agent `{}` may not tier tool `{tool}` as `discoverable`",
+                def.name
+            );
+        }
+        if *tier == ToolTier::Discoverable
+            && matches!(
+                tool.as_str(),
+                "inspect_audio" | "inspect_video" | "extract_audio" | "extract_video_clip"
+            )
+        {
+            // Host overrides may name Discoverable as a documented no-op that
+            // keeps direct-native placement without creating an MCP entry.
+            continue;
+        }
+        if *tier == ToolTier::Disabled && LOCK_WRITE_TOOLS.contains(&tool.as_str()) {
+            bail!(
+                "agent `{}` may not tier write/lock tool `{tool}` as `disabled`",
+                def.name
+            );
+        }
+        let legal_tiers = crate::agents::legal_tool_tiers(tool);
+        if !legal_tiers.contains(tier) {
+            let legal = legal_tiers
+                .iter()
+                .map(|tier| tier.label())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "agent `{}` may not tier tool `{tool}` as `{}`; legal tiers are {legal}",
+                def.name,
+                tier.label()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Validate `def` against the core invariants. Returns `Ok(())` when the
 /// definition is admissible, else an `Err` whose message names the
 /// specific reason (the offending tool / agent, backticked). The
@@ -352,6 +438,10 @@ pub fn validate_invariants(def: &AgentDef) -> Result<()> {
         }
     }
     if let Some(vnext) = &def.vnext {
+        // Host/session tool-tier overrides still apply to launch-v1 definitions;
+        // validate them before the closed schema gate so illegal placements
+        // cannot bypass the legacy tier rules via the vnext early return.
+        validate_tool_tier_overrides(def)?;
         // launch-v1 declarations are deliberately authority-free. Their own closed
         // schema is the only applicable definition-level invariant; legacy
         // tool/role checks below must not accidentally reinterpret them.
@@ -393,63 +483,7 @@ pub fn validate_invariants(def: &AgentDef) -> Result<()> {
         }
     }
 
-    for (tool, tier) in &def.tool_tiers {
-        if let Some(replacement) = retired_lock_verb_replacement(tool) {
-            bail!(
-                "agent `{}` tiers retired lock tool `{tool}`; use `{replacement}` instead",
-                def.name
-            );
-        }
-        if !known.contains(&tool.as_str()) && *tier != ToolTier::Disabled {
-            bail!("agent `{}` tiers unknown tool `{tool}`", def.name);
-        }
-        if let Some(grant) = &def.tools
-            && !grant.iter().any(|g| g == tool)
-            && tool != "read_image"
-        {
-            bail!(
-                "agent `{}` tiers tool `{tool}` it does not grant in `tools:`",
-                def.name
-            );
-        }
-        if *tier == ToolTier::Discoverable && STRUCTURAL_TOOLS.contains(&tool.as_str()) {
-            bail!(
-                "agent `{}` may not tier structural tool `{tool}` as `discoverable`",
-                def.name
-            );
-        }
-        if *tier == ToolTier::Disabled && STRUCTURAL_TOOLS.contains(&tool.as_str()) {
-            bail!(
-                "agent `{}` may not tier structural tool `{tool}` as `disabled`",
-                def.name
-            );
-        }
-        if *tier == ToolTier::Discoverable && LOCK_WRITE_TOOLS.contains(&tool.as_str()) {
-            bail!(
-                "agent `{}` may not tier write/lock tool `{tool}` as `discoverable`",
-                def.name
-            );
-        }
-        if *tier == ToolTier::Disabled && LOCK_WRITE_TOOLS.contains(&tool.as_str()) {
-            bail!(
-                "agent `{}` may not tier write/lock tool `{tool}` as `disabled`",
-                def.name
-            );
-        }
-        let legal_tiers = crate::agents::legal_tool_tiers(tool);
-        if !legal_tiers.contains(tier) {
-            let legal = legal_tiers
-                .iter()
-                .map(|tier| tier.label())
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "agent `{}` may not tier tool `{tool}` as `{}`; legal tiers are {legal}",
-                def.name,
-                tier.label()
-            );
-        }
-    }
+    validate_tool_tier_overrides(def)?;
 
     let effective_tools = effective_grant_for_invariants(def);
     validate_discoverable_tools_have_mcp(def, &effective_tools)?;
@@ -471,8 +505,9 @@ pub fn validate_invariants(def: &AgentDef) -> Result<()> {
         if !known.contains(&tool.as_str()) {
             bail!("agent `{}` requests unknown tool `{tool}`", def.name);
         }
-        // Docs-answerer sandbox: never grantable to a user agent.
-        if SANDBOX_ONLY_TOOLS.contains(&tool.as_str()) {
+        // Docs-answerer sandbox: never grantable to a user agent. The internal
+        // docs-answerer stage is the sole holder of these tools.
+        if SANDBOX_ONLY_TOOLS.contains(&tool.as_str()) && def.name != "docs-answerer" {
             bail!(
                 "agent `{}` may not use the docs-answerer-only sandboxed tool `{tool}`",
                 def.name

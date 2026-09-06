@@ -1483,7 +1483,7 @@ fn scoped_session_relationships_are_database_enforced_and_indexed() {
     for contract in [
         "FOREIGN KEY (parent_session_id, fork_point_turn_id)\n        REFERENCES session_events(session_id, seq)\n        ON DELETE RESTRICT ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED",
         "CREATE INDEX idx_sessions_parent_fork_point ON sessions(parent_session_id, fork_point_turn_id)",
-        "CREATE UNIQUE INDEX uq_tce_session_call ON tool_call_events(session_id, call_id)",
+        "CREATE INDEX idx_tce_session_call ON tool_call_events(session_id, call_id)",
         "CREATE INDEX idx_tce_parent     ON tool_call_events (session_id, parent_call_id)",
     ] {
         assert!(

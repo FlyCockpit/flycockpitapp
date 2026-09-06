@@ -138,12 +138,16 @@ impl TaskTool {
         // against the named tool's real schema, so embedding per-tool schemas
         // here would only duplicate (and drift from) them while blowing the
         // task-definition byte budget.
+        // Terse steering keeps the parameter schema inside the task-definition
+        // byte budget (`task_definition_shrinks_after_seed_removal`): only the
+        // descriptions a test or the terse contract pins stay inline; the rest
+        // of the field guidance lives in `verbose_parameters` below.
         let delegate_payload = serde_json::json!({
             "type": "object",
             "properties": {
                 "agent":  {
                     "type": "string",
-                    "description": "`docs` for dependency API usage; `knowledge` for cited KB retrieval; `explore`; `builder`",
+                    "description": "`docs` for dependency API usage",
                     "enum": agents
                 },
                 "prompt": {
@@ -167,15 +171,14 @@ impl TaskTool {
                 },
                 "cwd": {
                     "type": "string",
-                    "description": "Relative paths resolve against the parent session cwd; must stay in workspace"
+                    "description": "Relative paths resolve against the parent session cwd"
                 },
                 "write_scope": {
                     "type": "string",
                     "description": "Write-confined subtree"
                 },
                 "workspace_lease": {
-                    "type": "string",
-                    "description": "Containment kind or live host-issued lease UUID"
+                    "type": "string"
                 },
                 "grant_tools": {
                     "type": "array",
@@ -185,7 +188,6 @@ impl TaskTool {
                 "seed_reads": {
                     "type": "array",
                     "maxItems": 32,
-                    "description": "Fresh read-only calls selected by explore; implementation child executes them before its first inference",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -197,8 +199,7 @@ impl TaskTool {
                     }
                 },
                 "seed_reads_receipt": {
-                    "type": "string",
-                    "description": "Opaque host-issued receipt paired with explore-selected seed_reads; copy unchanged"
+                    "type": "string"
                 },
                 "todo_ids": {
                     "type": "array",
@@ -209,8 +210,7 @@ impl TaskTool {
                     "minimum": 0
                 },
                 "budget": {
-                    "type": "object",
-                    "description": "Optional per-delegation spend overlay (maxRounds, maxInputTokens, maxOutputTokens, maxCostMicrousd, maxWallClockSecs). Values are finite integers or \"unlimited\"."
+                    "type": "object"
                 }
             },
             "required": ["agent", "prompt"]
@@ -221,12 +221,11 @@ impl TaskTool {
                 "label": { "type": "string" },
                 "depends_on": {
                     "type": "array",
-                    "items": { "type": "string", "minLength": 1 },
-                    "description": "Optional sibling labels that must finish before this entry starts; unrelated entries still run concurrently"
+                    "items": { "type": "string", "minLength": 1 }
                 },
                 "agent":  {
                     "type": "string",
-                    "description": "`docs` for dependency API usage; `knowledge` for cited KB retrieval; `explore`",
+                    "description": "`docs` for dependency API usage",
                     "enum": agents
                 },
                 "prompt": {
@@ -243,7 +242,7 @@ impl TaskTool {
                 },
                 "cwd": {
                     "type": "string",
-                    "description": "Relative paths resolve against the parent session cwd; must stay in workspace"
+                    "description": "Relative paths resolve against the parent session cwd"
                 },
                 "grant_tools": {
                     "type": "array",
@@ -259,16 +258,14 @@ impl TaskTool {
                     "description": "Required write-confined subtree"
                 },
                 "workspace_lease": {
-                    "type": "string",
-                    "description": "Containment kind or live host-issued lease UUID"
+                    "type": "string"
                 },
                 "remaining_depth": {
                     "type": "integer",
                     "minimum": 0
                 },
                 "budget": {
-                    "type": "object",
-                    "description": "Optional per-delegation spend overlay (maxRounds, maxInputTokens, maxOutputTokens, maxCostMicrousd, maxWallClockSecs). Values are finite integers or \"unlimited\"."
+                    "type": "object"
                 }
             },
             "required": ["agent", "prompt"]
@@ -335,6 +332,38 @@ impl TaskTool {
         verbose_parameters["properties"]["payload"]["description"] = serde_json::json!(
             "Payload selected by `intent`: delegate uses an object with `agent`/`prompt` (for dependency API usage call `docs` first unless exact usage is already in local code); batch uses an array of entries; models/list may omit/null/{}; status/cancel/query/steer use control fields; query/steer require `message`"
         );
+        // Terse steering keeps only the pinned descriptions inline so the
+        // schema stays inside the task-definition byte budget; the defensive
+        // schema carries the full field guidance.
+        let defensive_cwd = serde_json::json!(
+            "Relative paths resolve against the parent session cwd; must stay in workspace"
+        );
+        verbose_parameters["properties"]["payload"]["properties"]["cwd"]["description"] =
+            defensive_cwd.clone();
+        verbose_parameters["properties"]["payload"]["items"]["properties"]["cwd"]["description"] =
+            defensive_cwd;
+        let defensive_workspace_lease =
+            serde_json::json!("Containment kind or live host-issued lease UUID");
+        verbose_parameters["properties"]["payload"]["properties"]["workspace_lease"]["description"] =
+            defensive_workspace_lease.clone();
+        verbose_parameters["properties"]["payload"]["items"]["properties"]["workspace_lease"]["description"] =
+            defensive_workspace_lease;
+        verbose_parameters["properties"]["payload"]["properties"]["seed_reads"]["description"] = serde_json::json!(
+            "Fresh read-only calls selected by explore; implementation child executes them before its first inference"
+        );
+        verbose_parameters["properties"]["payload"]["properties"]["seed_reads_receipt"]["description"] = serde_json::json!(
+            "Opaque host-issued receipt paired with explore-selected seed_reads; copy unchanged"
+        );
+        verbose_parameters["properties"]["payload"]["items"]["properties"]["depends_on"]["description"] = serde_json::json!(
+            "Optional sibling labels that must finish before this entry starts; unrelated entries still run concurrently"
+        );
+        let defensive_budget = serde_json::json!(
+            "Optional per-delegation spend overlay (maxRounds, maxInputTokens, maxOutputTokens, maxCostMicrousd, maxWallClockSecs). Values are finite integers or \"unlimited\"."
+        );
+        verbose_parameters["properties"]["payload"]["properties"]["budget"]["description"] =
+            defensive_budget.clone();
+        verbose_parameters["properties"]["payload"]["items"]["properties"]["budget"]["description"] =
+            defensive_budget;
         let defensive_min_context = serde_json::json!(
             "Minimum context tokens; omit unless genuinely required because models with unknown context metadata are rejected when this field is set"
         );
@@ -743,8 +772,10 @@ mod tests {
         let tool = TaskTool::with_subagents(&["explore", "builder"]);
         let len = serde_json::to_string(&tool.parameters()).unwrap().len();
         // Observed after seed schema removal plus scoped write support: ~3020
-        // bytes; multimodal requires enums add ~200. Keep this low enough that
-        // the seed blob cannot return.
+        // bytes; multimodal requires enums add ~200; the wave-7 budget overlay
+        // and workspace lease add ~330. The terse schema now carries only the
+        // pinned descriptions (the rest live in `verbose_parameters`), landing
+        // at ~3260. Keep this low enough that the seed blob cannot return.
         assert!(len < 3300, "task schema serialized to {len} bytes");
     }
 

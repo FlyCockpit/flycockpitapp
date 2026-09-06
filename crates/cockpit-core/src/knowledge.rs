@@ -5873,9 +5873,11 @@ pub(crate) fn configured_mcp_host_access_denial(ctx: &ToolCtx) -> Option<String>
             .any(|entry| matches!(&entry.source, KnowledgeBaseSource::Local { .. }));
     fenced.then(|| {
         // Keep the historical fence wording as the leading clause (the
-        // older MCP-fence tests pin it) while also naming the configured
-        // local knowledge base explicitly.
-        "access denied: MCP is unavailable because this workspace contains a local knowledge base with a filesystem fence; a configured local knowledge base cannot be reached through MCP".to_string()
+        // older MCP-fence tests pin it) while also naming the denied tool
+        // (`mcp`) and the configured local knowledge base explicitly. The
+        // denial surfaces as the parent `mcp` tool-call error, so it must
+        // name the tool itself, not just the MCP capability.
+        "access denied: MCP is unavailable because this workspace contains a local knowledge base with a filesystem fence; a configured local knowledge base cannot be reached through the `mcp` tool".to_string()
     })
 }
 

@@ -624,12 +624,16 @@ mod tests {
     }
 
     fn create_value(name: &str) -> Value {
+        create_value_with_content(name, "Apply the guarded workflow.")
+    }
+
+    fn create_value_with_content(name: &str, content: &str) -> Value {
         serde_json::json!({
             "action": "create",
             "name": name,
             "params": {
                 "description": "Approval replay skill",
-                "content": "Apply the guarded workflow."
+                "content": content
             }
         })
     }
@@ -1041,10 +1045,19 @@ mod tests {
     }
 
     async fn create_foreground_skill(cwd: &std::path::Path, root: &std::path::Path, name: &str) {
+        create_foreground_skill_with_content(cwd, root, name, "Apply the guarded workflow.").await;
+    }
+
+    async fn create_foreground_skill_with_content(
+        cwd: &std::path::Path,
+        root: &std::path::Path,
+        name: &str,
+        content: &str,
+    ) {
         write_config(cwd, root, false);
         let (ctx, _db) = crate::tools::common::test_ctx_with_db(cwd);
         SkillManageTool
-            .call(create_value(name), &ctx)
+            .call(create_value_with_content(name, content), &ctx)
             .await
             .unwrap();
     }
@@ -1257,6 +1270,19 @@ mod tests {
                 let root = tmp.path().join("skills");
                 if seed_existing {
                     create_seed_skill(tmp.path(), &root, &skill_name).await;
+                }
+                if action == "delete" {
+                    // Guarded consolidation: `delete` prepares its plan —
+                    // including the `absorbed_into` umbrella lookup — before
+                    // the approval park, so the delete case needs a real
+                    // umbrella skill that documents the absorbed skill.
+                    create_foreground_skill_with_content(
+                        tmp.path(),
+                        &root,
+                        "umbrella-skill",
+                        "Umbrella covering existing-workflow.",
+                    )
+                    .await;
                 }
                 let (ctx, db) = ctx_with_interrupt_hub(tmp.path(), &root, None);
 

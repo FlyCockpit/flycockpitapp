@@ -18947,6 +18947,16 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             observation: "pin state is toggled",
         },
         MutatingDispatchCase {
+            kind: "set_conversation_rule",
+            effect_class: Durable,
+            observation: "conversation rule row is persisted",
+        },
+        MutatingDispatchCase {
+            kind: "remove_conversation_rule",
+            effect_class: Durable,
+            observation: "conversation rule row is removed",
+        },
+        MutatingDispatchCase {
             kind: "create_project_note",
             effect_class: Durable,
             observation: "project note row is created",
@@ -20086,10 +20096,19 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_reader("get_agent_effective_settings"),
         authz_owner_only("resource_snapshot"),
         authz_owner_only("promote_resource"),
+        // The scheduled-job and image control-plane request kinds exist only
+        // behind the `extended` feature (see the `proto::command!` table), so
+        // their authz declarations must carry the same gate or the coverage
+        // ratchet above fails in a default-feature build.
+        #[cfg(feature = "extended")]
         authz_owner_only("create_scheduled_job"),
+        #[cfg(feature = "extended")]
         authz_owner_only("list_scheduled_jobs"),
+        #[cfg(feature = "extended")]
         authz_owner_only("delete_scheduled_job"),
+        #[cfg(feature = "extended")]
         authz_owner_only("set_scheduled_job_enabled"),
+        #[cfg(feature = "extended")]
         authz_owner_only("run_scheduled_job"),
         authz_session_writer("set_active_model"),
         authz_owner_only("set_model_favorite"),
@@ -20185,21 +20204,37 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("get_image_spend_policy"),
         #[cfg(feature = "extended")]
         authz_owner_only("save_image_spend_policy"),
+        #[cfg(feature = "extended")]
         authz_owner_only("image_endpoint_list"),
+        #[cfg(feature = "extended")]
         authz_owner_only("image_endpoint_get"),
+        #[cfg(feature = "extended")]
         authz_owner_only("image_target_list"),
+        #[cfg(feature = "extended")]
         authz_owner_only("image_target_get"),
+        #[cfg(feature = "extended")]
         authz_owner_only("image_workflow_list"),
+        #[cfg(feature = "extended")]
         authz_owner_only("image_workflow_get"),
+        #[cfg(feature = "extended")]
         authz_owner_only("image_endpoint_create"),
+        #[cfg(feature = "extended")]
         authz_owner_only("image_endpoint_update"),
+        #[cfg(feature = "extended")]
         authz_owner_only("image_endpoint_delete"),
+        #[cfg(feature = "extended")]
         authz_owner_only("image_target_create"),
+        #[cfg(feature = "extended")]
         authz_owner_only("image_target_update"),
+        #[cfg(feature = "extended")]
         authz_owner_only("image_target_delete"),
+        #[cfg(feature = "extended")]
         authz_owner_only("image_target_set_default"),
+        #[cfg(feature = "extended")]
         authz_owner_only("image_workflow_upload"),
+        #[cfg(feature = "extended")]
         authz_owner_only("image_workflow_bind"),
+        #[cfg(feature = "extended")]
         authz_owner_only("image_workflow_delete"),
         #[cfg(feature = "remote")]
         authz_owner_only("set_flycockpit_connector_enabled"),
@@ -38640,6 +38675,13 @@ async fn retraction_acceptance_model_server() -> (
         for (stream_body, hang) in streams {
             let (mut socket, _) = listener.accept().await.expect("model accepts request");
             let request = read_retraction_acceptance_http_request(&mut socket).await;
+            if std::env::var("COCKPIT_RETRACT_DBG").is_ok() {
+                eprintln!(
+                    "RETRACT-DBG model server accepted request ({} bytes): {}",
+                    request.len(),
+                    &request[..request.len().min(240)]
+                );
+            }
             captured_server.lock().unwrap().push(request);
             socket
                 .write_all(

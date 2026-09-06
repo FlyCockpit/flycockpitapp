@@ -5833,9 +5833,11 @@ pub(crate) async fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str)
 
 /// User-visible denial when MCP must stay fenced for a configured local KB.
 /// Keep the historical fence wording as the leading clause (older MCP-fence
-/// tests pin it) while also naming the configured local knowledge base
-/// explicitly.
-const MCP_HOST_ACCESS_DENIED: &str = "access denied: MCP is unavailable because this workspace contains a local knowledge base with a filesystem fence; a configured local knowledge base cannot be reached through MCP";
+/// tests pin it) while also naming the denied tool (`mcp`) and the configured
+/// local knowledge base explicitly. The denial surfaces as the parent `mcp`
+/// tool-call error, so it must name the tool itself, not just the MCP
+/// capability.
+const MCP_HOST_ACCESS_DENIED: &str = "access denied: MCP is unavailable because this workspace contains a local knowledge base with a filesystem fence; a configured local knowledge base cannot be reached through the `mcp` tool";
 
 /// Reject MCP server access whenever a local KB is configured. A configured
 /// server is arbitrary host code and an opaque tool call cannot prove that it

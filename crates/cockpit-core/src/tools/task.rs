@@ -17,6 +17,35 @@ use serde_json::Value;
 
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput};
 
+fn per_delegation_budget_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "maxRounds": { "type": "integer" },
+            "maxInputTokens": { "type": "integer" },
+            "maxOutputTokens": { "type": "integer" },
+            "maxCostMicrousd": { "type": "integer" },
+            "maxWallClockSecs": { "type": "integer" }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn seed_read_args_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "maxProperties": 12,
+        "propertyNames": { "type": "string", "minLength": 1 },
+        "additionalProperties": {
+            "oneOf": [
+                { "type": "string", "additionalProperties": false },
+                { "type": "integer", "additionalProperties": false },
+                { "type": "boolean", "additionalProperties": false }
+            ]
+        }
+    })
+}
+
 pub struct TaskTool {
     description: String,
     /// The explicit, steering verbose description, built
@@ -70,7 +99,7 @@ impl TaskTool {
             })
             .unwrap_or_default();
         let description = format!(
-            "Delegate {list}: `intent` plus optional `payload`; separate calls get task IDs, `batch` groups/depends_on work. Use @file, @file:XX-YY, @dir/, or /skill. Backgrounded JSON: task_call_id controls.{recursion_note}"
+            "Delegate {list}: `intent` and optional `payload`; calls get task IDs, `batch` groups/depends_on. Use @file, @file:XX-YY, @dir/, or /skill. Backgrounded: task_call_id controls.{recursion_note}"
         );
         // Verbose steering: decompose harder and
         // route narrow pieces through subagents so each does one focused job
@@ -132,12 +161,10 @@ impl TaskTool {
             },
             "required": ["kind"]
         });
-        // A seed carries the exact arguments for one bounded read-only tool.
-        // The item stays a single closed object with the full read-only
-        // allowlist enum: `args` are replayed by the implementation child
-        // against the named tool's real schema, so embedding per-tool schemas
-        // here would only duplicate (and drift from) them while blowing the
-        // task-definition byte budget.
+        // `args` use a compact typed map so the task schema stays strict-wire
+        // compatible without embedding every read-only tool schema here.
+        let seed_read_args = seed_read_args_schema();
+        let budget_schema = per_delegation_budget_schema();
         let delegate_payload = serde_json::json!({
             "type": "object",
             "properties": {
@@ -190,7 +217,7 @@ impl TaskTool {
                         "type": "object",
                         "properties": {
                             "tool": { "type": "string", "enum": ["read", "grep", "code", "graph", "search"] },
-                            "args": { "type": "object" }
+                            "args": seed_read_args
                         },
                         "required": ["tool", "args"],
                         "additionalProperties": false
@@ -208,10 +235,7 @@ impl TaskTool {
                     "type": "integer",
                     "minimum": 0
                 },
-                "budget": {
-                    "type": "object",
-                    "description": "Optional per-delegation spend overlay (maxRounds, maxInputTokens, maxOutputTokens, maxCostMicrousd, maxWallClockSecs). Values are finite integers or \"unlimited\"."
-                }
+                "budget": budget_schema.clone()
             },
             "required": ["agent", "prompt"]
         });
@@ -266,10 +290,7 @@ impl TaskTool {
                     "type": "integer",
                     "minimum": 0
                 },
-                "budget": {
-                    "type": "object",
-                    "description": "Optional per-delegation spend overlay (maxRounds, maxInputTokens, maxOutputTokens, maxCostMicrousd, maxWallClockSecs). Values are finite integers or \"unlimited\"."
-                }
+                "budget": budget_schema
             },
             "required": ["agent", "prompt"]
         });
@@ -742,10 +763,10 @@ mod tests {
     fn task_definition_shrinks_after_seed_removal() {
         let tool = TaskTool::with_subagents(&["explore", "builder"]);
         let len = serde_json::to_string(&tool.parameters()).unwrap().len();
-        // Observed after seed schema removal plus scoped write support: ~3020
-        // bytes; multimodal requires enums add ~200. Keep this low enough that
-        // the seed blob cannot return.
-        assert!(len < 3300, "task schema serialized to {len} bytes");
+        // Closed `budget` and `seed_reads.args` wire schemas add ~2 KiB over the
+        // former open-object shortcut. Keep this low enough that the old seed
+        // blob cannot return.
+        assert!(len < 5200, "task schema serialized to {len} bytes");
     }
 
     #[test]

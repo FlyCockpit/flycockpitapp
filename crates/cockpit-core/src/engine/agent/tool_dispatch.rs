@@ -2504,23 +2504,14 @@ async fn execute_ordinary_call_unscoped(
                 .all(|part| !part.is_media_reference()))
         .then(|| serde_json::to_value(output.content.parts()))
     });
-    let canonical_history_output = result.as_ref().ok().and_then(|output| {
+    let canonical_history_output = model_result_contents.as_ref().and_then(|projected| {
         (!hard_fail
-            && output.content.has_non_text_content()
-            && output
-                .content
+            && projected.has_non_text_content()
+            && projected
                 .parts()
                 .iter()
-                .all(|part| !part.is_media_reference())
-            && output_str == output.content.model_text())
-        .then(|| {
-            serde_json::to_value(
-                model_result_contents
-                    .as_ref()
-                    .unwrap_or(&output.content)
-                    .parts(),
-            )
-        })
+                .all(|part| !part.is_media_reference()))
+        .then(|| serde_json::to_value(projected.parts()))
     });
     let event_canonical_output = match event_canonical_output.transpose() {
         Ok(output) => output,
@@ -2569,6 +2560,9 @@ async fn execute_ordinary_call_unscoped(
     }
     if let Some(canonical_output_text) = &canonical_history_text {
         event_data["canonical_output_text"] = canonical_output_text.clone().into();
+    }
+    if let Some(model_canonical_output) = &canonical_history_output {
+        event_data["model_canonical_output"] = model_canonical_output.clone();
     }
     if result.as_ref().ok().is_some_and(|output| {
         output.display_content.is_some()
@@ -3040,6 +3034,9 @@ async fn execute_ordinary_call_unscoped(
         if let Some(canonical_output_text) = &canonical_history_text {
             completed_data["canonical_output_text"] = canonical_output_text.clone().into();
         }
+        if let Some(model_canonical_output) = &canonical_history_output {
+            completed_data["model_canonical_output"] = model_canonical_output.clone();
+        }
         if let Some(completed_data) = completed_data.as_object_mut() {
             completed_data.extend(result_metadata.clone());
         }
@@ -3332,25 +3329,36 @@ async fn execute_ordinary_call_unscoped(
             }
         }
     } else {
-        let wire_contents = match &result {
-            Ok(output)
-                if !hard_fail
-                    && wire_output
-                        == model_result_contents
-                            .as_ref()
-                            .unwrap_or(&output.content)
-                            .model_text()
-                    && model_result_contents
-                        .as_ref()
-                        .unwrap_or(&output.content)
-                        .parts()
-                        .iter()
-                        .all(|part| !part.is_media_reference()) =>
-            {
-                model_result_contents
-                    .as_ref()
-                    .unwrap_or(&output.content)
-                    .to_rig_contents()?
+        let wire_contents = match result.as_ref() {
+            Ok(output) if !hard_fail => {
+                let structured = model_result_contents.as_ref().unwrap_or(&output.content);
+                if structured
+                    .parts()
+                    .iter()
+                    .all(|part| !part.is_media_reference())
+                {
+                    if structured.has_non_text_content() {
+                        let mut contents = structured.to_rig_contents()?;
+                        let base = structured.model_text();
+                        if wire_output.starts_with(base) {
+                            let suffix = &wire_output[base.len()..];
+                            if !suffix.is_empty() {
+                                contents.push(rig::message::ToolResultContent::text(
+                                    suffix.to_string(),
+                                ));
+                            }
+                        } else if wire_output != base {
+                            contents = vec![rig::message::ToolResultContent::text(wire_output)];
+                        }
+                        contents
+                    } else if wire_output == structured.model_text() {
+                        structured.to_rig_contents()?
+                    } else {
+                        vec![rig::message::ToolResultContent::text(wire_output)]
+                    }
+                } else {
+                    vec![rig::message::ToolResultContent::text(wire_output)]
+                }
             }
             _ => vec![rig::message::ToolResultContent::text(wire_output)],
         };

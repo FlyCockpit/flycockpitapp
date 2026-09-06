@@ -74,9 +74,12 @@ pub fn elide_applied_write_edit_args_with_upcoming(
     history: &mut [Message],
     upcoming_result: Option<&Message>,
 ) -> usize {
-    // Applied-marker projection is audit-independent. Signed-turn canonical
-    // reconciliation runs only through [`reconcile_deferred_signed_turns_and_elide`].
-    elide_applied_write_edit_args_except(history, upcoming_result, &HashSet::new())
+    // A settled signed turn may still carry a repaired tool name or arguments
+    // from dispatch. Its canonical audit row is the only source of truth for
+    // that repair, so ordinary dispatch must leave it intact until inference
+    // performs the reconciliation below. Unsigned calls remain audit-free.
+    let deferred = deferred_signed_write_edit_call_ids(history, upcoming_result);
+    elide_applied_write_edit_args_except(history, upcoming_result, &deferred)
 }
 
 fn elide_applied_write_edit_args_except(

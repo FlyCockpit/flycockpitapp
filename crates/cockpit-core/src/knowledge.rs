@@ -5831,6 +5831,12 @@ pub(crate) async fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str)
     Ok(())
 }
 
+/// User-visible denial when MCP must stay fenced for a configured local KB.
+/// Keep the historical fence wording as the leading clause (older MCP-fence
+/// tests pin it) while also naming the configured local knowledge base
+/// explicitly.
+const MCP_HOST_ACCESS_DENIED: &str = "access denied: MCP is unavailable because this workspace contains a local knowledge base with a filesystem fence; a configured local knowledge base cannot be reached through MCP";
+
 /// Reject MCP server access whenever a local KB is configured. A configured
 /// server is arbitrary host code and an opaque tool call cannot prove that it
 /// will not mutate an attached KB, so this fences the connection boundary
@@ -5846,9 +5852,7 @@ async fn ensure_mcp_host_access_for_session(
     {
         return Ok(());
     }
-    bail!(
-        "access denied: MCP is unavailable because this workspace contains a local knowledge base with a filesystem fence"
-    );
+    bail!("{MCP_HOST_ACCESS_DENIED}");
 }
 
 pub(crate) async fn ensure_mcp_host_access(ctx: &ToolCtx) -> Result<()> {
@@ -5871,12 +5875,7 @@ pub(crate) fn configured_mcp_host_access_denial(ctx: &ToolCtx) -> Option<String>
             .knowledge_bases
             .iter()
             .any(|entry| matches!(&entry.source, KnowledgeBaseSource::Local { .. }));
-    fenced.then(|| {
-        // Keep the historical fence wording as the leading clause (the
-        // older MCP-fence tests pin it) while also naming the configured
-        // local knowledge base explicitly.
-        "access denied: MCP is unavailable because this workspace contains a local knowledge base with a filesystem fence; a configured local knowledge base cannot be reached through MCP".to_string()
-    })
+    fenced.then(|| MCP_HOST_ACCESS_DENIED.to_string())
 }
 
 /// Resolve a workspace-local KB to the filesystem object that owns it.

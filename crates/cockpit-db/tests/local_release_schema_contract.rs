@@ -1118,6 +1118,32 @@ fn collect_production_rust_sources(directory: &Path, sources: &mut Vec<PathBuf>)
     }
 }
 
+/// Cheap raw-text prefilter for the image state-write AST audit. Every
+/// condition the auditors can flag requires one of these substrings in the
+/// raw source: a transition-validator identifier (matched verbatim by
+/// `image_family`), a conditional-edge constant, or an `image_generation_*`
+/// state-table name (the SQL markers normalize whitespace between tokens,
+/// so the table identifier itself must appear contiguously — in any letter
+/// case, since the macro audit uppercases). A file that mentions none of
+/// them cannot fail the audit, so it does not need a `syn` parse. This keeps
+/// the repo-wide boundary scan linear in source bytes instead of paying a
+/// full AST parse for every production file in the repository.
+fn mentions_image_state_families(source: &str) -> bool {
+    let lowered = source.to_ascii_lowercase();
+    [
+        "image_generation_",
+        "job_transition_allowed",
+        "slot_transition_allowed",
+        "attempt_transition_allowed",
+        "artifact_transition_allowed",
+        "artifact_component_transition_allowed",
+        "image_job_conditional_edges",
+        "image_slot_conditional_edges",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
 fn assert_repo_wide_image_state_write_boundary(image_source_path: &Path) {
     let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1134,6 +1160,9 @@ fn assert_repo_wide_image_state_write_boundary(image_source_path: &Path) {
     for path in sources {
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+        if !mentions_image_state_families(&source) {
+            continue;
+        }
         let trusted = path
             .canonicalize()
             .is_ok_and(|candidate| candidate == canonical_owner);
@@ -2106,12 +2135,16 @@ fn applied_profile_inventory(
                 "profile object {kind} {name} has absent owning table {owning_table}"
             );
         }
+        // Tokenize the object's SQL once and probe the classified tables
+        // against the token set. Re-splitting the SQL per classified table is
+        // quadratic in contract-test runtime for the same membership answer.
+        let sql_tokens: std::collections::BTreeSet<&str> = sql
+            .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+            .collect();
         for classified_table in ownership.keys() {
-            let referenced = sql
-                .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
-                .any(|token| token == classified_table);
             assert!(
-                !referenced || tables.contains(classified_table),
+                !sql_tokens.contains(classified_table.as_str())
+                    || tables.contains(classified_table),
                 "profile object {kind} {name} references absent table {classified_table}"
             );
         }

@@ -172,6 +172,18 @@ impl IsolatedHome {
             ),
         )
         .expect("write integration provider config");
+        // The loopback scripted providers are free to run, but the delegation
+        // budget ledger treats unpriced token usage as fail-closed under a
+        // finite cost ceiling (issue #313). Model them with a legitimate $0
+        // price row so multi-round scripts charge real (zero-cost) usage
+        // instead of tripping `budget exhausted (cost)` after round one.
+        let prices_home = self._root.path().join(".cockpit");
+        std::fs::create_dir_all(&prices_home).expect("create isolated prices dir");
+        std::fs::write(
+            prices_home.join("prices.json"),
+            r#"{"scripted": {}, "fallback": {}}"#,
+        )
+        .expect("write integration prices.json");
     }
 
     /// Merge mouse-copy TUI flags into the isolated `config.json` written by
@@ -452,6 +464,10 @@ pub fn output_text(output: &Output) -> String {
     )
 }
 
+/// Window in which a freshly started/restarted daemon must record its pid
+/// receipt. After a live owner is observed, the handshake wait is driven by
+/// the owner's liveness and the socket hello, not by these budgets — see
+/// [`wait_for_status_handshake`].
 const DAEMON_START_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
 const DAEMON_RESTART_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -501,19 +517,8 @@ fn socket_answers_hello(socket: &Path) -> bool {
 
 fn handshake_debug(home: &IsolatedHome) -> String {
     let pid_raw = std::fs::read_to_string(home.pid_file()).ok();
-    let pid = pid_raw
-        .as_deref()
-        .and_then(|value| value.trim().parse::<u32>().ok());
-    let live = {
-        #[cfg(unix)]
-        {
-            pid.map(pid_is_live)
-        }
-        #[cfg(not(unix))]
-        {
-            None::<bool>
-        }
-    };
+    let pid = cockpit_host::daemon_lifecycle::read_pid_file(&home.pid_file());
+    let live = pid.map(cockpit_host::daemon_lifecycle::process_exists);
     let socket = home.socket_path();
     let log = home.log_file();
     let log_bytes = std::fs::metadata(&log).ok().map(|meta| meta.len());
@@ -530,16 +535,54 @@ fn handshake_debug(home: &IsolatedHome) -> String {
     )
 }
 
+/// Wait for the daemon's status handshake using explicit completion signals
+/// rather than a wall-clock budget.
+///
+/// Boot cost is unbounded on a loaded machine (SQLite durability makes every
+/// boot transaction an fsync, and a full workspace test run saturates the
+/// disk), so a fixed deadline only converts slow machines into flaky tests.
+/// The signals are:
+///
+/// * the socket answers its hello line — proceed;
+/// * a daemon pid recorded in the pid file goes live → dead without ever
+///   publishing a hello — the daemon failed to boot; fail immediately;
+/// * a dead pid we never observed live is a stale record (e.g. left behind by
+///   a SIGKILLed owner while its replacement is still starting) — keep
+///   waiting for a live owner.
+///
+/// `timeout` bounds only the window in which no owner was ever observed; once
+/// a live owner is seen, the wait is patient for as long as that owner lives.
 async fn wait_for_status_handshake(home: &IsolatedHome, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
+    let no_owner_deadline = Instant::now() + timeout;
     let mut delay = Duration::from_millis(20);
+    let mut last_live_pid: Option<u32> = None;
     loop {
         if socket_answers_hello(&home.socket_path()) {
             break;
         }
+        let recorded_pid = cockpit_host::daemon_lifecycle::read_pid_file(&home.pid_file());
+        let owner_progressing = match recorded_pid {
+            Some(pid) if cockpit_host::daemon_lifecycle::process_exists(pid) => {
+                last_live_pid = Some(pid);
+                true
+            }
+            Some(pid) if last_live_pid == Some(pid) => {
+                // The owner we watched booted partway and exited without ever
+                // publishing its socket. That is a real boot failure, not
+                // slowness — fail now with the boot log.
+                panic!(
+                    "daemon pid {pid} exited before publishing its status handshake\n{}",
+                    handshake_debug(home)
+                );
+            }
+            // Absent pid file, or a record naming a pid we never observed
+            // live (a stale record left behind by a SIGKILLed owner while its
+            // replacement is still starting): keep waiting for a live owner.
+            _ => false,
+        };
         assert!(
-            Instant::now() < deadline,
-            "timed out waiting for daemon status handshake\n{}",
+            owner_progressing || Instant::now() < no_owner_deadline,
+            "timed out waiting for a live daemon owner to publish its status handshake\n{}",
             handshake_debug(home)
         );
         tokio::time::sleep(delay).await;

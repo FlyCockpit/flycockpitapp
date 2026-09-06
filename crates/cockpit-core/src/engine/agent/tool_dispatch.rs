@@ -2795,7 +2795,9 @@ async fn execute_ordinary_call_unscoped(
                             }
                         }
                         admission => {
-                            if let Err(error) = crate::text_artifact_blob::remove(&blob_path) {
+                            if let Some(ref blob_path) = blob_path
+                                && let Err(error) = crate::text_artifact_blob::remove(blob_path)
+                            {
                                 tracing::error!(%error, %blob_path, "rejected tool artifact blob cleanup failed");
                             }
                             let reason = match admission {
@@ -2836,7 +2838,9 @@ async fn execute_ordinary_call_unscoped(
             }
             Err(error) => {
                 for (candidate, blob_path) in staged {
-                    if let Err(cleanup_error) = crate::text_artifact_blob::remove(&blob_path) {
+                    if let Some(ref blob_path) = blob_path
+                        && let Err(cleanup_error) = crate::text_artifact_blob::remove(blob_path)
+                    {
                         tracing::error!(%cleanup_error, %blob_path, "failed tool artifact blob cleanup after database error");
                     }
                     match candidate.relation {

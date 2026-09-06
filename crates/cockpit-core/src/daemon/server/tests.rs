@@ -21195,6 +21195,7 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "compact"
             | "resume_from_compaction"
             | "pin"
+            | "promote_conversation_rule"
             | "refresh_env"
             | "refresh_config"
             | "refresh_host_capabilities"
@@ -24581,6 +24582,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
         },
         "prune" => Request::Prune,
         "compact" => Request::Compact,
+        "resume_from_compaction" => Request::ResumeFromCompaction,
         "pin" => Request::Pin {
             text: "remember this".into(),
         },

@@ -3407,6 +3407,23 @@ mod tests {
             .await
             .expect("trust project");
 
+        // The in-process daemon resolves the production config source, so the
+        // socket Attach below needs a selectable default model. Publish one
+        // in the isolated home's canonical global config layer
+        // (`{root}/home/.config/cockpit`).
+        let global_cockpit = harness.state_home.join("home/.config/cockpit");
+        std::fs::create_dir_all(global_cockpit.join("providers")).expect("global providers dir");
+        std::fs::write(
+            global_cockpit.join("config.json"),
+            r#"{"active_model":{"provider":"lmstudio","model":"ephemeral-owner-model"}}"#,
+        )
+        .expect("global active model");
+        std::fs::write(
+            global_cockpit.join("providers/lmstudio.json"),
+            r#"{"url":"http://127.0.0.1:9/v1","models":[{"id":"ephemeral-owner-model"}]}"#,
+        )
+        .expect("global provider fixture");
+
         let paths = harness.ephemeral_paths("two-socket-clients");
         // The in-process daemon boots without a spawn-time launch ticket, so
         // issue #337's per-peer authority would otherwise deny these socket

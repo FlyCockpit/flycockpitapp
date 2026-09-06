@@ -460,9 +460,10 @@ BEGIN
 END;
 
 -- ---- typed media attachments ----------------------------------------------
--- Full-range monotonic values are canonical decimal text because SQLite's
--- INTEGER is signed i64. Application codecs reject zero, leading zeroes and
--- values outside u64 before any mutation.
+-- Monotonic versions, generations, and byte lengths are positive integers
+-- bounded by SQLite's signed i64. Application codecs reject zero and values
+-- outside i64 before any mutation, so a value at the i64 ceiling is the
+-- overflow boundary (see AvailabilityGenerationOverflow in the discard path).
 CREATE TABLE media_attachments (
     attachment_id                  TEXT PRIMARY KEY CHECK (
         length(attachment_id) = 36 AND attachment_id = lower(attachment_id)
@@ -6679,6 +6680,10 @@ CREATE INDEX idx_external_journal_queue_queued
 CREATE INDEX idx_external_journal_queue_terminal_retention
     ON external_journal_queue_entries (updated_at_wall_ms)
     WHERE state IN ('cancelled', 'expired', 'journaled');
+-- Reviewed leading index for the journaled-operation FK: resolution scans
+-- queue entries by their durable journal operation without a state filter.
+CREATE INDEX idx_external_journal_queue_journal_operation
+    ON external_journal_queue_entries (journal_operation_id);
 
 -- Session deletion tombstone. Writing one never deletes an unresolved
 -- operation; resolution afterwards emits owner-visible recovery status
@@ -8170,6 +8175,8 @@ CREATE TABLE onboarding_agent_publication_journals (
     previous_default_installation_id TEXT REFERENCES agent_installations(installation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     created_at_unix_ms           INTEGER NOT NULL
 );
+CREATE INDEX idx_onboarding_agent_publication_journals_previous
+    ON onboarding_agent_publication_journals (previous_default_installation_id);
 
 CREATE TABLE installation_continuations (
     continuation_token           TEXT PRIMARY KEY,

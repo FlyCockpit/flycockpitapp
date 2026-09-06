@@ -93,12 +93,12 @@ fn assert_launch_graph(launcher: &HermeticCockpit, profile: HermeticProfile) {
     );
     assert_eq!(
         spec.config_dir(),
-        spec.home().join(".config").join("cockpit"),
-        "config is discovered at HOME/.config/cockpit/"
+        spec.xdg_config_home().join("cockpit"),
+        "config is discovered at XDG_CONFIG_HOME/cockpit/"
     );
     assert!(
         spec.config_dir().join("config.json").is_file(),
-        "isolated config.json must exist at HOME/.config/cockpit/"
+        "isolated config.json must exist at XDG_CONFIG_HOME/cockpit/"
     );
     assert_eq!(spec.profile(), profile);
 

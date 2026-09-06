@@ -2344,7 +2344,10 @@ impl super::Db {
             let live:i64=conn.query_row("SELECT (SELECT COUNT(*) FROM media_attachment_references WHERE attachment_id=?1 AND released_at_unix_ms IS NULL)+(SELECT COUNT(*) FROM media_attachment_component_leases WHERE attachment_id=?1 AND released_at_unix_ms IS NULL)",[request.attachment_id.to_string()],|row|row.get(0))?;
             if live > 0 {
                 Some(MediaDiscardReasonV1::MediaAttachmentInUse)
-            } else if record.availability_generation == u64::MAX {
+            } else if record.availability_generation == i64::MAX as u64 {
+                // Generation columns are INTEGER (signed i64); a record at the
+                // storage ceiling cannot be advanced by one, so discard reports
+                // overflow instead of failing the compare-and-swap.
                 Some(MediaDiscardReasonV1::AvailabilityGenerationOverflow)
             } else {
                 None
@@ -3259,12 +3262,12 @@ mod tests {
             canonical_container: "png".into(),
             canonical_mime: "image/png".into(),
             availability: MediaAvailability::Quarantined,
-            attachment_version: u64::MAX,
+            attachment_version: i64::MAX as u64,
             availability_generation: 1,
             reference_generation: 1,
-            captured_capability_generation: u64::MAX,
+            captured_capability_generation: i64::MAX as u64,
             source_identity_digest: "22".repeat(32),
-            source_byte_length: u64::MAX,
+            source_byte_length: i64::MAX as u64,
             source_sha256: "33".repeat(32),
             selected_video_stream: None,
             selected_audio_stream: None,
@@ -3297,9 +3300,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!loaded.availability.is_ready());
-        assert_eq!(loaded.attachment_version, u64::MAX);
-        assert_eq!(loaded.source_byte_length, u64::MAX);
-        assert_eq!(loaded.captured_capability_generation, u64::MAX);
+        assert_eq!(loaded.attachment_version, i64::MAX as u64);
+        assert_eq!(loaded.source_byte_length, i64::MAX as u64);
+        assert_eq!(loaded.captured_capability_generation, i64::MAX as u64);
     }
 
     #[tokio::test]
@@ -3556,7 +3559,7 @@ mod tests {
         let in_use = Uuid::now_v7();
         let overflow = Uuid::now_v7();
         let reference_id = Uuid::now_v7();
-        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms)VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;for id in [applied,in_use,overflow]{super::super::Db::insert_media_attachment_conn(conn,&make(id))?;}for (generation,state) in [MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,MediaAvailability::Ready].into_iter().enumerate(){super::super::Db::transition_media_attachment_conn(conn,in_use,1,u64::try_from(generation)?+1,state,2)?;}let project_digest="11".repeat(32);super::super::Db::acquire_media_reference_conn(conn,AcquireMediaReferenceInput { reference_id,attachment_id:in_use,expected_version:1,session_id:session,project_digest:&project_digest,consumer_kind:MediaReferenceConsumerKind::Message,consumer_id:"message",now_unix_ms:2 })?;conn.execute("UPDATE media_attachments SET availability_generation=?1 WHERE attachment_id=?2",params![u64::MAX.to_string(),overflow.to_string()])?;Ok(())}).await.unwrap();
+        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms)VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;for id in [applied,in_use,overflow]{super::super::Db::insert_media_attachment_conn(conn,&make(id))?;}for (generation,state) in [MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,MediaAvailability::Ready].into_iter().enumerate(){super::super::Db::transition_media_attachment_conn(conn,in_use,1,u64::try_from(generation)?+1,state,2)?;}let project_digest="11".repeat(32);super::super::Db::acquire_media_reference_conn(conn,AcquireMediaReferenceInput { reference_id,attachment_id:in_use,expected_version:1,session_id:session,project_digest:&project_digest,consumer_kind:MediaReferenceConsumerKind::Message,consumer_id:"message",now_unix_ms:2 })?;conn.execute("UPDATE media_attachments SET availability_generation=?1 WHERE attachment_id=?2",params![i64::MAX.to_string(),overflow.to_string()])?;Ok(())}).await.unwrap();
         let request = |id, availability, reference| DiscardUnreferencedMediaAttachmentV1 {
             schema_version: 1,
             kind: "discardUnreferencedMediaAttachment".into(),
@@ -3577,7 +3580,7 @@ mod tests {
                     )?,
                     super::super::Db::discard_unreferenced_media_attachment_conn(
                         conn,
-                        &request(overflow, u64::MAX, 1),
+                        &request(overflow, i64::MAX as u64, 1),
                         3,
                     )?,
                     super::super::Db::discard_unreferenced_media_attachment_conn(

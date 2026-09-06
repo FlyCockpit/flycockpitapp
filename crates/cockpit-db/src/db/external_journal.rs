@@ -3669,6 +3669,12 @@ mod tests {
         let mut cursor = 0usize;
         while let Some(offset) = production_sessions[cursor..].find("delete_subtree_rows_conn(") {
             let index = cursor + offset;
+            cursor = index + 1;
+            // The primitive's own `fn` definition is not a call site — prose
+            // and definitions are not code (see `in_line_comment`).
+            if production_sessions[..index].trim_end().ends_with("fn") {
+                continue;
+            }
             let only_from_delete_fn = production_sessions[..index]
                 .rfind("pub fn delete_session_conn")
                 .map(|start| production_sessions[start..index].matches("\n}").count() == 0)
@@ -3677,7 +3683,6 @@ mod tests {
                 only_from_delete_fn,
                 "delete_subtree_rows_conn must be called only from delete_session_conn"
             );
-            cursor = index + 1;
         }
 
         // Writing the tombstone in the same *function* is not enough: under

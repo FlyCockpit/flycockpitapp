@@ -252,6 +252,29 @@ fn key_in_parens(tokens: &[Token], open: usize) -> Key {
                     name(part.get(2)).expect("ifnull/coalesce key term requires a column"),
                     part.len(),
                 )
+            } else if matches!(word(part.first()).as_deref(), Some("substr"))
+                && matches!(part.get(1), Some(Token::Mark('(')))
+                && matches!(part.get(3), Some(Token::Mark(',')))
+                && matches!(part.get(5), Some(Token::Mark(',')))
+                && matches!(part.get(7), Some(Token::Mark(')')))
+                && part.len() == 8
+                && word(part.get(2)).is_some()
+                && part
+                    .get(4)
+                    .is_some_and(|token| matches!(token, Token::Literal(_) | Token::Word(_)))
+                && part
+                    .get(6)
+                    .is_some_and(|token| matches!(token, Token::Literal(_) | Token::Word(_)))
+            {
+                // `substr(col, n, m)` is the reviewed authenticated-body
+                // projection used by the #308 fold-time retention uniqueness
+                // index. Exactly three scalar arguments (column plus two
+                // literal offsets) are accepted; every other shape stays
+                // rejected.
+                (
+                    name(part.get(2)).expect("substr key term requires a column"),
+                    part.len(),
+                )
             } else {
                 (
                     name(part.first()).expect("key term must start with an identifier"),
@@ -1386,6 +1409,7 @@ mod tests {
         for sql in [
             "CREATE TABLE t(a INTEGER, b INTEGER); CREATE INDEX t_i ON t(ifnull(a, b));",
             "CREATE TABLE t(a INTEGER, b INTEGER); CREATE INDEX t_c ON t(coalesce(a, b));",
+            "CREATE TABLE t(a BLOB); CREATE INDEX t_s ON t(substr(a, 6, 1));",
         ] {
             let schema = parse(&[sql]);
             assert_eq!(schema.indexes.len(), 1);

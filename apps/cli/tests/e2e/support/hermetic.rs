@@ -309,6 +309,11 @@ impl HermeticLaunchSpec {
         &self.executable
     }
 
+    /// The isolated `XDG_CONFIG_HOME` every launch path exports to children.
+    pub fn xdg_config_home(&self) -> &Path {
+        &self.xdg_config_home
+    }
+
     pub fn home(&self) -> &Path {
         &self.home
     }

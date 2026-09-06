@@ -2083,6 +2083,15 @@ async fn run_foreground_inner_with_boot_db(
     boot_db: Option<crate::db::Db>,
 ) -> Result<()> {
     let mut timer = crate::startup::PhaseTimer::start("daemon::run_foreground");
+    let boot_dbg_start = std::time::Instant::now();
+    macro_rules! boot_dbg {
+        ($phase:literal) => {
+            if std::env::var("COCKPIT_BOOT_DBG").is_ok() {
+                eprintln!("BOOT-DBG {} at {:?}", $phase, boot_dbg_start.elapsed());
+            }
+        };
+    }
+    boot_dbg!("entry");
     // The global config layer belongs to the user, not the workspace. Make it
     // durable and writable before a persistent daemon can accept onboarding
     // work. Ephemeral diagnostic owners (notably `cockpit doctor`) stay
@@ -2139,6 +2148,7 @@ async fn run_foreground_inner_with_boot_db(
     // The exclusive PID receipt is the starting reservation. Acquire it before
     // touching the shared socket so a losing concurrent starter cannot unlink
     // the winner's newly bound endpoint.
+    boot_dbg!("before_reserve");
     let pid_receipt = reclaim_stale_and_reserve(
         &paths.pid_file,
         &paths.socket,
@@ -2147,6 +2157,7 @@ async fn run_foreground_inner_with_boot_db(
         &executable,
     )
     .with_context(|| format!("reserving pid file {}", paths.pid_file.display()))?;
+    boot_dbg!("after_reserve");
     let mut metadata_guard = ForegroundMetadataGuard::new(
         paths.pid_file.clone(),
         paths.socket.clone(),
@@ -2173,19 +2184,24 @@ async fn run_foreground_inner_with_boot_db(
         }
         None => server::boot(paths.clone(), terminal_factory).await?,
     });
+    boot_dbg!("after_ctx_boot");
     if resume_all_sessions {
         resume_all_paused_sessions(&ctx.db).await?;
     }
+    boot_dbg!("after_resume");
     // Recovery is part of the socket-publication barrier. Neither the control
     // socket nor its reveal sibling may be observable while durable authority
     // is still being reconciled.
+    boot_dbg!("before_recover");
     server::recover_before_socket_publish(&ctx).await?;
     timer.phase("boot");
+    boot_dbg!("after_recover");
 
     // Do not expose a connectable socket until boot has completed. A client
     // that observes a bound socket expects the hello promptly; publishing it
     // before database/config initialization creates a startup handshake race.
     let listener = bind_private_socket(&paths.socket)?;
+    boot_dbg!("after_bind");
     if uses_supplied_boot_db {
         write_endpoint_record_with_receipt_and_canonical(&paths, &paths, &pid_receipt)?;
     } else {

@@ -518,7 +518,15 @@ async fn promote_live_ephemeral_owner(
     if discovered.status != crate::daemon::DaemonStatus::Running || discovered.paths.ephemeral {
         anyhow::bail!("daemon did not publish persistent ownership after promotion");
     }
-    let mut connected = attach_running_with_skew_check(discovered.paths, None).await?;
+    // Re-attach directly to the owner that just acknowledged the promotion.
+    // The skew-restart machinery in `attach_running_with_skew_check` is
+    // forbidden here: it probes the socket with an extra connection and may
+    // restart the daemon, contradicting the in-place contract this path just
+    // executed (same process keeps its socket, pid, and in-flight sessions).
+    // The connection above already negotiated an exact `PROTOCOL_VERSION`
+    // match, which is the wire compatibility gate; a binary-version skew is
+    // surfaced by ordinary attach paths, not by restarting a promoted owner.
+    let mut connected = connect_shared_running(discovered.paths, None).await?;
     connected.promoted_from_ephemeral = true;
     Ok(connected)
 }

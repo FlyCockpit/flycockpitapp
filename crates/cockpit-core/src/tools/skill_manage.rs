@@ -594,7 +594,17 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
-        let interrupt_id = interrupt_id.expect("skill_manage call did not raise an interrupt");
+        let Some(interrupt_id) = interrupt_id else {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), task).await {
+                Ok(joined) => panic!(
+                    "skill_manage call never raised an interrupt; task finished: {:?}",
+                    joined.map(|result| result.map(|out| out.content))
+                ),
+                Err(_still_running) => {
+                    panic!("skill_manage call never raised an interrupt; task still running")
+                }
+            }
+        };
         let error = task.await.unwrap().unwrap_err();
         assert!(crate::engine::interrupt::is_parked(&error));
         interrupt_id

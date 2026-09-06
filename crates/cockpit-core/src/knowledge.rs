@@ -5772,13 +5772,8 @@ pub(crate) async fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str)
         "deps",
         "graph",
         "hot",
-        "harness_invoke",
-        "harness_list",
-        // An MCP script can invoke any configured third-party server. The
-        // server's runtime capability is not knowable from the outer script,
-        // so this is an opaque host-filesystem proxy. The dedicated MCP gate
-        // below additionally fences every configured local KB, including
-        // attached sources that are readable through native tools.
+        // `harness_invoke` / `harness_list` are gated by
+        // `ensure_harness_cannot_reach_local_knowledge_bases` instead.
         "mcp",
         "search",
         "symbol_find",
@@ -5786,12 +5781,7 @@ pub(crate) async fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str)
         "word",
         "worktree_orchestrate",
     ];
-    const OPAQUE_WRITE_CAPABLE_HOST_TOOLS: &[&str] = &[
-        "harness_invoke",
-        "harness_list",
-        "lsp",
-        "worktree_orchestrate",
-    ];
+    const OPAQUE_WRITE_CAPABLE_HOST_TOOLS: &[&str] = &["lsp", "worktree_orchestrate"];
 
     if OPAQUE_WRITE_CAPABLE_HOST_TOOLS.contains(&tool_name)
         && local_knowledge_write_fence_active(&ctx.session, &ctx.cwd, &ctx.config.extended()).await
@@ -5826,7 +5816,7 @@ async fn ensure_mcp_host_access_for_session(
         return Ok(());
     }
     bail!(
-        "access denied: MCP is unavailable because this workspace contains a local knowledge base with a filesystem fence"
+        "access denied: MCP is unavailable because this workspace contains a configured local knowledge base with a filesystem fence"
     );
 }
 
@@ -5851,7 +5841,7 @@ pub(crate) fn configured_mcp_host_access_denial(ctx: &ToolCtx) -> Option<String>
             .iter()
             .any(|entry| matches!(&entry.source, KnowledgeBaseSource::Local { .. }));
     fenced.then(|| {
-        "access denied: MCP is unavailable because this workspace contains a local knowledge base with a filesystem fence".to_string()
+        "access denied: MCP is unavailable because this workspace contains a configured local knowledge base with a filesystem fence".to_string()
     })
 }
 

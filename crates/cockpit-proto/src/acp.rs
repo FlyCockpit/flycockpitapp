@@ -655,6 +655,13 @@ impl AcpForwardedMcpDeclarationV1 {
         }
         Ok(())
     }
+
+    /// Normalize declaration strings in place for bind-time equivalence.
+    /// Ingress validation uses [`Self::validate`]; catalog bind accepts
+    /// unicode-equivalent spellings after normalization.
+    pub fn normalize_in_place(&mut self) -> Result<(), String> {
+        self.normalize_and_validate()
+    }
 }
 
 impl AcpForwardedMcpIngressV1 {

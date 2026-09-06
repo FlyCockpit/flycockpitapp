@@ -440,12 +440,26 @@ async fn call_bash_inner(
         .collect::<Vec<_>>();
     let attached_knowledge_read = !attached_knowledge_paths.is_empty();
     let mut denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx).await?;
-    let write_denied_knowledge_paths = crate::knowledge::configured_local_knowledge_roots(
+    let mut write_denied_knowledge_paths = configured_local_knowledge_write_roots(ctx);
+    for root in crate::knowledge::configured_local_knowledge_roots(
         &ctx.session,
         &ctx.cwd,
         &ctx.config.extended(),
     )
-    .await;
+    .await
+    {
+        if !write_denied_knowledge_paths
+            .iter()
+            .any(|existing| existing == &root)
+        {
+            write_denied_knowledge_paths.push(root);
+        }
+    }
+    if let Some(message) =
+        refuse_configured_knowledge_shell_writes(command, &cwd, &write_denied_knowledge_paths)
+    {
+        return Ok(ToolOutput::text(message));
+    }
     crate::workspace_lease::ensure_shell_execution_allowed(ctx.workspace_lease.as_deref())
         .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
     let timeouts = normalize_bash_timeouts(&args);
@@ -1186,6 +1200,55 @@ pub(crate) enum ShellWriteTargets {
     None,
     Concrete(Vec<PathBuf>),
     Dynamic,
+}
+
+fn configured_local_knowledge_write_roots(ctx: &ToolCtx) -> Vec<PathBuf> {
+    ctx.config
+        .extended()
+        .knowledge_bases
+        .iter()
+        .filter_map(|entry| {
+            let crate::config::extended::KnowledgeBaseSource::Local { path } = &entry.source else {
+                return None;
+            };
+            Some(if path.is_absolute() {
+                path.clone()
+            } else {
+                ctx.cwd.join(path)
+            })
+        })
+        .collect()
+}
+
+fn refuse_configured_knowledge_shell_writes(
+    command: &str,
+    cwd: &Path,
+    write_denied_knowledge_paths: &[PathBuf],
+) -> Option<String> {
+    if write_denied_knowledge_paths.is_empty() {
+        return None;
+    }
+    match shell_write_targets(command, cwd) {
+        ShellWriteTargets::None => None,
+        ShellWriteTargets::Dynamic => Some(
+            "Error: shell commands with dynamic file targets cannot write while a configured local knowledge base is attached; use native file tools or a fixed path instead"
+                .to_string(),
+        ),
+        ShellWriteTargets::Concrete(targets) => {
+            for target in targets {
+                for root in write_denied_knowledge_paths {
+                    if cockpit_host::path_containment::contained_under(root, &target) {
+                        return Some(format!(
+                            "Error: cannot write `{}` because it is inside configured local knowledge base `{}`",
+                            target.display(),
+                            root.display()
+                        ));
+                    }
+                }
+            }
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

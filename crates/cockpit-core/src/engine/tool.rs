@@ -2669,6 +2669,7 @@ impl ToolBox {
             .filter(|(name, _)| !self.capability_unavailable.contains_key(*name))
             .filter_map(|(_name, entry)| {
                 crate::mcp::builtin::ToolOutputBuiltinAdapter::new(entry.tool.clone())
+                    .with_availability(Arc::new(|_| crate::mcp::builtin::Availability::available()))
                     .with_direct_call_marker(entry.directly_callable)
                     .into_function()
                     .ok()

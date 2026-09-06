@@ -94,6 +94,43 @@ pub const ID_GITIGNORE_REJECT: &str = ApprovalOptionId::GitignoreReject.as_str()
 /// beside the canonical approval-option vocabulary so a raw interrupt response
 /// can never turn a dismissal or unknown id into a final operation. A scoped
 /// reject is a durable host mutation, so it is selected and fenced too.
+/// Wrapper prompts label the once-only allow as "Approve once" but wire the
+/// canonical `approve` id. Headless clients and tests may still answer with
+/// `approve_once`; normalize that to the offered wrapper id before matching.
+fn normalize_selected_id_for_offered_prompt<'a>(
+    selected_id: &'a str,
+    options: &[InterruptOption],
+) -> &'a str {
+    if selected_id == ID_APPROVE_ONCE
+        && options.iter().any(|option| option.id == ID_APPROVE)
+        && !options.iter().any(|option| option.id == ID_APPROVE_ONCE)
+    {
+        ID_APPROVE
+    } else {
+        selected_id
+    }
+}
+
+pub(crate) fn normalize_host_approval_response(
+    response: &ResolveResponse,
+    offered: &InterruptQuestionSet,
+) -> ResolveResponse {
+    let ResolveResponse::Single { selected_id } = response else {
+        return response.clone();
+    };
+    let [InterruptQuestion::Single { options, .. }] = offered.questions.as_slice() else {
+        return response.clone();
+    };
+    let selected_id = normalize_selected_id_for_offered_prompt(selected_id, options);
+    if selected_id == response_single_id(response).unwrap_or(selected_id) {
+        response.clone()
+    } else {
+        ResolveResponse::Single {
+            selected_id: selected_id.to_string(),
+        }
+    }
+}
+
 pub(crate) fn host_approval_response_allows(
     response: &ResolveResponse,
     offered: &InterruptQuestionSet,
@@ -109,7 +146,8 @@ pub(crate) fn host_approval_response_allows(
     let [InterruptQuestion::Single { options, .. }] = offered.questions.as_slice() else {
         return false;
     };
-    let offered_here = options.iter().any(|option| option.id == *id);
+    let id = normalize_selected_id_for_offered_prompt(id, options);
+    let offered_here = options.iter().any(|option| option.id == id);
     if !offered_here {
         return false;
     }
@@ -965,6 +1003,14 @@ pub(crate) fn decode_option_response(
     };
     let Some(option) = ApprovalOptionId::from_str(id) else {
         return Err(ForeignOptionId::new(set, id));
+    };
+    let option = if option == ApprovalOptionId::ApproveOnce
+        && !set.contains(option)
+        && set.contains(ApprovalOptionId::Approve)
+    {
+        ApprovalOptionId::Approve
+    } else {
+        option
     };
     if !set.contains(option) {
         return Err(ForeignOptionId::new(set, id));

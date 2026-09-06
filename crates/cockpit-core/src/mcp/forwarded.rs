@@ -408,10 +408,11 @@ fn validate_and_convert(
     let mut by_name = BTreeMap::new();
     let mut normalized = Vec::with_capacity(declarations.len());
     for declaration in declarations {
+        let mut declaration = declaration.clone();
         declaration
-            .validate()
+            .normalize_in_place()
             .map_err(|_| anyhow::anyhow!("acp_mcp_invalid_declaration"))?;
-        let name: String = declaration.name.nfc().collect();
+        let name: String = declaration.name.clone();
         if name == super::builtin::BUILTIN_SERVER_ID || persistent_names.contains(&name) {
             bail!("acp_mcp_catalog_name_collision");
         }

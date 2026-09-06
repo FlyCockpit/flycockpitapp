@@ -14,12 +14,23 @@ impl Approver {
         let set = InterruptQuestionSet {
             questions: vec![question],
         };
+        let agent_instance_id =
+            if let Some(agent_instance_id) = crate::engine::agent::current_agent_instance_id() {
+                Some(agent_instance_id)
+            } else {
+                self.db
+                    .session_root_agent(self.session_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|root| root.agent_instance_id)
+            };
         Ok(crate::engine::interrupt::raise_and_wait_with_agent_tree(
             &self.db,
             &self.interrupts,
             self.session_id,
             &self.agent_id,
-            crate::engine::agent::current_agent_instance_id(),
+            agent_instance_id,
             description,
             set,
             // The caller has already classified and canonically bound the

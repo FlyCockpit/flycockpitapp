@@ -479,6 +479,7 @@ fn build_def() -> AgentDef {
             // write/lock set (arbitrated by the lock authority)
             "write",
             "edit",
+            "delete",
             "unlock",
             "schedule",
             "question",

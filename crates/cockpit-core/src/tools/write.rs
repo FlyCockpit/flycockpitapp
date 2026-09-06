@@ -38,7 +38,7 @@ impl Tool for WriteTool {
     }
 
     fn description(&self) -> &str {
-        "Write `content` as the file's COMPLETE new contents (omitted lines are deleted); `cockpit://session/<short_id>/plan` is the sole writable recall pseudofile; locking is automatic for host files"
+        "Write `content` as the file's COMPLETE new contents after `read`; omitted lines are deleted; prefer `edit` for partial changes; `cockpit://session/<short_id>/plan` is the sole writable recall pseudofile; locking is automatic for host files"
     }
 
     fn verbose_description(&self) -> Option<String> {
@@ -3837,6 +3837,12 @@ pub(crate) async fn authorize_existing_write(
     previous: &[u8],
     next: &[u8],
 ) -> Result<()> {
+    if matches!(
+        ctx.session.approval_mode(),
+        crate::config::extended::ApprovalMode::Yolo | crate::config::extended::ApprovalMode::Auto
+    ) {
+        return Ok(());
+    }
     let decision = if let Some(approver) = ctx.approver.as_ref() {
         approver
             .authorize(crate::approval::AuthorizationRequest::FileWrite {

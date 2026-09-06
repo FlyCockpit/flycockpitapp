@@ -466,18 +466,23 @@ async fn pseudofile_content(target: RecallPath, ctx: &ToolCtx) -> Result<Option<
                 .map(|doc| format!("[revision={}]\n{}", doc.revision, doc.content))
                 .unwrap_or_else(|| "[revision=0]\n".to_string()),
         )),
-        RecallPath::Artifact(session_id, artifact_id) => Ok(ctx
-            .session
-            .db
-            .text_artifact_for_reader_project_and_trust(
-                &ctx.session.project_id,
-                session_id,
-                artifact_id,
-                caller_history_trust(ctx),
-            )
-            .await?
-            .map(|artifact| crate::text_artifact_blob::read_artifact_content(&artifact))
-            .transpose()?),
+        RecallPath::Artifact(session_id, artifact_id) => {
+            if session_id != ctx.session.live_id() {
+                return Ok(None);
+            }
+            Ok(ctx
+                .session
+                .db
+                .text_artifact_for_reader_project_and_trust(
+                    &ctx.session.project_id,
+                    session_id,
+                    artifact_id,
+                    caller_history_trust(ctx),
+                )
+                .await?
+                .map(|artifact| crate::text_artifact_blob::read_artifact_content(&artifact))
+                .transpose()?)
+        }
     }
 }
 

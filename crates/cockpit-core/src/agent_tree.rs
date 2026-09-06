@@ -5645,6 +5645,7 @@ impl HostApprovalAuthority {
                 crate::db::needs_attention::InterruptState::Open
                     | crate::db::needs_attention::InterruptState::Parked
                     | crate::db::needs_attention::InterruptState::Executing
+                    | crate::db::needs_attention::InterruptState::Resolved
             ),
             "host approval interrupt is no longer live"
         );

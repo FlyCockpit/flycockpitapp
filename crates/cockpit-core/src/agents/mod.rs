@@ -534,6 +534,9 @@ pub fn apply_tool_surface_override(
     let mut candidate = def.clone();
     candidate.tools = Some(selection.tools.clone());
     candidate.tool_tiers = selection.tool_tiers.clone();
+    candidate
+        .tool_descriptions
+        .retain(|tool, _| selection.tools.iter().any(|granted| granted == tool));
     if def.vnext.is_some() {
         validate_host_tool_surface(&candidate)?;
     } else {

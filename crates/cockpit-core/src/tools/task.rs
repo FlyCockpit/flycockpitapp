@@ -70,7 +70,7 @@ impl TaskTool {
             })
             .unwrap_or_default();
         let description = format!(
-            "Delegate {list}: `intent` plus optional `payload`; separate calls get task IDs, `batch` groups/depends_on work. Use @file, @file:XX-YY, @dir/, or /skill. Backgrounded JSON: task_call_id controls.{recursion_note}"
+            "Delegate {list}: `intent` + `payload`; separate calls get task IDs, `batch` grouped work. Use @file, @file:XX-YY, @dir/, /skill. Backgrounded JSON: task_call_id controls.{recursion_note}"
         );
         // Verbose steering: decompose harder and
         // route narrow pieces through subagents so each does one focused job
@@ -138,6 +138,38 @@ impl TaskTool {
         // against the named tool's real schema, so embedding per-tool schemas
         // here would only duplicate (and drift from) them while blowing the
         // task-definition byte budget.
+        let spend_limit = serde_json::json!({
+            "oneOf": [
+                { "type": "integer", "minimum": 0 },
+                { "type": "string", "enum": ["unlimited"] }
+            ]
+        });
+        let budget_overlay_schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "maxRounds": spend_limit.clone(),
+                "maxInputTokens": spend_limit.clone(),
+                "maxOutputTokens": spend_limit.clone(),
+                "maxCostMicrousd": spend_limit.clone(),
+                "maxWallClockSecs": spend_limit
+            },
+            "description": "Optional per-delegation spend overlay (maxRounds, maxInputTokens, maxOutputTokens, maxCostMicrousd, maxWallClockSecs). Values are finite integers or \"unlimited\"."
+        });
+        let seed_read_args_schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "path": { "type": "string" },
+                "pattern": { "type": "string" },
+                "query": { "type": "string" },
+                "symbol": { "type": "string" },
+                "glob": { "type": "string" },
+                "cwd": { "type": "string" },
+                "offset": { "type": "integer" },
+                "limit": { "type": "integer" }
+            }
+        });
         let delegate_payload = serde_json::json!({
             "type": "object",
             "properties": {
@@ -190,7 +222,7 @@ impl TaskTool {
                         "type": "object",
                         "properties": {
                             "tool": { "type": "string", "enum": ["read", "grep", "code", "graph", "search"] },
-                            "args": { "type": "object" }
+                            "args": seed_read_args_schema
                         },
                         "required": ["tool", "args"],
                         "additionalProperties": false
@@ -208,10 +240,7 @@ impl TaskTool {
                     "type": "integer",
                     "minimum": 0
                 },
-                "budget": {
-                    "type": "object",
-                    "description": "Optional per-delegation spend overlay (maxRounds, maxInputTokens, maxOutputTokens, maxCostMicrousd, maxWallClockSecs). Values are finite integers or \"unlimited\"."
-                }
+                "budget": budget_overlay_schema.clone(),
             },
             "required": ["agent", "prompt"]
         });
@@ -266,10 +295,7 @@ impl TaskTool {
                     "type": "integer",
                     "minimum": 0
                 },
-                "budget": {
-                    "type": "object",
-                    "description": "Optional per-delegation spend overlay (maxRounds, maxInputTokens, maxOutputTokens, maxCostMicrousd, maxWallClockSecs). Values are finite integers or \"unlimited\"."
-                }
+                "budget": budget_overlay_schema.clone(),
             },
             "required": ["agent", "prompt"]
         });

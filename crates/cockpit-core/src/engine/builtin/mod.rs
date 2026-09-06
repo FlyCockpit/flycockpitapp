@@ -997,6 +997,42 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
             condition: Some("Requires an Owner-issued sealed-value action grant."),
         },
         BuiltinToolInventoryItem {
+            family: "Utility",
+            name: "capture_sealed_value",
+            summary: "Capture quarantined trusted-child command output by source tool-call reference.",
+            condition: Some(
+                "Trusted-child acquisition surface only; seals one bounded command result.",
+            ),
+        },
+        BuiltinToolInventoryItem {
+            family: "Utility",
+            name: "acquisition_requires_user",
+            summary: "Record that trusted-child acquisition needs user input before continuing.",
+            condition: Some("Trusted-child acquisition surface only; terminal acquisition move."),
+        },
+        BuiltinToolInventoryItem {
+            family: "Utility",
+            name: "acquisition_fail",
+            summary: "Record a terminal trusted-child acquisition failure without leaking command output.",
+            condition: Some("Trusted-child acquisition surface only; terminal acquisition move."),
+        },
+        BuiltinToolInventoryItem {
+            family: "Utility",
+            name: "acquire_sealed_value",
+            summary: "Delegate one trusted-child acquisition command and receive a sealed, requires-user, or failed outcome.",
+            condition: Some(
+                "Parent-agent dispatch only; intercepted before the trusted child runs.",
+            ),
+        },
+        BuiltinToolInventoryItem {
+            family: "Utility",
+            name: "run_acquisition_command",
+            summary: "Run one bounded trusted-child acquisition command and return quarantined output to the parent.",
+            condition: Some(
+                "Trusted-child acquisition surface only; never granted to ordinary agents.",
+            ),
+        },
+        BuiltinToolInventoryItem {
             family: "Media",
             name: "inspect_audio",
             summary: "Inspect bounded audio metadata.",
@@ -2860,6 +2896,11 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
             }
             crate::agents::apply_tool_surface_override(&mut effective_def, &selection)?;
         }
+        if let Some(tools) = &effective_def.tools {
+            effective_def
+                .tool_descriptions
+                .retain(|tool, _| tools.iter().any(|granted| granted == tool));
+        }
     }
     let def = &effective_def;
     let effective_vnext_grant = effective_vnext_grant_for(def, args)?;
@@ -3363,7 +3404,37 @@ fn recursive_targets(
 /// `code` role so a dual-role definition can serve as both a chat primary and
 /// a coding child. Shared by [`build_subagents`] and [`plan_subagents`].
 fn append_custom_subagents(out: &mut Vec<String>, cwd: &Path) {
-    for listing in crate::agents::list_all(cwd) {
+    let listings = if crate::config::trust::current_workspace_trust_policy().is_some() {
+        crate::agents::list_all(cwd)
+    } else if let Ok(root) = crate::config::trust::resolve_trust_root(cwd) {
+        crate::config::trust::with_workspace_trust_policy(
+            crate::config::trust::WorkspaceTrustPolicy {
+                root,
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            },
+            || crate::agents::list_all(cwd),
+        )
+    } else if cwd.join(".cockpit").is_dir() {
+        if let Ok(opened_path) = std::fs::canonicalize(cwd) {
+            let root = crate::config::trust::TrustRoot {
+                root: opened_path.clone(),
+                opened_path,
+                kind: crate::config::trust::TrustRootKind::Directory,
+            };
+            crate::config::trust::with_workspace_trust_policy(
+                crate::config::trust::WorkspaceTrustPolicy {
+                    root,
+                    mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+                },
+                || crate::agents::list_all(cwd),
+            )
+        } else {
+            crate::agents::list_all(cwd)
+        }
+    } else {
+        crate::agents::list_all(cwd)
+    };
+    for listing in listings {
         if !matches!(listing.kind, crate::agents::AgentKind::Custom) {
             continue;
         }
@@ -6151,7 +6222,15 @@ pub(crate) mod tests {
         assert_eq!(
             names,
             vec![
-                "bash", "edit", "mcp", "question", "read", "search", "unlock", "write",
+                "acquire_sealed_value",
+                "bash",
+                "edit",
+                "mcp",
+                "question",
+                "read",
+                "search",
+                "unlock",
+                "write",
             ]
         );
         assert!(

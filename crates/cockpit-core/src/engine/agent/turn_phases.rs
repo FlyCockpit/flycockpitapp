@@ -322,13 +322,15 @@ impl DeferredOrdinaryCall {
         let mut history = Vec::new();
         let result = super::tool_dispatch::with_scheduler_durable_order(
             self.durable_permit,
-            super::tool_dispatch::execute_ordinary_call(
-                &env,
-                &mut history,
-                &self.call,
-                &self.scheduled.resolved_name,
-                self.name_recovery,
-                self.text_recovery_marker,
+            crate::tools::trusted_child_acquisition::scope_inherited_acquisition_runtime(
+                super::tool_dispatch::execute_ordinary_call(
+                    &env,
+                    &mut history,
+                    &self.call,
+                    &self.scheduled.resolved_name,
+                    self.name_recovery,
+                    self.text_recovery_marker,
+                ),
             ),
         )
         .await;
@@ -888,13 +890,15 @@ impl DeferredTurnPlan {
             hooks: config_snapshot.hooks(),
         };
         let result_start = history.len();
-        super::tool_dispatch::execute_ordinary_call(
-            &env,
-            history,
-            tc,
-            &scheduled.resolved_name,
-            self.name_recoveries[scheduled.source_index].clone(),
-            text_recovery_marker,
+        crate::tools::trusted_child_acquisition::scope_inherited_acquisition_runtime(
+            super::tool_dispatch::execute_ordinary_call(
+                &env,
+                history,
+                tc,
+                &scheduled.resolved_name,
+                self.name_recoveries[scheduled.source_index].clone(),
+                text_recovery_marker,
+            ),
         )
         .await?;
         Ok(history[result_start..].to_vec())

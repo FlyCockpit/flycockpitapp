@@ -4496,6 +4496,8 @@ mod steering_tests {
             ("question", ToolEffect::Dynamic),
             ("raise", ToolEffect::Mutating),
             ("read", ToolEffect::ReadOnly),
+            ("acquire_sealed_value", ToolEffect::Mutating),
+            ("run_acquisition_command", ToolEffect::Dynamic),
             ("return", ToolEffect::Dynamic),
             ("schedule", ToolEffect::Dynamic),
             ("search", ToolEffect::Dynamic),

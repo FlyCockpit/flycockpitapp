@@ -104,6 +104,9 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("start_build"),
     ToolTimeoutSafety::abandon_safe("task"),
     ToolTimeoutSafety::abandon_safe("todo"),
+    ToolTimeoutSafety::abandon_safe("set_conversation_rule"),
+    ToolTimeoutSafety::abandon_safe("list_conversation_rules"),
+    ToolTimeoutSafety::abandon_safe("remove_conversation_rule"),
     // Journaled provider POST. Dispatcher drop does not cancel `ctx.cancel`
     // (that token is the turn). The tool clones a child token and cancels it
     // on drop so a detached send records `completed_after_cancel` instead of

@@ -193,7 +193,13 @@ fn update_imported_tool_projection_blob_path(
         .get_mut("provenance")
         .and_then(Value::as_object_mut)
         .ok_or_else(|| anyhow!("imported tool projection lacks object provenance"))?;
-    if Value::Object(provenance.clone()) != *original_provenance {
+    // The projection still carries the source machine's `blob_path` while
+    // `original_provenance` is the semantic provenance parse produced after
+    // discarding the artifact side's path. They must agree modulo that
+    // machine-local path; overwriting it below re-establishes exact equality.
+    let mut semantic_projection_provenance = provenance.clone();
+    semantic_projection_provenance.remove("blob_path");
+    if Value::Object(semantic_projection_provenance) != *original_provenance {
         bail!("imported tool projection provenance differs from its artifact");
     }
     provenance.insert("blob_path".to_owned(), Value::String(blob_path.to_owned()));
@@ -1125,15 +1131,35 @@ fn validate_tool_artifact_projection_state(
     let provenance = provenance
         .as_object()
         .ok_or_else(|| anyhow!("tool artifact projection provenance must be an object"))?;
-    let valid_provenance_keys = ["agent_id", "tool", "call_id", "source", "preview_lines"];
+    // `blob_path` is machine-local storage metadata: it may ride along in the
+    // durable projection (mirroring the DB/rehydrate contract) but always
+    // paired with the line-preview ingress markers (`source` + `preview_lines`)
+    // whose body the restage step recreates as a destination blob.
+    let valid_provenance_keys = [
+        "agent_id",
+        "tool",
+        "call_id",
+        "source",
+        "preview_lines",
+        "blob_path",
+    ];
     if !provenance.contains_key("agent_id")
         || !provenance.contains_key("tool")
         || !provenance.contains_key("call_id")
         || !provenance
             .keys()
             .all(|key| valid_provenance_keys.contains(&key.as_str()))
+        || (provenance.contains_key("blob_path")
+            && (!provenance.contains_key("source") || !provenance.contains_key("preview_lines")))
     {
         bail!("tool artifact projection provenance has an invalid shape");
+    }
+    if let Some(path) = provenance.get("blob_path")
+        && !path
+            .as_str()
+            .is_some_and(|path| path.starts_with("text-artifacts/") && !path.contains(".."))
+    {
+        bail!("tool artifact projection provenance blob_path is invalid");
     }
     if provenance.contains_key("source")
         && provenance.get("source").and_then(Value::as_str) != Some("tool_result")
@@ -1206,7 +1232,14 @@ fn validate_tool_artifact_projection_state(
             }
             let artifact_provenance: Value = serde_json::from_str(&artifact.provenance_json)
                 .context("parsing artifact provenance while validating projection state")?;
-            if artifact_provenance != Value::Object(provenance.clone()) {
+            // The archived projection still carries the source machine's
+            // `blob_path` while parse already discarded the artifact side's
+            // path as a non-portable disk reference. Compare the semantic
+            // provenance exactly; the restage step re-establishes byte-for-byte
+            // equality on both sides with a destination blob path.
+            let mut semantic_projection_provenance = provenance.clone();
+            semantic_projection_provenance.remove("blob_path");
+            if artifact_provenance != Value::Object(semantic_projection_provenance) {
                 bail!("available tool artifact projection provenance differs from its sidecar");
             }
             // Mirror the durable projection contract the DB layer enforces

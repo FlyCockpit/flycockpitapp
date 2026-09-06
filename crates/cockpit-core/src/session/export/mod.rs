@@ -1133,9 +1133,9 @@ fn build_zip_with_options_and_env_conn_with_redactor(
             } else {
                 "raw"
             };
+            let provenance: Value = serde_json::from_str(&entry.provenance_json)
+                .context("parsing text artifact provenance for export")?;
             if entry.relation == crate::db::text_artifacts::TextArtifactRelation::SourceUserInput {
-                let provenance: Value = serde_json::from_str(&entry.provenance_json)
-                    .context("parsing source artifact provenance for export")?;
                 let preview_lines = provenance
                     .get("preview_lines")
                     .and_then(Value::as_u64)
@@ -1160,11 +1160,34 @@ fn build_zip_with_options_and_env_conn_with_redactor(
                 let slot = entry
                     .projection_slot
                     .ok_or_else(|| anyhow!("tool artifact lacks an export projection slot"))?;
-                let (head, tail) = crate::engine::text_artifact_frame::utf8_preview_pair(&content);
-                exported_tool_artifact_previews.insert(
-                    (entry.session_id, entry.event_seq, slot),
-                    (head.to_owned(), tail.to_owned()),
-                );
+                // The durable projection contract (DB insert validation,
+                // import, rehydration) stores the selected ingress line
+                // preview with an empty tail for `preview_lines` artifacts
+                // and the 2KiB/2KiB UTF-8 pair for every other body. Restore
+                // the preview in that same shape from the exported body, or
+                // import rejects the projection as describing a different
+                // sidecar than the one beside it in the archive.
+                let (head, tail) = if provenance.get("preview_lines").is_some() {
+                    let preview_lines = provenance
+                        .get("preview_lines")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok())
+                        .filter(|value| *value > 0 && *value <= 10_000)
+                        .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES);
+                    (
+                        crate::engine::text_artifact_frame::utf8_preview_lines(
+                            &content,
+                            preview_lines,
+                        ),
+                        String::new(),
+                    )
+                } else {
+                    let (head, tail) =
+                        crate::engine::text_artifact_frame::utf8_preview_pair(&content);
+                    (head.to_owned(), tail.to_owned())
+                };
+                exported_tool_artifact_previews
+                    .insert((entry.session_id, entry.event_seq, slot), (head, tail));
             }
             let index_entry = json!({
                 "artifact_id": entry.artifact_id.to_string(),
@@ -1174,7 +1197,7 @@ fn build_zip_with_options_and_env_conn_with_redactor(
                 "projection_slot": entry.projection_slot,
                 "kind": entry.kind,
                 "capture_reason": entry.capture_reason,
-                "provenance": serde_json::from_str::<Value>(&entry.provenance_json)?,
+                "provenance": provenance.clone(),
                 "host_captured_bytes": entry.host_captured_bytes,
                 "host_original_bytes": entry.host_original_bytes,
                 "host_dropped_bytes": entry.host_dropped_bytes,

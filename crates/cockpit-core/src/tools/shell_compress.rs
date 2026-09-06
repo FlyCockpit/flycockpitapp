@@ -795,7 +795,15 @@ fn flush_compress_run(
     } else {
         safe
     };
-    rendered.extend(safe.split('\n').map(str::to_string));
+    // Fail open when margin elision would erase an entire retained run. Short
+    // signal lines (for example `done` after rust progress stripping) must
+    // never disappear just because the session redaction table has a large
+    // match window.
+    if safe.trim().is_empty() && !joined.trim().is_empty() {
+        rendered.extend(joined.split('\n').map(str::to_string));
+    } else {
+        rendered.extend(safe.split('\n').map(str::to_string));
+    }
     run.clear();
 }
 
@@ -844,12 +852,17 @@ fn drop_noise(
     let mut front_omitted = false;
     let mut omitted = OmittedCounts::default();
     for line in body.lines() {
-        if looks_like_signal(line) || !is_noise(line) {
-            run.push(line.to_string());
-        } else {
-            omitted.add(classify_omitted_line(line));
-            flush_compress_run(redact, &mut rendered, &mut run, front_omitted, true);
-            front_omitted = true;
+        for segment in split_embedded_escape_newlines(line) {
+            if segment.is_empty() {
+                continue;
+            }
+            if looks_like_signal(segment) || !is_noise(segment) {
+                run.push(segment.to_string());
+            } else {
+                omitted.add(classify_omitted_line(segment));
+                flush_compress_run(redact, &mut rendered, &mut run, front_omitted, true);
+                front_omitted = true;
+            }
         }
     }
     let total_omitted = omitted.total();
@@ -873,6 +886,13 @@ fn drop_noise(
         );
     }
     rendered.join("\n")
+}
+
+fn split_embedded_escape_newlines(line: &str) -> Vec<&str> {
+    if !line.contains("\\n") {
+        return vec![line];
+    }
+    line.split("\\n").collect()
 }
 
 /// Whether a line carries signal that must NEVER be dropped: errors,

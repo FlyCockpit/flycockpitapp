@@ -775,16 +775,6 @@ impl Approver {
             return Ok(decision);
         }
 
-        if self.yolo_mode()
-            || self
-                .auto_allows(
-                    crate::agent_tree::HostEffectClass::ExternalAction,
-                    &grant_target,
-                )
-                .await
-        {
-            return Ok(Decision::Allow { scope: Scope::Once });
-        }
         let prompt = if agent_bound {
             format!(
                 "`{tool}` on MCP server `{server}` wants to run for agent `{requesting_agent}` using credential profile `{profile}`. This server is external to cockpit."

@@ -3208,7 +3208,12 @@ impl Driver {
         // baked into the local cap); re-allotting would drop `task.budget`.
         let root = self.root_budget_handle();
         root.remint_root(resolved);
-        self.max_primary_rounds = resolved.max_rounds.unwrap_or(0);
+        let config_overlay = self.config.extended().max_primary_rounds;
+        self.max_primary_rounds = if config_overlay > 0 {
+            config_overlay
+        } else {
+            resolved.max_rounds.unwrap_or(0)
+        };
         self.budget.reset_retry_turn();
         self.schedule.set_budget(root.share());
         self.bind_active_retry_budget();
@@ -3593,11 +3598,13 @@ impl Driver {
             snapshot.providers = previous.providers.clone();
             snapshot.provider_model_sources = previous.provider_model_sources.clone();
         }
-        if snapshot.extended.delegation_budget.is_empty()
-            && snapshot.extended.max_primary_rounds == 0
-        {
+        if snapshot.extended.delegation_budget.is_empty() {
             snapshot.extended.delegation_budget = DelegationBudgetConfig {
-                max_rounds: Some(SpendLimit::Unlimited),
+                max_rounds: if snapshot.extended.max_primary_rounds > 0 {
+                    None
+                } else {
+                    Some(SpendLimit::Unlimited)
+                },
                 max_input_tokens: Some(SpendLimit::Unlimited),
                 max_output_tokens: Some(SpendLimit::Unlimited),
                 max_cost_microusd: Some(SpendLimit::Unlimited),
@@ -9066,7 +9073,13 @@ impl Driver {
         };
         let seq = match record_outcome {
             UserMessageRecordOutcome::Recorded(seq) => Some(seq),
-            UserMessageRecordOutcome::Untracked => None,
+            UserMessageRecordOutcome::Untracked => {
+                if folded.queue_item_ids.is_empty() {
+                    None
+                } else {
+                    return Err(());
+                }
+            }
             UserMessageRecordOutcome::RetryRequired => return Err(()),
         };
         // Folded submissions never enter `run_user_input`, so this is the

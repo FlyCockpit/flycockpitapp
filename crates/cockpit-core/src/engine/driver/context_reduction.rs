@@ -2636,6 +2636,17 @@ impl Driver {
             failure => return Err(PrepareCompactionError::Draft(failure)),
         }
 
+        self.draft_brief_chunked_synthesis(draft, authoring, prompt_text, history)
+            .await
+    }
+
+    async fn draft_brief_chunked_synthesis(
+        &self,
+        draft: CompactBriefDraft,
+        authoring: CompactAuthoringModel,
+        prompt_text: String,
+        history: Vec<Message>,
+    ) -> Result<(String, CompactAuthoringModel), PrepareCompactionError> {
         let Some(window) = draft.context_window else {
             return Err(PrepareCompactionError::Draft(
                 crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow {
@@ -2818,8 +2829,21 @@ impl Driver {
                 // shadow's revision history intentionally contains only its
                 // prior tail plus newer turns, so it is not a full-coverage
                 // fallback source by itself.
-                self.draft_brief(tx, tail_message_seqs, full_history, quota)
-                    .await
+                let draft = self
+                    .compact_brief_draft(tx, full_history.clone(), quota.clone())
+                    .await;
+                let authoring = CompactAuthoringModel {
+                    provider_id: draft.model.provider_id().to_string(),
+                    model_id: draft.model.model_id_ref().to_string(),
+                };
+                let mut prompt_text =
+                    crate::engine::compact::brief_prompt(draft.prompt_override.as_deref());
+                prompt_text.push_str(&crate::engine::compact::tail_anti_duplication_instruction(
+                    tail_message_seqs,
+                ));
+                return self
+                    .draft_brief_chunked_synthesis(draft, authoring, prompt_text, full_history)
+                    .await;
             }
             failure => Err(PrepareCompactionError::Draft(failure)),
         }

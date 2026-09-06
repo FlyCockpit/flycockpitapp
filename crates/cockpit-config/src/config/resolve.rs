@@ -20,7 +20,8 @@
 //!
 //! In test builds (`cfg(any(test, feature = "test-support"))`), those five pass
 //! through [`cockpit_test_support::home_isolation`] (`CockpitHomeKind` includes
-//! `Cache` and `Runtime` for the two newest roots):
+//! `Cache`, `Runtime` (`$XDG_RUNTIME_DIR/cockpit`), and `RuntimeRoot`
+//! (`$XDG_RUNTIME_DIR` for `cockpit-host` private runtime materialization):
 //!
 //! 1. Explicit env overrides installed by [`cockpit_test_support::TestEnvGuard`]
 //!    (XDG/HOME pointing away from the real developer profile) win unchanged.
@@ -29,7 +30,11 @@
 //! 3. Otherwise redirect to a lazy per-process isolated home mirroring
 //!    `TestEnvGuard::set_isolated_home` (`{root}/home/.config/cockpit`,
 //!    `{root}/data/cockpit`, `{root}/state/cockpit`, `{root}/cache/cockpit`,
-//!    `{root}/runtime/cockpit`).
+//!    `{root}/runtime/cockpit`, and `{root}/runtime` for `RuntimeRoot`).
+//!
+//! **Platform notes (greenfield):** `XDG_CACHE_HOME` is honored on every
+//! platform when set. On Windows the state dir canonical path is
+//! `%LOCALAPPDATA%\cockpit\state` (not under `%APPDATA%`).
 //!
 //! Under `cargo nextest` each test is its own process, so the isolated root is
 //! per test. Under `cargo test` one binary shares it across threads; creation is
@@ -238,9 +243,11 @@ mod tests {
     fn runtime_dir_redirects_without_explicit_override() {
         use cockpit_test_support::home_isolation;
 
-        if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
-            return;
-        }
+        home_isolation::ensure_real_developer_roots_captured();
+        let env = crate::test_env::lock();
+        let forced_runtime = home_isolation::real_developer_runtime_root_for_redirect_test();
+        env.set_var("XDG_RUNTIME_DIR", forced_runtime.as_os_str());
+
         let path = cockpit_runtime_dir()
             .expect("resolve runtime dir")
             .expect("runtime dir should be set when XDG_RUNTIME_DIR is set");
@@ -248,6 +255,25 @@ mod tests {
         assert!(
             path.ends_with(std::path::Path::new("runtime").join("cockpit")),
             "redirected runtime dir should mirror the platform layout: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn runtime_root_redirects_without_explicit_override() {
+        use cockpit_test_support::home_isolation;
+
+        home_isolation::ensure_real_developer_roots_captured();
+        let env = crate::test_env::lock();
+        let forced_runtime = home_isolation::real_developer_runtime_root_for_redirect_test();
+        env.set_var("XDG_RUNTIME_DIR", forced_runtime.as_os_str());
+
+        let path = cockpit_host::private_fs::private_runtime_root()
+            .expect("private runtime root when XDG_RUNTIME_DIR is set");
+        home_isolation::assert_not_real_developer_cockpit_path(&path);
+        assert!(
+            path.ends_with("runtime"),
+            "redirected private runtime root should be the isolated runtime parent: {}",
             path.display()
         );
     }

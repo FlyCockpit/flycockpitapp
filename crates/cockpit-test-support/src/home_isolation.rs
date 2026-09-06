@@ -28,7 +28,10 @@ pub enum CockpitHomeKind {
     Data,
     State,
     Cache,
+    /// `$XDG_RUNTIME_DIR/cockpit` (cockpit-config runtime resolver).
     Runtime,
+    /// `$XDG_RUNTIME_DIR` itself (cockpit-host private runtime materialization).
+    RuntimeRoot,
 }
 
 struct RealDeveloperCockpitRoots {
@@ -39,6 +42,7 @@ struct RealDeveloperCockpitRoots {
     state: PathBuf,
     cache: PathBuf,
     runtime: Option<PathBuf>,
+    runtime_root: Option<PathBuf>,
 }
 
 struct ProcessIsolatedHome {
@@ -52,6 +56,7 @@ struct ProcessIsolatedHome {
     data: PathBuf,
     state: PathBuf,
     cache: PathBuf,
+    runtime_root: PathBuf,
     runtime: PathBuf,
 }
 
@@ -73,6 +78,7 @@ pub fn ensure_real_developer_roots_captured() {
             state: real_developer_state_dir(),
             cache: real_developer_cache_dir(),
             runtime: real_developer_runtime_dir(),
+            runtime_root: captured_runtime_root_for_isolation(),
         }
     });
 }
@@ -88,13 +94,41 @@ fn real_developer_cache_dir() -> PathBuf {
         .join("cockpit")
 }
 
-fn real_developer_runtime_dir() -> Option<PathBuf> {
+fn real_developer_runtime_root() -> Option<PathBuf> {
     if let Ok(value) = std::env::var("XDG_RUNTIME_DIR")
         && !value.trim().is_empty()
     {
-        return Some(PathBuf::from(value).join("cockpit"));
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            return Some(path);
+        }
     }
     None
+}
+
+fn captured_runtime_root_for_isolation() -> Option<PathBuf> {
+    real_developer_runtime_root().or_else(|| {
+        let home = dirs::home_dir().expect("locate real developer home dir");
+        Some(home.join(".cockpit-test-runtime-root"))
+    })
+}
+
+fn real_developer_runtime_dir() -> Option<PathBuf> {
+    captured_runtime_root_for_isolation().map(|root| root.join("cockpit"))
+}
+
+/// Real `$XDG_RUNTIME_DIR` captured before any [`TestEnvGuard`] mutation, or a
+/// path under the captured developer home for redirect tests on hosts where the
+/// ambient runtime dir is unset (typical CI containers).
+pub fn real_developer_runtime_root_for_redirect_test() -> PathBuf {
+    ensure_real_developer_roots_captured();
+    let roots = REAL_DEVELOPER_COCKPIT_ROOTS
+        .get()
+        .expect("real developer cockpit roots captured above");
+    roots
+        .runtime_root
+        .clone()
+        .expect("runtime root captured for redirect tests")
 }
 
 fn real_developer_state_dir() -> PathBuf {
@@ -151,6 +185,7 @@ fn process_isolated_home() -> &'static ProcessIsolatedHome {
             data: data_cockpit,
             state: state_cockpit,
             cache: cache_cockpit,
+            runtime_root: runtime,
             runtime: runtime_cockpit,
         }
     })
@@ -166,18 +201,21 @@ fn is_under_real_developer_roots(path: &Path) -> bool {
     let roots = REAL_DEVELOPER_COCKPIT_ROOTS
         .get()
         .expect("real developer cockpit roots captured above");
-    path == roots.home
-        || contained_under(&roots.home, path)
-        || contained_under(&roots.xdg_data, path)
-        || contained_under(&roots.config, path)
+    contained_under(&roots.config, path)
+        || path == roots.config
         || contained_under(&roots.data, path)
+        || path == roots.data
         || contained_under(&roots.state, path)
+        || path == roots.state
         || contained_under(&roots.cache, path)
         || path == roots.cache
         || roots
             .runtime
             .as_ref()
             .is_some_and(|runtime| path == *runtime || contained_under(runtime, path))
+        || roots.runtime_root.as_ref().is_some_and(|runtime_root| {
+            path == *runtime_root || contained_under(runtime_root, path)
+        })
 }
 
 fn replace_path_prefix(path: &Path, from: &Path, to: &Path) -> PathBuf {
@@ -241,8 +279,19 @@ pub fn finalize_test_profile_path(path: PathBuf) -> PathBuf {
         .as_ref()
         .is_some_and(|runtime| path == *runtime || contained_under(runtime, &path))
     {
-        let runtime = roots.runtime.as_ref().expect("runtime root checked above");
+        let runtime = roots.runtime.as_ref().expect("runtime dir checked above");
         return replace_path_prefix(&path, runtime, &isolated.runtime);
+    }
+    if roots
+        .runtime_root
+        .as_ref()
+        .is_some_and(|runtime_root| path == *runtime_root || contained_under(runtime_root, &path))
+    {
+        let runtime_root = roots
+            .runtime_root
+            .as_ref()
+            .expect("runtime root checked above");
+        return replace_path_prefix(&path, runtime_root, &isolated.runtime_root);
     }
     if path == roots.home || contained_under(&roots.home, &path) {
         return replace_path_prefix(&path, &roots.home, &isolated.home);
@@ -274,6 +323,7 @@ pub fn finalize_test_cockpit_path(path: PathBuf, kind: CockpitHomeKind) -> PathB
         CockpitHomeKind::State => isolated.state.clone(),
         CockpitHomeKind::Cache => isolated.cache.clone(),
         CockpitHomeKind::Runtime => isolated.runtime.clone(),
+        CockpitHomeKind::RuntimeRoot => isolated.runtime_root.clone(),
     };
     if is_under_real_developer_roots(&redirected) {
         panic!(
@@ -285,7 +335,8 @@ pub fn finalize_test_cockpit_path(path: PathBuf, kind: CockpitHomeKind) -> PathB
 }
 
 /// Panic when `path` resolves under the captured real developer Cockpit
-/// config/data/state/cache/runtime roots without an explicit opt-in. Production code never
+/// config/data/state/cache/runtime/runtime-root paths without an explicit opt-in.
+/// Production code never
 /// calls this; it covers the unreachable case where redirect did not run.
 pub fn assert_not_real_developer_cockpit_path(path: &Path) {
     ensure_real_developer_roots_captured();

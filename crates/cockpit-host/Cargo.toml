@@ -19,10 +19,11 @@ default = []
 # crates' Windows tests can inject a broad ACL and prove the private-verify
 # paths reject it. Mirrors the test-support feature convention of the upper
 # Cockpit application crates.
-test-support = []
+test-support = ["dep:cockpit-test-support"]
 
 [dependencies]
 anyhow = { workspace = true }
+cockpit-test-support = { path = "../cockpit-test-support", optional = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -49,4 +50,5 @@ windows-sys = { version = "=0.61.2", default-features = false, features = [
 ] }
 
 [dev-dependencies]
+cockpit-test-support = { path = "../cockpit-test-support" }
 syn = { version = "2", features = ["full"] }

@@ -360,6 +360,22 @@ mod tests {
     }
 
     #[test]
+    fn home_isolation_redirects_real_developer_runtime_root() {
+        home_isolation::ensure_real_developer_roots_captured();
+        let forced_runtime = home_isolation::real_developer_runtime_root_for_redirect_test();
+        let redirected = home_isolation::finalize_test_cockpit_path(
+            forced_runtime,
+            home_isolation::CockpitHomeKind::RuntimeRoot,
+        );
+        home_isolation::assert_not_real_developer_cockpit_path(&redirected);
+        assert!(
+            redirected.ends_with("runtime"),
+            "redirected runtime root should be the isolated runtime parent: {}",
+            redirected.display()
+        );
+    }
+
+    #[test]
     fn home_isolation_guard_allows_isolated_cockpit_paths() {
         let tempdir = tempfile::tempdir().expect("isolated home tempdir");
         let guard = TestEnvGuard::isolate_cockpit_home_at(tempdir.path());
@@ -415,6 +431,11 @@ mod tests {
                 file: "crates/cockpit-core/src/daemon/session_worker/handle.rs",
                 symbol: "from_disk_for_tests_at_generation",
                 reason: "test helper save/restores COCKPIT_CONFIG so the tempdir project layer loads even when another test left an explicit path set",
+            },
+            AllowedMutation {
+                file: "crates/cockpit-host/src/private_fs.rs",
+                symbol: "private_runtime_root_redirects_away_from_real_developer_runtime",
+                reason: "ambient-env redirect test installs a captured real runtime root without TestEnvGuard home isolation",
             },
         ];
 

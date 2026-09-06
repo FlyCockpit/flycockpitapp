@@ -46,6 +46,7 @@ windows-sys = { version = "=0.61.2", default-features = false, features = [
 ] }
 
 [dev-dependencies]
+cockpit-host = { path = "../cockpit-host", features = ["test-support"] }
 cockpit-test-support = { path = "../cockpit-test-support" }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -266,10 +266,21 @@ pub const PRIVATE_FS_POLICY: PrivateFsPolicy = PrivateFsPolicy {
 /// Darwin temp root when XDG is absent. Other platforms report no suitable
 /// runtime root.
 pub fn private_runtime_root() -> Option<PathBuf> {
-    private_runtime_root_from(
+    let path = private_runtime_root_from(
         std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
         darwin_user_temp_dir(),
-    )
+    );
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        return path.map(|path| {
+            use cockpit_test_support::home_isolation::{
+                CockpitHomeKind, finalize_test_cockpit_path,
+            };
+            finalize_test_cockpit_path(path, CockpitHomeKind::RuntimeRoot)
+        });
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    path
 }
 
 fn private_runtime_root_from(
@@ -3391,6 +3402,25 @@ mod tests {
     fn private_runtime_root_fails_closed_without_absolute_xdg_runtime_dir() {
         let resolved = private_runtime_root_from(None, Some(PathBuf::from("/darwin-temp")));
         assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn private_runtime_root_redirects_away_from_real_developer_runtime() {
+        use cockpit_test_support::home_isolation;
+
+        home_isolation::ensure_real_developer_roots_captured();
+        let forced_runtime = home_isolation::real_developer_runtime_root_for_redirect_test();
+        // SAFETY: serialized by the process-global test env mutex in unit tests.
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", forced_runtime.as_os_str()) };
+        let resolved =
+            private_runtime_root().expect("private runtime root when XDG_RUNTIME_DIR is set");
+        assert_ne!(resolved, forced_runtime);
+        home_isolation::assert_not_real_developer_cockpit_path(&resolved);
+        assert!(
+            resolved.ends_with("runtime"),
+            "redirected private runtime root should be the isolated runtime parent: {}",
+            resolved.display()
+        );
     }
 
     /// Compare `windows_dacl_enforced` to real apply/verify, not the constant.

@@ -1257,14 +1257,17 @@ pub(super) fn settings_mouse(kind: MouseEventKind, column: u16, row: u16) -> Mou
 /// 69 rows. Counting the section headers, web/user/MCP rows, the reset row and
 /// the bottom detail controls, the tallest fixture (a user tool selected, so
 /// the contextual `[Enable/disable]`/`[Delete]` pair sits last) is ~93 rows
-/// with its deepest control at row index ~90. The settings dialog gives the
-/// page a list body of `render_height - 4` rows (2 block borders + a header
-/// row + a footer row), so any height short of ~95 scrolls those bottom
-/// detail controls off-screen and `render_control_lines` never registers them
-/// — which is exactly why 90 (body 86) still failed the exhaustiveness
-/// assertions. Render these fixtures tall enough that every page fits on
-/// screen (offset stays 0) and every control target is registered.
-const POINTER_TOOLS_FIXTURE_HEIGHT: u16 = 120;
+/// with its deepest control at row index ~90. Wave-7 sealed-value inventory
+/// growth pushed the built-in section to ~58 rows (57 tools with several
+/// long summaries wrapping at the ~78-column value width), so the tallest
+/// user-tool fixture now lands around row ~102 with contextual
+/// `[Enable/disable]` / `[Delete]` controls a few lines below. The settings
+/// dialog gives the page a list body of `render_height - 4` rows (2 block
+/// borders + a header row + a footer row), so any height short of ~106
+/// scrolls those bottom detail controls off-screen and `render_control_lines`
+/// never registers them. Render these fixtures tall enough that every page
+/// fits on screen (offset stays 0) and every control target is registered.
+const POINTER_TOOLS_FIXTURE_HEIGHT: u16 = 150;
 
 /// Real rendered/reducer regressions reused by the named pointer acceptance
 /// suites. Keeping these here lets them share the same concrete page fixtures

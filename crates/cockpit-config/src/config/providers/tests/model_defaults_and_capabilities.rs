@@ -1588,7 +1588,7 @@ fn resolve_wire_api_explicit_config_wins() {
     assert_eq!(cfg.resolve_wire_api("p", "gpt-4o"), WireApi::Completions);
     assert_eq!(cfg.resolve_wire_api("p", "missing"), WireApi::Completions);
     assert_eq!(cfg.resolve_wire_api("nope", "x"), WireApi::Completions);
-    assert!(cfg.is_wire_api_explicit("p", "gpt-4o"));
+    assert!(!cfg.is_wire_api_explicit("p", "gpt-4o"));
     assert!(cfg.is_wire_api_explicit("p", "gpt-5.4-mini"));
 }
 

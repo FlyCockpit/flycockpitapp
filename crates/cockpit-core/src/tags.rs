@@ -881,7 +881,14 @@ fn render_file(
         Some((start, end)) => (start, end - start + 1),
         None => (1, caps.max_lines),
     };
-    let slice = read_slice_with_byte_cap(redact, text, offset, limit, caps.max_bytes);
+    let slice = read_slice_with_byte_cap(
+        redact,
+        text,
+        offset,
+        limit,
+        caps.max_bytes,
+        matches!(range, Some((_, end)) if end != usize::MAX),
+    );
     let lines_shown = slice.numbered.lines().count();
     let mut out = format!("\n<file path=\"{display_path}\">\n{}", slice.numbered);
     if !out.ends_with('\n') {

@@ -5976,6 +5976,13 @@ impl Driver {
                 self.refresh_goal_watchdog(&mut goal_watchdog).await;
                 continue;
             }
+            if !waiting_for_keep_parked_siblings
+                && self
+                    .try_deliver_immediate_assistant_inbox(&input_queue, tx, &mut goal_watchdog)
+                    .await?
+            {
+                continue;
+            }
             // Wait for the next thing to do: a user message, a control
             // request (/prune /compact /pin), a job event (loop iteration
             // due / job completed), or a job command (an in-task timer
@@ -6110,18 +6117,15 @@ impl Driver {
                 }
                 _ = assistant_inbox_idle_poll.tick(),
                     if !waiting_for_keep_parked_siblings => {
-                    match self.claim_assistant_inbox_text(false).await {
-                        Ok(Some((text, inbox_item_ids))) => {
-                            self.preempt_shadow_brief_for_foreground().await;
-                            let mut submission =
-                                crate::engine::message::UserSubmission::text(text);
-                            submission.origin =
-                                crate::engine::message::SubmissionOrigin::Internal;
-                            self.run_user_input(submission, &input_queue, tx).await?;
-                            self.acknowledge_assistant_inbox(inbox_item_ids).await?;
-                        }
-                        Ok(None) => {}
-                        Err(error) => tracing::warn!(%error, "assistant inbox immediate delivery failed"),
+                    if self
+                        .try_deliver_immediate_assistant_inbox(
+                            &input_queue,
+                            tx,
+                            &mut goal_watchdog,
+                        )
+                        .await?
+                    {
+                        continue;
                     }
                 }
                 ev = self.job_event_rx.recv(),
@@ -9802,6 +9806,33 @@ impl Driver {
         input_rx.finish(&leading_queue_item_ids).await;
         result?;
         self.acknowledge_assistant_inbox(inbox_item_ids).await
+    }
+
+    async fn try_deliver_immediate_assistant_inbox(
+        &mut self,
+        input_queue: &crate::engine::message::UserSubmissionQueue,
+        tx: &mpsc::Sender<TurnEvent>,
+        goal_watchdog: &mut Option<Pin<Box<Sleep>>>,
+    ) -> Result<bool> {
+        match self.claim_assistant_inbox_text(false).await {
+            Ok(Some((text, inbox_item_ids))) => {
+                self.preempt_shadow_brief_for_foreground().await;
+                let mut submission = crate::engine::message::UserSubmission::text(text);
+                submission.origin = crate::engine::message::SubmissionOrigin::Internal;
+                self.run_user_input(submission, input_queue, tx).await?;
+                self.acknowledge_assistant_inbox(inbox_item_ids).await?;
+                self.reset_goal_progress_tracking().await;
+                self.clear_goal_idle_intervention();
+                self.maybe_continue_active_goal(input_queue, tx).await?;
+                self.refresh_goal_watchdog(goal_watchdog).await;
+                Ok(true)
+            }
+            Ok(None) => Ok(false),
+            Err(error) => {
+                tracing::warn!(%error, "assistant inbox immediate delivery failed");
+                Ok(false)
+            }
+        }
     }
 
     async fn claim_assistant_inbox_text(

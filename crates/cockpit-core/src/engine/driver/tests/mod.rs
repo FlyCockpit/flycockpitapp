@@ -2131,7 +2131,16 @@ fn install_test_providers(
         }),
         ..ProvidersConfig::default()
     };
-    driver.test_providers_override = Some((cfg, "lmstudio".into(), "local".into()));
+    driver.test_providers_override = Some((cfg.clone(), "lmstudio".into(), "local".into()));
+    driver.set_config_handle(
+        crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                driver.config.generation(),
+                cfg,
+                driver.config.extended().clone(),
+            ),
+        ),
+    );
 }
 
 async fn record_test_context_tokens(driver: &Driver, input_tokens: u64) {

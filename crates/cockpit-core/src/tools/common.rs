@@ -238,7 +238,7 @@ pub fn read_slice(
     offset: usize,
     limit: usize,
 ) -> ReadSlice {
-    read_slice_with_byte_cap(redact, text, offset, limit, OUTPUT_BYTE_CAP)
+    read_slice_with_byte_cap(redact, text, offset, limit, OUTPUT_BYTE_CAP, false)
 }
 
 pub fn read_slice_with_byte_cap(
@@ -247,6 +247,7 @@ pub fn read_slice_with_byte_cap(
     offset: usize,
     limit: usize,
     output_byte_cap: usize,
+    explicit_range_end: bool,
 ) -> ReadSlice {
     let offset = offset.max(1);
     let byte_cap = output_byte_cap.saturating_sub(80);
@@ -327,7 +328,7 @@ pub fn read_slice_with_byte_cap(
     // omission edge exactly like the byte-cap edge; a boundary-blind
     // line-limit cut would hand the §7 whole-value scrub a straddling
     // secret's unmatchable PREFIX.
-    let shown: Vec<String> = if stopped_for_byte_cap || more_lines {
+    let shown: Vec<String> = if stopped_for_byte_cap || (more_lines && !explicit_range_end) {
         let kept_content = safe_lines[..kept].join("\n");
         let safe = drop_back_margin(redact, &kept_content);
         // Fail-closed: when the elision empties the segment (nothing was
@@ -788,7 +789,8 @@ mod tests {
     async fn read_slice_with_byte_cap_uses_explicit_ceiling() {
         let text = format!("{}\nsmall\n", "x".repeat(OUTPUT_BYTE_CAP + 200));
         let legacy = read_slice(&empty_table(), &text, 1, READ_LINE_CAP);
-        let larger = read_slice_with_byte_cap(&empty_table(), &text, 1, READ_LINE_CAP, 48 * 1024);
+        let larger =
+            read_slice_with_byte_cap(&empty_table(), &text, 1, READ_LINE_CAP, 48 * 1024, false);
 
         assert!(legacy.truncated);
         assert_eq!(legacy.numbered, "");
@@ -954,7 +956,7 @@ mod tests {
         // partial at the retained back edge.
         let line1 = format!("{}{partial_head}", "x".repeat(400));
         let body = format!("{line1}\nfiller tail\n");
-        let slice = read_slice_with_byte_cap(&table, &body, 1, 10, 510);
+        let slice = read_slice_with_byte_cap(&table, &body, 1, 10, 510, false);
         let scrubbed = table.scrub(&slice.numbered);
         assert!(
             !scrubbed.contains(partial_head),

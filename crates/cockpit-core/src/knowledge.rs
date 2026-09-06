@@ -5772,8 +5772,6 @@ pub(crate) async fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str)
         "deps",
         "graph",
         "hot",
-        // `harness_invoke` / `harness_list` are gated by
-        // `ensure_harness_cannot_reach_local_knowledge_bases` instead.
         "mcp",
         "search",
         "symbol_find",
@@ -5781,7 +5779,12 @@ pub(crate) async fn ensure_workspace_tool_access(ctx: &ToolCtx, tool_name: &str)
         "word",
         "worktree_orchestrate",
     ];
-    const OPAQUE_WRITE_CAPABLE_HOST_TOOLS: &[&str] = &["lsp", "worktree_orchestrate"];
+    const OPAQUE_WRITE_CAPABLE_HOST_TOOLS: &[&str] = &[
+        "harness_invoke",
+        "harness_list",
+        "lsp",
+        "worktree_orchestrate",
+    ];
 
     if OPAQUE_WRITE_CAPABLE_HOST_TOOLS.contains(&tool_name)
         && local_knowledge_write_fence_active(&ctx.session, &ctx.cwd, &ctx.config.extended()).await

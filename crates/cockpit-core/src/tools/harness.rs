@@ -97,15 +97,12 @@ impl Tool for HarnessListTool {
             .as_deref()
             .map(|raw| normalize_harness_selector(raw, &ctx.config))
             .transpose()?;
-        require_workspace_trust_for_harness_spawn()?;
-        ensure_harness_cannot_reach_local_knowledge_bases(ctx).await?;
-        // Listing can launch each configured harness's auth probe, and a
-        // refresh launches its model-list command. Keep direct callers from
-        // bypassing the dispatcher fence and handing an ambient filesystem
-        // write path to either subprocess.
+        // Attached local KBs are read-only: deny opaque host subprocesses before
+        // any trust or spawn preflight can hand them ambient filesystem access.
         crate::knowledge::ensure_workspace_tool_access(ctx, self.name())
             .await
             .map_err(|error| invalid_input(error.to_string()))?;
+        require_workspace_trust_for_harness_spawn()?;
         let env_overlay = ctx
             .env_overlay
             .read()
@@ -377,13 +374,12 @@ impl Tool for HarnessInvokeTool {
         };
 
         let cwd = ctx.cwd.clone();
-        require_workspace_trust_for_harness_spawn()?;
-        ensure_harness_cannot_reach_local_knowledge_bases(ctx).await?;
-        // The dispatcher normally applies this fence, but direct tool callers
-        // must not be able to hand ambient filesystem access to a harness.
+        // Attached local KBs are read-only: deny opaque host subprocesses before
+        // any trust or spawn preflight can hand them ambient filesystem access.
         crate::knowledge::ensure_workspace_tool_access(ctx, self.name())
             .await
             .map_err(|error| invalid_input(error.to_string()))?;
+        require_workspace_trust_for_harness_spawn()?;
         let env_overlay = ctx
             .env_overlay
             .read()
@@ -685,26 +681,6 @@ fn require_workspace_trust_for_harness_spawn() -> Result<()> {
             "harness spawn blocked: workspace trust policy is not resolved for this session"
         ))
     }
-}
-
-/// An external harness is arbitrary host code. Unlike native tools it has no
-/// descriptor-backed KB write route and no OS-enforced deny mount, so granting
-/// it a process would let it bypass the two permitted KB authoring paths.
-/// Refuse every operation that can launch a configured harness (including a
-/// model-list refresh) while the session has any local KB configured.
-async fn ensure_harness_cannot_reach_local_knowledge_bases(ctx: &ToolCtx) -> Result<()> {
-    let roots = crate::knowledge::configured_local_knowledge_roots(
-        &ctx.session,
-        &ctx.cwd,
-        &ctx.config.extended(),
-    )
-    .await;
-    if roots.is_empty() {
-        return Ok(());
-    }
-    Err(invalid_input(
-        "external harnesses are unavailable while local knowledge bases are configured because their subprocesses do not have OS-enforced knowledge-base confinement",
-    ))
 }
 
 #[cfg(test)]

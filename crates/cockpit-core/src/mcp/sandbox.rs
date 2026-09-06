@@ -680,7 +680,8 @@ async fn dispatch_raw(
                             "mcp.invoke",
                             super::catalog::connect_context(host)
                                 .with_profile(entry.profile.clone())
-                                .with_agent_bound(entry.agent_bound),
+                                .with_agent_bound(entry.agent_bound)
+                                .for_discovery(),
                             entry.source(),
                             &entry.profile,
                             entry.agent_bound,

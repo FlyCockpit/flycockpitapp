@@ -39,6 +39,14 @@ impl App {
         if self.dialog.is_active() {
             return;
         }
+        if self.config_snapshot.providers.providers.is_empty()
+            && !self.has_no_providers_at_startup
+            && !self.config_snapshot.from_daemon
+        {
+            // A generation-zero empty seed during runner replacement or
+            // reconnect is not a provider-less launch.
+            return;
+        }
         if self.first_run_flow == FirstRunFlow::None {
             return;
         }

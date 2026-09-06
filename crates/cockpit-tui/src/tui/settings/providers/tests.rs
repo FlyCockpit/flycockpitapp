@@ -491,11 +491,14 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
     pointer_add_test_key_waiting_surface_has_no_validation_bypass_action();
     onboarding_validation_with_fallback_available_stays_resumable_and_offers_offline();
     pointer_add_done_continue_renders_and_dispatches_from_fresh_state();
-    pointer_add_grok_login_renders_and_dispatches_from_fresh_state();
+    #[cfg(feature = "grok-subscription")]
+    {
+        pointer_add_grok_login_renders_and_dispatches_from_fresh_state();
+        pointer_add_grok_continue_renders_and_dispatches_from_fresh_state();
+        pointer_add_grok_acknowledge_renders_and_dispatches_from_fresh_state();
+    }
     pointer_add_codex_login_renders_and_dispatches_from_fresh_state();
-    pointer_add_grok_continue_renders_and_dispatches_from_fresh_state();
     pointer_add_codex_continue_renders_and_dispatches_from_fresh_state();
-    pointer_add_grok_acknowledge_renders_and_dispatches_from_fresh_state();
     pointer_add_codex_acknowledge_renders_and_dispatches_from_fresh_state();
     pointer_model_refresh_renders_and_dispatches_from_fresh_state();
     pointer_model_discard_renders_and_dispatches_from_fresh_state();
@@ -3906,6 +3909,46 @@ fn pointer_enabled_list_and_edit_actions_dispatch_through_dialog_impl() {
         poll_source.test_page(),
         TestPageRef::Providers(ProvidersPage::OAuthSetup { state, .. }) if state.polling
     ));
+
+    #[cfg(feature = "grok-subscription")]
+    {
+        let grok = oauth_provider_config("grok-oauth", "oauth:test");
+        let (_tmp, mut source) = dialog_with_config(grok.clone());
+        source.page = super::super::providers_page(standalone_oauth_page(
+            OAuthProvider::Grok,
+            OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok),
+        ));
+        let _ = render_provider_rows(&source, 110, 60);
+        let actions = source
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled) {
+                (
+                    super::super::shell::SettingsPointerAction::Page(
+                        action @ super::super::pointer_actions::SettingsPointerAction::Providers(
+                            super::super::pointer_actions::ProvidersAction::OAuthOption(_, _),
+                        ),
+                    ),
+                    true,
+                ) => Some(action.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !actions.is_empty(),
+            "Grok OAuth source row must render its setup actions"
+        );
+        for action in actions {
+            let (_tmp, mut dialog) = dialog_with_config(grok.clone());
+            dialog.page = super::super::providers_page(standalone_oauth_page(
+                OAuthProvider::Grok,
+                OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok),
+            ));
+            click_rendered_provider_action(&mut dialog, &action);
+        }
+    }
 }
 
 fn pointer_delete_choice_fixture() -> (tempfile::TempDir, SettingsDialog) {
@@ -7543,39 +7586,44 @@ pub(crate) fn oauth_copy_completion_is_flow_scoped_and_exactly_once() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     reset_oauth_effects(false);
-    let (tmp, mut dialog) = dialog_with_config(oauth_provider_config("grok-oauth", "oauth:test"));
-    let mut visible = OAuthFlowState::new_without_acknowledgement_with_effects_for_test(
-        OAuthProvider::Grok,
-        fake_oauth_effects(),
-    );
-    visible.set_browser_session_for_test("https://example.test/oauth");
-    let visible_flow_id = visible.flow_id;
-    dialog.page = super::super::providers_page(standalone_oauth_page(OAuthProvider::Grok, visible));
-    let _ = render_provider_rows(&dialog, 110, 60);
-    let action = SettingsPointerAction::Providers(ProvidersAction::CopyOAuth(
-        visible_flow_id,
-        OAuthCopyKind::AuthorizationUrl,
-    ));
-    assert_eq!(
-        super::super::pointer_action_fixtures::key_for(&action),
-        super::super::pointer_action_fixtures::ActionFixtureKey::Providers(
-            super::super::pointer_action_fixtures::ProvidersFixture::CopyAuthorizationUrl,
-        )
-    );
-    click_rendered_provider_action(&mut dialog, &action);
-    assert!(
-        oauth_effects_log().is_empty(),
-        "pointer reducer must not touch host clipboard"
-    );
-    assert!(matches!(
-        dialog.cx.pending_oauth_action.take(),
-        Some(OAuthFlowRequest {
-            client_flow_id,
-            op: OAuthFlowOp::Present { user_code: None, open_browser: false, advance_flow: false, .. },
-            ..
-        }) if client_flow_id == visible_flow_id
-    ));
-    drop(tmp);
+    #[cfg(feature = "grok-subscription")]
+    {
+        let (tmp, mut dialog) =
+            dialog_with_config(oauth_provider_config("grok-oauth", "oauth:test"));
+        let mut visible = OAuthFlowState::new_without_acknowledgement_with_effects_for_test(
+            OAuthProvider::Grok,
+            fake_oauth_effects(),
+        );
+        visible.set_browser_session_for_test("https://example.test/oauth");
+        let visible_flow_id = visible.flow_id;
+        dialog.page =
+            super::super::providers_page(standalone_oauth_page(OAuthProvider::Grok, visible));
+        let _ = render_provider_rows(&dialog, 110, 60);
+        let action = SettingsPointerAction::Providers(ProvidersAction::CopyOAuth(
+            visible_flow_id,
+            OAuthCopyKind::AuthorizationUrl,
+        ));
+        assert_eq!(
+            super::super::pointer_action_fixtures::key_for(&action),
+            super::super::pointer_action_fixtures::ActionFixtureKey::Providers(
+                super::super::pointer_action_fixtures::ProvidersFixture::CopyAuthorizationUrl,
+            )
+        );
+        click_rendered_provider_action(&mut dialog, &action);
+        assert!(
+            oauth_effects_log().is_empty(),
+            "pointer reducer must not touch host clipboard"
+        );
+        assert!(matches!(
+            dialog.cx.pending_oauth_action.take(),
+            Some(OAuthFlowRequest {
+                client_flow_id,
+                op: OAuthFlowOp::Present { user_code: None, open_browser: false, advance_flow: false, .. },
+                ..
+            }) if client_flow_id == visible_flow_id
+        ));
+        drop(tmp);
+    }
 
     reset_oauth_effects(false);
     let (tmp, mut dialog) = dialog_with_config(oauth_provider_config("codex-oauth", "oauth:test"));

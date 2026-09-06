@@ -150,12 +150,10 @@ async fn export_via_attached_daemon(
     command: &'static str,
     shutdown: std::sync::Arc<crate::tui::async_action::AsyncActionCancellation>,
 ) -> Result<String, String> {
-    let response = tokio::select! {
-        biased;
-        () = shutdown.cancelled() => return Err(format!("{command}: export cancelled by shutdown")),
-        response = attached_request.request(request) => response,
-    }
-    .map_err(|error| format!("{command}: daemon request failed: {error}"))?;
+    let response = attached_request
+        .request_with_shutdown(request, &shutdown)
+        .await
+        .map_err(|error| format!("{command}: daemon request failed: {error}"))?;
     let Response::ExportSessionData { data } = response else {
         return Err(format!(
             "{command}: daemon request failed: unexpected daemon response"

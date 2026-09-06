@@ -43,6 +43,9 @@ struct RealDeveloperCockpitRoots {
     cache: PathBuf,
     runtime: Option<PathBuf>,
     runtime_root: Option<PathBuf>,
+    /// macOS production fallback when `XDG_RUNTIME_DIR` is unset (`_CS_DARWIN_USER_TEMP_DIR`).
+    #[cfg(target_os = "macos")]
+    darwin_temp_root: Option<PathBuf>,
 }
 
 struct ProcessIsolatedHome {
@@ -79,15 +82,26 @@ pub fn ensure_real_developer_roots_captured() {
             cache: real_developer_cache_dir(),
             runtime: real_developer_runtime_dir(),
             runtime_root: captured_runtime_root_for_isolation(),
+            #[cfg(target_os = "macos")]
+            darwin_temp_root: captured_darwin_user_temp_dir(),
         }
     });
 }
 
+/// XDG Base Directory spec: non-absolute `XDG_*` values are ignored (same as `dirs`).
+fn absolute_xdg_var(name: &str) -> Option<PathBuf> {
+    let value = std::env::var(name).ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(trimmed);
+    path.is_absolute().then_some(path)
+}
+
 fn real_developer_cache_dir() -> PathBuf {
-    if let Ok(value) = std::env::var("XDG_CACHE_HOME")
-        && !value.trim().is_empty()
-    {
-        return PathBuf::from(value).join("cockpit");
+    if let Some(base) = absolute_xdg_var("XDG_CACHE_HOME") {
+        return base.join("cockpit");
     }
     dirs::cache_dir()
         .expect("locate real developer cache dir")
@@ -95,22 +109,50 @@ fn real_developer_cache_dir() -> PathBuf {
 }
 
 fn real_developer_runtime_root() -> Option<PathBuf> {
-    if let Ok(value) = std::env::var("XDG_RUNTIME_DIR")
-        && !value.trim().is_empty()
-    {
-        let path = PathBuf::from(value);
-        if path.is_absolute() {
-            return Some(path);
-        }
-    }
-    None
+    absolute_xdg_var("XDG_RUNTIME_DIR")
 }
 
 fn captured_runtime_root_for_isolation() -> Option<PathBuf> {
-    real_developer_runtime_root().or_else(|| {
+    if let Some(root) = real_developer_runtime_root() {
+        return Some(root);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return captured_darwin_user_temp_dir();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
         let home = dirs::home_dir().expect("locate real developer home dir");
         Some(home.join(".cockpit-test-runtime-root"))
-    })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn captured_darwin_user_temp_dir() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let length = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, std::ptr::null_mut(), 0) };
+    if length == 0 {
+        return None;
+    }
+    let mut buffer = vec![0_u8; length];
+    let written = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    };
+    if written == 0 {
+        return None;
+    }
+    let without_nul = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(buffer.len());
+    let path = std::ffi::OsStr::from_bytes(&buffer[..without_nul]);
+    let path = PathBuf::from(path);
+    path.is_absolute().then_some(path)
 }
 
 fn real_developer_runtime_dir() -> Option<PathBuf> {
@@ -132,10 +174,8 @@ pub fn real_developer_runtime_root_for_redirect_test() -> PathBuf {
 }
 
 fn real_developer_state_dir() -> PathBuf {
-    if let Ok(value) = std::env::var("XDG_STATE_HOME")
-        && !value.trim().is_empty()
-    {
-        return PathBuf::from(value).join("cockpit");
+    if let Some(base) = absolute_xdg_var("XDG_STATE_HOME") {
+        return base.join("cockpit");
     }
     #[cfg(unix)]
     {
@@ -216,6 +256,22 @@ fn is_under_real_developer_roots(path: &Path) -> bool {
         || roots.runtime_root.as_ref().is_some_and(|runtime_root| {
             path == *runtime_root || contained_under(runtime_root, path)
         })
+        || darwin_temp_root_matches(roots, path)
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_temp_root_matches(roots: &RealDeveloperCockpitRoots, path: &Path) -> bool {
+    roots
+        .darwin_temp_root
+        .as_ref()
+        .is_some_and(|darwin_temp_root| {
+            path == *darwin_temp_root || contained_under(darwin_temp_root, path)
+        })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn darwin_temp_root_matches(_roots: &RealDeveloperCockpitRoots, _path: &Path) -> bool {
+    false
 }
 
 fn replace_path_prefix(path: &Path, from: &Path, to: &Path) -> PathBuf {
@@ -292,6 +348,20 @@ pub fn finalize_test_profile_path(path: PathBuf) -> PathBuf {
             .as_ref()
             .expect("runtime root checked above");
         return replace_path_prefix(&path, runtime_root, &isolated.runtime_root);
+    }
+    #[cfg(target_os = "macos")]
+    if roots
+        .darwin_temp_root
+        .as_ref()
+        .is_some_and(|darwin_temp_root| {
+            path == *darwin_temp_root || contained_under(darwin_temp_root, &path)
+        })
+    {
+        let darwin_temp_root = roots
+            .darwin_temp_root
+            .as_ref()
+            .expect("darwin temp root checked above");
+        return replace_path_prefix(&path, darwin_temp_root, &isolated.runtime_root);
     }
     if path == roots.home || contained_under(&roots.home, &path) {
         return replace_path_prefix(&path, &roots.home, &isolated.home);

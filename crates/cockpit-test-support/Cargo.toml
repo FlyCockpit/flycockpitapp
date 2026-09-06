@@ -14,3 +14,6 @@ dirs = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }

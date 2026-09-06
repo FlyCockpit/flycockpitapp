@@ -1529,6 +1529,7 @@ name = "cockpit-test-support"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "libc",
  "serde_json",
  "tempfile",
  "tokio",

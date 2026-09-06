@@ -432,11 +432,6 @@ mod tests {
                 symbol: "from_disk_for_tests_at_generation",
                 reason: "test helper save/restores COCKPIT_CONFIG so the tempdir project layer loads even when another test left an explicit path set",
             },
-            AllowedMutation {
-                file: "crates/cockpit-host/src/private_fs.rs",
-                symbol: "private_runtime_root_redirects_away_from_real_developer_runtime",
-                reason: "ambient-env redirect test installs a captured real runtime root without TestEnvGuard home isolation",
-            },
         ];
 
         let mut violations = Vec::new();

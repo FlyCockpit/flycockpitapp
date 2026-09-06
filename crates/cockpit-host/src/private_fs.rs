@@ -3405,13 +3405,42 @@ mod tests {
     }
 
     #[test]
+    fn private_runtime_root_ignores_relative_xdg_runtime_dir() {
+        let resolved = private_runtime_root_from(
+            Some(OsStr::new("relative-runtime")),
+            Some(PathBuf::from("/darwin-temp")),
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(resolved, Some(PathBuf::from("/darwin-temp")));
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(resolved, None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn private_runtime_root_redirects_darwin_temp_without_xdg() {
+        use cockpit_test_support::home_isolation;
+
+        home_isolation::ensure_real_developer_roots_captured();
+        let env = cockpit_test_support::TestEnvGuard::blocking_lock();
+        env.remove_var("XDG_RUNTIME_DIR");
+        let resolved = private_runtime_root().expect("darwin temp fallback on macOS");
+        home_isolation::assert_not_real_developer_cockpit_path(&resolved);
+        assert!(
+            resolved.ends_with("runtime"),
+            "redirected darwin temp fallback should map to the isolated runtime parent: {}",
+            resolved.display()
+        );
+    }
+
+    #[test]
     fn private_runtime_root_redirects_away_from_real_developer_runtime() {
         use cockpit_test_support::home_isolation;
 
         home_isolation::ensure_real_developer_roots_captured();
         let forced_runtime = home_isolation::real_developer_runtime_root_for_redirect_test();
-        // SAFETY: serialized by the process-global test env mutex in unit tests.
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", forced_runtime.as_os_str()) };
+        let env = cockpit_test_support::TestEnvGuard::blocking_lock();
+        env.set_var("XDG_RUNTIME_DIR", forced_runtime.as_os_str());
         let resolved =
             private_runtime_root().expect("private runtime root when XDG_RUNTIME_DIR is set");
         assert_ne!(resolved, forced_runtime);

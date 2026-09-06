@@ -29,20 +29,20 @@ crates/cockpit-config    -> cockpit-host, cockpit-tokenizer, cockpit-db
 crates/cockpit-tokenizer -> (none)
 crates/cockpit-db        -> (none)
 crates/cockpit-client    -> cockpit-proto, cockpit-host
-crates/cockpit-host      -> (none)
+crates/cockpit-host      -> (none) [production; optional `test-support` -> cockpit-test-support]
 crates/cockpit-noise     -> (none)
 crates/cockpit-test-support -> (none)
 crates/relay-protocol    -> (none)
 ```
 
-Layered, the application chain is `apps/cli -> cockpit-tui -> cockpit-core -> cockpit-client -> cockpit-proto -> cockpit-config -> cockpit-db`, with upper crates also depending directly on lower ones. `cockpit-client` is the authority-free local daemon transport shared by core, CLI, and TUI. `cockpit-host` is an independent production leaf shared by CLI, TUI, core, config, and the local daemon client; it must not depend on application, protocol, config, or storage crates. Config loaders use `cockpit_host::bounded` with an explicit domain cap because they sit below `cockpit-core` and cannot import `resource_limits`. `apps/tenant-authority` sits beside `apps/cli` and depends only on `cockpit-proto`. `cockpit-noise` is a leaf. `cockpit-test-support` is a test-only leaf: upper crates may take it as a dev-dependency or via an explicit `test-support` feature; that is not a production edge and must not become one.
+Layered, the application chain is `apps/cli -> cockpit-tui -> cockpit-core -> cockpit-client -> cockpit-proto -> cockpit-config -> cockpit-db`, with upper crates also depending directly on lower ones. `cockpit-client` is the authority-free local daemon transport shared by core, CLI, and TUI. `cockpit-host` is an independent production leaf shared by CLI, TUI, core, config, and the local daemon client; production builds keep it free of workspace-crate dependencies, while the optional `test-support` feature may add a test-only edge to `cockpit-test-support`. Config loaders use `cockpit_host::bounded` with an explicit domain cap because they sit below `cockpit-core` and cannot import `resource_limits`. `apps/tenant-authority` sits beside `apps/cli` and depends only on `cockpit-proto`. `cockpit-noise` is a leaf. `cockpit-test-support` is a test-only leaf: upper crates may take it as a dev-dependency or via an explicit `test-support` feature; that is not a production edge and must not become one.
 
 Rules that follow from the graph:
 
 - `apps/cli` is the only crate that may depend on `crates/cockpit-tui`. Nothing else does, and nothing else should.
 - `crates/cockpit-core` and everything below it must stay free of ratatui, crossterm, and any terminal-UI dependency.
 - `crates/cockpit-db` is the base of the chain and depends on no other production workspace crate (`cockpit-test-support` may appear only as a dev-dependency).
-- `crates/cockpit-host` owns shared private-filesystem, symlink-aware path, child-process/PID, lifecycle metadata guards, and named-pipe identity/connect primitives. It is a dependency-minimal leaf and must not depend on any other Cockpit workspace crate. Do not re-export its modules from `cockpit-core`; upper crates use it directly.
+- `crates/cockpit-host` owns shared private-filesystem, symlink-aware path, child-process/PID, lifecycle metadata guards, and named-pipe identity/connect primitives. Production builds keep it dependency-minimal with no workspace-crate edges; the optional `test-support` feature (and `[dev-dependencies]`) may add a feature-gated edge to `cockpit-test-support` for test instrumentation only. Do not re-export its modules from `cockpit-core`; upper crates use it directly.
 - `crates/cockpit-client` owns local daemon request/response framing, exact hello negotiation, event delivery, timeouts, and the authority-free in-process channel transport. It must not depend on `cockpit-core`, storage, or any UI crate. Do not re-export it through `cockpit-core`; upper crates use it directly.
 - `crates/cockpit-core` must not re-export `cockpit_db` (`pub use cockpit_db as db` or equivalent). The storage crate is an implementation detail of the core layer. CLI production paths and daemon-connected TUI paths talk to the ledger only through daemon RPCs. Do not add a production database bypass; fix one by moving the call onto an RPC, not by widening the re-export.
 - `crates/cockpit-test-support` and `cockpit_core::test_env` (behind the `test-support` feature) are test instrumentation only. They must not grow into a general-purpose database API for upper crates.

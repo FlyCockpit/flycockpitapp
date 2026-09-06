@@ -50,6 +50,17 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
+/// XDG Base Directory spec: non-absolute `XDG_*` values are ignored (same as `dirs`).
+fn absolute_xdg_var(name: &str) -> Option<PathBuf> {
+    let value = std::env::var(name).ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(trimmed);
+    path.is_absolute().then_some(path)
+}
+
 #[cfg(any(test, feature = "test-support"))]
 use cockpit_test_support::home_isolation::{CockpitHomeKind, finalize_test_cockpit_path};
 
@@ -59,20 +70,16 @@ pub(crate) fn cockpit_config_dir_unchecked() -> Result<PathBuf> {
 }
 
 pub(crate) fn cockpit_data_dir_unchecked() -> Result<PathBuf> {
-    if let Ok(s) = std::env::var("XDG_DATA_HOME")
-        && !s.trim().is_empty()
-    {
-        return Ok(PathBuf::from(s).join("cockpit"));
+    if let Some(base) = absolute_xdg_var("XDG_DATA_HOME") {
+        return Ok(base.join("cockpit"));
     }
     let base = dirs::data_dir().context("could not locate user data dir")?;
     Ok(base.join("cockpit"))
 }
 
 pub(crate) fn cockpit_state_dir_unchecked() -> Result<PathBuf> {
-    if let Ok(s) = std::env::var("XDG_STATE_HOME")
-        && !s.trim().is_empty()
-    {
-        return Ok(PathBuf::from(s).join("cockpit"));
+    if let Some(base) = absolute_xdg_var("XDG_STATE_HOME") {
+        return Ok(base.join("cockpit"));
     }
     #[cfg(unix)]
     {
@@ -87,22 +94,15 @@ pub(crate) fn cockpit_state_dir_unchecked() -> Result<PathBuf> {
 }
 
 pub(crate) fn cockpit_cache_dir_unchecked() -> Result<PathBuf> {
-    if let Ok(s) = std::env::var("XDG_CACHE_HOME")
-        && !s.trim().is_empty()
-    {
-        return Ok(PathBuf::from(s).join("cockpit"));
+    if let Some(base) = absolute_xdg_var("XDG_CACHE_HOME") {
+        return Ok(base.join("cockpit"));
     }
     let base = dirs::cache_dir().context("could not locate user cache dir")?;
     Ok(base.join("cockpit"))
 }
 
 pub(crate) fn cockpit_runtime_dir_unchecked() -> Option<PathBuf> {
-    if let Ok(s) = std::env::var("XDG_RUNTIME_DIR")
-        && !s.trim().is_empty()
-    {
-        return Some(PathBuf::from(s).join("cockpit"));
-    }
-    None
+    absolute_xdg_var("XDG_RUNTIME_DIR").map(|base| base.join("cockpit"))
 }
 
 /// Platform-default global configuration directory.
@@ -211,6 +211,41 @@ mod tests {
         env.remove_var("XDG_RUNTIME_DIR");
         let p = cockpit_runtime_dir().unwrap();
         assert_eq!(p, None);
+    }
+
+    #[test]
+    fn data_dir_ignores_relative_xdg() {
+        let env = crate::test_env::lock();
+        env.remove_var("XDG_DATA_HOME");
+        let default = cockpit_data_dir().unwrap();
+        env.set_var("XDG_DATA_HOME", "relative-data");
+        assert_eq!(cockpit_data_dir().unwrap(), default);
+    }
+
+    #[test]
+    fn state_dir_ignores_relative_xdg() {
+        let env = crate::test_env::lock();
+        env.remove_var("XDG_STATE_HOME");
+        let default = cockpit_state_dir().unwrap();
+        env.set_var("XDG_STATE_HOME", "relative-state");
+        assert_eq!(cockpit_state_dir().unwrap(), default);
+    }
+
+    #[test]
+    fn cache_dir_ignores_relative_xdg() {
+        let env = crate::test_env::lock();
+        env.remove_var("XDG_CACHE_HOME");
+        let default = cockpit_cache_dir().unwrap();
+        env.set_var("XDG_CACHE_HOME", "relative-cache");
+        assert_eq!(cockpit_cache_dir().unwrap(), default);
+    }
+
+    #[test]
+    fn runtime_dir_ignores_relative_xdg() {
+        let env = crate::test_env::lock();
+        env.remove_var("XDG_RUNTIME_DIR");
+        env.set_var("XDG_RUNTIME_DIR", "relative-runtime");
+        assert_eq!(cockpit_runtime_dir().unwrap(), None);
     }
 
     #[test]

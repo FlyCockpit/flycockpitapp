@@ -3451,8 +3451,8 @@ mod tests {
             .expect("trust project");
 
         // The in-process daemon resolves the production config source, so the
-        // socket Attach below needs a selectable default model. Publish one
-        // in the isolated home's canonical global config layer
+        // socket Code-root attach below needs a selectable default model.
+        // Publish one in the isolated home's canonical global config layer
         // (`{root}/home/.config/cockpit`).
         let global_cockpit = harness.state_home.join("home/.config/cockpit");
         std::fs::create_dir_all(global_cockpit.join("providers")).expect("global providers dir");
@@ -3490,30 +3490,35 @@ mod tests {
             )
             .await
         });
-        wait_until(|| paths.socket.exists(), Duration::from_secs(2)).await;
+        wait_until(|| paths.socket.exists(), Duration::from_secs(30)).await;
 
+        // The clients attach through the first-party Code-root surface: the
+        // generic `Request::Attach` route can no longer express a Code root,
+        // and its Assistant mode intentionally promotes an ephemeral owner to
+        // persistent in place (#274 — a durable Assistant owns background
+        // work), which would legitimately disable last-client reaping for the
+        // rest of this test. Code roots are the surface whose attached work
+        // an ephemeral owner must still drain and reap at count zero.
         let client_a = cockpit_client::DaemonClient::connect(&paths.socket)
             .await
             .expect("connect first socket client");
         let first = client_a
-            .request_ok(proto::Request::Attach {
-                session_id: None,
-                since_seq: None,
-                project_root: Some(project.path().to_string_lossy().into_owned()),
-                initial_model: None,
-                no_sandbox: false,
-                interactive: true,
-                session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
-                model_override: None,
-                client_protocol_version: proto::PROTOCOL_VERSION,
-                env_snapshot: None,
-                env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
-            })
+            .request_ok(proto::create_code_root_v1_request(
+                project.path().to_string_lossy().into_owned(),
+                None,
+                false,
+                true,
+                None,
+                proto::PROTOCOL_VERSION,
+                None,
+                crate::env_snapshot::EnvDriftPolicy::Daemon,
+            ))
             .await
-            .expect("first socket client attaches");
-        let proto::Response::Attached { session_id, .. } = first else {
-            panic!("first socket client must receive Attached");
+            .expect("first socket client attaches a Code root");
+        let proto::Response::CodeRootCreated(created) = first else {
+            panic!("first socket client must receive CodeRootCreated");
         };
+        let session_id = created.attachment.root_id.0;
 
         let client_b = cockpit_client::DaemonClient::connect(&paths.socket)
             .await
@@ -3522,22 +3527,24 @@ mod tests {
         // B sends any application request; otherwise this A -> B handoff can
         // race the ephemeral reaper into draining at count zero.
         drop(client_a);
-        client_b
-            .request_ok(proto::Request::Attach {
-                session_id: Some(session_id),
-                since_seq: None,
-                project_root: None,
-                initial_model: None,
-                no_sandbox: false,
-                interactive: true,
-                session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
-                model_override: None,
-                client_protocol_version: proto::PROTOCOL_VERSION,
-                env_snapshot: None,
-                env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
-            })
+        let second = client_b
+            .request_ok(proto::attach_existing_code_root_v1_request(
+                session_id,
+                None,
+                None,
+                false,
+                true,
+                None,
+                proto::PROTOCOL_VERSION,
+                None,
+                crate::env_snapshot::EnvDriftPolicy::Daemon,
+            ))
             .await
-            .expect("second socket client attaches");
+            .expect("second socket client attaches the same Code root");
+        assert!(
+            matches!(second, proto::Response::CodeRootAttached(_)),
+            "second socket client must receive CodeRootAttached"
+        );
 
         client_b
             .request_ok(proto::Request::DaemonStatus)

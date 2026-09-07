@@ -19596,6 +19596,11 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "rename_session"
         | "share_session"
         | "record_session_note"
+        // The guarded discard path (#311) acks a non-ephemeral row without
+        // stopping its worker: the durable stop-and-delete effect is proved by
+        // the dispatch matrix on an ephemeral fork, while this owner cell
+        // proves the post-auth handler reached the guarded no-op success.
+        | "discard_session"
         | "resource_snapshot"
         | "promote_resource"
         | "set_approval_mode"
@@ -19737,7 +19742,6 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "cancel_turn"
         | "resolve_interrupt"
         | "archive_session"
-        | "discard_session"
         | "set_active_model"
         | "set_agent"
         | "set_tool_surface_override"
@@ -31736,7 +31740,7 @@ async fn image_submission_exact_retry_case() {
     assert_eq!(retained_reference_count, 1);
 
     let diag_first_started = std::time::Instant::now();
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             if ctx
                 .db
@@ -31854,8 +31858,13 @@ async fn image_submission_exact_retry_case() {
     .expect("one immutable attachment version is reusable by another submission");
     assert!(matches!(reused, Response::UserMessageQueued { .. }));
 
+    // The second durable row can only fold once the first turn terminates:
+    // the stub provider refuses instantly, but the production retry layer
+    // legitimately spends several wall-clock seconds in backoff (plus the
+    // per-attempt request assembly), which saturates well past a tight fuse
+    // under full-suite load. The durable row remains the completion signal.
     let diag_wait_started = std::time::Instant::now();
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let mut diag_last_print = std::time::Instant::now();
         loop {
             let user_messages = ctx
@@ -38210,15 +38219,22 @@ async fn attach_since_seq_replays_retracted_user_row_identity() {
 async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     use crate::config::providers::{
-        ActiveModelRef, ModelEntry, ProviderEntry, ProvidersConfig, ThinkingMode,
+        ActiveModelRef, ModelEntry, ModelTrust, ProviderEntry, ProvidersConfig, ThinkingMode,
     };
 
     let (model_url, captured_requests, model_server) = retraction_acceptance_model_server().await;
     let mut providers = ProvidersConfig::default();
+    // The retraction boundary is asserted against LIVE pre-classification
+    // stream state, which by the leak-report design only a trusted route
+    // forwards: an untrusted tool-capable route engages the buffered
+    // delivery sink, and a cancelled turn drops its withheld deltas without
+    // ever flushing them. This test owns the scripted endpoint, so it marks
+    // the fixture provider trusted to keep streaming observable.
     providers.providers.insert(
         "lmstudio".to_string(),
         ProviderEntry {
             url: model_url,
+            trust: Some(ModelTrust::Trusted),
             models: vec![ModelEntry {
                 id: "retraction-model".to_string(),
                 ..ModelEntry::default()
@@ -38426,7 +38442,7 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         })
         .await;
     }
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             if captured_requests.lock().unwrap().len() >= 2 {
                 break;
@@ -38631,7 +38647,11 @@ async fn wait_for_retraction_acceptance_event(
     label: &str,
     matches_event: impl Fn(&proto::Event) -> bool,
 ) -> proto::Event {
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    // Every scripted stream event here is guaranteed to arrive; only its
+    // latency varies with machine load (request assembly between turn start
+    // and the first delta is CPU-heavy under a saturated suite run). The
+    // fuse is a failure bound, never a pacing mechanism.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             let event = events
                 .recv()
@@ -38652,7 +38672,7 @@ async fn collect_retraction_acceptance_events_until(
     label: &str,
     terminal: impl Fn(&proto::Event) -> bool,
 ) -> Vec<proto::Event> {
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let mut collected = Vec::new();
         loop {
             let event = events

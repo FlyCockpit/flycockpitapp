@@ -21323,6 +21323,31 @@ fn authz_acp_ingress() -> proto::AcpForwardedMcpIngressV1 {
     }
 }
 
+/// Sealed local executors pin an absolute, canonicalized, identity-hashed
+/// executable path, so every matrix fixture for `create_declared_sealed_action`
+/// must carry one — mirroring the positive controls in
+/// `declared_sealed_action_persists_daemon_minted_instance` and
+/// `sealed_action_channel_create_list_revise_retire_roundtrip`. The fixture
+/// directory outlives the dispatched request, which canonicalizes and hashes
+/// the file at handling time.
+fn sealed_action_matrix_executable() -> String {
+    static FIXTURE: std::sync::OnceLock<(tempfile::TempDir, String)> = std::sync::OnceLock::new();
+    FIXTURE
+        .get_or_init(|| {
+            let dir = tempfile::tempdir().expect("sealed action matrix fixture dir");
+            let exe = dir.path().join("notify");
+            std::fs::write(&exe, b"#!/bin/sh\n").expect("sealed action matrix fixture exe");
+            let pinned = exe
+                .canonicalize()
+                .expect("canonical sealed action matrix fixture exe")
+                .to_string_lossy()
+                .into_owned();
+            (dir, pinned)
+        })
+        .1
+        .clone()
+}
+
 fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Request {
     let root = project_root.to_string_lossy().into_owned();
     match kind {
@@ -21640,7 +21665,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             project_id: "proj".into(),
             description: "notify".into(),
             declaration: proto::SealedActionDeclaration::CommandArgument {
-                argv: vec!["notify".into(), "{{sealed_value}}".into()],
+                argv: vec![sealed_action_matrix_executable(), "{{sealed_value}}".into()],
             },
         },
         "revise_sealed_action_description" => Request::ReviseSealedActionDescription {
@@ -30972,7 +30997,13 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
         expected_model_state_generation: None,
         expected_model: None,
         kind: crate::engine::message::UserSubmissionKind::User,
-        origin: Default::default(),
+        // A real client submission reaches the worker as `ExternalRoot`
+        // (`UserMessageOrigin`'s default on the wire is not
+        // `SubmissionOrigin`'s engine-side default). The terminal receipt's
+        // fingerprint must be exactly what the dispatch-time probe computes
+        // for the same payload, or the exact replay is misclassified as a
+        // conflicting payload.
+        origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
         text: text.to_string(),
         display_text: None,
         tag_expansions: Vec::new(),
@@ -31704,6 +31735,7 @@ async fn image_submission_exact_retry_case() {
         .expect("read durable media reference");
     assert_eq!(retained_reference_count, 1);
 
+    let diag_first_started = std::time::Instant::now();
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
         loop {
             if ctx
@@ -31722,6 +31754,10 @@ async fn image_submission_exact_retry_case() {
     })
     .await
     .expect("the accepted submission becomes durable");
+    eprintln!(
+        "IMAGE-DIAG first submission became durable in {:?}",
+        diag_first_started.elapsed()
+    );
     // Simulate a daemon process restart by dropping the entire per-client
     // attachment state, then reconnecting. Neither the old client nor the
     // daemon replay cache has the bytes now; the durable wire receipt alone
@@ -31818,7 +31854,9 @@ async fn image_submission_exact_retry_case() {
     .expect("one immutable attachment version is reusable by another submission");
     assert!(matches!(reused, Response::UserMessageQueued { .. }));
 
+    let diag_wait_started = std::time::Instant::now();
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let mut diag_last_print = std::time::Instant::now();
         loop {
             let user_messages = ctx
                 .db
@@ -31830,6 +31868,14 @@ async fn image_submission_exact_retry_case() {
                 .count();
             if user_messages >= 2 {
                 break;
+            }
+            if diag_last_print.elapsed() >= std::time::Duration::from_secs(1) {
+                eprintln!(
+                    "IMAGE-DIAG still waiting for 2 durable user messages after {:?}: count={}",
+                    diag_wait_started.elapsed(),
+                    user_messages
+                );
+                diag_last_print = std::time::Instant::now();
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }

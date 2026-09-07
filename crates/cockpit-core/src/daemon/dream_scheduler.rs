@@ -262,7 +262,9 @@ pub(crate) async fn run_knowledge_dream(
     scheduled: bool,
 ) -> Result<DreamRunResult> {
     let project_root = CanonicalDreamProjectRoot::from_session_path(workspace_root)?;
+    let diag_t0 = std::time::Instant::now();
     let run_fence = crate::session::DreamRunFence::acquire(&project_root, &knowledge_base.id).await;
+    eprintln!("DREAM-STEP fence acquired in {:?}", diag_t0.elapsed());
     // Source selection and post-turn verification use the same
     // installation-scoped ledger partition under one execution fence.
     let consumer = db.ensure_installation_identity().await?;
@@ -274,6 +276,11 @@ pub(crate) async fn run_knowledge_dream(
             caller_trust,
         )
         .await?;
+    eprintln!(
+        "DREAM-STEP sources={} in {:?}",
+        sources.len(),
+        diag_t0.elapsed()
+    );
     if sources.is_empty() {
         record_dream_run_timestamp(
             db,
@@ -305,6 +312,10 @@ pub(crate) async fn run_knowledge_dream(
         )
         .await
         .context("starting Dream session")?;
+    eprintln!(
+        "DREAM-STEP dream session attached in {:?}",
+        diag_t0.elapsed()
+    );
     let (agent_settled_tx, agent_settled_rx) = oneshot::channel();
     handle
         .send_work(SessionWork::SetAgent {
@@ -1074,7 +1085,8 @@ mod tests {
             let workspace_root = root.path().to_path_buf();
             let entry = entry.clone();
             async move {
-                run_knowledge_dream(
+                let started = std::time::Instant::now();
+                let result = run_knowledge_dream(
                     &db,
                     &registry,
                     &workspace_root,
@@ -1084,7 +1096,16 @@ mod tests {
                     false,
                     false,
                 )
-                .await
+                .await;
+                eprintln!(
+                    "DREAM-RUN-DIAG finished in {:?}: {:?}",
+                    started.elapsed(),
+                    result
+                        .as_ref()
+                        .map(|r| r.disposition)
+                        .map_err(|e| e.to_string())
+                );
+                result
             }
         });
 

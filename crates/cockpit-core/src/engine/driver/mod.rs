@@ -3546,6 +3546,11 @@ impl Driver {
         self.approver = Some(approver);
     }
 
+    #[cfg(test)]
+    pub(in crate::engine::driver) fn clear_approver(&mut self) {
+        self.approver = None;
+    }
+
     pub fn set_assistant_identity_prefix(&mut self, prefix: Option<String>) {
         self.assistant_identity_prefix = prefix;
     }
@@ -3615,6 +3620,23 @@ impl Driver {
         self.set_config_handle(
             crate::daemon::session_worker::SessionConfigHandle::detached(snapshot),
         );
+        if let Some((providers, provider, model)) = self.test_providers_override.as_mut() {
+            *providers = self.config.providers().clone();
+            if let Some(active) = providers.active_model.as_ref() {
+                *provider = active.provider.clone();
+                *model = active.model.clone();
+            }
+        }
+        if let Some(active) = self.config.providers().active_model.clone() {
+            if let Ok(refreshed) = self.build_live_model_for_running(
+                &self.stack[0].agent.model,
+                &active.provider,
+                &active.model,
+            ) {
+                Arc::make_mut(&mut self.stack[0].agent).model = Arc::new(refreshed);
+                self.schedule.set_agent(self.stack[0].agent.clone());
+            }
+        }
     }
 
     /// The session config reader, re-pinned to the current generation for a
@@ -3623,6 +3645,25 @@ impl Driver {
     fn repin_config_for_turn(&mut self) {
         self.config = self.config.repin();
         self.schedule.set_config_handle(self.config.clone());
+    }
+
+    /// Keep scripted provider URLs on the config snapshot handed to nested
+    /// noninteractive lanes. In tests the override wins; production uses
+    /// [`Self::config`] unchanged.
+    fn config_for_noninteractive_child(
+        &self,
+    ) -> crate::daemon::session_worker::SessionConfigHandle {
+        #[cfg(test)]
+        if let Some((providers, _, _)) = &self.test_providers_override {
+            return crate::daemon::session_worker::SessionConfigHandle::detached(
+                crate::daemon::session_worker::SessionConfigSnapshot::new(
+                    self.config.generation(),
+                    providers.clone(),
+                    self.config.extended().clone(),
+                ),
+            );
+        }
+        self.config.clone()
     }
 
     pub fn set_resource_scheduler(
@@ -5976,6 +6017,26 @@ impl Driver {
                 self.refresh_goal_watchdog(&mut goal_watchdog).await;
                 continue;
             }
+            if !waiting_for_keep_parked_siblings {
+                match control_rx.try_recv() {
+                    Ok(ctl) => {
+                        goal_watchdog = None;
+                        match ctl {
+                            #[cfg(test)]
+                            DriverControl::AbortForTest => {
+                                anyhow::bail!("driver abort requested for test");
+                            }
+                            control => {
+                                self.run_control_with_input_queue(control, &input_queue, tx)
+                                    .await;
+                            }
+                        }
+                        continue;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                }
+            }
             if !waiting_for_keep_parked_siblings
                 && !human_input_already_pending
                 && self
@@ -6117,7 +6178,7 @@ impl Driver {
                     }
                 }
                 _ = assistant_inbox_idle_poll.tick(),
-                    if !waiting_for_keep_parked_siblings => {
+                    if !waiting_for_keep_parked_siblings && !human_input_already_pending => {
                     if self
                         .try_deliver_immediate_assistant_inbox(
                             &input_queue,

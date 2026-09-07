@@ -293,6 +293,12 @@ async fn forward(
             TurnEvent::InferenceWarning { .. } => {
                 let _ = real_tx.try_send(event);
             }
+            // Production display path: these deltas are the only live assistant
+            // plaintext the UI consumes during sensitive-turn withholding.
+            TurnEvent::AssistantDisplayTextDelta { .. }
+            | TurnEvent::AssistantDisplayReasoningDelta { .. } => {
+                let _ = real_tx.try_send(event);
+            }
             // Fail-closed default: any OTHER event is WITHHELD (buffered, surfaced
             // only on a Released flush, dropped on a contained/discarded turn)
             // rather than streamed live, so a future plaintext-bearing completion

@@ -817,6 +817,7 @@ async fn background_gate_no_approver_is_denied() {
     let (mut driver, _tmp) = test_driver(8);
     let mut rx = capture_schedule_events(&mut driver);
     driver.session.set_sandbox_enabled(false);
+    driver.clear_approver();
 
     let out = driver
         .dispatch_schedule_action(&serde_json::json!({

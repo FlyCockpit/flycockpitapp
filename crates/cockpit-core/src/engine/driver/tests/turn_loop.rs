@@ -28,7 +28,7 @@ async fn insert_pending_assistant_inbox_item(driver: &Driver, delivery: &str, su
         )
         .await
         .unwrap();
-    let main_session_id = driver.session.live_id();
+    let main_session_id = driver.session.id;
     let source_session_id = source.session_id;
     let delivery = delivery.to_owned();
     let summary = summary.to_owned();
@@ -486,6 +486,9 @@ async fn assistant_inbox_timer_yields_to_ready_human_input() {
 
     let (queue, tx, _rx) = event_harness();
     let target = driver.active_queue_target();
+    queue
+        .push(UserSubmission::text("HUMAN_TIMER_MARKER"), target)
+        .await;
     let (control_tx, control_rx) = mpsc::channel(1);
     let run_queue = queue.clone();
     let run_tx = tx.clone();
@@ -493,17 +496,13 @@ async fn assistant_inbox_timer_yields_to_ready_human_input() {
         tokio::spawn(async move { driver.run_main_loop(run_queue, control_rx, &run_tx).await });
 
     tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_millis(250)).await;
-    queue
-        .push(UserSubmission::text("HUMAN_TIMER_MARKER"), target)
-        .await;
+    tokio::time::resume();
     for _ in 0..100 {
         if provider_posts(&provider).len() == 1 {
             break;
         }
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-
     let posts = provider_posts(&provider);
     assert_eq!(posts.len(), 1, "the ready human turn starts first");
     let prompt = chat_messages(&posts[0])
@@ -539,14 +538,13 @@ async fn assistant_inbox_timer_yields_to_ready_control() {
 
     let (queue, tx, _rx) = event_harness();
     let (control_tx, control_rx) = mpsc::channel(1);
+    control_tx.send(DriverControl::AbortForTest).await.unwrap();
     let run_queue = queue.clone();
     let run_tx = tx.clone();
     let run =
         tokio::spawn(async move { driver.run_main_loop(run_queue, control_rx, &run_tx).await });
 
-    tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_millis(250)).await;
-    control_tx.send(DriverControl::AbortForTest).await.unwrap();
 
     let result = run.await.expect("driver task joins");
     assert!(
@@ -574,8 +572,22 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
     let (mut driver, _tmp) = scripted_driver(&provider);
     let main_session_id = driver.session.id;
     let inbox_db = driver.session.db.clone();
+    assert_eq!(
+        main_session_id,
+        driver.session.live_id(),
+        "test session main id must match the live delivery id"
+    );
     insert_pending_assistant_inbox_item(&driver, "immediate", "IMMEDIATE_INBOX_MARKER").await;
     insert_pending_assistant_inbox_item(&driver, "defer", "DEFERRED_INBOX_MARKER").await;
+    let claimed = inbox_db
+        .claim_assistant_inbox_for_delivery(main_session_id, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        claimed.len(),
+        1,
+        "immediate inbox item must be claimable before the loop starts"
+    );
 
     let (queue, tx, _rx) = event_harness();
     let target = driver.active_queue_target();
@@ -586,12 +598,12 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
         tokio::spawn(async move { driver.run_main_loop(run_queue, control_rx, &run_tx).await });
 
     tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_millis(250)).await;
+    tokio::time::resume();
     for _ in 0..100 {
         if provider_posts(&provider).len() == 1 {
             break;
         }
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let posts = provider_posts(&provider);
     assert_eq!(
@@ -607,6 +619,7 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
     assert!(immediate_prompt.contains("IMMEDIATE_INBOX_MARKER"));
     assert!(!immediate_prompt.contains("DEFERRED_INBOX_MARKER"));
 
+    tokio::time::pause();
     tokio::time::advance(Duration::from_secs(59)).await;
     for _ in 0..10 {
         tokio::task::yield_now().await;
@@ -618,11 +631,12 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
     );
 
     tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::time::resume();
     for _ in 0..100 {
-        if provider_posts(&provider).len() == 2 {
+        if provider_posts(&provider).len() >= 2 {
             break;
         }
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let posts = provider_posts(&provider);
     assert_eq!(posts.len(), 2, "the heartbeat starts the deferred turn");
@@ -634,6 +648,19 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
     assert!(heartbeat_prompt.contains("DEFERRED_INBOX_MARKER"));
     assert!(!heartbeat_prompt.contains("HUMAN_TURN_MARKER"));
 
+    for _ in 0..200 {
+        let visible = inbox_db
+            .assistant_inbox_for_main(main_session_id, true, 10)
+            .await
+            .unwrap();
+        if visible.iter().any(|item| {
+            item.summary.contains("DEFERRED_INBOX_MARKER") && item.delivered_at_unix_ms.is_some()
+        }) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
     queue
         .push(UserSubmission::text("HUMAN_TURN_MARKER"), target)
         .await;
@@ -641,7 +668,7 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
         if provider_posts(&provider).len() == 3 {
             break;
         }
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let posts = provider_posts(&provider);
     assert_eq!(posts.len(), 3, "the human turn starts the third inference");
@@ -2648,6 +2675,16 @@ fn enable_reasoning_retraction(driver: &mut Driver) {
     if let Some(active) = driver.config.providers().active_model.clone() {
         driver.session.set_active_model_ref(active).unwrap();
     }
+    driver.test_providers_override = Some((
+        driver.config.providers().clone(),
+        "lmstudio".into(),
+        "local".into(),
+    ));
+    if let Ok(refreshed) =
+        driver.build_live_model_for_running(&driver.stack[0].agent.model, "lmstudio", "local")
+    {
+        Arc::make_mut(&mut driver.stack[0].agent).model = Arc::new(refreshed);
+    }
 }
 
 #[tokio::test]
@@ -2674,9 +2711,11 @@ async fn interactive_cancel_after_reasoning_retracts_the_durable_user_row() {
 
     let cancel = driver.cancel_handle();
     let (queue, tx, mut rx) = event_harness();
+    let mut submission = UserSubmission::text("retract after thinking");
+    submission.origin = crate::engine::message::SubmissionOrigin::ExternalRoot;
     let run = tokio::spawn(async move {
         driver
-            .run_user_input(UserSubmission::text("retract after thinking"), &queue, &tx)
+            .run_user_input(submission, &queue, &tx)
             .await
             .unwrap();
         driver
@@ -2744,9 +2783,11 @@ async fn retracted_reasoning_only_turn_resends_with_an_identical_request_prefix(
     let (queue, tx, mut rx) = event_harness();
     let run_queue = queue.clone();
     let run_tx = tx.clone();
+    let mut submission = UserSubmission::text("same resend");
+    submission.origin = crate::engine::message::SubmissionOrigin::ExternalRoot;
     let run = tokio::spawn(async move {
         driver
-            .run_user_input(UserSubmission::text("same resend"), &run_queue, &run_tx)
+            .run_user_input(submission, &run_queue, &run_tx)
             .await
             .unwrap();
         driver
@@ -2774,7 +2815,15 @@ async fn retracted_reasoning_only_turn_resends_with_an_identical_request_prefix(
     let _ = drain_events(&mut rx);
 
     driver
-        .run_user_input(UserSubmission::text("same resend"), &queue, &tx)
+        .run_user_input(
+            {
+                let mut submission = UserSubmission::text("same resend");
+                submission.origin = crate::engine::message::SubmissionOrigin::ExternalRoot;
+                submission
+            },
+            &queue,
+            &tx,
+        )
         .await
         .unwrap();
     let captured = provider.captured();

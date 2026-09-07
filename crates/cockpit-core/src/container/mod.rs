@@ -307,29 +307,6 @@ impl ContainerManager {
     }
 }
 
-/// Complete container-runtime detection after daemon boot has published its
-/// transport endpoint. Launches are gated until this finishes.
-pub fn spawn_runtime_detection(
-    manager: std::sync::Arc<ContainerManager>,
-    shutdown: crate::daemon::shutdown::ShutdownSignal,
-) {
-    tokio::spawn(async move {
-        let detected = tokio::task::spawn_blocking(detect_runtime).await;
-        if shutdown.is_draining() {
-            return;
-        }
-        match detected {
-            Ok((runtime, availability)) => {
-                manager.install_detection(runtime, availability);
-                let _ = container_manager().set((*manager).clone());
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "container runtime detection task failed");
-            }
-        }
-    });
-}
-
 impl ContainerManager {
     async fn build_lock(&self, tag: &str) -> Arc<Mutex<()>> {
         let mut locks = self.build_locks.lock().await;

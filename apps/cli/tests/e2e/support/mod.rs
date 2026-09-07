@@ -10,7 +10,7 @@
 #[cfg(unix)]
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use assert_cmd::cargo::CommandCargoExt;
@@ -678,4 +678,58 @@ pub(crate) fn wait_for_pid_exit_blocking(pid: u32, timeout: Duration) -> bool {
         std::thread::yield_now();
     }
     !pid_is_live(pid)
+}
+
+/// Panic/unwind guard for foreground ephemeral daemons spawned outside
+/// [`SpawnedDaemon`]. Ensures the child is terminated and reaped and the socket
+/// node is removed on abnormal test exit.
+pub struct EphemeralDaemonGuard {
+    pid: u32,
+    socket: PathBuf,
+    disarmed: bool,
+}
+
+impl EphemeralDaemonGuard {
+    pub fn new(pid: u32, socket: PathBuf) -> Self {
+        Self {
+            pid,
+            socket,
+            disarmed: false,
+        }
+    }
+
+    pub fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for EphemeralDaemonGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        terminate_child_process_for_test_cleanup(self.pid);
+        if self.socket.exists() {
+            let _ = std::fs::remove_file(&self.socket);
+        }
+    }
+}
+
+fn terminate_child_process_for_test_cleanup(pid: u32) {
+    #[cfg(unix)]
+    {
+        if pid_is_live(pid) {
+            let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            let _ = wait_for_pid_exit_blocking(pid, Duration::from_secs(2));
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F", "/T"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
+    }
 }

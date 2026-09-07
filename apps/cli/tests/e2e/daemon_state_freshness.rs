@@ -2,7 +2,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use crate::support::{
-    IsolatedHome, SpawnedDaemon, assert_failure, assert_success, output_text,
+    EphemeralDaemonGuard, IsolatedHome, SpawnedDaemon, assert_failure, assert_success, output_text,
     wait_for_daemon_handshake_on_socket,
 };
 use cockpit_cli::integration::{DaemonClient, DaemonEvent};
@@ -125,30 +125,10 @@ async fn ephemeral_session_resumes_on_shared_daemon() {
             .spawn()
             .expect("spawn explicit ephemeral daemon process"),
     );
-    struct EphemeralDaemonGuard {
-        pid: u32,
-        socket: std::path::PathBuf,
-        disarmed: bool,
-    }
-    impl Drop for EphemeralDaemonGuard {
-        fn drop(&mut self) {
-            if self.disarmed {
-                return;
-            }
-            #[cfg(unix)]
-            {
-                let _ = unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGKILL) };
-            }
-            if self.socket.exists() {
-                let _ = std::fs::remove_file(&self.socket);
-            }
-        }
-    }
-    let mut ephemeral_guard = EphemeralDaemonGuard {
-        pid: ephemeral_process.as_ref().expect("ephemeral daemon").id(),
-        socket: ephemeral_socket.clone(),
-        disarmed: false,
-    };
+    let mut ephemeral_guard = EphemeralDaemonGuard::new(
+        ephemeral_process.as_ref().expect("ephemeral daemon").id(),
+        ephemeral_socket.clone(),
+    );
     wait_for_daemon_handshake_on_socket(&ephemeral_socket, Duration::from_secs(5), || {
         let process = ephemeral_process.as_mut().expect("ephemeral daemon");
         if let Some(status) = process.try_wait().expect("probe ephemeral daemon") {
@@ -202,7 +182,7 @@ async fn ephemeral_session_resumes_on_shared_daemon() {
         .await
         .expect("gracefully stop ephemeral daemon");
     drop(ephemeral_client);
-    ephemeral_guard.disarmed = true;
+    ephemeral_guard.disarm();
     let ephemeral_output = ephemeral_process
         .take()
         .expect("ephemeral daemon process")

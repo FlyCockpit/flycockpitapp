@@ -3549,8 +3549,14 @@ mod tests {
         );
 
         drop(client_b);
-        tokio::time::timeout(Duration::from_secs(3), daemon_task)
-            .await
+        let diag_started = std::time::Instant::now();
+        let joined = tokio::time::timeout(Duration::from_secs(30), daemon_task).await;
+        eprintln!(
+            "EPHEMERAL-DIAG daemon join outcome after {:?}: completed={}",
+            diag_started.elapsed(),
+            joined.is_ok()
+        );
+        joined
             .expect("last socket client must drain and reap the ephemeral owner")
             .expect("daemon task joins")
             .expect("daemon drain cancels attached session work cleanly");

@@ -2458,7 +2458,20 @@ impl SessionRegistry {
         // Everything after acquiring this synchronous guard is synchronous,
         // so session startup remains `Send` when spawned by the daemon.
         let _persistent_service_transition = self.lock_persistent_service_transition();
-        session.set_external_journal(self.external_journal());
+        let journal = self.external_journal();
+        #[cfg(test)]
+        let journal = journal.or_else(|| {
+            // Test builds skip the daemon's boot-time journal install (native
+            // secure keys are unavailable in tests), but the
+            // durable-before-handoff barrier is a hard invariant in every
+            // build: a session driven by the daemon must be journaled exactly
+            // like a production session instead of failing closed like a
+            // degraded boot. Test-harness registries that did not start a
+            // journal therefore install the production-shaped test journal.
+            session.install_test_external_journal();
+            session.external_journal()
+        });
+        session.set_external_journal(journal);
         session.set_message_media_authority(self.message_media_authority());
         self.copy_tool_media_runtime_to_session(&session);
         // Copy the daemon containment handle onto the worker session so every

@@ -114,6 +114,15 @@ struct LockState {
     /// means the record was restored without a known hash and cannot authorize
     /// a write.
     read_tracker: HashMap<(Uuid, AgentId), HashMap<PathBuf, Option<u64>>>,
+    /// `(session_id, agent_id) → path → content hash of the bytes this
+    /// session authored for that path by creating the file. Deliberately
+    /// distinct from [`Self::read_tracker`]: creation is not a read, so
+    /// `has_read` stays false and a later blind `write` still requires an
+    /// explicit `read`. Only the anchored `edit` gate accepts this as
+    /// freshness evidence, because its `old_string` match against the current
+    /// bytes is itself proof of fresh knowledge. In-memory only — a daemon
+    /// restart drops it and the agent must read again (fail-closed).
+    authored_tracker: HashMap<(Uuid, AgentId), HashMap<PathBuf, u64>>,
     /// Canonical paths whose persisted release failed after the in-memory
     /// lock was force-released. The next acquire may overwrite the stale DB
     /// owner row for these paths only.

@@ -728,8 +728,14 @@ async fn create_new_and_release(
         return Err(error);
     }
     let persist_ok = guard.release_after_write().await;
+    // Record the authored bytes, NOT a §3c read record: creation is not a
+    // read, `has_read` stays false, and a later blind `write` still requires
+    // an explicit `read` (new-file creation never grants future blind
+    // overwrites). Only the anchored `edit` gate accepts authored content as
+    // freshness evidence, because its `old_string` must match these exact
+    // bytes.
     ctx.locks
-        .note_read(path, &ctx.lock_identity, ctx.session.id)
+        .note_authored(path, &ctx.lock_identity, ctx.session.id)
         .await;
     Ok((
         crate::tools::common::WriteReleaseOutcome { persist_ok },

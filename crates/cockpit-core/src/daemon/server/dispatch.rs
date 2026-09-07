@@ -3353,6 +3353,40 @@ fn v2_terminal_client_submission_probe(
     }
 }
 
+fn v2_terminal_client_submission_wire_fingerprint(
+    request: &crate::proto_crate::send_user_message_v2::SendUserMessageV2,
+    run_invocation_options: Option<&proto::RunInvocationOptions>,
+) -> String {
+    let tag_expansions = request
+        .tag_expansions
+        .iter()
+        .cloned()
+        .map(Into::into)
+        .collect::<Vec<proto::TagExpansionMeta>>();
+    let mut wire_fingerprint = user_message_wire_fingerprint_bytes(
+        proto::UserMessageOrigin::ExternalRoot,
+        &request.text,
+        request.display_text.as_deref(),
+        &tag_expansions,
+        &[],
+        &[],
+        request.forced_skill.as_deref(),
+    );
+    if let Some(delivery_class) = request.delivery_class_override {
+        wire_fingerprint.push_str(match delivery_class {
+            proto::QueueDeliveryClass::Steering => "|delivery:steering",
+            proto::QueueDeliveryClass::Held => "|delivery:held",
+        });
+    }
+    if let Some(options) = run_invocation_options {
+        wire_fingerprint = format!(
+            "{wire_fingerprint}|run:{}",
+            run_invocation::options_digest(options)
+        );
+    }
+    wire_fingerprint
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_send_user_message_v2(
     request_id: Uuid,
@@ -3544,9 +3578,11 @@ async fn handle_send_user_message_v2(
         .map_err(internal)?
     {
         let probe = v2_terminal_client_submission_probe(&request, state.principal.tag());
-        if terminal.origin_principal.as_deref() != probe.origin_principal.as_deref()
-            || terminal.fingerprint != probe.client_fingerprint()
-        {
+        let wire_fingerprint = v2_terminal_client_submission_wire_fingerprint(
+            &request,
+            validated.run_invocation_options.as_ref(),
+        );
+        if terminal.origin_principal.as_deref() != probe.origin_principal.as_deref() {
             return Err(ErrorPayload {
                 code: ErrorCode::BadRequest,
                 message: format!(
@@ -3555,12 +3591,23 @@ async fn handle_send_user_message_v2(
                 ),
             });
         }
+        if terminal.wire_fingerprint == wire_fingerprint
+            || terminal.fingerprint == probe.client_fingerprint()
+        {
+            return Err(ErrorPayload {
+                code: ErrorCode::UserMessageTerminated,
+                message: format!(
+                    "client_submission_id {} is terminal ({}) and will not be executed",
+                    request.client_submission_id,
+                    terminal.disposition.as_str()
+                ),
+            });
+        }
         return Err(ErrorPayload {
-            code: ErrorCode::UserMessageTerminated,
+            code: ErrorCode::BadRequest,
             message: format!(
-                "client_submission_id {} is terminal ({}) and will not be executed",
-                request.client_submission_id,
-                terminal.disposition.as_str()
+                "client_submission_id {} was already used for a different payload",
+                request.client_submission_id
             ),
         });
     }

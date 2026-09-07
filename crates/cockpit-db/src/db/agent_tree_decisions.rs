@@ -4829,18 +4829,19 @@ impl Db {
                 )
                 .optional()?;
             if approved.is_none() {
-                // A live ready/dispatching handoff may already exist when this
-                // waiter wakes after an external resolver or replay path settled
-                // the operation. Return `true` so the caller can adopt the
-                // durable row instead of trying to mint a second capability.
-                // When no handoff exists yet, return `false` so the caller can
-                // distinguish a missing approval from an idempotent replay.
+                // A live `ready` handoff may already exist when this waiter
+                // wakes after an external resolver settled the operation.
+                // Return `true` so the caller can adopt that row instead of
+                // minting a second capability. A `dispatching` handoff means
+                // the effect boundary already claimed the operation; recovery
+                // must observe `false` and record submission-unknown rather
+                // than redeliver the effect.
                 let existing: Option<i64> = conn
                     .query_row(
                         "SELECT 1
                            FROM agent_host_approval_effect_handoffs
                           WHERE operation_id = ?1 AND session_id = ?2 AND agent_instance_id = ?3
-                            AND state IN ('ready', 'dispatching')",
+                            AND state = 'ready'",
                         params![
                             operation_id.to_string(),
                             session_id.to_string(),
@@ -4876,9 +4877,9 @@ impl Db {
                 ],
             )?;
             if inserted == 0 {
-                let existing: Option<i64> = conn
+                let existing_state: Option<String> = conn
                     .query_row(
-                        "SELECT 1
+                        "SELECT state
                            FROM agent_host_approval_effect_handoffs
                           WHERE operation_id = ?1 AND session_id = ?2 AND agent_instance_id = ?3
                             AND state IN ('ready', 'dispatching')",
@@ -4890,12 +4891,18 @@ impl Db {
                         |row| row.get(0),
                     )
                     .optional()?;
-                if existing.is_none() {
-                    ensure!(
-                        inserted == 1,
-                        "host approval operation lost its selected candidate while creating the effect handoff"
-                    );
-                }
+                return match existing_state.as_deref() {
+                    Some("ready") => Ok(true),
+                    Some("dispatching") => Ok(false),
+                    None => {
+                        ensure!(
+                            inserted == 1,
+                            "host approval operation lost its selected candidate while creating the effect handoff"
+                        );
+                        Ok(true)
+                    }
+                    Some(other) => bail!("unexpected host approval effect handoff state {other}"),
+                };
             }
             Ok(true)
         })
@@ -4941,7 +4948,7 @@ impl Db {
                     |row| row.get(0),
                 )
                 .optional()?;
-            Ok(state.filter(|state| state == "ready" || state == "dispatching"))
+            Ok(state.filter(|state| state == "ready"))
         })
         .await
     }

@@ -456,11 +456,12 @@ async fn run_approval_auto_denied() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn run_approve_class_grants() {
     // Keep the provider alive for the spawned run process; dropping it closes the listener.
-    let provider = run_provider(vec![
-        approval_tool_turn(false),
-        text_turn("adapted after approval result"),
-    ])
-    .await;
+    let provider = ScriptedProvider::builder()
+        .turn(approval_tool_turn(false))
+        .turn(text_turn("adapted after approval result"))
+        .repeat_last()
+        .start()
+        .await;
     let home = IsolatedHome::new();
     home.write_local_provider_config(&provider.base_url());
     home.trust_project();

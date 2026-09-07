@@ -4829,18 +4829,23 @@ impl Db {
                 )
                 .optional()?;
             if approved.is_none() {
-                // A live ready/dispatching handoff may already exist when this
-                // waiter wakes after an external resolver or replay path settled
-                // the operation. Return `true` so the caller can adopt the
-                // durable row instead of trying to mint a second capability.
-                // When no handoff exists yet, return `false` so the caller can
-                // distinguish a missing approval from an idempotent replay.
+                // A live ready handoff may already exist when this waiter
+                // wakes after an external resolver or replay path settled the
+                // operation. Return `true` so the caller can adopt the durable
+                // row instead of trying to mint a second capability. A
+                // `dispatching` handoff is deliberately not adoptable: its
+                // effect already crossed the concrete boundary, so its
+                // dispatch outcome is unknown and recovery must never
+                // redeliver it. When no unclaimed handoff exists yet, return
+                // `false` so the caller can distinguish a missing approval
+                // from an idempotent replay and can route a claimed
+                // submission to its submission-unknown terminalization.
                 let existing: Option<i64> = conn
                     .query_row(
                         "SELECT 1
                            FROM agent_host_approval_effect_handoffs
                           WHERE operation_id = ?1 AND session_id = ?2 AND agent_instance_id = ?3
-                            AND state IN ('ready', 'dispatching')",
+                            AND state = 'ready'",
                         params![
                             operation_id.to_string(),
                             session_id.to_string(),
@@ -4881,7 +4886,7 @@ impl Db {
                         "SELECT 1
                            FROM agent_host_approval_effect_handoffs
                           WHERE operation_id = ?1 AND session_id = ?2 AND agent_instance_id = ?3
-                            AND state IN ('ready', 'dispatching')",
+                            AND state = 'ready'",
                         params![
                             operation_id.to_string(),
                             session_id.to_string(),

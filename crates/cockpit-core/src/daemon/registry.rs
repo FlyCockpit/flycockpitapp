@@ -955,6 +955,19 @@ impl SessionRegistry {
         crate::sync::lock_or_recover(&self.inner.external_journal).clone()
     }
 
+    pub(crate) fn external_journal_handle(
+        &self,
+    ) -> Option<Arc<crate::external_journal::ExternalJournal>> {
+        self.external_journal()
+    }
+
+    pub(crate) fn publish_external_journal(
+        &self,
+        journal: Arc<crate::external_journal::ExternalJournal>,
+    ) {
+        self.set_external_journal(journal);
+    }
+
     pub(crate) fn set_message_media_authority(
         &self,
         storage: Arc<crate::media_storage::MediaStorageRecovery>,

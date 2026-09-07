@@ -30967,7 +30967,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
         expected_model_state_generation: None,
         expected_model: None,
         kind: crate::engine::message::UserSubmissionKind::User,
-        origin: Default::default(),
+        origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
         text: text.to_string(),
         display_text: None,
         tag_expansions: Vec::new(),

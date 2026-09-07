@@ -207,6 +207,7 @@ impl IsolatedHome {
     }
 
     pub fn trust_project(&self) {
+        self.ensure_persistent_daemon_started();
         let output = self
             .cockpit()
             .args([
@@ -219,6 +220,23 @@ impl IsolatedHome {
             .output()
             .expect("trust integration project");
         assert_success("cockpit trust set", &output, self);
+    }
+
+    /// Start the persistent daemon through the detach path so cold boot can use
+    /// the same handshake budget as other integration harnesses. `trust set`
+    /// otherwise spawns through the lifecycle client and its fixed wait.
+    fn ensure_persistent_daemon_started(&self) {
+        if socket_answers_hello(&self.socket_path()) {
+            return;
+        }
+        let output = self
+            .cockpit()
+            .args(["daemon", "start", "--detach"])
+            .env("COCKPIT_LOG", "warn,cockpit::startup=info")
+            .output()
+            .expect("spawn daemon start command for trust setup");
+        assert_success("cockpit daemon start --detach", &output, self);
+        wait_for_status_handshake_blocking(self, DAEMON_START_HANDSHAKE_TIMEOUT);
     }
 
     pub fn set_env(&mut self, key: impl Into<String>, value: impl Into<String>) {
@@ -545,6 +563,28 @@ async fn wait_for_status_handshake(home: &IsolatedHome, timeout: Duration) {
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(Duration::from_millis(200));
     }
+    assert_daemon_running_status(home);
+}
+
+fn wait_for_status_handshake_blocking(home: &IsolatedHome, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    let mut delay = Duration::from_millis(20);
+    loop {
+        if socket_answers_hello(&home.socket_path()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for daemon status handshake\n{}",
+            handshake_debug(home)
+        );
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(Duration::from_millis(200));
+    }
+    assert_daemon_running_status(home);
+}
+
+fn assert_daemon_running_status(home: &IsolatedHome) {
     let status = home
         .cockpit()
         .args(["daemon", "status"])

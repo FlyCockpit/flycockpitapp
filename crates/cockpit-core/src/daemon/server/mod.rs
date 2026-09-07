@@ -112,28 +112,6 @@ fn daemon_process_env() -> HashMap<String, String> {
         .collect()
 }
 
-fn build_daemon_redaction_table_boot_snapshot(
-    config_source: &crate::daemon::config_source::ConfigSource,
-    vault: &Arc<crate::secure_key::SecretVault>,
-) -> Result<Arc<RedactionTable>> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    let (_, extended) = config_source
-        .load(&cwd)
-        .context("loading config for daemon redaction")?;
-    let mut cfg = extended.redact;
-    // Boot publishes the transport endpoint before the process environment and
-    // dotenv scan complete. Vault-backed secrets are available immediately;
-    // env/dotenv enrichment runs on a background task and unions in later.
-    cfg.scan_environment = false;
-    cfg.scan_dotenv = false;
-    let env = HashMap::new();
-    let store = crate::credentials::CredentialStore::from_vault(vault.clone())
-        .context("opening daemon vault for redaction")?;
-    let built = RedactionTable::build_with_env_and_credential_store(&cfg, &cwd, &env, &store)
-        .context("building daemon redaction boot snapshot")?;
-    Ok(Arc::new(built))
-}
-
 fn build_daemon_redaction_table(
     config_source: &crate::daemon::config_source::ConfigSource,
     vault: &Arc<crate::secure_key::SecretVault>,
@@ -171,36 +149,6 @@ fn refresh_global_redaction_table(
 ) -> Result<Arc<RedactionTable>> {
     let fresh = build_daemon_redaction_table(config_source, vault)?;
     union_built_redaction_table(shared, fresh)
-}
-
-fn spawn_daemon_redaction_enrichment(
-    shared: SharedRedactionTable,
-    config_source: crate::daemon::config_source::ConfigSource,
-    vault: Arc<crate::secure_key::SecretVault>,
-    shutdown: crate::daemon::shutdown::ShutdownSignal,
-) {
-    tokio::spawn(async move {
-        let built = tokio::task::spawn_blocking(move || {
-            build_daemon_redaction_table(&config_source, &vault)
-        })
-        .await;
-        if shutdown.is_draining() {
-            return;
-        }
-        match built {
-            Ok(Ok(fresh)) => {
-                if let Err(error) = union_built_redaction_table(&shared, fresh) {
-                    tracing::warn!(error = %error, "daemon redaction env/dotenv enrichment failed");
-                }
-            }
-            Ok(Err(error)) => {
-                tracing::warn!(error = %error, "daemon redaction env/dotenv enrichment failed");
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "daemon redaction env/dotenv enrichment task failed");
-            }
-        }
-    });
 }
 
 fn scrub_json_strings(value: &mut serde_json::Value, redact: &RedactionTable) {
@@ -3188,6 +3136,35 @@ impl DaemonContext {
         terminal_factory: crate::daemon::terminal::TerminalHostFactory,
         config_source: crate::daemon::config_source::ConfigSource,
     ) -> Self {
+        Self::assemble(db, locks, paths, terminal_factory, config_source, None)
+    }
+
+    pub(crate) fn new_with_boot_redaction(
+        db: Db,
+        locks: Arc<LockManager>,
+        paths: DaemonPaths,
+        terminal_factory: crate::daemon::terminal::TerminalHostFactory,
+        config_source: crate::daemon::config_source::ConfigSource,
+        boot_redaction: Arc<RedactionTable>,
+    ) -> Self {
+        Self::assemble(
+            db,
+            locks,
+            paths,
+            terminal_factory,
+            config_source,
+            Some(boot_redaction),
+        )
+    }
+
+    fn assemble(
+        db: Db,
+        locks: Arc<LockManager>,
+        paths: DaemonPaths,
+        terminal_factory: crate::daemon::terminal::TerminalHostFactory,
+        config_source: crate::daemon::config_source::ConfigSource,
+        boot_redaction: Option<Arc<RedactionTable>>,
+    ) -> Self {
         let daemon_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let canonical_cwd = daemon_cwd.canonicalize().unwrap_or(daemon_cwd);
         let ephemeral_lifetime = paths.ephemeral;
@@ -3237,12 +3214,13 @@ impl DaemonContext {
             .unwrap_or_else(|error| panic!("daemon vault required at construction: {error}"));
         registry.set_secret_vault(secret_vault.clone());
         config_source.install_vault(secret_vault.clone());
-        let global_redaction = Arc::new(std::sync::RwLock::new(
-            build_daemon_redaction_table_boot_snapshot(&config_source, &secret_vault)
-                .unwrap_or_else(|error| {
-                    panic!("daemon redaction boot snapshot required at construction: {error}")
-                }),
-        ));
+        let global_redaction = Arc::new(std::sync::RwLock::new(boot_redaction.unwrap_or_else(
+            || {
+                build_daemon_redaction_table(&config_source, &secret_vault).unwrap_or_else(
+                    |error| panic!("daemon redaction table required at construction: {error}"),
+                )
+            },
+        )));
         // MCP connections retain only the vault handle, not the full daemon
         // context. Install the owner publication seam here so an in-band
         // OAuth refresh cannot commit a new token while leaving the active
@@ -3280,12 +3258,6 @@ impl DaemonContext {
             container.install_detection(runtime, availability);
             let _ = crate::container::container_manager().set((*container).clone());
         }
-        spawn_daemon_redaction_enrichment(
-            global_redaction.clone(),
-            config_source.clone(),
-            secret_vault.clone(),
-            shutdown.clone(),
-        );
         spawn_terminal_reaper(terminal_host.clone(), shutdown.clone());
         crate::daemon::bulk_staging::spawn_reaper(shutdown.clone());
         registry
@@ -4457,6 +4429,8 @@ pub(crate) async fn boot_with_db(
     terminal_factory: crate::daemon::terminal::TerminalHostFactory,
     config_source: crate::daemon::config_source::ConfigSource,
 ) -> Result<DaemonContext> {
+    #[cfg(not(test))]
+    let mut containment_recovered = false;
     timer.phase("db_open_and_migrate");
     let locks = Arc::new(
         LockManager::from_db(db.clone())
@@ -4487,8 +4461,27 @@ pub(crate) async fn boot_with_db(
         .context("checking global host capability refresh execution fence")?,
         "host capability refresh execution fence remains live after boot reconciliation"
     );
+    let boot_redaction = tokio::task::spawn_blocking({
+        let config_source = config_source.clone();
+        let db = db.clone();
+        move || {
+            let vault = crate::secure_key::open_for_db(&db)
+                .context("opening daemon vault for redaction")?;
+            build_daemon_redaction_table(&config_source, &vault)
+        }
+    })
+    .await
+    .context("daemon redaction build task failed")??;
+    timer.phase("redaction_table");
     #[cfg_attr(test, allow(unused_mut))]
-    let mut ctx = DaemonContext::new(db.clone(), locks, paths, terminal_factory, config_source);
+    let mut ctx = DaemonContext::new_with_boot_redaction(
+        db.clone(),
+        locks,
+        paths,
+        terminal_factory,
+        config_source,
+        boot_redaction,
+    );
     // A capability refresh receipt is daemon-global state, not a per-session
     // cache. Seed only from an already-published durable generation, then
     // replay the completed outbox below in order. Seeding from the newest
@@ -4757,6 +4750,18 @@ pub(crate) async fn boot_with_db(
         // Publish to the registry so every worker session installs the same
         // handle and spawns its lifecycle hooks under a proven containment lease.
         ctx.registry.set_process_containment(handle.clone());
+        match handle.recover().await {
+            Ok(outcomes) => {
+                containment_recovered = true;
+                tracing::info!(
+                    recovered = outcomes.len(),
+                    "process containment recovery finished"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "process containment recovery failed");
+            }
+        }
         timer.phase("process_containment_actor");
 
         // Durable write-scope authority. One coordinator per daemon: `recover`
@@ -4775,6 +4780,16 @@ pub(crate) async fn boot_with_db(
             std::sync::Arc::new(crate::write_scope::NullEventSink),
             crate::write_scope::system_clock(),
         ));
+        // Must run after containment recovery: reconciling a transfer consults
+        // the containment oracle for ProvenEmpty.
+        match coordinator.recover(None).await {
+            Ok(outcomes) => {
+                tracing::info!(recovered = outcomes.len(), "write scope recovery finished");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "write scope recovery failed");
+            }
+        }
         // Publish to the registry so every session worker installs the same
         // coordinator into its driver.
         ctx.registry.set_write_scope(coordinator.clone());
@@ -4786,60 +4801,7 @@ pub(crate) async fn boot_with_db(
         let _ = db;
         timer.phase("process_containment_actor_skipped");
     }
-    // External side-effect journal: recover the capsule spool and revalidate
-    // recovery capacity BEFORE any external dispatch can be enabled. The
-    // handle is published only once both succeed, so a consumer that cannot
-    // see `ctx.external_journal` cannot start a non-idempotent external
-    // action. Startup needs the secure-key handle for spool HMAC material.
-    #[cfg(not(test))]
-    {
-        match &ctx.secure_key {
-            Some(secure_key) => {
-                let now_wall_ms = chrono::Utc::now().timestamp_millis();
-                match crate::external_journal::ExternalJournal::start(
-                    ctx.db.clone(),
-                    secure_key,
-                    now_wall_ms,
-                )
-                .await
-                {
-                    Ok((journal, report)) => {
-                        tracing::info!(
-                            scanned = report.scanned,
-                            imported = report.imported,
-                            quarantined = report.quarantined,
-                            converted = report.converted,
-                            released_without_medium = report.released_without_medium,
-                            "external side-effect journal recovery finished"
-                        );
-                        let journal = std::sync::Arc::new(journal);
-                        ctx.registry.set_external_journal(journal.clone());
-                        ctx.external_journal = Some(journal);
-                        timer.phase("external_journal");
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            error = %error,
-                            "external side-effect journal startup failed; \
-                             non-idempotent external actions stay disabled"
-                        );
-                        timer.phase("external_journal_blocked");
-                    }
-                }
-            }
-            None => {
-                tracing::warn!(
-                    "native secure keys unavailable; external side-effect journal \
-                     stays disabled and non-idempotent external actions are refused"
-                );
-                timer.phase("external_journal_skipped");
-            }
-        }
-    }
-    #[cfg(test)]
-    {
-        timer.phase("external_journal_skipped");
-    }
+    timer.phase("external_journal_deferred");
     #[cfg(feature = "extended")]
     if let Some(handle) = ctx.scheduler()
         && let Err(error) =
@@ -4847,58 +4809,29 @@ pub(crate) async fn boot_with_db(
     {
         tracing::warn!(error = %error, "skill curator scheduler registration failed");
     }
-    Ok(ctx)
-}
-
-const TERMINAL_REAPER_POLL: Duration = Duration::from_secs(30);
-
-async fn run_deferred_daemon_subsystems(ctx: Arc<DaemonContext>) {
-    let mut containment_recovered = false;
-    if let Some(handle) = ctx.process_containment.as_ref() {
-        match handle.recover().await {
-            Ok(outcomes) => {
-                containment_recovered = true;
-                tracing::info!(
-                    recovered = outcomes.len(),
-                    "deferred process containment recovery finished"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "deferred process containment recovery failed");
-            }
-        }
-    }
-    if let Some(coordinator) = ctx.write_scope.as_ref() {
-        match coordinator.recover(None).await {
-            Ok(outcomes) => {
-                tracing::info!(
-                    recovered = outcomes.len(),
-                    "deferred write scope recovery finished"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "deferred write scope recovery failed");
-            }
-        }
-    }
     let recovery_wall_ms = chrono::Utc::now()
         .timestamp_millis()
         .try_into()
         .unwrap_or(0);
+    #[cfg(not(test))]
     if containment_recovered {
+        // The only production local media owner is currently the attachment
+        // path, whose collected and decoded bytes are process memory. Reaped
+        // daemon containment is therefore positive cleanup evidence for every
+        // local reservation this binary can create. This contract must grow an
+        // owner-specific deleter before any file-backed producer is added.
         match ctx
             .media_ledger
             .recover_after_restart(recovery_wall_ms, &RestartEphemeralMediaCleanup)
             .await
         {
             Ok(recovered) => {
-                tracing::info!(
-                    recovered,
-                    "deferred media reservation restart recovery finished"
-                );
+                tracing::info!(recovered, "media reservation restart recovery finished");
+                timer.phase("media_reservation_recovered");
             }
             Err(error) => {
-                tracing::warn!(%error, "deferred media reservation restart recovery failed");
+                tracing::warn!(%error, "media reservation restart recovery failed");
+                timer.phase("media_reservation_recovery_blocked");
             }
         }
     }
@@ -4907,22 +4840,160 @@ async fn run_deferred_daemon_subsystems(ctx: Arc<DaemonContext>) {
         .recover_ephemeral_attachment_uploads(recovery_wall_ms)
         .await
     {
-        tracing::warn!(%error, "deferred ephemeral attachment reservation recovery failed");
+        tracing::warn!(%error, "ephemeral attachment reservation recovery failed");
     }
     if let Err(error) = ctx
         .media_ledger
         .reconcile_terminal_downstream_ownership(recovery_wall_ms)
         .await
     {
-        tracing::warn!(%error, "deferred terminal downstream media ownership reconciliation failed");
+        tracing::warn!(%error, "terminal downstream media ownership reconciliation failed");
     }
     let recovery_complete = ctx.media_ledger.recovery_complete().await.unwrap_or(false);
     ctx.media_admission_open
         .store(recovery_complete, std::sync::atomic::Ordering::Release);
-    if !recovery_complete {
+    if recovery_complete {
+        timer.phase("media_reservation_admission_open");
+    } else {
         tracing::warn!("media admission is closed until durable reservations are recovered");
+        timer.phase("media_reservation_admission_blocked");
     }
     ctx.resolve_startup_command_secrets().await;
+    timer.phase("command_secret_startup_resolve");
+    Ok(ctx)
+}
+
+const TERMINAL_REAPER_POLL: Duration = Duration::from_secs(30);
+
+async fn run_deferred_daemon_subsystems(ctx: Arc<DaemonContext>) {
+    run_deferred_external_journal_start(&ctx).await;
+}
+
+const DEFERRED_EXTERNAL_JOURNAL_RETRY: Duration = Duration::from_millis(250);
+
+async fn run_deferred_external_journal_start(ctx: &DaemonContext) {
+    if ctx.registry.external_journal_handle().is_some() {
+        return;
+    }
+    loop {
+        if ctx.shutdown_signal().is_draining() {
+            return;
+        }
+        let secure_key = match ctx.secure_key.clone() {
+            Some(secure_key) => secure_key,
+            None => {
+                tracing::warn!(
+                    "native secure keys unavailable; external side-effect journal \
+                     stays disabled and non-idempotent external actions are refused"
+                );
+                return;
+            }
+        };
+        let now_wall_ms = chrono::Utc::now().timestamp_millis();
+        match crate::external_journal::ExternalJournal::start(
+            ctx.db.clone(),
+            &secure_key,
+            now_wall_ms,
+        )
+        .await
+        {
+            Ok((journal, report)) => {
+                tracing::info!(
+                    scanned = report.scanned,
+                    imported = report.imported,
+                    quarantined = report.quarantined,
+                    converted = report.converted,
+                    released_without_medium = report.released_without_medium,
+                    "deferred external side-effect journal recovery finished"
+                );
+                let journal = std::sync::Arc::new(journal);
+                ctx.registry.publish_external_journal(journal);
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "deferred external side-effect journal startup failed; \
+                     non-idempotent external actions stay disabled; retrying"
+                );
+                tokio::time::sleep(DEFERRED_EXTERNAL_JOURNAL_RETRY).await;
+            }
+        }
+    }
+}
+
+const DEFERRED_HOST_CAPABILITY_REFRESH_RETRY: Duration = Duration::from_millis(250);
+
+async fn run_deferred_host_capability_refresh(ctx: &DaemonContext) {
+    loop {
+        if ctx.shutdown_signal().is_draining() {
+            return;
+        }
+        let generation = match ctx
+            .db
+            .reserve_host_capability_boot_snapshot_generation(
+                crate::agent_tree::daemon_host_capability_refresh_authority(),
+            )
+            .await
+        {
+            Ok(generation) => generation,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "deferred host capability refresh generation reservation failed; retrying"
+                );
+                tokio::time::sleep(DEFERRED_HOST_CAPABILITY_REFRESH_RETRY).await;
+                continue;
+            }
+        };
+        if let Err(error) = ctx
+            .host_capabilities
+            .accept_durable_refresh_reservation(generation)
+        {
+            tracing::warn!(
+                error = %error,
+                generation,
+                "deferred host capability refresh rejected reserved generation; retrying"
+            );
+            tokio::time::sleep(DEFERRED_HOST_CAPABILITY_REFRESH_RETRY).await;
+            continue;
+        }
+        let probes = crate::host_capabilities::collect_shared_host_probes(
+            &ctx.host_capability_probes.for_refresh(),
+            false,
+        )
+        .await;
+        let authority = ctx
+            .db
+            .blocking_write_for_sync_maintenance(crate::db::secret_vault::load_authority_conn)
+            .ok()
+            .flatten();
+        let secret_store =
+            crate::secure_key::project_secret_store_snapshot(authority.as_ref(), &probes.keyring);
+        let snapshot = crate::host_capabilities::build_host_capability_snapshot(
+            generation,
+            &probes,
+            secret_store,
+        );
+        match ctx.host_capabilities.publish_committed(snapshot) {
+            Ok(true) => {
+                tracing::info!(
+                    generation,
+                    "deferred host capability refresh published through durable generation"
+                );
+                return;
+            }
+            Ok(false) => return,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    generation,
+                    "deferred host capability refresh publication failed; retrying"
+                );
+                tokio::time::sleep(DEFERRED_HOST_CAPABILITY_REFRESH_RETRY).await;
+            }
+        }
+    }
 }
 
 struct RestartEphemeralMediaCleanup;
@@ -5319,29 +5390,7 @@ pub(crate) fn spawn_deferred_boot_maintenance(ctx: Arc<DaemonContext>) {
             chrono::Utc::now().timestamp(),
         )
         .await;
-        let generation = ctx.host_capabilities.begin_refresh();
-        let probes = crate::host_capabilities::collect_shared_host_probes(
-            &ctx.host_capability_probes.for_refresh(),
-            false,
-        )
-        .await;
-        let authority = ctx
-            .db
-            .blocking_write_for_sync_maintenance(crate::db::secret_vault::load_authority_conn)
-            .ok()
-            .flatten();
-        let secret_store =
-            crate::secure_key::project_secret_store_snapshot(authority.as_ref(), &probes.keyring);
-        let snapshot = crate::host_capabilities::build_host_capability_snapshot(
-            generation,
-            &probes,
-            secret_store,
-        );
-        if !ctx.host_capabilities.publish(snapshot) {
-            tracing::warn!(
-                "deferred host capability republication did not advance the live snapshot"
-            );
-        }
+        run_deferred_host_capability_refresh(&ctx).await;
     });
 }
 

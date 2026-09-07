@@ -1391,9 +1391,14 @@ async fn wait_for_shared_daemon(
     // so the first retry must land near that mark, not 50ms later. Ramp gently
     // to a 50ms ceiling so a slow/contended spawn doesn't busy-spin.
     let mut backoff = Duration::from_millis(2);
+    let mut endpoint_observed = false;
 
     loop {
         if daemon_transport_ready(socket) {
+            if !endpoint_observed {
+                timer.phase("endpoint_observed");
+                endpoint_observed = true;
+            }
             // A connect error just means the socket exists but accept hasn't
             // started yet — fall through to the backoff retry. A registered
             // in-process owner hellos here without an OS socket.

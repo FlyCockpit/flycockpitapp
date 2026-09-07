@@ -3324,6 +3324,77 @@ pub(super) async fn handle_request(
     result
 }
 
+/// Client fingerprint for local-owner V2 ingress, matching
+/// `handle_send_user_message` submission construction. The early terminal-
+/// receipt probe must use the same domain as durable receipts.
+fn local_owner_v2_client_submission_fingerprint(
+    request: &crate::proto_crate::send_user_message_v2::SendUserMessageV2,
+    origin_principal: Option<String>,
+) -> String {
+    let delivery_class = request.delivery_class_override.unwrap_or_default();
+    crate::engine::message::UserSubmission {
+        origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
+        expected_model_state_generation: None,
+        expected_model: None,
+        kind: crate::engine::message::UserSubmissionKind::User,
+        text: request.text.clone(),
+        display_text: request.display_text.clone(),
+        tag_expansions: request
+            .tag_expansions
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect(),
+        images: Vec::new(),
+        media: Vec::new(),
+        forced_skill: request.forced_skill.clone(),
+        origin_principal,
+        job_id: None,
+        preflight_cleaned: None,
+        queue_item_ids: Vec::new(),
+        client_submissions: Vec::new(),
+        queue_target: None,
+        pending_terminal_disposition: None,
+        run_invocation_id: None,
+        delivery_class,
+        delivery_class_override: request.delivery_class_override,
+    }
+    .client_fingerprint()
+}
+
+fn local_owner_v2_wire_fingerprint(
+    origin: proto::UserMessageOrigin,
+    request: &crate::proto_crate::send_user_message_v2::SendUserMessageV2,
+    run_invocation_options: Option<&proto::RunInvocationOptions>,
+) -> String {
+    let tag_expansions = request
+        .tag_expansions
+        .iter()
+        .cloned()
+        .map(Into::into)
+        .collect::<Vec<proto::TagExpansionMeta>>();
+    let mut wire_fingerprint = user_message_wire_fingerprint_bytes(
+        origin,
+        &request.text,
+        request.display_text.as_deref(),
+        &tag_expansions,
+        &[],
+        &[],
+        request.forced_skill.as_deref(),
+    );
+    if let Some(delivery_class) = request.delivery_class_override {
+        wire_fingerprint.push_str(match delivery_class {
+            proto::QueueDeliveryClass::Steering => "|delivery:steering",
+            proto::QueueDeliveryClass::Held => "|delivery:held",
+        });
+    }
+    if let Some(options) = run_invocation_options {
+        let opts_digest = run_invocation::options_digest(options);
+        wire_fingerprint = format!("{wire_fingerprint}|run:{opts_digest}");
+    }
+    wire_fingerprint
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_send_user_message_v2(
     request_id: Uuid,
@@ -3514,18 +3585,26 @@ async fn handle_send_user_message_v2(
         .await
         .map_err(internal)?
     {
-        let mut probe = crate::engine::message::UserSubmission::text(request.text.clone());
-        probe.display_text = request.display_text.clone();
-        probe.tag_expansions = request
-            .tag_expansions
-            .iter()
-            .cloned()
-            .map(Into::into)
-            .collect();
-        probe.forced_skill = request.forced_skill.clone();
-        probe.origin_principal = state.principal.tag();
-        if terminal.origin_principal.as_deref() != probe.origin_principal.as_deref()
-            || terminal.fingerprint != probe.client_fingerprint()
+        let origin_principal = state.principal.tag();
+        let wire_fingerprint = local_owner_v2_wire_fingerprint(
+            request.origin,
+            &request,
+            validated.run_invocation_options.as_ref(),
+        );
+        if terminal.wire_fingerprint == wire_fingerprint {
+            return Err(ErrorPayload {
+                code: ErrorCode::UserMessageTerminated,
+                message: format!(
+                    "client_submission_id {} is terminal ({}) and will not be executed",
+                    request.client_submission_id,
+                    terminal.disposition.as_str()
+                ),
+            });
+        }
+        let probe_fingerprint =
+            local_owner_v2_client_submission_fingerprint(&request, origin_principal.clone());
+        if terminal.origin_principal.as_deref() != origin_principal.as_deref()
+            || terminal.fingerprint != probe_fingerprint
         {
             return Err(ErrorPayload {
                 code: ErrorCode::BadRequest,
@@ -3974,6 +4053,63 @@ fn user_message_wire_fingerprint_bytes(
     }
     optional_part(&mut hasher, forced_skill);
     crate::intel::hex_lower(&hasher.finalize())
+}
+
+#[cfg(test)]
+mod local_owner_v2_client_submission_fingerprint_tests {
+    use super::local_owner_v2_client_submission_fingerprint;
+
+    #[test]
+    fn v2_terminal_probe_matches_worker_submission_fingerprint() {
+        let request = crate::proto_crate::send_user_message_v2::SendUserMessageV2::text_only(
+            uuid::Uuid::now_v7(),
+            "trigger sandbox approval",
+        );
+        let origin_principal = Some("owner".to_string());
+        let probe =
+            local_owner_v2_client_submission_fingerprint(&request, origin_principal.clone());
+        let worker = crate::engine::message::UserSubmission {
+            origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
+            expected_model_state_generation: None,
+            expected_model: None,
+            kind: crate::engine::message::UserSubmissionKind::User,
+            text: request.text.clone(),
+            display_text: request.display_text.clone(),
+            tag_expansions: request
+                .tag_expansions
+                .iter()
+                .cloned()
+                .map(Into::into)
+                .collect(),
+            images: Vec::new(),
+            media: Vec::new(),
+            forced_skill: request.forced_skill.clone(),
+            origin_principal,
+            job_id: None,
+            preflight_cleaned: None,
+            queue_item_ids: Vec::new(),
+            client_submissions: Vec::new(),
+            queue_target: None,
+            pending_terminal_disposition: None,
+            run_invocation_id: None,
+            delivery_class: request.delivery_class_override.unwrap_or_default(),
+            delivery_class_override: request.delivery_class_override,
+        }
+        .client_fingerprint();
+        assert_eq!(probe, worker);
+    }
+
+    #[test]
+    fn v2_terminal_probe_differs_from_internal_default_origin() {
+        let request = crate::proto_crate::send_user_message_v2::SendUserMessageV2::text_only(
+            uuid::Uuid::now_v7(),
+            "trigger sandbox approval",
+        );
+        let probe = local_owner_v2_client_submission_fingerprint(&request, None);
+        let internal_default =
+            crate::engine::message::UserSubmission::text(request.text.clone()).client_fingerprint();
+        assert_ne!(probe, internal_default);
+    }
 }
 
 async fn handle_send_user_message(
@@ -5143,10 +5279,13 @@ pub(super) async fn execute_remote_staged_rename_with_hook(
     };
     use crate::external_journal::{DirGuard, HeldRenameEffect, RemoteRenameArtifactV1};
 
-    let journal = ctx.external_journal.as_ref().ok_or_else(|| ErrorPayload {
-        code: ErrorCode::Unavailable,
-        message: "remote staged rename recovery authority is unavailable".into(),
-    })?;
+    let journal = ctx
+        .registry
+        .external_journal_handle()
+        .ok_or_else(|| ErrorPayload {
+            code: ErrorCode::Unavailable,
+            message: "remote staged rename recovery authority is unavailable".into(),
+        })?;
     journal
         .ensure_dispatch_allowed()
         .await
@@ -11689,7 +11828,7 @@ async fn handle_serialized_request_impl(
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
-                if ctx.external_journal.is_some() {
+                if ctx.registry.external_journal_handle().is_some() {
                     let request = Request::FsRename {
                         project_root,
                         from_path,

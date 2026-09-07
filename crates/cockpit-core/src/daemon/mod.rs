@@ -588,6 +588,16 @@ fn runtime_dir() -> Option<PathBuf> {
     None
 }
 
+fn cache_dir() -> Option<PathBuf> {
+    if let Ok(s) = std::env::var("XDG_CACHE_HOME")
+        && !s.trim().is_empty()
+    {
+        return Some(PathBuf::from(s).join("cockpit"));
+    }
+    let home = dirs::home_dir()?;
+    Some(home.join(".cache/cockpit"))
+}
+
 /// Restores the process umask on drop, so a scoped tightening around a single
 /// syscall is undone on every path including an early `?` return.
 #[cfg(unix)]
@@ -1405,7 +1415,7 @@ fn spawn_detached_child(
 
 #[cfg(any(unix, windows))]
 fn open_detach_child_log() -> Option<std::fs::File> {
-    let dir = dirs::cache_dir()?.join("cockpit");
+    let dir = cache_dir().or_else(|| dirs::cache_dir().map(|dir| dir.join("cockpit")))?;
     cockpit_host::private_fs::ensure_private_dir(&dir).ok()?;
     std::fs::OpenOptions::new()
         .create(true)
@@ -2104,8 +2114,12 @@ async fn run_foreground_inner_with_boot_db(
         };
     }
     boot_dbg!("entry");
+    let global_config_dir = (!paths.ephemeral).then(|| {
+        tokio::task::spawn_blocking(crate::config::config::dirs::ensure_global_config_dir)
+    });
     #[cfg(not(test))]
     crate::daemon::server::begin_early_keyring_probe();
+    timer.phase("early_keyring_probe");
     // The global config layer belongs to the user, not the workspace. Make it
     // durable and writable before a persistent daemon can accept onboarding
     // work. Ephemeral diagnostic owners (notably `cockpit doctor`) stay
@@ -2114,10 +2128,12 @@ async fn run_foreground_inner_with_boot_db(
     // write target; the first authorized user-level mutation creates the
     // directory through `ensure_global_config_dir`, never as a side effect of
     // a file-write helper.
-    if !paths.ephemeral {
-        crate::config::config::dirs::ensure_global_config_dir()
+    if let Some(task) = global_config_dir {
+        task.await
+            .context("global config directory preparation task failed")?
             .context("creating writable global Cockpit config directory")?;
     }
+    timer.phase("global_config_dir");
     if matches!(
         probe(&paths).await,
         DaemonStatus::Running | DaemonStatus::IncompatibleProtocol
@@ -2127,6 +2143,7 @@ async fn run_foreground_inner_with_boot_db(
             paths.socket.display()
         );
     }
+    timer.phase("probe");
     if boot_db.is_none()
         && DaemonPaths::resolve_canonical()
             .as_ref()
@@ -2149,6 +2166,7 @@ async fn run_foreground_inner_with_boot_db(
             );
         }
     }
+    timer.phase("discover");
     let executable = std::env::current_exe().context("resolving daemon executable identity")?;
     let endpoint_record = if DaemonPaths::resolve_canonical()
         .as_ref()
@@ -2171,6 +2189,7 @@ async fn run_foreground_inner_with_boot_db(
         &executable,
     )
     .with_context(|| format!("reserving pid file {}", paths.pid_file.display()))?;
+    timer.phase("pid_reserve");
     boot_dbg!("after_reserve");
     let mut metadata_guard = ForegroundMetadataGuard::new(
         paths.pid_file.clone(),
@@ -2215,13 +2234,15 @@ async fn run_foreground_inner_with_boot_db(
     // that observes a bound socket expects the hello promptly; publishing it
     // before database/config initialization creates a startup handshake race.
     let listener = bind_private_socket(&paths.socket)?;
+    timer.phase("socket_bind");
     boot_dbg!("after_bind");
     if uses_supplied_boot_db {
         write_endpoint_record_with_receipt_and_canonical(&paths, &paths, &pid_receipt)?;
     } else {
         write_endpoint_record(&paths)?;
     }
-    timer.phase("bind_publish");
+    timer.phase("endpoint_published");
+    boot_dbg!("after_endpoint_publish");
     server::spawn_deferred_boot_maintenance(ctx.clone());
 
     // Signal task: SIGINT/SIGTERM (or Ctrl-C / console-close on Windows)

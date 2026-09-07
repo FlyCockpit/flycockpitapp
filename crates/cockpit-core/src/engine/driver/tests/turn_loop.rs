@@ -868,8 +868,18 @@ async fn oversized_user_provider_projection_replaces_the_full_source_with_its_ty
         .await
         .unwrap();
     assert!(artifacts.iter().any(|artifact| {
+        // The durable contract for a blob-backed user source: SQLite keeps
+        // the same bounded line preview as the owning event, while the full
+        // body lives in daemon-owned blob storage and is accounted by
+        // `content_bytes`. Asserting `artifact.content == source` here would
+        // desynchronize the ledger row from its event and violate
+        // `text_artifact_ref_validate_insert`.
         artifact.kind == crate::db::db::text_artifacts::TextArtifactKind::UserInputSource
-            && artifact.content == source
+            && artifact.content.len() < source.len()
+            && artifact.content.len() <= 16 * 1024
+            && artifact.content_bytes == source.len()
+            && crate::text_artifact_blob::read_artifact_content(artifact)
+                .is_ok_and(|body| body == source)
     }));
 }
 

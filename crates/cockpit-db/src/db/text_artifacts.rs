@@ -1922,15 +1922,18 @@ fn insert_artifact_conn(
     }
 
     let artifact_id = Uuid::new_v4();
+    // Blob-backed rows — including `user_input_source` — keep only the same
+    // bounded line preview in `content` that the owning event persists; the
+    // full body lives in daemon-owned blob storage and is accounted by
+    // `content_bytes`. Storing the full body here would desynchronize the
+    // ledger row from its event (`text_artifact_ref_validate_insert`) and
+    // resurrect the unbounded SQLite retention the blob spill exists to
+    // prevent.
     let stored_content = if has_blob_path(&candidate.provenance_json)? {
-        if candidate.kind == TextArtifactKind::UserInputSource {
-            candidate.content.clone()
-        } else {
-            artifact_inline_preview(
-                &candidate.content,
-                artifact_preview_lines(&candidate.provenance_json)?,
-            )
-        }
+        artifact_inline_preview(
+            &candidate.content,
+            artifact_preview_lines(&candidate.provenance_json)?,
+        )
     } else {
         candidate.content.clone()
     };

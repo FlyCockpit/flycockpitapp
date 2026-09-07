@@ -1923,14 +1923,10 @@ fn insert_artifact_conn(
 
     let artifact_id = Uuid::new_v4();
     let stored_content = if has_blob_path(&candidate.provenance_json)? {
-        if candidate.kind == TextArtifactKind::UserInputSource {
-            candidate.content.clone()
-        } else {
-            artifact_inline_preview(
-                &candidate.content,
-                artifact_preview_lines(&candidate.provenance_json)?,
-            )
-        }
+        artifact_inline_preview(
+            &candidate.content,
+            artifact_preview_lines(&candidate.provenance_json)?,
+        )
     } else {
         candidate.content.clone()
     };

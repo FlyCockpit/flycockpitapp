@@ -773,6 +773,7 @@ mod tests {
     // ---- native-tool confinement (sandboxing part 2) ----------------------
 
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
 
     use crate::approval::Approver;
     use crate::approval::ID_APPROVE_SESSION;
@@ -830,7 +831,14 @@ mod tests {
         let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
         let cfg = crate::config::extended::RedactConfig::default();
         let redact = Arc::new(crate::redact::RedactionTable::build(&cfg, cwd).unwrap());
-        let hub = Arc::new(InterruptHub::detached());
+        let (events, _events_rx) = tokio::sync::broadcast::channel(16);
+        let hub = Arc::new(InterruptHub::new(
+            events,
+            Arc::new(std::sync::RwLock::new(redact.clone())),
+            Arc::new(AtomicUsize::new(1)),
+            db.clone(),
+            sid,
+        ));
         let store = GrantStore::new(
             db.clone(),
             sid,

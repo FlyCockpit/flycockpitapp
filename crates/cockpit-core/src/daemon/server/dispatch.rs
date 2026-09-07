@@ -3324,6 +3324,35 @@ pub(super) async fn handle_request(
     result
 }
 
+/// Fingerprint probe for an existing V2 terminal receipt. Must mirror the
+/// `UserSubmission` built in [`handle_send_user_message`] for this ingress:
+/// adapter CAS fields are checked at acceptance time, but the worker queue
+/// seam intentionally clears them so durable replays stay payload-neutral.
+fn v2_terminal_client_submission_probe(
+    request: &crate::proto_crate::send_user_message_v2::SendUserMessageV2,
+    origin_principal: Option<String>,
+) -> crate::engine::message::UserSubmission {
+    crate::engine::message::UserSubmission {
+        origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
+        expected_model_state_generation: None,
+        expected_model: None,
+        kind: crate::engine::message::UserSubmissionKind::User,
+        text: request.text.clone(),
+        display_text: request.display_text.clone(),
+        tag_expansions: request
+            .tag_expansions
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect(),
+        forced_skill: request.forced_skill.clone(),
+        delivery_class_override: request.delivery_class_override,
+        delivery_class: request.delivery_class_override.unwrap_or_default(),
+        origin_principal,
+        ..Default::default()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_send_user_message_v2(
     request_id: Uuid,
@@ -3514,16 +3543,7 @@ async fn handle_send_user_message_v2(
         .await
         .map_err(internal)?
     {
-        let mut probe = crate::engine::message::UserSubmission::text(request.text.clone());
-        probe.display_text = request.display_text.clone();
-        probe.tag_expansions = request
-            .tag_expansions
-            .iter()
-            .cloned()
-            .map(Into::into)
-            .collect();
-        probe.forced_skill = request.forced_skill.clone();
-        probe.origin_principal = state.principal.tag();
+        let probe = v2_terminal_client_submission_probe(&request, state.principal.tag());
         if terminal.origin_principal.as_deref() != probe.origin_principal.as_deref()
             || terminal.fingerprint != probe.client_fingerprint()
         {

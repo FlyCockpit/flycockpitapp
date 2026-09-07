@@ -2978,7 +2978,7 @@ async fn run_shell(
     #[cfg(unix)]
     cmd.process_group(0);
 
-    let concrete_effects = vec![
+    let mut concrete_effects = vec![
         // Ordinary command approval binds the exact shell text.
         serde_json::json!({"execute": {"command": command}}),
         // A run-fail-escalate approval additionally binds the actual retry
@@ -2988,6 +2988,20 @@ async fn run_shell(
             "sandbox": if confine { "confined" } else { "unconfined" },
         }}),
     ];
+    if confine {
+        // Confined bash only prompts for path access, not a separate command
+        // approval. The spawn boundary must still be able to claim the same
+        // path-access candidate that `path_access_once` already selected.
+        concrete_effects.push(serde_json::json!({
+            "access": {
+                "path": cwd.display().to_string(),
+                "required_access": format!(
+                    "{:?}",
+                    crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite
+                ),
+            }
+        }));
+    }
     run_prepared_command(
         cmd,
         ctx,

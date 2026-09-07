@@ -630,8 +630,18 @@ pub(crate) async fn attach_send_pump(
 
     let was_processing = is_processing(client, session_id).await?;
     let submitted_message = !prompt.trim().is_empty();
-    // Sole invocation identity: allocated once before the V2 message send.
-    let client_submission_id = Uuid::now_v7();
+    // Sole invocation identity: one nonce per attach/send/pump; the submission
+    // id is derived from that nonce plus the payload fingerprint so retries of
+    // the same payload dedup while distinct invocations never collide.
+    let invocation_nonce = Uuid::new_v4();
+    let client_submission_id = if submitted_message {
+        cockpit_client::submission::derive_client_submission_id(
+            invocation_nonce,
+            &cockpit_client::submission::run_user_message_submission_fingerprint(&prompt),
+        )
+    } else {
+        Uuid::nil()
+    };
     if submitted_message {
         let use_bulk = cockpit_client::bulk_upload::user_message_needs_bulk(&prompt, None);
         if use_bulk && !options.image_data.is_empty() {

@@ -238,9 +238,56 @@ impl ClientUserSubmission {
     }
 }
 
+/// Derive a submission id that is stable for retries of the same payload within
+/// one CLI invocation and unique across distinct invocations.
+pub fn derive_client_submission_id(invocation_nonce: Uuid, payload_fingerprint: &str) -> Uuid {
+    Uuid::new_v5(&invocation_nonce, payload_fingerprint.as_bytes())
+}
+
+/// Payload fingerprint for a noninteractive `cockpit run` user message, aligned
+/// with the daemon's local-owner V2 terminal probe.
+pub fn run_user_message_submission_fingerprint(text: &str) -> String {
+    ClientUserSubmission {
+        origin: SubmissionOrigin::ExternalRoot,
+        text: text.to_owned(),
+        ..Default::default()
+    }
+    .client_fingerprint()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distinct_payloads_never_share_submission_id_within_invocation() {
+        let nonce = Uuid::new_v4();
+        let first = ClientUserSubmission::text("first payload");
+        let second = ClientUserSubmission::text("second payload");
+        assert_ne!(
+            derive_client_submission_id(nonce, &first.client_fingerprint()),
+            derive_client_submission_id(nonce, &second.client_fingerprint()),
+        );
+    }
+
+    #[test]
+    fn same_payload_retried_twice_dedups_within_invocation() {
+        let nonce = Uuid::new_v4();
+        let fingerprint = ClientUserSubmission::text("same payload").client_fingerprint();
+        assert_eq!(
+            derive_client_submission_id(nonce, &fingerprint),
+            derive_client_submission_id(nonce, &fingerprint),
+        );
+    }
+
+    #[test]
+    fn distinct_invocations_never_collide_on_same_payload() {
+        let fingerprint = ClientUserSubmission::text("same payload").client_fingerprint();
+        assert_ne!(
+            derive_client_submission_id(Uuid::new_v4(), &fingerprint),
+            derive_client_submission_id(Uuid::new_v4(), &fingerprint),
+        );
+    }
 
     #[test]
     fn client_fingerprint_binds_submission_origin() {

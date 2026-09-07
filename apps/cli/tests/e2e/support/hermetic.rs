@@ -598,7 +598,7 @@ impl HermeticCockpit {
         let deadline = Instant::now() + timeout;
         let mut delay = Duration::from_millis(20);
         loop {
-            if super::socket_answers_hello(&self.home.socket_path()) {
+            if super::socket_answers_hello(&self.home.socket_path(), Some(&self.home.pid_file())) {
                 break;
             }
             assert!(

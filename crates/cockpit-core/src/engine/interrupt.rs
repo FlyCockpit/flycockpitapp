@@ -3937,6 +3937,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn park_all_registered_collect_commits_before_shutdown_park_report() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let (hub, _events) = attached_hub(db.clone(), session.session_id);
+        let park_commit = ParkCommit::new();
+        let hub = InterruptHub::with_park_commit(hub, park_commit.clone());
+        let interrupt_id = db
+            .raise_interrupt_questions(session.session_id, "a", "park-me", &question_set())
+            .await
+            .unwrap();
+        let pending = hub.register(interrupt_id);
+
+        let sweep = hub.park_all_registered_collect().await;
+        assert_eq!(sweep.count, 1);
+        assert!(sweep.all_committed);
+        assert_eq!(
+            db.get_interrupt(interrupt_id)
+                .await
+                .unwrap()
+                .expect("row")
+                .state,
+            crate::db::needs_attention::InterruptState::Parked,
+            "park must be durably committed before the shutdown park report"
+        );
+        assert!(matches!(pending.wait().await, InterruptOutcome::Parked));
+
+        hub.report_shutdown_commit(true);
+        assert_eq!(
+            park_commit
+                .await_shutdown_commit(std::time::Duration::from_secs(1))
+                .await,
+            ParkCommitTerminal::Committed
+        );
+    }
+
+    #[tokio::test]
     async fn await_shutdown_commit_resolves_only_after_report() {
         // The consumer blocks until the producer reports a terminal state —
         // this is the happens-before the drain path relies on to gate

@@ -120,25 +120,24 @@ async fn ephemeral_session_resumes_on_shared_daemon() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut ephemeral_process = Some(
-        daemon_command
-            .spawn()
-            .expect("spawn explicit ephemeral daemon process"),
-    );
-    let mut ephemeral_guard = EphemeralDaemonGuard::new(
-        ephemeral_process.as_ref().expect("ephemeral daemon").id(),
-        ephemeral_socket.clone(),
-    );
-    wait_for_daemon_handshake_on_socket(&ephemeral_socket, Duration::from_secs(5), || {
-        let process = ephemeral_process.as_mut().expect("ephemeral daemon");
-        if let Some(status) = process.try_wait().expect("probe ephemeral daemon") {
-            panic!(
-                "ephemeral daemon exited before handshake ({status}): socket={}",
-                ephemeral_socket.display()
-            );
-        }
-        None
-    })
+    let child = daemon_command
+        .spawn()
+        .expect("spawn explicit ephemeral daemon process");
+    let mut ephemeral_guard = EphemeralDaemonGuard::new(child, ephemeral_socket.clone());
+    wait_for_daemon_handshake_on_socket(
+        &ephemeral_socket,
+        Some(&home.pid_file()),
+        Duration::from_secs(5),
+        || {
+            if let Ok(Some(status)) = ephemeral_guard.try_wait() {
+                panic!(
+                    "ephemeral daemon exited before handshake ({status}): socket={}",
+                    ephemeral_socket.display()
+                );
+            }
+            None
+        },
+    )
     .await;
     let ephemeral_client = DaemonClient::connect(&ephemeral_socket)
         .await
@@ -182,12 +181,12 @@ async fn ephemeral_session_resumes_on_shared_daemon() {
         .await
         .expect("gracefully stop ephemeral daemon");
     drop(ephemeral_client);
-    ephemeral_guard.disarm();
-    let ephemeral_output = ephemeral_process
-        .take()
+    let ephemeral_output = ephemeral_guard
+        .take_child()
         .expect("ephemeral daemon process")
         .wait_with_output()
         .expect("wait for ephemeral daemon exit");
+    ephemeral_guard.disarm();
     assert_success(
         "ephemeral daemon foreground process",
         &ephemeral_output,

@@ -13930,7 +13930,7 @@ pub(super) async fn run_worker(
         shutdown_park_committed = shutdown_park_committed && sweep.all_committed;
         if let WorkerStop::Shutdown {
             pause_for_resume: true,
-            active,
+            active: _,
             pending_tool_count,
         } = &stop
         {
@@ -13940,15 +13940,19 @@ pub(super) async fn run_worker(
                 .await
                 .map(|rows| rows.len() as i64)
                 .unwrap_or(*pending_tool_count);
-            if *active || pending > 0 {
-                persist_paused_session_work(
+            if pending > 0 {
+                if let Err(error) = persist_paused_session_work(
                     &session,
                     session_id,
                     &root_agent_name,
                     &project_root,
                     pending,
                 )
-                .await;
+                .await
+                {
+                    tracing::error!(%error, "persisting paused session work failed");
+                    shutdown_park_committed = false;
+                }
             }
         }
         interrupts.report_shutdown_commit(shutdown_park_committed);
@@ -14256,8 +14260,8 @@ async fn persist_paused_session_work(
     root_agent_name: &str,
     project_root: &std::path::Path,
     pending_tool_count: i64,
-) {
-    if let Err(error) = session
+) -> anyhow::Result<()> {
+    session
         .db
         .upsert_paused_session_work(
             session_id,
@@ -14268,9 +14272,7 @@ async fn persist_paused_session_work(
             proto::DAEMON_VERSION,
         )
         .await
-    {
-        tracing::warn!(%error, "persisting paused session work failed");
-    }
+        .context("persisting paused session work")
 }
 
 pub(super) async fn shutdown_activity_snapshot(

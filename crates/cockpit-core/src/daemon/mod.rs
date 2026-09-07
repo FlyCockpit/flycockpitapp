@@ -285,6 +285,25 @@ pub fn canonical_socket_endpoint_published(socket: &Path) -> bool {
     read_endpoint_record(&canonical).is_some()
 }
 
+/// Transport readiness for an isolated-home daemon: read the endpoint record
+/// beside `pid_file` when present, otherwise fall back to socket existence.
+pub fn isolated_socket_transport_ready(socket: &Path, pid_file: &Path) -> bool {
+    let Some(state_dir) = pid_file.parent() else {
+        return socket.exists();
+    };
+    let endpoint_path = endpoint_file_for_state(state_dir);
+    let paths = DaemonPaths {
+        socket: socket.to_path_buf(),
+        pid_file: pid_file.to_path_buf(),
+        ephemeral: false,
+    };
+    if endpoint_path.exists() {
+        read_bound_endpoint_record_from(&endpoint_path, &paths).is_some()
+    } else {
+        socket.exists()
+    }
+}
+
 fn read_endpoint_record_from(path: &Path) -> Option<DaemonEndpointRecord> {
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()

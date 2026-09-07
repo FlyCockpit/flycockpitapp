@@ -3248,14 +3248,8 @@ impl DaemonContext {
             global_redaction.clone(),
             terminal_temp_root(&paths),
         );
-        let container = Arc::new(crate::container::ContainerManager::unpublished());
+        let container = Arc::new(crate::container::ContainerManager::detect());
         let _ = crate::container::container_manager().set((*container).clone());
-        #[cfg(test)]
-        {
-            let (runtime, availability) = crate::container::detect_runtime();
-            container.install_detection(runtime, availability);
-            let _ = crate::container::container_manager().set((*container).clone());
-        }
         spawn_terminal_reaper(terminal_host.clone(), shutdown.clone());
         crate::daemon::bulk_staging::spawn_reaper(shutdown.clone());
         registry
@@ -3274,15 +3268,6 @@ impl DaemonContext {
         let host_capability_probes =
             crate::host_capabilities::HostCapabilityProbeInputs::production(canonical_cwd.clone());
         registry.set_host_capabilities(host_capabilities.clone(), host_capability_probes.clone());
-        #[cfg(not(test))]
-        spawn_container_runtime_detection(
-            container,
-            shutdown.clone(),
-            host_capabilities.clone(),
-            host_capability_probes.clone(),
-            global_events.clone(),
-            global_redaction.clone(),
-        );
         struct DaemonMediaClock(Instant);
         impl crate::media_reservation::MonotonicClock for DaemonMediaClock {
             fn now_ms(&self) -> u64 {
@@ -4962,111 +4947,6 @@ pub(crate) async fn boot_with_db(
 }
 
 const TERMINAL_REAPER_POLL: Duration = Duration::from_secs(30);
-const CONTAINER_DETECTION_REPUBLISH_ATTEMPTS: u32 = 8;
-const CONTAINER_DETECTION_REPUBLISH_DELAY: Duration = Duration::from_millis(25);
-
-#[cfg(not(test))]
-fn spawn_container_runtime_detection(
-    manager: Arc<crate::container::ContainerManager>,
-    shutdown: crate::daemon::shutdown::ShutdownSignal,
-    host_capabilities: crate::host_capabilities::HostCapabilitySnapshotStore,
-    host_capability_probes: crate::host_capabilities::HostCapabilityProbeInputs,
-    global_events: EventSender,
-    global_redaction: SharedRedactionTable,
-) {
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-    handle.spawn(async move {
-        let detected = tokio::task::spawn_blocking(crate::container::detect_runtime).await;
-        if shutdown.is_draining() {
-            return;
-        }
-        let (runtime, availability) = match detected {
-            Ok(result) => result,
-            Err(error) => {
-                tracing::warn!(error = %error, "container runtime detection task failed");
-                (
-                    None,
-                    cockpit_proto::ContainerAvailability {
-                        runtime: None,
-                        harness_in_container: crate::container::harness_in_container(),
-                        available: false,
-                        reason: Some(cockpit_proto::ContainerUnavailableReason::NoRuntime),
-                    },
-                )
-            }
-        };
-        manager.install_detection(runtime, availability);
-        let _ = crate::container::container_manager().set((*manager).clone());
-        republish_host_capabilities_after_container_detection(
-            &host_capabilities,
-            &host_capability_probes,
-            &global_events,
-            &global_redaction,
-            &shutdown,
-        )
-        .await;
-    });
-}
-
-#[cfg(not(test))]
-async fn republish_host_capabilities_after_container_detection(
-    store: &crate::host_capabilities::HostCapabilitySnapshotStore,
-    probes: &crate::host_capabilities::HostCapabilityProbeInputs,
-    global_events: &EventSender,
-    global_redaction: &SharedRedactionTable,
-    shutdown: &crate::daemon::shutdown::ShutdownSignal,
-) {
-    let secret_store = store
-        .current()
-        .map(|snapshot| snapshot.secret_store.clone())
-        .unwrap_or_else(cockpit_proto::SecretStoreSnapshot::unconfigured_placeholder);
-    for attempt in 1..=CONTAINER_DETECTION_REPUBLISH_ATTEMPTS {
-        if shutdown.is_draining() {
-            return;
-        }
-        match crate::host_capabilities::refresh_host_capabilities_with_secret_store(
-            store,
-            probes,
-            secret_store.clone(),
-        )
-        .await
-        {
-            Ok((snapshot, published)) => {
-                if published {
-                    crate::daemon::send_current_event(
-                        global_events,
-                        global_redaction,
-                        proto::Event::HostCapabilitiesChanged {
-                            snapshot: snapshot.clone(),
-                        },
-                    );
-                    tracing::info!(
-                        generation = snapshot.generation,
-                        "published host capabilities after container runtime detection"
-                    );
-                }
-                return;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    attempt,
-                    max_attempts = CONTAINER_DETECTION_REPUBLISH_ATTEMPTS,
-                    "failed to republish host capabilities after container runtime detection"
-                );
-                if attempt < CONTAINER_DETECTION_REPUBLISH_ATTEMPTS {
-                    tokio::time::sleep(CONTAINER_DETECTION_REPUBLISH_DELAY).await;
-                }
-            }
-        }
-    }
-    tracing::error!(
-        attempts = CONTAINER_DETECTION_REPUBLISH_ATTEMPTS,
-        "exhausted retries republishing host capabilities after container runtime detection"
-    );
-}
 
 struct RestartEphemeralMediaCleanup;
 

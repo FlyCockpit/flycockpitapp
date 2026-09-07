@@ -217,6 +217,30 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn repeated_upsert_keeps_exactly_one_paused_row() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/tmp/p", "Build").await.unwrap();
+
+        for pending in [1_i64, 2, 2] {
+            db.upsert_paused_session_work(
+                session.session_id,
+                "Build",
+                "/tmp/p",
+                "daemon shutdown paused active work",
+                pending,
+                "0.1.test",
+            )
+            .await
+            .unwrap();
+        }
+
+        let rows = db.paused_session_work_all().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pending_tool_count, 2);
+        assert_eq!(rows[0].status, PausedWorkStatus::Paused);
+    }
+
+    #[tokio::test]
     async fn db_async_approval_paused_work_roundtrip_through_async_api() {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/tmp/p", "Build").await.unwrap();

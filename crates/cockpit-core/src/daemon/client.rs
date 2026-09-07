@@ -1431,6 +1431,13 @@ fn daemon_transport_ready(socket: &Path) -> bool {
             return crate::daemon::canonical_socket_endpoint_published(socket);
         }
     }
+    if let Some(parent) = socket.parent() {
+        let pid_file = parent.join("cockpit.pid");
+        let endpoint = parent.join("daemon-endpoint.json");
+        if endpoint.exists() || pid_file.exists() {
+            return crate::daemon::isolated_socket_transport_ready(socket, &pid_file);
+        }
+    }
     socket.exists()
 }
 

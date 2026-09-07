@@ -869,8 +869,6 @@ pub enum ContainerUnavailableReason {
     SocketUnavailable,
     /// Engine CLI present but the daemon/service is not running or not usable.
     DaemonUnavailable,
-    /// Runtime detection has not completed yet (boot/deferred probe still in flight).
-    DetectionPending,
 }
 
 impl ContainerUnavailableReason {
@@ -881,7 +879,6 @@ impl ContainerUnavailableReason {
             Self::PermissionDenied => "permission_denied",
             Self::SocketUnavailable => "socket_unavailable",
             Self::DaemonUnavailable => "daemon_unavailable",
-            Self::DetectionPending => "detection_pending",
         }
     }
 }
@@ -900,7 +897,7 @@ impl ContainerAvailability {
             runtime: None,
             harness_in_container: false,
             available: false,
-            reason: Some(ContainerUnavailableReason::DetectionPending),
+            reason: Some(ContainerUnavailableReason::NoRuntime),
         }
     }
 }
@@ -933,9 +930,6 @@ impl ContainerAvailability {
             }
             ContainerUnavailableReason::DaemonUnavailable => {
                 "container engine daemon is not running or not usable".to_string()
-            }
-            ContainerUnavailableReason::DetectionPending => {
-                "container runtime detection is still in progress".to_string()
             }
         })
     }

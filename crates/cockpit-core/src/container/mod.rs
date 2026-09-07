@@ -226,20 +226,6 @@ pub struct ContainerManager {
 }
 
 impl ContainerManager {
-    /// Fast boot placeholder: vault-backed redaction and request admission do not
-    /// need a live engine probe. Production installs this first and completes
-    /// detection on a background task.
-    pub fn unpublished() -> Self {
-        Self {
-            selection: Arc::new(std::sync::Mutex::new(SelectedEngine {
-                runtime: None,
-                availability: initial_availability_unknown(),
-            })),
-            build_locks: Arc::new(Mutex::new(HashMap::new())),
-            create_locks: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
     pub fn detect() -> Self {
         let (runtime, availability) = detect_runtime();
         Self {
@@ -296,18 +282,6 @@ impl ContainerManager {
             .ok_or_else(|| "container runtime missing".to_string())
     }
 
-    pub(crate) fn install_detection(
-        &self,
-        runtime: Option<ContainerRuntime>,
-        availability: ContainerAvailability,
-    ) {
-        let mut sel = self.selection.lock().unwrap_or_else(|p| p.into_inner());
-        sel.runtime = runtime;
-        sel.availability = availability;
-    }
-}
-
-impl ContainerManager {
     async fn build_lock(&self, tag: &str) -> Arc<Mutex<()>> {
         let mut locks = self.build_locks.lock().await;
         locks

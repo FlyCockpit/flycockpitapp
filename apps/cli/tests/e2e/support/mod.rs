@@ -10,7 +10,7 @@
 #[cfg(unix)]
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use assert_cmd::cargo::CommandCargoExt;
@@ -456,9 +456,20 @@ const DAEMON_START_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
 const DAEMON_RESTART_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Transport readiness matches the CLI lifecycle client: persistent canonical
-/// sockets require a published endpoint record; ephemeral paths fall back to
-/// socket existence before hello probing.
+/// sockets require a published endpoint record; isolated-home paths read the
+/// endpoint record beside the daemon pid file.
 pub fn daemon_transport_ready(socket: &Path) -> bool {
+    daemon_transport_ready_for_paths(socket, None)
+}
+
+pub fn daemon_transport_ready_for_home(home: &IsolatedHome) -> bool {
+    daemon_transport_ready_for_paths(&home.socket_path(), Some(&home.pid_file()))
+}
+
+fn daemon_transport_ready_for_paths(socket: &Path, pid_file: Option<&Path>) -> bool {
+    if let Some(pid_file) = pid_file {
+        return cockpit_core::daemon::isolated_socket_transport_ready(socket, pid_file);
+    }
     if let Ok(canonical) = cockpit_core::daemon::DaemonPaths::resolve_canonical() {
         if canonical.socket == socket {
             return cockpit_core::daemon::canonical_socket_endpoint_published(socket);
@@ -475,10 +486,10 @@ pub fn daemon_transport_ready(socket: &Path) -> bool {
 /// Under nextest load that starves the detached child so it never reaches
 /// `daemon: running`.
 #[cfg(unix)]
-fn socket_answers_hello(socket: &Path) -> bool {
+fn socket_answers_hello(socket: &Path, pid_file: Option<&Path>) -> bool {
     use std::os::unix::net::UnixStream;
 
-    if !daemon_transport_ready(socket) {
+    if !daemon_transport_ready_for_paths(socket, pid_file) {
         return false;
     }
     let Ok(stream) = UnixStream::connect(socket) else {
@@ -490,8 +501,8 @@ fn socket_answers_hello(socket: &Path) -> bool {
 }
 
 #[cfg(windows)]
-fn socket_answers_hello(socket: &Path) -> bool {
-    if !daemon_transport_ready(socket) {
+fn socket_answers_hello(socket: &Path, pid_file: Option<&Path>) -> bool {
+    if !daemon_transport_ready_for_paths(socket, pid_file) {
         return false;
     }
     let Ok(Some(pipe)) = cockpit_host::named_pipe::read_pipe_identity_if_present(socket) else {
@@ -510,8 +521,8 @@ fn socket_answers_hello(socket: &Path) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn socket_answers_hello(socket: &Path) -> bool {
-    daemon_transport_ready(socket)
+fn socket_answers_hello(socket: &Path, pid_file: Option<&Path>) -> bool {
+    daemon_transport_ready_for_paths(socket, pid_file)
 }
 
 fn handshake_debug(home: &IsolatedHome) -> String {
@@ -538,8 +549,8 @@ fn handshake_debug(home: &IsolatedHome) -> String {
         pid_raw,
         live,
         socket.exists(),
-        daemon_transport_ready(&socket),
-        socket_answers_hello(&socket),
+        daemon_transport_ready_for_home(home),
+        socket_answers_hello(&socket, Some(&home.pid_file())),
         log.display(),
         log_bytes,
         log_tail(home),
@@ -550,7 +561,7 @@ async fn wait_for_status_handshake(home: &IsolatedHome, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     let mut delay = Duration::from_millis(20);
     loop {
-        if socket_answers_hello(&home.socket_path()) {
+        if socket_answers_hello(&home.socket_path(), Some(&home.pid_file())) {
             break;
         }
         assert!(
@@ -581,13 +592,14 @@ fn assert_daemon_running_status(home: &IsolatedHome) {
 
 pub async fn wait_for_daemon_handshake_on_socket(
     socket: &Path,
+    pid_file: Option<&Path>,
     timeout: Duration,
     mut child_exited: impl FnMut() -> Option<std::process::Output>,
 ) {
     let deadline = Instant::now() + timeout;
     let mut delay = Duration::from_millis(10);
     loop {
-        if socket_answers_hello(socket) {
+        if socket_answers_hello(socket, pid_file) {
             return;
         }
         if let Some(output) = child_exited() {
@@ -684,15 +696,15 @@ pub(crate) fn wait_for_pid_exit_blocking(pid: u32, timeout: Duration) -> bool {
 /// [`SpawnedDaemon`]. Ensures the child is terminated and reaped and the socket
 /// node is removed on abnormal test exit.
 pub struct EphemeralDaemonGuard {
-    pid: u32,
+    child: Option<std::process::Child>,
     socket: PathBuf,
     disarmed: bool,
 }
 
 impl EphemeralDaemonGuard {
-    pub fn new(pid: u32, socket: PathBuf) -> Self {
+    pub fn new(child: std::process::Child, socket: PathBuf) -> Self {
         Self {
-            pid,
+            child: Some(child),
             socket,
             disarmed: false,
         }
@@ -701,6 +713,17 @@ impl EphemeralDaemonGuard {
     pub fn disarm(&mut self) {
         self.disarmed = true;
     }
+
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        match self.child.as_mut() {
+            Some(child) => child.try_wait(),
+            None => Ok(None),
+        }
+    }
+
+    pub fn take_child(&mut self) -> Option<std::process::Child> {
+        self.child.take()
+    }
 }
 
 impl Drop for EphemeralDaemonGuard {
@@ -708,28 +731,12 @@ impl Drop for EphemeralDaemonGuard {
         if self.disarmed {
             return;
         }
-        terminate_child_process_for_test_cleanup(self.pid);
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         if self.socket.exists() {
             let _ = std::fs::remove_file(&self.socket);
         }
-    }
-}
-
-fn terminate_child_process_for_test_cleanup(pid: u32) {
-    #[cfg(unix)]
-    {
-        if pid_is_live(pid) {
-            let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-            let _ = wait_for_pid_exit_blocking(pid, Duration::from_secs(2));
-        }
-    }
-    #[cfg(windows)]
-    {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F", "/T"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .output();
     }
 }

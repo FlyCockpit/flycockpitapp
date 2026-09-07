@@ -318,9 +318,14 @@ pub fn spawn_runtime_detection(
         if shutdown.is_draining() {
             return;
         }
-        if let Ok((runtime, availability)) = detected {
-            manager.install_detection(runtime, availability);
-            let _ = container_manager().set((*manager).clone());
+        match detected {
+            Ok((runtime, availability)) => {
+                manager.install_detection(runtime, availability);
+                let _ = container_manager().set((*manager).clone());
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "container runtime detection task failed");
+            }
         }
     });
 }

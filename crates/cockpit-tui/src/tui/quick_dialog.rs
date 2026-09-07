@@ -700,6 +700,9 @@ fn container_unavailable_label(
         Some(cockpit_proto::ContainerUnavailableReason::DaemonUnavailable) => {
             "Container engine daemon is not running"
         }
+        Some(cockpit_proto::ContainerUnavailableReason::DetectionPending) => {
+            "Container runtime detection is still in progress"
+        }
         Some(cockpit_proto::ContainerUnavailableReason::NoRuntime) | None => {
             "No healthy docker/podman engine available"
         }

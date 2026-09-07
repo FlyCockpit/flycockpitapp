@@ -918,6 +918,7 @@ fn container_health_entry(
                     message: "cockpit is already running inside a container".into(),
                 },
             },
+            Some(ContainerUnavailableReason::DetectionPending) => HealthState::Missing,
             Some(ContainerUnavailableReason::NoRuntime) | None => HealthState::Missing,
         }
     };
@@ -1058,6 +1059,12 @@ fn feature_sandbox_container(availability: &ContainerAvailability) -> FeatureCap
             availability
                 .unavailable_reason_text()
                 .unwrap_or_else(|| "no healthy docker or podman engine available".into()),
+        ),
+        Some(ContainerUnavailableReason::DetectionPending) => (
+            FeatureCapabilityState::Missing,
+            availability
+                .unavailable_reason_text()
+                .unwrap_or_else(|| "container runtime detection is still in progress".into()),
         ),
         Some(_) => (
             FeatureCapabilityState::Failed,

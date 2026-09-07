@@ -151,12 +151,10 @@ fn build_daemon_redaction_table(
     Ok(Arc::new(built))
 }
 
-fn refresh_global_redaction_table(
+fn union_built_redaction_table(
     shared: &SharedRedactionTable,
-    config_source: &crate::daemon::config_source::ConfigSource,
-    vault: &Arc<crate::secure_key::SecretVault>,
+    fresh: Arc<RedactionTable>,
 ) -> Result<Arc<RedactionTable>> {
-    let fresh = build_daemon_redaction_table(config_source, vault)?;
     let table = Arc::new(
         current_redaction(shared)
             .union(&fresh)
@@ -166,6 +164,15 @@ fn refresh_global_redaction_table(
     Ok(table)
 }
 
+fn refresh_global_redaction_table(
+    shared: &SharedRedactionTable,
+    config_source: &crate::daemon::config_source::ConfigSource,
+    vault: &Arc<crate::secure_key::SecretVault>,
+) -> Result<Arc<RedactionTable>> {
+    let fresh = build_daemon_redaction_table(config_source, vault)?;
+    union_built_redaction_table(shared, fresh)
+}
+
 fn spawn_daemon_redaction_enrichment(
     shared: SharedRedactionTable,
     config_source: crate::daemon::config_source::ConfigSource,
@@ -173,8 +180,6 @@ fn spawn_daemon_redaction_enrichment(
     shutdown: crate::daemon::shutdown::ShutdownSignal,
 ) {
     tokio::spawn(async move {
-        let config_for_refresh = config_source.clone();
-        let vault_for_refresh = vault.clone();
         let built = tokio::task::spawn_blocking(move || {
             build_daemon_redaction_table(&config_source, &vault)
         })
@@ -182,9 +187,18 @@ fn spawn_daemon_redaction_enrichment(
         if shutdown.is_draining() {
             return;
         }
-        if built.is_ok() {
-            let _ =
-                refresh_global_redaction_table(&shared, &config_for_refresh, &vault_for_refresh);
+        match built {
+            Ok(Ok(fresh)) => {
+                if let Err(error) = union_built_redaction_table(&shared, fresh) {
+                    tracing::warn!(error = %error, "daemon redaction env/dotenv enrichment failed");
+                }
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "daemon redaction env/dotenv enrichment failed");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "daemon redaction env/dotenv enrichment task failed");
+            }
         }
     });
 }
@@ -3262,10 +3276,8 @@ impl DaemonContext {
         crate::container::spawn_runtime_detection(container.clone(), shutdown.clone());
         #[cfg(test)]
         {
-            container.install_detection(
-                crate::container::detect_runtime().0,
-                crate::container::detect_runtime().1,
-            );
+            let (runtime, availability) = crate::container::detect_runtime();
+            container.install_detection(runtime, availability);
             let _ = crate::container::container_manager().set((*container).clone());
         }
         spawn_daemon_redaction_enrichment(
@@ -4405,16 +4417,16 @@ pub(crate) fn begin_early_keyring_probe() {
 }
 
 #[cfg(not(test))]
-async fn take_early_keyring_probe() -> crate::secure_key::KeyringProbeResult {
+async fn take_early_keyring_probe() -> Result<crate::secure_key::KeyringProbeResult> {
     let handle = EARLY_KEYRING_PROBE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take();
     match handle {
-        Some(task) => task
+        Some(task) => Ok(task
             .await
-            .map_err(|error| anyhow::anyhow!("keyring probe task failed: {error}"))?,
-        None => crate::secure_key::probe_platform_keyring(),
+            .map_err(|error| anyhow::anyhow!("keyring probe task failed: {error}"))?),
+        None => Ok(crate::secure_key::probe_platform_keyring()),
     }
 }
 
@@ -4840,7 +4852,6 @@ pub(crate) async fn boot_with_db(
 
 const TERMINAL_REAPER_POLL: Duration = Duration::from_secs(30);
 
-#[cfg(not(test))]
 async fn run_deferred_daemon_subsystems(ctx: Arc<DaemonContext>) {
     let mut containment_recovered = false;
     if let Some(handle) = ctx.process_containment.as_ref() {
@@ -4914,10 +4925,8 @@ async fn run_deferred_daemon_subsystems(ctx: Arc<DaemonContext>) {
     ctx.resolve_startup_command_secrets().await;
 }
 
-#[cfg(not(test))]
 struct RestartEphemeralMediaCleanup;
 
-#[cfg(not(test))]
 impl crate::media_reservation::LocalExpiryCleanup for RestartEphemeralMediaCleanup {
     fn kill_reap_and_cleanup(&self, reservation_id: &str) -> anyhow::Result<String> {
         Ok(format!(
@@ -5310,35 +5319,28 @@ pub(crate) fn spawn_deferred_boot_maintenance(ctx: Arc<DaemonContext>) {
             chrono::Utc::now().timestamp(),
         )
         .await;
-        #[cfg(not(test))]
-        {
-            let Some(generation) = ctx
-                .host_capabilities
-                .current()
-                .map(|snapshot| snapshot.generation)
-            else {
-                return;
-            };
-            let probes = crate::host_capabilities::collect_shared_host_probes(
-                &ctx.host_capability_probes,
-                false,
-            )
-            .await;
-            let authority = ctx
-                .db
-                .blocking_write_for_sync_maintenance(crate::db::secret_vault::load_authority_conn)
-                .ok()
-                .flatten();
-            let secret_store = crate::secure_key::project_secret_store_snapshot(
-                authority.as_ref(),
-                &probes.keyring,
+        let generation = ctx.host_capabilities.begin_refresh();
+        let probes = crate::host_capabilities::collect_shared_host_probes(
+            &ctx.host_capability_probes.for_refresh(),
+            false,
+        )
+        .await;
+        let authority = ctx
+            .db
+            .blocking_write_for_sync_maintenance(crate::db::secret_vault::load_authority_conn)
+            .ok()
+            .flatten();
+        let secret_store =
+            crate::secure_key::project_secret_store_snapshot(authority.as_ref(), &probes.keyring);
+        let snapshot = crate::host_capabilities::build_host_capability_snapshot(
+            generation,
+            &probes,
+            secret_store,
+        );
+        if !ctx.host_capabilities.publish(snapshot) {
+            tracing::warn!(
+                "deferred host capability republication did not advance the live snapshot"
             );
-            let snapshot = crate::host_capabilities::build_host_capability_snapshot(
-                generation,
-                &probes,
-                secret_store,
-            );
-            let _ = ctx.host_capabilities.publish(snapshot);
         }
     });
 }

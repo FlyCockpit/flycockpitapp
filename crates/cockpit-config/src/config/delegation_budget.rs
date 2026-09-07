@@ -446,6 +446,7 @@ mod tests {
             max_output_tokens: Some(100),
             max_cost_microusd: Some(50),
             max_wall_clock: None,
+            cost_ceiling_configured: false,
         };
         let child = ResolvedDelegationBudget {
             max_rounds: Some(8),
@@ -453,6 +454,7 @@ mod tests {
             max_output_tokens: None,
             max_cost_microusd: Some(80),
             max_wall_clock: Some(Duration::from_secs(5)),
+            cost_ceiling_configured: false,
         };
         let got = parent.intersect(child);
         assert_eq!(got.max_rounds, Some(8));

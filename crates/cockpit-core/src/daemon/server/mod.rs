@@ -4646,7 +4646,7 @@ pub(crate) async fn boot_with_db(
     #[cfg(not(test))]
     {
         let keyring_probe = take_early_keyring_probe().await?;
-        let mut boot_probe_inputs = ctx.host_capability_probes.for_boot_fast_path();
+        let mut boot_probe_inputs = ctx.host_capability_probes.clone();
         boot_probe_inputs.keyring = crate::host_capabilities::KeyringProbeSource::Injected {
             result: keyring_probe,
             calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -4696,7 +4696,14 @@ pub(crate) async fn boot_with_db(
                             &probes,
                             secret_store,
                         );
-                        let _ = ctx.host_capabilities.publish(snapshot);
+                        ctx.host_capabilities
+                            .accept_durable_refresh_reservation(generation)
+                            .map_err(anyhow::Error::msg)
+                            .context("accepting boot host capability generation")?;
+                        ctx.host_capabilities
+                            .publish_committed(snapshot)
+                            .map_err(anyhow::Error::msg)
+                            .context("publishing boot host capability snapshot")?;
                     }
                     timer.phase("host_capabilities");
                 }
@@ -4720,7 +4727,14 @@ pub(crate) async fn boot_with_db(
                             &probes,
                             secret_store,
                         );
-                        let _ = ctx.host_capabilities.publish(snapshot);
+                        ctx.host_capabilities
+                            .accept_durable_refresh_reservation(generation)
+                            .map_err(anyhow::Error::msg)
+                            .context("accepting boot host capability generation")?;
+                        ctx.host_capabilities
+                            .publish_committed(snapshot)
+                            .map_err(anyhow::Error::msg)
+                            .context("publishing boot host capability snapshot")?;
                     }
                     timer.phase("host_capabilities");
                     return Err(anyhow::anyhow!("secure key vault: {error}"));
@@ -4750,7 +4764,14 @@ pub(crate) async fn boot_with_db(
                 &probes,
                 cockpit_proto::SecretStoreSnapshot::unconfigured_placeholder(),
             );
-            let _ = ctx.host_capabilities.publish(snapshot);
+            ctx.host_capabilities
+                .accept_durable_refresh_reservation(generation)
+                .map_err(anyhow::Error::msg)
+                .context("accepting boot host capability generation")?;
+            ctx.host_capabilities
+                .publish_committed(snapshot)
+                .map_err(anyhow::Error::msg)
+                .context("publishing boot host capability snapshot")?;
         }
         timer.phase("host_capabilities");
         timer.phase("secure_key_actor_skipped");
@@ -4934,80 +4955,6 @@ pub(crate) async fn boot_with_db(
 }
 
 const TERMINAL_REAPER_POLL: Duration = Duration::from_secs(30);
-
-const DEFERRED_HOST_CAPABILITY_REFRESH_RETRY: Duration = Duration::from_millis(250);
-
-async fn run_deferred_host_capability_refresh(ctx: &DaemonContext) {
-    loop {
-        if ctx.shutdown_signal().is_draining() {
-            return;
-        }
-        let generation = match ctx
-            .db
-            .reserve_host_capability_boot_snapshot_generation(
-                crate::agent_tree::daemon_host_capability_refresh_authority(),
-            )
-            .await
-        {
-            Ok(generation) => generation,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "deferred host capability refresh generation reservation failed; retrying"
-                );
-                tokio::time::sleep(DEFERRED_HOST_CAPABILITY_REFRESH_RETRY).await;
-                continue;
-            }
-        };
-        if let Err(error) = ctx
-            .host_capabilities
-            .accept_durable_refresh_reservation(generation)
-        {
-            tracing::warn!(
-                error = %error,
-                generation,
-                "deferred host capability refresh rejected reserved generation; retrying"
-            );
-            tokio::time::sleep(DEFERRED_HOST_CAPABILITY_REFRESH_RETRY).await;
-            continue;
-        }
-        let probes = crate::host_capabilities::collect_shared_host_probes(
-            &ctx.host_capability_probes.for_refresh(),
-            false,
-        )
-        .await;
-        let authority = ctx
-            .db
-            .blocking_write_for_sync_maintenance(crate::db::secret_vault::load_authority_conn)
-            .ok()
-            .flatten();
-        let secret_store =
-            crate::secure_key::project_secret_store_snapshot(authority.as_ref(), &probes.keyring);
-        let snapshot = crate::host_capabilities::build_host_capability_snapshot(
-            generation,
-            &probes,
-            secret_store,
-        );
-        match ctx.host_capabilities.publish_committed(snapshot) {
-            Ok(true) => {
-                tracing::info!(
-                    generation,
-                    "deferred host capability refresh published through durable generation"
-                );
-                return;
-            }
-            Ok(false) => return,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    generation,
-                    "deferred host capability refresh publication failed; retrying"
-                );
-                tokio::time::sleep(DEFERRED_HOST_CAPABILITY_REFRESH_RETRY).await;
-            }
-        }
-    }
-}
 
 struct RestartEphemeralMediaCleanup;
 
@@ -5378,13 +5325,6 @@ async fn run_retention_pass(db: Db, cfg: RetentionConfig, now_secs: i64) {
         Ok(outcome) => log_retention_outcome(outcome),
         Err(error) => tracing::warn!(error = %error, "session payload retention pass failed"),
     }
-}
-
-/// Housekeeping that is not required to accept the first client connection.
-pub(crate) fn spawn_deferred_boot_maintenance(ctx: Arc<DaemonContext>) {
-    tokio::spawn(async move {
-        run_deferred_host_capability_refresh(&ctx).await;
-    });
 }
 
 /// Media cleanup intents and due retention, then (on the caller) session expiry.

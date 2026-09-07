@@ -3395,6 +3395,34 @@ fn local_owner_v2_wire_fingerprint(
     wire_fingerprint
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalOwnerV2TerminalIngress {
+    PrincipalConflict,
+    ExactWireReplay,
+    FingerprintConflict,
+    ExactFingerprintReplay,
+}
+
+fn classify_local_owner_v2_terminal_receipt(
+    terminal_origin: Option<&str>,
+    request_origin: Option<&str>,
+    terminal_wire: &str,
+    wire_fingerprint: &str,
+    terminal_fingerprint: &str,
+    probe_fingerprint: &str,
+) -> LocalOwnerV2TerminalIngress {
+    if terminal_origin != request_origin {
+        return LocalOwnerV2TerminalIngress::PrincipalConflict;
+    }
+    if terminal_wire == wire_fingerprint {
+        return LocalOwnerV2TerminalIngress::ExactWireReplay;
+    }
+    if terminal_fingerprint != probe_fingerprint {
+        return LocalOwnerV2TerminalIngress::FingerprintConflict;
+    }
+    LocalOwnerV2TerminalIngress::ExactFingerprintReplay
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_send_user_message_v2(
     request_id: Uuid,
@@ -3591,37 +3619,38 @@ async fn handle_send_user_message_v2(
             &request,
             validated.run_invocation_options.as_ref(),
         );
-        if terminal.wire_fingerprint == wire_fingerprint {
-            return Err(ErrorPayload {
-                code: ErrorCode::UserMessageTerminated,
-                message: format!(
-                    "client_submission_id {} is terminal ({}) and will not be executed",
-                    request.client_submission_id,
-                    terminal.disposition.as_str()
-                ),
-            });
-        }
         let probe_fingerprint =
             local_owner_v2_client_submission_fingerprint(&request, origin_principal.clone());
-        if terminal.origin_principal.as_deref() != origin_principal.as_deref()
-            || terminal.fingerprint != probe_fingerprint
-        {
-            return Err(ErrorPayload {
-                code: ErrorCode::BadRequest,
-                message: format!(
-                    "client_submission_id {} was already used for a different payload",
-                    request.client_submission_id
-                ),
-            });
+        match classify_local_owner_v2_terminal_receipt(
+            terminal.origin_principal.as_deref(),
+            origin_principal.as_deref(),
+            &terminal.wire_fingerprint,
+            &wire_fingerprint,
+            &terminal.fingerprint,
+            &probe_fingerprint,
+        ) {
+            LocalOwnerV2TerminalIngress::PrincipalConflict
+            | LocalOwnerV2TerminalIngress::FingerprintConflict => {
+                return Err(ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: format!(
+                        "client_submission_id {} was already used for a different payload",
+                        request.client_submission_id
+                    ),
+                });
+            }
+            LocalOwnerV2TerminalIngress::ExactWireReplay
+            | LocalOwnerV2TerminalIngress::ExactFingerprintReplay => {
+                return Err(ErrorPayload {
+                    code: ErrorCode::UserMessageTerminated,
+                    message: format!(
+                        "client_submission_id {} is terminal ({}) and will not be executed",
+                        request.client_submission_id,
+                        terminal.disposition.as_str()
+                    ),
+                });
+            }
         }
-        return Err(ErrorPayload {
-            code: ErrorCode::UserMessageTerminated,
-            message: format!(
-                "client_submission_id {} is terminal ({}) and will not be executed",
-                request.client_submission_id,
-                terminal.disposition.as_str()
-            ),
-        });
     }
     let attachment_set_digest = canonical.attachment_set_digest().map_err(internal)?;
     // Exact replay is a durable fact. Check it before requiring a live key,
@@ -4057,7 +4086,25 @@ fn user_message_wire_fingerprint_bytes(
 
 #[cfg(test)]
 mod local_owner_v2_client_submission_fingerprint_tests {
-    use super::local_owner_v2_client_submission_fingerprint;
+    use super::{
+        LocalOwnerV2TerminalIngress, classify_local_owner_v2_terminal_receipt,
+        local_owner_v2_client_submission_fingerprint,
+    };
+
+    #[test]
+    fn matching_wire_fingerprint_from_different_principal_is_refused() {
+        assert_eq!(
+            classify_local_owner_v2_terminal_receipt(
+                Some("owner-a"),
+                Some("owner-b"),
+                "same-wire",
+                "same-wire",
+                "fp-a",
+                "fp-b",
+            ),
+            LocalOwnerV2TerminalIngress::PrincipalConflict
+        );
+    }
 
     #[test]
     fn v2_terminal_probe_matches_worker_submission_fingerprint() {

@@ -1,7 +1,10 @@
 use std::process::Stdio;
 use std::time::Duration;
 
-use crate::support::{IsolatedHome, SpawnedDaemon, assert_failure, assert_success, output_text};
+use crate::support::{
+    IsolatedHome, SpawnedDaemon, assert_failure, assert_success, output_text,
+    wait_for_daemon_handshake_on_socket,
+};
 use cockpit_cli::integration::{DaemonClient, DaemonEvent};
 use cockpit_test_support::provider::{ScriptedProvider, Turn};
 use rusqlite::{Connection, params};
@@ -117,29 +120,46 @@ async fn ephemeral_session_resumes_on_shared_daemon() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut ephemeral_process = daemon_command
-        .spawn()
-        .expect("spawn explicit ephemeral daemon process");
-    let socket_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !ephemeral_socket.exists() {
-        if let Some(status) = ephemeral_process
-            .try_wait()
-            .expect("probe ephemeral daemon")
-        {
-            let output = ephemeral_process
-                .wait_with_output()
-                .expect("collect failed ephemeral daemon output");
+    let mut ephemeral_process = Some(
+        daemon_command
+            .spawn()
+            .expect("spawn explicit ephemeral daemon process"),
+    );
+    struct EphemeralDaemonGuard {
+        pid: u32,
+        socket: std::path::PathBuf,
+        disarmed: bool,
+    }
+    impl Drop for EphemeralDaemonGuard {
+        fn drop(&mut self) {
+            if self.disarmed {
+                return;
+            }
+            #[cfg(unix)]
+            {
+                let _ = unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGKILL) };
+            }
+            if self.socket.exists() {
+                let _ = std::fs::remove_file(&self.socket);
+            }
+        }
+    }
+    let mut ephemeral_guard = EphemeralDaemonGuard {
+        pid: ephemeral_process.as_ref().expect("ephemeral daemon").id(),
+        socket: ephemeral_socket.clone(),
+        disarmed: false,
+    };
+    wait_for_daemon_handshake_on_socket(&ephemeral_socket, Duration::from_secs(5), || {
+        let process = ephemeral_process.as_mut().expect("ephemeral daemon");
+        if let Some(status) = process.try_wait().expect("probe ephemeral daemon") {
             panic!(
-                "ephemeral daemon exited before binding ({status}): {}",
-                output_text(&output)
+                "ephemeral daemon exited before handshake ({status}): socket={}",
+                ephemeral_socket.display()
             );
         }
-        assert!(
-            tokio::time::Instant::now() < socket_deadline,
-            "timed out waiting for ephemeral daemon socket"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+        None
+    })
+    .await;
     let ephemeral_client = DaemonClient::connect(&ephemeral_socket)
         .await
         .expect("connect explicit ephemeral daemon");
@@ -182,7 +202,10 @@ async fn ephemeral_session_resumes_on_shared_daemon() {
         .await
         .expect("gracefully stop ephemeral daemon");
     drop(ephemeral_client);
+    ephemeral_guard.disarmed = true;
     let ephemeral_output = ephemeral_process
+        .take()
+        .expect("ephemeral daemon process")
         .wait_with_output()
         .expect("wait for ephemeral daemon exit");
     assert_success(

@@ -455,6 +455,18 @@ pub fn output_text(output: &Output) -> String {
 const DAEMON_START_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
 const DAEMON_RESTART_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Transport readiness matches the CLI lifecycle client: persistent canonical
+/// sockets require a published endpoint record; ephemeral paths fall back to
+/// socket existence before hello probing.
+pub fn daemon_transport_ready(socket: &Path) -> bool {
+    if let Ok(canonical) = cockpit_core::daemon::DaemonPaths::resolve_canonical() {
+        if canonical.socket == socket {
+            return cockpit_core::daemon::canonical_socket_endpoint_published(socket);
+        }
+    }
+    socket.exists()
+}
+
 /// Cheap liveness check: connect and read the daemon hello line.
 ///
 /// Handshake waits must not exec the debug `cockpit` binary in a tight loop.
@@ -466,7 +478,7 @@ const DAEMON_RESTART_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 fn socket_answers_hello(socket: &Path) -> bool {
     use std::os::unix::net::UnixStream;
 
-    if !socket.exists() {
+    if !daemon_transport_ready(socket) {
         return false;
     }
     let Ok(stream) = UnixStream::connect(socket) else {
@@ -479,6 +491,9 @@ fn socket_answers_hello(socket: &Path) -> bool {
 
 #[cfg(windows)]
 fn socket_answers_hello(socket: &Path) -> bool {
+    if !daemon_transport_ready(socket) {
+        return false;
+    }
     let Ok(Some(pipe)) = cockpit_host::named_pipe::read_pipe_identity_if_present(socket) else {
         return false;
     };
@@ -496,7 +511,7 @@ fn socket_answers_hello(socket: &Path) -> bool {
 
 #[cfg(not(any(unix, windows)))]
 fn socket_answers_hello(socket: &Path) -> bool {
-    socket.exists()
+    daemon_transport_ready(socket)
 }
 
 fn handshake_debug(home: &IsolatedHome) -> String {
@@ -518,11 +533,12 @@ fn handshake_debug(home: &IsolatedHome) -> String {
     let log = home.log_file();
     let log_bytes = std::fs::metadata(&log).ok().map(|meta| meta.len());
     format!(
-        "pid_file={} pid_raw={:?} live={:?} socket_exists={} hello={} log={} log_bytes={:?}\nlog tail:\n{}",
+        "pid_file={} pid_raw={:?} live={:?} socket_exists={} transport_ready={} hello={} log={} log_bytes={:?}\nlog tail:\n{}",
         home.pid_file().display(),
         pid_raw,
         live,
         socket.exists(),
+        daemon_transport_ready(&socket),
         socket_answers_hello(&socket),
         log.display(),
         log_bytes,
@@ -561,6 +577,34 @@ fn assert_daemon_running_status(home: &IsolatedHome) {
         String::from_utf8_lossy(&status.stderr),
         handshake_debug(home)
     );
+}
+
+pub async fn wait_for_daemon_handshake_on_socket(
+    socket: &Path,
+    timeout: Duration,
+    mut child_exited: impl FnMut() -> Option<std::process::Output>,
+) {
+    let deadline = Instant::now() + timeout;
+    let mut delay = Duration::from_millis(10);
+    loop {
+        if socket_answers_hello(socket) {
+            return;
+        }
+        if let Some(output) = child_exited() {
+            panic!(
+                "daemon exited before handshake on {}: {}",
+                socket.display(),
+                output_text(&output)
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for daemon handshake on {}",
+            socket.display()
+        );
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_millis(200));
+    }
 }
 
 pub async fn wait_until<F, Fut>(label: &str, timeout: Duration, mut probe: F)

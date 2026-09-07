@@ -2243,7 +2243,6 @@ async fn run_foreground_inner_with_boot_db(
     }
     timer.phase("endpoint_published");
     boot_dbg!("after_endpoint_publish");
-    server::spawn_deferred_boot_maintenance(ctx.clone());
 
     // Signal task: SIGINT/SIGTERM (or Ctrl-C / console-close on Windows)
     // route into the single graceful-shutdown path. The **first** signal

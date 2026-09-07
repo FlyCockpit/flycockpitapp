@@ -145,23 +145,6 @@ impl HostCapabilityProbeInputs {
         }
         next
     }
-
-    /// Boot publishes the transport endpoint before catalog/ffmpeg functional
-    /// probes and host-sandbox detection complete. Keyring probing still runs
-    /// here because vault start depends on it.
-    pub fn for_boot_fast_path(&self) -> Self {
-        Self {
-            keyring: self.keyring.clone(),
-            sandbox: SandboxProbeSource::Injected(SandboxAvailability::Unavailable {
-                reason: "deferred until after transport publication".into(),
-                fix_command: None,
-            }),
-            container: self.container.clone(),
-            catalog: CatalogProbeSource::Injected(ExternalRuntimeSnapshot::empty(1, self.platform)),
-            platform: self.platform,
-            cwd: self.cwd.clone(),
-        }
-    }
 }
 
 /// Generation-tagged snapshot store. An older *committed* refresh never

@@ -4617,6 +4617,24 @@ pub(crate) async fn boot_with_db(
     db.reconcile_delegation_sidecar_cleanup_intents()
         .await
         .context("reconciling delegation sidecar cleanup intents")?;
+    if let Some(storage) = ctx.active_media_storage_recovery() {
+        let now_unix_ms = chrono::Utc::now().timestamp_millis();
+        storage
+            .reconcile_abandoned_component_leases(now_unix_ms)
+            .await
+            .context("reconciling abandoned media component leases")?;
+        // Boot is recovery-only: crash-resume the same three calls the periodic
+        // tick owns for long-lived daemons. Abandoned leases stay boot-only.
+        run_media_retention_sweep(storage.as_ref(), now_unix_ms)
+            .await
+            .context("media retention recovery")?;
+    }
+    run_retention_pass(
+        db.clone(),
+        retention_config(),
+        chrono::Utc::now().timestamp(),
+    )
+    .await;
     timer.phase("media_upload_reconcile");
     // Shared host-capability probes run once here. The TUI in-process doctor
     // snapshot is not the daemon's capability authority.
@@ -4801,13 +4819,54 @@ pub(crate) async fn boot_with_db(
         let _ = db;
         timer.phase("process_containment_actor_skipped");
     }
-    timer.phase("external_journal_deferred");
-    #[cfg(feature = "extended")]
-    if let Some(handle) = ctx.scheduler()
-        && let Err(error) =
-            crate::skills::curator::register_scheduler(&handle, ctx.db.clone()).await
+    #[cfg(not(test))]
     {
-        tracing::warn!(error = %error, "skill curator scheduler registration failed");
+        match &ctx.secure_key {
+            Some(secure_key) => {
+                let now_wall_ms = chrono::Utc::now().timestamp_millis();
+                match crate::external_journal::ExternalJournal::start(
+                    ctx.db.clone(),
+                    secure_key,
+                    now_wall_ms,
+                )
+                .await
+                {
+                    Ok((journal, report)) => {
+                        tracing::info!(
+                            scanned = report.scanned,
+                            imported = report.imported,
+                            quarantined = report.quarantined,
+                            converted = report.converted,
+                            released_without_medium = report.released_without_medium,
+                            "external side-effect journal recovery finished"
+                        );
+                        let journal = std::sync::Arc::new(journal);
+                        ctx.registry.set_external_journal(journal.clone());
+                        ctx.external_journal = Some(journal);
+                        timer.phase("external_journal");
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "external side-effect journal startup failed; \
+                             non-idempotent external actions stay disabled"
+                        );
+                        timer.phase("external_journal_blocked");
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    "native secure keys unavailable; external side-effect journal \
+                     stays disabled and non-idempotent external actions are refused"
+                );
+                timer.phase("external_journal_skipped");
+            }
+        }
+    }
+    #[cfg(test)]
+    {
+        timer.phase("external_journal_skipped");
     }
     let recovery_wall_ms = chrono::Utc::now()
         .timestamp_millis()
@@ -4858,69 +4917,23 @@ pub(crate) async fn boot_with_db(
         tracing::warn!("media admission is closed until durable reservations are recovered");
         timer.phase("media_reservation_admission_blocked");
     }
+    #[cfg(feature = "extended")]
+    if let Some(handle) = ctx.scheduler()
+        && let Err(error) =
+            crate::skills::curator::register_scheduler(&handle, ctx.db.clone()).await
+    {
+        tracing::warn!(error = %error, "skill curator scheduler registration failed");
+    }
+    // Resolve command-backed named secrets referenced by configured provider
+    // headers into the daemon cache. Failures land as `Failed` (never fail
+    // boot); the first outbound request then sees the cached status, not a sync
+    // exec.
     ctx.resolve_startup_command_secrets().await;
     timer.phase("command_secret_startup_resolve");
     Ok(ctx)
 }
 
 const TERMINAL_REAPER_POLL: Duration = Duration::from_secs(30);
-
-async fn run_deferred_daemon_subsystems(ctx: Arc<DaemonContext>) {
-    run_deferred_external_journal_start(&ctx).await;
-}
-
-const DEFERRED_EXTERNAL_JOURNAL_RETRY: Duration = Duration::from_millis(250);
-
-async fn run_deferred_external_journal_start(ctx: &DaemonContext) {
-    if ctx.registry.external_journal_handle().is_some() {
-        return;
-    }
-    loop {
-        if ctx.shutdown_signal().is_draining() {
-            return;
-        }
-        let secure_key = match ctx.secure_key.clone() {
-            Some(secure_key) => secure_key,
-            None => {
-                tracing::warn!(
-                    "native secure keys unavailable; external side-effect journal \
-                     stays disabled and non-idempotent external actions are refused"
-                );
-                return;
-            }
-        };
-        let now_wall_ms = chrono::Utc::now().timestamp_millis();
-        match crate::external_journal::ExternalJournal::start(
-            ctx.db.clone(),
-            &secure_key,
-            now_wall_ms,
-        )
-        .await
-        {
-            Ok((journal, report)) => {
-                tracing::info!(
-                    scanned = report.scanned,
-                    imported = report.imported,
-                    quarantined = report.quarantined,
-                    converted = report.converted,
-                    released_without_medium = report.released_without_medium,
-                    "deferred external side-effect journal recovery finished"
-                );
-                let journal = std::sync::Arc::new(journal);
-                ctx.registry.publish_external_journal(journal);
-                return;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "deferred external side-effect journal startup failed; \
-                     non-idempotent external actions stay disabled; retrying"
-                );
-                tokio::time::sleep(DEFERRED_EXTERNAL_JOURNAL_RETRY).await;
-            }
-        }
-    }
-}
 
 const DEFERRED_HOST_CAPABILITY_REFRESH_RETRY: Duration = Duration::from_millis(250);
 
@@ -5370,26 +5383,6 @@ async fn run_retention_pass(db: Db, cfg: RetentionConfig, now_secs: i64) {
 /// Housekeeping that is not required to accept the first client connection.
 pub(crate) fn spawn_deferred_boot_maintenance(ctx: Arc<DaemonContext>) {
     tokio::spawn(async move {
-        run_deferred_daemon_subsystems(ctx.clone()).await;
-        if let Some(storage) = ctx.active_media_storage_recovery() {
-            let now_unix_ms = chrono::Utc::now().timestamp_millis();
-            if let Err(error) = storage
-                .reconcile_abandoned_component_leases(now_unix_ms)
-                .await
-            {
-                tracing::warn!(error = %error, "deferred media lease reconciliation failed");
-            } else if let Err(error) =
-                run_media_retention_sweep(storage.as_ref(), now_unix_ms).await
-            {
-                tracing::warn!(error = %error, "deferred media retention recovery failed");
-            }
-        }
-        run_retention_pass(
-            ctx.db.clone(),
-            retention_config(),
-            chrono::Utc::now().timestamp(),
-        )
-        .await;
         run_deferred_host_capability_refresh(&ctx).await;
     });
 }

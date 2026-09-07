@@ -961,13 +961,6 @@ impl SessionRegistry {
         self.external_journal()
     }
 
-    pub(crate) fn publish_external_journal(
-        &self,
-        journal: Arc<crate::external_journal::ExternalJournal>,
-    ) {
-        self.set_external_journal(journal);
-    }
-
     pub(crate) fn set_message_media_authority(
         &self,
         storage: Arc<crate::media_storage::MediaStorageRecovery>,

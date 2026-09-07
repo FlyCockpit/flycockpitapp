@@ -4829,7 +4829,27 @@ impl Db {
                 )
                 .optional()?;
             if approved.is_none() {
-                return Ok(false);
+                // A live ready/dispatching handoff may already exist when this
+                // waiter wakes after an external resolver or replay path settled
+                // the operation. Return `true` so the caller can adopt the
+                // durable row instead of trying to mint a second capability.
+                // When no handoff exists yet, return `false` so the caller can
+                // distinguish a missing approval from an idempotent replay.
+                let existing: Option<i64> = conn
+                    .query_row(
+                        "SELECT 1
+                           FROM agent_host_approval_effect_handoffs
+                          WHERE operation_id = ?1 AND session_id = ?2 AND agent_instance_id = ?3
+                            AND state IN ('ready', 'dispatching')",
+                        params![
+                            operation_id.to_string(),
+                            session_id.to_string(),
+                            agent_instance_id.to_string(),
+                        ],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                return Ok(existing.is_some());
             }
             // The stable operation UUID is the only permissible idempotency
             // identity. A prompt ID or UI path is not an effect identity.  A
@@ -4855,11 +4875,73 @@ impl Db {
                     now_unix_ms,
                 ],
             )?;
-            ensure!(
-                inserted == 1,
-                "host approval operation lost its selected candidate while creating the effect handoff"
-            );
+            if inserted == 0 {
+                let existing: Option<i64> = conn
+                    .query_row(
+                        "SELECT 1
+                           FROM agent_host_approval_effect_handoffs
+                          WHERE operation_id = ?1 AND session_id = ?2 AND agent_instance_id = ?3
+                            AND state IN ('ready', 'dispatching')",
+                        params![
+                            operation_id.to_string(),
+                            session_id.to_string(),
+                            agent_instance_id.to_string(),
+                        ],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if existing.is_none() {
+                    ensure!(
+                        inserted == 1,
+                        "host approval operation lost its selected candidate while creating the effect handoff"
+                    );
+                }
+            }
             Ok(true)
+        })
+        .await
+    }
+
+    /// Return the live durable handoff row for an approved operation when
+    /// [`Self::consume_host_approval_final_operation`] observes no fresh
+    /// insert (for example an external resolver settled the operation while
+    /// the parked QuestionTool waiter was still asleep).
+    #[cfg(feature = "host-approval-composition")]
+    pub async fn live_host_approval_effect_handoff_state(
+        &self,
+        session_id: Uuid,
+        agent_instance_id: Uuid,
+        operation_id: Uuid,
+        operation_kind: String,
+        canonical_input_json: String,
+        input_digest: String,
+    ) -> Result<Option<String>> {
+        validate_host_operation_binding(&operation_kind, &input_digest)?;
+        validate_host_operation_canonical_input(&canonical_input_json, &input_digest)?;
+        self.read(move |conn| {
+            let state: Option<String> = conn
+                .query_row(
+                    "SELECT handoff.state
+                       FROM agent_host_approval_operations AS operation
+                       JOIN agent_host_approval_effect_handoffs AS handoff
+                         ON handoff.operation_id = operation.operation_id
+                      WHERE operation.operation_id = ?1 AND operation.session_id = ?2
+                        AND operation.agent_instance_id = ?3 AND operation.operation_kind = ?4
+                        AND operation.canonical_input_json = ?5 AND operation.input_digest = ?6
+                        AND operation.state IN ('approved', 'dispatching')
+                        AND handoff.state IN ('ready', 'dispatching')",
+                    params![
+                        operation_id.to_string(),
+                        session_id.to_string(),
+                        agent_instance_id.to_string(),
+                        operation_kind,
+                        canonical_input_json,
+                        input_digest,
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(state.filter(|state| state == "ready" || state == "dispatching"))
         })
         .await
     }

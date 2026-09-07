@@ -170,7 +170,11 @@ fn sandbox_policy_with_visibility_restriction(
             if cockpit_host::path_containment::contained_under(cwd, scope) {
                 push_unique_path(&mut allow_write_roots, scope.to_path_buf());
             }
-        } else {
+        } else if !system_writable_root_conflict(cwd) {
+            // Host path approval may still authorize read-write access to a
+            // system directory such as `/etc`, but making that path a writable
+            // sandbox root makes zerobox prepare protected `.codex` metadata
+            // beneath it. Keep those roots read-only inside the box.
             push_unique_path(&mut allow_write_roots, cwd.to_path_buf());
         }
     }
@@ -193,6 +197,7 @@ fn sandbox_policy_with_visibility_restriction(
         if workspace_write_allowed
             && matches!(extra.access, SandboxPathAccess::ReadWrite)
             && (!restrict_to_visibility || inside_visibility)
+            && !system_writable_root_conflict(&extra.path)
         {
             push_unique_path(&mut allow_write_roots, extra.path.clone());
         }
@@ -241,6 +246,39 @@ fn push_unique_path(paths: &mut Vec<std::path::PathBuf>, path: std::path::PathBu
     if !paths.iter().any(|existing| existing == &path) {
         paths.push(path);
     }
+}
+
+/// Zerobox's `system-read-linux` profile read-only-mounts `/etc/resolv.conf` and
+/// siblings. When `/etc` (or another parent) is also writable, bwrap rejects
+/// the conflicting carveout. Omit that profile and rely on the explicit
+/// runtime read roots we already add for confined shells.
+fn writable_roots_conflict_with_system_read_carveouts(
+    allow_write_roots: &[std::path::PathBuf],
+) -> bool {
+    allow_write_roots
+        .iter()
+        .any(|root| system_writable_root_conflict(root))
+}
+
+fn system_writable_root_conflict(root: &std::path::Path) -> bool {
+    root == std::path::Path::new("/etc") || root.starts_with("/etc/")
+}
+
+#[cfg(target_os = "linux")]
+const SANDBOX_PROFILES_WITHOUT_SYSTEM_READ_LINUX: &[&str] = &[
+    "deny-credentials",
+    "deny-shell-history",
+    "deny-shell-configs",
+    "deny-keychains-linux",
+    "deny-browser-data-linux",
+];
+
+fn apply_sandbox_profiles(sandbox: zerobox::Sandbox, policy: &SandboxPolicy) -> zerobox::Sandbox {
+    #[cfg(target_os = "linux")]
+    if writable_roots_conflict_with_system_read_carveouts(&policy.allow_write_roots) {
+        return sandbox.profiles(SANDBOX_PROFILES_WITHOUT_SYSTEM_READ_LINUX);
+    }
+    sandbox
 }
 
 /// Linux helper alias path, captured by [`init`] and read by
@@ -424,7 +462,6 @@ pub async fn build_sandboxed_command_with_visibility_root(
         .arg("-c")
         .arg(command)
         .cwd(cwd.to_path_buf())
-        // Share the host network (filesystem-confined only). An empty
         // allow-list with no deny-list and no secret store makes zerobox
         // select `BwrapNetworkMode::FullAccess`, so bwrap runs without
         // `--unshare-net` and never attempts the unprivileged loopback
@@ -487,6 +524,24 @@ pub async fn build_sandboxed_command_with_visibility_root(
             .env("TEMP", tmp.to_string_lossy().into_owned());
     }
 
+    #[cfg(target_os = "linux")]
+    if writable_roots_conflict_with_system_read_carveouts(&policy.allow_write_roots)
+        && let Some(tmp) = tmp_dir
+    {
+        let sandbox_home = tmp.join("sandbox-home");
+        std::fs::create_dir_all(&sandbox_home)
+            .map_err(|error| anyhow::anyhow!("creating confined shell home: {error}"))?;
+        let sandbox_config = sandbox_home.join(".config");
+        std::fs::create_dir_all(&sandbox_config)
+            .map_err(|error| anyhow::anyhow!("creating confined shell config home: {error}"))?;
+        sandbox = sandbox
+            .env("HOME", sandbox_home.to_string_lossy().into_owned())
+            .env(
+                "XDG_CONFIG_HOME",
+                sandbox_config.to_string_lossy().into_owned(),
+            );
+    }
+
     // Layer cockpit's env-scrub overrides (e.g. blanking injection-vector
     // vars) on top of the inherited env. Applied after the TMPDIR override
     // above; the scrub set never includes the temp-dir vars, so they stand.
@@ -504,6 +559,8 @@ pub async fn build_sandboxed_command_with_visibility_root(
     if let Some(Some(exe)) = LINUX_SANDBOX_EXE.get() {
         sandbox = sandbox.linux_sandbox_exe(exe.clone());
     }
+
+    sandbox = apply_sandbox_profiles(sandbox, &policy);
 
     let prepared = sandbox.prepare().await?;
     Ok(prepared.into_command())

@@ -205,6 +205,17 @@ impl Approver {
         {
             return Ok(GitignoreReadOutcome::ApproveOnce);
         }
+        if !self.interrupts.is_interactive_attached() {
+            self.record_permission_decision(
+                "read",
+                display_path,
+                &[],
+                Decision::NoninteractiveDeny,
+                DecisionSource::HeadlessAutoReject,
+            )
+            .await;
+            return Ok(GitignoreReadOutcome::NoninteractiveReject);
+        }
         // Stage 1 — scope (file / parent dir / reject).
         let shape = self
             .prompt_gitignore_stage1(display_path, parent_label, file_glob, parent_glob)

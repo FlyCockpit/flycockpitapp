@@ -228,6 +228,27 @@ fn tool_results(events: &[TurnEvent]) -> Vec<(&str, &str, &str)> {
         .collect()
 }
 
+fn tool_results_including_errors(events: &[TurnEvent]) -> Vec<(&str, &str, &str)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            TurnEvent::ToolEnd {
+                call_id,
+                tool,
+                output,
+                ..
+            } => Some((call_id.as_str(), tool.as_str(), output.as_str())),
+            TurnEvent::ToolError {
+                call_id,
+                tool,
+                error,
+                ..
+            } => Some((call_id.as_str(), tool.as_str(), error.as_str())),
+            _ => None,
+        })
+        .collect()
+}
+
 async fn session_events(driver: &Driver) -> Vec<crate::db::session_log::SessionEventRow> {
     driver
         .session
@@ -2072,7 +2093,7 @@ fn parallel_lane_respects_delegation_max_parallel_fifo() {
         assert_eq!(state.max_in_flight(), 2);
 
         let events = drain_events(&mut rx);
-        let results = tool_results(&events);
+        let results = tool_results_including_errors(&events);
         assert_eq!(
             results.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
             vec![
@@ -2614,6 +2635,9 @@ fn enable_reasoning_retraction(driver: &mut Driver) {
             ),
         ),
     );
+    if let Some(active) = driver.config.providers().active_model.clone() {
+        driver.session.set_active_model_ref(active).unwrap();
+    }
 }
 
 #[tokio::test]

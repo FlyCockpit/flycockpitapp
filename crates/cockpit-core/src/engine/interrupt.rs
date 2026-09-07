@@ -2406,13 +2406,16 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                             )
                             .await
                             {
-                                if !handoff.claimed
-                                    && register_host_approval_effect_handoff(handoff)
-                                {
-                                    response
-                                } else {
+                                if handoff.claimed {
+                                    // The claimed handoff already crossed its
+                                    // concrete boundary, so its dispatch
+                                    // outcome is unknown.  Record exactly
+                                    // that; a known-rejection receipt would
+                                    // be a false audit record and would
+                                    // also CAS the row out of `dispatching`
+                                    // before the promotion below could win.
                                     let _ = db
-                                        .reject_unclaimed_host_approval_final_operation(
+                                        .mark_host_approval_final_operation_submission_unknown(
                                             db_authority,
                                             interrupt_id,
                                             session_id,
@@ -2424,8 +2427,17 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                                             crate::agent_tree::system_now_unix_ms(),
                                         )
                                         .await;
+                                    ResolveResponse::Cancel
+                                } else if register_host_approval_effect_handoff(handoff) {
+                                    response
+                                } else {
+                                    // An unclaimed ready capability that
+                                    // cannot join an effect scope never
+                                    // reached a boundary, so a truthful
+                                    // known-not-submitted rejection is the
+                                    // correct terminal receipt.
                                     let _ = db
-                                        .mark_host_approval_final_operation_submission_unknown(
+                                        .reject_unclaimed_host_approval_final_operation(
                                             db_authority,
                                             interrupt_id,
                                             session_id,
@@ -2849,9 +2861,47 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                 &operation,
             )
             .await
-                && register_host_approval_effect_handoff(handoff)
             {
-                outcome
+                if handoff.claimed {
+                    // Another waiter already claimed this exact effect at its
+                    // concrete boundary, so its dispatch outcome is unknown
+                    // and must never be redelivered.  Promote the
+                    // still-dispatching row to the explicit audit state.
+                    let _ = db
+                        .mark_host_approval_final_operation_submission_unknown(
+                            db_authority,
+                            interrupt_id,
+                            session_id,
+                            agent_instance_id,
+                            operation.operation_id,
+                            operation.operation_kind.clone(),
+                            operation.canonical_input_json.clone(),
+                            operation.input_digest.clone(),
+                            crate::agent_tree::system_now_unix_ms(),
+                        )
+                        .await;
+                    InterruptOutcome::Resolved(ResolveResponse::Cancel)
+                } else if register_host_approval_effect_handoff(handoff) {
+                    outcome
+                } else {
+                    // An unclaimed ready capability that cannot join an
+                    // effect scope never reached a boundary; record the
+                    // truthful known-not-submitted rejection.
+                    let _ = db
+                        .reject_unclaimed_host_approval_final_operation(
+                            db_authority,
+                            interrupt_id,
+                            session_id,
+                            agent_instance_id,
+                            operation.operation_id,
+                            operation.operation_kind.clone(),
+                            operation.canonical_input_json.clone(),
+                            operation.input_digest.clone(),
+                            crate::agent_tree::system_now_unix_ms(),
+                        )
+                        .await;
+                    InterruptOutcome::Resolved(ResolveResponse::Cancel)
+                }
             } else {
                 InterruptOutcome::Resolved(ResolveResponse::Cancel)
             }

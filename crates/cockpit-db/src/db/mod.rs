@@ -130,21 +130,17 @@ pub mod workspace_trust;
 pub mod write_scope_leases;
 
 use std::any::Any;
-use std::io::Seek as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use sha2::{Digest, Sha256};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const MIGRATION_BACKUP_LIMIT: usize = 3;
-const UNTRUSTED_MIGRATION_BACKUP_LIMIT: usize = 2;
-const UNTRUSTED_MIGRATION_BACKUP_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 thread_local! {
     static OPEN_DEFAULT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

@@ -6,7 +6,7 @@
 
 use std::borrow::Cow;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use serde_json::Value;
 use uuid::Uuid;

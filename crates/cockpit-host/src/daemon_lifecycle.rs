@@ -6,7 +6,6 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1027,6 +1026,7 @@ pub fn process_exists(pid: u32) -> bool {
 /// the opened handle so a recycled PID cannot be terminated.
 #[cfg(windows)]
 pub fn terminate_verified_daemon_process(receipt: &DaemonPidReceipt) -> anyhow::Result<()> {
+    use anyhow::Context as _;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, TerminateProcess,

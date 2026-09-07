@@ -815,6 +815,7 @@ async fn background_gate_denied_approval_starts_no_job() {
 #[tokio::test]
 async fn background_gate_no_approver_is_denied() {
     let (mut driver, _tmp) = test_driver(8);
+    driver.clear_approver();
     let mut rx = capture_schedule_events(&mut driver);
     driver.session.set_sandbox_enabled(false);
 

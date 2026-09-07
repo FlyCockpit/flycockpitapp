@@ -293,6 +293,13 @@ async fn forward(
             TurnEvent::InferenceWarning { .. } => {
                 let _ = real_tx.try_send(event);
             }
+            // The display classifier has already assigned these deltas to the
+            // UI's text/reasoning channels. They are the live display surface;
+            // buffering only the legacy raw deltas must not suppress them.
+            TurnEvent::AssistantDisplayTextDelta { .. }
+            | TurnEvent::AssistantDisplayReasoningDelta { .. } => {
+                let _ = real_tx.try_send(event);
+            }
             // Fail-closed default: any OTHER event is WITHHELD (buffered, surfaced
             // only on a Released flush, dropped on a contained/discarded turn)
             // rather than streamed live, so a future plaintext-bearing completion

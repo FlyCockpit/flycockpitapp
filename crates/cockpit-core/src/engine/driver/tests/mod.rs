@@ -181,11 +181,17 @@ async fn recovered_interactive_task_admission_replays_durable_seed_before_infere
             crate::daemon::session_worker::SessionConfigHandle::detached(
                 crate::daemon::session_worker::SessionConfigSnapshot::new(
                     driver.config.generation(),
-                    config,
+                    config.clone(),
                     test_extended_config(),
                 ),
             ),
         );
+        driver.test_providers_override = Some((config, "lmstudio".into(), "local".into()));
+        if let Ok(refreshed) =
+            driver.build_live_model_for_running(&driver.stack[0].agent.model, "lmstudio", "local")
+        {
+            Arc::make_mut(&mut driver.stack[0].agent).model = Arc::new(refreshed);
+        }
     }
 
     let session = driver.session.clone();
@@ -193,6 +199,11 @@ async fn recovered_interactive_task_admission_replays_durable_seed_before_infere
     let redact = driver.redact.clone();
     let cwd = driver.cwd.clone();
     let root = driver.stack[0].agent.clone();
+    let recovered_config = driver.config.clone();
+    let recovered_providers = driver
+        .test_providers_override
+        .clone()
+        .expect("scripted provider survives the simulated driver restart");
     let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
     let input_queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
     let (turn_tx, _turn_rx) = mpsc::channel::<TurnEvent>(256);
@@ -286,6 +297,8 @@ async fn recovered_interactive_task_admission_replays_durable_seed_before_infere
 
     let mut recovered_driver =
         Driver::with_max_schedules(session.clone(), locks, redact, cwd, root, 8);
+    recovered_driver.set_config_handle(recovered_config);
+    recovered_driver.test_providers_override = Some(recovered_providers);
     bind_test_session_root(&mut recovered_driver);
     let (recovery_updates_tx, _recovery_updates_rx) = tokio::sync::watch::channel(Vec::new());
     let recovery_queue = crate::engine::message::UserSubmissionQueue::new(recovery_updates_tx);
@@ -744,11 +757,12 @@ fn test_driver_with_url_and_grant(
         crate::daemon::session_worker::SessionConfigHandle::detached(
             crate::daemon::session_worker::SessionConfigSnapshot::new(
                 0,
-                pcfg,
+                pcfg.clone(),
                 test_extended_config(),
             ),
         ),
     );
+    driver.test_providers_override = Some((pcfg, "lmstudio".into(), "local".into()));
     bind_test_session_root(&mut driver);
     let hub = Arc::new(crate::engine::interrupt::InterruptHub::detached());
     let grant_store = crate::approval::store::GrantStore::new(

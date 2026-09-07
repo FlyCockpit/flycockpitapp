@@ -4188,7 +4188,7 @@ impl Driver {
                 self.locks.clone(),
                 self.redact.clone(),
                 child_cwd.resolved,
-                self.config.clone(),
+                self.config_for_noninteractive_child(),
                 self.guidance_compiler.clone(),
                 self.interrupts.clone(),
                 cancel,
@@ -5033,7 +5033,7 @@ impl Driver {
                         self.locks.clone(),
                         self.redact.clone(),
                         child_cwd.resolved.clone(),
-                        self.config.clone(),
+                        self.config_for_noninteractive_child(),
                         self.guidance_compiler.clone(),
                         self.interrupts.clone(),
                         cancel,
@@ -10695,6 +10695,10 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
     let forwarder =
         spawn_noninteractive_event_forwarder(child_rx, event_tx.clone(), steer_target.clone());
 
+    #[cfg(test)]
+    let mut config = config;
+    #[cfg(not(test))]
+    let config = config;
     let mut agent = Arc::new(child);
     // This noninteractive executor does not own a foreground Driver frame,
     // but it is still a real delegation. Keep the same selected-delegation
@@ -10861,12 +10865,30 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
     scheduled_lane_driver.bind_active_retry_budget();
     let _lane_exit_drain = crate::engine::delegation_budget::LaneBudgetExitDrain::new(&budget);
     #[cfg(test)]
+    if scheduled_lane_driver.test_providers_override.is_none() {
+        let providers = config.providers();
+        if let Some(active) = providers.active_model.clone() {
+            scheduled_lane_driver.test_providers_override = Some((
+                providers.clone(),
+                active.provider.clone(),
+                active.model.clone(),
+            ));
+        }
+    }
+    #[cfg(test)]
     if let Some(hooks) = super::nested_lane_test_hooks::take() {
         if let Some(script) = hooks.test_compact_brief_script {
             scheduled_lane_driver.test_compact_brief_script = Some(script);
         }
         if let Some(override_) = hooks.test_providers_override {
-            scheduled_lane_driver.test_providers_override = Some(override_);
+            scheduled_lane_driver.test_providers_override = Some(override_.clone());
+            let snapshot = crate::daemon::session_worker::SessionConfigSnapshot::new(
+                config.generation(),
+                override_.0.clone(),
+                config.extended().clone(),
+            );
+            config = crate::daemon::session_worker::SessionConfigHandle::detached(snapshot);
+            scheduled_lane_driver.set_config_handle(config.clone());
         }
         for _ in 0..hooks.lane_compact_guard_precharge {
             let _ = budget.record_compaction(100, false);
@@ -12197,6 +12219,25 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                     continue 'turns;
                 }
                 let pending = std::mem::take(&mut pending_computer_continuations);
+                scheduled_lane_driver.repin_config_for_turn();
+                match scheduled_lane_driver.build_live_model_for_running(
+                    &agent.model,
+                    agent.model.provider_id(),
+                    agent.model.model_id_ref(),
+                ) {
+                    Ok(refreshed) => {
+                        let mut refreshed_agent = (*agent).clone();
+                        refreshed_agent.model = Arc::new(refreshed);
+                        agent = Arc::new(refreshed_agent);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            agent = %agent.name,
+                            "refreshing noninteractive model from config failed"
+                        );
+                    }
+                }
                 let mut turn_agent =
                     super::computer_native::with_live_loop_native_computer_geometry(
                         agent.as_ref().clone(),

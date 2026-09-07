@@ -33,7 +33,14 @@ impl Session {
         // set to contend with. The durable user row has already been removed
         // before this rollback is called; restore the consumed prelude even if
         // a concurrent manual title update wins the separate title rollback.
-        *self.last_time_prelude.lock().unwrap() = snapshot.last_time_prelude.clone();
+        let consumed_time_prelude = {
+            let mut last = self.last_time_prelude.lock().unwrap();
+            let prior = snapshot.last_time_prelude;
+            let consumed = (*last != prior).then(|| *last).flatten();
+            *last = prior;
+            consumed
+        };
+        *self.retracted_time_prelude.lock().unwrap() = consumed_time_prelude;
         let session_id = self.live_id();
         let prior_title = snapshot.title.clone();
         let generated_title = generated_title.map(str::to_owned);
@@ -574,6 +581,10 @@ impl Session {
     /// per-session "last prelude" stamp is the side-effect of a
     /// `Some` return — call only when actually about to send.
     pub fn take_time_prelude(&self, interval_minutes: u32) -> Option<String> {
+        if let Some(retracted) = self.retracted_time_prelude.lock().unwrap().take() {
+            *self.last_time_prelude.lock().unwrap() = Some(retracted);
+            return Some(format!("[time: {}]", retracted.to_rfc3339()));
+        }
         let now = Utc::now();
         let mut last = self.last_time_prelude.lock().unwrap();
         let should_inject = match *last {
@@ -643,7 +654,9 @@ mod metadata_tests {
         )
         .unwrap();
         let snapshot = session.title_progress_snapshot().await.unwrap();
-        assert!(session.take_time_prelude(5).is_some());
+        let consumed = session
+            .take_time_prelude(5)
+            .expect("first logical turn consumes a prelude");
         assert!(session.take_time_prelude(5).is_none());
 
         session
@@ -651,10 +664,12 @@ mod metadata_tests {
             .await
             .unwrap();
 
-        assert!(
-            session.take_time_prelude(5).is_some(),
-            "the retract rollback restores the pre-send time-prelude state"
+        assert_eq!(
+            session.take_time_prelude(5),
+            Some(consumed),
+            "the retract rollback replays the exact vanished request prelude"
         );
+        assert!(session.take_time_prelude(5).is_none());
     }
 
     #[test]

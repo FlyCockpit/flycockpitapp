@@ -19641,10 +19641,13 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         "apply_sealed_owner_operation" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
+        // Catalog sealed-action creation is retired (#236): the request is
+        // an unconditional post-auth `BadRequest` steering owners to the
+        // owner-declared sink path.
+        "create_sealed_action" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         "cancel_sealed_owner_operation" => AuthzAllowedOutcome::Response,
         "sealed_owner_inventory"
         | "list_sealed_actions"
-        | "create_sealed_action"
         | "create_declared_sealed_action"
         | "retire_sealed_action" => AuthzAllowedOutcome::Response,
         "edit_sealed_owner_description"
@@ -19931,12 +19934,12 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "cancel_all_session_work"
         | "exit_guard_status"
         | "release_exit_guard" => AuthzAllowedOutcome::Response,
-        // The authz probe intentionally uses an unknown inbox item. Reaching
-        // the writer handler must therefore fail after authorization rather
-        // than manufacture a durable acknowledgement.
-        "acknowledge_assistant_inbox_human_read" => {
-            AuthzAllowedOutcome::Error(ErrorCode::Internal)
-        }
+        // The authz probe intentionally uses an unknown inbox item. The
+        // human-read acknowledgement is deliberately idempotent (see
+        // `assert_assistant_inbox_human_read_happy`): an unknown or pruned id
+        // is a durable no-op Ack, and only a cross-session identity fails
+        // closed. The owner-allowed cell therefore surfaces the typed Ack.
+        "acknowledge_assistant_inbox_human_read" => AuthzAllowedOutcome::Response,
         "knowledge_dream_status" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         "promote_to_persistent" => AuthzAllowedOutcome::Response,
         "run_knowledge_dream" => AuthzAllowedOutcome::Response,
@@ -38588,6 +38591,7 @@ async fn wait_for_retraction_acceptance_event(
                 .recv()
                 .await
                 .unwrap_or_else(|error| panic!("{label}: event stream failed: {error}"));
+            eprintln!("RETRACT-WAIT [{label}] event: {:?}", event.event);
             if matches_event(&event.event) {
                 return event.event;
             }

@@ -5977,6 +5977,7 @@ impl Driver {
                 continue;
             }
             if !waiting_for_keep_parked_siblings
+                && !human_input_already_pending
                 && self
                     .try_deliver_immediate_assistant_inbox(&input_queue, tx, &mut goal_watchdog)
                     .await?
@@ -10207,6 +10208,32 @@ impl Driver {
         )
     }
 
+    fn merge_live_model_selection_fields(
+        &self,
+        mut selection: crate::config::providers::ActiveModelRef,
+    ) -> crate::config::providers::ActiveModelRef {
+        let Some(live) = self
+            .live_providers_config()
+            .ok()
+            .and_then(|providers| providers.active_model)
+        else {
+            return selection;
+        };
+        if live.provider != selection.provider || live.model != selection.model {
+            return selection;
+        }
+        if selection.reasoning_effort.is_none() {
+            selection.reasoning_effort = live.reasoning_effort.clone();
+        }
+        if selection.thinking_mode.is_none() {
+            selection.thinking_mode = live.thinking_mode.clone();
+        }
+        if selection.prompt_cache_retention.is_none() {
+            selection.prompt_cache_retention = live.prompt_cache_retention.clone();
+        }
+        selection
+    }
+
     fn active_selection_for_model(
         &self,
         model: &crate::engine::model::Model,
@@ -10215,7 +10242,7 @@ impl Driver {
             return if selection.provider == model.provider_id()
                 && selection.model == model.model_id_ref()
             {
-                selection
+                self.merge_live_model_selection_fields(selection)
             } else {
                 crate::config::providers::ActiveModelRef {
                     provider: model.provider_id().to_string(),
@@ -10233,6 +10260,7 @@ impl Driver {
             .filter(|selection| {
                 selection.provider == model.provider_id() && selection.model == model.model_id_ref()
             })
+            .map(|selection| self.merge_live_model_selection_fields(selection))
             .unwrap_or_else(|| crate::config::providers::ActiveModelRef {
                 provider: model.provider_id().to_string(),
                 model: model.model_id_ref().to_string(),

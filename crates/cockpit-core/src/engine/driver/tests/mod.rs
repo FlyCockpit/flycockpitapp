@@ -750,6 +750,20 @@ fn test_driver_with_url_and_grant(
         ),
     );
     bind_test_session_root(&mut driver);
+    let hub = Arc::new(crate::engine::interrupt::InterruptHub::detached());
+    let grant_store = crate::approval::store::GrantStore::new(
+        driver.session.db.clone(),
+        driver.session.id,
+        driver.cwd.clone(),
+        driver.config.clone(),
+    );
+    driver.set_approver(Arc::new(crate::approval::Approver::new(
+        grant_store,
+        driver.session.db.clone(),
+        driver.session.id,
+        "Build",
+        hub,
+    )));
     (driver, tmp)
 }
 

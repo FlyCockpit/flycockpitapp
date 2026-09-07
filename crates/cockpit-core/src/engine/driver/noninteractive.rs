@@ -4522,36 +4522,64 @@ impl Driver {
                     }
                 };
             }
-            let surface = execution_surface
+            let surface = if execution_surface
                 .as_ref()
-                .expect("fresh child surface resolved above");
-            if surface.config_generation != self.config.generation() {
-                let report = crate::workspace_lease::report_with_lease_retire_failure(
-                    "Error: delegated execution surface generation changed before attempt start"
-                        .to_string(),
-                    crate::workspace_lease::grace_retain_rejected_workspace_leases(
-                        &self.session.db,
-                        self.parent_workspace_lease(),
-                        [resolved_workspace_lease.as_ref()],
-                    )
-                    .await,
+                .is_some_and(|surface| surface.config_generation != self.config.generation())
+            {
+                let preflight_args = self.spawn_args_delegated_in_cwd_scoped(
+                    &child_cwd.resolved,
+                    false,
+                    granted_tools.clone(),
+                    model.clone(),
+                    child_recursion.clone(),
+                    DelegationConfinement {
+                        lock_identity: None,
+                        write_scope: resolved_write_scope.clone(),
+                        dream_read_scope: self.dream_read_scope.clone(),
+                        workspace_lease: resolved_workspace_lease.clone().map(std::sync::Arc::new),
+                    },
                 );
-                return Ok(SingleNoninteractiveCompletion {
-                    child_agent,
-                    task_call_id,
-                    task_provider_item_id,
-                    task_function_call_id,
-                    report,
-                    failed: true,
-                    failure: None,
-                    partial_progress: DelegationPartialProgress::default(),
-                    new_handle: None,
-                    snapshot: NoninteractiveDelegationSnapshot::empty(),
-                    shrink: None,
-                    repair_notes,
-                    child_routing: None,
-                });
-            }
+                match crate::engine::builtin::resolve_child_execution_surface(
+                    &child_agent,
+                    &preflight_args,
+                ) {
+                    Ok(surface) => {
+                        execution_surface = Some(surface.clone());
+                        surface
+                    }
+                    Err(error) => {
+                        let report = crate::workspace_lease::report_with_lease_retire_failure(
+                            format!("Error: {error:#}"),
+                            crate::workspace_lease::grace_retain_rejected_workspace_leases(
+                                &self.session.db,
+                                self.parent_workspace_lease(),
+                                [resolved_workspace_lease.as_ref()],
+                            )
+                            .await,
+                        );
+                        return Ok(SingleNoninteractiveCompletion {
+                            child_agent,
+                            task_call_id,
+                            task_provider_item_id,
+                            task_function_call_id,
+                            report,
+                            failed: true,
+                            failure: None,
+                            partial_progress: DelegationPartialProgress::default(),
+                            new_handle: None,
+                            snapshot: NoninteractiveDelegationSnapshot::empty(),
+                            shrink: None,
+                            repair_notes,
+                            child_routing: None,
+                        });
+                    }
+                }
+            } else {
+                execution_surface
+                    .as_ref()
+                    .expect("fresh child surface resolved above")
+                    .clone()
+            };
             (surface.posture.clone(), surface.context_policy.clone())
         };
         let followup_enabled =
@@ -12169,25 +12197,6 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                     continue 'turns;
                 }
                 let pending = std::mem::take(&mut pending_computer_continuations);
-                scheduled_lane_driver.repin_config_for_turn();
-                match scheduled_lane_driver.build_live_model_for_running(
-                    &agent.model,
-                    agent.model.provider_id(),
-                    agent.model.model_id_ref(),
-                ) {
-                    Ok(refreshed) => {
-                        let mut refreshed_agent = (*agent).clone();
-                        refreshed_agent.model = Arc::new(refreshed);
-                        agent = Arc::new(refreshed_agent);
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            agent = %agent.name,
-                            "refreshing noninteractive model from config failed"
-                        );
-                    }
-                }
                 let mut turn_agent =
                     super::computer_native::with_live_loop_native_computer_geometry(
                         agent.as_ref().clone(),

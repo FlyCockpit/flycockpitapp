@@ -1289,13 +1289,20 @@ impl Driver {
         provider: &str,
         model: &str,
     ) -> Result<crate::engine::model::Model> {
-        let active = crate::config::providers::ActiveModelRef {
+        let mut active = crate::config::providers::ActiveModelRef {
             provider: provider.to_string(),
             model: model.to_string(),
             reasoning_effort: None,
             thinking_mode: None,
             prompt_cache_retention: None,
         };
+        if let Some(live) = self.live_config_active_model() {
+            if live.provider == active.provider && live.model == active.model {
+                active.reasoning_effort = live.reasoning_effort.clone();
+                active.thinking_mode = live.thinking_mode.clone();
+                active.prompt_cache_retention = live.prompt_cache_retention.clone();
+            }
+        }
         self.build_live_model_for_running_with_active(running, &active)
     }
 

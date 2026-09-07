@@ -3380,7 +3380,7 @@ async fn execute_ordinary_call_unscoped(
     // live projection is pure and must not make a completed filesystem effect
     // depend on a best-effort audit read. The latest assistant message is
     // always left intact until a later turn settles it.
-    crate::engine::write_edit_arg_elision::elide_applied_write_edit_args(history);
+    crate::engine::write_edit_arg_elision::elide_applied_write_edit_args_deferring_signed(history);
     Ok(())
 }
 

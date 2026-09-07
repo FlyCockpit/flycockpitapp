@@ -4881,12 +4881,12 @@ impl Db {
                 ],
             )?;
             if inserted == 0 {
-                let existing: Option<i64> = conn
+                let existing_state: Option<String> = conn
                     .query_row(
-                        "SELECT 1
+                        "SELECT state
                            FROM agent_host_approval_effect_handoffs
                           WHERE operation_id = ?1 AND session_id = ?2 AND agent_instance_id = ?3
-                            AND state = 'ready'",
+                            AND state IN ('ready', 'dispatching')",
                         params![
                             operation_id.to_string(),
                             session_id.to_string(),
@@ -4895,12 +4895,18 @@ impl Db {
                         |row| row.get(0),
                     )
                     .optional()?;
-                if existing.is_none() {
-                    ensure!(
-                        inserted == 1,
-                        "host approval operation lost its selected candidate while creating the effect handoff"
-                    );
-                }
+                return match existing_state.as_deref() {
+                    Some("ready") => Ok(true),
+                    Some("dispatching") => Ok(false),
+                    None => {
+                        ensure!(
+                            inserted == 1,
+                            "host approval operation lost its selected candidate while creating the effect handoff"
+                        );
+                        Ok(true)
+                    }
+                    Some(other) => bail!("unexpected host approval effect handoff state {other}"),
+                };
             }
             Ok(true)
         })
@@ -4946,7 +4952,7 @@ impl Db {
                     |row| row.get(0),
                 )
                 .optional()?;
-            Ok(state.filter(|state| state == "ready" || state == "dispatching"))
+            Ok(state.filter(|state| state == "ready"))
         })
         .await
     }

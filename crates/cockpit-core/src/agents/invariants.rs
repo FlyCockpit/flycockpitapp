@@ -328,6 +328,18 @@ pub(crate) fn small_model_capability_warning(def: &AgentDef) -> Option<String> {
 fn validate_tool_tier_overrides(def: &AgentDef) -> Result<()> {
     let known = known_tool_names();
     for (tool, tier) in &def.tool_tiers {
+        if def.vnext.is_some() && !known.contains(&tool.as_str()) {
+            // A launch-v1 definition has no user-authored tool authority: its
+            // closed schema is the only applicable definition-level invariant,
+            // and its tier channel is `toolTierPreferences` (which rejects
+            // unknown names itself). An unknown name in the ignored legacy
+            // `tool_tiers` field must not be reinterpreted by this legacy
+            // leaf rule — it is inert here. Known names keep every tier rule
+            // below, so binary-owned factory inputs and host-projected
+            // surfaces (checked via `agents::validate_host_tool_surface`)
+            // cannot arrange illegal placements.
+            continue;
+        }
         if let Some(replacement) = retired_lock_verb_replacement(tool) {
             bail!(
                 "agent `{}` tiers retired lock tool `{tool}`; use `{replacement}` instead",

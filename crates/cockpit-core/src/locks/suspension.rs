@@ -177,9 +177,16 @@ impl LockManager {
             if let Some(from_reads) = state.read_tracker.remove(&from_key) {
                 state
                     .read_tracker
-                    .entry(to_key)
+                    .entry(to_key.clone())
                     .or_default()
                     .extend(from_reads);
+            }
+            if let Some(from_authored) = state.authored_tracker.remove(&from_key) {
+                state
+                    .authored_tracker
+                    .entry(to_key)
+                    .or_default()
+                    .extend(from_authored);
             }
         }
 
@@ -261,6 +268,7 @@ impl LockManager {
             let held_paths: HashSet<PathBuf> = state.held.keys().cloned().collect();
             state.touched.retain(|path, _| held_paths.contains(path));
             state.read_tracker.retain(|(s, _), _| *s != session);
+            state.authored_tracker.retain(|(s, _), _| *s != session);
             state.suspended.retain(|(s, _), _| *s != session);
             state.session_released.remove(&session);
             state.held.len() != held_before

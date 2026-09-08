@@ -14,25 +14,6 @@ fn event_harness() -> (
     (queue, turn_tx, turn_rx)
 }
 
-/// Readiness wait for paused-clock driver tests. A `yield_now` count can
-/// never observe completion of real async I/O (sqlite, TCP): the looping
-/// test task keeps the scheduler non-empty, so the runtime never parks and
-/// the I/O driver is never polled. A short *virtual* sleep per poll parks
-/// the runtime — polling I/O and any blocking-pool completions — while
-/// always remaining the earliest pending timer, so no production timer
-/// fires ahead of the condition. The real-time deadline is a failure
-/// bound on a condition production guarantees, never pacing.
-async fn wait_until_inbox_ready(mut ready: impl FnMut() -> bool) -> bool {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !ready() {
-        if std::time::Instant::now() > deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    true
-}
-
 async fn insert_pending_assistant_inbox_item(driver: &Driver, delivery: &str, summary: &str) {
     let db = driver.session.db.clone();
     db.upsert_assistant("inbox-source", "/tmp/inbox-source", "{}", &"0".repeat(64))
@@ -516,11 +497,12 @@ async fn assistant_inbox_timer_yields_to_ready_human_input() {
     queue
         .push(UserSubmission::text("HUMAN_TIMER_MARKER"), target)
         .await;
-    assert!(
-        wait_until_inbox_ready(|| provider_posts(&provider).len() == 1).await,
-        "the ready human turn must start; posts: {}",
-        provider_posts(&provider).len()
-    );
+    for _ in 0..100 {
+        if provider_posts(&provider).len() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
 
     let posts = provider_posts(&provider);
     assert_eq!(posts.len(), 1, "the ready human turn starts first");
@@ -605,11 +587,12 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
 
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_millis(250)).await;
-    assert!(
-        wait_until_inbox_ready(|| provider_posts(&provider).len() == 1).await,
-        "immediate delivery must run at the idle boundary; posts: {}",
-        provider_posts(&provider).len()
-    );
+    for _ in 0..100 {
+        if provider_posts(&provider).len() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
     let posts = provider_posts(&provider);
     assert_eq!(
         posts.len(),
@@ -635,11 +618,12 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
     );
 
     tokio::time::advance(Duration::from_secs(1)).await;
-    assert!(
-        wait_until_inbox_ready(|| provider_posts(&provider).len() == 2).await,
-        "the heartbeat must start the deferred turn; posts: {}",
-        provider_posts(&provider).len()
-    );
+    for _ in 0..100 {
+        if provider_posts(&provider).len() == 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
     let posts = provider_posts(&provider);
     assert_eq!(posts.len(), 2, "the heartbeat starts the deferred turn");
     let heartbeat_prompt = chat_messages(&posts[1])
@@ -653,11 +637,12 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
     queue
         .push(UserSubmission::text("HUMAN_TURN_MARKER"), target)
         .await;
-    assert!(
-        wait_until_inbox_ready(|| provider_posts(&provider).len() == 3).await,
-        "the human turn must start the third inference; posts: {}",
-        provider_posts(&provider).len()
-    );
+    for _ in 0..100 {
+        if provider_posts(&provider).len() == 3 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
     let posts = provider_posts(&provider);
     assert_eq!(posts.len(), 3, "the human turn starts the third inference");
     let human_prompt = chat_messages(&posts[2])
@@ -1973,20 +1958,8 @@ fn failed_write_keeps_args_on_the_next_request() {
         let args = tool_call_arguments(write_calls[0]);
         assert_eq!(args["content"], serde_json::json!(content));
         let second_body = serde_json::to_string(&posts[1].body).unwrap();
-        // The raw source text can never appear in a JSON-serialized body
-        // (its quotes and newlines are escaped). Compare the form the wire
-        // actually carries: arguments embedded as a JSON string escape the
-        // content twice; structured-arguments dialects embed it once.
-        let needle = match &write_calls[0]["tool_calls"][0]["function"]["arguments"] {
-            serde_json::Value::String(_) => {
-                let escaped_once = serde_json::to_string(&content).unwrap();
-                let escaped = serde_json::to_string(&escaped_once).unwrap();
-                escaped[1..escaped.len() - 1].to_string()
-            }
-            _ => serde_json::to_string(&content).unwrap(),
-        };
         assert!(
-            second_body.contains(&needle),
+            second_body.contains(&content),
             "failed write args must stay visible"
         );
     });

@@ -12207,33 +12207,6 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                     continue 'turns;
                 }
                 let pending = std::mem::take(&mut pending_computer_continuations);
-                // Each turn re-pins the lane's view of the config and
-                // rebuilds the running model from it (the same live-switch
-                // refresh the foreground driver applies at its turn
-                // boundary). In tests this is also the seam that carries a
-                // `NestedLaneTestHooks` providers override into the lane's
-                // own inference: the caller-built child model may point at a
-                // fixture-dead URL, while every driver-level helper here
-                // honors the pinned/override config.
-                scheduled_lane_driver.repin_config_for_turn();
-                match scheduled_lane_driver.build_live_model_for_running(
-                    &agent.model,
-                    agent.model.provider_id(),
-                    agent.model.model_id_ref(),
-                ) {
-                    Ok(refreshed) => {
-                        let mut refreshed_agent = (*agent).clone();
-                        refreshed_agent.model = Arc::new(refreshed);
-                        agent = Arc::new(refreshed_agent);
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            agent = %agent.name,
-                            "refreshing noninteractive model from config failed"
-                        );
-                    }
-                }
                 let mut turn_agent =
                     super::computer_native::with_live_loop_native_computer_geometry(
                         agent.as_ref().clone(),

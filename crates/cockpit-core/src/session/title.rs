@@ -573,6 +573,13 @@ impl Session {
     /// elapsed since the last prelude; otherwise `None`. Updating the
     /// per-session "last prelude" stamp is the side-effect of a
     /// `Some` return — call only when actually about to send.
+    ///
+    /// The injected timestamp is quantized to the interval bucket, so the
+    /// prelude string is a pure function of the wall-clock bucket rather
+    /// than of the injection instant: a request rebuilt within the same
+    /// interval (retract + resend, turn rollback) reproduces the identical,
+    /// cacheable prelude instead of fragmenting the provider prefix with a
+    /// fresh nanosecond timestamp.
     pub fn take_time_prelude(&self, interval_minutes: u32) -> Option<String> {
         let now = Utc::now();
         let mut last = self.last_time_prelude.lock().unwrap();
@@ -584,8 +591,25 @@ impl Session {
             return None;
         }
         *last = Some(now);
-        Some(format!("[time: {}]", now.to_rfc3339()))
+        Some(format!(
+            "[time: {}]",
+            time_prelude_timestamp(now, interval_minutes).to_rfc3339()
+        ))
     }
+}
+
+/// Quantize a prelude injection time to the configured interval. The bucket
+/// is epoch-aligned, so it is deterministic across processes and sessions:
+/// every injection inside one interval window renders the same string. A
+/// zero-minute interval is the always-inject test configuration and keeps
+/// the raw timestamp.
+fn time_prelude_timestamp(now: DateTime<Utc>, interval_minutes: u32) -> DateTime<Utc> {
+    if interval_minutes == 0 {
+        return now;
+    }
+    let interval_secs = i64::from(interval_minutes) * 60;
+    let bucket = now.timestamp() - now.timestamp().rem_euclid(interval_secs);
+    Utc.timestamp_opt(bucket, 0).single().unwrap_or(now)
 }
 
 #[cfg(test)]

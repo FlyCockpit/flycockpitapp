@@ -308,6 +308,41 @@ mod parked_call_tests {
     }
 }
 
+/// Resume/heal may synthesize a tool-result body for an interrupted call that
+/// never landed in `tool_call_events`. Parked-interrupt replay must not treat
+/// that stub as a completed execution.
+pub(super) fn strip_rehydrated_tool_result_for_replay(history: &mut Vec<Message>, call_id: &str) {
+    use rig::message::UserContent;
+
+    history.retain(|message| {
+        match message {
+            Message::User { content } => {
+                if content.iter().any(|part| {
+                    matches!(
+                        part,
+                        UserContent::ToolResult(result) if result.call.as_str() == call_id
+                    )
+                }) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        true
+    });
+}
+
+pub(super) async fn parked_tool_call_audit_exists(
+    session: &crate::session::Session,
+    call_id: &str,
+) -> anyhow::Result<bool> {
+    let rows = session
+        .db
+        .list_tool_calls_for_session(session.live_id())
+        .await?;
+    Ok(rows.iter().any(|row| row.call_id == call_id))
+}
+
 fn inspect_unpaired_tool_call(
     history: &[Message],
     call_id: &str,

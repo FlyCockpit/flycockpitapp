@@ -127,7 +127,7 @@ async fn ephemeral_session_resumes_on_shared_daemon() {
         EphemeralDaemonGuard::new(child, ephemeral_socket.clone(), home.pid_file());
     wait_for_daemon_handshake_on_socket(
         &ephemeral_socket,
-        Some(&home.pid_file()),
+        &home.pid_file(),
         Duration::from_secs(5),
         || {
             if let Ok(Some(status)) = ephemeral_guard.try_wait() {

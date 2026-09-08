@@ -459,27 +459,12 @@ pub fn output_text(output: &Output) -> String {
 const DAEMON_START_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(300);
 const DAEMON_RESTART_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Transport readiness matches the CLI lifecycle client: persistent canonical
-/// sockets require a published endpoint record; isolated-home paths read the
-/// endpoint record beside the daemon pid file.
-pub fn daemon_transport_ready(socket: &Path) -> bool {
-    daemon_transport_ready_for_paths(socket, None)
-}
-
 pub fn daemon_transport_ready_for_home(home: &IsolatedHome) -> bool {
-    daemon_transport_ready_for_paths(&home.socket_path(), Some(&home.pid_file()))
+    daemon_transport_ready_for_paths(&home.socket_path(), &home.pid_file())
 }
 
-fn daemon_transport_ready_for_paths(socket: &Path, pid_file: Option<&Path>) -> bool {
-    if let Some(pid_file) = pid_file {
-        return cockpit_core::daemon::isolated_socket_transport_ready(socket, pid_file);
-    }
-    if let Ok(canonical) = cockpit_core::daemon::DaemonPaths::resolve_canonical() {
-        if canonical.socket == socket {
-            return cockpit_core::daemon::canonical_socket_endpoint_published(socket);
-        }
-    }
-    socket.exists()
+fn daemon_transport_ready_for_paths(socket: &Path, pid_file: &Path) -> bool {
+    cockpit_core::daemon::isolated_socket_transport_ready(socket, pid_file)
 }
 
 /// Cheap liveness check: connect and read the daemon hello line.
@@ -490,7 +475,7 @@ fn daemon_transport_ready_for_paths(socket: &Path, pid_file: Option<&Path>) -> b
 /// Under nextest load that starves the detached child so it never reaches
 /// `daemon: running`.
 #[cfg(unix)]
-fn socket_answers_hello(socket: &Path, pid_file: Option<&Path>) -> bool {
+fn socket_answers_hello(socket: &Path, pid_file: &Path) -> bool {
     use std::os::unix::net::UnixStream;
 
     if !daemon_transport_ready_for_paths(socket, pid_file) {
@@ -505,7 +490,7 @@ fn socket_answers_hello(socket: &Path, pid_file: Option<&Path>) -> bool {
 }
 
 #[cfg(windows)]
-fn socket_answers_hello(socket: &Path, pid_file: Option<&Path>) -> bool {
+fn socket_answers_hello(socket: &Path, pid_file: &Path) -> bool {
     if !daemon_transport_ready_for_paths(socket, pid_file) {
         return false;
     }
@@ -525,7 +510,7 @@ fn socket_answers_hello(socket: &Path, pid_file: Option<&Path>) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn socket_answers_hello(socket: &Path, pid_file: Option<&Path>) -> bool {
+fn socket_answers_hello(socket: &Path, pid_file: &Path) -> bool {
     daemon_transport_ready_for_paths(socket, pid_file)
 }
 
@@ -554,7 +539,7 @@ fn handshake_debug(home: &IsolatedHome) -> String {
         live,
         socket.exists(),
         daemon_transport_ready_for_home(home),
-        socket_answers_hello(&socket, Some(&home.pid_file())),
+        socket_answers_hello(&socket, &home.pid_file()),
         log.display(),
         log_bytes,
         log_tail(home),
@@ -565,8 +550,11 @@ async fn wait_for_status_handshake(home: &IsolatedHome, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     let mut delay = Duration::from_millis(20);
     loop {
-        if socket_answers_hello(&home.socket_path(), Some(&home.pid_file())) {
-            break;
+        if daemon_transport_ready_for_home(home)
+            && let Ok(client) = DaemonClient::connect(&home.socket_path()).await
+            && client.status().await.is_ok()
+        {
+            return;
         }
         assert!(
             Instant::now() < deadline,
@@ -576,27 +564,11 @@ async fn wait_for_status_handshake(home: &IsolatedHome, timeout: Duration) {
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(Duration::from_millis(200));
     }
-    assert_daemon_running_status(home);
-}
-
-fn assert_daemon_running_status(home: &IsolatedHome) {
-    let status = home
-        .cockpit()
-        .args(["daemon", "status"])
-        .output()
-        .expect("daemon status after hello");
-    assert!(
-        status.status.success() && output_text(&status).contains("daemon: running"),
-        "daemon status after hello was not running\nstdout:\n{}\nstderr:\n{}\n{}",
-        String::from_utf8_lossy(&status.stdout),
-        String::from_utf8_lossy(&status.stderr),
-        handshake_debug(home)
-    );
 }
 
 pub async fn wait_for_daemon_handshake_on_socket(
     socket: &Path,
-    pid_file: Option<&Path>,
+    pid_file: &Path,
     timeout: Duration,
     mut child_exited: impl FnMut() -> Option<std::process::Output>,
 ) {

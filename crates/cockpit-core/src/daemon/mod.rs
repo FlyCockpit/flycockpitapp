@@ -1625,14 +1625,12 @@ async fn drain_daemon_context(
     ctx: &std::sync::Arc<server::DaemonContext>,
     grace: Duration,
 ) -> Result<()> {
-    let force_ctx = ctx.clone();
-    let force_timer = tokio::spawn(async move {
-        tokio::time::sleep(grace).await;
-        if !force_ctx.shutdown_signal().is_forced() {
-            force_ctx.shutdown_signal().force();
-            force_ctx.broadcast_global(proto::Event::DaemonDraining { forced: true });
-        }
-    });
+    // `drain_all` owns the ordered shutdown deadlines: first make every
+    // resumable interrupt and paused-work row durable, then apply `grace` to
+    // the remaining running work.  A parallel timer starting here would force
+    // the shared shutdown signal while the durability phase is still running;
+    // that can cancel the interrupt waiter before it is parked and let an
+    // apparently clean restart lose its resumable-work row.
     let drain = ctx.registry.drain_all(grace).await;
     let mut failures = Vec::new();
     if !drain.park_commit.is_clean() {
@@ -1703,8 +1701,6 @@ async fn drain_daemon_context(
         }
         Err(anyhow::anyhow!(failures.join("; ")))
     };
-    force_timer.abort();
-    let _ = force_timer.await;
     result
 }
 

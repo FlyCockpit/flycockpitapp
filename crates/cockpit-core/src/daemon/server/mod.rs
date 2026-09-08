@@ -4778,9 +4778,6 @@ pub(crate) async fn boot_with_db(
         let actor = crate::process_containment::ProcessContainmentActor::start(db.clone(), adapter);
         let handle = actor.handle();
         ctx.attach_process_containment_actor(actor);
-        // Publish to the registry so every worker session installs the same
-        // handle and spawns its lifecycle hooks under a proven containment lease.
-        ctx.registry.set_process_containment(handle.clone());
         match handle.recover().await {
             Ok(outcomes) => {
                 containment_recovered = true;
@@ -4793,6 +4790,9 @@ pub(crate) async fn boot_with_db(
                 return Err(error).context("process containment recovery failed");
             }
         }
+        // Publish only after recovery succeeds: a failed recover must not leave
+        // sessions observing a containment handle the boot path abandoned.
+        ctx.registry.set_process_containment(handle.clone());
         timer.phase("process_containment_actor");
 
         // Durable write-scope authority. One coordinator per daemon: `recover`

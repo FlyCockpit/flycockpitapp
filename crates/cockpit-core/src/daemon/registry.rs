@@ -1020,6 +1020,20 @@ impl SessionRegistry {
         crate::sync::lock_or_recover(&self.inner.process_containment).clone()
     }
 
+    #[cfg(test)]
+    pub fn process_containment_for_test(
+        &self,
+    ) -> Option<crate::process_containment::ProcessContainmentHandle> {
+        self.process_containment()
+    }
+
+    #[cfg(test)]
+    pub fn write_scope_for_test(
+        &self,
+    ) -> Option<std::sync::Arc<crate::write_scope::WriteScopeCoordinator>> {
+        crate::sync::lock_or_recover(&self.inner.write_scope).clone()
+    }
+
     /// Install the daemon's shared protected redaction-history key resolver.
     /// Called once at boot after the secure-key actor attaches; every session
     /// built afterwards shares this one cache.

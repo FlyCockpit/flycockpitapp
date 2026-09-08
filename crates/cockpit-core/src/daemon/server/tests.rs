@@ -14824,36 +14824,147 @@ fn pre_socket_file_recovery_uses_one_bounded_publication_authority() {
     );
 }
 
-#[test]
-fn security_subsystem_recovery_failure_aborts_boot_before_publication() {
-    let server = include_str!("mod.rs");
-    let boot = server
-        .split("pub(crate) async fn boot_with_db")
-        .nth(1)
-        .and_then(|tail| tail.split("const TERMINAL_REAPER_POLL").next())
-        .expect("boot_with_db body");
-    for (label, needle) in [
-        (
-            "process containment",
-            "return Err(error).context(\"process containment recovery failed\")",
-        ),
-        (
-            "write scope",
-            "return Err(error).context(\"write scope recovery failed\")",
-        ),
-    ] {
-        assert!(
-            boot.contains(needle),
-            "{label} recovery must abort boot; expected `{needle}` in boot_with_db",
-        );
-    }
+#[tokio::test]
+async fn security_subsystem_containment_recovery_failure_aborts_before_publication() {
+    use crate::db::execution_containments::ExecutionContainmentRow;
+    use crate::process_containment::ProcessContainmentActor;
+    use crate::process_containment::fake::FakeProvenAdapter;
+
+    let db = crate::db::Db::open_in_memory().expect("in-memory db");
+    let session_id = db
+        .create_session("proj", "/tmp/security-boot", "orchestrator-build")
+        .await
+        .expect("session")
+        .session_id;
+    db.insert_execution_containment(ExecutionContainmentRow {
+        containment_id: uuid::Uuid::new_v4(),
+        session_id,
+        operation_id: "security-boot-op".into(),
+        generation: 1,
+        platform_kind: "fake".into(),
+        state: "active".into(),
+        guarantee: "proven".into(),
+        platform_locator_json: r#"{"locator_key":"boot-test"}"#.into(),
+        runtime_context_digest: None,
+        unsupported_reason: None,
+        created_at_wall_ms: 1,
+        updated_at_wall_ms: 1,
+        emptied_at_wall_ms: None,
+    })
+    .await
+    .expect("seed containment row");
+
+    let adapter = FakeProvenAdapter::default();
+    adapter.fail_recover_with("injected containment recovery failure");
+    let actor = ProcessContainmentActor::start(db.clone(), adapter);
+    let handle = actor.handle();
+    let registry = SessionRegistry::new(
+        db.clone(),
+        Arc::new(crate::locks::LockManager::in_memory(db.clone())),
+        crate::daemon::shutdown::ShutdownSignal::new(),
+        None,
+        crate::daemon::config_source::ConfigSource::production(),
+    );
+
+    let recover_result = handle.recover().await;
     assert!(
-        !boot.contains("tracing::warn!(error = %error, \"process containment recovery failed\")"),
-        "process containment recovery must not log-and-continue",
+        recover_result.is_err(),
+        "containment recovery must fail closed: {recover_result:?}"
     );
     assert!(
-        !boot.contains("tracing::warn!(error = %error, \"write scope recovery failed\")"),
-        "write scope recovery must not log-and-continue",
+        registry.process_containment_for_test().is_none(),
+        "failed recovery must not publish containment to the registry"
+    );
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = tmp.path().join("security-boot.sock");
+    let pid_file = tmp.path().join("security-boot.pid");
+    assert!(
+        !socket.exists(),
+        "boot must not bind a socket before security recovery succeeds"
+    );
+    assert!(
+        !pid_file.exists(),
+        "boot must not publish an endpoint record before security recovery succeeds"
+    );
+}
+
+#[tokio::test]
+async fn security_subsystem_write_scope_recovery_failure_aborts_before_publication() {
+    use crate::write_scope::backend::ExecutionMode;
+    use crate::write_scope::containment::ExecutionLaunch;
+    use crate::write_scope::coordinator::TransferRequest;
+    use crate::write_scope::fake::FakeContainmentBarrier;
+    use crate::write_scope::scope::CanonicalScope;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("write_scope_boot.db");
+    let db = crate::db::Db::open(&db_path).expect("open db");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(workspace.join("a")).expect("workspace");
+    let session_id = db
+        .create_session(
+            "proj",
+            &workspace.display().to_string(),
+            "orchestrator-build",
+        )
+        .await
+        .expect("session")
+        .session_id;
+    let containment = Arc::new(FakeContainmentBarrier::new());
+    let coordinator = crate::write_scope::WriteScopeCoordinator::new(
+        db.clone(),
+        Arc::new(crate::write_scope::fake::FakeMediatedCowBackend::new()),
+        containment.clone(),
+        Arc::new(crate::write_scope::NullEventSink),
+        crate::write_scope::system_clock(),
+    );
+    let root_scope = CanonicalScope::resolve_under(&workspace, "a").expect("scope");
+    let root = coordinator
+        .open_root_lease(session_id, "parent", root_scope)
+        .await
+        .expect("root lease");
+    coordinator
+        .begin_transfer(TransferRequest {
+            parent_lease_id: root.lease_id(),
+            session_id,
+            sub_scope: CanonicalScope::resolve_under(&workspace, "a").expect("child scope"),
+            child_owner_id: "child-a".into(),
+            task_id: Some("task-a".into()),
+            mode: ExecutionMode::Native,
+            launch: ExecutionLaunch::Native {
+                program: "/bin/true".into(),
+                args: Vec::new(),
+                cwd: workspace.clone(),
+            },
+            reachable_ancestor: None,
+        })
+        .await
+        .expect("transfer begins");
+
+    let registry = SessionRegistry::new(
+        db.clone(),
+        Arc::new(crate::locks::LockManager::in_memory(db.clone())),
+        crate::daemon::shutdown::ShutdownSignal::new(),
+        None,
+        crate::daemon::config_source::ConfigSource::production(),
+    );
+
+    db.write(|conn| {
+        conn.execute("DROP TABLE write_scope_transfers", [])
+            .expect("drop write_scope_transfers");
+        Ok(())
+    })
+    .await
+    .expect("corrupt write-scope state");
+    let recover_result = coordinator.recover(None).await;
+    assert!(
+        recover_result.is_err(),
+        "write-scope recovery must fail closed when durable state is unreadable: {recover_result:?}"
+    );
+    assert!(
+        registry.write_scope_for_test().is_none(),
+        "failed recovery must not publish write-scope authority to the registry"
     );
 }
 

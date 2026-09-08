@@ -539,6 +539,38 @@ fn register_host_approval_effect_handoff(handoff: HostApprovalEffectHandoff) -> 
         .is_ok()
 }
 
+async fn adopt_live_host_approval_effect_handoff(
+    db: &crate::db::Db,
+    authority: crate::agent_tree::HostApprovalAuthority,
+    session_id: Uuid,
+    agent_instance_id: Uuid,
+    interrupt_id: Uuid,
+    operation: &crate::agent_tree::HostApprovalOperation,
+) -> Option<HostApprovalEffectHandoff> {
+    let state = db
+        .live_host_approval_effect_handoff_state(
+            session_id,
+            agent_instance_id,
+            operation.operation_id,
+            operation.operation_kind.clone(),
+            operation.canonical_input_json.clone(),
+            operation.input_digest.clone(),
+        )
+        .await
+        .ok()
+        .flatten()?;
+    let mut handoff = HostApprovalEffectHandoff::new(
+        db.clone(),
+        authority,
+        session_id,
+        agent_instance_id,
+        interrupt_id,
+        operation.clone(),
+    );
+    handoff.claimed = state == "dispatching";
+    Some(handoff)
+}
+
 /// Publish the definitive result of the currently-active host effect boundary.
 /// The helper is intentionally scoped, not a global completion API: only the
 /// code executing inside a typed handoff scope can settle the capabilities it
@@ -1139,7 +1171,7 @@ struct ParkCommitInner {
     /// whether this worker owes a shutdown park-commit.
     registered: AtomicUsize,
     shutdown: watch::Sender<ShutdownParkState>,
-    startup_reconciled: watch::Sender<bool>,
+    startup_reconciled: watch::Sender<ShutdownParkState>,
 }
 
 impl Default for ParkCommit {
@@ -1154,7 +1186,7 @@ impl ParkCommit {
             inner: Arc::new(ParkCommitInner {
                 registered: AtomicUsize::new(0),
                 shutdown: watch::channel(ShutdownParkState::Pending).0,
-                startup_reconciled: watch::channel(false).0,
+                startup_reconciled: watch::channel(ShutdownParkState::Pending).0,
             }),
         }
     }
@@ -1207,7 +1239,17 @@ impl ParkCommit {
     /// Producer (worker startup): the crash-reconciliation pass finished; any
     /// stale `Open` interrupt has been flipped to `Parked` (or none needed it).
     pub fn report_startup_reconciled(&self) {
-        let _ = self.inner.startup_reconciled.send_replace(true);
+        let _ = self
+            .inner
+            .startup_reconciled
+            .send_replace(ShutdownParkState::Committed);
+    }
+
+    pub fn report_startup_reconciliation_failed(&self) {
+        let _ = self
+            .inner
+            .startup_reconciled
+            .send_replace(ShutdownParkState::FailedWrite);
     }
 
     /// Consumer (drain): await the shutdown park-commit, bounded by `deadline`.
@@ -1243,26 +1285,35 @@ impl ParkCommit {
     }
 
     /// Consumer (attach): await the worker's startup reconciliation pass,
-    /// bounded by `deadline`. Returns `true` if the pass committed within the
-    /// deadline, `false` if the worker wedged (attach then proceeds anyway —
-    /// the reconciliation is idempotent and re-runs on the next attach).
-    pub async fn await_startup_reconciled(&self, deadline: std::time::Duration) -> bool {
+    /// bounded by `deadline`. Ordinary attach callers may continue after a
+    /// non-clean result; pre-publication recovery callers must reject it.
+    pub async fn await_startup_reconciled(
+        &self,
+        deadline: std::time::Duration,
+    ) -> ParkCommitTerminal {
         let mut rx = self.inner.startup_reconciled.subscribe();
-        if *rx.borrow_and_update() {
-            return true;
+        match *rx.borrow_and_update() {
+            ShutdownParkState::Committed => return ParkCommitTerminal::Committed,
+            ShutdownParkState::FailedWrite => return ParkCommitTerminal::KnownFailedWrite,
+            ShutdownParkState::Pending => {}
         }
         let resolved = tokio::time::timeout(deadline, async {
             loop {
                 if rx.changed().await.is_err() {
-                    return false;
+                    return ShutdownParkState::Pending;
                 }
-                if *rx.borrow_and_update() {
-                    return true;
+                match *rx.borrow_and_update() {
+                    ShutdownParkState::Pending => continue,
+                    other => return other,
                 }
             }
         })
         .await;
-        matches!(resolved, Ok(true))
+        match resolved {
+            Ok(ShutdownParkState::Committed) => ParkCommitTerminal::Committed,
+            Ok(ShutdownParkState::FailedWrite) => ParkCommitTerminal::KnownFailedWrite,
+            Ok(ShutdownParkState::Pending) | Err(_) => ParkCommitTerminal::DeadlineUnresolved,
+        }
     }
 
     /// Test-only: simulate a worker registering an interrupt waiter without a
@@ -2310,27 +2361,53 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                         {
                             response
                         }
-                        Ok(true) => {
-                            // There is no production effect boundary in this
-                            // task (for example a test-only direct caller).
-                            // The capability is still ready, not submitted,
-                            // so record a known rejection rather than an
-                            // ambiguous external handoff.
-                            let _ = db
-                                .reject_unclaimed_host_approval_final_operation(
-                                    db_authority,
-                                    interrupt_id,
-                                    session_id,
-                                    decision.agent_instance_id,
-                                    operation_id,
-                                    operation.operation_kind.clone(),
-                                    operation.canonical_input_json.clone(),
-                                    operation.input_digest.clone(),
-                                    crate::agent_tree::system_now_unix_ms(),
-                                )
-                                .await;
-                            ResolveResponse::Cancel
-                        }
+                        Ok(true) => match adopt_live_host_approval_effect_handoff(
+                            db,
+                            authority,
+                            session_id,
+                            decision.agent_instance_id,
+                            interrupt_id,
+                            &operation,
+                        )
+                        .await
+                        {
+                            Some(handoff) if !handoff.claimed => {
+                                if register_host_approval_effect_handoff(handoff) {
+                                    response
+                                } else {
+                                    let _ = db
+                                        .reject_unclaimed_host_approval_final_operation(
+                                            db_authority,
+                                            interrupt_id,
+                                            session_id,
+                                            decision.agent_instance_id,
+                                            operation_id,
+                                            operation.operation_kind.clone(),
+                                            operation.canonical_input_json.clone(),
+                                            operation.input_digest.clone(),
+                                            crate::agent_tree::system_now_unix_ms(),
+                                        )
+                                        .await;
+                                    ResolveResponse::Cancel
+                                }
+                            }
+                            _ => {
+                                let _ = db
+                                    .reject_unclaimed_host_approval_final_operation(
+                                        db_authority,
+                                        interrupt_id,
+                                        session_id,
+                                        decision.agent_instance_id,
+                                        operation_id,
+                                        operation.operation_kind.clone(),
+                                        operation.canonical_input_json.clone(),
+                                        operation.input_digest.clone(),
+                                        crate::agent_tree::system_now_unix_ms(),
+                                    )
+                                    .await;
+                                ResolveResponse::Cancel
+                            }
+                        },
                         // A pre-resolved replay that observes an existing
                         // dispatch is deliberately denied.  We cannot prove
                         // whether a non-idempotent shell/MCP/harness/fs
@@ -2339,39 +2416,69 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                         // duplicate effect.  Promote a still-dispatching
                         // handoff to the explicit audit state when possible;
                         // completed/rejected rows make this a fenced no-op.
-                        Ok(false) => {
-                            // A concurrent replay can observe either a
-                            // still-ready capability (no submission happened)
-                            // or an already-claimed dispatch. Reject the former
-                            // first; only the latter is promoted to unknown.
-                            let _ = db
-                                .reject_unclaimed_host_approval_final_operation(
-                                    db_authority,
-                                    interrupt_id,
-                                    session_id,
-                                    decision.agent_instance_id,
-                                    operation_id,
-                                    operation.operation_kind.clone(),
-                                    operation.canonical_input_json.clone(),
-                                    operation.input_digest.clone(),
-                                    crate::agent_tree::system_now_unix_ms(),
-                                )
-                                .await;
-                            let _ = db
-                                .mark_host_approval_final_operation_submission_unknown(
-                                    db_authority,
-                                    interrupt_id,
-                                    session_id,
-                                    decision.agent_instance_id,
-                                    operation_id,
-                                    operation.operation_kind.clone(),
-                                    operation.canonical_input_json.clone(),
-                                    operation.input_digest.clone(),
-                                    crate::agent_tree::system_now_unix_ms(),
-                                )
-                                .await;
-                            ResolveResponse::Cancel
-                        }
+                        Ok(false) => match adopt_live_host_approval_effect_handoff(
+                            db,
+                            authority,
+                            session_id,
+                            decision.agent_instance_id,
+                            interrupt_id,
+                            &operation,
+                        )
+                        .await
+                        {
+                            Some(handoff) if handoff.claimed => {
+                                let _ = db
+                                    .mark_host_approval_final_operation_submission_unknown(
+                                        db_authority,
+                                        interrupt_id,
+                                        session_id,
+                                        decision.agent_instance_id,
+                                        operation_id,
+                                        operation.operation_kind.clone(),
+                                        operation.canonical_input_json.clone(),
+                                        operation.input_digest.clone(),
+                                        crate::agent_tree::system_now_unix_ms(),
+                                    )
+                                    .await;
+                                ResolveResponse::Cancel
+                            }
+                            Some(handoff) => {
+                                if register_host_approval_effect_handoff(handoff) {
+                                    response
+                                } else {
+                                    let _ = db
+                                        .reject_unclaimed_host_approval_final_operation(
+                                            db_authority,
+                                            interrupt_id,
+                                            session_id,
+                                            decision.agent_instance_id,
+                                            operation_id,
+                                            operation.operation_kind.clone(),
+                                            operation.canonical_input_json.clone(),
+                                            operation.input_digest.clone(),
+                                            crate::agent_tree::system_now_unix_ms(),
+                                        )
+                                        .await;
+                                    ResolveResponse::Cancel
+                                }
+                            }
+                            None => {
+                                let _ = db
+                                    .reject_unclaimed_host_approval_final_operation(
+                                        db_authority,
+                                        interrupt_id,
+                                        session_id,
+                                        decision.agent_instance_id,
+                                        operation_id,
+                                        operation.operation_kind.clone(),
+                                        operation.canonical_input_json.clone(),
+                                        operation.input_digest.clone(),
+                                        crate::agent_tree::system_now_unix_ms(),
+                                    )
+                                    .await;
+                                ResolveResponse::Cancel
+                            }
+                        },
                         Err(_) => ResolveResponse::Cancel,
                     }
                 }
@@ -2655,9 +2762,9 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
     let InterruptOutcome::Resolved(response) = &outcome else {
         return outcome;
     };
-    let Some(operation_id) = host_operation_id else {
+    if host_operation_id.is_none() {
         return outcome;
-    };
+    }
     let Some(operation) = host_operation else {
         return InterruptOutcome::Resolved(ResolveResponse::Cancel);
     };
@@ -2699,23 +2806,117 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
         {
             outcome
         }
-        Ok(true) => {
-            let _ = db
-                .reject_unclaimed_host_approval_final_operation(
-                    db_authority,
-                    interrupt_id,
-                    session_id,
-                    agent_instance_id,
-                    operation.operation_id,
-                    operation.operation_kind,
-                    operation.canonical_input_json,
-                    operation.input_digest,
-                    crate::agent_tree::system_now_unix_ms(),
-                )
-                .await;
-            InterruptOutcome::Resolved(ResolveResponse::Cancel)
-        }
-        Ok(false) | Err(_) => InterruptOutcome::Resolved(ResolveResponse::Cancel),
+        Ok(true) => match adopt_live_host_approval_effect_handoff(
+            db,
+            authority,
+            session_id,
+            agent_instance_id,
+            interrupt_id,
+            &operation,
+        )
+        .await
+        {
+            Some(handoff) if !handoff.claimed => {
+                if register_host_approval_effect_handoff(handoff) {
+                    outcome
+                } else {
+                    let _ = db
+                        .reject_unclaimed_host_approval_final_operation(
+                            db_authority,
+                            interrupt_id,
+                            session_id,
+                            agent_instance_id,
+                            operation.operation_id,
+                            operation.operation_kind,
+                            operation.canonical_input_json,
+                            operation.input_digest,
+                            crate::agent_tree::system_now_unix_ms(),
+                        )
+                        .await;
+                    InterruptOutcome::Resolved(ResolveResponse::Cancel)
+                }
+            }
+            _ => {
+                let _ = db
+                    .reject_unclaimed_host_approval_final_operation(
+                        db_authority,
+                        interrupt_id,
+                        session_id,
+                        agent_instance_id,
+                        operation.operation_id,
+                        operation.operation_kind,
+                        operation.canonical_input_json,
+                        operation.input_digest,
+                        crate::agent_tree::system_now_unix_ms(),
+                    )
+                    .await;
+                InterruptOutcome::Resolved(ResolveResponse::Cancel)
+            }
+        },
+        Ok(false) => match adopt_live_host_approval_effect_handoff(
+            db,
+            authority,
+            session_id,
+            agent_instance_id,
+            interrupt_id,
+            &operation,
+        )
+        .await
+        {
+            Some(handoff) if handoff.claimed => {
+                let _ = db
+                    .mark_host_approval_final_operation_submission_unknown(
+                        db_authority,
+                        interrupt_id,
+                        session_id,
+                        agent_instance_id,
+                        operation.operation_id,
+                        operation.operation_kind,
+                        operation.canonical_input_json,
+                        operation.input_digest,
+                        crate::agent_tree::system_now_unix_ms(),
+                    )
+                    .await;
+                InterruptOutcome::Resolved(ResolveResponse::Cancel)
+            }
+            Some(handoff) => {
+                if register_host_approval_effect_handoff(handoff) {
+                    outcome
+                } else {
+                    let _ = db
+                        .reject_unclaimed_host_approval_final_operation(
+                            db_authority,
+                            interrupt_id,
+                            session_id,
+                            agent_instance_id,
+                            operation.operation_id,
+                            operation.operation_kind,
+                            operation.canonical_input_json,
+                            operation.input_digest,
+                            crate::agent_tree::system_now_unix_ms(),
+                        )
+                        .await;
+                    InterruptOutcome::Resolved(ResolveResponse::Cancel)
+                }
+            }
+            None => {
+                let _ = db
+                    .reject_unclaimed_host_approval_final_operation(
+                        db_authority,
+                        interrupt_id,
+                        session_id,
+                        agent_instance_id,
+                        operation.operation_id,
+                        operation.operation_kind,
+                        operation.canonical_input_json,
+                        operation.input_digest,
+                        crate::agent_tree::system_now_unix_ms(),
+                    )
+                    .await;
+                InterruptOutcome::Resolved(ResolveResponse::Cancel)
+            }
+        },
+        Err(_) => InterruptOutcome::Resolved(ResolveResponse::Cancel),
     }
 }
 
@@ -4034,7 +4235,19 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!consumer.is_finished());
         park_commit.report_startup_reconciled();
-        assert!(consumer.await.unwrap());
+        assert_eq!(consumer.await.unwrap(), ParkCommitTerminal::Committed);
+    }
+
+    #[tokio::test]
+    async fn await_startup_reconciled_surfaces_failed_write() {
+        let park_commit = ParkCommit::new();
+        park_commit.report_startup_reconciliation_failed();
+        assert_eq!(
+            park_commit
+                .await_startup_reconciled(std::time::Duration::from_secs(1))
+                .await,
+            ParkCommitTerminal::KnownFailedWrite
+        );
     }
 
     #[tokio::test]

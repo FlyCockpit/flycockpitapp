@@ -452,8 +452,12 @@ pub fn output_text(output: &Output) -> String {
     )
 }
 
-const DAEMON_START_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
-const DAEMON_RESTART_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+// Boot performs synchronous containment, write-scope, media, and container
+// recovery before endpoint publication. Loaded CI hosts can spend minutes in
+// durable filesystem commits; the harness must wait for the real handshake,
+// not substitute socket existence for readiness.
+const DAEMON_START_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(300);
+const DAEMON_RESTART_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Transport readiness matches the CLI lifecycle client: persistent canonical
 /// sockets require a published endpoint record; isolated-home paths read the
@@ -698,20 +702,22 @@ pub(crate) fn wait_for_pid_exit_blocking(pid: u32, timeout: Duration) -> bool {
 pub struct EphemeralDaemonGuard {
     child: Option<std::process::Child>,
     socket: PathBuf,
-    disarmed: bool,
+    endpoint: PathBuf,
+    pid_file: PathBuf,
 }
 
 impl EphemeralDaemonGuard {
-    pub fn new(child: std::process::Child, socket: PathBuf) -> Self {
+    pub fn new(child: std::process::Child, socket: PathBuf, pid_file: PathBuf) -> Self {
+        let endpoint = pid_file
+            .parent()
+            .expect("isolated daemon pid file has a state directory")
+            .join("daemon-endpoint.json");
         Self {
             child: Some(child),
             socket,
-            disarmed: false,
+            endpoint,
+            pid_file,
         }
-    }
-
-    pub fn disarm(&mut self) {
-        self.disarmed = true;
     }
 
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
@@ -721,22 +727,28 @@ impl EphemeralDaemonGuard {
         }
     }
 
-    pub fn take_child(&mut self) -> Option<std::process::Child> {
-        self.child.take()
+    pub fn wait_with_output(&mut self) -> std::io::Result<std::process::Output> {
+        self.child
+            .take()
+            .expect("ephemeral daemon process")
+            .wait_with_output()
     }
 }
 
 impl Drop for EphemeralDaemonGuard {
     fn drop(&mut self) {
-        if self.disarmed {
-            return;
-        }
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
         if self.socket.exists() {
             let _ = std::fs::remove_file(&self.socket);
+        }
+        if self.endpoint.exists() {
+            let _ = std::fs::remove_file(&self.endpoint);
+        }
+        if self.pid_file.exists() {
+            let _ = std::fs::remove_file(&self.pid_file);
         }
     }
 }

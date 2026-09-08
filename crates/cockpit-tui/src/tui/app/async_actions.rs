@@ -2741,6 +2741,44 @@ impl App {
             return;
         }
         let sequence = fence.fence_sequence;
+        let mut fence_id = fence_id;
+        if let Some(invocation_nonce) = deferred.identity_nonce.take() {
+            let derived_submission_id = cockpit_client::submission::derive_client_submission_id(
+                invocation_nonce,
+                &deferred.submission.client_fingerprint(),
+            );
+            if !self.submission_order.replace(
+                sequence,
+                crate::tui::structured_paste::OrderedIntent::Fence(derived_submission_id),
+            ) {
+                let _ = fence;
+                self.submission_fences.remove(&fence_id);
+                let _ = self.submission_order.cancel(sequence);
+                self.cancel_paste_probes_matching(|probe| probe.owner_fence == Some(fence_id));
+                self.show_toast(
+                    "Submission ordering identity is unavailable",
+                    ToastKind::Error,
+                );
+                self.dispatch_next_ready_paste_fence();
+                return;
+            }
+            fence.client_submission_id = derived_submission_id;
+            let _ = fence;
+            let Some(rekeyed_fence) = self.submission_fences.remove(&fence_id) else {
+                let _ = self.submission_order.cancel(sequence);
+                self.show_toast("Submission fence identity is unavailable", ToastKind::Error);
+                self.dispatch_next_ready_paste_fence();
+                return;
+            };
+            self.submission_fences
+                .insert(derived_submission_id, rekeyed_fence);
+            for probe in self.pending_paste_probes.values_mut() {
+                if probe.owner_fence == Some(fence_id) {
+                    probe.owner_fence = Some(derived_submission_id);
+                }
+            }
+            fence_id = derived_submission_id;
+        }
         let was_busy = self.busy;
         if was_busy && self.has_pending_session_switch_action() {
             let item = super::input::optimistic_queue_item_with_id(

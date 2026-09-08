@@ -4837,7 +4837,7 @@ impl Db {
             // and cannot be replayed as an effect until the exact boundary
             // claims it below.
             let inserted = conn.execute(
-                "INSERT INTO agent_host_approval_effect_handoffs (
+                "INSERT OR IGNORE INTO agent_host_approval_effect_handoffs (
                      operation_id, session_id, agent_instance_id, operation_kind, canonical_input_json, input_digest,
                      selected_candidate_json, idempotency_key, state, dispatch_started_at_unix_ms
                  ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, selected_candidate_json, ?7, 'ready', ?8
@@ -4855,11 +4855,79 @@ impl Db {
                     now_unix_ms,
                 ],
             )?;
-            ensure!(
-                inserted == 1,
-                "host approval operation lost its selected candidate while creating the effect handoff"
-            );
+            if inserted == 0 {
+                let existing_state: Option<String> = conn
+                    .query_row(
+                        "SELECT state
+                          FROM agent_host_approval_effect_handoffs
+                          WHERE operation_id = ?1 AND session_id = ?2 AND agent_instance_id = ?3
+                            AND operation_kind = ?4 AND canonical_input_json = ?5
+                            AND input_digest = ?6 AND idempotency_key = ?1
+                            AND state IN ('ready', 'dispatching')",
+                        params![
+                            operation_id.to_string(),
+                            session_id.to_string(),
+                            agent_instance_id.to_string(),
+                            operation_kind,
+                            canonical_input_json,
+                            input_digest,
+                        ],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                return match existing_state.as_deref() {
+                    Some("ready") => Ok(true),
+                    Some("dispatching") => Ok(false),
+                    None => {
+                        ensure!(
+                            inserted == 1,
+                            "host approval operation lost its selected candidate while creating the effect handoff"
+                        );
+                        Ok(true)
+                    }
+                    Some(other) => bail!("unexpected host approval effect handoff state {other}"),
+                };
+            }
             Ok(true)
+        })
+        .await
+    }
+
+    #[cfg(feature = "host-approval-composition")]
+    pub async fn live_host_approval_effect_handoff_state(
+        &self,
+        session_id: Uuid,
+        agent_instance_id: Uuid,
+        operation_id: Uuid,
+        operation_kind: String,
+        canonical_input_json: String,
+        input_digest: String,
+    ) -> Result<Option<String>> {
+        validate_host_operation_binding(&operation_kind, &input_digest)?;
+        validate_host_operation_canonical_input(&canonical_input_json, &input_digest)?;
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT handoff.state
+                   FROM agent_host_approval_operations AS operation
+                   JOIN agent_host_approval_effect_handoffs AS handoff
+                     ON handoff.operation_id = operation.operation_id
+                  WHERE operation.operation_id = ?1 AND operation.session_id = ?2
+                    AND operation.agent_instance_id = ?3 AND operation.operation_kind = ?4
+                    AND operation.canonical_input_json = ?5 AND operation.input_digest = ?6
+                    AND operation.state IN ('approved', 'dispatching')
+                    AND handoff.state IN ('ready', 'dispatching')",
+                params![
+                    operation_id.to_string(),
+                    session_id.to_string(),
+                    agent_instance_id.to_string(),
+                    operation_kind,
+                    canonical_input_json,
+                    input_digest,
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
         })
         .await
     }

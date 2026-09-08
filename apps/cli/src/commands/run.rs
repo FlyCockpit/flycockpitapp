@@ -633,11 +633,23 @@ pub(crate) async fn attach_send_pump(
     // Sole invocation identity: one nonce per attach/send/pump; the submission
     // id is derived from that nonce plus the payload fingerprint so retries of
     // the same payload dedup while distinct invocations never collide.
-    let invocation_nonce = Uuid::new_v4();
+    let invocation_nonce = Uuid::now_v7();
     let client_submission_id = if submitted_message {
+        let images = options
+            .image_data
+            .iter()
+            .cloned()
+            .map(cockpit_client::image_upload::SubmissionImage::png)
+            .collect::<Vec<_>>();
         cockpit_client::submission::derive_client_submission_id(
             invocation_nonce,
-            &cockpit_client::submission::run_user_message_submission_fingerprint(&prompt),
+            &cockpit_client::submission::ClientUserSubmission {
+                origin: cockpit_client::submission::SubmissionOrigin::ExternalRoot,
+                text: prompt.clone(),
+                images,
+                ..Default::default()
+            }
+            .client_fingerprint(),
         )
     } else {
         Uuid::nil()

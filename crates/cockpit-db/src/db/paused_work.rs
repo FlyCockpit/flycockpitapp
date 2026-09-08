@@ -179,7 +179,7 @@ impl Db {
                             created_at, updated_at, resolved_at
                        FROM paused_session_work
                       WHERE status = 'paused'
-                      ORDER BY updated_at DESC",
+                      ORDER BY updated_at ASC, created_at ASC, session_id ASC",
                 )
                 .context("preparing paused session work query")?;
             let rows = stmt
@@ -324,6 +324,46 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_work_recovery_order_is_oldest_first_and_stable() {
+        let db = Db::open_in_memory().unwrap();
+        let older = db.create_session("p", "/tmp/older", "Build").await.unwrap();
+        let newer = db.create_session("p", "/tmp/newer", "Build").await.unwrap();
+        for session in [&older, &newer] {
+            db.upsert_paused_session_work(
+                session.session_id,
+                "Build",
+                &session.project_root,
+                "daemon shutdown",
+                1,
+                "0.1.test",
+            )
+            .await
+            .unwrap();
+        }
+        let older_id = older.session_id;
+        let newer_id = newer.session_id;
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE paused_session_work SET created_at = 10, updated_at = 10 WHERE session_id = ?1",
+                rusqlite::params![older_id.to_string()],
+            )?;
+            conn.execute(
+                "UPDATE paused_session_work SET created_at = 20, updated_at = 20 WHERE session_id = ?1",
+                rusqlite::params![newer_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let rows = db.paused_session_work_all().await.unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.session_id).collect::<Vec<_>>(),
+            vec![older_id, newer_id]
         );
     }
 }

@@ -412,6 +412,7 @@ async fn call_bash_inner(
     options: BashRunOptions,
 ) -> Result<ToolOutput> {
     let workspace_scratch_dir = ctx.session.workspace_scratch_dir();
+    let mut approved_access_effects = Vec::new();
     if let Some(lease) = ctx.workspace_lease.as_ref()
         && (!lease.is_live(crate::workspace_lease::now_unix_ms()) || !lease.allows_execute())
     {
@@ -496,7 +497,8 @@ async fn call_bash_inner(
             Some(&workspace_scratch_dir),
         )
     {
-        approve_outside_working_directory(ctx, &outside).await?;
+        let effect = approve_outside_working_directory(ctx, &outside).await?;
+        retain_unique_concrete_effect(&mut approved_access_effects, effect);
     }
     if ctx.workspace_lease.is_none()
         && let Some(outside) = crate::tools::bash::command_directory_escape_with_workspace_scratch(
@@ -507,7 +509,8 @@ async fn call_bash_inner(
             Some(&workspace_scratch_dir),
         )
     {
-        approve_outside_working_directory(ctx, &outside).await?;
+        let effect = approve_outside_working_directory(ctx, &outside).await?;
+        retain_unique_concrete_effect(&mut approved_access_effects, effect);
     }
     let mut identity_denied_paths = Vec::new();
     let identity_accounting = match crate::assistants::identity::check_identity_shell(ctx).await? {
@@ -657,6 +660,7 @@ async fn call_bash_inner(
             ctx,
             timeout_note,
             identity_accounting,
+            &approved_access_effects,
         )
         .await;
     }
@@ -848,6 +852,7 @@ async fn call_bash_inner(
         timeout_ms,
         &mut resource_lease,
         identity_accounting.clone(),
+        &approved_access_effects,
     )
     .await;
     let outcome = match attempt {
@@ -994,6 +999,7 @@ async fn call_bash_inner(
                 timeout_ms,
                 &mut resource_lease,
                 identity_accounting.clone(),
+                &approved_access_effects,
             )
             .await;
             match rerun {
@@ -1180,7 +1186,10 @@ async fn call_bash_inner(
     Ok(out)
 }
 
-async fn approve_outside_working_directory(ctx: &ToolCtx, path: &Path) -> Result<()> {
+async fn approve_outside_working_directory(
+    ctx: &ToolCtx,
+    path: &Path,
+) -> Result<serde_json::Value> {
     let Some(approver) = ctx.approver.as_ref() else {
         return Err(crate::engine::tool::invalid_input(outside_cwd_error(
             &ctx.cwd,
@@ -1193,7 +1202,10 @@ async fn approve_outside_working_directory(ctx: &ToolCtx, path: &Path) -> Result
         )
         .await?;
     if decision.is_allowed() {
-        Ok(())
+        Ok(crate::tools::sandbox::native_access_effect(
+            path,
+            crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+        ))
     } else if matches!(decision, crate::approval::Decision::NoninteractiveDeny) {
         Err(crate::engine::tool::invalid_input(
             crate::approval::NONINTERACTIVE_RUN_DENIAL,
@@ -1202,6 +1214,15 @@ async fn approve_outside_working_directory(ctx: &ToolCtx, path: &Path) -> Result
         Err(crate::engine::tool::invalid_input(outside_cwd_error(
             &ctx.cwd,
         )))
+    }
+}
+
+fn retain_unique_concrete_effect(
+    concrete_effects: &mut Vec<serde_json::Value>,
+    effect: serde_json::Value,
+) {
+    if !concrete_effects.contains(&effect) {
+        concrete_effects.push(effect);
     }
 }
 
@@ -2603,6 +2624,7 @@ async fn run_container_bash(
     ctx: &ToolCtx,
     timeout_note: Option<&str>,
     identity_accounting: Option<crate::assistants::identity::IdentityShellAccounting>,
+    approved_access_effects: &[serde_json::Value],
 ) -> Result<ToolOutput> {
     let mode = ctx.session.sandbox_mode();
     let mut meta = crate::engine::tool::SandboxMeta {
@@ -2631,6 +2653,7 @@ async fn run_container_bash(
         timeout_ms,
         &mut resource_lease,
         identity_accounting,
+        approved_access_effects,
     )
     .await;
     let final_outcome = match attempt {
@@ -2700,6 +2723,7 @@ async fn run_container_shell(
     timeout_ms: u64,
     resource_lease: &mut Option<ResourceLeaseGuard>,
     identity_accounting: Option<crate::assistants::identity::IdentityShellAccounting>,
+    approved_access_effects: &[serde_json::Value],
 ) -> RunOutcome {
     let manager = crate::container::container_manager()
         .get_or_init(|| async { crate::container::ContainerManager::detect() })
@@ -2774,11 +2798,13 @@ async fn run_container_shell(
         Ok(cmd) => cmd,
         Err(e) => return RunOutcome::SpawnError(std::io::Error::other(e.to_string())),
     };
+    let mut concrete_effects = vec![serde_json::json!({"execute": {"command": command}})];
+    concrete_effects.extend_from_slice(approved_access_effects);
     run_prepared_command(
         cmd,
         ctx,
         timeout_ms,
-        vec![serde_json::json!({"execute": {"command": command}})],
+        concrete_effects,
         resource_lease,
         false,
         identity_accounting,
@@ -2893,6 +2919,7 @@ async fn run_shell(
     timeout_ms: u64,
     resource_lease: &mut Option<ResourceLeaseGuard>,
     identity_accounting: Option<crate::assistants::identity::IdentityShellAccounting>,
+    approved_access_effects: &[serde_json::Value],
 ) -> RunOutcome {
     let attached_knowledge_read = extra_sandbox_paths
         .iter()
@@ -2978,7 +3005,7 @@ async fn run_shell(
     #[cfg(unix)]
     cmd.process_group(0);
 
-    let concrete_effects = vec![
+    let mut concrete_effects = vec![
         // Ordinary command approval binds the exact shell text.
         serde_json::json!({"execute": {"command": command}}),
         // A run-fail-escalate approval additionally binds the actual retry
@@ -2988,6 +3015,22 @@ async fn run_shell(
             "sandbox": if confine { "confined" } else { "unconfined" },
         }}),
     ];
+    if confine {
+        // Confined bash prompts for path access rather than a separate
+        // command approval. Preserve the cwd candidate as a concrete effect
+        // while also carrying any exact outside-path candidates collected
+        // before sandbox construction.
+        concrete_effects.push(serde_json::json!({
+            "access": {
+                "path": cwd.display().to_string(),
+                "required_access": format!(
+                    "{:?}",
+                    crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite
+                ),
+            }
+        }));
+    }
+    concrete_effects.extend_from_slice(approved_access_effects);
     run_prepared_command(
         cmd,
         ctx,
@@ -3423,6 +3466,28 @@ mod idle_wake_effect_tests {
         assert_eq!(
             tool.completed_call_effect(&json!({ "command": "touch marker && false" }), &output),
             ToolEffect::Dynamic
+        );
+    }
+}
+
+#[cfg(test)]
+mod approved_access_effect_tests {
+    use super::retain_unique_concrete_effect;
+
+    #[test]
+    fn outside_access_effects_retain_exact_candidate_and_dedupe() {
+        let effect = crate::tools::sandbox::native_access_effect(
+            std::path::Path::new("/outside/exact"),
+            crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+        );
+        let mut effects = Vec::new();
+        retain_unique_concrete_effect(&mut effects, effect.clone());
+        retain_unique_concrete_effect(&mut effects, effect.clone());
+
+        assert_eq!(effects, vec![effect]);
+        assert_eq!(
+            effects[0]["access"]["path"],
+            serde_json::Value::String("/outside/exact".to_string())
         );
     }
 }

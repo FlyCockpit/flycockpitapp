@@ -285,8 +285,9 @@ pub fn canonical_socket_endpoint_published(socket: &Path) -> bool {
     read_endpoint_record(&canonical).is_some()
 }
 
-/// Transport readiness for an isolated-home daemon: read the endpoint record
-/// beside `pid_file` when present, otherwise fall back to socket existence.
+/// Transport readiness for an isolated-home daemon: once either lifecycle
+/// receipt exists, require the endpoint record beside `pid_file`; only paths
+/// with no lifecycle metadata may fall back to socket existence.
 pub fn isolated_socket_transport_ready(socket: &Path, pid_file: &Path) -> bool {
     let Some(state_dir) = pid_file.parent() else {
         return socket.exists();
@@ -297,7 +298,7 @@ pub fn isolated_socket_transport_ready(socket: &Path, pid_file: &Path) -> bool {
         pid_file: pid_file.to_path_buf(),
         ephemeral: false,
     };
-    if endpoint_path.exists() {
+    if endpoint_path.exists() || pid_file.exists() {
         read_bound_endpoint_record_from(&endpoint_path, &paths).is_some()
     } else {
         socket.exists()
@@ -2237,15 +2238,13 @@ async fn run_foreground_inner_with_boot_db(
         None => server::boot(paths.clone(), terminal_factory).await?,
     });
     boot_dbg!("after_ctx_boot");
-    if resume_all_sessions {
-        resume_all_paused_sessions(&ctx.db).await?;
-    }
-    boot_dbg!("after_resume");
     // Recovery is part of the socket-publication barrier. Neither the control
     // socket nor its reveal sibling may be observable while durable authority
     // is still being reconciled.
     boot_dbg!("before_recover");
     server::recover_before_socket_publish(&ctx).await?;
+    recover_paused_sessions(&ctx, resume_all_sessions).await?;
+    boot_dbg!("after_resume");
     timer.phase("boot");
     boot_dbg!("after_recover");
 
@@ -2441,14 +2440,43 @@ pub async fn run_foreground_inner(
 }
 
 #[cfg(any(unix, windows, test))]
-async fn resume_all_paused_sessions(db: &crate::db::Db) -> Result<()> {
-    for row in db.paused_session_work_all().await? {
-        if let Err(e) = db.mark_paused_session_work_resumed(row.session_id).await {
-            tracing::warn!(
-                error = %e,
-                session_id = %row.session_id,
-                "resume-all failed to mark paused session resumed"
-            );
+async fn recover_paused_sessions(
+    ctx: &std::sync::Arc<server::DaemonContext>,
+    resume_all_sessions: bool,
+) -> Result<()> {
+    for row in ctx.db.paused_session_work_all().await? {
+        let handle = ctx
+            .registry
+            .attach_existing(
+                row.session_id,
+                None,
+                false,
+                None,
+                crate::env_snapshot::EnvSnapshot::from_process(
+                    crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+                ),
+            )
+            .await
+            .with_context(|| format!("recovering paused session {}", row.session_id))?;
+        let startup = handle
+            .park_commit()
+            .await_startup_reconciled(registry::INTERRUPT_PARK_COMMIT_DEADLINE)
+            .await;
+        anyhow::ensure!(
+            startup == crate::engine::interrupt::ParkCommitTerminal::Committed,
+            "paused session {} interrupt reconciliation was not committed: {startup:?}",
+            row.session_id
+        );
+        if resume_all_sessions {
+            ctx.db
+                .mark_paused_session_work_resumed(row.session_id)
+                .await
+                .with_context(|| {
+                    format!(
+                        "resume-all failed to mark paused session {} resumed",
+                        row.session_id
+                    )
+                })?;
         }
     }
     Ok(())

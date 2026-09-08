@@ -17,6 +17,7 @@ use super::adapter::{
     AdapterHandle, AllocatedContainment, ContainerExecRequest, ContainmentAdapter,
     NativeSpawnRequest,
 };
+#[cfg(any(test, feature = "test-support"))]
 use super::fake::FakeContainerRuntime;
 use super::types::{
     ContainmentError, ContainmentGuarantee, EmptyOutcome, PlatformKind, SafeContainmentMetadata,
@@ -59,6 +60,7 @@ pub struct RuntimeOutput {
 }
 
 /// Fake executor wrapping [`FakeContainerRuntime`].
+#[cfg(any(test, feature = "test-support"))]
 pub struct FakeRuntimeExecutor {
     pub runtime: FakeContainerRuntime,
     pub kind: RuntimeKind,
@@ -66,6 +68,7 @@ pub struct FakeRuntimeExecutor {
     pub context: String,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl RuntimeExecutor for FakeRuntimeExecutor {
     fn run(&self, argv: &[String]) -> Result<RuntimeOutput, String> {
         let out = self.runtime.exec(argv);
@@ -112,6 +115,7 @@ impl ContainerRuntimeAdapter {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn fake(kind: RuntimeKind) -> (Self, FakeContainerRuntime) {
         let runtime = FakeContainerRuntime::new();
         let executor = FakeRuntimeExecutor {

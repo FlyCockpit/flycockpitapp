@@ -338,7 +338,7 @@ pub mod integration {
                     }
                 })
                 .collect();
-            let invocation_nonce = Uuid::new_v4();
+            let invocation_nonce = Uuid::now_v7();
             let client_submission_id = cockpit_client::submission::derive_client_submission_id(
                 invocation_nonce,
                 &cockpit_client::submission::ClientUserSubmission {

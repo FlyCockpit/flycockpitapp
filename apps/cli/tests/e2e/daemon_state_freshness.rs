@@ -123,7 +123,8 @@ async fn ephemeral_session_resumes_on_shared_daemon() {
     let child = daemon_command
         .spawn()
         .expect("spawn explicit ephemeral daemon process");
-    let mut ephemeral_guard = EphemeralDaemonGuard::new(child, ephemeral_socket.clone());
+    let mut ephemeral_guard =
+        EphemeralDaemonGuard::new(child, ephemeral_socket.clone(), home.pid_file());
     wait_for_daemon_handshake_on_socket(
         &ephemeral_socket,
         Some(&home.pid_file()),
@@ -182,11 +183,8 @@ async fn ephemeral_session_resumes_on_shared_daemon() {
         .expect("gracefully stop ephemeral daemon");
     drop(ephemeral_client);
     let ephemeral_output = ephemeral_guard
-        .take_child()
-        .expect("ephemeral daemon process")
         .wait_with_output()
         .expect("wait for ephemeral daemon exit");
-    ephemeral_guard.disarm();
     assert_success(
         "ephemeral daemon foreground process",
         &ephemeral_output,

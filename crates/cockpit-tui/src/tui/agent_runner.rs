@@ -705,7 +705,12 @@ impl AgentRunner {
         &self,
         submission: ClientUserSubmission,
     ) -> Result<(), InputNotDelivered> {
-        self.try_send_optimistic_input(submission, Uuid::now_v7())
+        let invocation_nonce = Uuid::now_v7();
+        let client_submission_id = cockpit_client::submission::derive_client_submission_id(
+            invocation_nonce,
+            &submission.client_fingerprint(),
+        );
+        self.try_send_optimistic_input(submission, client_submission_id)
             .map_err(|(outcome, _submission)| outcome)
     }
 

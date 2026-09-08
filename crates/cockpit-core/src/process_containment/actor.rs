@@ -1246,9 +1246,9 @@ pub fn default_host_adapter() -> SharedAdapter {
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
-        Arc::new(super::fake::FakeUnsupportedAdapter {
-            reason: "platform_unsupported".into(),
-            kind: super::types::PlatformKind::Unsupported,
-        })
+        // The production macOS adapter is deliberately Unsupported off its
+        // native host, and therefore provides the fail-closed fallback
+        // without linking production composition to test fakes.
+        Arc::new(super::macos::MacosNativeAdapter::production())
     }
 }

@@ -3324,14 +3324,15 @@ pub(super) async fn handle_request(
     result
 }
 
-/// Client fingerprint for local-owner V2 ingress, matching
-/// `handle_send_user_message` submission construction. The early terminal-
-/// receipt probe must use the same domain as durable receipts.
-fn local_owner_v2_client_submission_fingerprint(
+/// Build the worker-level identity used by legacy terminal receipts. New V2
+/// receipts also have an immutable canonical operation record, but keeping
+/// this exact fallback lets pre-canonical terminal rows reject UUID reuse
+/// without making an identical retry executable.
+fn v2_terminal_client_submission_probe(
     request: &crate::proto_crate::send_user_message_v2::SendUserMessageV2,
     origin_principal: Option<String>,
-) -> String {
-    let delivery_class = request.delivery_class_override.unwrap_or_default();
+    run_invocation_options: Option<&proto::RunInvocationOptions>,
+) -> crate::engine::message::UserSubmission {
     crate::engine::message::UserSubmission {
         origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
         expected_model_state_generation: None,
@@ -3345,25 +3346,16 @@ fn local_owner_v2_client_submission_fingerprint(
             .cloned()
             .map(Into::into)
             .collect(),
-        images: Vec::new(),
-        media: Vec::new(),
         forced_skill: request.forced_skill.clone(),
-        origin_principal,
-        job_id: None,
-        preflight_cleaned: None,
-        queue_item_ids: Vec::new(),
-        client_submissions: Vec::new(),
-        queue_target: None,
-        pending_terminal_disposition: None,
-        run_invocation_id: None,
-        delivery_class,
         delivery_class_override: request.delivery_class_override,
+        delivery_class: request.delivery_class_override.unwrap_or_default(),
+        run_invocation_id: run_invocation_options.map(|_| request.client_submission_id),
+        origin_principal,
+        ..Default::default()
     }
-    .client_fingerprint()
 }
 
-fn local_owner_v2_wire_fingerprint(
-    origin: proto::UserMessageOrigin,
+fn v2_terminal_client_submission_wire_fingerprint(
     request: &crate::proto_crate::send_user_message_v2::SendUserMessageV2,
     run_invocation_options: Option<&proto::RunInvocationOptions>,
 ) -> String {
@@ -3374,7 +3366,7 @@ fn local_owner_v2_wire_fingerprint(
         .map(Into::into)
         .collect::<Vec<proto::TagExpansionMeta>>();
     let mut wire_fingerprint = user_message_wire_fingerprint_bytes(
-        origin,
+        proto::UserMessageOrigin::ExternalRoot,
         &request.text,
         request.display_text.as_deref(),
         &tag_expansions,
@@ -3389,38 +3381,12 @@ fn local_owner_v2_wire_fingerprint(
         });
     }
     if let Some(options) = run_invocation_options {
-        let opts_digest = run_invocation::options_digest(options);
-        wire_fingerprint = format!("{wire_fingerprint}|run:{opts_digest}");
+        wire_fingerprint = format!(
+            "{wire_fingerprint}|run:{}",
+            run_invocation::options_digest(options)
+        );
     }
     wire_fingerprint
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LocalOwnerV2TerminalIngress {
-    PrincipalConflict,
-    ExactWireReplay,
-    FingerprintConflict,
-    ExactFingerprintReplay,
-}
-
-fn classify_local_owner_v2_terminal_receipt(
-    terminal_origin: Option<&str>,
-    request_origin: Option<&str>,
-    terminal_wire: &str,
-    wire_fingerprint: &str,
-    terminal_fingerprint: &str,
-    probe_fingerprint: &str,
-) -> LocalOwnerV2TerminalIngress {
-    if terminal_origin != request_origin {
-        return LocalOwnerV2TerminalIngress::PrincipalConflict;
-    }
-    if terminal_wire == wire_fingerprint {
-        return LocalOwnerV2TerminalIngress::ExactWireReplay;
-    }
-    if terminal_fingerprint != probe_fingerprint {
-        return LocalOwnerV2TerminalIngress::FingerprintConflict;
-    }
-    LocalOwnerV2TerminalIngress::ExactFingerprintReplay
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3542,7 +3508,7 @@ async fn handle_send_user_message_v2(
         .map_err(internal)?,
     )
     .into();
-    let canonical = if let Some(stored) = ctx
+    let (canonical, durable_canonical_replay) = if let Some(stored) = ctx
         .db
         .canonical_message_for_operation(session_id, *validated.operation_id.as_bytes())
         .await
@@ -3557,7 +3523,7 @@ async fn handle_send_user_message_v2(
                 message: "message operation identity conflicts with a durable receipt".into(),
             });
         }
-        stored
+        (stored, true)
     } else {
         let (model_config_generation, canonical_model_digest) = match authoritative_model.as_ref() {
             None => (
@@ -3571,13 +3537,16 @@ async fn handle_send_user_message_v2(
                 (model.generation, Sha256::digest(digest_input).into())
             }
         };
-        crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2 {
-            session_id,
-            canonical_project_digest: project_digest_bytes,
-            model_config_generation,
-            canonical_model_digest,
-            request: request.clone(),
-        }
+        (
+            crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2 {
+                session_id,
+                canonical_project_digest: project_digest_bytes,
+                model_config_generation,
+                canonical_model_digest,
+                request: request.clone(),
+            },
+            false,
+        )
     };
     let canonical_message = canonical.encode().map_err(|error| ErrorPayload {
         code: ErrorCode::BadRequest,
@@ -3614,43 +3583,73 @@ async fn handle_send_user_message_v2(
         .map_err(internal)?
     {
         let origin_principal = state.principal.tag();
-        let wire_fingerprint = local_owner_v2_wire_fingerprint(
-            request.origin,
+        if !durable_canonical_replay
+            && terminal.origin_principal.as_deref() != origin_principal.as_deref()
+        {
+            return Err(ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: format!(
+                    "client_submission_id {} was already used by a different principal",
+                    request.client_submission_id
+                ),
+            });
+        }
+        // The worker fingerprint is deliberately replay-neutral for the
+        // already-validated model fence and contains normalized media bytes
+        // unavailable at this early probe. The durable canonical acceptance
+        // is therefore the authoritative payload identity for every V2 retry.
+        // A terminal worker has already drained the queue item. The durable
+        // operation receipt loaded above is the surviving exact payload
+        // binding, and its decoded request was compared field-for-field.
+        let probe = v2_terminal_client_submission_probe(
+            &request,
+            origin_principal,
+            validated.run_invocation_options.as_ref(),
+        );
+        let wire_fingerprint = v2_terminal_client_submission_wire_fingerprint(
             &request,
             validated.run_invocation_options.as_ref(),
         );
-        let probe_fingerprint =
-            local_owner_v2_client_submission_fingerprint(&request, origin_principal.clone());
-        match classify_local_owner_v2_terminal_receipt(
-            terminal.origin_principal.as_deref(),
-            origin_principal.as_deref(),
-            &terminal.wire_fingerprint,
-            &wire_fingerprint,
-            &terminal.fingerprint,
-            &probe_fingerprint,
-        ) {
-            LocalOwnerV2TerminalIngress::PrincipalConflict
-            | LocalOwnerV2TerminalIngress::FingerprintConflict => {
-                return Err(ErrorPayload {
-                    code: ErrorCode::BadRequest,
-                    message: format!(
-                        "client_submission_id {} was already used for a different payload",
-                        request.client_submission_id
-                    ),
-                });
+        let canonical_wire_fingerprint =
+            format!("fcm2:{}", crate::intel::hex_lower(&message_request_digest));
+        let exact_canonical_replay = durable_canonical_replay
+            || terminal.wire_fingerprint == canonical_wire_fingerprint
+            || terminal.wire_fingerprint == wire_fingerprint
+            || terminal.fingerprint == probe.client_fingerprint();
+        // Run bounds have their own durable, submission-keyed ledger. The
+        // terminal receipt can predate that suffix or be reconstructed from
+        // a canonical FCM2 receipt, so it is not the authority for options.
+        let durable_run = ctx
+            .db
+            .get_run_invocation(request.client_submission_id)
+            .await
+            .map_err(internal)?;
+        let run_identity_matches = match (validated.run_invocation_options.as_ref(), durable_run) {
+            (Some(options), Some(run)) => {
+                run.session_id == session_id
+                    && run.origin_principal_digest == principal_digest(&state.principal)
+                    && run.options_digest == run_invocation::options_digest(options)
             }
-            LocalOwnerV2TerminalIngress::ExactWireReplay
-            | LocalOwnerV2TerminalIngress::ExactFingerprintReplay => {
-                return Err(ErrorPayload {
-                    code: ErrorCode::UserMessageTerminated,
-                    message: format!(
-                        "client_submission_id {} is terminal ({}) and will not be executed",
-                        request.client_submission_id,
-                        terminal.disposition.as_str()
-                    ),
-                });
-            }
+            (None, None) => true,
+            _ => false,
+        };
+        if !exact_canonical_replay || !run_identity_matches {
+            return Err(ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: format!(
+                    "client_submission_id {} was already used for a different payload",
+                    request.client_submission_id
+                ),
+            });
         }
+        return Err(ErrorPayload {
+            code: ErrorCode::UserMessageTerminated,
+            message: format!(
+                "client_submission_id {} is terminal ({}) and will not be executed",
+                request.client_submission_id,
+                terminal.disposition.as_str()
+            ),
+        });
     }
     let attachment_set_digest = canonical.attachment_set_digest().map_err(internal)?;
     // Exact replay is a durable fact. Check it before requiring a live key,
@@ -3868,6 +3867,10 @@ async fn handle_send_user_message_v2(
         media,
         true,
         true,
+        Some(format!(
+            "fcm2:{}",
+            crate::intel::hex_lower(&message_request_digest)
+        )),
         request.forced_skill,
         request.delivery_class_override,
         validated.run_invocation_options,
@@ -4084,81 +4087,6 @@ fn user_message_wire_fingerprint_bytes(
     crate::intel::hex_lower(&hasher.finalize())
 }
 
-#[cfg(test)]
-mod local_owner_v2_client_submission_fingerprint_tests {
-    use super::{
-        LocalOwnerV2TerminalIngress, classify_local_owner_v2_terminal_receipt,
-        local_owner_v2_client_submission_fingerprint,
-    };
-
-    #[test]
-    fn matching_wire_fingerprint_from_different_principal_is_refused() {
-        assert_eq!(
-            classify_local_owner_v2_terminal_receipt(
-                Some("owner-a"),
-                Some("owner-b"),
-                "same-wire",
-                "same-wire",
-                "fp-a",
-                "fp-b",
-            ),
-            LocalOwnerV2TerminalIngress::PrincipalConflict
-        );
-    }
-
-    #[test]
-    fn v2_terminal_probe_matches_worker_submission_fingerprint() {
-        let request = crate::proto_crate::send_user_message_v2::SendUserMessageV2::text_only(
-            uuid::Uuid::now_v7(),
-            "trigger sandbox approval",
-        );
-        let origin_principal = Some("owner".to_string());
-        let probe =
-            local_owner_v2_client_submission_fingerprint(&request, origin_principal.clone());
-        let worker = crate::engine::message::UserSubmission {
-            origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
-            expected_model_state_generation: None,
-            expected_model: None,
-            kind: crate::engine::message::UserSubmissionKind::User,
-            text: request.text.clone(),
-            display_text: request.display_text.clone(),
-            tag_expansions: request
-                .tag_expansions
-                .iter()
-                .cloned()
-                .map(Into::into)
-                .collect(),
-            images: Vec::new(),
-            media: Vec::new(),
-            forced_skill: request.forced_skill.clone(),
-            origin_principal,
-            job_id: None,
-            preflight_cleaned: None,
-            queue_item_ids: Vec::new(),
-            client_submissions: Vec::new(),
-            queue_target: None,
-            pending_terminal_disposition: None,
-            run_invocation_id: None,
-            delivery_class: request.delivery_class_override.unwrap_or_default(),
-            delivery_class_override: request.delivery_class_override,
-        }
-        .client_fingerprint();
-        assert_eq!(probe, worker);
-    }
-
-    #[test]
-    fn v2_terminal_probe_differs_from_internal_default_origin() {
-        let request = crate::proto_crate::send_user_message_v2::SendUserMessageV2::text_only(
-            uuid::Uuid::now_v7(),
-            "trigger sandbox approval",
-        );
-        let probe = local_owner_v2_client_submission_fingerprint(&request, None);
-        let internal_default =
-            crate::engine::message::UserSubmission::text(request.text.clone()).client_fingerprint();
-        assert_ne!(probe, internal_default);
-    }
-}
-
 async fn handle_send_user_message(
     state: &mut MutableClientState,
     ctx: &Arc<DaemonContext>,
@@ -4173,6 +4101,7 @@ async fn handle_send_user_message(
     media: Vec<crate::engine::message::SubmissionMedia>,
     durable_message_receipt: bool,
     durable_run_invocation_bound: bool,
+    canonical_wire_fingerprint: Option<String>,
     forced_skill: Option<String>,
     delivery_class_override: Option<proto::QueueDeliveryClass>,
     run_invocation_options: Option<proto::RunInvocationOptions>,
@@ -4252,26 +4181,31 @@ async fn handle_send_user_message(
     } else {
         None
     };
-    let mut wire_fingerprint = user_message_wire_fingerprint_bytes(
-        origin,
-        &text,
-        display_text.as_deref(),
-        &tag_expansions,
-        &images,
-        &media,
-        forced_skill.as_deref(),
-    );
-    if let Some(delivery_class) = delivery_class_override {
-        wire_fingerprint.push_str(match delivery_class {
-            proto::QueueDeliveryClass::Steering => "|delivery:steering",
-            proto::QueueDeliveryClass::Held => "|delivery:held",
-        });
-    }
-    if let (Some(generation), Some(model)) =
-        (expected_model_state_generation, expected_model.as_ref())
-    {
-        let model_json = serde_json::to_string(model).map_err(internal)?;
-        wire_fingerprint.push_str(&format!("|model:{generation}:{model_json}"));
+    let canonical_worker_receipt = canonical_wire_fingerprint.is_some();
+    let mut wire_fingerprint = canonical_wire_fingerprint.unwrap_or_else(|| {
+        user_message_wire_fingerprint_bytes(
+            origin,
+            &text,
+            display_text.as_deref(),
+            &tag_expansions,
+            &images,
+            &media,
+            forced_skill.as_deref(),
+        )
+    });
+    if !canonical_worker_receipt {
+        if let Some(delivery_class) = delivery_class_override {
+            wire_fingerprint.push_str(match delivery_class {
+                proto::QueueDeliveryClass::Steering => "|delivery:steering",
+                proto::QueueDeliveryClass::Held => "|delivery:held",
+            });
+        }
+        if let (Some(generation), Some(model)) =
+            (expected_model_state_generation, expected_model.as_ref())
+        {
+            let model_json = serde_json::to_string(model).map_err(internal)?;
+            wire_fingerprint.push_str(&format!("|model:{generation}:{model_json}"));
+        }
     }
     // Include immutable run options in the fingerprint so option drift
     // conflicts. V2 inline/media has already persisted the invocation in its
@@ -4279,7 +4213,9 @@ async fn handle_send_user_message(
     // to the worker, which creates it atomically with phase one.
     if let Some(options) = &run_invocation_options {
         let opts_digest = run_invocation::options_digest(options);
-        wire_fingerprint = format!("{wire_fingerprint}|run:{opts_digest}");
+        if !canonical_worker_receipt {
+            wire_fingerprint = format!("{wire_fingerprint}|run:{opts_digest}");
+        }
         if durable_run_invocation_bound {
             // V2 inline/media admission persisted this exact invocation in the
             // same transaction as the message receipt and attachment refs.
@@ -4371,14 +4307,31 @@ async fn handle_send_user_message(
         delivery_class: delivery_class_override.unwrap_or_default(),
         delivery_class_override,
     };
-    let fingerprint = submission.client_fingerprint();
+    // FCM2's canonical message digest is the durable content identity.  The
+    // startup outbox reconstruction intentionally omits replay-neutral live
+    // fields (model fence and principal tag), so its receipt must not derive
+    // a different legacy client fingerprint from that reduced submission.
+    let fingerprint = if canonical_worker_receipt {
+        wire_fingerprint.clone()
+    } else {
+        submission.client_fingerprint()
+    };
+    let receipt_origin_principal = if canonical_worker_receipt {
+        // Actor ownership was already authenticated and durably bound by the
+        // FCM2 operation receipt. Startup reconstruction deliberately carries
+        // no live connection principal, so the worker-level replay receipt is
+        // principal-neutral on both paths.
+        None
+    } else {
+        origin_principal
+    };
     submission
         .client_submissions
         .push(crate::engine::message::ClientSubmissionReceipt {
             id: client_submission_id,
             fingerprint,
             wire_fingerprint,
-            origin_principal,
+            origin_principal: receipt_origin_principal,
         });
     handle
         .send_work(SessionWork::UserMessage {
@@ -4759,6 +4712,7 @@ async fn handle_send_user_message_bulk(
         Vec::new(),
         false,
         false,
+        None,
         forced_skill,
         delivery_class_override,
         run_invocation_options,

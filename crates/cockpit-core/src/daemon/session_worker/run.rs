@@ -4390,7 +4390,7 @@ async fn settle_or_replay_executing_interrupt(
     session_id: Uuid,
     row: crate::db::needs_attention::NeedsAttentionRow,
     terminal_tree_interrupt_replays: &mut Vec<crate::db::needs_attention::NeedsAttentionRow>,
-) {
+) -> bool {
     let linked_decision = match session
         .db
         .decision_request_for_interrupt(session_id, row.interrupt_id)
@@ -4403,7 +4403,7 @@ async fn settle_or_replay_executing_interrupt(
                 interrupt_id = %row.interrupt_id,
                 "loading executing interrupt lifecycle decision failed"
             );
-            return;
+            return false;
         }
     };
     if let Some(decision) = linked_decision.as_ref()
@@ -4411,7 +4411,7 @@ async fn settle_or_replay_executing_interrupt(
         && should_replay_terminal_linked_tool(&row, decision)
     {
         terminal_tree_interrupt_replays.push(row);
-        return;
+        return true;
     }
     settle_unrecoverable_interrupt(
         session,
@@ -4422,7 +4422,7 @@ async fn settle_or_replay_executing_interrupt(
         linked_decision.is_some(),
         interrupt_restart_notice_text(row.interrupt_id, Ok(())),
     )
-    .await;
+    .await
 }
 
 pub(super) fn validate_parked_interrupt_payload(
@@ -4463,7 +4463,7 @@ async fn settle_unrecoverable_interrupt(
     interrupt_id: Uuid,
     linked: bool,
     notice_text: String,
-) {
+) -> bool {
     let marked = if linked {
         session
             .db
@@ -4472,20 +4472,26 @@ async fn settle_unrecoverable_interrupt(
     } else {
         session.db.mark_interrupt_interrupted(interrupt_id).await
     };
-    match marked {
-        Ok(true) => {}
-        Ok(false) => tracing::error!(
-            %interrupt_id,
-            %session_id,
-            linked,
-            "settling unrecoverable interrupt did not change the durable row"
-        ),
-        Err(error) => tracing::warn!(
-            %error,
-            %interrupt_id,
-            "marking unrecoverable interrupt failed"
-        ),
-    }
+    let committed = match marked {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::error!(
+                %interrupt_id,
+                %session_id,
+                linked,
+                "settling unrecoverable interrupt did not change the durable row"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                %interrupt_id,
+                "marking unrecoverable interrupt failed"
+            );
+            false
+        }
+    };
     send_current_session_event(
         session,
         event_tx,
@@ -4496,6 +4502,7 @@ async fn settle_unrecoverable_interrupt(
         },
         NoticeSource::DaemonDirect,
     );
+    committed
 }
 
 pub(super) async fn forward_queue_updates(
@@ -5240,7 +5247,9 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
             run_invocation_id,
             delivery_class,
         };
-        let fingerprint = submission.client_fingerprint();
+        // The canonical FCM2 digest, rather than replay-neutral reconstructed
+        // fields, is the durable content identity shared with live handoff.
+        let fingerprint = wire_fingerprint.clone();
         submission
             .client_submissions
             .push(crate::engine::message::ClientSubmissionReceipt {
@@ -5392,7 +5401,9 @@ pub(crate) async fn replay_accepted_message_attachment_queue(
             delivery_class: request.resolved_delivery_class.unwrap_or_default(),
             delivery_class_override: request.delivery_class_override,
         };
-        let fingerprint = submission.client_fingerprint();
+        // Match live V2 handoff: replay-neutral reconstructed fields are not
+        // part of the durable FCM2 content identity.
+        let fingerprint = wire_fingerprint.clone();
         submission
             .client_submissions
             .push(crate::engine::message::ClientSubmissionReceipt {
@@ -6198,7 +6209,7 @@ pub(super) async fn run_worker(
                 &mut driver_failed,
                 message,
             );
-            park_commit.report_startup_reconciled();
+            park_commit.report_startup_reconciliation_failed();
             return;
         }
     };
@@ -7360,6 +7371,7 @@ pub(super) async fn run_worker(
     // that durable `executing` claim as an interrupted orphan would discard
     // the original continuation and its already-recorded answer.
     let mut terminal_tree_interrupt_replays = Vec::new();
+    let mut startup_reconciliation_committed = true;
     match session.db.list_reconcilable_interrupts(session_id).await {
         Ok(rows) => {
             for row in rows {
@@ -7380,6 +7392,7 @@ pub(super) async fn run_worker(
                     Ok(true) => continue,
                     Ok(false) => {}
                     Err(error) => {
+                        startup_reconciliation_committed = false;
                         tracing::warn!(
                             %error,
                             interrupt_id = %row.interrupt_id,
@@ -7392,6 +7405,7 @@ pub(super) async fn run_worker(
                         if validate_parked_interrupt_payload(&row).is_ok() =>
                     {
                         if let Err(error) = session.db.park_interrupt(row.interrupt_id).await {
+                            startup_reconciliation_committed = false;
                             tracing::warn!(
                                 %error,
                                 interrupt_id = %row.interrupt_id,
@@ -7405,7 +7419,7 @@ pub(super) async fn run_worker(
                         if validate_parked_interrupt_payload(&row).is_ok()
                             && row.response.is_some() =>
                     {
-                        settle_or_replay_executing_interrupt(
+                        startup_reconciliation_committed &= settle_or_replay_executing_interrupt(
                             &session,
                             &event_tx,
                             &redaction,
@@ -7425,12 +7439,13 @@ pub(super) async fn run_worker(
                         {
                             Ok(decision) => decision,
                             Err(error) => {
+                                startup_reconciliation_committed = false;
                                 tracing::error!(
                                     %error,
                                     interrupt_id = %row.interrupt_id,
                                     "loading unrecoverable interrupt lifecycle decision failed"
                                 );
-                                settle_unrecoverable_interrupt(
+                                startup_reconciliation_committed &= settle_unrecoverable_interrupt(
                                     &session,
                                     &event_tx,
                                     &redaction,
@@ -7456,7 +7471,7 @@ pub(super) async fn run_worker(
                         if waiting_host {
                             continue;
                         }
-                        settle_unrecoverable_interrupt(
+                        startup_reconciliation_committed &= settle_unrecoverable_interrupt(
                             &session,
                             &event_tx,
                             &redaction,
@@ -7475,17 +7490,10 @@ pub(super) async fn run_worker(
             }
         }
         Err(error) => {
+            startup_reconciliation_committed = false;
             tracing::warn!(%error, "interrupt reconciliation failed");
         }
     }
-    // Publish the attach-path park-commit edge
-    // (`daemon-lifecycle-replay-timing-robustness.md`, §3): the crash-surviving
-    // `Open → Parked` reconciliation above has now committed (or there was
-    // nothing to reconcile), so a client that attached and is awaiting this
-    // signal can observe the durable `Parked` row. Always fired (even on the
-    // error/empty paths) so `attach` never blocks to the deadline needlessly.
-    park_commit.report_startup_reconciled();
-
     // Session-only redaction source overrides (`/toggle-redaction`). The
     // base config is reloaded at every turn boundary so dotenv/settings/SSH
     // changes made after session start are picked up before the next provider
@@ -8255,7 +8263,7 @@ pub(super) async fn run_worker(
                 {
                     continue;
                 }
-                settle_or_replay_executing_interrupt(
+                startup_reconciliation_committed &= settle_or_replay_executing_interrupt(
                     &session,
                     &event_tx,
                     &redaction,
@@ -8267,8 +8275,17 @@ pub(super) async fn run_worker(
             }
         }
         Err(error) => {
+            startup_reconciliation_committed = false;
             tracing::warn!(%error, %session_id, "scanning post-recovery terminal interrupt claims failed")
         }
+    }
+    // Agent-tree recovery can create a terminal execution claim after the
+    // initial Open -> Parked sweep. Publish the attach-path park-commit edge
+    // only after both startup interrupt passes have durably settled.
+    if startup_reconciliation_committed {
+        park_commit.report_startup_reconciled();
+    } else {
+        park_commit.report_startup_reconciliation_failed();
     }
     let root_claimed = tree_recovery
         .claimed_agents
@@ -13934,21 +13951,22 @@ pub(super) async fn run_worker(
             pending_tool_count,
         } = &stop
         {
-            let pending = session
+            let pending = match session
                 .db
-                .list_open_interrupts(session.live_id())
+                .list_reconcilable_interrupts(session.live_id())
                 .await
-                .map(|rows| rows.len() as i64)
-                .unwrap_or(*pending_tool_count);
+            {
+                Ok(rows) => (rows.len() as i64).max(*pending_tool_count),
+                Err(error) => {
+                    tracing::error!(%error, "final shutdown interrupt reconciliation scan failed");
+                    shutdown_park_committed = false;
+                    (*pending_tool_count).max(1)
+                }
+            };
             if pending > 0 {
-                if let Err(error) = persist_paused_session_work(
-                    &session,
-                    session_id,
-                    &root_agent_name,
-                    &project_root,
-                    pending,
-                )
-                .await
+                if let Err(error) =
+                    persist_paused_session_work(&session, &root_agent_name, &project_root, pending)
+                        .await
                 {
                     tracing::error!(%error, "persisting paused session work failed");
                     shutdown_park_committed = false;
@@ -14256,7 +14274,6 @@ async fn test_injected_park_delay(_var: &str) {
 
 async fn persist_paused_session_work(
     session: &Session,
-    session_id: Uuid,
     root_agent_name: &str,
     project_root: &std::path::Path,
     pending_tool_count: i64,
@@ -14264,7 +14281,7 @@ async fn persist_paused_session_work(
     session
         .db
         .upsert_paused_session_work(
-            session_id,
+            session.live_id(),
             root_agent_name,
             &project_root.display().to_string(),
             "daemon shutdown paused active work",
@@ -14277,7 +14294,7 @@ async fn persist_paused_session_work(
 
 pub(super) async fn shutdown_activity_snapshot(
     session: &Session,
-    session_id: Uuid,
+    _session_id: Uuid,
     interrupts: &crate::engine::interrupt::InterruptHub,
     live: &LiveState,
 ) -> (bool, i64, bool) {
@@ -14294,17 +14311,26 @@ pub(super) async fn shutdown_activity_snapshot(
     // waiter is then gone from the map and cannot be re-detected by a later
     // sweep) still surfaces as a non-clean terminal.
     let sweep = interrupts.park_all_registered_collect().await;
-    let pending_tool_count = session
+    let (pending_tool_count, scan_committed) = match session
         .db
-        .list_open_interrupts(session.live_id())
+        .list_reconcilable_interrupts(session.live_id())
         .await
-        .map(|rows| rows.len() as i64)
-        .unwrap_or(sweep.count as i64);
+    {
+        Ok(rows) => (rows.len() as i64, true),
+        Err(error) => {
+            tracing::error!(%error, "shutdown interrupt reconciliation scan failed");
+            ((sweep.count as i64).max(1), false)
+        }
+    };
     let active = {
         let (has_schedules, processing) = (live.has_active_schedules(), live.processing());
         has_schedules || processing || pending_tool_count > 0
     };
-    (active, pending_tool_count, sweep.all_committed)
+    (
+        active,
+        pending_tool_count,
+        sweep.all_committed && scan_committed,
+    )
 }
 
 #[cfg(test)]

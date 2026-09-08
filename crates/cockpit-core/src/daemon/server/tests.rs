@@ -14856,7 +14856,7 @@ async fn security_subsystem_containment_recovery_failure_aborts_before_publicati
 
     let adapter = FakeProvenAdapter::default();
     adapter.fail_recover_with("injected containment recovery failure");
-    let actor = ProcessContainmentActor::start(db.clone(), adapter);
+    let actor = ProcessContainmentActor::start(db.clone(), Arc::new(adapter));
     let handle = actor.handle();
     let registry = SessionRegistry::new(
         db.clone(),

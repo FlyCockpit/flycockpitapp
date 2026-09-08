@@ -878,8 +878,15 @@ impl SessionIngress for DaemonIngress {
             .collect::<Option<Vec<_>>>()
             .ok_or(SessionIngressError::InvalidAdmission)?
             .join("\n");
-        let message =
-            cockpit_proto::send_user_message_v2::SendUserMessageV2::text_only(Uuid::now_v7(), text);
+        let invocation_nonce = Uuid::now_v7();
+        let client_submission_id = cockpit_client::submission::derive_client_submission_id(
+            invocation_nonce,
+            &cockpit_client::submission::run_user_message_submission_fingerprint(&text),
+        );
+        let message = cockpit_proto::send_user_message_v2::SendUserMessageV2::text_only(
+            client_submission_id,
+            text,
+        );
         self.handle
             .block_on(client.request_ok(Request::SendUserMessageV2 {
                 ingress: cockpit_proto::send_user_message_v2::MessageIngressV2::local_direct(

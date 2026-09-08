@@ -970,6 +970,7 @@ impl App {
                             display: queued.display,
                             submission: queued.submission,
                             tag_expansions: queued.tag_expansions,
+                            identity_nonce: Some(queued.client_submission_id),
                             waiting_model_selection: None,
                             parked_fence_sequence: None,
                         },

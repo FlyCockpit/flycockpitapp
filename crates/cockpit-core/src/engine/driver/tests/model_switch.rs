@@ -1205,65 +1205,67 @@ async fn plain_enter_never_establishes_a_first_default() {
 /// Formerly `concurrent_stale_workers_initialize_exactly_one_default`: plain
 /// Enter no longer initializes anything, so the correct invariant is that
 /// *neither* concurrent session-only switch writes a default.
-#[tokio::test]
-async fn concurrent_plain_enter_switches_write_no_default_at_all() {
-    let (mut driver_a, mut driver_b, shared, _driver_b_tmp) =
-        model_switch_drivers_with_shared_disk_config_without_default();
-    let (tx_a, mut rx_a) = mpsc::channel::<TurnEvent>(64);
-    let (tx_b, mut rx_b) = mpsc::channel::<TurnEvent>(64);
-    let root = shared.path();
+#[test]
+fn concurrent_plain_enter_switches_write_no_default_at_all() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        let (mut driver_a, mut driver_b, shared, _driver_b_tmp) =
+            model_switch_drivers_with_shared_disk_config_without_default();
+        let (tx_a, mut rx_a) = mpsc::channel::<TurnEvent>(64);
+        let (tx_b, mut rx_b) = mpsc::channel::<TurnEvent>(64);
+        let root = shared.path();
 
-    let a = run_control_with_trusted_project_config(
-        &mut driver_a,
-        root,
-        DriverControl::SetActiveModel {
-            selection_id: uuid::Uuid::new_v4(),
-            provider: "provider-a".into(),
-            model: "model-a".into(),
-            persist_as_default: false,
-            trigger: crate::session::ModelSwitchTrigger::Picker,
-            reasoning_effort: None,
-            thinking_mode: None,
-            prompt_cache_retention: None,
-        },
-        &tx_a,
-    );
-    let b = run_control_with_trusted_project_config(
-        &mut driver_b,
-        root,
-        DriverControl::SetActiveModel {
-            selection_id: uuid::Uuid::new_v4(),
-            provider: "provider-b".into(),
-            model: "model-b".into(),
-            persist_as_default: false,
-            trigger: crate::session::ModelSwitchTrigger::Picker,
-            reasoning_effort: None,
-            thinking_mode: None,
-            prompt_cache_retention: None,
-        },
-        &tx_b,
-    );
-    tokio::join!(a, b);
+        let a = run_control_with_trusted_project_config(
+            &mut driver_a,
+            root,
+            DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::new_v4(),
+                provider: "provider-a".into(),
+                model: "model-a".into(),
+                persist_as_default: false,
+                trigger: crate::session::ModelSwitchTrigger::Picker,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            &tx_a,
+        );
+        let b = run_control_with_trusted_project_config(
+            &mut driver_b,
+            root,
+            DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::new_v4(),
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                persist_as_default: false,
+                trigger: crate::session::ModelSwitchTrigger::Picker,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            &tx_b,
+        );
+        tokio::join!(a, b);
 
-    let outcomes = [
-        terminal_default_update(&mut rx_a),
-        terminal_default_update(&mut rx_b),
-    ];
-    assert!(
-        outcomes.iter().all(|outcome| matches!(
-            outcome,
-            crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested
-        )),
-        "a session-only switch may never report a default update; outcomes={outcomes:?}"
-    );
-    assert_eq!(
-        crate::config::providers::ConfigDoc::load(&root.join(".cockpit/config.json"))
-            .unwrap()
-            .providers()
-            .active_model,
-        None,
-        "no plain-Enter switch may establish a default"
-    );
+        let outcomes = [
+            terminal_default_update(&mut rx_a),
+            terminal_default_update(&mut rx_b),
+        ];
+        assert!(
+            outcomes.iter().all(|outcome| matches!(
+                outcome,
+                crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested
+            )),
+            "a session-only switch may never report a default update; outcomes={outcomes:?}"
+        );
+        assert_eq!(
+            crate::config::providers::ConfigDoc::load(&root.join(".cockpit/config.json"))
+                .unwrap()
+                .providers()
+                .active_model,
+            None,
+            "no plain-Enter switch may establish a default"
+        );
+    });
 }
 
 /// **Rejected behavior.** Plain Enter must not touch the default at all. The
@@ -1278,47 +1280,49 @@ async fn concurrent_plain_enter_switches_write_no_default_at_all() {
 /// Formerly `concurrent_explicit_replace_always_wins_over_stale_initializer`:
 /// the "initializer" is now an ordinary session-only switch, so the explicit
 /// replacement is the *only* writer.
-#[tokio::test]
-async fn a_concurrent_plain_enter_cannot_disturb_an_explicit_replace() {
-    let (mut explicit_driver, mut session_only_driver, shared, _session_only_tmp) =
-        model_switch_drivers_with_shared_disk_config_without_default();
-    let (explicit_tx, _explicit_rx) = mpsc::channel::<TurnEvent>(64);
-    let (session_only_tx, _session_only_rx) = mpsc::channel::<TurnEvent>(64);
-    let root = shared.path();
+#[test]
+fn a_concurrent_plain_enter_cannot_disturb_an_explicit_replace() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        let (mut explicit_driver, mut session_only_driver, shared, _session_only_tmp) =
+            model_switch_drivers_with_shared_disk_config_without_default();
+        let (explicit_tx, _explicit_rx) = mpsc::channel::<TurnEvent>(64);
+        let (session_only_tx, _session_only_rx) = mpsc::channel::<TurnEvent>(64);
+        let root = shared.path();
 
-    let explicit = run_control_with_trusted_project_config(
-        &mut explicit_driver,
-        root,
-        DriverControl::SetActiveModel {
-            selection_id: uuid::Uuid::new_v4(),
-            provider: "provider-a".into(),
-            model: "model-a".into(),
-            persist_as_default: true,
-            trigger: crate::session::ModelSwitchTrigger::Picker,
-            reasoning_effort: None,
-            thinking_mode: None,
-            prompt_cache_retention: None,
-        },
-        &explicit_tx,
-    );
-    let session_only = run_control_with_trusted_project_config(
-        &mut session_only_driver,
-        root,
-        DriverControl::SetActiveModel {
-            selection_id: uuid::Uuid::new_v4(),
-            provider: "provider-b".into(),
-            model: "model-b".into(),
-            persist_as_default: false,
-            trigger: crate::session::ModelSwitchTrigger::Picker,
-            reasoning_effort: None,
-            thinking_mode: None,
-            prompt_cache_retention: None,
-        },
-        &session_only_tx,
-    );
-    tokio::join!(explicit, session_only);
+        let explicit = run_control_with_trusted_project_config(
+            &mut explicit_driver,
+            root,
+            DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::new_v4(),
+                provider: "provider-a".into(),
+                model: "model-a".into(),
+                persist_as_default: true,
+                trigger: crate::session::ModelSwitchTrigger::Picker,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            &explicit_tx,
+        );
+        let session_only = run_control_with_trusted_project_config(
+            &mut session_only_driver,
+            root,
+            DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::new_v4(),
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                persist_as_default: false,
+                trigger: crate::session::ModelSwitchTrigger::Picker,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            &session_only_tx,
+        );
+        tokio::join!(explicit, session_only);
 
-    assert_disk_config_active_model(root, "provider-a", "model-a");
+        assert_disk_config_active_model(root, "provider-a", "model-a");
+    });
 }
 
 #[tokio::test]

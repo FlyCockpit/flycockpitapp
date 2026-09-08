@@ -639,6 +639,19 @@ fn root_child_cwd(driver: &Driver) -> ChildCwd {
     }
 }
 
+fn align_scripted_provider_override_with_config(driver: &mut Driver) {
+    let providers = driver.config.providers().clone();
+    let active = providers
+        .active_model
+        .as_ref()
+        .expect("delegated-model fixture config has an active model");
+    driver.test_providers_override = Some((
+        providers.clone(),
+        active.provider.clone(),
+        active.model.clone(),
+    ));
+}
+
 fn write_delegated_model_config(driver: &mut Driver, models: &[&str]) {
     let config_dir = driver.cwd.join(".cockpit");
     let providers_dir = config_dir.join("providers");
@@ -675,6 +688,11 @@ fn write_delegated_model_config(driver: &mut Driver, models: &[&str]) {
     driver.set_config_handle(
         crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(&cwd),
     );
+    // The model harness keeps a test-only provider authority alongside the
+    // worker snapshot. Both represent the same pinned parent configuration;
+    // leaving the former on the constructor snapshot would make child
+    // inheritance replace the freshly loaded registry with stale providers.
+    align_scripted_provider_override_with_config(driver);
 }
 
 fn failing_provider() -> cockpit_test_support::provider::ScriptedProvider {
@@ -735,6 +753,7 @@ fn write_delegated_model_config_with_backup(
     driver.set_config_handle(
         crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(&cwd),
     );
+    align_scripted_provider_override_with_config(driver);
 }
 
 async fn seed_task_payload(driver: &Driver, task_call_id: &str, label: &str, child_agent: &str) {

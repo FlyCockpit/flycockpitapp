@@ -254,6 +254,13 @@ async fn recovered_interactive_task_admission_replays_durable_seed_before_infere
         "the interactive executor must own an interactive durable launch descriptor: {}",
         child.original_args_json
     );
+    assert_eq!(
+        durable_launch
+            .get("remaining_depth")
+            .and_then(serde_json::Value::as_u64),
+        Some(0),
+        "publication freezes the resolved recursion depth required by reattach"
+    );
     let snapshot: serde_json::Value =
         serde_json::from_str(&child.snapshot_json).expect("real admission writes JSON snapshot");
     let history: Vec<Message> = serde_json::from_value(

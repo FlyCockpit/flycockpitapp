@@ -2968,7 +2968,7 @@ async fn interactive_cancel_after_visible_text_keeps_the_durable_user_row() {
 #[test]
 fn interactive_cancel_after_tool_call_keeps_the_durable_user_row() {
     crate::test_env::run_async_with_large_stack(|| async {
-        let mut provider = ScriptedProvider::builder()
+        let provider = ScriptedProvider::builder()
             .dialect(WireDialect::ChatCompletions)
             .turn(Turn::ToolCall {
                 id: "read-before-cancel".into(),
@@ -2980,6 +2980,11 @@ fn interactive_cancel_after_tool_call_keeps_the_durable_user_row() {
             .await;
         let (mut driver, tmp) = scripted_read_driver(&provider);
         std::fs::write(tmp.path().join("fixture.txt"), "fixture body").unwrap();
+        // This fixture exercises the cancel/retract boundary after a real tool
+        // completion. Keep the independent result-injection classifier out of
+        // the scripted provider sequence so its request cannot consume the
+        // deliberate post-tool Hang before ToolEnd is emitted.
+        Arc::make_mut(&mut driver.stack[0].agent).scan_tool_results = false;
         let cancel = driver.cancel_handle();
         let (queue, tx, mut rx) = event_harness();
         let run = tokio::spawn(async move {
@@ -2989,12 +2994,23 @@ fn interactive_cancel_after_tool_call_keeps_the_durable_user_row() {
                 .unwrap();
             driver
         });
-        let _ = provider.next_request().await;
-        let _ = provider.next_request().await;
+        let mut observed = Vec::new();
+        loop {
+            let event = rx.recv().await.expect("turn event stream stays open");
+            let tool_completed = matches!(
+                &event,
+                TurnEvent::ToolEnd { call_id, .. } if call_id == "read-before-cancel"
+            );
+            observed.push(event);
+            if tool_completed {
+                break;
+            }
+        }
         cancel.cancel_turn();
         let driver = run.await.unwrap();
 
-        let events = drain_events(&mut rx);
+        observed.extend(drain_events(&mut rx));
+        let events = observed;
         assert!(
             events.iter().any(|event| matches!(event, TurnEvent::ToolEnd { call_id, .. } if call_id == "read-before-cancel")),
             "the test must cancel only after the real tool call completed: {events:?}"

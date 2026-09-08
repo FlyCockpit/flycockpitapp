@@ -5291,9 +5291,13 @@ impl Driver {
             hooks: snapshot.hooks(),
         };
         let frame = self.stack.last_mut().context("driver stack is empty")?;
-        frame.history.push(brief);
         crate::engine::seed_reads::execute_declared_seed_calls(&env, &mut frame.history, pending)
             .await?;
+        // Keep every declared assistant tool call adjacent to its paired
+        // result. Appending the handoff brief first makes request rehydration
+        // treat the call as dangling and synthesize an interrupted result,
+        // hiding the freshly executed seed from the child.
+        frame.history.push(brief);
         Ok(crate::engine::seed_reads::completion_prompt())
     }
 
@@ -14825,7 +14829,7 @@ impl Driver {
                     let task_args_json = serde_json::to_string(&serde_json::json!({
                         "child_agent": &child_agent,
                         "model": model_selector_json(&model),
-                        "remaining_depth": remaining_depth,
+                        "remaining_depth": child_recursion.remaining_depth,
                         "granted_tools": &granted_tools,
                         "seed_reads": &seed_reads,
                         "todo_ids": &todo_ids,

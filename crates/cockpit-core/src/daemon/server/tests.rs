@@ -22760,7 +22760,11 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "create_image_sidecar_grant" => Request::CreateImageSidecarGrant {
             project_root: project_root.to_string_lossy().into_owned(),
-            config_generation: 0,
+            // Wire semantics reject generation 0, so the matrix probe must
+            // carry a nonzero generation to pass `validate_request_semantics`
+            // and surface the serialized attach gate (`NotAttached`) the
+            // owner cell documents, instead of the pre-dispatch `BadRequest`.
+            config_generation: 1,
             selection_id: "selection".into(),
             expected_daemon_instance_id: None,
             expected_session_id: None,
@@ -22772,7 +22776,8 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "revoke_image_sidecar_grant" => Request::RevokeImageSidecarGrant {
             project_root: project_root.to_string_lossy().into_owned(),
-            config_generation: 0,
+            // Same wire-validity requirement as the create probe above.
+            config_generation: 1,
             selection_id: "selection".into(),
             expected_daemon_instance_id: None,
             expected_session_id: None,

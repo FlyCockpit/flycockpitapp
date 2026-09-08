@@ -2764,7 +2764,7 @@ fn enable_reasoning_retraction(driver: &mut Driver) {
     install_scripted_provider_snapshot(driver, providers);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn interactive_cancel_after_reasoning_retracts_the_durable_user_row() {
     let mut provider = ScriptedProvider::builder()
         .dialect(WireDialect::ChatCompletions)
@@ -2790,37 +2790,45 @@ async fn interactive_cancel_after_reasoning_retracts_the_durable_user_row() {
     let (queue, tx, mut rx) = event_harness();
     let mut submission = UserSubmission::text("retract after thinking");
     submission.origin = crate::engine::message::SubmissionOrigin::ExternalRoot;
-    let run = tokio::spawn(async move {
+    let mut run = tokio::spawn(async move {
         driver
             .run_user_input(submission, &queue, &tx)
             .await
             .unwrap();
         driver
     });
-    let _ = provider.next_request_ready().await;
+    tokio::select! {
+        _ = provider.next_request_ready() => {}
+        _ = &mut run => panic!("driver ended before the reasoning request was captured"),
+    }
 
-    let saw_reasoning = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    let mut observed = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if matches!(
-                rx.recv().await,
-                Some(TurnEvent::AssistantDisplayReasoningDelta { .. })
-            ) {
-                return;
+            let event = rx
+                .recv()
+                .await
+                .expect("turn event stream closed before the reasoning delta");
+            let saw_reasoning = matches!(event, TurnEvent::AssistantDisplayReasoningDelta { .. });
+            observed.push(event);
+            if saw_reasoning {
+                break;
             }
         }
     })
-    .await;
-    assert!(
-        saw_reasoning.is_ok(),
-        "the real provider reasoning delta must arrive before cancelling"
-    );
+    .await
+    .expect("the real provider reasoning delta must arrive before cancelling");
     cancel.cancel_turn();
+    // Paused Tokio time makes this a deterministic production-unwind
+    // deadline: host scheduler contention cannot consume the budget, while a
+    // cancellation path that actually waits on a Tokio timer still fails.
     let driver = tokio::time::timeout(std::time::Duration::from_secs(2), run)
         .await
         .expect("interactive cancellation must unwind the worker-facing driver promptly")
         .unwrap();
 
-    let events = drain_events(&mut rx);
+    observed.extend(drain_events(&mut rx));
+    let events = observed;
     assert!(
         events
             .iter()
@@ -2846,7 +2854,7 @@ async fn interactive_cancel_after_reasoning_retracts_the_durable_user_row() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn retracted_reasoning_only_turn_resends_with_an_identical_request_prefix() {
     let mut provider = ScriptedProvider::builder()
         .dialect(WireDialect::ChatCompletions)
@@ -2862,21 +2870,25 @@ async fn retracted_reasoning_only_turn_resends_with_an_identical_request_prefix(
     let run_tx = tx.clone();
     let mut submission = UserSubmission::text("same resend");
     submission.origin = crate::engine::message::SubmissionOrigin::ExternalRoot;
-    let run = tokio::spawn(async move {
+    let mut run = tokio::spawn(async move {
         driver
             .run_user_input(submission, &run_queue, &run_tx)
             .await
             .unwrap();
         driver
     });
-    let _ = provider.next_request_ready().await;
+    tokio::select! {
+        _ = provider.next_request_ready() => {}
+        _ = &mut run => panic!("driver ended before the reasoning request was captured"),
+    }
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if matches!(
-                rx.recv().await,
-                Some(TurnEvent::AssistantDisplayReasoningDelta { .. })
-            ) {
-                return;
+            let event = rx
+                .recv()
+                .await
+                .expect("turn event stream closed before the reasoning delta");
+            if matches!(event, TurnEvent::AssistantDisplayReasoningDelta { .. }) {
+                break;
             }
         }
     })
@@ -2911,7 +2923,7 @@ async fn retracted_reasoning_only_turn_resends_with_an_identical_request_prefix(
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn interactive_cancel_after_visible_text_keeps_the_durable_user_row() {
     let mut provider = ScriptedProvider::builder()
         .dialect(WireDialect::ChatCompletions)
@@ -2926,21 +2938,25 @@ async fn interactive_cancel_after_visible_text_keeps_the_durable_user_row() {
     let (queue, tx, mut rx) = event_harness();
     let mut submission = UserSubmission::text("keep after visible text");
     submission.origin = crate::engine::message::SubmissionOrigin::ExternalRoot;
-    let run = tokio::spawn(async move {
+    let mut run = tokio::spawn(async move {
         driver
             .run_user_input(submission, &queue, &tx)
             .await
             .unwrap();
         driver
     });
-    let _ = provider.next_request_ready().await;
+    tokio::select! {
+        _ = provider.next_request_ready() => {}
+        _ = &mut run => panic!("driver ended before the visible-text request was captured"),
+    }
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if matches!(
-                rx.recv().await,
-                Some(TurnEvent::AssistantDisplayTextDelta { .. })
-            ) {
-                return;
+            let event = rx
+                .recv()
+                .await
+                .expect("turn event stream closed before the visible-text delta");
+            if matches!(event, TurnEvent::AssistantDisplayTextDelta { .. }) {
+                break;
             }
         }
     })

@@ -643,11 +643,16 @@ struct PendingAction {
     shutdown: Option<Arc<AsyncActionCancellation>>,
 }
 
+type AttachedReplyReceiver =
+    tokio::sync::oneshot::Receiver<Result<cockpit_proto::Response, String>>;
+pub(crate) type AttachedReplySlot = Arc<std::sync::Mutex<Option<AttachedReplyReceiver>>>;
+
 #[derive(Debug, Default)]
 pub struct AsyncActionCancellation {
     cancelled: std::sync::atomic::AtomicBool,
     notify: Notify,
     export_temp: std::sync::Mutex<Option<std::path::PathBuf>>,
+    pending_attached_replies: std::sync::Mutex<Vec<AttachedReplySlot>>,
 }
 
 enum ExportReaperMessage {
@@ -946,7 +951,37 @@ impl AsyncActionCancellation {
 
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        self.drop_pending_attached_replies();
         self.notify.notify_waiters();
+    }
+
+    pub(crate) fn register_attached_reply(
+        &self,
+        receiver: AttachedReplyReceiver,
+    ) -> AttachedReplySlot {
+        let slot = Arc::new(std::sync::Mutex::new(Some(receiver)));
+        self.pending_attached_replies
+            .lock()
+            .expect("attached reply tracker poisoned")
+            .push(Arc::clone(&slot));
+        slot
+    }
+
+    pub(crate) fn unregister_attached_reply(&self, slot: &AttachedReplySlot) {
+        self.pending_attached_replies
+            .lock()
+            .expect("attached reply tracker poisoned")
+            .retain(|tracked| !Arc::ptr_eq(tracked, slot));
+    }
+
+    fn drop_pending_attached_replies(&self) {
+        let pending = self
+            .pending_attached_replies
+            .lock()
+            .expect("attached reply tracker poisoned");
+        for slot in pending.iter() {
+            slot.lock().expect("attached reply slot poisoned").take();
+        }
     }
 
     pub fn own_export_temp(&self, path: std::path::PathBuf) {

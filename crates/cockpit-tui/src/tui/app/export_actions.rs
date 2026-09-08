@@ -481,14 +481,13 @@ mod tests {
 
     async fn drain_until_idle(app: &mut App) {
         for _ in 0..200 {
-            let notify = app.async_actions.notifier();
-            let notified = notify.notified();
+            tokio::task::yield_now().await;
             app.drain_async_actions();
             if app.async_actions.pending_count() == 0 {
                 app.drain_async_actions();
                 return;
             }
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(25), notified).await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         panic!(
             "export action did not complete; pending={}",
@@ -745,6 +744,8 @@ mod tests {
         app.export_transcript_json("first", &exports);
         let first = rx.recv().await.unwrap();
         app.export_debug_bundle(session_id, "second", &exports);
+        tokio::task::yield_now().await;
+        app.drain_async_actions();
         let second = rx.recv().await.unwrap();
         assert!(
             first

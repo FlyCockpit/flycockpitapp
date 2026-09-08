@@ -13951,11 +13951,7 @@ pub(super) async fn run_worker(
             pending_tool_count,
         } = &stop
         {
-            let pending = match session
-                .db
-                .list_reconcilable_interrupts(session.live_id())
-                .await
-            {
+            let pending = match session.db.list_reconcilable_interrupts(session_id).await {
                 Ok(rows) => (rows.len() as i64).max(*pending_tool_count),
                 Err(error) => {
                     tracing::error!(%error, "final shutdown interrupt reconciliation scan failed");
@@ -13964,9 +13960,14 @@ pub(super) async fn run_worker(
                 }
             };
             if pending > 0 {
-                if let Err(error) =
-                    persist_paused_session_work(&session, &root_agent_name, &project_root, pending)
-                        .await
+                if let Err(error) = persist_paused_session_work(
+                    &session,
+                    session_id,
+                    &root_agent_name,
+                    &project_root,
+                    pending,
+                )
+                .await
                 {
                     tracing::error!(%error, "persisting paused session work failed");
                     shutdown_park_committed = false;
@@ -14272,8 +14273,9 @@ async fn test_injected_park_delay(_var: &str) {
     }
 }
 
-async fn persist_paused_session_work(
+pub(super) async fn persist_paused_session_work(
     session: &Session,
+    session_id: Uuid,
     root_agent_name: &str,
     project_root: &std::path::Path,
     pending_tool_count: i64,
@@ -14281,7 +14283,7 @@ async fn persist_paused_session_work(
     session
         .db
         .upsert_paused_session_work(
-            session.live_id(),
+            session_id,
             root_agent_name,
             &project_root.display().to_string(),
             "daemon shutdown paused active work",
@@ -14294,7 +14296,7 @@ async fn persist_paused_session_work(
 
 pub(super) async fn shutdown_activity_snapshot(
     session: &Session,
-    _session_id: Uuid,
+    session_id: Uuid,
     interrupts: &crate::engine::interrupt::InterruptHub,
     live: &LiveState,
 ) -> (bool, i64, bool) {
@@ -14311,17 +14313,14 @@ pub(super) async fn shutdown_activity_snapshot(
     // waiter is then gone from the map and cannot be re-detected by a later
     // sweep) still surfaces as a non-clean terminal.
     let sweep = interrupts.park_all_registered_collect().await;
-    let (pending_tool_count, scan_committed) = match session
-        .db
-        .list_reconcilable_interrupts(session.live_id())
-        .await
-    {
-        Ok(rows) => (rows.len() as i64, true),
-        Err(error) => {
-            tracing::error!(%error, "shutdown interrupt reconciliation scan failed");
-            ((sweep.count as i64).max(1), false)
-        }
-    };
+    let (pending_tool_count, scan_committed) =
+        match session.db.list_reconcilable_interrupts(session_id).await {
+            Ok(rows) => (rows.len() as i64, true),
+            Err(error) => {
+                tracing::error!(%error, "shutdown interrupt reconciliation scan failed");
+                ((sweep.count as i64).max(1), false)
+            }
+        };
     let active = {
         let (has_schedules, processing) = (live.has_active_schedules(), live.processing());
         has_schedules || processing || pending_tool_count > 0

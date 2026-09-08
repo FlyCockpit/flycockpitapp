@@ -5282,6 +5282,10 @@ async fn shutdown_activity_snapshot_counts_open_and_parked_interrupts_as_pending
         .unwrap();
     assert!(db.park_interrupt(parked).await.unwrap());
 
+    let successor_id = Uuid::new_v4();
+    session.adopt_compaction_successor(successor_id, "successor".to_string());
+    assert_eq!(session.live_id(), successor_id);
+
     let live = LiveState::default();
     let interrupts = crate::engine::interrupt::InterruptHub::detached();
     let (active, pending_tool_count, _committed) =
@@ -5291,6 +5295,22 @@ async fn shutdown_activity_snapshot_counts_open_and_parked_interrupts_as_pending
     assert_eq!(
         pending_tool_count, 2,
         "paused row count must include both open and already-parked interrupts"
+    );
+    persist_paused_session_work(
+        &session,
+        session_id,
+        "Build",
+        tmp.path(),
+        pending_tool_count,
+    )
+    .await
+    .unwrap();
+    assert!(db.paused_session_work(session_id).await.unwrap().is_some());
+    assert!(
+        db.paused_session_work(successor_id)
+            .await
+            .unwrap()
+            .is_none()
     );
     assert_eq!(db.list_open_interrupts(session_id).await.unwrap().len(), 2);
     assert!(db.get_interrupt(open).await.unwrap().is_some());

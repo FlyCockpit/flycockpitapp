@@ -142,6 +142,7 @@ impl AttachedRequestBinding {
         shutdown: &crate::tui::async_action::AsyncActionCancellation,
     ) -> Result<Response, String> {
         let (response_tx, response_rx) = oneshot::channel();
+        let reply_slot = shutdown.register_attached_reply(response_rx);
         self.sender
             .send(AttachedRequest {
                 request,
@@ -151,15 +152,27 @@ impl AttachedRequestBinding {
             })
             .await
             .map_err(|_| "daemon client task has stopped".to_string())?;
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             () = shutdown.cancelled() => {
                 Err("daemon client dropped reply channel".to_string())
             }
-            response = response_rx => {
-                response.map_err(|_| "daemon client dropped reply channel".to_string())?
-            }
-        }
+            response = Self::take_attached_reply(&reply_slot) => response,
+        };
+        shutdown.unregister_attached_reply(&reply_slot);
+        result
+    }
+
+    async fn take_attached_reply(
+        slot: &crate::tui::async_action::AttachedReplySlot,
+    ) -> Result<Response, String> {
+        let rx = slot
+            .lock()
+            .expect("attached reply slot poisoned")
+            .take()
+            .ok_or_else(|| "daemon client dropped reply channel".to_string())?;
+        rx.await
+            .map_err(|_| "daemon client dropped reply channel".to_string())?
     }
 }
 

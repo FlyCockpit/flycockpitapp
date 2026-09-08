@@ -1665,6 +1665,32 @@ impl InterruptHub {
         self.redaction_table_write_lock.lock().await
     }
 
+    /// If a park or resolve landed durably before this waiter registered,
+    /// return the outcome the tool should observe instead of blocking on the
+    /// channel. The persist→register gap is intentional for headless clients,
+    /// so shutdown/test park paths must not strand a late registration.
+    async fn durable_waiter_outcome(&self, interrupt_id: Uuid) -> Option<InterruptOutcome> {
+        let db = match self.db.as_ref() {
+            Some(db) => db,
+            None => return None,
+        };
+        match db.get_interrupt(interrupt_id).await {
+            Ok(Some(row)) => match row.state {
+                crate::db::needs_attention::InterruptState::Parked => {
+                    Some(InterruptOutcome::Parked)
+                }
+                crate::db::needs_attention::InterruptState::Resolved => Some(
+                    InterruptOutcome::Resolved(row.response.unwrap_or(ResolveResponse::Cancel)),
+                ),
+                crate::db::needs_attention::InterruptState::Interrupted => {
+                    Some(InterruptOutcome::Resolved(ResolveResponse::Cancel))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Register a wakeup for `interrupt_id` and return the guard the
     /// caller awaits. The guard removes its registry entry on drop, so a
     /// tool whose future is cancelled (e.g. the worker shuts down) never
@@ -1971,6 +1997,9 @@ impl PendingInterrupt<'_> {
     /// Block until resolved or parked. A closed wakeup channel is treated
     /// as parked: teardown must never auto-answer or auto-cancel a row.
     pub async fn wait(mut self) -> InterruptOutcome {
+        if let Some(outcome) = self.hub.durable_waiter_outcome(self.interrupt_id).await {
+            return outcome;
+        }
         let rx = self.rx.take().expect("wait called once");
         match rx.await {
             Ok(outcome) => outcome,
@@ -3214,6 +3243,22 @@ mod tests {
             db.get_interrupt(id).await.unwrap().unwrap().state,
             crate::db::needs_attention::InterruptState::Parked
         );
+    }
+
+    #[tokio::test]
+    async fn park_before_register_yields_parked_on_wait() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let (hub, _events) = attached_hub(db.clone(), session.session_id);
+        let set = question_set();
+        let id = db
+            .raise_interrupt_questions(session.session_id, "a", "first", &set)
+            .await
+            .unwrap();
+
+        assert!(hub.park(id).await);
+        let pending = hub.register(id);
+        assert!(matches!(pending.wait().await, InterruptOutcome::Parked));
     }
 
     #[tokio::test]

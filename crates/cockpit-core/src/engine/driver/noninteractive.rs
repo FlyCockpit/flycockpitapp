@@ -10466,7 +10466,17 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
         payload.tool
     );
     super::delegation_helpers::ensure_or_restore_parked_tool_call(history, &payload)?;
-    if crate::engine::agent::history_ends_with_tool_result_call(history, &payload.call_id) {
+    let audit_exists =
+        super::delegation_helpers::parked_tool_call_audit_exists(session, &payload.call_id).await?;
+    if !audit_exists {
+        super::delegation_helpers::strip_rehydrated_tool_result_for_replay(
+            history,
+            &payload.call_id,
+        );
+    }
+    if audit_exists
+        && crate::engine::agent::history_ends_with_tool_result_call(history, &payload.call_id)
+    {
         return Ok(());
     }
     let ctx = crate::engine::tool::ToolCtx {

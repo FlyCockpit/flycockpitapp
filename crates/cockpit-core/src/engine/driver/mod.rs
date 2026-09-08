@@ -5098,12 +5098,24 @@ impl Driver {
             cwd: &self.cwd,
             hooks: config_snapshot.hooks(),
         };
-        let call_completed = self.stack.last().is_some_and(|frame| {
-            crate::engine::agent::history_ends_with_tool_result_call(
-                &frame.history,
-                &payload.call_id,
-            )
-        });
+        let audit_exists =
+            delegation_helpers::parked_tool_call_audit_exists(&self.session, &payload.call_id)
+                .await?;
+        if !audit_exists {
+            if let Some(frame) = self.stack.last_mut() {
+                delegation_helpers::strip_rehydrated_tool_result_for_replay(
+                    &mut frame.history,
+                    &payload.call_id,
+                );
+            }
+        }
+        let call_completed = audit_exists
+            && self.stack.last().is_some_and(|frame| {
+                crate::engine::agent::history_ends_with_tool_result_call(
+                    &frame.history,
+                    &payload.call_id,
+                )
+            });
         if !call_completed {
             crate::engine::interrupt::with_pre_resolved_interrupt_question(
                 interrupt_id,

@@ -1,7 +1,7 @@
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::support::{IsolatedHome, output_text};
+use crate::support::{IsolatedHome, output_text, wait_until_with_home};
 use cockpit_test_support::provider::{ScriptedProvider, Turn};
 
 const TOOL_CALL_ID: &str = "run-approval-call";
@@ -97,6 +97,26 @@ fn spawn_run(mut command: Command) -> Output {
         command.spawn().expect("spawn cockpit run"),
         Duration::from_secs(15),
     )
+}
+
+async fn stop_ephemeral_daemon(home: &IsolatedHome) {
+    let output = home
+        .cockpit()
+        .args(["daemon", "stop", "--grace", "0"])
+        .output()
+        .expect("stop ephemeral daemon");
+    assert!(
+        output.status.success(),
+        "ephemeral daemon stop: {}",
+        output_text(&output)
+    );
+    wait_until_with_home(
+        "ephemeral daemon teardown",
+        Duration::from_secs(30),
+        home,
+        || async { !home.socket_path().exists() && !home.pid_file().exists() },
+    )
+    .await;
 }
 
 #[test]
@@ -362,15 +382,23 @@ async fn cwd_flag_sets_workspace_root() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn run_approval_auto_denied() {
     // Keep the provider alive for the spawned run processes; dropping it closes the listener.
-    let provider = run_provider(vec![
-        approval_tool_turn(cfg!(target_os = "linux")),
-        text_turn("adapted after approval result"),
-        approval_tool_turn(cfg!(target_os = "linux")),
-        text_turn("adapted after approval result"),
-        question_tool_turn(),
-        text_turn("adapted after approval result"),
-    ])
-    .await;
+    let mut builder = ScriptedProvider::builder();
+    // Each `cockpit run` may consume more than one provider turn (for example a
+    // denied bash call followed by adaptation text, or an extra inference pass
+    // while the ephemeral owner is still winding down). Pad several identical
+    // approval rounds before the question-script tail so later runs in this test
+    // still receive the expected tool shapes.
+    for _ in 0..4 {
+        builder = builder
+            .turn(approval_tool_turn(cfg!(target_os = "linux")))
+            .turn(text_turn("adapted after approval result"));
+    }
+    let provider = builder
+        .turn(question_tool_turn())
+        .turn(text_turn("adapted after approval result"))
+        .repeat_last()
+        .start()
+        .await;
     let home = IsolatedHome::new();
     home.write_local_provider_config(&provider.base_url());
     std::fs::write(
@@ -418,6 +446,11 @@ async fn run_approval_auto_denied() {
         "model did not receive the structured noninteractive denial"
     );
 
+    // Each `spawn_run` is a fresh CLI process against the same isolated home.
+    // Stop the ephemeral owner between runs so the next invocation does not
+    // inherit a live worker/session snapshot from the prior turn.
+    stop_ephemeral_daemon(&home).await;
+
     let mut json_command = home.cockpit();
     json_command.args(["run", "--json", "trigger sandbox approval"]);
     let json_output = spawn_run(json_command);
@@ -436,6 +469,8 @@ async fn run_approval_auto_denied() {
         "{stdout}"
     );
     assert!(stdout.contains("\"outcome\":\"auto_denied\""), "{stdout}");
+
+    stop_ephemeral_daemon(&home).await;
 
     let mut question_command = home.cockpit();
     question_command.args(["run", "--json", "trigger question decision"]);

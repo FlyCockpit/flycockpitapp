@@ -38,6 +38,22 @@ fn reasoning_delta(delta: &str) -> TurnEvent {
     }
 }
 
+fn display_text_delta(delta: &str) -> TurnEvent {
+    TurnEvent::AssistantDisplayTextDelta {
+        agent: AGENT.to_string(),
+        attempt_id: crate::engine::AssistantAttemptId::new(1),
+        delta: delta.to_string(),
+    }
+}
+
+fn display_reasoning_delta(delta: &str) -> TurnEvent {
+    TurnEvent::AssistantDisplayReasoningDelta {
+        agent: AGENT.to_string(),
+        attempt_id: crate::engine::AssistantAttemptId::new(2),
+        delta: delta.to_string(),
+    }
+}
+
 fn inference_warning() -> TurnEvent {
     TurnEvent::InferenceWarning {
         agent: AGENT.to_string(),
@@ -72,9 +88,10 @@ fn drain(rx: &mut mpsc::Receiver<TurnEvent>) -> Vec<TurnEvent> {
 /// Whether any event on the real channel carries `needle` in a delta payload.
 fn any_delta_contains(events: &[TurnEvent], needle: &str) -> bool {
     events.iter().any(|event| match event {
-        TurnEvent::AssistantTextDelta { delta, .. } | TurnEvent::ReasoningDelta { delta, .. } => {
-            delta.contains(needle)
-        }
+        TurnEvent::AssistantTextDelta { delta, .. }
+        | TurnEvent::ReasoningDelta { delta, .. }
+        | TurnEvent::AssistantDisplayTextDelta { delta, .. }
+        | TurnEvent::AssistantDisplayReasoningDelta { delta, .. } => delta.contains(needle),
         _ => false,
     })
 }
@@ -98,6 +115,14 @@ async fn buffered_delivery_withholds_deltas_until_classification() {
         .await
         .unwrap();
     event_tx.send(reasoning_delta("thinking...")).await.unwrap();
+    event_tx
+        .send(display_text_delta(&format!("displayed {SECRET}")))
+        .await
+        .unwrap();
+    event_tx
+        .send(display_reasoning_delta("display thinking..."))
+        .await
+        .unwrap();
     event_tx.send(inference_warning()).await.unwrap();
 
     // Completion returns: close the wrapped sender and collect the buffer.
@@ -118,14 +143,21 @@ async fn buffered_delivery_withholds_deltas_until_classification() {
     assert!(
         !live.iter().any(|e| matches!(
             e,
-            TurnEvent::AssistantTextDelta { .. } | TurnEvent::ReasoningDelta { .. }
+            TurnEvent::AssistantTextDelta { .. }
+                | TurnEvent::ReasoningDelta { .. }
+                | TurnEvent::AssistantDisplayTextDelta { .. }
+                | TurnEvent::AssistantDisplayReasoningDelta { .. }
         )),
         "no delta may reach the client stream before classification"
     );
 
     // Precondition: the deltas really were captured (so the absence above is
     // withholding, not that nothing was ever sent).
-    assert_eq!(withheld.withheld_count(), 2, "both deltas must be withheld");
+    assert_eq!(
+        withheld.withheld_count(),
+        4,
+        "raw and display deltas must all be withheld"
+    );
     assert!(!withheld.overflowed());
 
     // A Contained turn DROPS the buffer (never flushes). Simulate that: do not
@@ -148,6 +180,8 @@ async fn non_sensitive_turn_flushes_buffered_deltas_in_order() {
 
     event_tx.send(text_delta("A")).await.unwrap();
     event_tx.send(reasoning_delta("R")).await.unwrap();
+    event_tx.send(display_text_delta("D")).await.unwrap();
+    event_tx.send(display_reasoning_delta("DR")).await.unwrap();
     event_tx.send(text_delta("B")).await.unwrap();
 
     drop(event_tx);
@@ -167,13 +201,15 @@ async fn non_sensitive_turn_flushes_buffered_deltas_in_order() {
         .iter()
         .filter_map(|e| match e {
             TurnEvent::AssistantTextDelta { delta, .. }
-            | TurnEvent::ReasoningDelta { delta, .. } => Some(delta.as_str()),
+            | TurnEvent::ReasoningDelta { delta, .. }
+            | TurnEvent::AssistantDisplayTextDelta { delta, .. }
+            | TurnEvent::AssistantDisplayReasoningDelta { delta, .. } => Some(delta.as_str()),
             _ => None,
         })
         .collect();
     assert_eq!(
         payloads,
-        vec!["A", "R", "B"],
+        vec!["A", "R", "D", "DR", "B"],
         "Released turn must flush every withheld delta in original stream order"
     );
 }

@@ -75,6 +75,21 @@ fn drain_events(rx: &mut mpsc::Receiver<TurnEvent>) -> Vec<TurnEvent> {
     events
 }
 
+async fn synchronize_driver_idle(control_tx: &mpsc::Sender<DriverControl>) {
+    let (respond_to, receipt) = tokio::sync::oneshot::channel();
+    control_tx
+        .send(DriverControl::SwapPrimary {
+            name: "Build".to_string(),
+            respond_to,
+        })
+        .await
+        .unwrap();
+    receipt
+        .await
+        .expect("driver returns the idle-boundary receipt")
+        .expect("reselecting the current primary at idle is a no-op");
+}
+
 fn scripted_driver(provider: &ScriptedProvider) -> (Driver, tempfile::TempDir) {
     let (driver, tmp) = test_driver_with_url(8, provider.base_url());
     driver
@@ -476,7 +491,7 @@ async fn turn_loop_text_only_turn_pushes_history_and_emits_events() {
 
 #[tokio::test(start_paused = true)]
 async fn assistant_inbox_timer_yields_to_ready_human_input() {
-    let provider = ScriptedProvider::builder()
+    let mut provider = ScriptedProvider::builder()
         .dialect(WireDialect::ChatCompletions)
         .turn(Turn::Text("human turn handled".into()))
         .start()
@@ -484,7 +499,7 @@ async fn assistant_inbox_timer_yields_to_ready_human_input() {
     let (mut driver, _tmp) = scripted_driver(&provider);
     insert_pending_assistant_inbox_item(&driver, "immediate", "INBOX_TIMER_MARKER").await;
 
-    let (queue, tx, _rx) = event_harness();
+    let (queue, tx, mut rx) = event_harness();
     let target = driver.active_queue_target();
     queue
         .push(UserSubmission::text("HUMAN_TIMER_MARKER"), target)
@@ -497,16 +512,16 @@ async fn assistant_inbox_timer_yields_to_ready_human_input() {
 
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_millis(250)).await;
-    for _ in 0..100 {
-        if provider_posts(&provider).len() == 1 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    let request = provider.next_request_ready().await;
+    synchronize_driver_idle(&control_tx).await;
+    let _ = drain_events(&mut rx);
 
-    let posts = provider_posts(&provider);
-    assert_eq!(posts.len(), 1, "the ready human turn starts first");
-    let prompt = chat_messages(&posts[0])
+    assert_eq!(
+        provider.request_count(),
+        1,
+        "the ready human turn starts first"
+    );
+    let prompt = chat_messages(&request)
         .iter()
         .map(message_content_text)
         .collect::<Vec<_>>()
@@ -522,6 +537,76 @@ async fn assistant_inbox_timer_yields_to_ready_human_input() {
     assert!(
         result
             .expect_err("test abort terminates the driver")
+            .to_string()
+            .contains("driver abort requested for test")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn queued_human_input_runs_before_control_disconnect_terminates_loop() {
+    let mut provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text("human turn handled".into()))
+        .start()
+        .await;
+    let (mut driver, _tmp) = scripted_driver(&provider);
+    let (queue, tx, _rx) = event_harness();
+    let target = driver.active_queue_target();
+    queue
+        .push(UserSubmission::text("QUEUED_BEFORE_DISCONNECT"), target)
+        .await;
+    let (control_tx, control_rx) = mpsc::channel(1);
+    drop(control_tx);
+
+    let run = tokio::spawn(async move { driver.run_main_loop(queue, control_rx, &tx).await });
+    let request = provider.next_request_ready().await;
+    run.await
+        .expect("driver task joins")
+        .expect("control disconnect terminates cleanly after queued input");
+
+    let prompt = chat_messages(&request)
+        .iter()
+        .map(message_content_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        prompt.contains("QUEUED_BEFORE_DISCONNECT"),
+        "biased input readiness must win before the disconnected control arm"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn simultaneously_ready_human_input_wins_before_control() {
+    let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text("human turn handled".into()))
+        .with_response_gate(response_gate.clone())
+        .start()
+        .await;
+    let (mut driver, _tmp) = scripted_driver(&provider);
+    let (queue, tx, _rx) = event_harness();
+    let target = driver.active_queue_target();
+    queue
+        .push(UserSubmission::text("SIMULTANEOUS_HUMAN"), target)
+        .await;
+    let (control_tx, control_rx) = mpsc::channel(1);
+    control_tx.send(DriverControl::AbortForTest).await.unwrap();
+
+    let run = tokio::spawn(async move { driver.run_main_loop(queue, control_rx, &tx).await });
+    let request = provider.next_request_ready().await;
+    let prompt = chat_messages(&request)
+        .iter()
+        .map(message_content_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(prompt.contains("SIMULTANEOUS_HUMAN"));
+
+    response_gate.add_permits(1);
+    let result = run.await.expect("driver task joins");
+    assert!(
+        result
+            .expect_err("queued control runs after the human turn")
             .to_string()
             .contains("driver abort requested for test")
     );
@@ -563,7 +648,7 @@ async fn assistant_inbox_timer_yields_to_ready_control() {
 
 #[tokio::test(start_paused = true)]
 async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() {
-    let provider = ScriptedProvider::builder()
+    let mut provider = ScriptedProvider::builder()
         .dialect(WireDialect::ChatCompletions)
         .turn(Turn::Text("idle delivery handled".into()))
         .turn(Turn::Text("heartbeat delivery handled".into()))
@@ -589,7 +674,7 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
         "immediate inbox item must be claimable before the loop starts"
     );
 
-    let (queue, tx, _rx) = event_harness();
+    let (queue, tx, mut rx) = event_harness();
     let target = driver.active_queue_target();
     let (control_tx, control_rx) = mpsc::channel(1);
     let run_queue = queue.clone();
@@ -597,21 +682,15 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
     let run =
         tokio::spawn(async move { driver.run_main_loop(run_queue, control_rx, &run_tx).await });
 
-    tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_millis(250)).await;
-    for _ in 0..100 {
-        if provider_posts(&provider).len() == 1 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    let posts = provider_posts(&provider);
+    let immediate_request = provider.next_request_ready().await;
+    synchronize_driver_idle(&control_tx).await;
+    let _ = drain_events(&mut rx);
     assert_eq!(
-        posts.len(),
+        provider.request_count(),
         1,
         "immediate delivery runs at the idle boundary"
     );
-    let immediate_prompt = chat_messages(&posts[0])
+    let immediate_prompt = chat_messages(&immediate_request)
         .iter()
         .map(message_content_text)
         .collect::<Vec<_>>()
@@ -620,25 +699,22 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
     assert!(!immediate_prompt.contains("DEFERRED_INBOX_MARKER"));
 
     tokio::time::advance(Duration::from_secs(59)).await;
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
-    }
     assert_eq!(
-        provider_posts(&provider).len(),
+        provider.request_count(),
         1,
         "defer waits for the next main-session heartbeat"
     );
 
     tokio::time::advance(Duration::from_secs(1)).await;
-    for _ in 0..100 {
-        if provider_posts(&provider).len() >= 2 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    let posts = provider_posts(&provider);
-    assert_eq!(posts.len(), 2, "the heartbeat starts the deferred turn");
-    let heartbeat_prompt = chat_messages(&posts[1])
+    let heartbeat_request = provider.next_request_ready().await;
+    synchronize_driver_idle(&control_tx).await;
+    let _ = drain_events(&mut rx);
+    assert_eq!(
+        provider.request_count(),
+        2,
+        "the heartbeat starts the deferred turn"
+    );
+    let heartbeat_prompt = chat_messages(&heartbeat_request)
         .iter()
         .map(message_content_text)
         .collect::<Vec<_>>()
@@ -646,31 +722,18 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
     assert!(heartbeat_prompt.contains("DEFERRED_INBOX_MARKER"));
     assert!(!heartbeat_prompt.contains("HUMAN_TURN_MARKER"));
 
-    for _ in 0..200 {
-        let visible = inbox_db
-            .assistant_inbox_for_main(main_session_id, true, 10)
-            .await
-            .unwrap();
-        if visible.iter().any(|item| {
-            item.summary.contains("DEFERRED_INBOX_MARKER") && item.delivered_at_unix_ms.is_some()
-        }) {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-
     queue
         .push(UserSubmission::text("HUMAN_TURN_MARKER"), target)
         .await;
-    for _ in 0..100 {
-        if provider_posts(&provider).len() == 3 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    let posts = provider_posts(&provider);
-    assert_eq!(posts.len(), 3, "the human turn starts the third inference");
-    let human_prompt = chat_messages(&posts[2])
+    let human_request = provider.next_request_ready().await;
+    synchronize_driver_idle(&control_tx).await;
+    let _ = drain_events(&mut rx);
+    assert_eq!(
+        provider.request_count(),
+        3,
+        "the human turn starts the third inference"
+    );
+    let human_prompt = chat_messages(&human_request)
         .iter()
         .rev()
         .find(|message| message_role(message) == "user")
@@ -679,20 +742,10 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
     assert!(human_prompt.contains("HUMAN_TURN_MARKER"));
     assert!(!human_prompt.contains("DEFERRED_INBOX_MARKER"));
 
-    let mut visible = Vec::new();
-    for _ in 0..100 {
-        visible = inbox_db
-            .assistant_inbox_for_main(main_session_id, true, 10)
-            .await
-            .unwrap();
-        if visible
-            .iter()
-            .all(|item| item.delivered_at_unix_ms.is_some())
-        {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    let visible = inbox_db
+        .assistant_inbox_for_main(main_session_id, true, 10)
+        .await
+        .unwrap();
     assert_eq!(visible.len(), 2);
     assert!(
         visible

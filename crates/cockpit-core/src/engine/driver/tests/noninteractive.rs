@@ -1,5 +1,51 @@
 use super::*;
 
+#[test]
+fn noninteractive_child_inherits_parent_provider_snapshot_by_construction() {
+    let (mut driver, _tmp) = test_driver(1);
+    let (mut scripted_providers, provider, model) = driver
+        .test_providers_override
+        .take()
+        .expect("scripted parent has a provider snapshot");
+    scripted_providers
+        .providers
+        .get_mut(&provider)
+        .expect("active scripted provider is registered")
+        .url = "http://127.0.0.1:9/v1".to_string();
+    driver.test_providers_override = Some((scripted_providers, provider, model));
+    let (parent_providers, parent_provider, parent_model) = driver
+        .test_providers_override
+        .as_ref()
+        .expect("scripted parent has a provider snapshot");
+
+    let child_config = driver
+        .spawn_args_delegated_in_cwd(
+            &driver.cwd,
+            false,
+            Vec::new(),
+            None,
+            crate::engine::builtin::DelegationRecursionContext::default(),
+        )
+        .config;
+    let child_providers = child_config.providers();
+    let child_providers_json = serde_json::to_value(&child_providers).unwrap();
+    let parent_providers_json = serde_json::to_value(parent_providers).unwrap();
+    let base_providers_json = serde_json::to_value(driver.config.providers()).unwrap();
+
+    assert_eq!(child_config.generation(), driver.config.generation());
+    assert_eq!(child_providers_json, parent_providers_json);
+    assert_ne!(
+        child_providers_json, base_providers_json,
+        "the regression fixture must distinguish the scripted parent registry from the base handle"
+    );
+    let child_active = child_providers
+        .active_model
+        .as_ref()
+        .expect("child provider snapshot keeps the active selection");
+    assert_eq!(child_active.provider, *parent_provider);
+    assert_eq!(child_active.model, *parent_model);
+}
+
 #[tokio::test]
 async fn intermediate_noninteractive_continue_checkpoint_survives_cancel_or_failure_for_restart() {
     // `history` and `next_prompt` model the state immediately after a turn
@@ -99,7 +145,8 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
                 }),
             )
         };
-        let provider = ScriptedProvider::builder()
+        let child_response_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut provider = ScriptedProvider::builder()
             .dialect(WireDialect::ChatCompletions)
             .turn(Turn::ParallelToolCalls(vec![
                 delegate("delegate-a", "readonly-probe", "inspect alpha"),
@@ -117,12 +164,12 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
             // The two concurrently admitted children may claim these two
             // equivalent terminal responses in either wall-clock order.
             .turn(Turn::Text("delegate completed".into()))
-            // These are the two independently started child turns.  Keeping
-            // both sockets open gives the assertion below a deterministic
-            // production in-flight window; this is not a planner probe.
-            .with_delay(std::time::Duration::from_millis(350))
+            // These are the two independently started child turns. Keep both
+            // sockets open behind an explicit gate until the assertion below
+            // observes them; this is not a planner probe or a timing window.
+            .with_response_gate(child_response_gate.clone())
             .turn(Turn::Text("delegate completed".into()))
-            .with_delay(std::time::Duration::from_millis(350))
+            .with_response_gate(child_response_gate.clone())
             .turn(Turn::Text("serial delegate completed".into()))
             .turn(Turn::Text("parent observed all results".into()))
             .start()
@@ -184,21 +231,28 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
                 driver.run_user_input(UserSubmission::text("run mixed lane"), &queue, &tx),
             );
             tokio::pin!(run);
-            for _ in 0..100 {
-                // Request one is the root planning turn.  Requests two and three
-                // can only be the two distinct delegated calls.  They are both
-                // still held by the delayed fixture, proving simultaneous real
-                // child attempts under the one mixed Driver lane (rather than two
-                // planner classifications or a synthetic batch rewrite).
-                if provider.request_count() >= 3 {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            for expected_request in 1..=3 {
+                // Request one is the root planning turn. Requests two and three
+                // can only be the two distinct delegated calls. Poll the driver
+                // concurrently with the provider readiness channel: merely pinning
+                // a future does not drive it.
+                let request = tokio::select! {
+                    result = &mut run => panic!(
+                        "driver completed after only {} provider requests: {result:?}",
+                        expected_request - 1,
+                    ),
+                    // The provider's existing short failure guard prevents a
+                    // broken admission path from hanging the suite; overlap is
+                    // proved by the response gate, never by this timeout.
+                    request = provider.next_request() => request,
+                };
+                assert!(request.request_line.starts_with("POST "));
             }
             assert!(
-                provider.request_count() >= 3,
+                provider.peak_in_flight() >= 2,
                 "both separately identified eligible delegates must be in flight before either settles"
             );
+            child_response_gate.add_permits(2);
             run.await.unwrap();
         }
 
@@ -5571,12 +5625,13 @@ fn scheduler_defers_delegate_admission_until_serial_barrier() {
             "the released delegate creates one real child lifecycle"
         );
         assert_eq!(children[0].task_call_id, delegate_call_id);
+        let captured = provider.captured();
         assert!(
-            provider.captured().iter().any(|request| {
+            captured.iter().any(|request| {
                 request.request_line.starts_with("POST ")
                     && request.body["model"] == "child-surface"
             }),
-            "the refreshed child execution surface must reach its real child provider attempt"
+            "the refreshed child execution surface must reach its real child provider attempt; children={children:?}; events={events:?}; requests={captured:?}"
         );
         assert!(
             drain_turn_events(&mut rx).iter().any(|event| {

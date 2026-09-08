@@ -3657,13 +3657,9 @@ impl Driver {
     ) -> crate::daemon::session_worker::SessionConfigHandle {
         #[cfg(test)]
         if let Some((providers, _, _)) = &self.test_providers_override {
-            return crate::daemon::session_worker::SessionConfigHandle::detached(
-                crate::daemon::session_worker::SessionConfigSnapshot::new(
-                    self.config.generation(),
-                    providers.clone(),
-                    self.config.extended().clone(),
-                ),
-            );
+            let mut snapshot = (*self.config.snapshot()).clone();
+            snapshot.providers = providers.clone();
+            return crate::daemon::session_worker::SessionConfigHandle::detached(snapshot);
         }
         self.config.clone()
     }
@@ -6017,34 +6013,6 @@ impl Driver {
                 self.clear_goal_idle_intervention();
                 self.maybe_continue_active_goal(&input_queue, tx).await?;
                 self.refresh_goal_watchdog(&mut goal_watchdog).await;
-                continue;
-            }
-            if !waiting_for_keep_parked_siblings {
-                match control_rx.try_recv() {
-                    Ok(ctl) => {
-                        goal_watchdog = None;
-                        match ctl {
-                            #[cfg(test)]
-                            DriverControl::AbortForTest => {
-                                anyhow::bail!("driver abort requested for test");
-                            }
-                            control => {
-                                self.run_control_with_input_queue(control, &input_queue, tx)
-                                    .await;
-                            }
-                        }
-                        continue;
-                    }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-                }
-            }
-            if !waiting_for_keep_parked_siblings
-                && !human_input_already_pending
-                && self
-                    .try_deliver_immediate_assistant_inbox(&input_queue, tx, &mut goal_watchdog)
-                    .await?
-            {
                 continue;
             }
             // Wait for the next thing to do: a user message, a control
@@ -16297,6 +16265,8 @@ impl Driver {
         model: Option<crate::engine::model_roles::DelegationModelSelector>,
         recursion: crate::engine::builtin::DelegationRecursionContext,
     ) -> crate::engine::builtin::SpawnArgs {
+        let mut inherited = self.spawn_args(interactive);
+        inherited.config = self.config_for_noninteractive_child();
         let parent = self.stack.last().expect("stack never empty");
         let inherited_vnext_root_pin = parent.agent.vnext_grant.is_some()
             && self.model_override.as_ref().is_some_and(|override_model| {
@@ -16341,7 +16311,7 @@ impl Driver {
                 .stack
                 .last()
                 .map(|frame| frame.agent.mcp_resolver.catalog().admitted_entries()),
-            ..self.spawn_args(interactive)
+            ..inherited
         }
     }
 
@@ -16381,6 +16351,8 @@ impl Driver {
         recursion: crate::engine::builtin::DelegationRecursionContext,
         confinement: DelegationConfinement,
     ) -> crate::engine::builtin::SpawnArgs {
+        let mut inherited = self.spawn_args(interactive);
+        inherited.config = self.config_for_noninteractive_child();
         let parent = self.stack.last().expect("stack never empty");
         let inherited_vnext_root_pin = parent.agent.vnext_grant.is_some()
             && self.model_override.as_ref().is_some_and(|override_model| {
@@ -16425,7 +16397,7 @@ impl Driver {
                 .last()
                 .map(|frame| frame.agent.mcp_resolver.catalog().admitted_entries()),
             workspace_lease: confinement.workspace_lease,
-            ..self.spawn_args(interactive)
+            ..inherited
         }
     }
 

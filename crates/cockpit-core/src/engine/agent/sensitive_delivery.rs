@@ -20,8 +20,8 @@
 //! completion stream a wrapped `event_tx` produced by [`BufferedDeliverySink`]
 //! instead of the real turn channel. The sink:
 //!
-//! * **Withholds** every `AssistantTextDelta` / `ReasoningDelta` — buffering it
-//!   in stream order rather than forwarding it — until the turn is classified.
+//! * **Withholds** every raw or display text/reasoning delta — buffering it in
+//!   stream order rather than forwarding it — until the turn is classified.
 //! * **Forwards** every other event (e.g. `InferenceWarning`) to the real
 //!   channel immediately, preserving its ordering. Those carry no
 //!   pre-classification assistant plaintext.
@@ -64,7 +64,7 @@ use super::TurnEvent;
 
 /// Maximum withheld UTF-8 delta bytes buffered per turn before the turn fails
 /// closed. 1 MiB — far beyond any legitimate single assistant turn; a turn whose
-/// withheld `AssistantTextDelta` + `ReasoningDelta` payloads exceed it is
+/// withheld raw/display text and reasoning delta payloads exceed it is
 /// `Discarded` (drop buffer, content-free status), never `Released`.
 pub(crate) const SENSITIVE_TURN_BUFFER_CAP: usize = 1024 * 1024;
 
@@ -82,8 +82,8 @@ const SINK_CHANNEL_CAP: usize = 64;
 /// a stray `{:?}` cannot render the withheld deltas' plaintext.
 #[derive(Default)]
 pub(crate) struct WithheldDeltas {
-    /// The withheld events, in stream order: the `AssistantTextDelta` /
-    /// `ReasoningDelta` deltas plus any non-allowlisted event caught by the
+    /// The withheld events, in stream order: all raw/display text/reasoning
+    /// deltas plus any non-allowlisted event caught by the
     /// forwarder's fail-closed default arm. Cleared the instant `overflow` is
     /// set, so no plaintext survives an overflow even transiently.
     events: Vec<TurnEvent>,
@@ -253,7 +253,9 @@ async fn forward(
         };
         match &event {
             TurnEvent::AssistantTextDelta { delta, .. }
-            | TurnEvent::ReasoningDelta { delta, .. } => {
+            | TurnEvent::ReasoningDelta { delta, .. }
+            | TurnEvent::AssistantDisplayTextDelta { delta, .. }
+            | TurnEvent::AssistantDisplayReasoningDelta { delta, .. } => {
                 if withheld.overflow {
                     // Already overflowed: drop every further delta. No plaintext
                     // is forwarded or retained once the budget is blown.
@@ -291,13 +293,6 @@ async fn forward(
             // (`try_send`), dropping under transient backpressure rather than
             // wedging the turn.
             TurnEvent::InferenceWarning { .. } => {
-                let _ = real_tx.try_send(event);
-            }
-            // The display classifier has already assigned these deltas to the
-            // UI's text/reasoning channels. They are the live display surface;
-            // buffering only the legacy raw deltas must not suppress them.
-            TurnEvent::AssistantDisplayTextDelta { .. }
-            | TurnEvent::AssistantDisplayReasoningDelta { .. } => {
                 let _ = real_tx.try_send(event);
             }
             // Fail-closed default: any OTHER event is WITHHELD (buffered, surfaced

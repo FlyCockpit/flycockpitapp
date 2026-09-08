@@ -16,6 +16,70 @@ mod schedule;
 mod skills_preflight;
 mod turn_loop;
 
+/// Await a real provider request/event readiness signal without advancing the
+/// paused production clock.
+///
+/// A finite poll budget keeps broken setup wiring from hanging forever, while
+/// the deliberately generous number of scheduler turns prevents host load
+/// from consuming the post-cancel virtual-time budget before cancellation has
+/// actually been requested.
+async fn await_paused_driver_test_readiness<T>(
+    future: impl std::future::Future<Output = T>,
+    context: &str,
+) -> T {
+    const MAX_POLLS: usize = 100_000;
+
+    tokio::pin!(future);
+    for _ in 0..MAX_POLLS {
+        tokio::task::yield_now().await;
+        tokio::select! {
+            biased;
+            result = &mut future => return result,
+            _ = std::future::ready(()) => {}
+        }
+    }
+    panic!("{context} did not become ready within {MAX_POLLS} scheduler polls");
+}
+
+/// Bound post-cancel completion under a paused Tokio clock while live provider
+/// TCP prevents automatic timer advancement.
+async fn await_paused_driver_test_completion<T>(
+    future: impl std::future::Future<Output = T>,
+    context: &str,
+) -> T {
+    const SETTLE_POLLS: usize = 100_000;
+    const QUANTUM: std::time::Duration = std::time::Duration::from_millis(1);
+    const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    tokio::pin!(future);
+    // Give cancellation cleanup (including blocking SQLite work) ample fair
+    // scheduling without spending its virtual deadline under host load.
+    for _ in 0..SETTLE_POLLS {
+        tokio::task::yield_now().await;
+        tokio::select! {
+            biased;
+            result = &mut future => return result,
+            _ = std::future::ready(()) => {}
+        }
+    }
+    let mut elapsed = std::time::Duration::ZERO;
+    loop {
+        tokio::task::yield_now().await;
+        tokio::select! {
+            biased;
+            result = &mut future => return result,
+            _ = std::future::ready(()) => {}
+        }
+        if elapsed >= MAX_WAIT {
+            panic!(
+                "{context} did not complete within {MAX_WAIT:?} of explicitly advanced virtual time"
+            );
+        }
+        tokio::time::advance(QUANTUM).await;
+        elapsed += QUANTUM;
+    }
+}
+
 /// `run_user_input` deliberately returns `Ok(())` after it has cleaned up a
 /// cancellation or terminal inference failure.  The late-steer receipt is a
 /// stricter boundary: neither a cancellation before the dispatch permit, a

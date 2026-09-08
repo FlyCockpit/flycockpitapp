@@ -2586,9 +2586,12 @@ async fn turn_loop_cancellation_mid_stream_does_not_persist_partial_output() {
             .unwrap();
         driver
     });
-    let _captured = provider.next_request().await;
+    await_paused_driver_test_readiness(provider.next_request_ready(), "hung request readiness")
+        .await;
     cancel.cancel_turn();
-    let driver = handle.await.unwrap();
+    let driver = await_paused_driver_test_completion(handle, "cancelled turn unwind")
+        .await
+        .unwrap();
 
     let events = drain_events(&mut rx);
     assert!(assistant_texts(&events).is_empty(), "{events:?}");
@@ -2629,9 +2632,12 @@ async fn stop_all_cancels_in_flight_turn_like_cancel_turn() {
             .unwrap();
         driver
     });
-    let _captured = provider.next_request().await;
+    await_paused_driver_test_readiness(provider.next_request_ready(), "hung request readiness")
+        .await;
     cancel.cancel_all_session_work();
-    let driver = handle.await.unwrap();
+    let driver = await_paused_driver_test_completion(handle, "stopped turn unwind")
+        .await
+        .unwrap();
 
     let events = drain_events(&mut rx);
     assert!(assistant_texts(&events).is_empty(), "{events:?}");
@@ -2797,35 +2803,41 @@ async fn interactive_cancel_after_reasoning_retracts_the_durable_user_row() {
             .unwrap();
         driver
     });
-    tokio::select! {
-        _ = provider.next_request_ready() => {}
-        _ = &mut run => panic!("driver ended before the reasoning request was captured"),
-    }
+    await_paused_driver_test_readiness(
+        async {
+            tokio::select! {
+                _ = provider.next_request_ready() => {}
+                _ = &mut run => panic!("driver ended before the reasoning request was captured"),
+            }
+        },
+        "reasoning request readiness",
+    )
+    .await;
 
     let mut observed = Vec::new();
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            let event = rx
-                .recv()
-                .await
-                .expect("turn event stream closed before the reasoning delta");
-            let saw_reasoning = matches!(event, TurnEvent::AssistantDisplayReasoningDelta { .. });
-            observed.push(event);
-            if saw_reasoning {
-                break;
+    await_paused_driver_test_readiness(
+        async {
+            loop {
+                let event = rx
+                    .recv()
+                    .await
+                    .expect("turn event stream closed before the reasoning delta");
+                let saw_reasoning =
+                    matches!(event, TurnEvent::AssistantDisplayReasoningDelta { .. });
+                observed.push(event);
+                if saw_reasoning {
+                    break;
+                }
             }
-        }
-    })
-    .await
-    .expect("the real provider reasoning delta must arrive before cancelling");
+        },
+        "reasoning delta readiness",
+    )
+    .await;
     cancel.cancel_turn();
-    // Paused Tokio time makes this a deterministic production-unwind
-    // deadline: host scheduler contention cannot consume the budget, while a
-    // cancellation path that actually waits on a Tokio timer still fails.
-    let driver = tokio::time::timeout(std::time::Duration::from_secs(2), run)
-        .await
-        .expect("interactive cancellation must unwind the worker-facing driver promptly")
-        .unwrap();
+    let driver =
+        await_paused_driver_test_completion(run, "interactive reasoning cancellation unwind")
+            .await
+            .unwrap();
 
     observed.extend(drain_events(&mut rx));
     let events = observed;
@@ -2877,25 +2889,36 @@ async fn retracted_reasoning_only_turn_resends_with_an_identical_request_prefix(
             .unwrap();
         driver
     });
-    tokio::select! {
-        _ = provider.next_request_ready() => {}
-        _ = &mut run => panic!("driver ended before the reasoning request was captured"),
-    }
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            let event = rx
-                .recv()
-                .await
-                .expect("turn event stream closed before the reasoning delta");
-            if matches!(event, TurnEvent::AssistantDisplayReasoningDelta { .. }) {
-                break;
+    await_paused_driver_test_readiness(
+        async {
+            tokio::select! {
+                _ = provider.next_request_ready() => {}
+                _ = &mut run => panic!("driver ended before the reasoning request was captured"),
             }
-        }
-    })
-    .await
-    .expect("the cancellation follows actual reasoning output");
+        },
+        "reasoning resend request readiness",
+    )
+    .await;
+    await_paused_driver_test_readiness(
+        async {
+            loop {
+                let event = rx
+                    .recv()
+                    .await
+                    .expect("turn event stream closed before the reasoning delta");
+                if matches!(event, TurnEvent::AssistantDisplayReasoningDelta { .. }) {
+                    break;
+                }
+            }
+        },
+        "reasoning resend delta readiness",
+    )
+    .await;
     cancel.cancel_turn();
-    let mut driver = run.await.unwrap();
+    let mut driver =
+        await_paused_driver_test_completion(run, "reasoning resend cancellation unwind")
+            .await
+            .unwrap();
     let first_request = provider.captured()[0].body.clone();
     assert!(
         first_request.to_string().contains("[time:"),
@@ -2945,25 +2968,35 @@ async fn interactive_cancel_after_visible_text_keeps_the_durable_user_row() {
             .unwrap();
         driver
     });
-    tokio::select! {
-        _ = provider.next_request_ready() => {}
-        _ = &mut run => panic!("driver ended before the visible-text request was captured"),
-    }
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            let event = rx
-                .recv()
-                .await
-                .expect("turn event stream closed before the visible-text delta");
-            if matches!(event, TurnEvent::AssistantDisplayTextDelta { .. }) {
-                break;
+    await_paused_driver_test_readiness(
+        async {
+            tokio::select! {
+                _ = provider.next_request_ready() => {}
+                _ = &mut run => panic!("driver ended before the visible-text request was captured"),
             }
-        }
-    })
-    .await
-    .expect("visible text must close the retraction window before cancellation");
+        },
+        "visible-text request readiness",
+    )
+    .await;
+    await_paused_driver_test_readiness(
+        async {
+            loop {
+                let event = rx
+                    .recv()
+                    .await
+                    .expect("turn event stream closed before the visible-text delta");
+                if matches!(event, TurnEvent::AssistantDisplayTextDelta { .. }) {
+                    break;
+                }
+            }
+        },
+        "visible-text delta readiness",
+    )
+    .await;
     cancel.cancel_turn();
-    let driver = run.await.unwrap();
+    let driver = await_paused_driver_test_completion(run, "visible-text cancellation unwind")
+        .await
+        .unwrap();
 
     let events = drain_events(&mut rx);
     assert!(
@@ -2984,7 +3017,11 @@ async fn interactive_cancel_after_visible_text_keeps_the_durable_user_row() {
 #[test]
 fn interactive_cancel_after_tool_call_keeps_the_durable_user_row() {
     crate::test_env::run_async_with_large_stack(|| async {
-        let provider = ScriptedProvider::builder()
+        // `run_async_with_large_stack` owns a fresh current-thread runtime, so
+        // freezing it here is isolated to this test and happens before any
+        // test future installs a timer.
+        tokio::time::pause();
+        let mut provider = ScriptedProvider::builder()
             .dialect(WireDialect::ChatCompletions)
             .turn(Turn::ToolCall {
                 id: "read-before-cancel".into(),
@@ -3003,27 +3040,53 @@ fn interactive_cancel_after_tool_call_keeps_the_durable_user_row() {
         Arc::make_mut(&mut driver.stack[0].agent).scan_tool_results = false;
         let cancel = driver.cancel_handle();
         let (queue, tx, mut rx) = event_harness();
-        let run = tokio::spawn(async move {
+        let mut run = tokio::spawn(async move {
             driver
                 .run_user_input(UserSubmission::text("read before cancel"), &queue, &tx)
                 .await
                 .unwrap();
             driver
         });
+        await_paused_driver_test_readiness(
+            provider.next_request_ready(),
+            "tool-call request readiness",
+        )
+        .await;
         let mut observed = Vec::new();
-        loop {
-            let event = rx.recv().await.expect("turn event stream stays open");
-            let tool_completed = matches!(
-                &event,
-                TurnEvent::ToolEnd { call_id, .. } if call_id == "read-before-cancel"
-            );
-            observed.push(event);
-            if tool_completed {
-                break;
-            }
-        }
+        await_paused_driver_test_readiness(
+            async {
+                loop {
+                    let event = rx
+                        .recv()
+                        .await
+                        .expect("turn event stream closed before tool completion");
+                    let tool_completed = matches!(
+                        &event,
+                        TurnEvent::ToolEnd { call_id, .. } if call_id == "read-before-cancel"
+                    );
+                    observed.push(event);
+                    if tool_completed {
+                        break;
+                    }
+                }
+            },
+            "tool completion event readiness",
+        )
+        .await;
+        await_paused_driver_test_readiness(
+            async {
+                tokio::select! {
+                    _ = provider.next_request_ready() => {}
+                    _ = &mut run => panic!("driver ended before the post-tool request"),
+                }
+            },
+            "post-tool hung request readiness",
+        )
+        .await;
         cancel.cancel_turn();
-        let driver = run.await.unwrap();
+        let driver = await_paused_driver_test_completion(run, "post-tool cancellation unwind")
+            .await
+            .unwrap();
 
         observed.extend(drain_events(&mut rx));
         let events = observed;
@@ -3511,9 +3574,15 @@ async fn root_stop_gate_not_entered_on_cancellation() {
             .unwrap();
         driver
     });
-    let _captured = provider.next_request().await;
+    await_paused_driver_test_readiness(
+        provider.next_request_ready(),
+        "stop-gate request readiness",
+    )
+    .await;
     cancel.cancel_turn();
-    let driver = handle.await.unwrap();
+    let driver = await_paused_driver_test_completion(handle, "stop-gate cancellation unwind")
+        .await
+        .unwrap();
 
     assert!(
         observe_hook_events(&driver, "stop").await.is_empty(),

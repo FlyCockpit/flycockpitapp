@@ -1826,7 +1826,7 @@ async fn stop_aborts_noninteractive_jobs_of_the_cancelled_generation() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn stop_cancels_in_flight_background_delegate_inference() {
     use cockpit_test_support::provider::{ScriptedProvider, Turn, WireDialect};
 
@@ -1849,12 +1849,16 @@ async fn stop_cancels_in_flight_background_delegate_inference() {
                 .await
         }
     });
-    let _captured = provider.next_request().await;
+    await_paused_driver_test_readiness(
+        provider.next_request_ready(),
+        "background delegate request readiness",
+    )
+    .await;
     cancel.cancel();
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), run)
-        .await
-        .expect("Stop must abort in-flight delegate inference")
-        .expect("join");
+    let result =
+        await_paused_driver_test_completion(run, "background delegate cancellation unwind")
+            .await
+            .expect("join");
     let completion = result.expect("execute_single returns a completion on cancel");
     assert!(
         completion.failed,

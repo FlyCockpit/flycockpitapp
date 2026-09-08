@@ -7372,7 +7372,11 @@ pub(super) async fn run_worker(
     // the original continuation and its already-recorded answer.
     let mut terminal_tree_interrupt_replays = Vec::new();
     let mut startup_reconciliation_committed = true;
-    match session.db.list_reconcilable_interrupts(session_id).await {
+    match session
+        .db
+        .list_reconcilable_interrupts(session.live_id())
+        .await
+    {
         Ok(rows) => {
             for row in rows {
                 // A host-capability refresh is a daemon RPC with a durable
@@ -8251,7 +8255,11 @@ pub(super) async fn run_worker(
     // driver has attached. Re-read just the terminal execution claims after
     // that durable pass so the original continuation is replayed rather than
     // being stranded until another user action happens.
-    match session.db.list_reconcilable_interrupts(session_id).await {
+    match session
+        .db
+        .list_reconcilable_interrupts(session.live_id())
+        .await
+    {
         Ok(rows) => {
             for row in rows {
                 if row.state != crate::db::needs_attention::InterruptState::Executing
@@ -8411,7 +8419,7 @@ pub(super) async fn run_worker(
         };
         let root_has_parked_continuation = match session
             .db
-            .list_reconcilable_interrupts(session_id)
+            .list_reconcilable_interrupts(session.live_id())
             .await
         {
             Ok(rows) => match expected_parked_interrupt_id {
@@ -13951,8 +13959,12 @@ pub(super) async fn run_worker(
             pending_tool_count,
         } = &stop
         {
-            let pending = match session.db.list_reconcilable_interrupts(session_id).await {
-                Ok(rows) => (rows.len() as i64).max(*pending_tool_count),
+            let pending = match session
+                .db
+                .count_nonterminal_interrupts(session.live_id())
+                .await
+            {
+                Ok(rows) => rows.max(*pending_tool_count),
                 Err(error) => {
                     tracing::error!(%error, "final shutdown interrupt reconciliation scan failed");
                     shutdown_park_committed = false;
@@ -14296,7 +14308,7 @@ pub(super) async fn persist_paused_session_work(
 
 pub(super) async fn shutdown_activity_snapshot(
     session: &Session,
-    session_id: Uuid,
+    _session_id: Uuid,
     interrupts: &crate::engine::interrupt::InterruptHub,
     live: &LiveState,
 ) -> (bool, i64, bool) {
@@ -14313,14 +14325,20 @@ pub(super) async fn shutdown_activity_snapshot(
     // waiter is then gone from the map and cannot be re-detected by a later
     // sweep) still surfaces as a non-clean terminal.
     let sweep = interrupts.park_all_registered_collect().await;
-    let (pending_tool_count, scan_committed) =
-        match session.db.list_reconcilable_interrupts(session_id).await {
-            Ok(rows) => (rows.len() as i64, true),
-            Err(error) => {
-                tracing::error!(%error, "shutdown interrupt reconciliation scan failed");
-                ((sweep.count as i64).max(1), false)
-            }
-        };
+    let (pending_tool_count, scan_committed) = match session
+        .db
+        .count_nonterminal_interrupts(session.live_id())
+        .await
+    {
+        // Durable lifecycle ownership is broader than the renderable
+        // replay projection: linked decisions can retain exact parked
+        // continuations after their question columns are consumed.
+        Ok(rows) => (shutdown_pending_tool_count(rows, sweep.count), true),
+        Err(error) => {
+            tracing::error!(%error, "shutdown interrupt reconciliation scan failed");
+            ((sweep.count as i64).max(1), false)
+        }
+    };
     let active = {
         let (has_schedules, processing) = (live.has_active_schedules(), live.processing());
         has_schedules || processing || pending_tool_count > 0
@@ -14330,6 +14348,10 @@ pub(super) async fn shutdown_activity_snapshot(
         pending_tool_count,
         sweep.all_committed && scan_committed,
     )
+}
+
+pub(super) fn shutdown_pending_tool_count(nonterminal_rows: i64, parked_waiters: usize) -> i64 {
+    nonterminal_rows.max(i64::try_from(parked_waiters).unwrap_or(i64::MAX))
 }
 
 #[cfg(test)]

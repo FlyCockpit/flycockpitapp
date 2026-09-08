@@ -474,6 +474,26 @@ impl Db {
         .await
     }
 
+    /// Count durable interrupt work that must survive a daemon lifecycle
+    /// boundary. Unlike the client/replay projection queries, this deliberately
+    /// does not require a renderable question projection: linked decisions can
+    /// own an exact parked continuation after those presentation columns have
+    /// been consumed.
+    pub async fn count_nonterminal_interrupts(&self, session_id: Uuid) -> Result<i64> {
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*)
+                   FROM needs_attention
+                  WHERE session_id = ?1
+                    AND state IN ('open', 'parked', 'executing')",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .context("counting nonterminal needs_attention rows")
+        })
+        .await
+    }
+
     pub async fn get_interrupt(&self, interrupt_id: Uuid) -> Result<Option<NeedsAttentionRow>> {
         self.read(move |conn| {
             let mut stmt = conn
@@ -1091,6 +1111,12 @@ mod tests {
             .raise_interrupt_questions(session.session_id, "Build", "approval required", &questions)
             .await
             .unwrap();
+        assert_eq!(
+            db.count_nonterminal_interrupts(session.session_id)
+                .await
+                .unwrap(),
+            1
+        );
 
         let open = db.list_open_interrupts(session.session_id).await.unwrap();
         assert_eq!(open.len(), 1);
@@ -1116,6 +1142,12 @@ mod tests {
         let resolved = db.get_interrupt(interrupt_id).await.unwrap().unwrap();
         assert_eq!(resolved.state, InterruptState::Resolved);
         assert!(resolved.response.is_some());
+        assert_eq!(
+            db.count_nonterminal_interrupts(session.session_id)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

@@ -5272,19 +5272,22 @@ async fn shutdown_activity_snapshot_counts_open_and_parked_interrupts_as_pending
             sandbox_escalation: None,
         }],
     };
+    let successor_id = db
+        .create_session("p", tmp.path().to_str().unwrap(), "Build")
+        .await
+        .unwrap()
+        .session_id;
+    session.adopt_compaction_successor(successor_id, "successor".to_string());
+    assert_eq!(session.live_id(), successor_id);
     let open = db
-        .raise_interrupt_questions(session_id, "Build", "open", &set)
+        .raise_interrupt_questions(successor_id, "Build", "open", &set)
         .await
         .unwrap();
     let parked = db
-        .raise_interrupt_questions(session_id, "Build", "parked", &set)
+        .raise_interrupt_questions(successor_id, "Build", "parked", &set)
         .await
         .unwrap();
     assert!(db.park_interrupt(parked).await.unwrap());
-
-    let successor_id = Uuid::new_v4();
-    session.adopt_compaction_successor(successor_id, "successor".to_string());
-    assert_eq!(session.live_id(), successor_id);
 
     let live = LiveState::default();
     let interrupts = crate::engine::interrupt::InterruptHub::detached();
@@ -5312,8 +5315,17 @@ async fn shutdown_activity_snapshot_counts_open_and_parked_interrupts_as_pending
             .unwrap()
             .is_none()
     );
-    assert_eq!(db.list_open_interrupts(session_id).await.unwrap().len(), 2);
+    assert_eq!(
+        db.list_open_interrupts(successor_id).await.unwrap().len(),
+        2
+    );
     assert!(db.get_interrupt(open).await.unwrap().is_some());
+}
+
+#[test]
+fn shutdown_pending_count_retains_parked_waiters_excluded_from_recovery_projection() {
+    assert_eq!(shutdown_pending_tool_count(0, 1), 1);
+    assert_eq!(shutdown_pending_tool_count(2, 1), 2);
 }
 
 /// §6.5 de-dupe: the latch fires the broadcast exactly once per condition.

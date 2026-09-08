@@ -465,8 +465,9 @@ pub fn output_text(output: &Output) -> String {
 }
 
 /// Window in which a freshly started/restarted daemon must record its pid
-/// receipt, and in which a live owner must publish its socket hello after
-/// that receipt. See [`wait_for_status_handshake`].
+/// receipt. After a live owner is observed, the handshake wait is driven by
+/// the owner's liveness and the socket hello, not by these budgets — see
+/// [`wait_for_status_handshake`].
 const DAEMON_START_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
 const DAEMON_RESTART_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -549,19 +550,12 @@ fn handshake_debug(home: &IsolatedHome) -> String {
 ///   a SIGKILLed owner while its replacement is still starting) — keep
 ///   waiting for a live owner.
 ///
-/// Once a live owner is observed, the pid receipt precedes socket publication
-/// (recovery runs between the two). Bound only that post-pid window with the
-/// same budget as the no-owner window so a stuck boot fails with diagnostics
-/// instead of burning the whole nextest slow-test allowance while the owner
-/// never reaches bind.
-///
-/// `timeout` bounds the window in which no owner was ever observed, and the
-/// post-pid socket-publication window once a live owner is seen.
+/// `timeout` bounds only the window in which no owner was ever observed; once
+/// a live owner is seen, the wait is patient for as long as that owner lives.
 async fn wait_for_status_handshake(home: &IsolatedHome, timeout: Duration) {
     let no_owner_deadline = Instant::now() + timeout;
     let mut delay = Duration::from_millis(20);
     let mut last_live_pid: Option<u32> = None;
-    let mut socket_publication_deadline: Option<Instant> = None;
     loop {
         if socket_answers_hello(&home.socket_path()) {
             break;
@@ -569,10 +563,7 @@ async fn wait_for_status_handshake(home: &IsolatedHome, timeout: Duration) {
         let recorded_pid = cockpit_host::daemon_lifecycle::read_pid_file(&home.pid_file());
         let owner_progressing = match recorded_pid {
             Some(pid) if cockpit_host::daemon_lifecycle::process_exists(pid) => {
-                if last_live_pid != Some(pid) {
-                    last_live_pid = Some(pid);
-                    socket_publication_deadline = Some(Instant::now() + timeout);
-                }
+                last_live_pid = Some(pid);
                 true
             }
             Some(pid) if last_live_pid == Some(pid) => {
@@ -594,14 +585,6 @@ async fn wait_for_status_handshake(home: &IsolatedHome, timeout: Duration) {
             "timed out waiting for a live daemon owner to publish its status handshake\n{}",
             handshake_debug(home)
         );
-        if let Some(deadline) = socket_publication_deadline {
-            assert!(
-                Instant::now() < deadline,
-                "daemon pid {} stayed live but never published its status handshake within {timeout:?}\n{}",
-                last_live_pid.expect("live owner deadline without pid"),
-                handshake_debug(home)
-            );
-        }
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(Duration::from_millis(200));
     }

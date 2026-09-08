@@ -14825,6 +14825,39 @@ fn pre_socket_file_recovery_uses_one_bounded_publication_authority() {
 }
 
 #[test]
+fn security_subsystem_recovery_failure_aborts_boot_before_publication() {
+    let server = include_str!("mod.rs");
+    let boot = server
+        .split("pub(crate) async fn boot_with_db")
+        .nth(1)
+        .and_then(|tail| tail.split("const TERMINAL_REAPER_POLL").next())
+        .expect("boot_with_db body");
+    for (label, needle) in [
+        (
+            "process containment",
+            "return Err(error).context(\"process containment recovery failed\")",
+        ),
+        (
+            "write scope",
+            "return Err(error).context(\"write scope recovery failed\")",
+        ),
+    ] {
+        assert!(
+            boot.contains(needle),
+            "{label} recovery must abort boot; expected `{needle}` in boot_with_db",
+        );
+    }
+    assert!(
+        !boot.contains("tracing::warn!(error = %error, \"process containment recovery failed\")"),
+        "process containment recovery must not log-and-continue",
+    );
+    assert!(
+        !boot.contains("tracing::warn!(error = %error, \"write scope recovery failed\")"),
+        "write scope recovery must not log-and-continue",
+    );
+}
+
+#[test]
 fn oauth_stored_token_debug_and_drop_are_secret_safe() {
     for source in [
         include_str!("../../auth/xai_oauth.rs"),

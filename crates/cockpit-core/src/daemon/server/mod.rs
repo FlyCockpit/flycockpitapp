@@ -4790,7 +4790,7 @@ pub(crate) async fn boot_with_db(
                 );
             }
             Err(error) => {
-                tracing::warn!(error = %error, "process containment recovery failed");
+                return Err(error).context("process containment recovery failed");
             }
         }
         timer.phase("process_containment_actor");
@@ -4818,7 +4818,7 @@ pub(crate) async fn boot_with_db(
                 tracing::info!(recovered = outcomes.len(), "write scope recovery finished");
             }
             Err(error) => {
-                tracing::warn!(error = %error, "write scope recovery failed");
+                return Err(error).context("write scope recovery failed");
             }
         }
         // Publish to the registry so every session worker installs the same

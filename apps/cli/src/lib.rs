@@ -326,6 +326,30 @@ pub mod integration {
                 .lock()
                 .map_err(|_| anyhow!("attached session state is unavailable"))?
                 .ok_or_else(|| anyhow!("send_user_message requires an attached session"))?;
+            let text = text.into();
+            let tag_expansions: Vec<_> = tag_expansions
+                .into_iter()
+                .map(|(tool, path, detail, ok)| {
+                    crate::daemon::proto::send_user_message_v2::MessageTagExpansion {
+                        tool,
+                        path,
+                        detail,
+                        ok,
+                    }
+                })
+                .collect();
+            let invocation_nonce = Uuid::new_v4();
+            let client_submission_id = cockpit_client::submission::derive_client_submission_id(
+                invocation_nonce,
+                &cockpit_client::submission::ClientUserSubmission {
+                    origin: cockpit_client::submission::SubmissionOrigin::ExternalRoot,
+                    text: text.clone(),
+                    display_text: display_text.clone(),
+                    tag_expansions: tag_expansions.iter().cloned().map(Into::into).collect(),
+                    ..Default::default()
+                }
+                .client_fingerprint(),
+            );
             match self
                 .inner
                 .request_ok(crate::daemon::proto::Request::SendUserMessageV2 {
@@ -337,21 +361,11 @@ pub mod integration {
                             None,
                             None,
                             crate::daemon::proto::send_user_message_v2::SendUserMessageV2 {
-                                client_submission_id: Uuid::now_v7(),
+                                client_submission_id,
                                 origin: Default::default(),
-                                text: text.into(),
+                                text,
                                 display_text,
-                                tag_expansions: tag_expansions
-                                    .into_iter()
-                                    .map(|(tool, path, detail, ok)| {
-                                        crate::daemon::proto::send_user_message_v2::MessageTagExpansion {
-                                            tool,
-                                            path,
-                                            detail,
-                                            ok,
-                                        }
-                                    })
-                                    .collect(),
+                                tag_expansions,
                                 forced_skill: None,
                                 delivery_class_override: None,
                                 resolved_delivery_class: None,

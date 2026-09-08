@@ -609,7 +609,7 @@ fn time_prelude_timestamp(now: DateTime<Utc>, interval_minutes: u32) -> DateTime
     }
     let interval_secs = i64::from(interval_minutes) * 60;
     let bucket = now.timestamp() - now.timestamp().rem_euclid(interval_secs);
-    Utc.timestamp_opt(bucket, 0).single().unwrap_or(now)
+    DateTime::<Utc>::from_timestamp(bucket, 0).unwrap_or(now)
 }
 
 #[cfg(test)]

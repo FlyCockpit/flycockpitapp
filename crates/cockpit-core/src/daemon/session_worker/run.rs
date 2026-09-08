@@ -13934,16 +13934,14 @@ pub(super) async fn run_worker(
             pending_tool_count,
         } = &stop
         {
-            let pending = session
-                .db
-                .list_open_interrupts(session.live_id())
+            let pending = resumable_open_interrupt_count(&session, session_id)
                 .await
-                .map(|rows| rows.len() as i64)
-                .unwrap_or(*pending_tool_count);
+                .max(*pending_tool_count)
+                .max(sweep.count as i64);
             if *active || pending > 0 {
                 persist_paused_session_work(
                     &session,
-                    session_id,
+                    session.live_id(),
                     &root_agent_name,
                     &project_root,
                     pending,
@@ -14273,6 +14271,30 @@ async fn persist_paused_session_work(
     }
 }
 
+async fn resumable_open_interrupt_count(session: &Session, worker_session_id: Uuid) -> i64 {
+    use crate::db::needs_attention::InterruptState;
+    let live_id = session.live_id();
+    let mut pending = 0_i64;
+    for id in [live_id, worker_session_id] {
+        if let Ok(rows) = session.db.list_open_interrupts(id).await {
+            pending = pending.max(rows.len() as i64);
+        }
+        if let Ok(rows) = session.db.list_reconcilable_interrupts(id).await {
+            let count = rows
+                .iter()
+                .filter(|row| {
+                    matches!(
+                        row.state,
+                        InterruptState::Open | InterruptState::Parked | InterruptState::Executing
+                    )
+                })
+                .count();
+            pending = pending.max(count as i64);
+        }
+    }
+    pending
+}
+
 pub(super) async fn shutdown_activity_snapshot(
     session: &Session,
     session_id: Uuid,
@@ -14292,12 +14314,9 @@ pub(super) async fn shutdown_activity_snapshot(
     // waiter is then gone from the map and cannot be re-detected by a later
     // sweep) still surfaces as a non-clean terminal.
     let sweep = interrupts.park_all_registered_collect().await;
-    let pending_tool_count = session
-        .db
-        .list_open_interrupts(session.live_id())
+    let pending_tool_count = resumable_open_interrupt_count(session, session_id)
         .await
-        .map(|rows| rows.len() as i64)
-        .unwrap_or(sweep.count as i64);
+        .max(sweep.count as i64);
     let active = {
         let (has_schedules, processing) = (live.has_active_schedules(), live.processing());
         has_schedules || processing || pending_tool_count > 0

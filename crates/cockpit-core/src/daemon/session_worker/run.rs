@@ -13859,25 +13859,6 @@ pub(super) async fn run_worker(
                     let (active, pending_tool_count, initial_committed) =
                         shutdown_activity_snapshot(&session, session_id, &interrupts, &live).await;
                     shutdown_park_committed = initial_committed;
-                    // Persist resumable work as soon as the shutdown snapshot
-                    // observes it. The worker can be force-aborted by the
-                    // registry's grace deadline before its park-drain
-                    // finishes; the parked interrupt rows are already durable
-                    // at this point, and a successor must be able to see the
-                    // paused-work row even when the drain is cut short. The
-                    // final sweep after the drain re-runs the same upsert with
-                    // the settled pending count, so this write is an
-                    // idempotent floor, not a second source of truth.
-                    if pause_for_resume && (active || pending_tool_count > 0) {
-                        persist_paused_session_work(
-                            &session,
-                            session_id,
-                            &root_agent_name,
-                            &project_root,
-                            pending_tool_count,
-                        )
-                        .await;
-                    }
                     break WorkerStop::Shutdown {
                         pause_for_resume,
                         active,

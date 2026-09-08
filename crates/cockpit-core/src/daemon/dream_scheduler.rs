@@ -1109,7 +1109,7 @@ mod tests {
             }
         });
 
-        let dream_id = tokio::time::timeout(Duration::from_secs(1), async {
+        let dream_id = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if let Some(row) = db
                     .list_sessions(true, 10)
@@ -1120,7 +1120,14 @@ mod tests {
                 {
                     break row.session_id;
                 }
-                tokio::task::yield_now().await;
+                // The durable row is the completion signal; poll it with a
+                // bounded sleep instead of yield_now()-spinning so this
+                // waiter never competes for the CPU the registry attach
+                // needs to persist the row. The fuse stays generous: under
+                // full-suite load the real attach legitimately takes well
+                // over the previous 1s bound, and the row is guaranteed
+                // before the worker can receive the turn.
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await

@@ -285,12 +285,12 @@ async fn forward(
                 withheld.overflow = false;
                 let _ = real_tx.try_send(event);
             }
-            // Production display-path deltas are already classified for the
-            // client and must stream live even on leak-report-withholding routes.
-            TurnEvent::AssistantDisplayTextDelta { .. }
-            | TurnEvent::AssistantDisplayReasoningDelta { .. }
-            | TurnEvent::AssistantDisplayAttemptReset { .. }
-            | TurnEvent::InferenceWarning { .. } => {
+            // ALLOWLIST of the other plaintext-free live status event the
+            // completion stream emits (`drain_items` sends `InferenceWarning`).
+            // It carries no assistant plaintext, so stream it live — non-blocking
+            // (`try_send`), dropping under transient backpressure rather than
+            // wedging the turn.
+            TurnEvent::InferenceWarning { .. } => {
                 let _ = real_tx.try_send(event);
             }
             // Fail-closed default: any OTHER event is WITHHELD (buffered, surfaced

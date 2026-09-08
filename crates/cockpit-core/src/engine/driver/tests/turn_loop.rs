@@ -476,7 +476,6 @@ async fn turn_loop_text_only_turn_pushes_history_and_emits_events() {
 
 #[tokio::test(start_paused = true)]
 async fn assistant_inbox_timer_yields_to_ready_human_input() {
-    tokio::time::resume();
     let provider = ScriptedProvider::builder()
         .dialect(WireDialect::ChatCompletions)
         .turn(Turn::Text("human turn handled".into()))
@@ -530,7 +529,6 @@ async fn assistant_inbox_timer_yields_to_ready_human_input() {
 
 #[tokio::test(start_paused = true)]
 async fn assistant_inbox_timer_yields_to_ready_control() {
-    tokio::time::resume();
     let provider = ScriptedProvider::builder()
         .dialect(WireDialect::ChatCompletions)
         .turn(Turn::Text("inbox turn must not run".into()))
@@ -566,7 +564,6 @@ async fn assistant_inbox_timer_yields_to_ready_control() {
 
 #[tokio::test(start_paused = true)]
 async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() {
-    tokio::time::resume();
     let provider = ScriptedProvider::builder()
         .dialect(WireDialect::ChatCompletions)
         .turn(Turn::Text("idle delivery handled".into()))

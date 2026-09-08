@@ -10658,7 +10658,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
     locks: Arc<crate::locks::LockManager>,
     redact: Arc<RedactionTable>,
     cwd: std::path::PathBuf,
-    mut config: crate::daemon::session_worker::SessionConfigHandle,
+    config: crate::daemon::session_worker::SessionConfigHandle,
     guidance_compiler: Option<crate::computer::guidance::service::GuidanceCompiler>,
     interrupts: Arc<crate::engine::interrupt::InterruptHub>,
     cancel: tokio_util::sync::CancellationToken,
@@ -10875,17 +10875,8 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
         if let Some(script) = hooks.test_compact_brief_script {
             scheduled_lane_driver.test_compact_brief_script = Some(script);
         }
-        if let Some((providers, provider, model)) = hooks.test_providers_override {
-            config = crate::daemon::session_worker::SessionConfigHandle::detached(
-                crate::daemon::session_worker::SessionConfigSnapshot::new(
-                    config.generation(),
-                    providers.clone(),
-                    config.extended().clone(),
-                ),
-            );
-            scheduled_lane_driver.set_config_handle(config.clone());
-            scheduled_lane_driver.test_providers_override =
-                Some((providers, provider, model));
+        if let Some(override_) = hooks.test_providers_override {
+            scheduled_lane_driver.test_providers_override = Some(override_);
         }
         for _ in 0..hooks.lane_compact_guard_precharge {
             let _ = budget.record_compaction(100, false);
@@ -12216,25 +12207,6 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                     continue 'turns;
                 }
                 let pending = std::mem::take(&mut pending_computer_continuations);
-                scheduled_lane_driver.repin_config_for_turn();
-                match scheduled_lane_driver.build_live_model_for_running(
-                    &agent.model,
-                    agent.model.provider_id(),
-                    agent.model.model_id_ref(),
-                ) {
-                    Ok(refreshed) => {
-                        let mut refreshed_agent = (*agent).clone();
-                        refreshed_agent.model = Arc::new(refreshed);
-                        agent = Arc::new(refreshed_agent);
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            agent = %agent.name,
-                            "refreshing noninteractive model from config failed"
-                        );
-                    }
-                }
                 let mut turn_agent =
                     super::computer_native::with_live_loop_native_computer_geometry(
                         agent.as_ref().clone(),

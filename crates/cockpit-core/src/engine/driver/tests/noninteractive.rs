@@ -184,20 +184,39 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
                 driver.run_user_input(UserSubmission::text("run mixed lane"), &queue, &tx),
             );
             tokio::pin!(run);
-            for _ in 0..100 {
-                // Request one is the root planning turn.  Requests two and three
-                // can only be the two distinct delegated calls.  They are both
-                // still held by the delayed fixture, proving simultaneous real
-                // child attempts under the one mixed Driver lane (rather than two
-                // planner classifications or a synthetic batch rewrite).
-                if provider.request_count() >= 3 {
+            // Request one is the root planning turn.  Requests two and three
+            // can only be the two distinct delegated calls.  They are both
+            // still held by the delayed fixture, proving simultaneous real
+            // child attempts under the one mixed Driver lane (rather than two
+            // planner classifications or a synthetic batch rewrite).
+            //
+            // The observation is bounded by the turn's own structure, not a
+            // wall-clock budget: a pass is a moment where both delegate
+            // requests have arrived while fewer than both delayed responses
+            // have been served, and a fail is the parent turn structurally
+            // settling without that moment ever existing.
+            let mut run_done = false;
+            let mut observed_in_flight = false;
+            loop {
+                if provider.request_count() >= 3 && provider.served_count() <= 2 {
+                    observed_in_flight = true;
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                if run_done {
+                    break;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                    _ = &mut run => {
+                        run_done = true;
+                    }
+                }
             }
             assert!(
-                provider.request_count() >= 3,
-                "both separately identified eligible delegates must be in flight before either settles"
+                observed_in_flight,
+                "both separately identified eligible delegates must be in flight before either settles (requests: {}, served: {})",
+                provider.request_count(),
+                provider.served_count()
             );
             run.await.unwrap();
         }

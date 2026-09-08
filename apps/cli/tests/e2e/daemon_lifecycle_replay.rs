@@ -128,6 +128,20 @@ fn session_event_rows(db_path: &Path, session_id: Uuid) -> Vec<(i64, String)> {
     .collect()
 }
 
+/// The replay high-water is a durable cursor over every session_events row —
+/// including rows whose kind has no transcript display entry (the client's
+/// dedup cursor must advance past them, or reconnects replay tombstones).
+/// It is not the max of the filtered transcript projection above.
+fn max_session_event_seq(db_path: &Path, session_id: Uuid) -> i64 {
+    let conn = open_db(db_path);
+    conn.query_row(
+        "SELECT COALESCE(MAX(seq), 0) FROM session_events WHERE session_id = ?1",
+        params![session_id.to_string()],
+        |row| row.get(0),
+    )
+    .expect("max session event seq")
+}
+
 fn tool_call_command(db_path: &Path, session_id: Uuid) -> String {
     let conn = open_db(db_path);
     let raw: String = conn
@@ -980,7 +994,7 @@ fn lifecycle_attach_replay_across_restart_delivers_persisted_events_once_in_orde
         daemon.restart_same_home().await;
         let expected_rows = session_event_rows(&daemon.db_path(), attached.session_id);
         let expected_seqs: Vec<_> = expected_rows.iter().map(|(seq, _)| *seq).collect();
-        let expected_max = *expected_seqs.last().expect("persisted session events");
+        let expected_max = max_session_event_seq(&daemon.db_path(), attached.session_id);
         let replay_client = daemon.client().await;
         let reattached = replay_client
             .attach(

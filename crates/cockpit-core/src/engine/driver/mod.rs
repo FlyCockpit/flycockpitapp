@@ -5988,14 +5988,6 @@ impl Driver {
                 self.refresh_goal_watchdog(&mut goal_watchdog).await;
                 continue;
             }
-            if !waiting_for_keep_parked_siblings
-                && !human_input_already_pending
-                && self
-                    .try_deliver_immediate_assistant_inbox(&input_queue, tx, &mut goal_watchdog)
-                    .await?
-            {
-                continue;
-            }
             // Wait for the next thing to do: a user message, a control
             // request (/prune /compact /pin), a job event (loop iteration
             // due / job completed), or a job command (an in-task timer
@@ -6013,6 +6005,8 @@ impl Driver {
             // history or run a turn). Compact/Prune controls already defer
             // on the same predicate; auto-compact and prune-after-switch
             // must not bypass it.
+            let mut assistant_inbox_poll_fired = false;
+            let mut assistant_inbox_defer_heartbeat_fired = false;
             tokio::select! {
                 biased;
                 msg = input_queue.recv_group_order_for(Some(&active_target_id)),
@@ -6111,35 +6105,19 @@ impl Driver {
                 // Inbox timers deliberately follow foreground input and
                 // control. In a biased select, a timer that became ready
                 // while another turn was running must not start inference
-                // ahead of either already-ready boundary request.
+                // ahead of either already-ready boundary request. The arms
+                // only record that the cadence fired: the actual claim runs
+                // after the select so it can re-check the boundary, and a
+                // control arm winning the select still runs first (an
+                // unpolled-but-elapsed tick stays pending and fires on the
+                // next loop iteration instead of being lost).
                 _ = assistant_inbox_defer_heartbeat.tick(),
                     if !waiting_for_keep_parked_siblings => {
-                    match self.claim_assistant_inbox_text(true).await {
-                        Ok(Some((text, inbox_item_ids))) => {
-                            self.preempt_shadow_brief_for_foreground().await;
-                            let mut submission =
-                                crate::engine::message::UserSubmission::text(text);
-                            submission.origin =
-                                crate::engine::message::SubmissionOrigin::Internal;
-                            self.run_user_input(submission, &input_queue, tx).await?;
-                            self.acknowledge_assistant_inbox(inbox_item_ids).await?;
-                        }
-                        Ok(None) => {}
-                        Err(error) => tracing::warn!(%error, "assistant inbox deferred delivery failed"),
-                    }
+                    assistant_inbox_defer_heartbeat_fired = true;
                 }
                 _ = assistant_inbox_idle_poll.tick(),
                     if !waiting_for_keep_parked_siblings => {
-                    if self
-                        .try_deliver_immediate_assistant_inbox(
-                            &input_queue,
-                            tx,
-                            &mut goal_watchdog,
-                        )
-                        .await?
-                    {
-                        continue;
-                    }
+                    assistant_inbox_poll_fired = true;
                 }
                 ev = self.job_event_rx.recv(),
                     if !waiting_for_keep_parked_siblings => {
@@ -6222,6 +6200,46 @@ impl Driver {
                         }
                     }
                     self.refresh_goal_watchdog(&mut goal_watchdog).await;
+                }
+            }
+            // A fired inbox cadence claims and delivers after the select, so
+            // a boundary request that arrived while the claim's DB read was
+            // in flight still wins the boundary. The claim is a
+            // non-consuming read, so skipping delivery here loses nothing:
+            // a ready foreground submission folds the same inbox items at
+            // its own turn, and a control request runs before an inbox turn
+            // can start inference.
+            if (assistant_inbox_defer_heartbeat_fired || assistant_inbox_poll_fired)
+                && !self.persist_on_reentry_owns_started_unsettled_siblings()
+            {
+                let include_deferred = assistant_inbox_defer_heartbeat_fired;
+                match self.claim_assistant_inbox_text(include_deferred).await {
+                    Ok(Some((text, inbox_item_ids))) => {
+                        let target_id = self.active_queue_target_id();
+                        let human_input_now_pending =
+                            input_queue.has_pending_for(Some(&target_id)).await;
+                        if !human_input_now_pending && control_rx.len() == 0 {
+                            self.preempt_shadow_brief_for_foreground().await;
+                            let mut submission = crate::engine::message::UserSubmission::text(text);
+                            submission.origin = crate::engine::message::SubmissionOrigin::Internal;
+                            self.run_user_input(submission, &input_queue, tx).await?;
+                            self.acknowledge_assistant_inbox(inbox_item_ids).await?;
+                            if !include_deferred {
+                                self.reset_goal_progress_tracking().await;
+                                self.clear_goal_idle_intervention();
+                                self.maybe_continue_active_goal(&input_queue, tx).await?;
+                                self.refresh_goal_watchdog(&mut goal_watchdog).await;
+                                // The immediate-cadence arm historically
+                                // returned to the loop top on delivery; the
+                                // defer heartbeat fell through to the idle
+                                // tail so its settled turn still emits the
+                                // turn-boundary chrome.
+                                continue;
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(%error, "assistant inbox delivery failed"),
                 }
             }
             // The select arm finished: auto-compact at this candidate safe
@@ -9819,33 +9837,6 @@ impl Driver {
         input_rx.finish(&leading_queue_item_ids).await;
         result?;
         self.acknowledge_assistant_inbox(inbox_item_ids).await
-    }
-
-    async fn try_deliver_immediate_assistant_inbox(
-        &mut self,
-        input_queue: &crate::engine::message::UserSubmissionQueue,
-        tx: &mpsc::Sender<TurnEvent>,
-        goal_watchdog: &mut Option<Pin<Box<Sleep>>>,
-    ) -> Result<bool> {
-        match self.claim_assistant_inbox_text(false).await {
-            Ok(Some((text, inbox_item_ids))) => {
-                self.preempt_shadow_brief_for_foreground().await;
-                let mut submission = crate::engine::message::UserSubmission::text(text);
-                submission.origin = crate::engine::message::SubmissionOrigin::Internal;
-                self.run_user_input(submission, input_queue, tx).await?;
-                self.acknowledge_assistant_inbox(inbox_item_ids).await?;
-                self.reset_goal_progress_tracking().await;
-                self.clear_goal_idle_intervention();
-                self.maybe_continue_active_goal(input_queue, tx).await?;
-                self.refresh_goal_watchdog(goal_watchdog).await;
-                Ok(true)
-            }
-            Ok(None) => Ok(false),
-            Err(error) => {
-                tracing::warn!(%error, "assistant inbox immediate delivery failed");
-                Ok(false)
-            }
-        }
     }
 
     async fn claim_assistant_inbox_text(

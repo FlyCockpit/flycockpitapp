@@ -93,6 +93,7 @@ pub struct ScriptedProvider {
     base_url: String,
     captured: Arc<Mutex<Vec<CapturedRequest>>>,
     request_count: Arc<AtomicUsize>,
+    served_count: Arc<AtomicUsize>,
     request_rx: mpsc::UnboundedReceiver<CapturedRequest>,
     shutdown_tx: broadcast::Sender<()>,
     accept_task: JoinHandle<()>,
@@ -106,6 +107,7 @@ struct SharedState {
     repeat_last: bool,
     script_index: AtomicUsize,
     request_count: Arc<AtomicUsize>,
+    served_count: Arc<AtomicUsize>,
     captured: Arc<Mutex<Vec<CapturedRequest>>>,
     request_tx: mpsc::UnboundedSender<CapturedRequest>,
 }
@@ -200,6 +202,7 @@ impl ScriptedProviderBuilder {
         let addr = listener.local_addr().expect("scripted provider local addr");
         let captured = Arc::new(Mutex::new(Vec::new()));
         let request_count = Arc::new(AtomicUsize::new(0));
+        let served_count = Arc::new(AtomicUsize::new(0));
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, _) = broadcast::channel(1);
         let state = Arc::new(SharedState {
@@ -209,6 +212,7 @@ impl ScriptedProviderBuilder {
             repeat_last: self.repeat_last,
             script_index: AtomicUsize::new(0),
             request_count: Arc::clone(&request_count),
+            served_count: Arc::clone(&served_count),
             captured: Arc::clone(&captured),
             request_tx,
         });
@@ -217,6 +221,7 @@ impl ScriptedProviderBuilder {
             base_url: format!("http://{addr}/v1"),
             captured,
             request_count,
+            served_count,
             request_rx,
             shutdown_tx,
             accept_task,
@@ -254,6 +259,15 @@ impl ScriptedProvider {
 
     pub fn request_count(&self) -> usize {
         self.request_count.load(Ordering::SeqCst)
+    }
+
+    /// Count of scripted turns whose response has been fully served. Combined
+    /// with [`Self::request_count`] this lets callers prove a request was
+    /// still in flight at a structural point rather than by wall-clock
+    /// budget: a delayed turn counts as served only after its delay and
+    /// response write complete. `Turn::Hang` connections never count.
+    pub fn served_count(&self) -> usize {
+        self.served_count.load(Ordering::SeqCst)
     }
 
     /// Await the next captured request. Panics on timeout so test failures are
@@ -353,6 +367,7 @@ async fn handle_connection(
     match &turn.turn {
         Turn::HttpError { status, body } => {
             write_response(&mut stream, *status, "application/json", body).await;
+            state.served_count.fetch_add(1, Ordering::SeqCst);
         }
         Turn::Hang => {
             let _ = shutdown_rx.recv().await;
@@ -362,12 +377,14 @@ async fn handle_connection(
         }
         Turn::RawSse(payload) => {
             write_response(&mut stream, 200, "text/event-stream", payload).await;
+            state.served_count.fetch_add(1, Ordering::SeqCst);
         }
         Turn::RawSseThenHang(payload) => {
             write_sse_then_hang(&mut stream, Some(payload), &mut shutdown_rx).await;
         }
         Turn::RawJson(body) => {
             write_response(&mut stream, 200, "application/json", &body.to_string()).await;
+            state.served_count.fetch_add(1, Ordering::SeqCst);
         }
         other => {
             let payload = emit_turn(
@@ -376,6 +393,7 @@ async fn handle_connection(
                 turn.usage.as_ref(),
             );
             write_response(&mut stream, 200, "text/event-stream", &payload).await;
+            state.served_count.fetch_add(1, Ordering::SeqCst);
         }
     }
 }

@@ -104,7 +104,7 @@ async fn recovery_activation_gate_blocks_until_claim_and_abort_never_executes() 
 /// consumed and the worker's deferred activation gate is released.
 #[tokio::test]
 async fn recovered_interactive_task_admission_replays_durable_seed_before_inference() {
-    let (mut driver, tmp) = test_driver_without_network(8);
+    let (mut driver, tmp) = test_driver_vnext(8);
     std::fs::write(tmp.path().join("recovery-seed.txt"), "RECOVERED_SEED_BODY").unwrap();
     let seed_reads = vec![crate::engine::seed_reads::SeedRead {
         tool: "read".to_string(),
@@ -120,28 +120,24 @@ async fn recovered_interactive_task_admission_replays_durable_seed_before_infere
             id: "task-recovery-seed".to_string(),
             name: "task".to_string(),
             arguments: serde_json::json!({
-                "agent": "builder",
-                "prompt": "durable interactive handoff",
-                "mode": "subagent_interactive",
-                "seed_reads": &seed_reads,
-                "seed_reads_receipt": &receipt,
+                "intent": "delegate",
+                "payload": {
+                    "agent": "builder",
+                    "prompt": "durable interactive handoff",
+                    "mode": "subagent_interactive",
+                    "seed_reads": &seed_reads,
+                    "seed_reads_receipt": &receipt,
+                },
             }),
         })
-        // The post-publication parent retry remains open while the test drops
-        // the daemon. The child itself must not load: that is the fallible
-        // post-publication boundary this recovery fixture exercises.
+        // Keep the first child inference in flight while the test drops the
+        // driver, then answer the recovered attempt. This exercises recovery
+        // from a genuinely published/running child rather than a synthetic
+        // descriptor.
         .turn(Turn::Hang)
+        .turn(Turn::Text("recovered child completed".into()))
         .start()
         .await;
-
-    let cockpit = tmp.path().join(".cockpit");
-    std::fs::create_dir_all(&cockpit).unwrap();
-    std::fs::write(
-        cockpit.join("config.json"),
-        r#"{"tools":{"read":{"enabled":true,"command":"echo hi"}}}"#,
-    )
-    .unwrap();
-    driver.refresh_config_from_disk_for_tests();
 
     {
         use crate::config::providers::{ActiveModelRef, ProviderEntry, ProvidersConfig, WireApi};
@@ -177,12 +173,13 @@ async fn recovered_interactive_task_admission_replays_durable_seed_before_infere
             driver.stack[0].agent.tools.clone().with(Arc::new(
                 crate::tools::task::TaskTool::with_subagents(&["explore", "builder"]),
             ));
+        let extended = driver.config.extended().clone();
         driver.set_config_handle(
             crate::daemon::session_worker::SessionConfigHandle::detached(
                 crate::daemon::session_worker::SessionConfigSnapshot::new(
                     driver.config.generation(),
                     config.clone(),
-                    test_extended_config(),
+                    extended,
                 ),
             ),
         );
@@ -199,6 +196,9 @@ async fn recovered_interactive_task_admission_replays_durable_seed_before_infere
     let redact = driver.redact.clone();
     let cwd = driver.cwd.clone();
     let root = driver.stack[0].agent.clone();
+    let root_agent_instance_id = driver.stack[0]
+        .agent_instance_id
+        .expect("the admitted child has a durable session root");
     let recovered_config = driver.config.clone();
     let recovered_providers = driver
         .test_providers_override
@@ -216,28 +216,26 @@ async fn recovered_interactive_task_admission_replays_durable_seed_before_infere
         tokio::pin!(admission);
 
         let parent_request = tokio::select! {
-            request = provider.next_request() => request,
+            request = provider.next_request_ready() => request,
             result = &mut admission => panic!("admission ended before the parent request: {result:?}"),
         };
         assert!(
             parent_request.body.to_string().contains("task"),
             "the real parent turn must own the task admission"
         );
-        let post_failure_parent_request = tokio::select! {
-            request = provider.next_request() => request,
-            result = &mut admission => panic!("admission ended before the post-publication child-load failure: {result:?}"),
+        let pre_crash_child_request = tokio::select! {
+            request = provider.next_request_ready() => request,
+            result = &mut admission => panic!("admission ended before the published child inferred: {result:?}"),
         };
         assert!(
-            post_failure_parent_request
+            pre_crash_child_request
                 .body
                 .to_string()
-                .contains("failed to load subagent `builder`"),
-            "the parent receives the post-publication child-load failure before retrying"
+                .contains("RECOVERED_SEED_BODY"),
+            "the published child consumes the durable seed before its interrupted inference: {pre_crash_child_request:?}"
         );
     }
     drop(driver);
-    std::fs::remove_file(cockpit.join("config.json"))
-        .expect("recovery restores the valid child builtin configuration");
 
     let child = session
         .db
@@ -246,6 +244,16 @@ async fn recovered_interactive_task_admission_replays_durable_seed_before_infere
         .expect("real admission publishes a recovery descriptor")
         .pop()
         .expect("real admission publishes one interactive child");
+    let durable_launch: serde_json::Value = serde_json::from_str(&child.original_args_json)
+        .expect("real admission writes a JSON launch descriptor");
+    assert_eq!(
+        durable_launch
+            .get("interactive")
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "the interactive executor must own an interactive durable launch descriptor: {}",
+        child.original_args_json
+    );
     let snapshot: serde_json::Value =
         serde_json::from_str(&child.snapshot_json).expect("real admission writes JSON snapshot");
     let history: Vec<Message> = serde_json::from_value(
@@ -255,17 +263,12 @@ async fn recovered_interactive_task_admission_replays_durable_seed_before_infere
             .expect("real admission snapshot includes history"),
     )
     .expect("real admission snapshot history decodes");
-    let declarations = crate::engine::seed_reads::pending_declared_seed_calls(&history);
-    assert_eq!(
-        declarations.len(),
-        1,
-        "snapshot retains one seed declaration"
-    );
-    assert_eq!(declarations[0].function.name, "read");
-    assert_eq!(
-        declarations[0].function.arguments,
-        serde_json::json!({"path": "recovery-seed.txt"}),
-        "the real admission snapshot retains the seed arguments"
+    let durable_seed_history =
+        serde_json::to_string(&history).expect("durable seed history re-encodes");
+    assert!(
+        durable_seed_history.contains("recovery-seed.txt")
+            && durable_seed_history.contains("RECOVERED_SEED_BODY"),
+        "the published child snapshot retains the exact completed seed declaration and result: {durable_seed_history}"
     );
     assert!(
         session
@@ -299,7 +302,7 @@ async fn recovered_interactive_task_admission_replays_durable_seed_before_infere
         Driver::with_max_schedules(session.clone(), locks, redact, cwd, root, 8);
     recovered_driver.set_config_handle(recovered_config);
     recovered_driver.test_providers_override = Some(recovered_providers);
-    bind_test_session_root(&mut recovered_driver);
+    recovered_driver.set_root_agent_instance_id(root_agent_instance_id);
     let (recovery_updates_tx, _recovery_updates_rx) = tokio::sync::watch::channel(Vec::new());
     let recovery_queue = crate::engine::message::UserSubmissionQueue::new(recovery_updates_tx);
     let (recovery_turn_tx, _recovery_turn_rx) = mpsc::channel::<TurnEvent>(256);
@@ -359,7 +362,7 @@ async fn recovered_interactive_task_admission_replays_durable_seed_before_infere
         "the worker must acknowledge the claim before it releases execution"
     );
     activation_gate.release();
-    let recovered_child_request = provider.next_request().await;
+    let recovered_child_request = provider.next_request_ready().await;
     assert!(
         recovered_child_request
             .body
@@ -2604,5 +2607,10 @@ fn admit_authored_child_to_test_grants(driver: &mut Driver, portable_agent_ref: 
                 portable_agent_ref: portable_agent_ref.to_string(),
             });
         }
+    }
+    // The scheduler owns its own immutable agent snapshot. Keep the fixture's
+    // admitted root authority aligned across both execution lanes.
+    if let Some(active) = driver.stack.last() {
+        driver.schedule.set_agent(active.agent.clone());
     }
 }

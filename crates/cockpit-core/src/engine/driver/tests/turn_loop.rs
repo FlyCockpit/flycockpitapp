@@ -698,7 +698,13 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
     assert!(immediate_prompt.contains("IMMEDIATE_INBOX_MARKER"));
     assert!(!immediate_prompt.contains("DEFERRED_INBOX_MARKER"));
 
+    let before_pre_heartbeat_advance = tokio::time::Instant::now();
     tokio::time::advance(Duration::from_secs(59)).await;
+    assert_eq!(
+        tokio::time::Instant::now().duration_since(before_pre_heartbeat_advance),
+        Duration::from_secs(59),
+        "the pre-boundary assertion must be made at an exact paused-clock offset"
+    );
     assert_eq!(
         provider.request_count(),
         1,
@@ -2700,6 +2706,39 @@ fn text_then_hang_sse() -> String {
     format!("data: {text}\n\n")
 }
 
+fn install_scripted_provider_snapshot(
+    driver: &mut Driver,
+    providers: crate::config::providers::ProvidersConfig,
+) {
+    let mut snapshot = (*driver.config.snapshot()).clone();
+    snapshot.providers = providers;
+    driver
+        .set_config_handle(crate::daemon::session_worker::SessionConfigHandle::detached(snapshot));
+    if let Some(active) = driver.config.providers().active_model.clone() {
+        driver.session.set_active_model_ref(active).unwrap();
+    }
+    driver.test_providers_override = Some((
+        driver.config.providers().clone(),
+        "lmstudio".into(),
+        "local".into(),
+    ));
+    if let Ok(refreshed) =
+        driver.build_live_model_for_running(&driver.stack[0].agent.model, "lmstudio", "local")
+    {
+        Arc::make_mut(&mut driver.stack[0].agent).model = Arc::new(refreshed);
+    }
+}
+
+fn trust_scripted_provider_for_streaming_test(driver: &mut Driver) {
+    let (_extended, mut providers) = driver.config.configs();
+    providers
+        .providers
+        .get_mut("lmstudio")
+        .expect("scripted driver has lmstudio")
+        .trust = Some(crate::config::providers::ModelTrust::Trusted);
+    install_scripted_provider_snapshot(driver, providers);
+}
+
 fn enable_reasoning_retraction(driver: &mut Driver) {
     let (_extended, mut providers) = driver.config.configs();
     let active = providers
@@ -2717,28 +2756,12 @@ fn enable_reasoning_retraction(driver: &mut Driver) {
             crate::config::providers::ThinkingMode::High,
             serde_json::json!({"reasoning_effort": "high"}),
         );
-    driver.set_config_handle(
-        crate::daemon::session_worker::SessionConfigHandle::detached(
-            crate::daemon::session_worker::SessionConfigSnapshot::new(
-                1,
-                providers,
-                super::test_extended_config(),
-            ),
-        ),
-    );
-    if let Some(active) = driver.config.providers().active_model.clone() {
-        driver.session.set_active_model_ref(active).unwrap();
-    }
-    driver.test_providers_override = Some((
-        driver.config.providers().clone(),
-        "lmstudio".into(),
-        "local".into(),
-    ));
-    if let Ok(refreshed) =
-        driver.build_live_model_for_running(&driver.stack[0].agent.model, "lmstudio", "local")
-    {
-        Arc::make_mut(&mut driver.stack[0].agent).model = Arc::new(refreshed);
-    }
+    providers
+        .providers
+        .get_mut("lmstudio")
+        .expect("scripted driver has lmstudio")
+        .trust = Some(crate::config::providers::ModelTrust::Trusted);
+    install_scripted_provider_snapshot(driver, providers);
 }
 
 #[tokio::test]
@@ -2774,7 +2797,7 @@ async fn interactive_cancel_after_reasoning_retracts_the_durable_user_row() {
             .unwrap();
         driver
     });
-    let _ = provider.next_request().await;
+    let _ = provider.next_request_ready().await;
 
     let saw_reasoning = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
@@ -2846,7 +2869,7 @@ async fn retracted_reasoning_only_turn_resends_with_an_identical_request_prefix(
             .unwrap();
         driver
     });
-    let _ = provider.next_request().await;
+    let _ = provider.next_request_ready().await;
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             if matches!(
@@ -2896,6 +2919,9 @@ async fn interactive_cancel_after_visible_text_keeps_the_durable_user_row() {
         .start()
         .await;
     let (mut driver, _tmp) = scripted_driver(&provider);
+    // This test observes live display streaming, not the untrusted-route leak
+    // barrier. A trusted local fixture keeps that independent contract active.
+    trust_scripted_provider_for_streaming_test(&mut driver);
     let cancel = driver.cancel_handle();
     let (queue, tx, mut rx) = event_harness();
     let mut submission = UserSubmission::text("keep after visible text");
@@ -2907,7 +2933,7 @@ async fn interactive_cancel_after_visible_text_keeps_the_durable_user_row() {
             .unwrap();
         driver
     });
-    let _ = provider.next_request().await;
+    let _ = provider.next_request_ready().await;
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             if matches!(

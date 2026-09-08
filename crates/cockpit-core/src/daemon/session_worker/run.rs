@@ -6407,6 +6407,7 @@ pub(super) async fn run_worker(
             ..ModelParams::default()
         },
         cwd: project_root.clone(),
+        delegated_definition_root: None,
         config: SessionConfigHandle::new(config_snapshot.clone()),
         session_short_id: session.short_id(),
         workspace_scratch_dir: session.workspace_scratch_dir(),

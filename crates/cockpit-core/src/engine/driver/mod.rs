@@ -14161,52 +14161,56 @@ impl Driver {
                             .user_cancel_requested
                             .load(std::sync::atomic::Ordering::Acquire)
                         && !response_window_closed.load(std::sync::atomic::Ordering::SeqCst);
-                    if retractable_direct_turn
-                        && let Some(seq) = recorded_user_seq
-                        && self
-                            .session
-                            .db
-                            .remove_latest_user_message(self.session.live_id(), seq)
-                            .await
-                            .unwrap_or_else(|error| {
-                                tracing::warn!(%error, seq, "initial-thinking user-message retract failed");
-                                false
-                            })
-                    {
-                        let generated_title = if let Some((title_state, task)) = auto_title_task.take() {
-                            // The state handoff and the durable title write share
-                            // one mutex. Marking retracted before aborting either
-                            // prevents a later write or captures the exact title
-                            // already written for the rollback predicate.
-                            let generated_title = {
-                                let mut state = title_state.lock().unwrap();
-                                state.retracted = true;
-                                state.persisted_title.clone()
+                    if retractable_direct_turn && let Some(seq) = recorded_user_seq {
+                        let generated_title =
+                            if let Some((title_state, task)) = auto_title_task.take() {
+                                // The state handoff and the durable title write share
+                                // one mutex. Freeze it before the combined DB
+                                // transition so the title predicate cannot race a
+                                // detached write between snapshot and commit.
+                                {
+                                    let mut state = title_state.lock().unwrap();
+                                    state.retracted = true;
+                                }
+                                task.abort();
+                                let _ = task.await;
+                                title_state.lock().unwrap().persisted_title.clone()
+                            } else {
+                                None
                             };
-                            task.abort();
-                            let _ = task.await;
-                            generated_title
-                        } else {
-                            None
-                        };
-                        if let Err(error) = self.session.restore_title_progress_after_retract(
-                            title_progress_before_turn,
-                            generated_title.as_deref(),
-                        ).await {
-                            tracing::warn!(%error, "auto_title: retract rollback lost");
-                        }
-                        if let Err(error) = crate::text_artifact_blob::reconcile_cleanup_intents(&self.session.db).await {
-                            tracing::warn!(%error, seq, "retracted user-message blob cleanup remains pending");
-                        }
-                        let _ = tx
-                            .send(TurnEvent::UserMessageRemoved {
+                        match self
+                            .session
+                            .retract_latest_user_message(
                                 seq,
-                                client_submission_ids: client_submissions
-                                    .iter()
-                                    .map(|receipt| receipt.id)
-                                    .collect(),
-                            })
-                            .await;
+                                title_progress_before_turn,
+                                generated_title.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok(true) => {
+                                if let Err(error) =
+                                    crate::text_artifact_blob::reconcile_cleanup_intents(
+                                        &self.session.db,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(%error, seq, "retracted user-message blob cleanup remains pending");
+                                }
+                                let _ = tx
+                                    .send(TurnEvent::UserMessageRemoved {
+                                        seq,
+                                        client_submission_ids: client_submissions
+                                            .iter()
+                                            .map(|receipt| receipt.id)
+                                            .collect(),
+                                    })
+                                    .await;
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::warn!(%error, seq, "initial-thinking user-message retract failed");
+                            }
+                        }
                     }
                     if let Some((goal_id, generation, turn_id)) = self.goal_root_turn.take() {
                         let _ = self
@@ -16197,6 +16201,7 @@ impl Driver {
             params,
             env_overlay: self.stack[0].agent.env_overlay.clone(),
             cwd: self.cwd.clone(),
+            delegated_definition_root: None,
             config: self.config.clone(),
             session_short_id: self.session.short_id(),
             workspace_scratch_dir: self.session.workspace_scratch_dir(),
@@ -16389,6 +16394,7 @@ impl Driver {
             parent_posture: self.stack.last().map(|frame| frame.agent.posture.clone()),
             model_override,
             cwd: child_cwd.to_path_buf(),
+            delegated_definition_root: parent.agent.vnext_grant.is_some().then(|| self.cwd.clone()),
             lock_identity: confinement.lock_identity,
             write_scope: confinement.write_scope,
             dream_read_scope: confinement.dream_read_scope,

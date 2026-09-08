@@ -152,8 +152,8 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
                 delegate("delegate-a", "readonly-probe", "inspect alpha"),
                 (
                     "read-middle".into(),
-                    "read".into(),
-                    serde_json::json!({ "path": "middle.txt" }),
+                    "scheduler_read_probe".into(),
+                    serde_json::json!({}),
                 ),
                 delegate("delegate-b", "readonly-probe", "inspect beta"),
                 // `explore` carries Dynamic `bash`, so parallel admission
@@ -164,10 +164,10 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
             // The two concurrently admitted children may claim these two
             // equivalent terminal responses in either wall-clock order.
             .turn(Turn::Text("delegate completed".into()))
+            .with_response_gate(child_response_gate.clone())
             // These are the two independently started child turns. Keep both
             // sockets open behind an explicit gate until the assertion below
             // observes them; this is not a planner probe or a timing window.
-            .with_response_gate(child_response_gate.clone())
             .turn(Turn::Text("delegate completed".into()))
             .with_response_gate(child_response_gate.clone())
             .turn(Turn::Text("serial delegate completed".into()))
@@ -192,7 +192,6 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
         )
         .unwrap();
         write_host_tool_surface(&agents_dir, "readonly-probe", &["read"]);
-        admit_authored_child_to_test_grants(&mut driver, "authored/readonly-probe");
         std::fs::write(
             config_dir.join("config.json"),
             serde_json::json!({
@@ -217,6 +216,13 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
         )
         .unwrap();
         driver.refresh_config_from_disk_for_tests();
+        let root = Arc::make_mut(&mut driver.stack[0].agent);
+        root.tools = root.tools.clone().with(Arc::new(SchedulerReadProbe));
+        driver.schedule.set_agent(driver.stack[0].agent.clone());
+        // Refresh rebuilds the live root from the newly loaded snapshot. Add
+        // the authored child to that exact root grant, not to the stale frame
+        // that existed before the refresh boundary.
+        admit_authored_child_to_test_grants(&mut driver, "authored/readonly-probe");
 
         let trust = crate::config::trust::WorkspaceTrustPolicy {
             root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
@@ -226,10 +232,12 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
         let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
         let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
         {
-            let run = crate::config::trust::scope_workspace_trust_policy(
-                trust,
-                driver.run_user_input(UserSubmission::text("run mixed lane"), &queue, &tx),
-            );
+            // This dedicated current-thread harness spawns the ordinary lane
+            // and child runners. Tokio task-locals do not propagate through
+            // `tokio::spawn`, so keep the intended trust policy on the runtime
+            // thread for those tasks too.
+            let _trust = crate::config::trust::enter_workspace_trust_policy(trust);
+            let run = driver.run_user_input(UserSubmission::text("run mixed lane"), &queue, &tx);
             tokio::pin!(run);
             for expected_request in 1..=3 {
                 // Request one is the root planning turn. Requests two and three
@@ -244,7 +252,7 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
                     // The provider's existing short failure guard prevents a
                     // broken admission path from hanging the suite; overlap is
                     // proved by the response gate, never by this timeout.
-                    request = provider.next_request() => request,
+                    request = provider.next_request_ready() => request,
                 };
                 assert!(request.request_line.starts_with("POST "));
             }
@@ -274,7 +282,7 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
         assert!(
             events.iter().any(|event| {
                 matches!(event, TurnEvent::ToolStart { call_id, tool, .. }
-                    if call_id == "read-middle" && tool == "read")
+                    if call_id == "read-middle" && tool == "scheduler_read_probe")
             }),
             "the ordinary read is dispatched on the same real mixed lane as the two in-flight delegates"
         );
@@ -5365,6 +5373,38 @@ struct SchedulerSerialBarrier {
     release: Arc<tokio::sync::Notify>,
 }
 
+/// Immediate read-only ordinary call for the capability scheduler fixture.
+/// It avoids coupling that scheduler test to the production `read` tool's
+/// independent result-safety inference path.
+struct SchedulerReadProbe;
+
+#[async_trait::async_trait]
+impl crate::engine::tool::Tool for SchedulerReadProbe {
+    fn name(&self) -> &str {
+        "scheduler_read_probe"
+    }
+
+    fn description(&self) -> &str {
+        "Return a deterministic read-only scheduler result."
+    }
+
+    fn effect(&self) -> crate::engine::tool::ToolEffect {
+        crate::engine::tool::ToolEffect::ReadOnly
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+
+    async fn call(
+        &self,
+        _args: serde_json::Value,
+        _ctx: &crate::engine::tool::ToolCtx,
+    ) -> anyhow::Result<crate::engine::tool::ToolOutput> {
+        Ok(crate::engine::tool::ToolOutput::text("middle body"))
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::engine::tool::Tool for SchedulerSerialBarrier {
     fn name(&self) -> &str {
@@ -5456,7 +5496,6 @@ fn scheduler_defers_delegate_admission_until_serial_barrier() {
         )
         .unwrap();
         write_host_tool_surface(&agents_dir, "readonly-probe", &["read"]);
-        admit_authored_child_to_test_grants(&mut driver, "authored/readonly-probe");
         std::fs::write(
             config_dir.join("config.json"),
             serde_json::json!({
@@ -5481,6 +5520,9 @@ fn scheduler_defers_delegate_admission_until_serial_barrier() {
         )
         .unwrap();
         driver.refresh_config_from_disk_for_tests();
+        // The refreshed root owns delegation admission. Mutating the prior
+        // frame's grant would be discarded by this rebuild.
+        admit_authored_child_to_test_grants(&mut driver, "authored/readonly-probe");
 
         let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
         let release = Arc::new(tokio::sync::Notify::new());
@@ -5510,13 +5552,21 @@ fn scheduler_defers_delegate_admission_until_serial_barrier() {
         let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
         let (tx, mut rx) = mpsc::channel::<TurnEvent>(128);
-        let run = crate::config::trust::scope_workspace_trust_policy(
-            trust,
-            driver.run_user_input(
-                UserSubmission::text("exercise deferred admission"),
-                &queue,
-                &tx,
-            ),
+        // See the mixed-lane fixture above: spawned tasks remain on this
+        // dedicated current-thread runtime, so keep trust on that thread for
+        // the complete scheduler execution.
+        let _trust = crate::config::trust::enter_workspace_trust_policy(trust);
+        let resolved = crate::agents::resolve(tmp.path(), "readonly-probe")
+            .expect("trusted authored child definition resolves")
+            .expect("trusted authored child definition exists");
+        assert!(
+            resolved.vnext.is_some(),
+            "the scheduler fixture must resolve the child as vNext"
+        );
+        let run = driver.run_user_input(
+            UserSubmission::text("exercise deferred admission"),
+            &queue,
+            &tx,
         );
         tokio::pin!(run);
         tokio::select! {

@@ -144,6 +144,8 @@ pub(crate) struct SchedulerDurablePermit {
     order: Arc<SchedulerDurableOrder>,
     ordinal: usize,
     started_released: bool,
+    execution_release: Option<(usize, tokio::sync::mpsc::UnboundedSender<usize>)>,
+    execution_released: bool,
 }
 
 impl SchedulerDurablePermit {
@@ -152,6 +154,25 @@ impl SchedulerDurablePermit {
             order,
             ordinal,
             started_released: false,
+            execution_release: None,
+            execution_released: false,
+        }
+    }
+
+    pub(crate) fn set_execution_release_sender(
+        &mut self,
+        source_index: usize,
+        tx: tokio::sync::mpsc::UnboundedSender<usize>,
+    ) {
+        self.execution_release = Some((source_index, tx));
+    }
+
+    fn release_execution(&mut self) {
+        if !self.execution_released {
+            self.execution_released = true;
+            if let Some((source_index, tx)) = &self.execution_release {
+                let _ = tx.send(*source_index);
+            }
         }
     }
 
@@ -172,6 +193,10 @@ impl SchedulerDurablePermit {
     }
 
     pub(crate) async fn await_commit(&mut self) {
+        // Execution capacity and durable source ordering are distinct. Once
+        // the tool has finished producing its result, release its scheduler
+        // slot before waiting for an earlier source ordinal to commit.
+        self.release_execution();
         SchedulerDurableOrder::wait_for(&self.order.next_commit, self.ordinal, &self.order.notify)
             .await;
     }
@@ -180,6 +205,7 @@ impl SchedulerDurablePermit {
 impl Drop for SchedulerDurablePermit {
     fn drop(&mut self) {
         self.release_started();
+        self.release_execution();
         // An error can leave before the common durable-commit boundary. Mark
         // that ordinal released as well so later completed calls never deadlock
         // behind a cancelled predecessor.
@@ -224,7 +250,12 @@ async fn scheduler_release_started() {
 
 async fn scheduler_await_commit() {
     if let Ok(permit) = SCHEDULER_DURABLE_PERMIT.try_with(Arc::clone) {
-        permit.lock().await.await_commit().await;
+        let mut permit = permit.lock().await;
+        // Execution capacity and durable ordering are separate invariants.
+        // Release the FIFO slot before waiting for an earlier source member's
+        // commit, while retaining the source-ordered commit fence below.
+        permit.release_execution();
+        permit.await_commit().await;
     }
 }
 use crate::db::needs_attention::{InterruptParkPayload, InterruptResumeAnchor};

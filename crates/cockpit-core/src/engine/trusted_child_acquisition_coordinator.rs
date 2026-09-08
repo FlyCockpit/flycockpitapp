@@ -173,6 +173,7 @@ pub(crate) fn run_parent_acquisition_tool<'a>(
             params: env.agent.params.clone(),
             env_overlay: env.agent.env_overlay.clone(),
             cwd: env.ctx.cwd.clone(),
+            delegated_definition_root: None,
             config: env.ctx.config.clone(),
             session_short_id: env.ctx.session.short_id(),
             workspace_scratch_dir: env.ctx.session.workspace_scratch_dir(),

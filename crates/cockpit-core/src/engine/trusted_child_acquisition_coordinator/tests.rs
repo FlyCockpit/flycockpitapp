@@ -66,6 +66,7 @@ fn acquisition_spawn_args(
         params: ModelParams::default(),
         env_overlay: Arc::new(std::sync::RwLock::new(HashMap::new())),
         cwd: session.project_root.clone(),
+        delegated_definition_root: None,
         config,
         session_short_id: session.short_id(),
         workspace_scratch_dir: session.workspace_scratch_dir(),

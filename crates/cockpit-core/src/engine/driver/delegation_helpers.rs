@@ -605,7 +605,12 @@ pub(super) async fn grant_rejection(input: GrantRejectionInput<'_>) -> Option<St
             .definition(installation_id)
             .map(|definition| Some(definition.clone()))
     } else {
-        crate::agents::resolve_with_assistant_db(cwd, child_agent, assistant_db).await
+        // A vNext parent's effective grant is authority over definitions from
+        // its admitted namespace. The requested execution cwd is confinement,
+        // not a new definition-discovery root; letting it replace the parent
+        // root can both lose an authorized child and admit a shadowing file.
+        let definition_root = if parent_is_vnext { parent_cwd } else { cwd };
+        crate::agents::resolve_with_assistant_db(definition_root, child_agent, assistant_db).await
     } {
         Ok(definition) => definition,
         Err(error) => {

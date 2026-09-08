@@ -292,6 +292,14 @@ impl DeferredOrdinaryCall {
         self.scheduled.source_index
     }
 
+    pub(crate) fn set_execution_release_sender(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<usize>,
+    ) {
+        self.durable_permit
+            .set_execution_release_sender(self.scheduled.source_index, tx);
+    }
+
     pub(crate) async fn execute(
         self,
     ) -> (
@@ -1867,6 +1875,22 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     ));
                 }
                 let mode = args.get("mode").and_then(Value::as_str);
+                let explicitly_interactive = mode == Some("subagent_interactive");
+                if agent.vnext_grant.is_some()
+                    && explicitly_interactive
+                    && (cwd.is_some() || write_scope.is_some() || workspace_lease.is_some())
+                {
+                    return_structural!(task_refusal(
+                        &tc.id,
+                        tc.provider
+                            .as_ref()
+                            .and_then(|provider| provider.item_id.clone()),
+                        tc.provider
+                            .as_ref()
+                            .map(|provider| provider.call_id.clone()),
+                        "an interactive vNext handoff cannot carry cwd, write_scope, or workspace_lease; use subagent mode",
+                    ));
+                }
                 let model = match crate::engine::model_roles::DelegationModelSelector::from_value(
                     args.get("model"),
                 ) {
@@ -1884,12 +1908,12 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         ));
                     }
                 };
-                // A vNext tree uses the structural noninteractive task path.
-                // That path carries the requested cwd and write_scope through
-                // every recursive launch and applies the live grant against
-                // the resolved target.  The legacy interactive handoff loses
-                // those authority inputs, so it is not a vNext runtime path.
-                let noninteractive = agent.vnext_grant.is_some()
+                // vNext defaults to its structural noninteractive path, which
+                // preserves cwd/write-scope/lease authority. An explicit
+                // authority-free interactive handoff remains interactive;
+                // silently rewriting the requested mode would persist the
+                // wrong executor kind and make crash recovery impossible.
+                let noninteractive = (agent.vnext_grant.is_some() && !explicitly_interactive)
                     || resolve_interactivity(mode, &child, resume_handle.is_some());
                 if context == TaskContext::Fork
                     && let Some(err) = fork_context_refusal(

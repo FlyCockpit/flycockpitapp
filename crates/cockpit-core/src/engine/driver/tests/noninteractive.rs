@@ -156,10 +156,11 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
                     serde_json::json!({}),
                 ),
                 delegate("delegate-b", "readonly-probe", "inspect beta"),
-                // `explore` carries Dynamic `bash`, so parallel admission
-                // rejects it and the real lane must drain before it runs as a
-                // serial delegate barrier.
-                delegate("delegate-barrier", "explore", "inspect serially"),
+                // The authored serial probe carries dynamic `bash`, so
+                // parallel admission rejects it and the real lane must drain
+                // before it runs as a serial delegate barrier. Its response
+                // never invokes that capability.
+                delegate("delegate-barrier", "serial-probe", "inspect serially"),
             ]))
             // The two concurrently admitted children may claim these two
             // equivalent terminal responses in either wall-clock order.
@@ -193,10 +194,24 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
         .unwrap();
         write_host_tool_surface(&agents_dir, "readonly-probe", &["read"]);
         std::fs::write(
+            agents_dir.join("serial-probe.md"),
+            vnext_coding_agent_document(
+                "serial-probe",
+                "dynamic scheduler barrier fixture",
+                "Return a short deterministic report.",
+            ),
+        )
+        .unwrap();
+        write_host_tool_surface(&agents_dir, "serial-probe", &["bash"]);
+        std::fs::write(
             config_dir.join("config.json"),
             serde_json::json!({
                 "active_model": { "provider": "lmstudio", "model": "local" },
                 "delegation": { "maxParallel": 2 },
+                // This fixture measures scheduler admission only. Override any
+                // user-level guard model so ordinary/delegate result scans do
+                // not add unrelated provider requests to the shared script.
+                "prompt_injection_guard": { "threshold": "off" },
                 // The fixture's authored leaf is intentionally limited to
                 // `read`; disable config-projected web commands so they do
                 // not turn that real child surface Dynamic.
@@ -223,6 +238,11 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
         // the authored child to that exact root grant, not to the stale frame
         // that existed before the refresh boundary.
         admit_authored_child_to_test_grants(&mut driver, "authored/readonly-probe");
+        admit_authored_child_to_test_grants(&mut driver, "authored/serial-probe");
+        // Dynamic authored-tool admission is approval-gated even when the
+        // scripted child never invokes the tool. Keep the approver alive for
+        // the entire run so the fixture reaches scheduler classification.
+        let approver = install_test_approver(&mut driver);
 
         let trust = crate::config::trust::WorkspaceTrustPolicy {
             root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
@@ -263,6 +283,7 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
             child_response_gate.add_permits(2);
             run.await.unwrap();
         }
+        drop(approver);
 
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -292,6 +313,11 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
             .into_iter()
             .filter(|request| request.request_line.starts_with("POST "))
             .collect::<Vec<_>>();
+        assert_eq!(
+            posts.len(),
+            5,
+            "the scheduler fixture must issue only root, three child, and parent-resume requests"
+        );
         let parent_resume = posts
             .iter()
             .find(|request| {
@@ -5524,6 +5550,7 @@ fn scheduler_defers_delegate_admission_until_serial_barrier() {
             serde_json::json!({
                 "active_model": { "provider": "lmstudio", "model": "local" },
                 "agent_chooses_subagent_model": true,
+                "prompt_injection_guard": { "threshold": "off" },
                 "web": { "provider": "custom" }
             })
             .to_string(),
@@ -5699,6 +5726,14 @@ fn scheduler_defers_delegate_admission_until_serial_barrier() {
         );
         assert_eq!(children[0].task_call_id, delegate_call_id);
         let captured = provider.captured();
+        assert_eq!(
+            captured
+                .iter()
+                .filter(|request| request.request_line.starts_with("POST "))
+                .count(),
+            3,
+            "the barrier fixture must issue only root, delegated-child, and parent-resume requests"
+        );
         assert!(
             captured.iter().any(|request| {
                 request.request_line.starts_with("POST ")

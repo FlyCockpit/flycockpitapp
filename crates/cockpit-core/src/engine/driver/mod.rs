@@ -3655,13 +3655,15 @@ impl Driver {
     fn config_for_noninteractive_child(
         &self,
     ) -> crate::daemon::session_worker::SessionConfigHandle {
+        let mut snapshot = (*self.config.snapshot()).clone();
         #[cfg(test)]
         if let Some((providers, _, _)) = &self.test_providers_override {
-            let mut snapshot = (*self.config.snapshot()).clone();
             snapshot.providers = providers.clone();
-            return crate::daemon::session_worker::SessionConfigHandle::detached(snapshot);
         }
-        self.config.clone()
+        // A child attempt owns the exact parent snapshot selected at admission.
+        // Never forward a live handle whose shared cell can advance before the
+        // child constructs its model or nested scheduler driver.
+        crate::daemon::session_worker::SessionConfigHandle::detached(snapshot)
     }
 
     pub fn set_resource_scheduler(

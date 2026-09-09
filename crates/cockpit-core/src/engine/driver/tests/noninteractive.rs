@@ -46,6 +46,47 @@ fn noninteractive_child_inherits_parent_provider_snapshot_by_construction() {
     assert_eq!(child_active.model, *parent_model);
 }
 
+#[test]
+fn noninteractive_child_detaches_the_live_parent_snapshot_at_construction() {
+    let (mut driver, _tmp) = test_driver(1);
+    let (providers, _, _) = driver
+        .test_providers_override
+        .take()
+        .expect("scripted parent has a provider snapshot");
+    let live = crate::daemon::session_worker::SessionConfigHandle::new(Arc::new(
+        std::sync::RwLock::new(crate::daemon::session_worker::SessionConfigSnapshot::new(
+            7,
+            providers.clone(),
+            crate::config::extended::ExtendedConfig::default(),
+        )),
+    ));
+    driver.set_config_handle(live.clone());
+
+    let child_config = driver
+        .spawn_args_delegated_in_cwd(
+            &driver.cwd,
+            false,
+            Vec::new(),
+            None,
+            crate::engine::builtin::DelegationRecursionContext::default(),
+        )
+        .config;
+    let mut refreshed = providers;
+    refreshed.active_model = None;
+    live.set_full_config_snapshot_for_tests(
+        crate::daemon::session_worker::SessionConfigSnapshot::new(
+            8,
+            refreshed,
+            crate::config::extended::ExtendedConfig::default(),
+        ),
+    );
+
+    assert_eq!(child_config.generation(), 7);
+    assert!(child_config.providers().active_model.is_some());
+    assert_eq!(live.generation(), 8);
+    assert!(live.providers().active_model.is_none());
+}
+
 #[tokio::test]
 async fn intermediate_noninteractive_continue_checkpoint_survives_cancel_or_failure_for_restart() {
     // `history` and `next_prompt` model the state immediately after a turn

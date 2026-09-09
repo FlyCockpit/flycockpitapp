@@ -29905,7 +29905,6 @@ pub(super) async fn attach(
             let (history, replay_max_seq, removed_user_message_seqs) = if let Some(since_seq) = since_seq {
                 let replay_rows =
                     crate::db::Db::list_session_events_since_conn(conn, session_id, since_seq)?;
-                let replay_max_seq = replay_rows.iter().map(|row| row.seq).max();
                 // A retraction deletes its user row, so normal transcript
                 // projection has nothing to render for it. Preserve the
                 // tombstone's target identity as a narrow replay operation:
@@ -29920,6 +29919,11 @@ pub(super) async fn attach(
                             .and_then(serde_json::Value::as_i64)
                     })
                     .collect();
+                let retraction_max_seq = replay_rows
+                    .iter()
+                    .filter(|row| row.kind == "user_message_retracted")
+                    .map(|row| row.seq)
+                    .max();
                 let history = crate::engine::rehydrate::history_snapshot_from_events_conn(
                     conn,
                     session_id,
@@ -29927,6 +29931,19 @@ pub(super) async fn attach(
                     active_subagent_for_attach.as_ref(),
                     replay_rows,
                 )?;
+                // The cursor acknowledges only rows represented in this replay
+                // batch. Internal lifecycle events are deliberately omitted
+                // from `HistoryReplay`; advancing over them would claim the
+                // client received state it never saw. Retraction tombstones are
+                // represented by `removed_user_message_seqs`, so their own
+                // event seq still participates in the high-water mark.
+                let replay_max_seq = history
+                    .iter()
+                    .map(history_entry_seq)
+                    .max()
+                    .into_iter()
+                    .chain(retraction_max_seq)
+                    .max();
                 (history, replay_max_seq, removed_user_message_seqs)
             } else {
                 // A full snapshot is merged with retained paged/live rows by

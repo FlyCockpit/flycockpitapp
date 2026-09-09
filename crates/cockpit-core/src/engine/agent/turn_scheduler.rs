@@ -450,12 +450,13 @@ fn classify_delegate_call(delegate_args: &Value, force_noninteractive: bool) -> 
         .filter(|s| !s.is_empty())
         .is_some();
 
-    let interactive = if force_noninteractive || has_resume_handle {
+    let interactive = if has_resume_handle {
         false // follow-up is always noninteractive
     } else {
         match mode {
             Some("subagent_interactive") => true,
             Some("subagent") => false,
+            _ if force_noninteractive => false,
             _ => !crate::engine::builtin::is_noninteractive(child_agent),
         }
     };
@@ -723,6 +724,32 @@ mod tests {
         // explore with write_scope remains a candidate. The mixed lane binds
         // write_authority from the live surface at attempt start.
         assert!(plan.calls[1].is_delegate_candidate());
+    }
+
+    #[test]
+    fn vnext_default_does_not_override_explicit_interactive_mode_in_canonical_envelope() {
+        let toolbox = ToolBox::new();
+        let calls = vec![tool_call(
+            "task",
+            serde_json::json!({
+                "intent": "delegate",
+                "payload": {
+                    "agent": "builder",
+                    "prompt": "handoff",
+                    "mode": "subagent_interactive"
+                }
+            }),
+        )];
+        let names = resolved_names(&calls);
+        let plan = build_plan_with_delegate_context(&calls, &names, &toolbox, 4, true);
+
+        assert_eq!(
+            plan.calls[0].classification,
+            CallClassification::SerialBarrier {
+                reason: SerialBarrierReason::InteractiveDelegate,
+            },
+            "vNext changes only the default; an explicit interactive mode must match dispatch"
+        );
     }
 
     /// AC3 (plan-level): `plan_keeps_batch_and_distinct_delegates_separate` —

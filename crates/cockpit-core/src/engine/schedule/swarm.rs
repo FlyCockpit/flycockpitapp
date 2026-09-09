@@ -862,6 +862,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         params: ctx.agent.params.clone(),
         env_overlay: ctx.agent.env_overlay.clone(),
         cwd: ctx.cwd.clone(),
+        delegated_definition_root: None,
         config: pinned.clone(),
         session_short_id: ctx.session.short_id(),
         workspace_scratch_dir: ctx.session.workspace_scratch_dir(),

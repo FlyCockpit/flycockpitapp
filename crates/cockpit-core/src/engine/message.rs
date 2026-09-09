@@ -1473,6 +1473,35 @@ impl UserSubmissionQueue {
         }
     }
 
+    /// Whether the next group-ordered submission for `target_id` can be
+    /// dequeued now. Unlike [`Self::has_pending_for`], delayed submissions and
+    /// submissions held by an edit/removal claim are not ready. A delayed
+    /// effective-top item also keeps a later held item from reporting ready,
+    /// matching [`Self::recv_group_order_for`]'s ordering contract.
+    pub async fn has_ready_for(&self, target_id: Option<&str>) -> bool {
+        let mut state = self.inner.lock().await;
+        if state.closed || state.staged_removal.is_some() {
+            return false;
+        }
+        for pending in &mut state.pending {
+            clear_expired_edit_lease(pending);
+        }
+        let item = [QueueDrainFilter::EffectiveTop, QueueDrainFilter::Held]
+            .into_iter()
+            .find_map(|filter| {
+                state.pending.iter().find(|item| {
+                    target_id.is_none_or(|target_id| item.target.id == target_id)
+                        && filter.matches(item)
+                })
+            });
+        item.is_some_and(|item| {
+            item.edit_lease.is_none()
+                && item
+                    .not_before
+                    .is_none_or(|deadline| deadline <= tokio::time::Instant::now())
+        })
+    }
+
     /// Wait until a matching foreground submission is pending without taking
     /// it from the queue. Utility work uses this to yield immediately to user
     /// re-entry while preserving the normal group-order dequeue path.
@@ -3684,6 +3713,41 @@ mod tests {
                 .unwrap()
                 .text,
             "ready held"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_readiness_excludes_deferred_effective_top_until_its_deadline() {
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let target = QueueTarget::root("Build");
+        queue
+            .requeue_front_after(
+                UserSubmission::text("delayed steering"),
+                target.clone(),
+                std::time::Duration::from_millis(250),
+            )
+            .await;
+        let mut held = UserSubmission::text("ready held");
+        held.delivery_class = QueueDeliveryClass::Held;
+        queue.push(held, target.clone()).await;
+
+        assert!(queue.has_pending_for(Some(&target.id)).await);
+        assert!(
+            !queue.has_ready_for(Some(&target.id)).await,
+            "a later held item cannot bypass the deferred effective-top group"
+        );
+
+        tokio::time::advance(std::time::Duration::from_millis(250)).await;
+
+        assert!(queue.has_ready_for(Some(&target.id)).await);
+        assert_eq!(
+            queue
+                .recv_group_order_for(Some(&target.id))
+                .await
+                .unwrap()
+                .text,
+            "delayed steering"
         );
     }
 

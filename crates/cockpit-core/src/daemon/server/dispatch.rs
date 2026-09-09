@@ -30649,6 +30649,7 @@ async fn run_docs_ask_pipeline(
         },
         env_overlay: Arc::new(std::sync::RwLock::new(Default::default())),
         cwd: cwd.clone(),
+        delegated_definition_root: None,
         config: config.clone(),
         session_short_id: session.short_id(),
         workspace_scratch_dir: session.workspace_scratch_dir(),

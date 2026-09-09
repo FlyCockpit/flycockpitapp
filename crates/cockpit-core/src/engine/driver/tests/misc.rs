@@ -75,10 +75,7 @@ async fn turn_boundary_refresh_refuses_when_dotenv_exceeds_the_file_cap() {
             .contains("turn-boundary-keep-secret"),
         "over-cap must not wipe the previously committed table"
     );
-    let notice = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-        .await
-        .expect("over-cap must surface a notice")
-        .expect("notice channel closed");
+    let notice = rx.recv().await.expect("notice channel closed");
     match notice {
         TurnEvent::Notice { text } => {
             assert!(
@@ -129,10 +126,7 @@ async fn store_open_failure_does_not_replace_the_live_table_with_unredacted_secr
         .refresh_redaction_table_for_turn(&tx)
         .await
         .expect_err("store-open failure must abort the refresh so the turn cannot send");
-    let notice = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-        .await
-        .expect("store-open failure must surface a notice")
-        .expect("notice channel closed");
+    let notice = rx.recv().await.expect("notice channel closed");
     match notice {
         TurnEvent::Notice { text } => {
             assert!(

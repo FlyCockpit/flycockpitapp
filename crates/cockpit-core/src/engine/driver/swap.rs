@@ -1350,10 +1350,6 @@ impl Driver {
     fn authoritative_config_active_model(
         &self,
     ) -> Option<crate::config::providers::ActiveModelRef> {
-        #[cfg(test)]
-        if let Some((providers, _, _)) = &self.test_providers_override {
-            return providers.active_model.clone();
-        }
         // Session-scoped code reads config through the driver's live snapshot,
         // never straight from disk.
         self.live_config_active_model()
@@ -1378,7 +1374,9 @@ impl Driver {
         }
 
         #[cfg(test)]
-        if self.test_providers_override.is_some() || self.test_fail_next_active_model_config_write {
+        if self.test_fail_next_active_model_config_write
+            || self.test_fail_next_active_model_session_persist
+        {
             return Ok(PreparedDefaultModelUpdate::Test(intent));
         }
 
@@ -1625,19 +1623,13 @@ impl Driver {
     #[cfg(test)]
     fn write_active_model_config_for_test(
         &mut self,
-        active: &crate::config::providers::ActiveModelRef,
+        _active: &crate::config::providers::ActiveModelRef,
     ) -> Result<()> {
         if self.test_fail_next_active_model_config_write {
             self.test_fail_next_active_model_config_write = false;
             anyhow::bail!("test injected active model config write failure");
         }
-        if let Some((providers, provider, model)) = self.test_providers_override.as_mut() {
-            providers.active_model = Some(active.clone());
-            *provider = active.provider.clone();
-            *model = active.model.clone();
-            return Ok(());
-        }
-        unreachable!("test config write helper requires an override or injected failure")
+        unreachable!("test config write helper requires an injected failure")
     }
 
     fn persist_active_model_session(

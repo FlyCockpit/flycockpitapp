@@ -11,11 +11,7 @@ use cockpit_client::{DaemonClient, is_protocol_version_mismatch};
 
 use crate::daemon::proto::{self, Request};
 
-// Container capability detection is deliberately synchronous and must finish
-// before endpoint publication. Give a cold or heavily loaded host the same
-// a generous startup budget instead of timing out while the daemon is still
-// completing its prepublication security checks.
-const SPAWN_DAEMON_TIMEOUT: Duration = Duration::from_secs(300);
+const SPAWN_DAEMON_TIMEOUT: Duration = Duration::from_secs(30);
 /// An accepted ephemeral restart is destructive, so its replacement phase is
 /// given one bounded recovery window. This prevents a permanently broken
 /// successor from serially wedging the lifecycle host forever.

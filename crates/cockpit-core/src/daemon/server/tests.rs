@@ -19621,8 +19621,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "list_guidance_proposals"
         | "clean_managed_workspace_lease"
         | "restart_if_idle"
-        | "stop_daemon"
-        | "refresh_host_capabilities" => AuthzAllowedOutcome::Response,
+        | "stop_daemon" => AuthzAllowedOutcome::Response,
         "count_pinned_messages"
         | "list_pinned_message_seqs"
         | "list_pinned_messages_with_text"
@@ -19752,6 +19751,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "set_redaction"
         | "set_tandem_models"
         | "refresh_config"
+        | "refresh_host_capabilities"
         | "cancel_schedule"
         | "prune"
         | "compact"
@@ -31135,7 +31135,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
 fn message_attachment_exactly_once_local_v2_replay_preserves_durable_reference() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home();
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(4)
         .thread_stack_size(crate::daemon::session_worker::TOKIO_WORKER_STACK_SIZE)
         .enable_all()
         .build()
@@ -31603,7 +31603,20 @@ fn tool_media_subject_binding_replay_and_propagation_daemon_restart_and_release(
 }
 
 async fn image_submission_exact_retry_case() {
-    let mut ctx = test_ctx();
+    let (model_url, model_server) = immediate_done_model_server().await;
+    let mut providers = stub_providers_config();
+    providers
+        .providers
+        .get_mut("lmstudio")
+        .expect("stub lmstudio provider")
+        .url = model_url;
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.auto_title = Some("openai/gpt-4o-mini".to_string());
+    extended.auto_title_with_session_model = false;
+    extended.default_approval_mode = crate::config::extended::ApprovalMode::Yolo;
+    let mut ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+        providers, extended,
+    ));
     let media_dir = tempfile::tempdir().unwrap();
     let db = ctx.db.clone();
     // V2 attachment acceptance requires durable media storage; provision it
@@ -31905,6 +31918,7 @@ async fn image_submission_exact_retry_case() {
         .filter(|event| event.kind == "user_message")
         .count();
     assert_eq!(user_messages, 2, "exact retry must not duplicate inference");
+    model_server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -38266,6 +38280,12 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         );
     let mut extended = crate::config::extended::ExtendedConfig::default();
     extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxIntent::Off;
+    // The scripted retraction model server owns a fixed stream sequence. A
+    // same-model metadata fork after a successful turn would consume the next
+    // stream and desynchronize the visible-text/tool/cancel-all boundaries.
+    extended.auto_title = Some("openai/gpt-4o-mini".to_string());
+    extended.auto_title_with_session_model = false;
+    extended.default_approval_mode = crate::config::extended::ApprovalMode::Yolo;
     let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
         providers, extended,
     ));
@@ -38695,6 +38715,51 @@ async fn collect_retraction_acceptance_events_until(
     .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
 }
 
+/// Minimal completions endpoint that finishes every accepted request
+/// immediately. Image-retry acceptance needs the first foreground turn to
+/// terminate promptly so the next queued user row can fold; connection-refused
+/// retries against `localhost:1` can legitimately outlive a tight fuse under a
+/// saturated multi-thread runtime.
+async fn immediate_done_model_server() -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.expect("model accepts request");
+            let mut request = Vec::new();
+            let mut scratch = [0_u8; 4096];
+            loop {
+                let read = socket
+                    .read(&mut scratch)
+                    .await
+                    .expect("model reads request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&scratch[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n\
+data: [DONE]\n\n",
+                )
+                .await
+                .expect("model writes completion");
+            socket.flush().await.expect("model flushes completion");
+        }
+    });
+    (format!("http://{address}/v1"), server)
+}
+
 /// Six controlled chat-completions streams for the acceptance test above:
 /// reasoning/hang, resend/text, visible-text/hang, tool, then tool-follow-up
 /// hang, then reasoning/hang for the `CancelAllSessionWork` boundary. Hanging
@@ -38775,6 +38840,24 @@ async fn retraction_acceptance_model_server() -> (
                 let mut eof = [0_u8; 1];
                 let _ = socket.read(&mut eof).await;
             }
+        }
+        // Absorb any stray utility/metadata requests without shifting the
+        // scripted stream sequence above.
+        loop {
+            let (mut socket, _) = listener.accept().await.expect("model accepts request");
+            let _ = read_retraction_acceptance_http_request(&mut socket).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"stray\"},\"finish_reason\":null}]}\n\n\
+data: [DONE]\n\n",
+                )
+                .await
+                .expect("model writes stray completion");
+            socket
+                .flush()
+                .await
+                .expect("model flushes stray completion");
         }
     });
     (format!("http://{address}/v1"), captured, server)

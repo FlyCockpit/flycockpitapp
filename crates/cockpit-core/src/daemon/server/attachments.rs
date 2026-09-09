@@ -43,7 +43,7 @@ pub(super) async fn admit_image_ingress(
     let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
     let storage = ctx
         .active_media_storage_recovery()
-        .ok_or_else(|| internal("durable media storage unavailable"))?;
+        .ok_or_else(|| bad_request("media_attachment_unavailable"))?;
     // This digest is the durable idempotency binding. For terminal ingress it
     // contains only a one-way digest of the opaque bearer, never the bearer or
     // its host-retained path. Clipboard binding uses declared metadata so the
@@ -376,7 +376,7 @@ pub(super) async fn discard_image_ingress_draft(
     let principal_digest = super::run_invocation::principal_digest(&state.principal);
     let storage = ctx
         .active_media_storage_recovery()
-        .ok_or_else(|| internal("media storage authority is unavailable"))?;
+        .ok_or_else(unavailable)?;
     if let Some(receipt) = storage
         .image_ingress_draft_discard_receipt(
             admission_id,

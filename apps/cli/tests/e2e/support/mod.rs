@@ -252,6 +252,9 @@ impl IsolatedHome {
 }
 
 pub struct SpawnedDaemon {
+    // Declared before `home` so the exact child is killed and reaped before
+    // TempDir removes the isolated socket, endpoint, database, and log tree.
+    process: EphemeralDaemonGuard,
     home: IsolatedHome,
 }
 
@@ -291,15 +294,26 @@ impl SpawnedDaemon {
     }
 
     async fn start_in(home: IsolatedHome) -> Self {
-        let output = home
-            .cockpit()
-            .args(["daemon", "start", "--detach"])
+        // Mirror the production detached-spawn provenance handshake while
+        // retaining the foreground Child in this process. The daemon persists
+        // this ticket beside its isolated socket for follower CLI commands.
+        let launch_ticket = format!(
+            "{:032x}{:032x}",
+            uuid::Uuid::new_v4().as_u128(),
+            uuid::Uuid::new_v4().as_u128()
+        );
+        let mut command = home.cockpit();
+        command
+            .args(["daemon", "start", "--foreground"])
             .env("COCKPIT_LOG", "warn,cockpit::startup=info")
-            .output()
-            .expect("spawn daemon start command");
-        assert_success("cockpit daemon start --detach", &output, &home);
+            .env("COCKPIT_DAEMON_LAUNCH_TICKET", &launch_ticket)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let child = command.spawn().expect("spawn foreground daemon");
+        let process = EphemeralDaemonGuard::new(child, home.socket_path(), home.pid_file());
         wait_for_status_handshake(&home, DAEMON_START_HANDSHAKE_TIMEOUT).await;
-        Self { home }
+        Self { process, home }
     }
 
     pub fn command(&self) -> Command {
@@ -416,6 +430,9 @@ impl Drop for SpawnedDaemon {
             let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
             let _ = wait_for_pid_exit_blocking(pid, Duration::from_secs(2));
         }
+        // `process` remains armed. Its Drop is the portable final authority:
+        // kill + wait the exact child before removing lifecycle metadata and
+        // before `home` removes the entire isolated tree.
     }
 }
 
@@ -452,12 +469,10 @@ pub fn output_text(output: &Output) -> String {
     )
 }
 
-// Boot performs synchronous containment, write-scope, media, and container
-// recovery before endpoint publication. Loaded CI hosts can spend minutes in
-// durable filesystem commits; the harness must wait for the real handshake,
-// not substitute socket existence for readiness.
-const DAEMON_START_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(300);
-const DAEMON_RESTART_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(300);
+// Keep startup waits bounded while requiring the real status handshake rather
+// than substituting socket existence for readiness.
+const DAEMON_START_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
+const DAEMON_RESTART_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn daemon_transport_ready_for_home(home: &IsolatedHome) -> bool {
     daemon_transport_ready_for_paths(&home.socket_path(), &home.pid_file())
@@ -668,9 +683,8 @@ pub(crate) fn wait_for_pid_exit_blocking(pid: u32, timeout: Duration) -> bool {
     !pid_is_live(pid)
 }
 
-/// Panic/unwind guard for foreground ephemeral daemons spawned outside
-/// [`SpawnedDaemon`]. Ensures the child is terminated and reaped and the socket
-/// node is removed on abnormal test exit.
+/// Panic/unwind guard for foreground test daemons. Ensures the exact child is
+/// terminated and reaped before its socket and lifecycle metadata are removed.
 pub struct EphemeralDaemonGuard {
     child: Option<std::process::Child>,
     socket: PathBuf,

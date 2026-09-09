@@ -1,7 +1,7 @@
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::support::{IsolatedHome, output_text};
+use crate::support::{IsolatedHome, SpawnedDaemon, output_text};
 use cockpit_test_support::provider::{ScriptedProvider, Turn};
 
 const TOOL_CALL_ID: &str = "run-approval-call";
@@ -118,6 +118,8 @@ async fn one_shot_run_dispatches() {
     let provider = repeating_text_provider("run dispatched").await;
     let home = IsolatedHome::new();
     home.write_local_provider_config(&provider.base_url());
+    let daemon = SpawnedDaemon::start_with_home(home).await;
+    let home = daemon.home();
     home.trust_project();
 
     let mut command = home.cockpit();
@@ -149,6 +151,8 @@ async fn org_logging_indicator_does_not_corrupt_ndjson() {
     let provider = repeating_text_provider("run dispatched").await;
     let home = IsolatedHome::new();
     home.write_local_provider_config(&provider.base_url());
+    let daemon = SpawnedDaemon::start_with_home(home).await;
+    let home = daemon.home();
     home.trust_project();
 
     let credential = cockpit_core::auth::flycockpit::StoredFlycockpitCredential {
@@ -202,6 +206,8 @@ async fn inference_failure_is_loud() {
     let provider = run_provider(vec![inference_failure_turn(), inference_failure_turn()]).await;
     let home = IsolatedHome::new();
     home.write_local_provider_config(&provider.base_url());
+    let daemon = SpawnedDaemon::start_with_home(home).await;
+    let home = daemon.home();
     home.trust_project();
 
     let mut default_command = home.cockpit();
@@ -250,6 +256,8 @@ async fn usage_errors_exit_two_and_post_attach_error_keeps_session_id() {
     let provider = repeating_text_provider("run dispatched").await;
     let home = IsolatedHome::new();
     home.write_local_provider_config(&provider.base_url());
+    let daemon = SpawnedDaemon::start_with_home(home).await;
+    let home = daemon.home();
     home.trust_project();
 
     let mut invalid_agent = home.cockpit();
@@ -275,6 +283,8 @@ async fn cwd_flag_sets_workspace_root() {
     let provider = repeating_text_provider("run dispatched").await;
     let home = IsolatedHome::new();
     home.write_local_provider_config(&provider.base_url());
+    let daemon = SpawnedDaemon::start_with_home(home).await;
+    let home = daemon.home();
     home.trust_project();
     let target = home.project_path().join("target");
     std::fs::create_dir(&target).expect("create target workspace");
@@ -389,6 +399,8 @@ async fn run_approval_auto_denied() {
         serde_json::to_vec(&provider_json).expect("serialize local provider config"),
     )
     .expect("disable rolling precompaction for finite approval script");
+    let daemon = SpawnedDaemon::start_with_home(home).await;
+    let home = daemon.home();
     home.trust_project();
 
     let mut default_command = home.cockpit();
@@ -463,6 +475,8 @@ async fn run_approve_class_grants() {
     .await;
     let home = IsolatedHome::new();
     home.write_local_provider_config(&provider.base_url());
+    let daemon = SpawnedDaemon::start_with_home(home).await;
+    let home = daemon.home();
     home.trust_project();
 
     let mut command = home.cockpit();

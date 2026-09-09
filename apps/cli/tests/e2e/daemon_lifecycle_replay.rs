@@ -303,8 +303,8 @@ async fn create_parked_session_with_hook(
         home.set_env("COCKPIT_TEST_PAUSE_PARKED_REPLAY_EXECUTING", "1");
     }
     home.write_local_provider_config(&provider.base_url());
-    home.trust_project();
     let daemon = SpawnedDaemon::start_with_home(home).await;
+    daemon.home().trust_project();
     let client = daemon.client().await;
     let attached = client
         .attach(daemon.project_path(), None, None, true)
@@ -340,8 +340,8 @@ async fn create_auto_gate_parked_session_with_hook(
         r#"{"active_model":{"provider":"local","model":"scripted"},"sandbox_escalation_enabled":true,"defaultApprovalMode":"auto"}"#,
     )
     .expect("write auto approval replay config");
-    home.trust_project();
     let daemon = SpawnedDaemon::start_with_home(home).await;
+    daemon.home().trust_project();
     let client = daemon.client().await;
     let attached = client
         .attach(daemon.project_path(), None, None, true)
@@ -396,8 +396,8 @@ async fn create_parked_session_with_shutdown_park_delay()
         INJECTED_SHUTDOWN_PARK_DELAY_MS,
     );
     home.write_local_provider_config(&provider.base_url());
-    home.trust_project();
     let daemon = SpawnedDaemon::start_with_home(home).await;
+    daemon.home().trust_project();
     let client = daemon.client().await;
     let attached = client
         .attach(daemon.project_path(), None, None, true)
@@ -437,8 +437,8 @@ async fn create_open_interrupt_session_with_reconcile_delay()
         INJECTED_STARTUP_RECONCILE_DELAY_MS,
     );
     home.write_local_provider_config(&provider.base_url());
-    home.trust_project();
     let daemon = SpawnedDaemon::start_with_home(home).await;
+    daemon.home().trust_project();
     let client = daemon.client().await;
     let attached = client
         .attach(daemon.project_path(), None, None, true)

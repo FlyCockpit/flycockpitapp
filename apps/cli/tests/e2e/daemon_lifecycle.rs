@@ -5,6 +5,7 @@ use crate::support::{SpawnedDaemon, output_text, wait_until};
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawned_daemon_start_status_stop_round_trip() {
     let daemon = SpawnedDaemon::start().await;
+    let isolated_root = daemon.home().home_dir().to_path_buf();
 
     let output = daemon
         .command()
@@ -13,6 +14,13 @@ async fn spawned_daemon_start_status_stop_round_trip() {
         .expect("daemon status command");
     assert!(output.status.success(), "{}", output_text(&output));
     assert!(output_text(&output).contains("daemon: running"));
+
+    drop(daemon);
+    assert!(
+        !isolated_root.exists(),
+        "exact child reap must finish before isolated-home removal: {}",
+        isolated_root.display()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

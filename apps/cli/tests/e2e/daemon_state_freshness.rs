@@ -94,20 +94,6 @@ async fn ephemeral_session_resumes_on_shared_daemon() {
     let provider = text_provider().await;
     let home = IsolatedHome::new();
     home.write_local_provider_config(&provider.base_url());
-    home.trust_project();
-    // `trust set` starts a persistent daemon that holds the exclusive boot
-    // lock. Ephemeral and persistent cannot share that lock; stop the
-    // trust-started process before the explicit ephemeral daemon boots.
-    let stop_trust_daemon = home
-        .cockpit()
-        .args(["daemon", "stop", "--grace", "0"])
-        .output()
-        .expect("stop trust-started persistent daemon");
-    assert_success(
-        "stop trust-started persistent daemon",
-        &stop_trust_daemon,
-        &home,
-    );
 
     // Ephemeral ownership is a lifetime policy on the canonical ledger
     // endpoint. A shared follow-up daemon must discover the exact same socket
@@ -140,6 +126,9 @@ async fn ephemeral_session_resumes_on_shared_daemon() {
         },
     )
     .await;
+    // Establish trust through the already-published exact child. Starting
+    // trust first would auto-spawn an unowned persistent daemon.
+    home.trust_project();
     let ephemeral_client = DaemonClient::connect(&ephemeral_socket)
         .await
         .expect("connect explicit ephemeral daemon");

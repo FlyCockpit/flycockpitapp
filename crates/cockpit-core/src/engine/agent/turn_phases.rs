@@ -2351,6 +2351,7 @@ pub(crate) async fn run_turn(
         is_root,
         context_usage,
         history,
+        &prompt,
         &cwd,
         &config,
         redact.clone(),
@@ -3872,11 +3873,13 @@ async fn inject_volatile_context(
     is_root: bool,
     context_usage: crate::engine::tool::ContextUsageSnapshot,
     history: &mut Vec<Message>,
+    prompt: &Message,
     cwd: &std::path::Path,
     config: &crate::daemon::session_worker::SessionConfigHandle,
     redact: Arc<RedactionTable>,
     tx: &mpsc::Sender<TurnEvent>,
 ) -> Result<()> {
+    let trailing_tool_group = take_trailing_tool_group_for_volatile_context(history, prompt);
     inject_turn_start_system_messages(session, active_tools, is_root, context_usage, history)
         .await?;
     let active_tool_names = active_tools.names();
@@ -3902,7 +3905,48 @@ async fn inject_volatile_context(
             redact.as_ref(),
         );
     }
+    history.extend(trailing_tool_group);
     Ok(())
+}
+
+/// Detach an open assistant tool-call group while volatile turn-start context
+/// is injected. The final sibling result lives in `prompt`; leaving the group
+/// in history would put new system messages before that result and make the
+/// pairing healer synthesize a duplicate interrupted result.
+fn take_trailing_tool_group_for_volatile_context(
+    history: &mut Vec<Message>,
+    prompt: &Message,
+) -> Vec<Message> {
+    use rig::message::{AssistantContent, UserContent};
+
+    let Some(prompt_call_id) = tool_result_call_id(prompt) else {
+        return Vec::new();
+    };
+    let Some(start) = history.iter().rposition(|message| {
+        matches!(message, Message::Assistant { content, .. } if content.iter().any(|part| {
+            matches!(part, AssistantContent::ToolCall(call) if call.id.as_str() == prompt_call_id)
+        }))
+    }) else {
+        return Vec::new();
+    };
+    let call_ids = match &history[start] {
+        Message::Assistant { content, .. } => content
+            .iter()
+            .filter_map(|part| match part {
+                AssistantContent::ToolCall(call) => Some(call.id.to_string()),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>(),
+        _ => unreachable!("rposition matched an assistant message"),
+    };
+    if !history[start + 1..].iter().all(|message| {
+        matches!(message, Message::User { content } if !content.is_empty() && content.iter().all(|part| {
+            matches!(part, UserContent::ToolResult(result) if call_ids.contains(result.call.as_str()))
+        }))
+    }) {
+        return Vec::new();
+    }
+    history.split_off(start)
 }
 
 #[cfg(test)]
@@ -3968,6 +4012,63 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn volatile_context_stays_before_an_open_tool_result_group() {
+        let call = |id: &str| ToolCall {
+            id: rig::message::ToolCallId::new_or_mint(id.to_string()),
+            provider: rig::message::ProviderCallId::new(format!("provider-{id}")),
+            function: ToolFunction {
+                name: "task".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            signature: None,
+            additional_params: None,
+        };
+        let mut history = vec![
+            Message::user("original input"),
+            Message::Assistant {
+                id: None,
+                content: vec![
+                    crate::engine::message::AssistantContent::ToolCall(call("delegate-a")),
+                    crate::engine::message::AssistantContent::ToolCall(call("delegate-barrier")),
+                ],
+            },
+            crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                "delegate-a",
+                None,
+                None,
+                "task",
+                "first result",
+            ),
+        ];
+        let prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "delegate-barrier",
+            None,
+            None,
+            "task",
+            "barrier result",
+        );
+
+        let trailing = take_trailing_tool_group_for_volatile_context(&mut history, &prompt);
+        history.push(Message::System {
+            content: "volatile capability notice".to_string(),
+        });
+        history.extend(trailing);
+
+        assert!(
+            matches!(&history[1], Message::System { content } if content == "volatile capability notice")
+        );
+        assert!(matches!(&history[2], Message::Assistant { .. }));
+        assert_eq!(
+            tool_result_call_id(&history[3]).as_deref(),
+            Some("delegate-a")
+        );
+        assert_eq!(
+            tool_result_call_id(&prompt).as_deref(),
+            Some("delegate-barrier")
+        );
     }
 
     #[tokio::test]

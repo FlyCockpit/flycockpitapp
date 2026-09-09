@@ -14212,7 +14212,15 @@ impl Driver {
                                     })
                                     .await;
                             }
-                            Ok(false) => {}
+                            Ok(false) => {
+                                // A newer durable row won, so this turn was not
+                                // retracted. Keep its already-committed title and
+                                // accounting: both are valid state derived from a
+                                // user row that remains in the ledger. The aborted
+                                // task only fences a later title write; a completed
+                                // `set_auto_title` is atomic and is intentionally
+                                // not rolled back without removing its source row.
+                            }
                             Err(error) => {
                                 tracing::warn!(%error, seq, "initial-thinking user-message retract failed");
                             }

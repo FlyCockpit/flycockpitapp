@@ -686,6 +686,56 @@ mod metadata_tests {
     }
 
     #[tokio::test]
+    async fn failed_latest_row_retract_keeps_committed_title_progress() {
+        let session = Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            PathBuf::from("/title-retract-lost-race"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let snapshot = session.title_progress_snapshot().await.unwrap();
+        assert_eq!(
+            session.note_user_content("cancelled prompt"),
+            TitleAction::Eager
+        );
+        assert!(session.set_auto_title("retained-title").unwrap());
+        let seq = session
+            .db
+            .insert_session_event(
+                session.id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &serde_json::json!({"text": "cancelled prompt"}),
+            )
+            .await
+            .unwrap();
+        session
+            .db
+            .insert_session_event(
+                session.id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &serde_json::json!({"text": "newer prompt"}),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !session
+                .retract_latest_user_message(seq, snapshot, Some("retained-title"))
+                .await
+                .unwrap(),
+            "a superseded user row cannot be retracted"
+        );
+        assert_eq!(session.title().as_deref(), Some("retained-title"));
+        assert!(session.user_content_tokens() > 0);
+        assert_eq!(session.user_content_turns(), 1);
+    }
+
+    #[tokio::test]
     async fn retract_without_consuming_prelude_preserves_pending_replay() {
         let session = Session::create_for_test(
             crate::db::Db::open_in_memory().unwrap(),

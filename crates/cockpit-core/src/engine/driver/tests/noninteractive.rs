@@ -214,8 +214,12 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
             .with_response_gate(child_response_gate.clone())
             .turn(Turn::Text("serial delegate completed".into()))
             .turn(Turn::Text("parent observed all results".into()))
-            .start()
-            .await;
+            // The driver below intentionally performs synchronous config and
+            // admission work on a current-thread runtime. Keep the HTTP
+            // fixture on its owned runtime so provider progress is an
+            // independent readiness source rather than an executor-ordering
+            // accident under parallel nextest load.
+            .start_blocking();
         let (mut driver, tmp) = test_driver_with_url_vnext(8, provider.base_url());
         std::fs::write(tmp.path().join("middle.txt"), "middle body").unwrap();
 

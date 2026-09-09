@@ -2721,7 +2721,7 @@ impl SessionRegistry {
         // Snapshot + take the join handles. Taking them out of the map means
         // a worker that exits on its own mid-drain (and calls `forget`)
         // can't race us for its handle.
-        let joins: Vec<(Uuid, WorkerJoin)> = {
+        let mut joins: Vec<(Uuid, WorkerJoin)> = {
             let mut joins = crate::sync::lock_or_recover(&self.inner.worker_joins);
             joins.drain().collect()
         };
@@ -2802,11 +2802,6 @@ impl SessionRegistry {
                 }
             }
         }
-        if grace.is_zero() {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
         // Interrupt-park obligations: EVERY worker we delivered a Shutdown to is
         // an obligation — drain awaits its ParkCommit terminal unconditionally
         // (`daemon-lifecycle-replay-timing-robustness.md`, finding 2 residual).
@@ -2848,9 +2843,12 @@ impl SessionRegistry {
             .iter()
             .map(|(_, entry)| entry.join.abort_handle())
             .collect();
-        let drain = futures::future::join_all(joins.into_iter().map(|(_, entry)| entry.join));
-
-        let phase2_clean = match tokio::time::timeout(grace, drain).await {
+        let phase2_clean = match tokio::time::timeout(
+            grace,
+            futures::future::join_all(joins.iter_mut().map(|(_, entry)| &mut entry.join)),
+        )
+        .await
+        {
             Ok(_) => true,
             Err(_) => {
                 // Grace exhausted with work still outstanding: force-abort
@@ -2875,6 +2873,17 @@ impl SessionRegistry {
                 for ah in &abort_handles {
                     ah.abort();
                 }
+                // Cancellation is not complete until each exact task handle
+                // resolves. Dropping the handles here leaves worker-owned
+                // DaemonContext/Db clones alive into runtime teardown, so a
+                // stop can report its bounded grace exhausted yet retain the
+                // database boot lock beyond the restart release deadline.
+                // The durable forced-interruption marker above precedes this
+                // external cancellation; now reap every task before daemon
+                // metadata and process ownership are released.
+                let _ =
+                    futures::future::join_all(joins.iter_mut().map(|(_, entry)| &mut entry.join))
+                        .await;
                 false
             }
         };

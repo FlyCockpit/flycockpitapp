@@ -224,8 +224,8 @@ struct Writer {
 }
 
 /// Shared writer lifetime. `Db` declares its `writer` field before its owner
-/// lock, so the final clone joins this thread (including its final checkpoint)
-/// before releasing exclusive database ownership.
+/// lock, so the final clone drains and joins this thread before releasing
+/// exclusive database ownership.
 struct WriterInner {
     tx: Mutex<Option<mpsc::SyncSender<WriteRequest>>>,
     join: Mutex<Option<std::thread::JoinHandle<Result<()>>>>,
@@ -271,12 +271,13 @@ impl Writer {
                         ));
                     }
                 }
-                // The last database owner performs an explicit truncating
-                // checkpoint before SQLite closes the writer. This bounds
-                // WAL growth and makes the durable shutdown boundary
-                // independent of SQLite's build-time autocheckpoint defaults.
-                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-                    .context("checkpointing SQLite WAL during writer shutdown")?;
+                // Closing the final writer connection preserves every
+                // synchronous=FULL WAL commit. Do not put a truncating
+                // checkpoint on daemon process teardown: the kernel flush can
+                // block indefinitely, retaining the exclusive boot lock past
+                // the bounded stop/restart release contract. Runtime WAL
+                // growth remains bounded by our explicit wal_autocheckpoint.
+                drop(conn);
                 Ok(())
             })
             .context("spawning db writer thread")?;

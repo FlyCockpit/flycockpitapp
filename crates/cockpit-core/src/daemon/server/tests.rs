@@ -15020,7 +15020,10 @@ fn authority_recovery_precedes_both_socket_binds() {
     let reveal_bind = boot[recovery..]
         .find("leak_reveal_socket::bind_reveal_socket(&ctx)")
         .expect("reveal socket bind must follow recovery");
-    assert!(control_bind < reveal_bind);
+    assert!(
+        reveal_bind < control_bind,
+        "control socket must be the final observable bind after reveal setup"
+    );
 
     let server = include_str!("mod.rs");
     let recover_prefix = server

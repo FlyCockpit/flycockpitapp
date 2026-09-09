@@ -2244,20 +2244,6 @@ async fn run_foreground_inner_with_boot_db(
     timer.phase("boot");
     boot_dbg!("after_recover");
 
-    // Do not expose a connectable socket until boot has completed. A client
-    // that observes a bound socket expects the hello promptly; publishing it
-    // before database/config initialization creates a startup handshake race.
-    let listener = bind_private_socket(&paths.socket)?;
-    timer.phase("socket_bind");
-    boot_dbg!("after_bind");
-    if uses_supplied_boot_db {
-        write_endpoint_record_with_receipt_and_canonical(&paths, &paths, &pid_receipt)?;
-    } else {
-        write_endpoint_record(&paths)?;
-    }
-    timer.phase("endpoint_published");
-    boot_dbg!("after_endpoint_publish");
-
     // Signal task: SIGINT/SIGTERM (or Ctrl-C / console-close on Windows)
     // route into the single graceful-shutdown path. The **first** signal
     // begins the drain; a **second** signal while still draining shortens
@@ -2357,9 +2343,26 @@ async fn run_foreground_inner_with_boot_db(
     };
 
     timer.phase("signal_and_lifecycle");
+
+    // Finish every potentially blocking setup operation before making the
+    // control socket observable. In particular, binding the leak-reveal
+    // sibling can block in filesystem I/O under load. A client that observes
+    // the control socket expects its hello promptly.
+    if uses_supplied_boot_db {
+        write_endpoint_record_with_receipt_and_canonical(&paths, &paths, &pid_receipt)?;
+    } else {
+        write_endpoint_record(&paths)?;
+    }
+    let listener = bind_private_socket(&paths.socket)?;
+    // Schedule the accept loop before startup logging after bind. This keeps
+    // a slow log sink from extending the socket-visible/hello-ready interval.
+    let accept = tokio::spawn(server::run_accept_loop(ctx.clone(), listener));
+    timer.phase("socket_bind");
+    boot_dbg!("after_bind");
+    timer.phase("endpoint_published");
+    boot_dbg!("after_endpoint_publish");
     timer.done();
-    let accept = server::run_accept_loop(ctx.clone(), listener);
-    let result = accept.await;
+    let result = accept.await.context("daemon accept loop task stopped")?;
 
     // The accept loop normally stops because `request_shutdown` already began
     // the drain. Do not call it a second time here: a second request is the

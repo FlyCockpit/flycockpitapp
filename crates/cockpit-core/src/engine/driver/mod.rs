@@ -5098,12 +5098,17 @@ impl Driver {
             cwd: &self.cwd,
             hooks: config_snapshot.hooks(),
         };
-        let call_completed = self.stack.last().is_some_and(|frame| {
+        let history_has_result = self.stack.last().is_some_and(|frame| {
             crate::engine::agent::history_ends_with_tool_result_call(
                 &frame.history,
                 &payload.call_id,
             )
         });
+        // A paired history result is not an execution receipt. The process may
+        // have stopped after appending it but before the ordinary audit row was
+        // committed, so only the durable audit permits replay to skip dispatch.
+        let call_completed =
+            history_has_result && parked_tool_audit_is_committed(&self.session, &payload).await?;
         if !call_completed {
             crate::engine::interrupt::with_pre_resolved_interrupt_question(
                 interrupt_id,
@@ -5127,6 +5132,7 @@ impl Driver {
             )
             .await?;
         }
+        ensure_parked_tool_audit_committed(&self.session, &payload).await?;
         if payload.call_id.starts_with("seed-read-") {
             let pending = self
                 .stack

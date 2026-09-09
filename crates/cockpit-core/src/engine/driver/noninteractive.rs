@@ -10549,7 +10549,8 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
             .await
         },
     )
-    .await
+    .await?;
+    super::delegation_helpers::ensure_parked_tool_audit_committed(session, &payload).await
 }
 
 /// Run a fresh noninteractive child while retaining its transcript for a

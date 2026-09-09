@@ -1888,13 +1888,10 @@ impl InterruptHub {
     }
 
     /// Park every currently-registered interrupt waiter WITHOUT publishing the
-    /// shutdown park-commit terminal. The worker's `SessionWork::Shutdown` drain
-    /// calls this repeatedly — re-parking any interrupt the in-flight turn
-    /// registered after an earlier sweep (`daemon-lifecycle-replay-timing-
-    /// robustness.md`, finding 2) — and only reports once, via
-    /// [`Self::report_shutdown_commit`], after the driver task has exited and no
-    /// further registration is possible. Returns the woken count and whether
-    /// every `park_interrupt` write in this sweep committed.
+    /// shutdown park-commit terminal. Runtime suspension paths use this narrow
+    /// operation; graceful shutdown instead commits its broader atomic
+    /// park-and-summary transaction before waking waiters. Returns the woken
+    /// count and whether every `park_interrupt` write in this sweep committed.
     pub async fn park_all_registered_collect(&self) -> ParkSweep {
         let interrupt_ids = {
             let guard = lock_or_recover(&self.waiters);
@@ -1917,16 +1914,35 @@ impl InterruptHub {
         }
     }
 
-    /// Park every currently-registered interrupt waiter and publish the
-    /// shutdown park-commit terminal in one shot. Retained for non-drain
-    /// callers (loop/skill runners, tests) whose hubs carry no [`ParkCommit`]
-    /// so the report is a no-op; the worker's graceful drain instead uses
-    /// [`Self::park_all_registered_collect`] + a deferred
+    /// Wake every registered waiter after the caller has parked the matching
+    /// durable rows in a broader transaction. This is shutdown-only: the
+    /// worker first commits both `needs_attention` and `paused_session_work`,
+    /// then releases the blocked driver so no acknowledgement can outrun the
+    /// recovery summary.
+    pub fn wake_all_registered_after_durable_park(&self) -> usize {
+        let interrupt_ids = {
+            let guard = lock_or_recover(&self.waiters);
+            guard.keys().copied().collect::<Vec<_>>()
+        };
+        let mut count = 0;
+        for interrupt_id in interrupt_ids {
+            if let Some(tx) = lock_or_recover(&self.waiters).remove(&interrupt_id) {
+                let _ = tx.send(InterruptOutcome::Parked);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Park every currently-registered interrupt waiter without publishing a
+    /// shutdown terminal. Runtime callers use this to suspend a gate/tool
+    /// continuation, and production worker hubs carry a [`ParkCommit`]; marking
+    /// that one-shot shutdown fence here would let a later daemon drain observe
+    /// a stale `Committed` value before its paused-work summary is durable.
+    /// The graceful drain is the sole publisher via
     /// [`Self::report_shutdown_commit`].
     pub async fn park_all_registered(&self) -> usize {
-        let sweep = self.park_all_registered_collect().await;
-        self.report_shutdown_commit(sweep.all_committed);
-        sweep.count
+        self.park_all_registered_collect().await.count
     }
 
     /// Publish the shutdown park-commit terminal for this worker (no-op when no
@@ -4060,10 +4076,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn park_all_registered_reports_committed_to_park_commit() {
-        // The real shutdown path: `park_all_registered` on a hub with a
-        // ParkCommit publishes `Committed` once every registered park has
-        // landed durably, which the drain path then observes.
+    async fn runtime_park_does_not_precommit_a_future_shutdown() {
+        // Runtime gate/tool parking uses the same production hub as shutdown.
+        // It must not satisfy the later shutdown durability rendezvous.
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/x", "builder").await.unwrap();
         let (hub, _events) = attached_hub(db.clone(), session.session_id);
@@ -4078,9 +4093,9 @@ mod tests {
         assert_eq!(hub.park_all_registered().await, 1);
         assert_eq!(
             park_commit
-                .await_shutdown_commit(std::time::Duration::from_secs(1))
+                .await_shutdown_commit(std::time::Duration::ZERO)
                 .await,
-            ParkCommitTerminal::Committed
+            ParkCommitTerminal::DeadlineUnresolved
         );
     }
 

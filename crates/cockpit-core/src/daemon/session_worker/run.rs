@@ -7378,6 +7378,35 @@ pub(super) async fn run_worker(
         .await
     {
         Ok(rows) => {
+            // Crash reconciliation uses the same atomic park-and-summary
+            // boundary as graceful drain. A SIGKILL can leave `open` durable
+            // work, but startup must never publish `Parked` without also
+            // publishing the stable session's recovery row.
+            let has_crash_surviving_open = rows.iter().any(|row| {
+                row.state == crate::db::needs_attention::InterruptState::Open
+                    && validate_parked_interrupt_payload(row).is_ok()
+            });
+            if has_crash_surviving_open {
+                if let Err(error) = session
+                    .db
+                    .park_session_for_resume(
+                        session_id,
+                        session.live_id(),
+                        &root_agent_name,
+                        &project_root.display().to_string(),
+                        "daemon restart recovered interrupted work",
+                        0,
+                        proto::DAEMON_VERSION,
+                    )
+                    .await
+                {
+                    startup_reconciliation_committed = false;
+                    tracing::warn!(
+                        %error,
+                        "atomically parking crash-surviving interrupts failed"
+                    );
+                }
+            }
             for row in rows {
                 // A host-capability refresh is a daemon RPC with a durable
                 // decision, not a parked driver tool call. It intentionally
@@ -7408,14 +7437,10 @@ pub(super) async fn run_worker(
                     crate::db::needs_attention::InterruptState::Open
                         if validate_parked_interrupt_payload(&row).is_ok() =>
                     {
-                        if let Err(error) = session.db.park_interrupt(row.interrupt_id).await {
-                            startup_reconciliation_committed = false;
-                            tracing::warn!(
-                                %error,
-                                interrupt_id = %row.interrupt_id,
-                                "parking crash-surviving interrupt failed"
-                            );
-                        }
+                        // The shared transaction above already parked every
+                        // renderable open row. Keep using this pre-transaction
+                        // snapshot only to classify the remaining recovery
+                        // work; no second per-row write may split the invariant.
                     }
                     crate::db::needs_attention::InterruptState::Parked
                         if validate_parked_interrupt_payload(&row).is_ok() => {}
@@ -13882,7 +13907,15 @@ pub(super) async fn run_worker(
                 }
                 SessionWork::Shutdown { pause_for_resume } => {
                     let (active, pending_tool_count, initial_committed) =
-                        shutdown_activity_snapshot(&session, session_id, &interrupts, &live).await;
+                        shutdown_activity_snapshot(
+                            &session,
+                            session_id,
+                            &root_agent_name,
+                            &project_root,
+                            &interrupts,
+                            &live,
+                        )
+                        .await;
                     shutdown_park_committed = initial_committed;
                     break WorkerStop::Shutdown {
                         pause_for_resume,
@@ -13922,10 +13955,19 @@ pub(super) async fn run_worker(
     if !driver_joined {
         if graceful_park {
             loop {
-                // Park first so a driver blocked on an interrupt is woken
-                // immediately (its tool returns Parked → the turn ends).
-                let sweep = interrupts.park_all_registered_collect().await;
-                shutdown_park_committed = shutdown_park_committed && sweep.all_committed;
+                // Commit the park and recovery summary before waking a driver
+                // blocked on an interrupt (its tool then returns Parked and
+                // the turn ends).
+                let (_, committed) = commit_shutdown_park_sweep(
+                    &session,
+                    session_id,
+                    &root_agent_name,
+                    &project_root,
+                    &interrupts,
+                    0,
+                )
+                .await;
+                shutdown_park_committed = shutdown_park_committed && committed;
                 match tokio::time::timeout(PARK_DRAIN_POLL_INTERVAL, &mut driver_handle).await {
                     Ok(join_result) => {
                         let outcome = driver_join_outcome(join_result);
@@ -13951,8 +13993,6 @@ pub(super) async fn run_worker(
         // be registered. Persist resumable work *before* publishing the
         // shutdown park-commit: drain waits on that signal to release pid and
         // socket, and a successor must already see the paused row.
-        let sweep = interrupts.park_all_registered_collect().await;
-        shutdown_park_committed = shutdown_park_committed && sweep.all_committed;
         if let WorkerStop::Shutdown {
             pause_for_resume: true,
             active: _,
@@ -13971,20 +14011,16 @@ pub(super) async fn run_worker(
                     (*pending_tool_count).max(1)
                 }
             };
-            if pending > 0 {
-                if let Err(error) = persist_paused_session_work(
-                    &session,
-                    session_id,
-                    &root_agent_name,
-                    &project_root,
-                    pending,
-                )
-                .await
-                {
-                    tracing::error!(%error, "persisting paused session work failed");
-                    shutdown_park_committed = false;
-                }
-            }
+            let (_, committed) = commit_shutdown_park_sweep(
+                &session,
+                session_id,
+                &root_agent_name,
+                &project_root,
+                &interrupts,
+                pending,
+            )
+            .await;
+            shutdown_park_committed = shutdown_park_committed && committed;
         }
         interrupts.report_shutdown_commit(shutdown_park_committed);
     }
@@ -14291,11 +14327,12 @@ pub(super) async fn persist_paused_session_work(
     root_agent_name: &str,
     project_root: &std::path::Path,
     pending_tool_count: i64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<i64> {
     session
         .db
-        .upsert_paused_session_work(
+        .park_session_for_resume(
             session_id,
+            session.live_id(),
             root_agent_name,
             &project_root.display().to_string(),
             "daemon shutdown paused active work",
@@ -14308,7 +14345,9 @@ pub(super) async fn persist_paused_session_work(
 
 pub(super) async fn shutdown_activity_snapshot(
     session: &Session,
-    _session_id: Uuid,
+    session_id: Uuid,
+    root_agent_name: &str,
+    project_root: &std::path::Path,
     interrupts: &crate::engine::interrupt::InterruptHub,
     live: &LiveState,
 ) -> (bool, i64, bool) {
@@ -14317,37 +14356,60 @@ pub(super) async fn shutdown_activity_snapshot(
     // `--grace` deadline) races ahead of it, while the fixed path awaits the
     // park-commit signal below.
     test_injected_park_delay("COCKPIT_TEST_DELAY_SHUTDOWN_PARK_MS").await;
-    // Initial sweep only — the shutdown park-commit is NOT reported here.
-    // The worker re-parks (finding 2 registration barrier) and reports once,
-    // after the driver task exits, so `Committed` cannot be observed while an
-    // in-flight turn could still register a fresh interrupt. The sweep's
-    // write-commit status is threaded out so a failed *initial* park (whose
-    // waiter is then gone from the map and cannot be re-detected by a later
-    // sweep) still surfaces as a non-clean terminal.
-    let sweep = interrupts.park_all_registered_collect().await;
-    let (pending_tool_count, scan_committed) = match session
-        .db
-        .count_nonterminal_interrupts(session.live_id())
-        .await
-    {
-        // Durable lifecycle ownership is broader than the renderable
-        // replay projection: linked decisions can retain exact parked
-        // continuations after their question columns are consumed.
-        Ok(rows) => (shutdown_pending_tool_count(rows, sweep.count), true),
-        Err(error) => {
-            tracing::error!(%error, "shutdown interrupt reconciliation scan failed");
-            ((sweep.count as i64).max(1), false)
-        }
-    };
+    // Initial atomic park-and-summary commit only — the shutdown terminal is
+    // NOT reported here. The worker repeats this transaction (finding 2
+    // registration barrier) and reports once after the driver exits, so
+    // `Committed` cannot be observed while an in-flight turn could still
+    // register fresh durable work. The commit status is threaded out so an
+    // initial write failure still surfaces as a non-clean terminal.
+    let (pending_tool_count, scan_committed) = commit_shutdown_park_sweep(
+        session,
+        session_id,
+        root_agent_name,
+        project_root,
+        interrupts,
+        0,
+    )
+    .await;
     let active = {
         let (has_schedules, processing) = (live.has_active_schedules(), live.processing());
         has_schedules || processing || pending_tool_count > 0
     };
-    (
-        active,
-        pending_tool_count,
-        sweep.all_committed && scan_committed,
+    (active, pending_tool_count, scan_committed)
+}
+
+async fn commit_shutdown_park_sweep(
+    session: &Session,
+    session_id: Uuid,
+    root_agent_name: &str,
+    project_root: &std::path::Path,
+    interrupts: &crate::engine::interrupt::InterruptHub,
+    pending_floor: i64,
+) -> (i64, bool) {
+    // Write-ahead invariant: park every durable continuation and publish the
+    // stable recovery summary in one SQLite transaction before waking a live
+    // waiter. Every shutdown source (restart command and SIGTERM included)
+    // enters this shared worker drain, and the final sweep closes late
+    // registration after the driver has quiesced.
+    let committed = persist_paused_session_work(
+        session,
+        session_id,
+        root_agent_name,
+        project_root,
+        pending_floor,
     )
+    .await;
+    let woke = interrupts.wake_all_registered_after_durable_park();
+    match committed {
+        Ok(pending) => (shutdown_pending_tool_count(pending, woke), true),
+        Err(error) => {
+            tracing::error!(%error, "committing shutdown park transaction failed");
+            (
+                shutdown_pending_tool_count(pending_floor.max(1), woke),
+                false,
+            )
+        }
+    }
 }
 
 pub(super) fn shutdown_pending_tool_count(nonterminal_rows: i64, parked_waiters: usize) -> i64 {

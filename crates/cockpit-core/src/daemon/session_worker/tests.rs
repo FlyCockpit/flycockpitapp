@@ -5245,7 +5245,7 @@ async fn active_interrupt_hydration_rebroadcasts_with_rehydration_reason() {
 }
 
 #[tokio::test]
-async fn shutdown_activity_snapshot_counts_open_and_parked_interrupts_as_pending_paused_work() {
+async fn shutdown_durability_commit_parks_interrupt_and_writes_paused_work_atomically() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open_in_memory().unwrap();
     let session = Session::create_for_test(
@@ -5291,23 +5291,25 @@ async fn shutdown_activity_snapshot_counts_open_and_parked_interrupts_as_pending
 
     let live = LiveState::default();
     let interrupts = crate::engine::interrupt::InterruptHub::detached();
-    let (active, pending_tool_count, _committed) =
-        shutdown_activity_snapshot(&session, session_id, &interrupts, &live).await;
+    let (active, pending_tool_count, committed) = shutdown_activity_snapshot(
+        &session,
+        session_id,
+        "Build",
+        tmp.path(),
+        &interrupts,
+        &live,
+    )
+    .await;
 
+    assert!(
+        committed,
+        "the atomic shutdown durability commit must succeed"
+    );
     assert!(active, "blocked-only sessions must be paused on shutdown");
     assert_eq!(
         pending_tool_count, 2,
         "paused row count must include both open and already-parked interrupts"
     );
-    persist_paused_session_work(
-        &session,
-        session_id,
-        "Build",
-        tmp.path(),
-        pending_tool_count,
-    )
-    .await
-    .unwrap();
     assert!(db.paused_session_work(session_id).await.unwrap().is_some());
     assert!(
         db.paused_session_work(successor_id)
@@ -5319,7 +5321,11 @@ async fn shutdown_activity_snapshot_counts_open_and_parked_interrupts_as_pending
         db.list_open_interrupts(successor_id).await.unwrap().len(),
         2
     );
-    assert!(db.get_interrupt(open).await.unwrap().is_some());
+    assert_eq!(
+        db.get_interrupt(open).await.unwrap().unwrap().state,
+        crate::db::needs_attention::InterruptState::Parked,
+        "the shared drain durability operation must park open work"
+    );
 }
 
 #[test]

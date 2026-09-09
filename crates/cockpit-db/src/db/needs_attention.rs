@@ -10,7 +10,7 @@
 
 use anyhow::{Context, Result, ensure};
 use chrono::Utc;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -573,66 +573,70 @@ impl Db {
     }
 
     pub async fn park_interrupt(&self, interrupt_id: Uuid) -> Result<bool> {
-        self.transaction(move |conn| {
-            // A real QuestionTool interrupt can be bound to a pending
-            // AgentTree decision.  Parking is still part of the original
-            // continuation protocol, so make that one reversible projection
-            // update under the same short-lived DB guard used by terminal
-            // decision settlement.  Synthetic Attention rows never reach
-            // this branch because they have no question payload.
-            let linked_decision: Option<(String, String)> = conn
-                .query_row(
-                    "SELECT decision_request_id, session_id
+        self.transaction(move |conn| Self::park_interrupt_conn(conn, interrupt_id))
+            .await
+    }
+
+    /// Connection-scoped interrupt park used when the park must commit with a
+    /// broader lifecycle record (for example `paused_session_work`).
+    pub fn park_interrupt_conn(conn: &Connection, interrupt_id: Uuid) -> Result<bool> {
+        // A real QuestionTool interrupt can be bound to a pending
+        // AgentTree decision.  Parking is still part of the original
+        // continuation protocol, so make that one reversible projection
+        // update under the same short-lived DB guard used by terminal
+        // decision settlement.  Synthetic Attention rows never reach
+        // this branch because they have no question payload.
+        let linked_decision: Option<(String, String)> = conn
+            .query_row(
+                "SELECT decision_request_id, session_id
                        FROM needs_attention
                       WHERE interrupt_id = ?1
                         AND state = 'open'
                         AND decision_request_id IS NOT NULL
                         AND (question_json IS NOT NULL OR questions_json IS NOT NULL)",
-                    [interrupt_id.to_string()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            if let Some((decision_request_id, session_id)) = linked_decision.as_ref() {
-                conn.execute(
-                    "INSERT INTO decision_attention_mutation_guards (decision_request_id, session_id)
+                [interrupt_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((decision_request_id, session_id)) = linked_decision.as_ref() {
+            conn.execute(
+                "INSERT INTO decision_attention_mutation_guards (decision_request_id, session_id)
                      VALUES (?1, ?2)",
-                    params![decision_request_id, session_id],
-                )?;
-            }
-            let affected = conn
-                .execute(
-                    "UPDATE needs_attention
+                params![decision_request_id, session_id],
+            )?;
+        }
+        let affected = conn
+            .execute(
+                "UPDATE needs_attention
                         SET state = 'parked', revision = revision + 1
                       WHERE interrupt_id = ?1 AND state = 'open'
                         AND (decision_request_id IS NULL
                              OR question_json IS NOT NULL OR questions_json IS NOT NULL)",
-                    params![interrupt_id.to_string()],
-                )
-                .context("parking needs_attention")?;
-            if affected == 1
-                && let Some((decision_request_id, session_id)) = linked_decision.as_ref()
-            {
-                crate::db::agent_tree_decisions::insert_control_event(
-                    conn,
-                    Uuid::parse_str(session_id).context("decoding linked interrupt session id")?,
-                    "attention_transition",
-                    Uuid::parse_str(decision_request_id)
-                        .context("decoding linked interrupt decision id")?,
-                    InterruptState::Parked.as_str(),
-                    Utc::now().timestamp_millis(),
-                )?;
-            }
-            if let Some((decision_request_id, session_id)) = linked_decision {
-                let removed = conn.execute(
-                    "DELETE FROM decision_attention_mutation_guards
+                params![interrupt_id.to_string()],
+            )
+            .context("parking needs_attention")?;
+        if affected == 1
+            && let Some((decision_request_id, session_id)) = linked_decision.as_ref()
+        {
+            crate::db::agent_tree_decisions::insert_control_event(
+                conn,
+                Uuid::parse_str(session_id).context("decoding linked interrupt session id")?,
+                "attention_transition",
+                Uuid::parse_str(decision_request_id)
+                    .context("decoding linked interrupt decision id")?,
+                InterruptState::Parked.as_str(),
+                Utc::now().timestamp_millis(),
+            )?;
+        }
+        if let Some((decision_request_id, session_id)) = linked_decision {
+            let removed = conn.execute(
+                "DELETE FROM decision_attention_mutation_guards
                      WHERE decision_request_id = ?1 AND session_id = ?2",
-                    params![decision_request_id, session_id],
-                )?;
-                ensure!(removed == 1, "parked interrupt decision guard disappeared");
-            }
-            Ok(affected > 0)
-        })
-        .await
+                params![decision_request_id, session_id],
+            )?;
+            ensure!(removed == 1, "parked interrupt decision guard disappeared");
+        }
+        Ok(affected > 0)
     }
 
     pub async fn mark_interrupt_interrupted(&self, interrupt_id: Uuid) -> Result<bool> {

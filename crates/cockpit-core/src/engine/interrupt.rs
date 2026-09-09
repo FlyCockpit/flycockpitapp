@@ -1285,8 +1285,8 @@ impl ParkCommit {
     }
 
     /// Consumer (attach): await the worker's startup reconciliation pass,
-    /// bounded by `deadline`. Ordinary attach callers may continue after a
-    /// non-clean result; pre-publication recovery callers must reject it.
+    /// bounded by `deadline`. Every attach caller rejects a non-clean result;
+    /// otherwise a failed or timed-out `Open -> Parked` write could be exposed.
     pub async fn await_startup_reconciled(
         &self,
         deadline: std::time::Duration,
@@ -4239,18 +4239,14 @@ mod tests {
     #[tokio::test]
     async fn await_startup_reconciled_gates_on_report() {
         let park_commit = ParkCommit::new();
-        let consumer = {
-            let park_commit = park_commit.clone();
-            tokio::spawn(async move {
-                park_commit
-                    .await_startup_reconciled(std::time::Duration::from_secs(5))
-                    .await
-            })
-        };
-        tokio::task::yield_now().await;
-        assert!(!consumer.is_finished());
+        let mut consumer =
+            Box::pin(park_commit.await_startup_reconciled(std::time::Duration::from_secs(5)));
+        assert!(matches!(
+            futures::poll!(&mut consumer),
+            std::task::Poll::Pending
+        ));
         park_commit.report_startup_reconciled();
-        assert_eq!(consumer.await.unwrap(), ParkCommitTerminal::Committed);
+        assert_eq!(consumer.await, ParkCommitTerminal::Committed);
     }
 
     #[tokio::test]

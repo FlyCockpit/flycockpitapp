@@ -2461,15 +2461,17 @@ async fn recover_paused_sessions(
             )
             .await
             .with_context(|| format!("recovering paused session {}", row.session_id))?;
-        let startup = handle
-            .park_commit()
-            .await_startup_reconciled(registry::INTERRUPT_PARK_COMMIT_DEADLINE)
-            .await;
-        anyhow::ensure!(
-            startup == crate::engine::interrupt::ParkCommitTerminal::Committed,
-            "paused session {} interrupt reconciliation was not committed: {startup:?}",
-            row.session_id
-        );
+        registry::require_startup_reconciled(
+            &handle.park_commit(),
+            registry::INTERRUPT_PARK_COMMIT_DEADLINE,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "paused session {} interrupt reconciliation was not committed",
+                row.session_id
+            )
+        })?;
         if resume_all_sessions {
             ctx.db
                 .mark_paused_session_work_resumed(row.session_id)

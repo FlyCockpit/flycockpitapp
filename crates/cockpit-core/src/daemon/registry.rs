@@ -201,6 +201,30 @@ async fn await_park_commits(
     terminal
 }
 
+/// Enforce the startup reconciliation invariant shared by every resumed-worker
+/// attach path. A published worker is not safe to expose until its startup
+/// interrupt sweep has durably committed: a known write failure and an
+/// unresolved deadline both leave the prior `Open` state possible, so both
+/// must fail closed and require a later attach/restart to retry recovery.
+pub(crate) async fn require_startup_reconciled(
+    park_commit: &crate::engine::interrupt::ParkCommit,
+    deadline: Duration,
+) -> Result<()> {
+    use crate::engine::interrupt::ParkCommitTerminal;
+
+    match park_commit.await_startup_reconciled(deadline).await {
+        ParkCommitTerminal::Committed => Ok(()),
+        ParkCommitTerminal::KnownFailedWrite => {
+            anyhow::bail!("session startup interrupt reconciliation failed to commit")
+        }
+        ParkCommitTerminal::DeadlineUnresolved => {
+            anyhow::bail!(
+                "session startup interrupt reconciliation did not complete before its deadline"
+            )
+        }
+    }
+}
+
 /// Daemon-wide registry of active session workers.
 #[derive(Clone)]
 pub struct SessionRegistry {
@@ -1418,18 +1442,16 @@ impl SessionRegistry {
             // while the row is still `Open`. Awaiting the shared park-commit
             // signal here for EVERY resume-claim path (not just `Start`) closes
             // that window: no attach observes the pre-reconciliation `Open` row.
-            // Idempotent and immediate once reconciliation has landed; bounded
-            // by the product-owned deadline, after which attach still proceeds
-            // (the reconciliation is idempotent and re-runs on the next attach),
-            // so it can never deadlock against a worker that is being torn down.
+            // Idempotent and immediate once reconciliation has landed. A write
+            // failure or deadline is rejected: either can leave the durable row
+            // `Open`, so exposing the worker would violate the attach boundary.
             // Box the reconciliation-gate await so its (handle-holding) state
             // does not inline into `attach`'s future.
-            Box::pin(
-                handle
-                    .park_commit()
-                    .await_startup_reconciled(INTERRUPT_PARK_COMMIT_DEADLINE),
-            )
-            .await;
+            Box::pin(require_startup_reconciled(
+                &handle.park_commit(),
+                INTERRUPT_PARK_COMMIT_DEADLINE,
+            ))
+            .await?;
             if handle.session_entry_mode() != session_entry_mode {
                 return Err(SessionEntryModeConflict {
                     actual: handle.session_entry_mode().as_str(),
@@ -1548,13 +1570,11 @@ impl SessionRegistry {
                 terminal_cleanup_complete: entry.terminal_cleanup_complete.clone(),
             }
         };
-        Box::pin(
-            claim
-                .handle
-                .park_commit()
-                .await_startup_reconciled(INTERRUPT_PARK_COMMIT_DEADLINE),
-        )
-        .await;
+        Box::pin(require_startup_reconciled(
+            &claim.handle.park_commit(),
+            INTERRUPT_PARK_COMMIT_DEADLINE,
+        ))
+        .await?;
         if !self.live_claim_is_current(&claim) {
             return Ok(None);
         }
@@ -5087,6 +5107,44 @@ mod tests {
 
     use crate::engine::interrupt::ParkCommitTerminal;
 
+    /// Startup attach is fail-closed over the exact worker acknowledgment that
+    /// is published only after the real reconciliation transactions finish.
+    /// Cover every terminal without scheduling or wall-clock interleavings.
+    #[tokio::test]
+    async fn startup_reconciliation_gate_accepts_only_committed() {
+        let committed = crate::engine::interrupt::ParkCommit::new();
+        let mut gate = Box::pin(require_startup_reconciled(
+            &committed,
+            Duration::from_secs(5),
+        ));
+        assert!(matches!(
+            futures::poll!(&mut gate),
+            std::task::Poll::Pending
+        ));
+        committed.report_startup_reconciled();
+        gate.await
+            .expect("a committed reconciliation may expose the worker");
+
+        let failed = crate::engine::interrupt::ParkCommit::new();
+        failed.report_startup_reconciliation_failed();
+        let failure = require_startup_reconciled(&failed, Duration::ZERO)
+            .await
+            .expect_err("a failed reconciliation must reject attach");
+        assert!(
+            failure.to_string().contains("failed to commit"),
+            "unexpected failure: {failure:#}"
+        );
+
+        let pending = crate::engine::interrupt::ParkCommit::new();
+        let unresolved = require_startup_reconciled(&pending, Duration::ZERO)
+            .await
+            .expect_err("an unresolved reconciliation must reject attach");
+        assert!(
+            unresolved.to_string().contains("before its deadline"),
+            "unexpected failure: {unresolved:#}"
+        );
+    }
+
     /// Criterion 2: with a registered interrupt waiter, `drain_all` must not
     /// return (so `metadata_guard.cleanup()` cannot release pid/socket) until
     /// the worker's park commits — even though its running-work join already
@@ -5096,7 +5154,7 @@ mod tests {
     async fn drain_park_commits_before_metadata_release() {
         let reg = test_registry();
         let session = test_session(&reg);
-        let (handle, _rx) = test_handle_with_rx(&reg, session);
+        let (handle, mut rx) = test_handle_with_rx(&reg, session);
         let park_commit = handle.park_commit();
         park_commit.test_add_registered(); // a turn blocked on a human decision
         // Running work already drained: the join completes immediately, so only
@@ -5105,19 +5163,20 @@ mod tests {
 
         let reg_drain = reg.clone();
         let drain = tokio::spawn(async move { reg_drain.drain_all(Duration::from_secs(5)).await });
-        // Let the drain reach its park-commit await.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(session_worker::SessionWork::Shutdown {
+                pause_for_resume: true
+            })
+        ));
         assert!(
             !drain.is_finished(),
-            "drain (→ metadata cleanup) must block until the registered park commits"
+            "after Shutdown is accepted, drain (→ metadata cleanup) must block until the registered park commits"
         );
 
         // Release: the worker reports its park committed durably.
         park_commit.report_shutdown_committed();
-        let outcome = tokio::time::timeout(Duration::from_secs(2), drain)
-            .await
-            .expect("drain must complete once the park commits")
-            .expect("drain task join");
+        let outcome = drain.await.expect("drain task join");
         assert_eq!(outcome.park_commit, ParkCommitTerminal::Committed);
         assert!(outcome.is_clean());
     }
@@ -5131,7 +5190,7 @@ mod tests {
     async fn drain_awaits_in_flight_worker_without_registered_waiter() {
         let reg = test_registry();
         let session = test_session(&reg);
-        let (handle, _rx) = test_handle_with_rx(&reg, session);
+        let (handle, mut rx) = test_handle_with_rx(&reg, session);
         let park_commit = handle.park_commit();
         // Mid-turn, but no interrupt registered yet — the finding-2 window.
         handle.set_processing_for_test(true);
@@ -5143,17 +5202,22 @@ mod tests {
 
         let reg_drain = reg.clone();
         let drain = tokio::spawn(async move { reg_drain.drain_all(Duration::from_secs(5)).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(session_worker::SessionWork::Shutdown {
+                pause_for_resume: true
+            })
+        ));
+        // Registration may appear only after shutdown dispatch. The obligation
+        // was captured from the delivered worker, not from a racy waiter count.
+        park_commit.test_add_registered();
         assert!(
             !drain.is_finished(),
-            "drain must await a processing worker's post-quiescence park-commit"
+            "drain must await a processing worker's late-registered post-quiescence park-commit"
         );
 
         park_commit.report_shutdown_committed();
-        let outcome = tokio::time::timeout(Duration::from_secs(2), drain)
-            .await
-            .expect("drain completes once the in-flight worker's park commits")
-            .expect("drain task join");
+        let outcome = drain.await.expect("drain task join");
         assert!(outcome.is_clean());
     }
 
@@ -5283,8 +5347,8 @@ mod tests {
     #[tokio::test]
     async fn drain_park_commit_aggregates_across_workers() {
         let reg = test_registry();
-        let (handle_a, _rx_a) = test_handle_with_rx(&reg, test_session(&reg));
-        let (handle_b, _rx_b) = test_handle_with_rx(&reg, test_session(&reg));
+        let (handle_a, mut rx_a) = test_handle_with_rx(&reg, test_session(&reg));
+        let (handle_b, mut rx_b) = test_handle_with_rx(&reg, test_session(&reg));
         let park_a = handle_a.park_commit();
         let park_b = handle_b.park_commit();
         park_a.test_add_registered();
@@ -5294,18 +5358,25 @@ mod tests {
 
         let reg_drain = reg.clone();
         let drain = tokio::spawn(async move { reg_drain.drain_all(Duration::from_secs(5)).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(matches!(
+            rx_a.recv().await,
+            Some(session_worker::SessionWork::Shutdown {
+                pause_for_resume: true
+            })
+        ));
+        assert!(matches!(
+            rx_b.recv().await,
+            Some(session_worker::SessionWork::Shutdown {
+                pause_for_resume: true
+            })
+        ));
         park_a.report_shutdown_committed();
-        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             !drain.is_finished(),
             "drain must still block on the second worker's park"
         );
         park_b.report_shutdown_committed();
-        let outcome = tokio::time::timeout(Duration::from_secs(2), drain)
-            .await
-            .expect("drain completes once both parks commit")
-            .expect("drain task join");
+        let outcome = drain.await.expect("drain task join");
         assert!(outcome.is_clean());
     }
 

@@ -7357,14 +7357,6 @@ pub(super) async fn run_worker(
         .await;
     }
 
-    // Releasable, debug-build + env-gated pause point
-    // (`daemon-lifecycle-replay-timing-robustness.md`, §3 / criterion 1): hold
-    // the attach reconciliation BEFORE the crash-surviving `Open → Parked`
-    // write so a test can prove the attach path awaits the park-commit signal.
-    // Bounded (self-releasing) so the fixed code's reconciliation still lands
-    // within `INTERRUPT_PARK_COMMIT_DEADLINE`; not the irreversible
-    // `COCKPIT_TEST_PAUSE_PARKED_REPLAY_EXECUTING` loop. Unreachable in release.
-    test_injected_park_delay("COCKPIT_TEST_DELAY_STARTUP_RECONCILE_MS").await;
     // A terminal AgentTree decision may have claimed a parked QuestionTool
     // continuation immediately before a worker crash.  Keep the exact row so
     // the fresh root executor can replay it after it attaches below; treating
@@ -12501,18 +12493,6 @@ pub(super) async fn run_worker(
                             interrupts.emit_queue_state().await;
                             continue;
                         }
-                        // Process-boundary lifecycle tests kill the daemon while
-                        // a parked replay is durably `executing`. The hook is
-                        // debug-build + env-gated, so release production binaries
-                        // cannot enter this pause.
-                        if cfg!(debug_assertions)
-                            && std::env::var_os("COCKPIT_TEST_PAUSE_PARKED_REPLAY_EXECUTING")
-                                .is_some()
-                        {
-                            loop {
-                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                            }
-                        }
                         let Some(payload) = row.parked.clone() else {
                             let _ = session.db.mark_interrupt_interrupted(interrupt_id).await;
                             send_current_session_event(
@@ -14301,26 +14281,6 @@ fn update_authoritative_active_model_state(
     }
 }
 
-/// Releasable, debug-build + env-gated injected pause point
-/// (`daemon-lifecycle-replay-timing-robustness.md`, matching
-/// `COCKPIT_TEST_PAUSE_PARKED_REPLAY_EXECUTING`'s `cfg!(debug_assertions)` +
-/// env shape). Sleeps `<var>` milliseconds so a test can force the worst-case
-/// drain interleaving deterministically — the park write lands *after* the
-/// `--grace` deadline would have fired on the pre-fix code — without relying on
-/// host CPU starvation. Bounded/self-releasing, so the fixed drain path still
-/// observes a committed park within `INTERRUPT_PARK_COMMIT_DEADLINE`.
-/// Compiled out of release binaries entirely.
-async fn test_injected_park_delay(_var: &str) {
-    #[cfg(debug_assertions)]
-    {
-        if let Some(ms) =
-            std::env::var_os(_var).and_then(|raw| raw.to_str().and_then(|s| s.parse::<u64>().ok()))
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-        }
-    }
-}
-
 pub(super) async fn persist_paused_session_work(
     session: &Session,
     session_id: Uuid,
@@ -14351,11 +14311,6 @@ pub(super) async fn shutdown_activity_snapshot(
     interrupts: &crate::engine::interrupt::InterruptHub,
     live: &LiveState,
 ) -> (bool, i64, bool) {
-    // Injected worst-case interleaving for criteria 2/3/8: delay the shutdown
-    // park commit so the pre-fix drain path (which released pid/socket at the
-    // `--grace` deadline) races ahead of it, while the fixed path awaits the
-    // park-commit signal below.
-    test_injected_park_delay("COCKPIT_TEST_DELAY_SHUTDOWN_PARK_MS").await;
     // Initial atomic park-and-summary commit only — the shutdown terminal is
     // NOT reported here. The worker repeats this transaction (finding 2
     // registration barrier) and reports once after the driver exits, so

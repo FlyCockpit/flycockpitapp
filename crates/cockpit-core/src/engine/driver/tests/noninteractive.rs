@@ -1230,13 +1230,14 @@ fn scoped_child_subtree_is_pre_granted_read_write() {
     // post-build generation guard, so a generation move records no lingering
     // grant). The grant is recorded immediately BEFORE the child's first inference
     // request. On a big-stack thread (avoiding the pre-existing deep-batch stack
-    // overflow) run the scoped `builder` against a long-delayed provider; once the
-    // request is in flight the pregrant has already run, so poll the shared grant
-    // store from THIS thread, then cancel before the 20s delay elapses.
-    let provider = cockpit_test_support::provider::ScriptedProvider::builder()
+    // overflow) run the scoped `builder` against a response-gated provider. The
+    // provider's request-ready signal proves dispatch, after which the shared
+    // grant store can be checked directly before cancellation.
+    let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut provider = cockpit_test_support::provider::ScriptedProvider::builder()
         .dialect(cockpit_test_support::provider::WireDialect::ChatCompletions)
         .turn(cockpit_test_support::provider::Turn::Text("done".into()))
-        .with_delay(std::time::Duration::from_secs(20))
+        .with_response_gate(response_gate)
         .repeat_last()
         .start_blocking();
     let url = provider.base_url();
@@ -1290,7 +1291,7 @@ fn scoped_child_subtree_is_pre_granted_read_write() {
                     let scope = driver.cwd.join("scope");
                     std::fs::create_dir_all(&scope).unwrap();
                     // Hand the shared approver + scope to the probing thread so it
-                    // can poll the grant while this batch holds its guard.
+                    // can inspect the grant while this batch holds its guard.
                     handoff_tx.send((approver.clone(), scope.clone())).unwrap();
                     seed_batch_task_delegation(&driver, "task-pregrant", &["scoped"]).await;
                     seed_task_payload(&driver, "task-pregrant", "scoped", "builder").await;
@@ -1318,21 +1319,13 @@ fn scoped_child_subtree_is_pre_granted_read_write() {
         .enable_all()
         .build()
         .unwrap();
-    let mut granted = false;
-    for _ in 0..200 {
-        if provider.request_count() >= 1
-            && probe_rt
-                .block_on(approver.store().is_path_granted_for(
-                    &scope,
-                    crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
-                ))
-                .unwrap()
-        {
-            granted = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    probe_rt.block_on(provider.next_request_ready());
+    let granted = probe_rt
+        .block_on(approver.store().is_path_granted_for(
+            &scope,
+            crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+        ))
+        .unwrap();
     cancel.cancel();
     batch_thread.join().unwrap();
     assert!(
@@ -2583,13 +2576,13 @@ async fn docs_pipeline_emits_no_routing_amend() {
 /// takes a shared read guard) — exactly 1 in flight. If docs were wrongly admitted
 /// concurrently (a shared read guard), BOTH would dispatch → 2. The batch runs on
 /// a dedicated big-stack thread; the probe runs on THIS thread against the
-/// provider's cross-thread atomic counter, then cancels so the 20s delay is never
-/// fully waited.
+/// provider's request-ready signal and response gate, then cancels.
 fn dmh_docs_batch_exclusive_in_flight() -> usize {
-    let provider = cockpit_test_support::provider::ScriptedProvider::builder()
+    let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut provider = cockpit_test_support::provider::ScriptedProvider::builder()
         .dialect(cockpit_test_support::provider::WireDialect::ChatCompletions)
         .turn(cockpit_test_support::provider::Turn::Text("done".into()))
-        .with_delay(std::time::Duration::from_secs(20))
+        .with_response_gate(response_gate)
         .repeat_last()
         .start_blocking();
     let url = provider.base_url();
@@ -2671,14 +2664,12 @@ fn dmh_docs_batch_exclusive_in_flight() -> usize {
         })
         .unwrap();
 
-    for _ in 0..200 {
-        if provider.request_count() >= 1 {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-    let in_flight = provider.request_count();
+    let probe_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    probe_rt.block_on(provider.next_request_ready());
+    let in_flight = provider.peak_in_flight();
     cancel.cancel();
     batch_thread.join().unwrap();
     in_flight
@@ -2905,17 +2896,18 @@ fn batch_read_only_child_fails_closed_if_def_gains_write_before_build() {
 /// (pre-refresh) generation, with NO split and NO fail-closed. Driven on a
 /// big-stack thread (avoiding the pre-existing deep-batch overflow): a bumper
 /// advances the LIVE shared generation while `execute_single` is suspended at its
-/// first await (AFTER the synchronous repin), then a long-delayed provider parks
+/// first await (AFTER the synchronous repin), then a response gate holds
 /// the child's request in flight so the main thread can confirm the child
 /// dispatched AND its grant was recorded — proving the attempt ran the pinned
 /// generation, not the refreshed one. (Under the old fail-closed behaviour the
 /// move would abort with no request and no grant.)
 #[test]
 fn single_delegation_runs_under_pinned_generation_across_refresh() {
-    let provider = cockpit_test_support::provider::ScriptedProvider::builder()
+    let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut provider = cockpit_test_support::provider::ScriptedProvider::builder()
         .dialect(cockpit_test_support::provider::WireDialect::ChatCompletions)
         .turn(cockpit_test_support::provider::Turn::Text("done".into()))
-        .with_delay(std::time::Duration::from_secs(20))
+        .with_response_gate(response_gate)
         .repeat_last()
         .start_blocking();
     let url = provider.base_url();
@@ -3002,21 +2994,13 @@ fn single_delegation_runs_under_pinned_generation_across_refresh() {
         .enable_all()
         .build()
         .unwrap();
-    let mut dispatched_and_granted = false;
-    for _ in 0..200 {
-        if provider.request_count() >= 1
-            && probe_rt
-                .block_on(approver.store().is_path_granted_for(
-                    &scope,
-                    crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
-                ))
-                .unwrap()
-        {
-            dispatched_and_granted = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    probe_rt.block_on(provider.next_request_ready());
+    let dispatched_and_granted = probe_rt
+        .block_on(approver.store().is_path_granted_for(
+            &scope,
+            crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+        ))
+        .unwrap();
     cancel.cancel();
     attempt_thread.join().unwrap();
     assert!(
@@ -5792,23 +5776,22 @@ fn scheduler_defers_delegate_admission_until_serial_barrier() {
     });
 }
 
-/// Run a 2-child batch of `child_agent` against a provider whose responses are
-/// long-delayed, and return how many child requests are simultaneously IN FLIGHT
-/// while the first child's (delayed) response is still outstanding. A
+/// Run a 2-child batch of `child_agent` against a response-gated provider and
+/// return the peak number of child requests simultaneously in flight. A
 /// non-admissible (dynamic) child holds the EXCLUSIVE write guard → the second
 /// cannot dispatch → 1 in flight. Concurrently-admissible (read-only) children
 /// share read guards → both dispatch → 2 in flight.
 ///
 /// The batch runs on a dedicated big-stack thread (avoiding the pre-existing
 /// deep-batch stack overflow); the probe runs on THIS thread against the
-/// provider's cross-thread atomic request counter using real-time sleeps, so its
-/// timing is independent of the batch's scheduling. The batch is cancelled once
-/// the count is read, so the long delay is never fully waited.
+/// provider's request-ready channel and peak counter. The response gate keeps
+/// admitted children outstanding until the assertion has exact evidence.
 fn dmh_batch_in_flight_while_first_delayed(child_agent: &str, custom_read_only: bool) -> usize {
-    let provider = cockpit_test_support::provider::ScriptedProvider::builder()
+    let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut provider = cockpit_test_support::provider::ScriptedProvider::builder()
         .dialect(cockpit_test_support::provider::WireDialect::ChatCompletions)
         .turn(cockpit_test_support::provider::Turn::Text("done".into()))
-        .with_delay(std::time::Duration::from_secs(20))
+        .with_response_gate(response_gate)
         .repeat_last()
         .start_blocking();
     let url = provider.base_url();
@@ -5899,19 +5882,15 @@ fn dmh_batch_in_flight_while_first_delayed(child_agent: &str, custom_read_only: 
         })
         .unwrap();
 
-    // Probe on THIS thread (real-time, independent of the batch's scheduling).
-    // Wait (generously) for the FIRST child's request to reach the provider,
-    // then give a would-be-concurrent second child ample time to ALSO dispatch,
-    // and read how many are in flight while the first is still delayed.
-    for _ in 0..200 {
-        if provider.request_count() >= 1 {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    let probe_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    probe_rt.block_on(provider.next_request_ready());
+    if custom_read_only {
+        probe_rt.block_on(provider.next_request_ready());
     }
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-    let in_flight = provider.request_count();
-    // Stop the batch early — the 20s delay is never fully waited.
+    let in_flight = provider.peak_in_flight();
     cancel.cancel();
     batch_thread.join().unwrap();
     in_flight

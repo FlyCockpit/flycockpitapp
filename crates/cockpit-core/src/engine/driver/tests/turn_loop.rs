@@ -1740,6 +1740,7 @@ fn turn_loop_tool_call_result_feeds_second_inference() {
 /// lane results from a `BTreeMap<usize, _>` even when more than the bound run.
 struct FifoLaneState {
     started: std::sync::Mutex<Vec<String>>,
+    started_tx: tokio::sync::watch::Sender<Vec<String>>,
     in_flight: std::sync::atomic::AtomicUsize,
     max_in_flight: std::sync::atomic::AtomicUsize,
     gates: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
@@ -1747,8 +1748,10 @@ struct FifoLaneState {
 
 impl FifoLaneState {
     fn new() -> Arc<Self> {
+        let (started_tx, _) = tokio::sync::watch::channel(Vec::new());
         Arc::new(Self {
             started: std::sync::Mutex::new(Vec::new()),
+            started_tx,
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             max_in_flight: std::sync::atomic::AtomicUsize::new(0),
             gates: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1769,6 +1772,10 @@ impl FifoLaneState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    fn started_rx(&self) -> tokio::sync::watch::Receiver<Vec<String>> {
+        self.started_tx.subscribe()
     }
 
     fn in_flight(&self) -> usize {
@@ -1821,13 +1828,6 @@ impl crate::engine::tool::Tool for FifoLaneTool {
             .unwrap_or("missing")
             .to_string();
         let gate = self.state.gate(&id);
-        {
-            self.state
-                .started
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(id.clone());
-        }
         let n = self
             .state
             .in_flight
@@ -1836,6 +1836,15 @@ impl crate::engine::tool::Tool for FifoLaneTool {
         self.state
             .max_in_flight
             .fetch_max(n, std::sync::atomic::Ordering::SeqCst);
+        {
+            let mut started = self
+                .state
+                .started
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            started.push(id.clone());
+            self.state.started_tx.send_replace(started.clone());
+        }
         gate.notified().await;
         self.state
             .in_flight
@@ -1844,17 +1853,11 @@ impl crate::engine::tool::Tool for FifoLaneTool {
     }
 }
 
-async fn wait_until_started(state: &FifoLaneState, count: usize) {
-    for _ in 0..200 {
-        if state.started().len() >= count {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!(
-        "timed out waiting for {count} fifo_lane starts; observed {:?}",
-        state.started()
-    );
+async fn wait_until_started(started: &mut tokio::sync::watch::Receiver<Vec<String>>, count: usize) {
+    started
+        .wait_for(|ids| ids.len() >= count)
+        .await
+        .expect("fifo lane readiness sender stays alive");
 }
 
 #[test]
@@ -2094,6 +2097,7 @@ fn parallel_lane_respects_delegation_max_parallel_fifo() {
             .await;
         let (mut driver, tmp) = scripted_driver(&provider);
         let state = FifoLaneState::new();
+        let mut started = state.started_rx();
         let old = driver.stack[0].agent.clone();
         driver.stack[0].agent = Arc::new(Agent {
             name: old.name.clone(),
@@ -2150,12 +2154,11 @@ fn parallel_lane_respects_delegation_max_parallel_fifo() {
 
             tokio::select! {
                 result = &mut run => panic!("driver completed before the over-limit lane blocked: {result:?}"),
-                () = wait_until_started(&state, 2) => {}
+                () = wait_until_started(&mut started, 2) => {}
             }
             // Removing `ordinary_active + delegates.len() >= max_parallel` would
             // admit gamma/delta while alpha/beta are still held. Source-order
             // folding would still be green; in-flight count is the bound.
-            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
             assert_eq!(state.started(), vec!["alpha", "beta"]);
             assert_eq!(state.in_flight(), 2);
             assert_eq!(state.max_in_flight(), 2);
@@ -2163,9 +2166,8 @@ fn parallel_lane_respects_delegation_max_parallel_fifo() {
             state.release("alpha");
             tokio::select! {
                 result = &mut run => panic!("driver completed before the FIFO successor started: {result:?}"),
-                () = wait_until_started(&state, 3) => {}
+                () = wait_until_started(&mut started, 3) => {}
             }
-            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
             assert_eq!(state.started(), vec!["alpha", "beta", "gamma"]);
             assert!(
                 state.in_flight() <= 2,
@@ -2177,7 +2179,7 @@ fn parallel_lane_respects_delegation_max_parallel_fifo() {
             state.release("gamma");
             tokio::select! {
                 result = &mut run => panic!("driver completed before the last queued member started: {result:?}"),
-                () = wait_until_started(&state, 4) => {}
+                () = wait_until_started(&mut started, 4) => {}
             }
             assert_eq!(
                 state.started(),

@@ -776,13 +776,19 @@ async fn background_gate_resolved_cwd_reaches_spawn() {
         .unwrap();
 
     assert!(out.starts_with("started background"), "got {out}");
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while !marker.exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("background command should create its marker");
+    let completed = driver
+        .job_event_rx
+        .recv()
+        .await
+        .expect("background runner sends one terminal event");
+    assert!(
+        matches!(
+            completed,
+            crate::engine::schedule::ScheduleEvent::Completed { failed: false, .. }
+        ),
+        "background command must complete successfully: {completed:?}"
+    );
+    assert!(marker.exists(), "completed command created its marker");
 }
 
 #[tokio::test]

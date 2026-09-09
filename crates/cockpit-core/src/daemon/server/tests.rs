@@ -19616,8 +19616,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "list_guidance_proposals"
         | "clean_managed_workspace_lease"
         | "restart_if_idle"
-        | "stop_daemon"
-        | "refresh_host_capabilities" => AuthzAllowedOutcome::Response,
+        | "stop_daemon" => AuthzAllowedOutcome::Response,
         "count_pinned_messages"
         | "list_pinned_message_seqs"
         | "list_pinned_messages_with_text"
@@ -19736,6 +19735,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "repair_resume"
         | "cancel_turn"
         | "resolve_interrupt"
+        | "resolve_agent_decision"
         | "archive_session"
         | "discard_session"
         | "set_active_model"
@@ -19748,12 +19748,17 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "set_redaction"
         | "set_tandem_models"
         | "refresh_config"
+        | "refresh_host_capabilities"
+        | "cancel_all_session_work"
         | "cancel_schedule"
         | "prune"
         | "compact"
         | "resume_from_compaction"
         | "pin"
         | "promote_conversation_rule" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
+        // The attached handler validates the generated agent id before it
+        // forwards any work, and reports the missing agent as a typed outcome.
+        "apply_agent_session_override" => AuthzAllowedOutcome::Response,
         // `recover_security_blocked_media` validates the owner-principal binding
         // first, then short-circuits on the missing storage authority before the
         // attach check, so a detached owner reaches the `Internal` "media storage
@@ -19775,9 +19780,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "append_media_upload_chunk"
         | "cancel_media_upload"
         | "finalize_media_upload"
-        | "discard_unreferenced_media_attachment"
-        | "resolve_agent_decision"
-        | "apply_agent_session_override" => {
+        | "discard_unreferenced_media_attachment" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
         "list_leak_reports" | "list_secret_inventory" | "get_flycockpit_account" => {
@@ -19921,17 +19924,16 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "resolve_code_root_interrupt_v1"
         | "execute_storage_cleanup"
         | "set_primary_assistant_soul_edit_mode" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
-        // Root creation requires a configured model; the matrix daemon is
-        // intentionally model-less. Discovery and the owner configuration /
-        // storage read paths remain fully typed on an empty daemon.
-        "create_code_root_v1"
-        | "create_code_root_with_acp_ingress_v1" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
+        // The matrix daemon carries the production stub-model snapshot, so
+        // both root-creation paths complete with their typed attachment.
+        "create_code_root_v1" | "create_code_root_with_acp_ingress_v1" => {
+            AuthzAllowedOutcome::Response
+        }
         "discover_code_roots_v1"
         | "set_workspace_history_scope"
         | "get_workspace_history_scope"
         | "get_storage_report"
         | "preview_storage_cleanup"
-        | "cancel_all_session_work"
         | "exit_guard_status"
         | "release_exit_guard" => AuthzAllowedOutcome::Response,
         // The authz probe intentionally uses an unknown inbox item. The
@@ -20801,8 +20803,20 @@ async fn authz_dispatch_matrix_covers_every_controlled_kind() {
 async fn authz_default_profile_owner_traverses_every_controlled_socket_path() {
     assert_dispatch_matrix_coverage_complete();
     for case in authz_dispatch_cases() {
-        let ctx = test_ctx();
+        let mut ctx = test_ctx();
         let tmp = tempfile::tempdir().unwrap();
+        if case.kind == "discard_image_ingress_draft" {
+            let db = ctx.db.clone();
+            Arc::get_mut(&mut ctx)
+                .expect("authz fixture owns its daemon context")
+                .media_storage_recovery = Some(Arc::new(
+                crate::media_storage::MediaStorageRecovery::open_or_create(
+                    db,
+                    &tmp.path().join("media-store"),
+                )
+                .unwrap(),
+            ));
+        }
         // Stamp a minimal `.cockpit/config.json` so config-bearing requests
         // (e.g. `set_default_model`) find a retained default target under
         // the trusted workspace policy.
@@ -20810,6 +20824,18 @@ async fn authz_default_profile_owner_traverses_every_controlled_socket_path() {
         std::fs::create_dir_all(&cockpit_dir).unwrap();
         std::fs::write(cockpit_dir.join("config.json"), "{}").unwrap();
         let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
+        if case.kind == "discard_session" {
+            ctx.db
+                .write(move |conn| {
+                    conn.execute(
+                        "UPDATE sessions SET ephemeral = 1 WHERE session_id = ?1",
+                        [session_id.to_string()],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
         ctx.db
             .set_session_shared_with_collaborators(session_id, true)
             .await
@@ -20968,8 +20994,20 @@ async fn assert_authz_known_hole_socket_case(kind: &'static str, known_hole: Aut
 
 #[cfg(feature = "remote")]
 async fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSocketScenario {
-    let ctx = test_ctx();
+    let mut ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
+    if kind == "discard_image_ingress_draft" {
+        let db = ctx.db.clone();
+        Arc::get_mut(&mut ctx)
+            .expect("authz fixture owns its daemon context")
+            .media_storage_recovery = Some(Arc::new(
+            crate::media_storage::MediaStorageRecovery::open_or_create(
+                db,
+                &tmp.path().join("media-store"),
+            )
+            .unwrap(),
+        ));
+    }
     // Stamp a minimal `.cockpit/config.json` so config-bearing requests
     // (e.g. `set_default_model`) find a retained default target under
     // the trusted workspace policy.
@@ -20977,6 +21015,18 @@ async fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSo
     std::fs::create_dir_all(&cockpit_dir).unwrap();
     std::fs::write(cockpit_dir.join("config.json"), "{}").unwrap();
     let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
+    if kind == "discard_session" {
+        ctx.db
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE sessions SET ephemeral = 1 WHERE session_id = ?1",
+                    [session_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
     ctx.db
         .set_session_shared_with_collaborators(session_id, true)
         .await
@@ -21640,7 +21690,13 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             project_id: "proj".into(),
             description: "notify".into(),
             declaration: proto::SealedActionDeclaration::CommandArgument {
-                argv: vec!["notify".into(), "{{sealed_value}}".into()],
+                argv: vec![
+                    std::env::current_exe()
+                        .expect("authz fixture executable")
+                        .to_string_lossy()
+                        .into_owned(),
+                    "{{sealed_value}}".into(),
+                ],
             },
         },
         "revise_sealed_action_description" => Request::ReviseSealedActionDescription {
@@ -22731,7 +22787,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "create_image_sidecar_grant" => Request::CreateImageSidecarGrant {
             project_root: project_root.to_string_lossy().into_owned(),
-            config_generation: 0,
+            config_generation: 1,
             selection_id: "selection".into(),
             expected_daemon_instance_id: None,
             expected_session_id: None,
@@ -22743,7 +22799,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "revoke_image_sidecar_grant" => Request::RevokeImageSidecarGrant {
             project_root: project_root.to_string_lossy().into_owned(),
-            config_generation: 0,
+            config_generation: 1,
             selection_id: "selection".into(),
             expected_daemon_instance_id: None,
             expected_session_id: None,
@@ -38164,7 +38220,8 @@ async fn attach_since_seq_replays_retracted_user_row_identity() {
 async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     use crate::config::providers::{
-        ActiveModelRef, ModelEntry, ProviderEntry, ProvidersConfig, ThinkingMode,
+        ActiveModelRef, ModelEntry, ModelTrust, ProviderEntry, ProvidersConfig, ThinkingMode,
+        WireApi,
     };
 
     let (model_url, captured_requests, model_server) = retraction_acceptance_model_server().await;
@@ -38173,6 +38230,8 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         "lmstudio".to_string(),
         ProviderEntry {
             url: model_url,
+            trust: Some(ModelTrust::Trusted),
+            wire_api: WireApi::Completions,
             models: vec![ModelEntry {
                 id: "retraction-model".to_string(),
                 ..ModelEntry::default()
@@ -38199,9 +38258,18 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         );
     let mut extended = crate::config::extended::ExtendedConfig::default();
     extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxIntent::Off;
-    let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+    let journal_dir = tempfile::tempdir().unwrap();
+    let mut ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
         providers, extended,
     ));
+    let journal = Arc::new(crate::external_journal::ExternalJournal::for_test_at(
+        ctx.db.clone(),
+        &journal_dir.path().join("journal"),
+    ));
+    ctx.registry.set_external_journal(journal.clone());
+    Arc::get_mut(&mut ctx)
+        .expect("retraction fixture owns its daemon context")
+        .external_journal = Some(journal);
     let project = tempfile::tempdir().unwrap();
     std::fs::write(project.path().join("fixture.txt"), "fixture body").unwrap();
     trust_workspace_root(&ctx, project.path()).await;
@@ -38678,7 +38746,8 @@ async fn retraction_acceptance_model_server() -> (
         (format!("data: {reasoning}\n\n"), true),
     ];
     let server = tokio::spawn(async move {
-        for (stream_body, hang) in streams {
+        let mut foreground_index = 0;
+        while foreground_index < streams.len() {
             let (mut socket, _) = listener.accept().await.expect("model accepts request");
             let request = read_retraction_acceptance_http_request(&mut socket).await;
             if std::env::var("COCKPIT_RETRACT_DBG").is_ok() {
@@ -38688,13 +38757,33 @@ async fn retraction_acceptance_model_server() -> (
                     &request[..request.len().min(240)]
                 );
             }
-            captured_server.lock().unwrap().push(request);
+            let metadata_fork = request.contains("set_session_metadata");
+            if !metadata_fork {
+                captured_server.lock().unwrap().push(request);
+            }
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
                 )
                 .await
                 .expect("model writes stream headers");
+            let metadata_response = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({
+                    "id": "retraction-metadata", "model": "retraction-model",
+                    "choices": [{
+                        "delta": { "content": "metadata unavailable" },
+                        "finish_reason": "stop"
+                    }]
+                })
+            );
+            let (stream_body, hang) = if metadata_fork {
+                (metadata_response.as_str(), false)
+            } else {
+                let (stream_body, hang) = &streams[foreground_index];
+                foreground_index += 1;
+                (stream_body.as_str(), *hang)
+            };
             socket
                 .write_all(stream_body.as_bytes())
                 .await

@@ -2285,8 +2285,9 @@ async fn abort_unbound_host_capability_refresh_initialization(
 /// first, registers the existing continuation before any lifecycle delivery can
 /// settle it, binds that *same* Attention row to the requesting agent's durable
 /// decision, and then emits through the unchanged InterruptHub continuation.
-/// An ownerless user question may retain the historical isolated path; an
-/// ownerless host effect always fails closed in every build mode.
+/// An ownerless caller on an isolated hub retains the historical interrupt
+/// path. A daemon-owned hub is identified by its live-session binding, and an
+/// ownerless host effect on that hub always fails closed.
 pub(crate) async fn raise_and_wait_with_agent_tree(
     db: &crate::db::Db,
     interrupts: &InterruptHub,
@@ -2551,14 +2552,18 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
         return InterruptOutcome::Resolved(response);
     }
     // The normal turn dispatcher is intentionally usable by lightweight
-    // helpers too. An isolated caller has no typed owner, so only an ordinary
-    // user question can use the historical name-keyed path. Host effects need
-    // a durable AgentTree owner in every build mode.
+    // helpers and the standalone shim too. Those callers deliberately use a
+    // hub without a daemon-owned live-session binding and have no AgentTree
+    // owner, so retain their single historical interrupt route. A daemon hub
+    // always carries `live_session`; host effects reaching it without a typed
+    // owner fail closed instead of silently creating a parallel decision path.
     let Some(agent_instance_id) = agent_instance_id else {
-        if matches!(
-            &decision_subject,
-            crate::agent_tree::HostDecisionSubject::UserQuestion
-        ) {
+        if interrupts.live_session.is_none()
+            || matches!(
+                &decision_subject,
+                crate::agent_tree::HostDecisionSubject::UserQuestion
+            )
+        {
             return raise_and_wait_legacy(
                 db,
                 interrupts,
@@ -2957,8 +2962,28 @@ mod tests {
 
     #[tokio::test]
     async fn ownerless_host_approval_fails_closed_without_raising_legacy_interrupt() {
+        let tmp = tempfile::tempdir().unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let session = std::sync::Arc::new(
+            crate::session::Session::create_for_test(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "builder",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let (events, _events_rx) = tokio::sync::broadcast::channel(4);
+        let hub = InterruptHub::new(
+            events,
+            std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(
+                crate::redact::RedactionTable::empty(),
+            ))),
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            db.clone(),
+            session.id,
+        )
+        .with_live_session(session.clone());
         let operation = crate::agent_tree::HostApprovalOperation::new(
             "ownerless-test-effect",
             serde_json::json!({"command": "printf forbidden"}),
@@ -2967,8 +2992,8 @@ mod tests {
 
         let outcome = raise_and_wait_with_agent_tree(
             &db,
-            &InterruptHub::detached(),
-            session.session_id,
+            &hub,
+            session.id,
             "builder",
             None,
             "ownerless host approval",
@@ -2983,7 +3008,7 @@ mod tests {
             InterruptOutcome::Resolved(ResolveResponse::Cancel)
         ));
         assert!(
-            db.list_open_interrupts(session.session_id)
+            db.list_open_interrupts(session.id)
                 .await
                 .unwrap()
                 .is_empty(),

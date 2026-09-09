@@ -109,7 +109,7 @@ async fn ephemeral_session_resumes_on_shared_daemon() {
     let child = daemon_command
         .spawn()
         .expect("spawn explicit ephemeral daemon process");
-    let mut ephemeral_guard =
+    let ephemeral_guard =
         EphemeralDaemonGuard::new(child, ephemeral_socket.clone(), home.pid_file());
     wait_for_daemon_handshake_on_socket(
         &ephemeral_socket,

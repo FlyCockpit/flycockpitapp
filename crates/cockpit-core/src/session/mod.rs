@@ -659,10 +659,6 @@ pub struct Session {
     /// memory only: the daemon re-evaluates the interval on every
     /// send, so re-attaching a resumed session naturally re-injects.
     pub last_time_prelude: Mutex<Option<DateTime<Utc>>>,
-    /// A reasoning-only user cancellation retracts the whole logical turn.
-    /// Preserve the exact prelude consumed by that vanished request so the
-    /// next accepted turn reuses the same cacheable timestamp once.
-    retracted_time_prelude: Mutex<Option<DateTime<Utc>>>,
     /// Running token estimate of RAW typed user-authored content
     /// (pre-skill-injection) this session. Bumped by
     /// [`Self::note_user_content`] and retained for stats/compatibility.

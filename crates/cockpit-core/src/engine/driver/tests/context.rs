@@ -94,9 +94,15 @@ async fn auto_prune_master_switch_off_suppresses_auto_prune() {
         ContextConfig::default(),
         100_000,
     );
-    edit_test_provider_config(&mut driver, |providers| {
-        providers.providers.get_mut("lmstudio").unwrap().auto_prune = Some(false);
-    });
+    driver
+        .test_providers_override
+        .as_mut()
+        .unwrap()
+        .0
+        .providers
+        .get_mut("lmstudio")
+        .unwrap()
+        .auto_prune = Some(false);
     driver.stack[0].history = dup_read_history_big();
     let plan = prune::dedup_plan(&driver.stack[0].history);
     assert!(!plan.is_empty(), "test requires a prunable plan");
@@ -115,9 +121,15 @@ async fn auto_prune_master_switch_off_suppresses_auto_prune() {
         "switch-off must advance the watermark to history_len"
     );
 
-    edit_test_provider_config(&mut driver, |providers| {
-        providers.providers.get_mut("lmstudio").unwrap().auto_prune = Some(true);
-    });
+    driver
+        .test_providers_override
+        .as_mut()
+        .unwrap()
+        .0
+        .providers
+        .get_mut("lmstudio")
+        .unwrap()
+        .auto_prune = Some(true);
     // Flipping back on with no growth stays short-circuited by the
     // watermark — matching sibling-branch semantics.
     assert!(
@@ -376,8 +388,7 @@ async fn active_context_length_uses_probed_capability() {
     });
     let mut providers = std::collections::BTreeMap::new();
     providers.insert("lmstudio".to_string(), entry);
-    install_test_provider_config(
-        &mut driver,
+    driver.test_providers_override = Some((
         ProvidersConfig {
             providers,
             active_model: Some(ActiveModelRef {
@@ -389,7 +400,9 @@ async fn active_context_length_uses_probed_capability() {
             }),
             ..ProvidersConfig::default()
         },
-    );
+        "lmstudio".into(),
+        "local".into(),
+    ));
 
     assert_eq!(driver.active_model_context_length(), Some(128_000));
 }
@@ -1130,13 +1143,12 @@ async fn compact_override_uses_selected_models_context_window() {
         ContextConfig::default(),
         100_000,
     );
-    edit_test_provider_config(&mut driver, |providers| {
-        let provider = providers.providers.get_mut("lmstudio").unwrap();
-        let mut compact = provider.models[0].clone();
-        compact.id = "compact".to_string();
-        compact.context_length = Some(4_096);
-        provider.models.push(compact);
-    });
+    let (providers, _, _) = driver.test_providers_override.as_mut().unwrap();
+    let provider = providers.providers.get_mut("lmstudio").unwrap();
+    let mut compact = provider.models[0].clone();
+    compact.id = "compact".to_string();
+    compact.context_length = Some(4_096);
+    provider.models.push(compact);
     driver.test_compact_model_ref = Some("lmstudio:compact".to_string());
     let draft = driver
         .compact_brief_draft(
@@ -1789,9 +1801,12 @@ async fn shadow_brief_foreground_preparation_preempts_before_preflight() {
         >()),
     }));
 
-    let prepared = driver
-        .prepare_queued_user_submission(UserSubmission::text("hello"), &queue, &tx)
-        .await;
+    let prepared = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        driver.prepare_queued_user_submission(UserSubmission::text("hello"), &queue, &tx),
+    )
+    .await
+    .expect("foreground preparation should not wait for the delayed shadow");
     assert!(prepared.is_some());
     assert!(
         observed_cancel.is_cancelled(),
@@ -3739,7 +3754,7 @@ async fn keep_warm_does_not_extend_the_idle_window_during_preparation() {
 /// The idle window remains a hard boundary after the provider handoff: a
 /// parked provider proves that the in-flight refresh is cancelled at the
 /// deadline rather than being left to the generic background timeout.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn keep_warm_cancels_an_in_flight_refresh_at_the_idle_deadline() {
     use crate::config::providers::{CacheMode, ContextConfig};
 
@@ -3782,15 +3797,17 @@ async fn keep_warm_cancels_an_in_flight_refresh_at_the_idle_deadline() {
     tokio::pin!(refresh);
 
     tokio::select! {
-        accepted = accepted_rx => {
-            assert!(accepted.is_ok(), "parked provider must observe the refresh");
+        accepted = tokio::time::timeout(std::time::Duration::from_secs(1), accepted_rx) => {
+            assert!(accepted.is_ok(), "keep-warm must reach the parked provider");
+            assert!(accepted.unwrap().is_ok(), "parked provider must observe the refresh");
         }
         result = &mut refresh => panic!("keep-warm ended before provider dispatch: {result:?}"),
     }
 
-    // The production idle fence is exactly one second for this fixture.
-    tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    let result = refresh.await.unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), &mut refresh)
+        .await
+        .expect("idle-window fence must beat the 30-second background timeout")
+        .unwrap();
     assert_eq!(result, "skipped: idle window elapsed");
     assert!(
         cancel.is_cancelled(),
@@ -3860,8 +3877,7 @@ async fn no_context_length_makes_ctx_gated_paths_inert() {
     });
     let mut providers = std::collections::BTreeMap::new();
     providers.insert("lmstudio".to_string(), entry);
-    install_test_provider_config(
-        &mut driver,
+    driver.test_providers_override = Some((
         ProvidersConfig {
             providers,
             active_model: Some(ActiveModelRef {
@@ -3873,7 +3889,9 @@ async fn no_context_length_makes_ctx_gated_paths_inert() {
             }),
             ..ProvidersConfig::default()
         },
-    );
+        "lmstudio".into(),
+        "local".into(),
+    ));
 
     // Auto-compact inert (no ctx%).
     driver
@@ -4046,7 +4064,8 @@ async fn fitted_initial_shadow_persists_partial_coverage_across_restart() {
             )
         }),
     }));
-    wait_for_shadow_brief(&mut driver).await;
+    tokio::task::yield_now().await;
+    driver.settle_shadow_brief().await;
 
     let stored = driver
         .session
@@ -4694,7 +4713,15 @@ async fn noninteractive_executor_returns_partial_on_compact_guard_trip() {
         },
         10_000,
     );
-    set_test_provider_url(&mut driver, provider.base_url());
+    driver
+        .test_providers_override
+        .as_mut()
+        .unwrap()
+        .0
+        .providers
+        .get_mut("lmstudio")
+        .unwrap()
+        .url = provider.base_url();
     Arc::make_mut(&mut driver.stack[0].agent).context_policy = Some(crate::agents::ContextPolicy {
         auto_compact_pct: Some(50),
         inline_caps: None,
@@ -4706,6 +4733,7 @@ async fn noninteractive_executor_returns_partial_on_compact_guard_trip() {
 
     nested_lane_test_hooks::set(NestedLaneTestHooks {
         test_compact_brief_script: driver.test_compact_brief_script.clone(),
+        test_providers_override: driver.test_providers_override.clone(),
         lane_compact_guard_precharge: 2,
         compaction_ignore_forward_progress: true,
         ..Default::default()
@@ -4814,7 +4842,15 @@ async fn noninteractive_executor_returns_partial_when_compact_charges_exhaust_bu
         },
         10_000,
     );
-    set_test_provider_url(&mut driver, provider.base_url());
+    driver
+        .test_providers_override
+        .as_mut()
+        .unwrap()
+        .0
+        .providers
+        .get_mut("lmstudio")
+        .unwrap()
+        .url = provider.base_url();
     Arc::make_mut(&mut driver.stack[0].agent).context_policy = Some(crate::agents::ContextPolicy {
         auto_compact_pct: Some(50),
         inline_caps: None,
@@ -4824,6 +4860,7 @@ async fn noninteractive_executor_returns_partial_when_compact_charges_exhaust_bu
 
     nested_lane_test_hooks::set(NestedLaneTestHooks {
         test_compact_brief_script: None,
+        test_providers_override: driver.test_providers_override.clone(),
         compact_brief_lane_charge: Some(
             crate::engine::delegation_budget::BudgetCharge::from_usage(crate::tokens::TokenUsage {
                 input_tokens: 15,

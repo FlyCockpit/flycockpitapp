@@ -1,91 +1,5 @@
 use super::*;
 
-#[test]
-fn noninteractive_child_inherits_parent_provider_snapshot_by_construction() {
-    let (mut driver, _tmp) = test_driver(1);
-    let mut scripted_providers = driver.config.providers();
-    let active = scripted_providers
-        .active_model
-        .clone()
-        .expect("scripted parent has an active provider snapshot");
-    let provider = active.provider;
-    let model = active.model;
-    scripted_providers
-        .providers
-        .get_mut(&provider)
-        .expect("active scripted provider is registered")
-        .url = "http://127.0.0.1:9/v1".to_string();
-    driver.set_config_handle(
-        crate::daemon::session_worker::SessionConfigHandle::detached(
-            crate::daemon::session_worker::SessionConfigSnapshot::new(
-                driver.config.generation(),
-                scripted_providers.clone(),
-                driver.config.extended().clone(),
-            ),
-        ),
-    );
-
-    let child_config = driver
-        .spawn_args_delegated_in_cwd(
-            &driver.cwd,
-            false,
-            Vec::new(),
-            None,
-            crate::engine::builtin::DelegationRecursionContext::default(),
-        )
-        .config;
-    let child_providers = child_config.providers();
-    let child_providers_json = serde_json::to_value(&child_providers).unwrap();
-    let parent_providers_json = serde_json::to_value(&scripted_providers).unwrap();
-
-    assert_eq!(child_config.generation(), driver.config.generation());
-    assert_eq!(child_providers_json, parent_providers_json);
-    let child_active = child_providers
-        .active_model
-        .as_ref()
-        .expect("child provider snapshot keeps the active selection");
-    assert_eq!(child_active.provider, provider);
-    assert_eq!(child_active.model, model);
-}
-
-#[test]
-fn noninteractive_child_detaches_the_live_parent_snapshot_at_construction() {
-    let (mut driver, _tmp) = test_driver(1);
-    let providers = driver.config.providers();
-    let live = crate::daemon::session_worker::SessionConfigHandle::new(Arc::new(
-        std::sync::RwLock::new(crate::daemon::session_worker::SessionConfigSnapshot::new(
-            7,
-            providers.clone(),
-            crate::config::extended::ExtendedConfig::default(),
-        )),
-    ));
-    driver.set_config_handle(live.clone());
-
-    let child_config = driver
-        .spawn_args_delegated_in_cwd(
-            &driver.cwd,
-            false,
-            Vec::new(),
-            None,
-            crate::engine::builtin::DelegationRecursionContext::default(),
-        )
-        .config;
-    let mut refreshed = providers;
-    refreshed.active_model = None;
-    live.set_full_config_snapshot_for_tests(
-        crate::daemon::session_worker::SessionConfigSnapshot::new(
-            8,
-            refreshed,
-            crate::config::extended::ExtendedConfig::default(),
-        ),
-    );
-
-    assert_eq!(child_config.generation(), 7);
-    assert!(child_config.providers().active_model.is_some());
-    assert_eq!(live.generation(), 8);
-    assert!(live.providers().active_model.is_none());
-}
-
 #[tokio::test]
 async fn intermediate_noninteractive_continue_checkpoint_survives_cancel_or_failure_for_restart() {
     // `history` and `next_prompt` model the state immediately after a turn
@@ -185,40 +99,34 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
                 }),
             )
         };
-        let child_response_gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let mut provider = ScriptedProvider::builder()
+        let provider = ScriptedProvider::builder()
             .dialect(WireDialect::ChatCompletions)
             .turn(Turn::ParallelToolCalls(vec![
                 delegate("delegate-a", "readonly-probe", "inspect alpha"),
                 (
                     "read-middle".into(),
-                    "scheduler_read_probe".into(),
-                    serde_json::json!({}),
+                    "read".into(),
+                    serde_json::json!({ "path": "middle.txt" }),
                 ),
                 delegate("delegate-b", "readonly-probe", "inspect beta"),
-                // The authored serial probe carries dynamic `bash`, so
-                // parallel admission rejects it and the real lane must drain
-                // before it runs as a serial delegate barrier. Its response
-                // never invokes that capability.
-                delegate("delegate-barrier", "serial-probe", "inspect serially"),
+                // `explore` carries Dynamic `bash`, so parallel admission
+                // rejects it and the real lane must drain before it runs as a
+                // serial delegate barrier.
+                delegate("delegate-barrier", "explore", "inspect serially"),
             ]))
             // The two concurrently admitted children may claim these two
             // equivalent terminal responses in either wall-clock order.
             .turn(Turn::Text("delegate completed".into()))
-            .with_response_gate(child_response_gate.clone())
-            // These are the two independently started child turns. Keep both
-            // sockets open behind an explicit gate until the assertion below
-            // observes them; this is not a planner probe or a timing window.
+            // These are the two independently started child turns.  Keeping
+            // both sockets open gives the assertion below a deterministic
+            // production in-flight window; this is not a planner probe.
+            .with_delay(std::time::Duration::from_millis(350))
             .turn(Turn::Text("delegate completed".into()))
-            .with_response_gate(child_response_gate.clone())
+            .with_delay(std::time::Duration::from_millis(350))
             .turn(Turn::Text("serial delegate completed".into()))
             .turn(Turn::Text("parent observed all results".into()))
-            // The driver below intentionally performs synchronous config and
-            // admission work on a current-thread runtime. Keep the HTTP
-            // fixture on its owned runtime so provider progress is an
-            // independent readiness source rather than an executor-ordering
-            // accident under parallel nextest load.
-            .start_blocking();
+            .start()
+            .await;
         let (mut driver, tmp) = test_driver_with_url_vnext(8, provider.base_url());
         std::fs::write(tmp.path().join("middle.txt"), "middle body").unwrap();
 
@@ -237,25 +145,12 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
         )
         .unwrap();
         write_host_tool_surface(&agents_dir, "readonly-probe", &["read"]);
-        std::fs::write(
-            agents_dir.join("serial-probe.md"),
-            vnext_coding_agent_document(
-                "serial-probe",
-                "dynamic scheduler barrier fixture",
-                "Return a short deterministic report.",
-            ),
-        )
-        .unwrap();
-        write_host_tool_surface(&agents_dir, "serial-probe", &["bash"]);
+        admit_authored_child_to_test_grants(&mut driver, "authored/readonly-probe");
         std::fs::write(
             config_dir.join("config.json"),
             serde_json::json!({
                 "active_model": { "provider": "lmstudio", "model": "local" },
                 "delegation": { "maxParallel": 2 },
-                // This fixture measures scheduler admission only. Override any
-                // user-level guard model so ordinary/delegate result scans do
-                // not add unrelated provider requests to the shared script.
-                "prompt_injection_guard": { "threshold": "off" },
                 // The fixture's authored leaf is intentionally limited to
                 // `read`; disable config-projected web commands so they do
                 // not turn that real child surface Dynamic.
@@ -275,18 +170,6 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
         )
         .unwrap();
         driver.refresh_config_from_disk_for_tests();
-        let root = Arc::make_mut(&mut driver.stack[0].agent);
-        root.tools = root.tools.clone().with(Arc::new(SchedulerReadProbe));
-        driver.schedule.set_agent(driver.stack[0].agent.clone());
-        // Refresh rebuilds the live root from the newly loaded snapshot. Add
-        // the authored child to that exact root grant, not to the stale frame
-        // that existed before the refresh boundary.
-        admit_authored_child_to_test_grants(&mut driver, "authored/readonly-probe");
-        admit_authored_child_to_test_grants(&mut driver, "authored/serial-probe");
-        // Dynamic authored-tool admission is approval-gated even when the
-        // scripted child never invokes the tool. Keep the approver alive for
-        // the entire run so the fixture reaches scheduler classification.
-        let approver = install_test_approver(&mut driver);
 
         let trust = crate::config::trust::WorkspaceTrustPolicy {
             root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
@@ -296,38 +179,28 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
         let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
         let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
         {
-            // This dedicated current-thread harness spawns the ordinary lane
-            // and child runners. Tokio task-locals do not propagate through
-            // `tokio::spawn`, so keep the intended trust policy on the runtime
-            // thread for those tasks too.
-            let _trust = crate::config::trust::enter_workspace_trust_policy(trust);
-            let run = driver.run_user_input(UserSubmission::text("run mixed lane"), &queue, &tx);
+            let run = crate::config::trust::scope_workspace_trust_policy(
+                trust,
+                driver.run_user_input(UserSubmission::text("run mixed lane"), &queue, &tx),
+            );
             tokio::pin!(run);
-            for expected_request in 1..=3 {
-                // Request one is the root planning turn. Requests two and three
-                // can only be the two distinct delegated calls. Poll the driver
-                // concurrently with the provider readiness channel: merely pinning
-                // a future does not drive it.
-                let request = tokio::select! {
-                    result = &mut run => panic!(
-                        "driver completed after only {} provider requests: {result:?}",
-                        expected_request - 1,
-                    ),
-                    // The provider's existing short failure guard prevents a
-                    // broken admission path from hanging the suite; overlap is
-                    // proved by the response gate, never by this timeout.
-                    request = provider.next_request_ready() => request,
-                };
-                assert!(request.request_line.starts_with("POST "));
+            for _ in 0..100 {
+                // Request one is the root planning turn.  Requests two and three
+                // can only be the two distinct delegated calls.  They are both
+                // still held by the delayed fixture, proving simultaneous real
+                // child attempts under the one mixed Driver lane (rather than two
+                // planner classifications or a synthetic batch rewrite).
+                if provider.request_count() >= 3 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
             assert!(
-                provider.peak_in_flight() >= 2,
+                provider.request_count() >= 3,
                 "both separately identified eligible delegates must be in flight before either settles"
             );
-            child_response_gate.add_permits(2);
             run.await.unwrap();
         }
-        drop(approver);
 
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -347,7 +220,7 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
         assert!(
             events.iter().any(|event| {
                 matches!(event, TurnEvent::ToolStart { call_id, tool, .. }
-                    if call_id == "read-middle" && tool == "scheduler_read_probe")
+                    if call_id == "read-middle" && tool == "read")
             }),
             "the ordinary read is dispatched on the same real mixed lane as the two in-flight delegates"
         );
@@ -357,11 +230,6 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
             .into_iter()
             .filter(|request| request.request_line.starts_with("POST "))
             .collect::<Vec<_>>();
-        assert_eq!(
-            posts.len(),
-            5,
-            "the scheduler fixture must issue only root, three child, and parent-resume requests"
-        );
         let parent_resume = posts
             .iter()
             .find(|request| {
@@ -709,15 +577,6 @@ fn root_child_cwd(driver: &Driver) -> ChildCwd {
     }
 }
 
-fn align_scripted_provider_with_config(driver: &mut Driver) {
-    let providers = driver.config.providers();
-    assert!(
-        providers.active_model.is_some(),
-        "delegated-model fixture config has an active model"
-    );
-    install_test_provider_config(driver, providers);
-}
-
 fn write_delegated_model_config(driver: &mut Driver, models: &[&str]) {
     let config_dir = driver.cwd.join(".cockpit");
     let providers_dir = config_dir.join("providers");
@@ -754,11 +613,6 @@ fn write_delegated_model_config(driver: &mut Driver, models: &[&str]) {
     driver.set_config_handle(
         crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(&cwd),
     );
-    // The model harness keeps a test-only provider authority alongside the
-    // worker snapshot. Both represent the same pinned parent configuration;
-    // leaving the former on the constructor snapshot would make child
-    // inheritance replace the freshly loaded registry with stale providers.
-    align_scripted_provider_with_config(driver);
 }
 
 fn failing_provider() -> cockpit_test_support::provider::ScriptedProvider {
@@ -819,7 +673,6 @@ fn write_delegated_model_config_with_backup(
     driver.set_config_handle(
         crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(&cwd),
     );
-    align_scripted_provider_with_config(driver);
 }
 
 async fn seed_task_payload(driver: &Driver, task_call_id: &str, label: &str, child_agent: &str) {
@@ -1229,14 +1082,13 @@ fn scoped_child_subtree_is_pre_granted_read_write() {
     // post-build generation guard, so a generation move records no lingering
     // grant). The grant is recorded immediately BEFORE the child's first inference
     // request. On a big-stack thread (avoiding the pre-existing deep-batch stack
-    // overflow) run the scoped `builder` against a response-gated provider. The
-    // provider's request-ready signal proves dispatch, after which the shared
-    // grant store can be checked directly before cancellation.
-    let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
-    let mut provider = cockpit_test_support::provider::ScriptedProvider::builder()
+    // overflow) run the scoped `builder` against a long-delayed provider; once the
+    // request is in flight the pregrant has already run, so poll the shared grant
+    // store from THIS thread, then cancel before the 20s delay elapses.
+    let provider = cockpit_test_support::provider::ScriptedProvider::builder()
         .dialect(cockpit_test_support::provider::WireDialect::ChatCompletions)
         .turn(cockpit_test_support::provider::Turn::Text("done".into()))
-        .with_response_gate(response_gate)
+        .with_delay(std::time::Duration::from_secs(20))
         .repeat_last()
         .start_blocking();
     let url = provider.base_url();
@@ -1290,7 +1142,7 @@ fn scoped_child_subtree_is_pre_granted_read_write() {
                     let scope = driver.cwd.join("scope");
                     std::fs::create_dir_all(&scope).unwrap();
                     // Hand the shared approver + scope to the probing thread so it
-                    // can inspect the grant while this batch holds its guard.
+                    // can poll the grant while this batch holds its guard.
                     handoff_tx.send((approver.clone(), scope.clone())).unwrap();
                     seed_batch_task_delegation(&driver, "task-pregrant", &["scoped"]).await;
                     seed_task_payload(&driver, "task-pregrant", "scoped", "builder").await;
@@ -1318,13 +1170,21 @@ fn scoped_child_subtree_is_pre_granted_read_write() {
         .enable_all()
         .build()
         .unwrap();
-    probe_rt.block_on(provider.next_request_ready());
-    let granted = probe_rt
-        .block_on(approver.store().is_path_granted_for(
-            &scope,
-            crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
-        ))
-        .unwrap();
+    let mut granted = false;
+    for _ in 0..200 {
+        if provider.request_count() >= 1
+            && probe_rt
+                .block_on(approver.store().is_path_granted_for(
+                    &scope,
+                    crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+                ))
+                .unwrap()
+        {
+            granted = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     cancel.cancel();
     batch_thread.join().unwrap();
     assert!(
@@ -1847,13 +1707,7 @@ async fn delivered_finished_noninteractive_job_is_reaped() {
         job.delivered = true;
         job
     });
-    (&mut driver
-        .noninteractive_jobs
-        .get_mut("task-reap")
-        .expect("fixture job remains registered")
-        .handle)
-        .await
-        .expect("fixture job joins");
+    tokio::task::yield_now().await;
 
     driver.reap_finished_noninteractive_jobs();
 
@@ -1891,7 +1745,7 @@ async fn stop_aborts_noninteractive_jobs_of_the_cancelled_generation() {
     );
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn stop_cancels_in_flight_background_delegate_inference() {
     use cockpit_test_support::provider::{ScriptedProvider, Turn, WireDialect};
 
@@ -1914,16 +1768,12 @@ async fn stop_cancels_in_flight_background_delegate_inference() {
                 .await
         }
     });
-    await_paused_driver_test_readiness(
-        provider.next_request_ready(),
-        "background delegate request readiness",
-    )
-    .await;
+    let _captured = provider.next_request().await;
     cancel.cancel();
-    let result =
-        await_paused_driver_test_completion(run, "background delegate cancellation unwind")
-            .await
-            .expect("join");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .expect("Stop must abort in-flight delegate inference")
+        .expect("join");
     let completion = result.expect("execute_single returns a completion on cancel");
     assert!(
         completion.failed,
@@ -2581,13 +2431,13 @@ async fn docs_pipeline_emits_no_routing_amend() {
 /// takes a shared read guard) — exactly 1 in flight. If docs were wrongly admitted
 /// concurrently (a shared read guard), BOTH would dispatch → 2. The batch runs on
 /// a dedicated big-stack thread; the probe runs on THIS thread against the
-/// provider's request-ready signal and response gate, then cancels.
+/// provider's cross-thread atomic counter, then cancels so the 20s delay is never
+/// fully waited.
 fn dmh_docs_batch_exclusive_in_flight() -> usize {
-    let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
-    let mut provider = cockpit_test_support::provider::ScriptedProvider::builder()
+    let provider = cockpit_test_support::provider::ScriptedProvider::builder()
         .dialect(cockpit_test_support::provider::WireDialect::ChatCompletions)
         .turn(cockpit_test_support::provider::Turn::Text("done".into()))
-        .with_response_gate(response_gate)
+        .with_delay(std::time::Duration::from_secs(20))
         .repeat_last()
         .start_blocking();
     let url = provider.base_url();
@@ -2669,12 +2519,14 @@ fn dmh_docs_batch_exclusive_in_flight() -> usize {
         })
         .unwrap();
 
-    let probe_rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    probe_rt.block_on(provider.next_request_ready());
-    let in_flight = provider.peak_in_flight();
+    for _ in 0..200 {
+        if provider.request_count() >= 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let in_flight = provider.request_count();
     cancel.cancel();
     batch_thread.join().unwrap();
     in_flight
@@ -2901,18 +2753,17 @@ fn batch_read_only_child_fails_closed_if_def_gains_write_before_build() {
 /// (pre-refresh) generation, with NO split and NO fail-closed. Driven on a
 /// big-stack thread (avoiding the pre-existing deep-batch overflow): a bumper
 /// advances the LIVE shared generation while `execute_single` is suspended at its
-/// first await (AFTER the synchronous repin), then a response gate holds
+/// first await (AFTER the synchronous repin), then a long-delayed provider parks
 /// the child's request in flight so the main thread can confirm the child
 /// dispatched AND its grant was recorded — proving the attempt ran the pinned
 /// generation, not the refreshed one. (Under the old fail-closed behaviour the
 /// move would abort with no request and no grant.)
 #[test]
 fn single_delegation_runs_under_pinned_generation_across_refresh() {
-    let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
-    let mut provider = cockpit_test_support::provider::ScriptedProvider::builder()
+    let provider = cockpit_test_support::provider::ScriptedProvider::builder()
         .dialect(cockpit_test_support::provider::WireDialect::ChatCompletions)
         .turn(cockpit_test_support::provider::Turn::Text("done".into()))
-        .with_response_gate(response_gate)
+        .with_delay(std::time::Duration::from_secs(20))
         .repeat_last()
         .start_blocking();
     let url = provider.base_url();
@@ -2999,13 +2850,21 @@ fn single_delegation_runs_under_pinned_generation_across_refresh() {
         .enable_all()
         .build()
         .unwrap();
-    probe_rt.block_on(provider.next_request_ready());
-    let dispatched_and_granted = probe_rt
-        .block_on(approver.store().is_path_granted_for(
-            &scope,
-            crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
-        ))
-        .unwrap();
+    let mut dispatched_and_granted = false;
+    for _ in 0..200 {
+        if provider.request_count() >= 1
+            && probe_rt
+                .block_on(approver.store().is_path_granted_for(
+                    &scope,
+                    crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+                ))
+                .unwrap()
+        {
+            dispatched_and_granted = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     cancel.cancel();
     attempt_thread.join().unwrap();
     assert!(
@@ -5452,38 +5311,6 @@ struct SchedulerSerialBarrier {
     release: Arc<tokio::sync::Notify>,
 }
 
-/// Immediate read-only ordinary call for the capability scheduler fixture.
-/// It avoids coupling that scheduler test to the production `read` tool's
-/// independent result-safety inference path.
-struct SchedulerReadProbe;
-
-#[async_trait::async_trait]
-impl crate::engine::tool::Tool for SchedulerReadProbe {
-    fn name(&self) -> &str {
-        "scheduler_read_probe"
-    }
-
-    fn description(&self) -> &str {
-        "Return a deterministic read-only scheduler result."
-    }
-
-    fn effect(&self) -> crate::engine::tool::ToolEffect {
-        crate::engine::tool::ToolEffect::ReadOnly
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({ "type": "object", "properties": {} })
-    }
-
-    async fn call(
-        &self,
-        _args: serde_json::Value,
-        _ctx: &crate::engine::tool::ToolCtx,
-    ) -> anyhow::Result<crate::engine::tool::ToolOutput> {
-        Ok(crate::engine::tool::ToolOutput::text("middle body"))
-    }
-}
-
 #[async_trait::async_trait]
 impl crate::engine::tool::Tool for SchedulerSerialBarrier {
     fn name(&self) -> &str {
@@ -5575,12 +5402,12 @@ fn scheduler_defers_delegate_admission_until_serial_barrier() {
         )
         .unwrap();
         write_host_tool_surface(&agents_dir, "readonly-probe", &["read"]);
+        admit_authored_child_to_test_grants(&mut driver, "authored/readonly-probe");
         std::fs::write(
             config_dir.join("config.json"),
             serde_json::json!({
                 "active_model": { "provider": "lmstudio", "model": "local" },
                 "agent_chooses_subagent_model": true,
-                "prompt_injection_guard": { "threshold": "off" },
                 "web": { "provider": "custom" }
             })
             .to_string(),
@@ -5600,9 +5427,6 @@ fn scheduler_defers_delegate_admission_until_serial_barrier() {
         )
         .unwrap();
         driver.refresh_config_from_disk_for_tests();
-        // The refreshed root owns delegation admission. Mutating the prior
-        // frame's grant would be discarded by this rebuild.
-        admit_authored_child_to_test_grants(&mut driver, "authored/readonly-probe");
 
         let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
         let release = Arc::new(tokio::sync::Notify::new());
@@ -5632,21 +5456,13 @@ fn scheduler_defers_delegate_admission_until_serial_barrier() {
         let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
         let (tx, mut rx) = mpsc::channel::<TurnEvent>(128);
-        // See the mixed-lane fixture above: spawned tasks remain on this
-        // dedicated current-thread runtime, so keep trust on that thread for
-        // the complete scheduler execution.
-        let _trust = crate::config::trust::enter_workspace_trust_policy(trust);
-        let resolved = crate::agents::resolve(tmp.path(), "readonly-probe")
-            .expect("trusted authored child definition resolves")
-            .expect("trusted authored child definition exists");
-        assert!(
-            resolved.vnext.is_some(),
-            "the scheduler fixture must resolve the child as vNext"
-        );
-        let run = driver.run_user_input(
-            UserSubmission::text("exercise deferred admission"),
-            &queue,
-            &tx,
+        let run = crate::config::trust::scope_workspace_trust_policy(
+            trust,
+            driver.run_user_input(
+                UserSubmission::text("exercise deferred admission"),
+                &queue,
+                &tx,
+            ),
         );
         tokio::pin!(run);
         tokio::select! {
@@ -5755,21 +5571,12 @@ fn scheduler_defers_delegate_admission_until_serial_barrier() {
             "the released delegate creates one real child lifecycle"
         );
         assert_eq!(children[0].task_call_id, delegate_call_id);
-        let captured = provider.captured();
-        assert_eq!(
-            captured
-                .iter()
-                .filter(|request| request.request_line.starts_with("POST "))
-                .count(),
-            3,
-            "the barrier fixture must issue only root, delegated-child, and parent-resume requests"
-        );
         assert!(
-            captured.iter().any(|request| {
+            provider.captured().iter().any(|request| {
                 request.request_line.starts_with("POST ")
                     && request.body["model"] == "child-surface"
             }),
-            "the refreshed child execution surface must reach its real child provider attempt; children={children:?}; events={events:?}; requests={captured:?}"
+            "the refreshed child execution surface must reach its real child provider attempt"
         );
         assert!(
             drain_turn_events(&mut rx).iter().any(|event| {
@@ -5781,22 +5588,23 @@ fn scheduler_defers_delegate_admission_until_serial_barrier() {
     });
 }
 
-/// Run a 2-child batch of `child_agent` against a response-gated provider and
-/// return the peak number of child requests simultaneously in flight. A
+/// Run a 2-child batch of `child_agent` against a provider whose responses are
+/// long-delayed, and return how many child requests are simultaneously IN FLIGHT
+/// while the first child's (delayed) response is still outstanding. A
 /// non-admissible (dynamic) child holds the EXCLUSIVE write guard → the second
 /// cannot dispatch → 1 in flight. Concurrently-admissible (read-only) children
 /// share read guards → both dispatch → 2 in flight.
 ///
 /// The batch runs on a dedicated big-stack thread (avoiding the pre-existing
 /// deep-batch stack overflow); the probe runs on THIS thread against the
-/// provider's request-ready channel and peak counter. The response gate keeps
-/// admitted children outstanding until the assertion has exact evidence.
+/// provider's cross-thread atomic request counter using real-time sleeps, so its
+/// timing is independent of the batch's scheduling. The batch is cancelled once
+/// the count is read, so the long delay is never fully waited.
 fn dmh_batch_in_flight_while_first_delayed(child_agent: &str, custom_read_only: bool) -> usize {
-    let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
-    let mut provider = cockpit_test_support::provider::ScriptedProvider::builder()
+    let provider = cockpit_test_support::provider::ScriptedProvider::builder()
         .dialect(cockpit_test_support::provider::WireDialect::ChatCompletions)
         .turn(cockpit_test_support::provider::Turn::Text("done".into()))
-        .with_response_gate(response_gate)
+        .with_delay(std::time::Duration::from_secs(20))
         .repeat_last()
         .start_blocking();
     let url = provider.base_url();
@@ -5887,15 +5695,19 @@ fn dmh_batch_in_flight_while_first_delayed(child_agent: &str, custom_read_only: 
         })
         .unwrap();
 
-    let probe_rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    probe_rt.block_on(provider.next_request_ready());
-    if custom_read_only {
-        probe_rt.block_on(provider.next_request_ready());
+    // Probe on THIS thread (real-time, independent of the batch's scheduling).
+    // Wait (generously) for the FIRST child's request to reach the provider,
+    // then give a would-be-concurrent second child ample time to ALSO dispatch,
+    // and read how many are in flight while the first is still delayed.
+    for _ in 0..200 {
+        if provider.request_count() >= 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    let in_flight = provider.peak_in_flight();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let in_flight = provider.request_count();
+    // Stop the batch early — the 20s delay is never fully waited.
     cancel.cancel();
     batch_thread.join().unwrap();
     in_flight

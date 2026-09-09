@@ -73,7 +73,6 @@ struct ScriptedTurn {
     turn: Turn,
     usage: Option<Usage>,
     delay: Duration,
-    response_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 #[derive(Debug)]
@@ -94,7 +93,6 @@ pub struct ScriptedProvider {
     base_url: String,
     captured: Arc<Mutex<Vec<CapturedRequest>>>,
     request_count: Arc<AtomicUsize>,
-    peak_in_flight: Arc<AtomicUsize>,
     request_rx: mpsc::UnboundedReceiver<CapturedRequest>,
     shutdown_tx: broadcast::Sender<()>,
     accept_task: JoinHandle<()>,
@@ -108,8 +106,6 @@ struct SharedState {
     repeat_last: bool,
     script_index: AtomicUsize,
     request_count: Arc<AtomicUsize>,
-    in_flight: Arc<AtomicUsize>,
-    peak_in_flight: Arc<AtomicUsize>,
     captured: Arc<Mutex<Vec<CapturedRequest>>>,
     request_tx: mpsc::UnboundedSender<CapturedRequest>,
 }
@@ -143,7 +139,6 @@ impl ScriptedProviderBuilder {
             turn: t,
             usage: None,
             delay: Duration::ZERO,
-            response_gate: None,
         });
         self
     }
@@ -165,17 +160,6 @@ impl ScriptedProviderBuilder {
             panic!("with_delay requires a preceding turn");
         };
         turn.delay = delay;
-        self
-    }
-
-    /// Withhold the most recently appended response until one permit is
-    /// explicitly released. The permit is consumed, so a caller controls the
-    /// exact number of responses allowed through the boundary.
-    pub fn with_response_gate(mut self, gate: Arc<tokio::sync::Semaphore>) -> Self {
-        let Some(turn) = self.turns.last_mut() else {
-            panic!("with_response_gate requires a preceding turn");
-        };
-        turn.response_gate = Some(gate);
         self
     }
 
@@ -216,8 +200,6 @@ impl ScriptedProviderBuilder {
         let addr = listener.local_addr().expect("scripted provider local addr");
         let captured = Arc::new(Mutex::new(Vec::new()));
         let request_count = Arc::new(AtomicUsize::new(0));
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let peak_in_flight = Arc::new(AtomicUsize::new(0));
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, _) = broadcast::channel(1);
         let state = Arc::new(SharedState {
@@ -227,8 +209,6 @@ impl ScriptedProviderBuilder {
             repeat_last: self.repeat_last,
             script_index: AtomicUsize::new(0),
             request_count: Arc::clone(&request_count),
-            in_flight,
-            peak_in_flight: Arc::clone(&peak_in_flight),
             captured: Arc::clone(&captured),
             request_tx,
         });
@@ -237,7 +217,6 @@ impl ScriptedProviderBuilder {
             base_url: format!("http://{addr}/v1"),
             captured,
             request_count,
-            peak_in_flight,
             request_rx,
             shutdown_tx,
             accept_task,
@@ -277,28 +256,12 @@ impl ScriptedProvider {
         self.request_count.load(Ordering::SeqCst)
     }
 
-    /// Highest number of simultaneously accepted requests whose responses had
-    /// not yet completed. Useful for concurrency assertions without polling.
-    pub fn peak_in_flight(&self) -> usize {
-        self.peak_in_flight.load(Ordering::SeqCst)
-    }
-
     /// Await the next captured request. Panics on timeout so test failures are
     /// loud instead of hanging forever.
     pub async fn next_request(&mut self) -> CapturedRequest {
         tokio::time::timeout(Duration::from_secs(2), self.request_rx.recv())
             .await
             .expect("timed out waiting for scripted provider request")
-            .expect("scripted provider request channel closed")
-    }
-
-    /// Await the next captured request without installing a Tokio timer.
-    /// Paused-time tests use this readiness signal so their only clock movement
-    /// is the explicit `advance` that exercises the production timer boundary.
-    pub async fn next_request_ready(&mut self) -> CapturedRequest {
-        self.request_rx
-            .recv()
-            .await
             .expect("scripted provider request channel closed")
     }
 
@@ -349,17 +312,7 @@ async fn handle_connection(
     state: Arc<SharedState>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
-    struct InFlightGuard(Arc<AtomicUsize>);
-    impl Drop for InFlightGuard {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-
     let parsed = read_http_request(&mut stream).await;
-    let in_flight = state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-    state.peak_in_flight.fetch_max(in_flight, Ordering::SeqCst);
-    let _in_flight = InFlightGuard(Arc::clone(&state.in_flight));
     state.request_count.fetch_add(1, Ordering::SeqCst);
     state
         .captured
@@ -390,21 +343,13 @@ async fn handle_connection(
         return;
     };
 
-    if let Some(gate) = turn.response_gate.as_ref() {
-        tokio::select! {
-            permit = gate.acquire() => {
-                permit.expect("scripted provider response gate closed").forget();
-            }
-            _ = shutdown_rx.recv() => return,
-        }
-    }
-
     if !turn.delay.is_zero() {
         tokio::select! {
             _ = tokio::time::sleep(turn.delay) => {}
             _ = shutdown_rx.recv() => return,
         }
     }
+
     match &turn.turn {
         Turn::HttpError { status, body } => {
             write_response(&mut stream, *status, "application/json", body).await;

@@ -66,7 +66,6 @@ fn learn_respects_write_gate() {
             session_id,
         ));
         driver.set_interrupt_hub(hub.clone());
-        let mut registered = hub.subscribe_registered();
         let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
         let (turn_tx, _turn_rx) = mpsc::channel(64);
@@ -84,11 +83,18 @@ fn learn_respects_write_gate() {
             .await
         });
 
-        let interrupt_id = registered
-            .recv()
-            .await
-            .expect("learn interrupt producer remains live");
-        assert!(hub.park(interrupt_id).await);
+        loop {
+            if !db
+                .list_open_interrupts(session_id)
+                .await
+                .unwrap()
+                .is_empty()
+                && hub.park_all_registered().await == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         task.await.unwrap().unwrap();
         assert!(!root.join("gated-learn/SKILL.md").exists());
         let row = db.list_open_interrupts(session_id).await.unwrap().remove(0);

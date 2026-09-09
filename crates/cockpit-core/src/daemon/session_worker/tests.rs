@@ -4194,7 +4194,6 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
         params: crate::engine::model::ModelParams::default(),
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         cwd: cwd.to_path_buf(),
-        delegated_definition_root: None,
         config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
         session_short_id: "abc123".to_string(),
         workspace_scratch_dir: cwd.join("workspace-scratch"),

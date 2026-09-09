@@ -94,7 +94,10 @@ fn ordinary_vnext_root_rebuild_pins_its_authorized_running_model() {
 fn install_slot_compatible_model_switch_config(driver: &mut Driver) {
     use crate::config::providers::{ModelCapabilities, ModelEntry};
 
-    let mut cfg = driver.config.providers();
+    let (mut cfg, provider, model) = driver
+        .test_providers_override
+        .clone()
+        .expect("model switch harness installs provider override");
     for (provider_id, model_id) in [("provider-a", "model-a"), ("provider-b", "model-b")] {
         let entry = cfg
             .providers
@@ -111,6 +114,7 @@ fn install_slot_compatible_model_switch_config(driver: &mut Driver) {
             });
         }
     }
+    driver.test_providers_override = Some((cfg.clone(), provider, model));
     driver.set_config_handle(
         crate::daemon::session_worker::SessionConfigHandle::detached(
             crate::daemon::session_worker::SessionConfigSnapshot::new(
@@ -208,7 +212,12 @@ async fn rebuild_prepared_primary_keeps_session_matching_in_set_selection() {
 fn ordinary_vnext_child_rebuild_pins_its_parent_named_running_model() {
     let (mut driver, _tmp) = model_switch_driver();
     push_test_child(&mut driver, Vec::new());
-    let cfg = driver.config.providers();
+    let cfg = driver
+        .test_providers_override
+        .as_ref()
+        .expect("model switch harness installs provider override")
+        .0
+        .clone();
     let parent_named = Arc::new(
         crate::engine::model::Model::for_provider(
             &cfg,
@@ -368,7 +377,11 @@ fn edit_model_switch_config(
     driver: &mut Driver,
     edit: impl FnOnce(&mut crate::config::providers::ProvidersConfig),
 ) {
-    edit_test_provider_config(driver, edit);
+    let (cfg, _, _) = driver
+        .test_providers_override
+        .as_mut()
+        .expect("model switch harness installs provider override");
+    edit(cfg);
 }
 
 #[test]
@@ -683,7 +696,12 @@ async fn config_refresh_gates_retention_on_loaded_foreground_model() {
             .expect("active model exists")
             .prompt_cache_retention = Some(PromptCacheRetention::Extended);
     });
-    let cfg = driver.config.providers();
+    let cfg = driver
+        .test_providers_override
+        .as_ref()
+        .expect("model switch harness installs provider override")
+        .0
+        .clone();
     let model_b = Arc::new(
         crate::engine::model::Model::for_provider(
             &cfg,
@@ -727,14 +745,16 @@ async fn longcache_unsupported_model_surfaces_notice_and_stays_off() {
 
     let (mut driver, _tmp) = model_switch_driver();
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
-    edit_model_switch_config(&mut driver, |cfg| {
-        set_prompt_cache_retention_capability(
-            cfg,
-            "provider-a",
-            "model-a",
-            CapabilityStatus::Unsupported,
-        );
-    });
+    let (cfg, _, _) = driver
+        .test_providers_override
+        .as_mut()
+        .expect("model switch harness installs provider override");
+    set_prompt_cache_retention_capability(
+        cfg,
+        "provider-a",
+        "model-a",
+        CapabilityStatus::Unsupported,
+    );
     driver.prompt_cache_retention_preference = Some(PromptCacheRetention::Extended);
 
     driver
@@ -836,7 +856,7 @@ async fn reasoning_params_prefer_native_capability_over_legacy_thinking_mode() {
         Arc::new(crate::redact::RedactionTable::empty()),
     )
     .unwrap();
-    install_test_provider_config(&mut driver, cfg);
+    driver.test_providers_override = Some((cfg, "provider-a".into(), "model-a".into()));
 
     assert_eq!(
         driver.resolve_thinking_params_for(&model),
@@ -863,21 +883,21 @@ async fn live_model_switch_routes_next_request_to_new_model() {
     assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-a");
     assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-a");
 
-    run_control_with_driver_trust(
-        &mut driver,
-        DriverControl::SetActiveModel {
-            selection_id: uuid::Uuid::nil(),
-            provider: "provider-b".into(),
-            model: "model-b".into(),
-            persist_as_default: true,
-            trigger: crate::session::ModelSwitchTrigger::Daemon,
-            reasoning_effort: None,
-            thinking_mode: None,
-            prompt_cache_retention: None,
-        },
-        &tx,
-    )
-    .await;
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                persist_as_default: true,
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            &tx,
+        )
+        .await;
 
     // The next outbound request now routes to B's id + provider, same
     // session, same root history (no restart).
@@ -951,30 +971,32 @@ async fn model_switch_carries_prompt_cache_retention() {
 
     let (mut driver, _tmp) = model_switch_driver();
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
-    edit_model_switch_config(&mut driver, |cfg| {
-        set_prompt_cache_retention_capability(
-            cfg,
-            "provider-b",
-            "model-b",
-            CapabilityStatus::Supported,
-        );
-    });
+    let (cfg, _, _) = driver
+        .test_providers_override
+        .as_mut()
+        .expect("model switch harness installs provider override");
+    set_prompt_cache_retention_capability(
+        cfg,
+        "provider-b",
+        "model-b",
+        CapabilityStatus::Supported,
+    );
 
-    run_control_with_driver_trust(
-        &mut driver,
-        DriverControl::SetActiveModel {
-            selection_id: uuid::Uuid::nil(),
-            provider: "provider-b".into(),
-            model: "model-b".into(),
-            persist_as_default: true,
-            trigger: crate::session::ModelSwitchTrigger::Daemon,
-            reasoning_effort: None,
-            thinking_mode: None,
-            prompt_cache_retention: Some(PromptCacheRetention::Extended),
-        },
-        &tx,
-    )
-    .await;
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                persist_as_default: true,
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: Some(PromptCacheRetention::Extended),
+            },
+            &tx,
+        )
+        .await;
 
     assert_eq!(
         driver.stack[0]
@@ -991,9 +1013,10 @@ async fn model_switch_carries_prompt_cache_retention() {
             .and_then(|active| active.prompt_cache_retention),
         Some(PromptCacheRetention::Extended)
     );
-    let cfg = crate::config::providers::ConfigDoc::load(&driver.cwd.join(".cockpit/config.json"))
-        .unwrap()
-        .providers();
+    let (cfg, _, _) = driver
+        .test_providers_override
+        .as_ref()
+        .expect("model switch harness installs provider override");
     assert_eq!(
         cfg.active_model
             .as_ref()
@@ -1182,67 +1205,65 @@ async fn plain_enter_never_establishes_a_first_default() {
 /// Formerly `concurrent_stale_workers_initialize_exactly_one_default`: plain
 /// Enter no longer initializes anything, so the correct invariant is that
 /// *neither* concurrent session-only switch writes a default.
-#[test]
-fn concurrent_plain_enter_switches_write_no_default_at_all() {
-    crate::test_env::run_async_with_large_stack(|| async {
-        let (mut driver_a, mut driver_b, shared, _driver_b_tmp) =
-            model_switch_drivers_with_shared_disk_config_without_default();
-        let (tx_a, mut rx_a) = mpsc::channel::<TurnEvent>(64);
-        let (tx_b, mut rx_b) = mpsc::channel::<TurnEvent>(64);
-        let root = shared.path();
+#[tokio::test]
+async fn concurrent_plain_enter_switches_write_no_default_at_all() {
+    let (mut driver_a, mut driver_b, shared, _driver_b_tmp) =
+        model_switch_drivers_with_shared_disk_config_without_default();
+    let (tx_a, mut rx_a) = mpsc::channel::<TurnEvent>(64);
+    let (tx_b, mut rx_b) = mpsc::channel::<TurnEvent>(64);
+    let root = shared.path();
 
-        let a = run_control_with_trusted_project_config(
-            &mut driver_a,
-            root,
-            DriverControl::SetActiveModel {
-                selection_id: uuid::Uuid::new_v4(),
-                provider: "provider-a".into(),
-                model: "model-a".into(),
-                persist_as_default: false,
-                trigger: crate::session::ModelSwitchTrigger::Picker,
-                reasoning_effort: None,
-                thinking_mode: None,
-                prompt_cache_retention: None,
-            },
-            &tx_a,
-        );
-        let b = run_control_with_trusted_project_config(
-            &mut driver_b,
-            root,
-            DriverControl::SetActiveModel {
-                selection_id: uuid::Uuid::new_v4(),
-                provider: "provider-b".into(),
-                model: "model-b".into(),
-                persist_as_default: false,
-                trigger: crate::session::ModelSwitchTrigger::Picker,
-                reasoning_effort: None,
-                thinking_mode: None,
-                prompt_cache_retention: None,
-            },
-            &tx_b,
-        );
-        tokio::join!(a, b);
+    let a = run_control_with_trusted_project_config(
+        &mut driver_a,
+        root,
+        DriverControl::SetActiveModel {
+            selection_id: uuid::Uuid::new_v4(),
+            provider: "provider-a".into(),
+            model: "model-a".into(),
+            persist_as_default: false,
+            trigger: crate::session::ModelSwitchTrigger::Picker,
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        },
+        &tx_a,
+    );
+    let b = run_control_with_trusted_project_config(
+        &mut driver_b,
+        root,
+        DriverControl::SetActiveModel {
+            selection_id: uuid::Uuid::new_v4(),
+            provider: "provider-b".into(),
+            model: "model-b".into(),
+            persist_as_default: false,
+            trigger: crate::session::ModelSwitchTrigger::Picker,
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        },
+        &tx_b,
+    );
+    tokio::join!(a, b);
 
-        let outcomes = [
-            terminal_default_update(&mut rx_a),
-            terminal_default_update(&mut rx_b),
-        ];
-        assert!(
-            outcomes.iter().all(|outcome| matches!(
-                outcome,
-                crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested
-            )),
-            "a session-only switch may never report a default update; outcomes={outcomes:?}"
-        );
-        assert_eq!(
-            crate::config::providers::ConfigDoc::load(&root.join(".cockpit/config.json"))
-                .unwrap()
-                .providers()
-                .active_model,
-            None,
-            "no plain-Enter switch may establish a default"
-        );
-    });
+    let outcomes = [
+        terminal_default_update(&mut rx_a),
+        terminal_default_update(&mut rx_b),
+    ];
+    assert!(
+        outcomes.iter().all(|outcome| matches!(
+            outcome,
+            crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested
+        )),
+        "a session-only switch may never report a default update; outcomes={outcomes:?}"
+    );
+    assert_eq!(
+        crate::config::providers::ConfigDoc::load(&root.join(".cockpit/config.json"))
+            .unwrap()
+            .providers()
+            .active_model,
+        None,
+        "no plain-Enter switch may establish a default"
+    );
 }
 
 /// **Rejected behavior.** Plain Enter must not touch the default at all. The
@@ -1257,49 +1278,47 @@ fn concurrent_plain_enter_switches_write_no_default_at_all() {
 /// Formerly `concurrent_explicit_replace_always_wins_over_stale_initializer`:
 /// the "initializer" is now an ordinary session-only switch, so the explicit
 /// replacement is the *only* writer.
-#[test]
-fn a_concurrent_plain_enter_cannot_disturb_an_explicit_replace() {
-    crate::test_env::run_async_with_large_stack(|| async {
-        let (mut explicit_driver, mut session_only_driver, shared, _session_only_tmp) =
-            model_switch_drivers_with_shared_disk_config_without_default();
-        let (explicit_tx, _explicit_rx) = mpsc::channel::<TurnEvent>(64);
-        let (session_only_tx, _session_only_rx) = mpsc::channel::<TurnEvent>(64);
-        let root = shared.path();
+#[tokio::test]
+async fn a_concurrent_plain_enter_cannot_disturb_an_explicit_replace() {
+    let (mut explicit_driver, mut session_only_driver, shared, _session_only_tmp) =
+        model_switch_drivers_with_shared_disk_config_without_default();
+    let (explicit_tx, _explicit_rx) = mpsc::channel::<TurnEvent>(64);
+    let (session_only_tx, _session_only_rx) = mpsc::channel::<TurnEvent>(64);
+    let root = shared.path();
 
-        let explicit = run_control_with_trusted_project_config(
-            &mut explicit_driver,
-            root,
-            DriverControl::SetActiveModel {
-                selection_id: uuid::Uuid::new_v4(),
-                provider: "provider-a".into(),
-                model: "model-a".into(),
-                persist_as_default: true,
-                trigger: crate::session::ModelSwitchTrigger::Picker,
-                reasoning_effort: None,
-                thinking_mode: None,
-                prompt_cache_retention: None,
-            },
-            &explicit_tx,
-        );
-        let session_only = run_control_with_trusted_project_config(
-            &mut session_only_driver,
-            root,
-            DriverControl::SetActiveModel {
-                selection_id: uuid::Uuid::new_v4(),
-                provider: "provider-b".into(),
-                model: "model-b".into(),
-                persist_as_default: false,
-                trigger: crate::session::ModelSwitchTrigger::Picker,
-                reasoning_effort: None,
-                thinking_mode: None,
-                prompt_cache_retention: None,
-            },
-            &session_only_tx,
-        );
-        tokio::join!(explicit, session_only);
+    let explicit = run_control_with_trusted_project_config(
+        &mut explicit_driver,
+        root,
+        DriverControl::SetActiveModel {
+            selection_id: uuid::Uuid::new_v4(),
+            provider: "provider-a".into(),
+            model: "model-a".into(),
+            persist_as_default: true,
+            trigger: crate::session::ModelSwitchTrigger::Picker,
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        },
+        &explicit_tx,
+    );
+    let session_only = run_control_with_trusted_project_config(
+        &mut session_only_driver,
+        root,
+        DriverControl::SetActiveModel {
+            selection_id: uuid::Uuid::new_v4(),
+            provider: "provider-b".into(),
+            model: "model-b".into(),
+            persist_as_default: false,
+            trigger: crate::session::ModelSwitchTrigger::Picker,
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        },
+        &session_only_tx,
+    );
+    tokio::join!(explicit, session_only);
 
-        assert_disk_config_active_model(root, "provider-a", "model-a");
-    });
+    assert_disk_config_active_model(root, "provider-a", "model-a");
 }
 
 #[tokio::test]
@@ -1430,6 +1449,7 @@ async fn held_config_lock_times_out_before_terminal_claim_without_late_mutation(
     }
 
     drop(held);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(
         driver.session.active_provider().as_deref(),
         Some("provider-a")
@@ -1484,21 +1504,21 @@ async fn live_model_switch_from_subagent_frame_converges_session_and_parked_root
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
     push_test_child(&mut driver, Vec::new());
 
-    run_control_with_driver_trust(
-        &mut driver,
-        DriverControl::SetActiveModel {
-            selection_id: uuid::Uuid::nil(),
-            provider: "provider-b".into(),
-            model: "model-b".into(),
-            persist_as_default: true,
-            trigger: crate::session::ModelSwitchTrigger::Daemon,
-            reasoning_effort: None,
-            thinking_mode: None,
-            prompt_cache_retention: None,
-        },
-        &tx,
-    )
-    .await;
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                persist_as_default: true,
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            &tx,
+        )
+        .await;
 
     assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-b");
     assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-b");
@@ -1527,21 +1547,21 @@ async fn live_model_switch_persists_requested_reasoning_options() {
         set_reasoning_effort_capability(cfg, "provider-b", "model-b");
     });
 
-    run_control_with_driver_trust(
-        &mut driver,
-        DriverControl::SetActiveModel {
-            selection_id: uuid::Uuid::nil(),
-            provider: "provider-b".into(),
-            model: "model-b".into(),
-            persist_as_default: true,
-            trigger: crate::session::ModelSwitchTrigger::Daemon,
-            reasoning_effort: Some("xhigh".into()),
-            thinking_mode: Some(crate::config::providers::ThinkingMode::High),
-            prompt_cache_retention: None,
-        },
-        &tx,
-    )
-    .await;
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                persist_as_default: true,
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: Some("xhigh".into()),
+                thinking_mode: Some(crate::config::providers::ThinkingMode::High),
+                prompt_cache_retention: None,
+            },
+            &tx,
+        )
+        .await;
     let persisted = driver
         .session
         .active_model_ref()
@@ -1565,9 +1585,10 @@ async fn live_model_switch_persists_requested_reasoning_options() {
         "the committed default selection is applied to the live inference frame"
     );
 
-    let cfg = crate::config::providers::ConfigDoc::load(&driver.cwd.join(".cockpit/config.json"))
-        .unwrap()
-        .providers();
+    let (cfg, _, _) = driver
+        .test_providers_override
+        .as_ref()
+        .expect("model switch harness installs provider override");
     let active = cfg.active_model.as_ref().expect("active model written");
     assert_eq!(active.provider, "provider-b");
     assert_eq!(active.model, "model-b");
@@ -1603,21 +1624,21 @@ async fn live_model_switch_keeps_endpoint_specific_reasoning_recovery_params() {
         set_responses_reasoning_effort_capability(cfg, "provider-b", "model-b");
     });
 
-    run_control_with_driver_trust(
-        &mut driver,
-        DriverControl::SetActiveModel {
-            selection_id: uuid::Uuid::nil(),
-            provider: "provider-b".into(),
-            model: "model-b".into(),
-            persist_as_default: true,
-            trigger: crate::session::ModelSwitchTrigger::Daemon,
-            reasoning_effort: Some("ultra".into()),
-            thinking_mode: None,
-            prompt_cache_retention: None,
-        },
-        &tx,
-    )
-    .await;
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                persist_as_default: true,
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: Some("ultra".into()),
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            &tx,
+        )
+        .await;
 
     let params = &driver.stack[0].agent.params;
     assert_eq!(
@@ -1957,7 +1978,7 @@ async fn live_model_switch_same_model_emits_state_without_rebuild() {
     let (mut driver, _tmp) = model_switch_driver();
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
     let before = Arc::as_ptr(&driver.stack[0].agent);
-    edit_model_switch_config(&mut driver, |cfg| {
+    if let Some((cfg, _, _)) = driver.test_providers_override.as_mut() {
         cfg.active_model = Some(crate::config::providers::ActiveModelRef {
             provider: "provider-b".into(),
             model: "model-b".into(),
@@ -1965,23 +1986,23 @@ async fn live_model_switch_same_model_emits_state_without_rebuild() {
             thinking_mode: None,
             prompt_cache_retention: None,
         });
-    });
+    }
 
-    run_control_with_driver_trust(
-        &mut driver,
-        DriverControl::SetActiveModel {
-            selection_id: uuid::Uuid::nil(),
-            provider: "provider-a".into(),
-            model: "model-a".into(),
-            persist_as_default: true,
-            trigger: crate::session::ModelSwitchTrigger::Daemon,
-            reasoning_effort: None,
-            thinking_mode: None,
-            prompt_cache_retention: None,
-        },
-        &tx,
-    )
-    .await;
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
+                provider: "provider-a".into(),
+                model: "model-a".into(),
+                persist_as_default: true,
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            &tx,
+        )
+        .await;
 
     // Same Arc — the agent was not rebuilt.
     assert_eq!(
@@ -2038,21 +2059,21 @@ async fn live_model_switch_same_model_is_noop() {
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
     let before = Arc::as_ptr(&driver.stack[0].agent);
 
-    run_control_with_driver_trust(
-        &mut driver,
-        DriverControl::SetActiveModel {
-            selection_id: uuid::Uuid::nil(),
-            provider: "provider-a".into(),
-            model: "model-a".into(),
-            persist_as_default: true,
-            trigger: crate::session::ModelSwitchTrigger::Daemon,
-            reasoning_effort: None,
-            thinking_mode: None,
-            prompt_cache_retention: None,
-        },
-        &tx,
-    )
-    .await;
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
+                provider: "provider-a".into(),
+                model: "model-a".into(),
+                persist_as_default: true,
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            &tx,
+        )
+        .await;
 
     assert_eq!(Arc::as_ptr(&driver.stack[0].agent), before);
     assert_one_model_switch_event(&driver, "noop", false).await;
@@ -2065,21 +2086,21 @@ async fn live_model_switch_emits_active_model_state_event() {
     let (mut driver, _tmp) = model_switch_driver();
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
 
-    run_control_with_driver_trust(
-        &mut driver,
-        DriverControl::SetActiveModel {
-            selection_id: uuid::Uuid::nil(),
-            provider: "provider-b".into(),
-            model: "model-b".into(),
-            persist_as_default: true,
-            trigger: crate::session::ModelSwitchTrigger::Daemon,
-            reasoning_effort: None,
-            thinking_mode: None,
-            prompt_cache_retention: None,
-        },
-        &tx,
-    )
-    .await;
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                persist_as_default: true,
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            &tx,
+        )
+        .await;
 
     let event = drain_until_active_model_state(&mut rx);
     match event {
@@ -2138,9 +2159,10 @@ async fn live_model_switch_audit_record_failure_does_not_roll_back() {
 }
 
 fn assert_config_active_model(driver: &Driver, provider: &str, model: &str) {
-    let cfg = crate::config::providers::ConfigDoc::load(&driver.cwd.join(".cockpit/config.json"))
-        .unwrap()
-        .providers();
+    let (cfg, _, _) = driver
+        .test_providers_override
+        .as_ref()
+        .expect("model switch harness installs provider override");
     let active = cfg.active_model.as_ref().expect("active model written");
     assert_eq!(active.provider, provider);
     assert_eq!(active.model, model);
@@ -2243,6 +2265,7 @@ fn terminal_default_update(
 fn model_switch_driver_with_disk_config() -> (Driver, tempfile::TempDir) {
     let (mut driver, tmp) = model_switch_driver();
     write_two_model_config(tmp.path(), "provider-a", "model-a");
+    driver.test_providers_override = None;
     let policy = crate::config::trust::WorkspaceTrustPolicy {
         root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
         mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
@@ -2264,10 +2287,12 @@ fn model_switch_drivers_with_shared_disk_config_without_default()
         r#"{"active_model":null}"#,
     )
     .unwrap();
+    driver_a.test_providers_override = None;
     driver_a.refresh_config_from_disk_for_tests();
 
     let (mut driver_b, driver_b_tmp) = model_switch_driver();
     driver_b.cwd = shared.path().to_path_buf();
+    driver_b.test_providers_override = None;
     driver_b.refresh_config_from_disk_for_tests();
     (driver_a, driver_b, shared, driver_b_tmp)
 }
@@ -2287,16 +2312,7 @@ async fn run_control_with_trusted_project_config(
         .await;
 }
 
-async fn run_control_with_driver_trust(
-    driver: &mut Driver,
-    control: DriverControl,
-    tx: &mpsc::Sender<TurnEvent>,
-) {
-    let project_root = driver.cwd.clone();
-    run_control_with_trusted_project_config(driver, &project_root, control, tx).await;
-}
-
-pub(super) fn write_two_model_config(root: &std::path::Path, provider: &str, model: &str) {
+fn write_two_model_config(root: &std::path::Path, provider: &str, model: &str) {
     let cockpit = root.join(".cockpit");
     std::fs::create_dir_all(&cockpit).unwrap();
     let config_path = cockpit.join("config.json");
@@ -2577,10 +2593,11 @@ async fn active_frame_tool_surface_refresh_survives_model_build_failure() {
         let custom = "model-failure-helper";
         write_custom_agent(tmp.path(), custom);
         admit_authored_child_to_test_grants(&mut driver, &format!("authored/{custom}"));
-        install_test_provider_config(
-            &mut driver,
+        driver.test_providers_override = Some((
             crate::config::providers::ProvidersConfig::default(),
-        );
+            "provider-a".into(),
+            "model-a".into(),
+        ));
 
         driver.refresh_active_frame_for_turn(&tx).await;
 
@@ -2657,13 +2674,16 @@ async fn live_model_refresh_repostures_prompt_before_tool_surface_rebuild_failur
     use crate::config::providers::ModelTrust;
 
     let (mut driver, _tmp) = model_switch_driver();
-    let mut providers = driver.config.providers();
+    let (mut providers, provider, model) = driver
+        .test_providers_override
+        .clone()
+        .expect("model switch harness installs provider override");
     providers
         .providers
         .get_mut("provider-a")
         .expect("provider A exists")
         .trust = Some(ModelTrust::Trusted);
-    install_test_provider_config(&mut driver, providers.clone());
+    driver.test_providers_override = Some((providers.clone(), provider, model));
 
     let trusted_model = Arc::new(
         crate::engine::model::Model::for_provider(
@@ -2726,10 +2746,11 @@ async fn active_frame_refresh_notices_dedupe_independently() {
         let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
         push_named_test_child(&mut driver, "builder");
         write_malformed_agent_override(tmp.path(), "builder");
-        install_test_provider_config(
-            &mut driver,
+        driver.test_providers_override = Some((
             crate::config::providers::ProvidersConfig::default(),
-        );
+            "provider-a".into(),
+            "model-a".into(),
+        ));
 
         driver.refresh_active_frame_for_turn(&tx).await;
         let notices = drain_notices(&mut rx);
@@ -2743,7 +2764,11 @@ async fn active_frame_refresh_notices_dedupe_independently() {
         );
 
         remove_agent_override(tmp.path(), "builder");
-        install_test_provider_config(&mut driver, two_model_providers_config());
+        driver.test_providers_override = Some((
+            two_model_providers_config(),
+            "provider-a".into(),
+            "model-a".into(),
+        ));
         driver.refresh_active_frame_for_turn(&tx).await;
         assert!(
             drain_notices(&mut rx).is_empty(),
@@ -2799,10 +2824,11 @@ async fn active_frame_refresh_updates_schedule_when_model_refresh_fails() {
         let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
         push_named_test_child(&mut driver, "builder");
         write_malformed_agent_override(tmp.path(), "builder");
-        install_test_provider_config(
-            &mut driver,
+        driver.test_providers_override = Some((
             crate::config::providers::ProvidersConfig::default(),
-        );
+            "provider-a".into(),
+            "model-a".into(),
+        ));
 
         driver.refresh_active_frame_for_turn(&tx).await;
 
@@ -2825,21 +2851,21 @@ async fn model_switch_inside_subagent_frame_rebuilds_session_root_only() {
     let root_before = Arc::as_ptr(&driver.stack[0].agent);
     let child_before = Arc::as_ptr(&driver.stack.last().unwrap().agent);
 
-    run_control_with_driver_trust(
-        &mut driver,
-        DriverControl::SetActiveModel {
-            selection_id: uuid::Uuid::nil(),
-            provider: "provider-b".into(),
-            model: "model-b".into(),
-            persist_as_default: true,
-            trigger: crate::session::ModelSwitchTrigger::Daemon,
-            reasoning_effort: None,
-            thinking_mode: None,
-            prompt_cache_retention: None,
-        },
-        &tx,
-    )
-    .await;
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                persist_as_default: true,
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            &tx,
+        )
+        .await;
 
     assert_ne!(
         Arc::as_ptr(&driver.stack[0].agent),
@@ -3037,16 +3063,18 @@ async fn turn_refresh_rebuilds_when_wire_api_changes_model_variant() {
         .agent
         .model
         .confirm_wire_api_for_base_url("http://localhost:1/v1", WireApi::Responses);
-    edit_model_switch_config(&mut driver, |cfg| {
-        let entry = cfg
-            .providers
-            .get_mut("provider-a")
-            .expect("provider-a exists");
-        entry.wire_api = WireApi::Responses;
-        entry.headers.push(HeaderSpec {
-            name: "Authorization".into(),
-            value: "Bearer test-token".into(),
-        });
+    let (cfg, _, _) = driver
+        .test_providers_override
+        .as_mut()
+        .expect("model switch harness installs provider override");
+    let entry = cfg
+        .providers
+        .get_mut("provider-a")
+        .expect("provider-a exists");
+    entry.wire_api = WireApi::Responses;
+    entry.headers.push(HeaderSpec {
+        name: "Authorization".into(),
+        value: "Bearer test-token".into(),
     });
 
     driver.refresh_active_frame_for_turn(&tx).await;
@@ -3075,10 +3103,11 @@ async fn refresh_failure_is_loud_and_deduped() {
         .agent
         .model
         .confirm_wire_api_for_base_url("http://localhost:1/v1", WireApi::Responses);
-    install_test_provider_config(
-        &mut driver,
+    driver.test_providers_override = Some((
         crate::config::providers::ProvidersConfig::default(),
-    );
+        "provider-a".into(),
+        "model-a".into(),
+    ));
 
     driver.refresh_active_frame_for_turn(&tx).await;
     assert_eq!(
@@ -3109,17 +3138,22 @@ async fn refresh_failure_is_loud_and_deduped() {
         "identical consecutive refresh failures should dedupe notices"
     );
 
-    install_test_provider_config(&mut driver, two_model_providers_config());
+    driver.test_providers_override = Some((
+        two_model_providers_config(),
+        "provider-a".into(),
+        "model-a".into(),
+    ));
     driver.refresh_active_frame_for_turn(&tx).await;
     assert!(
         rx.try_recv().is_err(),
         "successful refresh should not emit a notice"
     );
 
-    install_test_provider_config(
-        &mut driver,
+    driver.test_providers_override = Some((
         crate::config::providers::ProvidersConfig::default(),
-    );
+        "provider-a".into(),
+        "model-a".into(),
+    ));
     driver.refresh_active_frame_for_turn(&tx).await;
     rx.try_recv()
         .expect("success clears the dedupe key so the next failure re-notifies");

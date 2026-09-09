@@ -406,17 +406,6 @@ pub enum DriverControl {
     },
 }
 
-/// Observation of the readiness guards owned by one driver-loop boundary.
-///
-/// This is deliberately an observation-only surface: publishing is
-/// best-effort and a missing or dropped observer cannot influence scheduling.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DriverLoopBoundaryObservation {
-    sequence: u64,
-    human_input_already_ready: bool,
-    assistant_inbox_idle_poll_enabled: bool,
-}
-
 #[derive(Debug, Clone)]
 pub struct RecoveredInteractiveTaskChild {
     pub agent_instance_id: uuid::Uuid,
@@ -1562,11 +1551,12 @@ pub struct Driver {
     /// substantive turn also shadows its assembled request to each tandem
     /// model via the single job authority ([`Self::run_user_input`]).
     tandem_set: crate::engine::schedule::TandemSet,
-    /// Optional single-owner observer for driver-loop boundary readiness.
-    /// The unbounded send is non-blocking and failures are intentionally
-    /// ignored, keeping this surface observational in every build.
-    loop_boundary_observer: Option<mpsc::UnboundedSender<DriverLoopBoundaryObservation>>,
-    loop_boundary_sequence: u64,
+    /// Test-only injected (providers config, provider, model). Lets the
+    /// auto-prune/auto-compact trigger tests exercise the real
+    /// resolution + trigger paths deterministically without depending on the
+    /// test machine's on-disk config layers. Never set in production.
+    #[cfg(test)]
+    test_providers_override: Option<(crate::config::providers::ProvidersConfig, String, String)>,
     #[cfg(test)]
     test_fail_next_active_model_session_persist: bool,
     #[cfg(test)]
@@ -1701,6 +1691,8 @@ pub(in crate::engine::driver) enum CompactForceFailure {
 pub(in crate::engine::driver) struct NestedLaneTestHooks {
     pub test_compact_brief_script:
         Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<TestCompactSample>>>>,
+    pub test_providers_override:
+        Option<(crate::config::providers::ProvidersConfig, String, String)>,
     /// No-progress compaction charges applied to the lane budget after allot.
     pub lane_compact_guard_precharge: u32,
     /// When true, subagent compaction apply ignores lane forward progress.
@@ -2498,8 +2490,8 @@ impl Driver {
             pending_swap_marker_from: None,
             tool_call_owner: self.tool_call_owner.clone(),
             tandem_set: self.tandem_set.clone(),
-            loop_boundary_observer: None,
-            loop_boundary_sequence: 0,
+            #[cfg(test)]
+            test_providers_override: self.test_providers_override.clone(),
             #[cfg(test)]
             test_fail_next_active_model_session_persist: self
                 .test_fail_next_active_model_session_persist,
@@ -2893,8 +2885,8 @@ impl Driver {
             pending_swap_marker_from: None,
             tool_call_owner: std::collections::HashMap::new(),
             tandem_set: crate::engine::schedule::TandemSet::default(),
-            loop_boundary_observer: None,
-            loop_boundary_sequence: 0,
+            #[cfg(test)]
+            test_providers_override: None,
             #[cfg(test)]
             test_fail_next_active_model_session_persist: false,
             #[cfg(test)]
@@ -3558,14 +3550,6 @@ impl Driver {
         self.assistant_identity_prefix = prefix;
     }
 
-    fn set_loop_boundary_observer(
-        &mut self,
-        observer: Option<mpsc::UnboundedSender<DriverLoopBoundaryObservation>>,
-    ) {
-        self.loop_boundary_observer = observer;
-        self.loop_boundary_sequence = 0;
-    }
-
     /// Install the daemon-owned local installation mapping captured at root
     /// construction.  It is intentionally an explicit input rather than a
     /// lookup by display name, and every delegated spawn reuses this snapshot.
@@ -3631,16 +3615,6 @@ impl Driver {
         self.set_config_handle(
             crate::daemon::session_worker::SessionConfigHandle::detached(snapshot),
         );
-        if let Some(active) = self.config.providers().active_model.clone()
-            && let Ok(refreshed) = self.build_live_model_for_running(
-                &self.stack[0].agent.model,
-                &active.provider,
-                &active.model,
-            )
-        {
-            Arc::make_mut(&mut self.stack[0].agent).model = Arc::new(refreshed);
-            self.schedule.set_agent(self.stack[0].agent.clone());
-        }
     }
 
     /// The session config reader, re-pinned to the current generation for a
@@ -3649,17 +3623,6 @@ impl Driver {
     fn repin_config_for_turn(&mut self) {
         self.config = self.config.repin();
         self.schedule.set_config_handle(self.config.clone());
-    }
-
-    /// Hand the exact generation-pinned worker snapshot to a nested lane.
-    fn config_for_noninteractive_child(
-        &self,
-    ) -> crate::daemon::session_worker::SessionConfigHandle {
-        let snapshot = (*self.config.snapshot()).clone();
-        // A child attempt owns the exact parent snapshot selected at admission.
-        // Never forward a live handle whose shared cell can advance before the
-        // child constructs its model or nested scheduler driver.
-        crate::daemon::session_worker::SessionConfigHandle::detached(snapshot)
     }
 
     pub fn set_resource_scheduler(
@@ -5301,13 +5264,9 @@ impl Driver {
             hooks: snapshot.hooks(),
         };
         let frame = self.stack.last_mut().context("driver stack is empty")?;
+        frame.history.push(brief);
         crate::engine::seed_reads::execute_declared_seed_calls(&env, &mut frame.history, pending)
             .await?;
-        // Keep every declared assistant tool call adjacent to its paired
-        // result. Appending the handoff brief first makes request rehydration
-        // treat the call as dangling and synthesize an interrupted result,
-        // hiding the freshly executed seed from the child.
-        frame.history.push(brief);
         Ok(crate::engine::seed_reads::completion_prompt())
     }
 
@@ -6012,15 +5971,13 @@ impl Driver {
             // settling the in-memory plan.
             let waiting_for_keep_parked_siblings =
                 self.persist_on_reentry_owns_started_unsettled_siblings();
-            // Ready human input takes priority over a previously completed
-            // noninteractive result before the boundary select runs. Deferred
-            // input remains owned by the queue but must not suppress idle work
-            // until its dequeue deadline.
-            let human_input_already_ready =
-                input_queue.has_ready_for(Some(&active_target_id)).await;
+            // Pending human input takes priority over a previously completed
+            // noninteractive result before the boundary select runs.
+            let human_input_already_pending =
+                input_queue.has_pending_for(Some(&active_target_id)).await;
             if !waiting_for_keep_parked_siblings
                 && !self.pending_noninteractive_completions.is_empty()
-                && !human_input_already_ready
+                && !human_input_already_pending
                 && self
                     .run_next_pending_noninteractive_completion(&input_queue, tx)
                     .await?
@@ -6029,6 +5986,14 @@ impl Driver {
                 self.clear_goal_idle_intervention();
                 self.maybe_continue_active_goal(&input_queue, tx).await?;
                 self.refresh_goal_watchdog(&mut goal_watchdog).await;
+                continue;
+            }
+            if !waiting_for_keep_parked_siblings
+                && !human_input_already_pending
+                && self
+                    .try_deliver_immediate_assistant_inbox(&input_queue, tx, &mut goal_watchdog)
+                    .await?
+            {
                 continue;
             }
             // Wait for the next thing to do: a user message, a control
@@ -6048,29 +6013,6 @@ impl Driver {
             // history or run a turn). Compact/Prune controls already defer
             // on the same predicate; auto-compact and prune-after-switch
             // must not bypass it.
-            let clear_boundary_observer = if let Some(observer) = &self.loop_boundary_observer {
-                let observation = DriverLoopBoundaryObservation {
-                    sequence: self.loop_boundary_sequence,
-                    human_input_already_ready,
-                    assistant_inbox_idle_poll_enabled: !waiting_for_keep_parked_siblings
-                        && !human_input_already_ready,
-                };
-                if observer.send(observation).is_ok() {
-                    if let Some(next) = self.loop_boundary_sequence.checked_add(1) {
-                        self.loop_boundary_sequence = next;
-                        false
-                    } else {
-                        true
-                    }
-                } else {
-                    true
-                }
-            } else {
-                false
-            };
-            if clear_boundary_observer {
-                self.set_loop_boundary_observer(None);
-            }
             tokio::select! {
                 biased;
                 msg = input_queue.recv_group_order_for(Some(&active_target_id)),
@@ -6187,7 +6129,7 @@ impl Driver {
                     }
                 }
                 _ = assistant_inbox_idle_poll.tick(),
-                    if !waiting_for_keep_parked_siblings && !human_input_already_ready => {
+                    if !waiting_for_keep_parked_siblings => {
                     if self
                         .try_deliver_immediate_assistant_inbox(
                             &input_queue,
@@ -10031,10 +9973,15 @@ impl Driver {
         }
     }
 
-    /// Load the layered providers config for the live model switch from the
-    /// worker's generation-aware config snapshot.
+    /// Load the layered providers config for the live model switch, honoring a
+    /// test-injected config when present (mirrors [`Self::active_providers_config`])
+    /// and otherwise reading the worker's generation-aware config snapshot.
     /// Disk writes become visible here when the config watcher refreshes it.
     fn live_providers_config(&self) -> Result<crate::config::providers::ProvidersConfig> {
+        #[cfg(test)]
+        if let Some((providers, _, _)) = &self.test_providers_override {
+            return Ok(providers.clone());
+        }
         Ok(self.config.providers())
     }
 
@@ -10639,6 +10586,10 @@ impl Driver {
     fn frame_providers_config(
         &self,
     ) -> Option<(crate::config::providers::ProvidersConfig, String, String)> {
+        #[cfg(test)]
+        if let Some(o) = &self.test_providers_override {
+            return Some(o.clone());
+        }
         let frame = self.stack.last()?;
         let providers = self.config.providers();
         Some((
@@ -11110,6 +11061,15 @@ impl Driver {
         &self,
         model: &crate::engine::model::Model,
     ) -> Option<Arc<crate::engine::model::Model>> {
+        // Honor the test-injected providers config when present (mirrors
+        // `active_providers_config`), else load from the cwd config chain. Either
+        // way the store is OWNER-SCOPED to the exact providers config so a backup
+        // model can never resolve a foreign workspace's `$secret:`.
+        #[cfg(test)]
+        if let Some((providers, _, _)) = &self.test_providers_override {
+            let store = self.session.provider_credential_store(providers).ok();
+            return build_backup_model_with_store(providers, model, store);
+        }
         resolve_backup_model_for_session(&self.config, model, &self.session)
     }
 
@@ -11117,6 +11077,11 @@ impl Driver {
         &self,
         model: &crate::engine::model::Model,
     ) -> Vec<Arc<crate::engine::model::Model>> {
+        #[cfg(test)]
+        if let Some((providers, _, _)) = &self.test_providers_override {
+            let store = self.session.provider_credential_store(providers).ok();
+            return build_failover_models_with_store(providers, model, store);
+        }
         resolve_failover_models_for_session(&self.config, model, &self.session)
     }
 
@@ -11128,6 +11093,10 @@ impl Driver {
     fn active_providers_config(
         &self,
     ) -> Option<(crate::config::providers::ProvidersConfig, String, String)> {
+        #[cfg(test)]
+        if let Some(o) = &self.test_providers_override {
+            return Some(o.clone());
+        }
         let provider = self.session.active_provider()?;
         let model = self.session.active_model()?;
         let providers = self.config.providers();
@@ -14173,64 +14142,52 @@ impl Driver {
                             .user_cancel_requested
                             .load(std::sync::atomic::Ordering::Acquire)
                         && !response_window_closed.load(std::sync::atomic::Ordering::SeqCst);
-                    if retractable_direct_turn && let Some(seq) = recorded_user_seq {
-                        let generated_title =
-                            if let Some((title_state, task)) = auto_title_task.take() {
-                                // The state handoff and the durable title write share
-                                // one mutex. Freeze it before the combined DB
-                                // transition so the title predicate cannot race a
-                                // detached write between snapshot and commit.
-                                {
-                                    let mut state = title_state.lock().unwrap();
-                                    state.retracted = true;
-                                }
-                                task.abort();
-                                let _ = task.await;
-                                title_state.lock().unwrap().persisted_title.clone()
-                            } else {
-                                None
-                            };
-                        match self
+                    if retractable_direct_turn
+                        && let Some(seq) = recorded_user_seq
+                        && self
                             .session
-                            .retract_latest_user_message(
-                                seq,
-                                title_progress_before_turn,
-                                generated_title.as_deref(),
-                            )
+                            .db
+                            .remove_latest_user_message(self.session.live_id(), seq)
                             .await
-                        {
-                            Ok(true) => {
-                                if let Err(error) =
-                                    crate::text_artifact_blob::reconcile_cleanup_intents(
-                                        &self.session.db,
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(%error, seq, "retracted user-message blob cleanup remains pending");
-                                }
-                                let _ = tx
-                                    .send(TurnEvent::UserMessageRemoved {
-                                        seq,
-                                        client_submission_ids: client_submissions
-                                            .iter()
-                                            .map(|receipt| receipt.id)
-                                            .collect(),
-                                    })
-                                    .await;
-                            }
-                            Ok(false) => {
-                                // A newer durable row won, so this turn was not
-                                // retracted. Keep its already-committed title and
-                                // accounting: both are valid state derived from a
-                                // user row that remains in the ledger. The aborted
-                                // task only fences a later title write; a completed
-                                // `set_auto_title` is atomic and is intentionally
-                                // not rolled back without removing its source row.
-                            }
-                            Err(error) => {
+                            .unwrap_or_else(|error| {
                                 tracing::warn!(%error, seq, "initial-thinking user-message retract failed");
-                            }
+                                false
+                            })
+                    {
+                        let generated_title = if let Some((title_state, task)) = auto_title_task.take() {
+                            // The state handoff and the durable title write share
+                            // one mutex. Marking retracted before aborting either
+                            // prevents a later write or captures the exact title
+                            // already written for the rollback predicate.
+                            let generated_title = {
+                                let mut state = title_state.lock().unwrap();
+                                state.retracted = true;
+                                state.persisted_title.clone()
+                            };
+                            task.abort();
+                            let _ = task.await;
+                            generated_title
+                        } else {
+                            None
+                        };
+                        if let Err(error) = self.session.restore_title_progress_after_retract(
+                            title_progress_before_turn,
+                            generated_title.as_deref(),
+                        ).await {
+                            tracing::warn!(%error, "auto_title: retract rollback lost");
                         }
+                        if let Err(error) = crate::text_artifact_blob::reconcile_cleanup_intents(&self.session.db).await {
+                            tracing::warn!(%error, seq, "retracted user-message blob cleanup remains pending");
+                        }
+                        let _ = tx
+                            .send(TurnEvent::UserMessageRemoved {
+                                seq,
+                                client_submission_ids: client_submissions
+                                    .iter()
+                                    .map(|receipt| receipt.id)
+                                    .collect(),
+                            })
+                            .await;
                     }
                     if let Some((goal_id, generation, turn_id)) = self.goal_root_turn.take() {
                         let _ = self
@@ -14845,7 +14802,7 @@ impl Driver {
                     let task_args_json = serde_json::to_string(&serde_json::json!({
                         "child_agent": &child_agent,
                         "model": model_selector_json(&model),
-                        "remaining_depth": child_recursion.remaining_depth,
+                        "remaining_depth": remaining_depth,
                         "granted_tools": &granted_tools,
                         "seed_reads": &seed_reads,
                         "todo_ids": &todo_ids,
@@ -16221,7 +16178,6 @@ impl Driver {
             params,
             env_overlay: self.stack[0].agent.env_overlay.clone(),
             cwd: self.cwd.clone(),
-            delegated_definition_root: None,
             config: self.config.clone(),
             session_short_id: self.session.short_id(),
             workspace_scratch_dir: self.session.workspace_scratch_dir(),
@@ -16290,8 +16246,6 @@ impl Driver {
         model: Option<crate::engine::model_roles::DelegationModelSelector>,
         recursion: crate::engine::builtin::DelegationRecursionContext,
     ) -> crate::engine::builtin::SpawnArgs {
-        let mut inherited = self.spawn_args(interactive);
-        inherited.config = self.config_for_noninteractive_child();
         let parent = self.stack.last().expect("stack never empty");
         let inherited_vnext_root_pin = parent.agent.vnext_grant.is_some()
             && self.model_override.as_ref().is_some_and(|override_model| {
@@ -16336,7 +16290,7 @@ impl Driver {
                 .stack
                 .last()
                 .map(|frame| frame.agent.mcp_resolver.catalog().admitted_entries()),
-            ..inherited
+            ..self.spawn_args(interactive)
         }
     }
 
@@ -16376,8 +16330,6 @@ impl Driver {
         recursion: crate::engine::builtin::DelegationRecursionContext,
         confinement: DelegationConfinement,
     ) -> crate::engine::builtin::SpawnArgs {
-        let mut inherited = self.spawn_args(interactive);
-        inherited.config = self.config_for_noninteractive_child();
         let parent = self.stack.last().expect("stack never empty");
         let inherited_vnext_root_pin = parent.agent.vnext_grant.is_some()
             && self.model_override.as_ref().is_some_and(|override_model| {
@@ -16414,7 +16366,6 @@ impl Driver {
             parent_posture: self.stack.last().map(|frame| frame.agent.posture.clone()),
             model_override,
             cwd: child_cwd.to_path_buf(),
-            delegated_definition_root: parent.agent.vnext_grant.is_some().then(|| self.cwd.clone()),
             lock_identity: confinement.lock_identity,
             write_scope: confinement.write_scope,
             dream_read_scope: confinement.dream_read_scope,
@@ -16423,7 +16374,7 @@ impl Driver {
                 .last()
                 .map(|frame| frame.agent.mcp_resolver.catalog().admitted_entries()),
             workspace_lease: confinement.workspace_lease,
-            ..inherited
+            ..self.spawn_args(interactive)
         }
     }
 

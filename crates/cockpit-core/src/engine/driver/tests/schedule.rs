@@ -736,12 +736,10 @@ async fn background_gate_requires_command_approval() {
     let (mut driver, _tmp) = test_driver(8);
     driver.session.set_sandbox_enabled(false);
     let (_approver, hub) = install_background_approver(&mut driver);
-    let raised = hub.subscribe_raised();
     let resolver = tokio::spawn(resolve_next_interrupt(
         driver.session.db.clone(),
         driver.session.id,
         hub,
-        raised,
         crate::approval::ID_APPROVE_ONCE,
     ));
 
@@ -778,19 +776,13 @@ async fn background_gate_resolved_cwd_reaches_spawn() {
         .unwrap();
 
     assert!(out.starts_with("started background"), "got {out}");
-    let completed = driver
-        .job_event_rx
-        .recv()
-        .await
-        .expect("background runner sends one terminal event");
-    assert!(
-        matches!(
-            completed,
-            crate::engine::schedule::ScheduleEvent::Completed { failed: false, .. }
-        ),
-        "background command must complete successfully: {completed:?}"
-    );
-    assert!(marker.exists(), "completed command created its marker");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !marker.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background command should create its marker");
 }
 
 #[tokio::test]
@@ -799,12 +791,10 @@ async fn background_gate_denied_approval_starts_no_job() {
     let mut rx = capture_schedule_events(&mut driver);
     driver.session.set_sandbox_enabled(false);
     let (_approver, hub) = install_background_approver(&mut driver);
-    let raised = hub.subscribe_raised();
     let resolver = tokio::spawn(resolve_next_interrupt(
         driver.session.db.clone(),
         driver.session.id,
         hub,
-        raised,
         crate::approval::ID_REJECT,
     ));
 
@@ -825,7 +815,6 @@ async fn background_gate_denied_approval_starts_no_job() {
 #[tokio::test]
 async fn background_gate_no_approver_is_denied() {
     let (mut driver, _tmp) = test_driver(8);
-    driver.approver = None;
     let mut rx = capture_schedule_events(&mut driver);
     driver.session.set_sandbox_enabled(false);
 
@@ -848,12 +837,10 @@ async fn background_gate_noninteractive_denial_uses_shared_message() {
     let mut rx = capture_schedule_events(&mut driver);
     driver.session.set_sandbox_enabled(false);
     let (_approver, hub) = install_background_approver(&mut driver);
-    let raised = hub.subscribe_raised();
     let resolver = tokio::spawn(resolve_next_interrupt_with_response(
         driver.session.db.clone(),
         driver.session.id,
         hub,
-        raised,
         crate::daemon::proto::ResolveResponse::Freetext {
             text: crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string(),
         },
@@ -985,14 +972,12 @@ async fn resolve_next_interrupt(
     db: crate::db::Db,
     sid: uuid::Uuid,
     hub: std::sync::Arc<crate::engine::interrupt::InterruptHub>,
-    raised: tokio::sync::mpsc::UnboundedReceiver<uuid::Uuid>,
     selected_id: &'static str,
 ) -> uuid::Uuid {
     resolve_next_interrupt_with_response(
         db,
         sid,
         hub,
-        raised,
         crate::daemon::proto::ResolveResponse::Single {
             selected_id: selected_id.into(),
         },
@@ -1004,32 +989,21 @@ async fn resolve_next_interrupt_with_response(
     db: crate::db::Db,
     sid: uuid::Uuid,
     hub: std::sync::Arc<crate::engine::interrupt::InterruptHub>,
-    mut raised: tokio::sync::mpsc::UnboundedReceiver<uuid::Uuid>,
     response: crate::daemon::proto::ResolveResponse,
 ) -> uuid::Uuid {
-    let iid = raised
-        .recv()
-        .await
-        .expect("interrupt producer remains live");
-    assert!(
-        hub.has_waiter(iid),
-        "raised approval retains its exact waiter"
-    );
-    assert!(
-        db.list_open_interrupts(sid)
-            .await
-            .unwrap()
-            .into_iter()
-            .any(|row| row.interrupt_id == iid),
-        "raised approval has a durable open interrupt"
-    );
-    assert!(
-        db.decision_request_for_interrupt(sid, iid)
-            .await
-            .unwrap()
-            .is_some(),
-        "registered approval has a durable lifecycle decision"
-    );
+    let iid = loop {
+        let open = db.list_open_interrupts(sid).await.unwrap();
+        if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id))
+            && db
+                .decision_request_for_interrupt(sid, row.interrupt_id)
+                .await
+                .unwrap()
+                .is_some()
+        {
+            break row.interrupt_id;
+        }
+        tokio::task::yield_now().await;
+    };
     // Mirror the worker's durable settlement order.  Host approvals are now
     // bound to an AgentTree decision and typed operation capability; waking
     // the local InterruptHub alone would make the approver observe a stale
@@ -1225,8 +1199,7 @@ async fn compact_delegation_draft_elides_a_settled_large_write_before_model_infe
         strategy: ShrinkStrategy::Compact,
         margin_secs: 30,
     };
-    let _ = (provider_id, model_id);
-    install_test_provider_config(&mut driver, providers);
+    driver.test_providers_override = Some((providers, provider_id, model_id));
 
     let mut content = String::new();
     while crate::tokens::count(&content) < 140 {

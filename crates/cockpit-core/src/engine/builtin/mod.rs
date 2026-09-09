@@ -117,11 +117,6 @@ pub struct SpawnArgs {
     /// so user-defined custom-bash tools (`webfetch`, `websearch`, …)
     /// land on the toolbox for agents that should see them.
     pub cwd: std::path::PathBuf,
-    /// Definition-discovery root inherited from the delegating parent. A
-    /// delegated vNext child may execute in a different cwd, but that cwd must
-    /// not replace the already-admitted namespace used to resolve its agent
-    /// definition.
-    pub delegated_definition_root: Option<std::path::PathBuf>,
     /// Session config reader (`engine-config-snapshot-adoption`). Agent
     /// factories resolve web/custom-tool, computer, delegation-model, and
     /// deepthink config from this snapshot rather than re-reading disk, so a
@@ -2176,11 +2171,7 @@ pub fn load_with_tool_surface_override(
     // takes precedence over the embedded factory. A malformed override
     // fails loudly here (naming its source) rather than silently falling
     // back to the embedded default.
-    let definition_root = args
-        .delegated_definition_root
-        .as_deref()
-        .unwrap_or(&args.cwd);
-    let Some(mut def) = crate::agents::resolve(definition_root, name)? else {
+    let Some(mut def) = crate::agents::resolve(&args.cwd, name)? else {
         // Not a built-in and no file on disk: unknown agent.
         bail!("unknown agent `{name}`");
     };
@@ -2248,11 +2239,7 @@ pub async fn load_with_assistant_db_and_tool_surface_override(
     if let Some(mut def) = local_definition_for_spawn(name, args)? {
         return load_resolved_def(name, args, tool_surface_override, &mut def);
     }
-    let definition_root = args
-        .delegated_definition_root
-        .as_deref()
-        .unwrap_or(&args.cwd);
-    let def = crate::agents::resolve_with_assistant_db(definition_root, name, db).await?;
+    let def = crate::agents::resolve_with_assistant_db(&args.cwd, name, db).await?;
     let Some(mut def) = def else {
         bail!("unknown agent `{name}");
     };
@@ -4821,7 +4808,6 @@ pub(crate) mod tests {
             params: ModelParams::default(),
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             cwd: cwd.to_path_buf(),
-            delegated_definition_root: None,
             config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
             session_short_id: String::new(),
             workspace_scratch_dir: cwd.join("workspace-scratch"),

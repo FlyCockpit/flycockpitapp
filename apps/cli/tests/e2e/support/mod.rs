@@ -846,9 +846,18 @@ impl EphemeralDaemonGuard {
             if owned_exited {
                 return Ok(true);
             }
-            if command.try_wait()?.is_some() {
-                self.reap_current();
-                return Ok(false);
+            if let Some(status) = command.try_wait()? {
+                if !status.success() {
+                    self.reap_current();
+                    return Ok(false);
+                }
+                // A successful lifecycle command has durably reported that
+                // the old daemon stopped. Its exact Child can become
+                // waitable just after the command itself exits, particularly
+                // after a forced graceful-shutdown fallback. Keep reaping
+                // that exact child within the same bounded operation instead
+                // of turning this scheduling race into a false failure (or
+                // killing the replacement's metadata in reap_current()).
             }
             if Instant::now() >= deadline {
                 let _ = command.kill();

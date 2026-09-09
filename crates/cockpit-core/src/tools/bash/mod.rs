@@ -3004,7 +3004,10 @@ async fn run_shell(
     // zerobox handed us a plain `tokio::process::Command`.
     #[cfg(unix)]
     cmd.process_group(0);
-
+    // A daemon SIGKILL cannot run this future's drop cleanup. Arm the direct
+    // shell/zerobox launcher at the host spawn boundary; on Linux it then dies
+    // with the daemon, allowing bwrap's own --die-with-parent contract to tear
+    // down the remaining sandbox process tree.
     let mut concrete_effects = vec![
         // Ordinary command approval binds the exact shell text.
         serde_json::json!({"execute": {"command": command}}),
@@ -3058,6 +3061,7 @@ async fn run_prepared_command(
         .kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
+    cockpit_host::process::configure_parent_death_signal(&mut cmd);
 
     // This is the immediate process-creation boundary, after all sandbox
     // preparation but before `spawn` can hand control to the host OS.

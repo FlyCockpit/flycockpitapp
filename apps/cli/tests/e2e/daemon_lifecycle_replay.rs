@@ -321,31 +321,22 @@ async fn create_parked_session() -> (ScriptedProvider, SpawnedDaemon, AttachedSe
     (provider, daemon, attached, interrupt_id)
 }
 
-/// Build a parked replay whose real host operation blocks on a FIFO. Once the
+/// Build a parked replay whose real host operation remains live. Once the
 /// durable interrupt state becomes `executing`, SIGKILL therefore lands after
 /// the replay claim and before the effect can complete, without a product hook
 /// or a wall-clock race.
 async fn create_parked_session_with_blocked_replay()
 -> (ScriptedProvider, SpawnedDaemon, AttachedSession, Uuid) {
     let home = IsolatedHome::new();
-    // Keep the FIFO outside the trusted project. `cat <project-file>` is a
-    // confined read and therefore executes without the approval interrupt
-    // this lifecycle fixture must first park. An outside-project read retains
-    // the same real approval/escalation path as `COMMAND` (`cat /tmp`) and,
-    // after approval, blocks at the host process boundary until SIGKILL.
-    let fifo = home.home_dir().join("blocked-replay.fifo");
-    let output = std::process::Command::new("mkfifo")
-        .arg(&fifo)
-        .output()
-        .expect("run mkfifo for blocked replay");
-    assert!(
-        output.status.success(),
-        "mkfifo failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let command = format!("cat {}", fifo.display());
-    let provider = lifecycle_provider_for_command(&command).await;
+    // `/dev/null` supplies one host-read approval boundary and `tail` remains
+    // live after spawn without a test timing hook or helper process.
+    let provider = lifecycle_provider_for_command("exec tail -f /dev/null").await;
     home.write_local_provider_config(&provider.base_url());
+    std::fs::write(
+        home.config_dir().join("config.json"),
+        r#"{"active_model":{"provider":"local","model":"scripted"},"sandbox_escalation_enabled":true,"defaultApprovalMode":"auto"}"#,
+    )
+    .expect("write blocked replay auto approval config");
     let daemon = SpawnedDaemon::start_with_home(home).await;
     daemon.home().trust_project();
     let client = daemon.client().await;
@@ -357,6 +348,12 @@ async fn create_parked_session_with_blocked_replay()
         .send_user_message("trigger blocked lifecycle approval")
         .await
         .expect("send user message");
+    let gate_interrupt =
+        wait_for_interrupt(&client, &daemon, attached.session_id, Some("initial")).await;
+    client
+        .approve_interrupt_once(gate_interrupt)
+        .await
+        .expect("approve blocked replay auto gate");
     let interrupt_id =
         wait_for_interrupt(&client, &daemon, attached.session_id, Some("initial")).await;
     (provider, daemon, attached, interrupt_id)
@@ -772,7 +769,6 @@ fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without_reexe
             create_parked_session_with_blocked_replay().await;
 
         restart_daemon_gracefully(&daemon).await;
-
         let client = daemon.client().await;
         client
             .attach(daemon.project_path(), Some(attached.session_id), None, true)
@@ -791,8 +787,18 @@ fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without_reexe
             async move { interrupt_row(&db_path, interrupt_id).state == "executing" }
         })
         .await;
+        assert_eq!(
+            interrupt_row(&daemon.db_path(), interrupt_id).state,
+            "executing",
+            "host-effect boundary must follow the durable executing claim"
+        );
+
+        #[cfg(target_os = "linux")]
+        let sandbox_descendants = daemon.capture_owned_sandbox_descendants();
 
         daemon.sigkill().await;
+        #[cfg(target_os = "linux")]
+        sandbox_descendants.assert_exited();
         daemon.restart_same_home().await;
         let client = daemon.client().await;
         client

@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use std::os::fd::{FromRawFd as _, OwnedFd};
+
 use assert_cmd::cargo::CommandCargoExt;
 use cockpit_cli::integration::{DaemonClient, DaemonStatus};
 
@@ -258,6 +261,59 @@ pub struct SpawnedDaemon {
     home: IsolatedHome,
 }
 
+/// Stable kernel handles for sandbox processes proven to descend from this
+/// harness's exact daemon child. Holding pidfds across daemon death avoids PID
+/// reuse and lets the assertion wait on process exit without retries or name-
+/// based killing.
+#[cfg(target_os = "linux")]
+pub struct OwnedSandboxDescendants {
+    processes: Vec<OwnedSandboxDescendant>,
+}
+
+#[cfg(target_os = "linux")]
+struct OwnedSandboxDescendant {
+    pid: u32,
+    command: String,
+    executable_name: String,
+    pidfd: OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+impl OwnedSandboxDescendants {
+    pub fn assert_exited(self) {
+        use std::os::fd::AsRawFd as _;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut survivors = Vec::new();
+        for process in &self.processes {
+            let mut pollfd = libc::pollfd {
+                fd: process.pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let timeout_ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+            // SAFETY: `pollfd` points to one initialized entry whose fd is an
+            // owned pidfd retained by `process` for the whole call.
+            let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+            assert!(
+                ready >= 0,
+                "waiting for owned sandbox descendant {} failed: {}",
+                process.pid,
+                std::io::Error::last_os_error()
+            );
+            if pollfd.revents & libc::POLLIN == 0 {
+                survivors.push(format!("{} {}", process.pid, process.command));
+            }
+        }
+        assert!(
+            survivors.is_empty(),
+            "sandbox descendants outlived their killed daemon:\n{}",
+            survivors.join("\n")
+        );
+    }
+}
+
 impl SpawnedDaemon {
     pub async fn start() -> Self {
         Self::start_in(IsolatedHome::new()).await
@@ -418,6 +474,104 @@ impl SpawnedDaemon {
 
     pub fn try_pid(&self) -> Option<u32> {
         cockpit_host::daemon_lifecycle::read_pid_file(&self.home.pid_file())
+    }
+
+    /// Snapshot the sandbox launchers below this harness's exact daemon and
+    /// pin their identities with pidfds before a SIGKILL test kills the owner.
+    #[cfg(target_os = "linux")]
+    pub fn capture_owned_sandbox_descendants(&self) -> OwnedSandboxDescendants {
+        let daemon_pid = self.pid();
+        let mut descendants = std::collections::BTreeSet::from([daemon_pid]);
+        let mut processes = Vec::new();
+        let mut proc_rows = std::fs::read_dir("/proc")
+            .expect("read /proc for daemon descendants")
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let pid = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
+                let status = std::fs::read_to_string(entry.path().join("status")).ok()?;
+                let ppid = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("PPid:\t"))?
+                    .trim()
+                    .parse::<u32>()
+                    .ok()?;
+                Some((pid, ppid, entry.path()))
+            })
+            .collect::<Vec<_>>();
+        loop {
+            let before = descendants.len();
+            for (pid, ppid, _) in &proc_rows {
+                if descendants.contains(ppid) {
+                    descendants.insert(*pid);
+                }
+            }
+            if descendants.len() == before {
+                break;
+            }
+        }
+        for (pid, _, path) in proc_rows.drain(..) {
+            if !descendants.contains(&pid) || pid == daemon_pid {
+                continue;
+            }
+            let executable_name = std::fs::read_to_string(path.join("comm"))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let command = std::fs::read(path.join("cmdline"))
+                .map(|bytes| {
+                    String::from_utf8_lossy(&bytes)
+                        .replace('\0', " ")
+                        .trim()
+                        .to_string()
+                })
+                .unwrap_or_else(|_| executable_name.clone());
+            if executable_name != "bwrap"
+                && !executable_name.contains("zerobox")
+                && !command.contains("zerobox-linux-sandbox")
+            {
+                continue;
+            }
+            // SAFETY: pidfd_open takes a numeric PID and creates a fresh
+            // descriptor; the descendant relationship was captured above.
+            let raw_fd = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_open,
+                    libc::pid_t::try_from(pid).expect("Linux pid fits pid_t"),
+                    0,
+                )
+            };
+            assert!(
+                raw_fd >= 0,
+                "pidfd_open for owned descendant {pid} failed: {}",
+                std::io::Error::last_os_error()
+            );
+            processes.push(OwnedSandboxDescendant {
+                pid,
+                command,
+                executable_name,
+                // SAFETY: a successful pidfd_open returned a new descriptor,
+                // and this is its sole transfer into an owning Rust handle.
+                pidfd: unsafe {
+                    OwnedFd::from_raw_fd(
+                        std::os::fd::RawFd::try_from(raw_fd).expect("pidfd fits RawFd"),
+                    )
+                },
+            });
+        }
+        assert!(
+            processes
+                .iter()
+                .any(|process| process.executable_name.contains("zerobox")
+                    || process.command.contains("zerobox-linux-sandbox")),
+            "no zerobox launcher descended from daemon {daemon_pid}"
+        );
+        assert!(
+            processes
+                .iter()
+                .any(|process| process.executable_name == "bwrap"),
+            "no bwrap process descended from daemon {daemon_pid}"
+        );
+        OwnedSandboxDescendants { processes }
     }
 
     pub fn socket_path(&self) -> PathBuf {

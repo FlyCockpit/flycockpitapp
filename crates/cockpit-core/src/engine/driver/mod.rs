@@ -6001,6 +6001,11 @@ impl Driver {
             // must not bypass it.
             tokio::select! {
                 biased;
+                // Queue closure is lifecycle control, not user input. Keep it
+                // observable even while a parked-continuation fence disables
+                // dequeueing; otherwise graceful shutdown can wait forever
+                // for a driver that intentionally refuses the message arm.
+                _ = input_queue.wait_closed() => break,
                 msg = input_queue.recv_group_order_for(Some(&active_target_id)),
                     if !waiting_for_keep_parked_siblings => {
                     goal_watchdog = None;

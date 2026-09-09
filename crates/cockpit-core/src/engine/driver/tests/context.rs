@@ -4217,6 +4217,33 @@ async fn completed_rolling_shadow_persists_before_idle_driver_shutdown() {
     ));
 }
 
+/// Unfinished rolling-summary inference is utility work and cannot hold the
+/// daemon lifecycle boundary behind an unbounded provider response.
+#[tokio::test]
+async fn unfinished_rolling_shadow_is_cancelled_on_driver_shutdown() {
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let observed_cancel = cancel.clone();
+    driver.shadow_brief_generation = 7;
+    driver.shadow_brief = Some(ShadowBriefState::InFlight(ShadowBriefInFlight {
+        generation: 7,
+        snapshot_history: Vec::new(),
+        snapshot_turns: 0,
+        snapshot_tail_turns: 0,
+        turns_since_rebuild: 0,
+        cancel,
+        handle: tokio::spawn(std::future::pending::<
+            crate::engine::compact_draft::CompactDraftOutcome,
+        >()),
+    }));
+
+    driver.drain_shadow_brief_on_shutdown().await;
+
+    assert!(observed_cancel.is_cancelled());
+    assert!(driver.shadow_brief.is_none());
+    assert_eq!(driver.shadow_brief_generation, 8);
+}
+
 /// Manual `/compact` bypasses the auto-compaction gate: even when the gate
 /// is in a suppressing state (`UntilActivity`), `do_compact` proceeds
 /// because it never calls `suppresses()`.  Only `maybe_auto_compact`

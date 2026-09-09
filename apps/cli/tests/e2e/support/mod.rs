@@ -294,26 +294,16 @@ impl SpawnedDaemon {
     }
 
     async fn start_in(home: IsolatedHome) -> Self {
-        // Mirror the production detached-spawn provenance handshake while
-        // retaining the foreground Child in this process. The daemon persists
-        // this ticket beside its isolated socket for follower CLI commands.
-        let launch_ticket = format!(
-            "{:032x}{:032x}",
-            uuid::Uuid::new_v4().as_u128(),
-            uuid::Uuid::new_v4().as_u128()
-        );
-        let mut command = home.cockpit();
-        command
-            .args(["daemon", "start", "--foreground"])
-            .env("COCKPIT_LOG", "warn,cockpit::startup=info")
-            .env("COCKPIT_DAEMON_LAUNCH_TICKET", &launch_ticket)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let child = command.spawn().expect("spawn foreground daemon");
+        let child = spawn_foreground_daemon(&home);
         let process = EphemeralDaemonGuard::new(child, home.socket_path(), home.pid_file());
         wait_for_status_handshake(&home, DAEMON_START_HANDSHAKE_TIMEOUT).await;
         Self { process, home }
+    }
+
+    pub async fn restart_same_home(&self) {
+        self.process.reap_current();
+        self.process.replace(spawn_foreground_daemon(&self.home));
+        self.wait_for_handshake().await;
     }
 
     pub fn command(&self) -> Command {
@@ -369,17 +359,6 @@ impl SpawnedDaemon {
         })
     }
 
-    pub async fn restart_same_home(&self) {
-        let output = self
-            .home
-            .cockpit()
-            .args(["daemon", "start", "--detach"])
-            .output()
-            .expect("restart daemon in same home");
-        assert_success("cockpit daemon start --detach", &output, &self.home);
-        self.wait_for_handshake().await;
-    }
-
     pub async fn wait_for_handshake(&self) {
         wait_for_status_handshake(&self.home, DAEMON_RESTART_HANDSHAKE_TIMEOUT).await;
     }
@@ -405,14 +384,30 @@ impl SpawnedDaemon {
             std::io::Error::last_os_error(),
             log_tail(&self.home)
         );
-        wait_until_with_home(
-            "daemon process exit",
-            Duration::from_secs(5),
-            &self.home,
-            || async move { !pid_is_live(pid) },
-        )
-        .await;
+        // This test process is the child's parent. Reap the exact child here;
+        // PID polling would report its zombie as live until this wait occurs.
+        self.process.reap_current();
     }
+}
+
+fn spawn_foreground_daemon(home: &IsolatedHome) -> std::process::Child {
+    // Mirror the production detached-spawn provenance handshake while
+    // retaining the foreground Child in this process. The daemon persists
+    // this ticket beside its isolated socket for follower CLI commands.
+    let launch_ticket = format!(
+        "{:032x}{:032x}",
+        uuid::Uuid::new_v4().as_u128(),
+        uuid::Uuid::new_v4().as_u128()
+    );
+    let mut command = home.cockpit();
+    command
+        .args(["daemon", "start", "--foreground"])
+        .env("COCKPIT_LOG", "warn,cockpit::startup=info")
+        .env("COCKPIT_DAEMON_LAUNCH_TICKET", &launch_ticket)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    command.spawn().expect("spawn foreground daemon")
 }
 
 impl Drop for SpawnedDaemon {
@@ -664,11 +659,7 @@ fn tail_file(path: PathBuf, max_bytes: usize) -> Option<String> {
 
 #[cfg(unix)]
 pub(crate) fn pid_is_live(pid: u32) -> bool {
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if rc == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    cockpit_host::daemon_lifecycle::process_exists(pid)
 }
 
 #[cfg(unix)]
@@ -686,7 +677,7 @@ pub(crate) fn wait_for_pid_exit_blocking(pid: u32, timeout: Duration) -> bool {
 /// Panic/unwind guard for foreground test daemons. Ensures the exact child is
 /// terminated and reaped before its socket and lifecycle metadata are removed.
 pub struct EphemeralDaemonGuard {
-    child: Option<std::process::Child>,
+    child: std::sync::Mutex<Option<std::process::Child>>,
     socket: PathBuf,
     endpoint: PathBuf,
     pid_file: PathBuf,
@@ -699,31 +690,42 @@ impl EphemeralDaemonGuard {
             .expect("isolated daemon pid file has a state directory")
             .join("daemon-endpoint.json");
         Self {
-            child: Some(child),
+            child: std::sync::Mutex::new(Some(child)),
             socket,
             endpoint,
             pid_file,
         }
     }
 
-    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        match self.child.as_mut() {
+    pub fn try_wait(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let mut child = self.child.lock().unwrap_or_else(|error| error.into_inner());
+        match child.as_mut() {
             Some(child) => child.try_wait(),
             None => Ok(None),
         }
     }
 
-    pub fn wait_with_output(&mut self) -> std::io::Result<std::process::Output> {
+    pub fn wait_with_output(&self) -> std::io::Result<std::process::Output> {
         self.child
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
             .take()
             .expect("ephemeral daemon process")
             .wait_with_output()
     }
-}
 
-impl Drop for EphemeralDaemonGuard {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
+    fn replace(&self, child: std::process::Child) {
+        self.reap_current();
+        *self.child.lock().unwrap_or_else(|error| error.into_inner()) = Some(child);
+    }
+
+    fn reap_current(&self) {
+        if let Some(mut child) = self
+            .child
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -736,5 +738,11 @@ impl Drop for EphemeralDaemonGuard {
         if self.pid_file.exists() {
             let _ = std::fs::remove_file(&self.pid_file);
         }
+    }
+}
+
+impl Drop for EphemeralDaemonGuard {
+    fn drop(&mut self) {
+        self.reap_current();
     }
 }

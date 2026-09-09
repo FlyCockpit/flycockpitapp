@@ -13430,7 +13430,16 @@ impl Driver {
         let title_progress_before_turn = self.session.title_progress_snapshot().await?;
         let (extended, providers) = self.config.configs();
         let use_session_model_metadata = use_session_model_for_auto_title(&extended);
-        let (title_action, mut metadata_work) = if use_session_model_metadata {
+        // A durable run invocation owns an exact provider-turn budget and
+        // terminal. Metadata/title inference is deliberately outside the
+        // conversation, so launching it here would spend unaccounted provider
+        // turns that can outlive this invocation and consume another
+        // invocation's responses. Headless runs therefore defer metadata
+        // inference; interactive turns retain the existing title cadence.
+        let run_invocation_owns_provider_budget = run_invocation_id.is_some();
+        let (title_action, mut metadata_work) = if run_invocation_owns_provider_budget {
+            (crate::session::TitleAction::None, None)
+        } else if use_session_model_metadata {
             (
                 crate::session::TitleAction::None,
                 self.session
@@ -13440,7 +13449,9 @@ impl Driver {
             (self.session.note_user_content(&canonical_user_text), None)
         };
         let mut auto_title_task = None;
-        if !use_session_model_metadata && !matches!(title_action, crate::session::TitleAction::None)
+        if !run_invocation_owns_provider_budget
+            && !use_session_model_metadata
+            && !matches!(title_action, crate::session::TitleAction::None)
         {
             let session = self.session.clone();
             let content_prefix = if artifact_frame.is_some() {

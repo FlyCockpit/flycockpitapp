@@ -10733,10 +10733,6 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
     let forwarder =
         spawn_noninteractive_event_forwarder(child_rx, event_tx.clone(), steer_target.clone());
 
-    #[cfg(test)]
-    let mut config = config;
-    #[cfg(not(test))]
-    let config = config;
     let mut agent = Arc::new(child);
     // This noninteractive executor does not own a foreground Driver frame,
     // but it is still a real delegation. Keep the same selected-delegation
@@ -10903,30 +10899,9 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
     scheduled_lane_driver.bind_active_retry_budget();
     let _lane_exit_drain = crate::engine::delegation_budget::LaneBudgetExitDrain::new(&budget);
     #[cfg(test)]
-    if scheduled_lane_driver.test_providers_override.is_none() {
-        let providers = config.providers();
-        if let Some(active) = providers.active_model.clone() {
-            scheduled_lane_driver.test_providers_override = Some((
-                providers.clone(),
-                active.provider.clone(),
-                active.model.clone(),
-            ));
-        }
-    }
-    #[cfg(test)]
     if let Some(hooks) = super::nested_lane_test_hooks::take() {
         if let Some(script) = hooks.test_compact_brief_script {
             scheduled_lane_driver.test_compact_brief_script = Some(script);
-        }
-        if let Some(override_) = hooks.test_providers_override {
-            scheduled_lane_driver.test_providers_override = Some(override_.clone());
-            let snapshot = crate::daemon::session_worker::SessionConfigSnapshot::new(
-                config.generation(),
-                override_.0.clone(),
-                config.extended().clone(),
-            );
-            config = crate::daemon::session_worker::SessionConfigHandle::detached(snapshot);
-            scheduled_lane_driver.set_config_handle(config.clone());
         }
         for _ in 0..hooks.lane_compact_guard_precharge {
             let _ = budget.record_compaction(100, false);
@@ -14209,10 +14184,7 @@ mod vnext_child_admission_tests {
             worker_rx.recv().await,
             Some(TurnEvent::AgentTreeExecutorEndpointAttached { agent_instance_id, .. }) if agent_instance_id == owner
         ));
-        let detached =
-            tokio::time::timeout(std::time::Duration::from_millis(100), worker_rx.recv())
-                .await
-                .expect("private teardown pump must wait through worker backpressure");
+        let detached = worker_rx.recv().await;
         assert!(matches!(
             detached,
             Some(TurnEvent::NestedTurn { inner, .. })
@@ -14310,28 +14282,37 @@ mod vnext_child_admission_tests {
 
         // No edge points at `independent`, so it may start even while the
         // declared predecessor for the other child is unfinished.
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(20),
-                independent.acquire(&cancel),
+        assert!(independent.acquire(&cancel).await.is_ok());
+
+        // Poll the dependent acquisition to its known dependency barrier,
+        // then inspect completion without waiting for elapsed wall time.
+        let dependent_cancel = cancel.clone();
+        let (blocked_ready_tx, blocked_ready_rx) = tokio::sync::oneshot::channel();
+        let blocked = tokio::spawn(async move {
+            let mut acquisition = Box::pin(dependent.acquire(&dependent_cancel));
+            let mut blocked_ready_tx = Some(blocked_ready_tx);
+            std::future::poll_fn(
+                |cx| match std::future::Future::poll(acquisition.as_mut(), cx) {
+                    std::task::Poll::Pending => {
+                        blocked_ready_tx
+                            .take()
+                            .expect("dependency barrier is reported once")
+                            .send(())
+                            .expect("barrier observer remains live");
+                        std::task::Poll::Ready(())
+                    }
+                    std::task::Poll::Ready(_) => {
+                        panic!("dependent acquired before its predecessor completed")
+                    }
+                },
             )
-            .await
-            .expect("independent child must not inherit an unrelated barrier")
-            .is_ok()
-        );
-        let mut blocked = Box::pin(dependent.acquire(&cancel));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), &mut blocked)
-                .await
-                .is_err()
-        );
+            .await;
+            acquisition.await
+        });
+        blocked_ready_rx.await.unwrap();
+        assert!(!blocked.is_finished());
         base_done.send(true).unwrap();
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), blocked)
-                .await
-                .expect("declared dependent should release after its predecessor")
-                .is_ok()
-        );
+        assert!(blocked.await.unwrap().is_ok());
     }
 
     #[test]

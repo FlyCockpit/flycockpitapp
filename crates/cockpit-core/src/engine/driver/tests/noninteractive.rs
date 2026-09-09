@@ -3,20 +3,27 @@ use super::*;
 #[test]
 fn noninteractive_child_inherits_parent_provider_snapshot_by_construction() {
     let (mut driver, _tmp) = test_driver(1);
-    let (mut scripted_providers, provider, model) = driver
-        .test_providers_override
-        .take()
-        .expect("scripted parent has a provider snapshot");
+    let mut scripted_providers = driver.config.providers();
+    let active = scripted_providers
+        .active_model
+        .clone()
+        .expect("scripted parent has an active provider snapshot");
+    let provider = active.provider;
+    let model = active.model;
     scripted_providers
         .providers
         .get_mut(&provider)
         .expect("active scripted provider is registered")
         .url = "http://127.0.0.1:9/v1".to_string();
-    driver.test_providers_override = Some((scripted_providers, provider, model));
-    let (parent_providers, parent_provider, parent_model) = driver
-        .test_providers_override
-        .as_ref()
-        .expect("scripted parent has a provider snapshot");
+    driver.set_config_handle(
+        crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                driver.config.generation(),
+                scripted_providers.clone(),
+                driver.config.extended().clone(),
+            ),
+        ),
+    );
 
     let child_config = driver
         .spawn_args_delegated_in_cwd(
@@ -29,30 +36,22 @@ fn noninteractive_child_inherits_parent_provider_snapshot_by_construction() {
         .config;
     let child_providers = child_config.providers();
     let child_providers_json = serde_json::to_value(&child_providers).unwrap();
-    let parent_providers_json = serde_json::to_value(parent_providers).unwrap();
-    let base_providers_json = serde_json::to_value(driver.config.providers()).unwrap();
+    let parent_providers_json = serde_json::to_value(&scripted_providers).unwrap();
 
     assert_eq!(child_config.generation(), driver.config.generation());
     assert_eq!(child_providers_json, parent_providers_json);
-    assert_ne!(
-        child_providers_json, base_providers_json,
-        "the regression fixture must distinguish the scripted parent registry from the base handle"
-    );
     let child_active = child_providers
         .active_model
         .as_ref()
         .expect("child provider snapshot keeps the active selection");
-    assert_eq!(child_active.provider, *parent_provider);
-    assert_eq!(child_active.model, *parent_model);
+    assert_eq!(child_active.provider, provider);
+    assert_eq!(child_active.model, model);
 }
 
 #[test]
 fn noninteractive_child_detaches_the_live_parent_snapshot_at_construction() {
     let (mut driver, _tmp) = test_driver(1);
-    let (providers, _, _) = driver
-        .test_providers_override
-        .take()
-        .expect("scripted parent has a provider snapshot");
+    let providers = driver.config.providers();
     let live = crate::daemon::session_worker::SessionConfigHandle::new(Arc::new(
         std::sync::RwLock::new(crate::daemon::session_worker::SessionConfigSnapshot::new(
             7,
@@ -710,17 +709,13 @@ fn root_child_cwd(driver: &Driver) -> ChildCwd {
     }
 }
 
-fn align_scripted_provider_override_with_config(driver: &mut Driver) {
-    let providers = driver.config.providers().clone();
-    let active = providers
-        .active_model
-        .as_ref()
-        .expect("delegated-model fixture config has an active model");
-    driver.test_providers_override = Some((
-        providers.clone(),
-        active.provider.clone(),
-        active.model.clone(),
-    ));
+fn align_scripted_provider_with_config(driver: &mut Driver) {
+    let providers = driver.config.providers();
+    assert!(
+        providers.active_model.is_some(),
+        "delegated-model fixture config has an active model"
+    );
+    install_test_provider_config(driver, providers);
 }
 
 fn write_delegated_model_config(driver: &mut Driver, models: &[&str]) {
@@ -763,7 +758,7 @@ fn write_delegated_model_config(driver: &mut Driver, models: &[&str]) {
     // worker snapshot. Both represent the same pinned parent configuration;
     // leaving the former on the constructor snapshot would make child
     // inheritance replace the freshly loaded registry with stale providers.
-    align_scripted_provider_override_with_config(driver);
+    align_scripted_provider_with_config(driver);
 }
 
 fn failing_provider() -> cockpit_test_support::provider::ScriptedProvider {
@@ -824,7 +819,7 @@ fn write_delegated_model_config_with_backup(
     driver.set_config_handle(
         crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(&cwd),
     );
-    align_scripted_provider_override_with_config(driver);
+    align_scripted_provider_with_config(driver);
 }
 
 async fn seed_task_payload(driver: &Driver, task_call_id: &str, label: &str, child_agent: &str) {
@@ -1852,7 +1847,13 @@ async fn delivered_finished_noninteractive_job_is_reaped() {
         job.delivered = true;
         job
     });
-    tokio::task::yield_now().await;
+    (&mut driver
+        .noninteractive_jobs
+        .get_mut("task-reap")
+        .expect("fixture job remains registered")
+        .handle)
+        .await
+        .expect("fixture job joins");
 
     driver.reap_finished_noninteractive_jobs();
 

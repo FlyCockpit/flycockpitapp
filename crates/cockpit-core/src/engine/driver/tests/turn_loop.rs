@@ -501,16 +501,52 @@ async fn assistant_inbox_timer_yields_to_ready_human_input() {
 
     let (queue, tx, mut rx) = event_harness();
     let target = driver.active_queue_target();
-    queue
-        .push(UserSubmission::text("HUMAN_TIMER_MARKER"), target)
-        .await;
+    let (boundary_tx, mut boundary_rx) = mpsc::unbounded_channel();
+    driver.set_loop_boundary_observer(Some(boundary_tx));
     let (control_tx, control_rx) = mpsc::channel(1);
     let run_queue = queue.clone();
     let run_tx = tx.clone();
     let run =
         tokio::spawn(async move { driver.run_main_loop(run_queue, control_rx, &run_tx).await });
 
-    tokio::task::yield_now().await;
+    assert_eq!(
+        boundary_rx.recv().await,
+        Some(DriverLoopBoundaryObservation {
+            sequence: 0,
+            human_input_already_ready: false,
+            assistant_inbox_idle_poll_enabled: true,
+        }),
+        "the initial boundary establishes this observer's sequence"
+    );
+    queue
+        .requeue_front_after(
+            UserSubmission::text("HUMAN_TIMER_MARKER"),
+            target.clone(),
+            Duration::from_millis(250),
+        )
+        .await;
+    assert!(
+        queue.has_pending_for(Some(&target.id)).await,
+        "the delayed human submission remains pending"
+    );
+    assert!(
+        !queue.has_ready_for(Some(&target.id)).await,
+        "the delayed human submission must not disable the idle timer arm before its deadline"
+    );
+
+    // Force re-entry after enqueuing, then await the producer-owned readiness
+    // snapshot emitted after every guard is computed and immediately before
+    // the select. Sequence 1 cannot be satisfied by the initial boundary.
+    synchronize_driver_idle(&control_tx).await;
+    assert_eq!(
+        boundary_rx.recv().await,
+        Some(DriverLoopBoundaryObservation {
+            sequence: 1,
+            human_input_already_ready: false,
+            assistant_inbox_idle_poll_enabled: true,
+        }),
+        "the deferred human item leaves the idle timer enabled at t0"
+    );
     tokio::time::advance(Duration::from_millis(250)).await;
     let request = provider.next_request_ready().await;
     synchronize_driver_idle(&control_tx).await;
@@ -1111,7 +1147,7 @@ fn persistent_user_event_failure_defers_exact_payload_and_services_controls() {
         let run_tx = tx.clone();
         let run =
             tokio::spawn(async move { driver.run_main_loop(run_queue, control_rx, &run_tx).await });
-        let notice = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let notice = async {
             loop {
                 if let Some(TurnEvent::Notice { text }) = rx.recv().await
                     && text.contains("exact payload will be retried")
@@ -1119,16 +1155,12 @@ fn persistent_user_event_failure_defers_exact_payload_and_services_controls() {
                     break text;
                 }
             }
-        })
-        .await
-        .expect("persistent failure emits a bounded retry notice");
+        }
+        .await;
         assert!(notice.contains("exact payload will be retried"), "{notice}");
 
         control_tx.send(DriverControl::AbortForTest).await.unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), run)
-            .await
-            .expect("a driver control is serviced while the payload is deferred")
-            .expect("driver task joins");
+        let result = run.await.expect("driver task joins");
         assert!(
             result
                 .expect_err("test abort terminates the driver")
@@ -1159,10 +1191,7 @@ fn persistent_user_event_failure_defers_exact_payload_and_services_controls() {
         let mut expected = submission;
         expected.queue_item_ids = vec![id];
         expected.queue_target = Some(target);
-        let retried = tokio::time::timeout(std::time::Duration::from_secs(2), queue.recv())
-            .await
-            .expect("deferred payload becomes runnable")
-            .expect("exact payload remains queued");
+        let retried = queue.recv().await.expect("exact payload remains queued");
         assert_eq!(
             serde_json::to_value(retried).unwrap(),
             serde_json::to_value(expected).unwrap(),
@@ -1514,6 +1543,7 @@ fn queued_user_fold_retry_does_not_duplicate_assistant_inbox_text() {
 fn continue_fold_failure_restores_tool_result_and_defers_exact_payload() {
     crate::test_env::run_async_with_large_stack(|| async {
         const QUEUED: &str = "continue-queued-exact-4bb2";
+        let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
         let mut provider = ScriptedProvider::builder()
             .dialect(WireDialect::ChatCompletions)
             .turn(Turn::ToolCall {
@@ -1521,7 +1551,7 @@ fn continue_fold_failure_restores_tool_result_and_defers_exact_payload() {
                 name: "read".into(),
                 arguments: serde_json::json!({ "path": "continue.txt" }),
             })
-            .with_delay(std::time::Duration::from_millis(500))
+            .with_response_gate(response_gate.clone())
             .turn(Turn::Text("initial turn complete".into()))
             .turn(Turn::Text("queued turn recovered".into()))
             .start()
@@ -1536,11 +1566,12 @@ fn continue_fold_failure_restores_tool_result_and_defers_exact_payload() {
 
         let run = driver.run_user_input(UserSubmission::text("start continue path"), &queue, &tx);
         let enqueue = async {
-            let _ = provider.next_request().await;
+            let _ = provider.next_request_ready().await;
             let (_, _, outcome) = queue
                 .push_idempotent(receipt, submission, target.clone())
                 .await;
             assert_eq!(outcome, crate::engine::message::IdempotentPush::Inserted);
+            response_gate.add_permits(1);
         };
         let (result, ()) = tokio::join!(run, enqueue);
         result.unwrap();
@@ -1608,10 +1639,11 @@ fn continue_fold_failure_restores_tool_result_and_defers_exact_payload() {
 fn done_fold_failure_defers_exact_payload_without_second_inference() {
     crate::test_env::run_async_with_large_stack(|| async {
         const QUEUED: &str = "done-queued-exact-6cc4";
+        let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
         let mut provider = ScriptedProvider::builder()
             .dialect(WireDialect::ChatCompletions)
             .turn(Turn::Text("initial done".into()))
-            .with_delay(std::time::Duration::from_millis(500))
+            .with_response_gate(response_gate.clone())
             .turn(Turn::Text("queued done recovered".into()))
             .start()
             .await;
@@ -1624,11 +1656,12 @@ fn done_fold_failure_defers_exact_payload_without_second_inference() {
 
         let run = driver.run_user_input(UserSubmission::text("start done path"), &queue, &tx);
         let enqueue = async {
-            let _ = provider.next_request().await;
+            let _ = provider.next_request_ready().await;
             let (_, _, outcome) = queue
                 .push_idempotent(receipt, submission, target.clone())
                 .await;
             assert_eq!(outcome, crate::engine::message::IdempotentPush::Inserted);
+            response_gate.add_permits(1);
         };
         let (result, ()) = tokio::join!(run, enqueue);
         result.unwrap();
@@ -2725,11 +2758,6 @@ fn install_scripted_provider_snapshot(
     if let Some(active) = driver.config.providers().active_model.clone() {
         driver.session.set_active_model_ref(active).unwrap();
     }
-    driver.test_providers_override = Some((
-        driver.config.providers().clone(),
-        "lmstudio".into(),
-        "local".into(),
-    ));
     if let Ok(refreshed) =
         driver.build_live_model_for_running(&driver.stack[0].agent.model, "lmstudio", "local")
     {

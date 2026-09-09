@@ -1317,6 +1317,19 @@ pub struct InterruptHub {
     /// [`Self::register`] and removed when [`Self::resolve`] fires it
     /// (or when the [`PendingInterrupt`] guard drops on cancellation).
     waiters: Mutex<HashMap<Uuid, oneshot::Sender<InterruptOutcome>>>,
+    /// Exact waiter identities published at registration to an optional,
+    /// single consuming owner. This mirrors `raised_interrupts`: readiness is
+    /// an identity stream, never a collapsible hub-wide permit.
+    registered_interrupts: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Uuid>>>,
+    /// Producer-owned stream of exact identities whose raise path has reached
+    /// event publication. AgentTree callers publish only after their durable
+    /// decision bind commits. The legacy isolated path also publishes its
+    /// exact id, but deliberately makes no AgentTree durability claim.
+    /// The optional unbounded sender exists only while a consumer has
+    /// subscribed before starting a producer. Thus distinct concurrent and
+    /// sequential UUIDs cannot collapse or lag, while normal production with
+    /// no readiness observer retains no queue.
+    raised_interrupts: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Uuid>>>,
     /// Outbound event channel to attached clients. `None` in
     /// non-daemon paths (tool unit tests, the standalone run shim) where
     /// no client is listening — raising still works; the event is just
@@ -1416,6 +1429,8 @@ impl InterruptHub {
     ) -> Self {
         Self {
             waiters: Mutex::new(HashMap::new()),
+            registered_interrupts: Mutex::new(None),
+            raised_interrupts: Mutex::new(None),
             events: Some(events),
             redaction: Some(redaction),
             db: Some(db),
@@ -1433,6 +1448,8 @@ impl InterruptHub {
     pub fn detached() -> Self {
         Self {
             waiters: Mutex::new(HashMap::new()),
+            registered_interrupts: Mutex::new(None),
+            raised_interrupts: Mutex::new(None),
             events: None,
             redaction: None,
             db: None,
@@ -1672,6 +1689,13 @@ impl InterruptHub {
     pub fn register(&self, interrupt_id: Uuid) -> PendingInterrupt<'_> {
         let (tx, rx) = oneshot::channel();
         lock_or_recover(&self.waiters).insert(interrupt_id, tx);
+        let mut registered = lock_or_recover(&self.registered_interrupts);
+        if registered
+            .as_ref()
+            .is_some_and(|subscriber| subscriber.send(interrupt_id).is_err())
+        {
+            *registered = None;
+        }
         if let Some(park_commit) = &self.park_commit {
             park_commit.on_register();
         }
@@ -1679,6 +1703,48 @@ impl InterruptHub {
             hub: self,
             interrupt_id,
             rx: Some(rx),
+        }
+    }
+
+    /// Subscribe before starting a waiter producer. The receiver observes the
+    /// exact UUID registered, so multiple registrations cannot collapse or
+    /// release a consumer for a sibling waiter.
+    pub(crate) fn subscribe_registered(&self) -> tokio::sync::mpsc::UnboundedReceiver<Uuid> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut subscriber = lock_or_recover(&self.registered_interrupts);
+        assert!(
+            subscriber
+                .as_ref()
+                .is_none_or(|current| current.is_closed()),
+            "interrupt registration readiness has exactly one consuming owner"
+        );
+        *subscriber = Some(tx);
+        rx
+    }
+
+    /// Subscribe before starting an interrupt producer. Each received item is
+    /// the exact UUID whose raise path reached publication; unlike a bare
+    /// notification permit, items cannot collapse or release the wrong waiter.
+    pub(crate) fn subscribe_raised(&self) -> tokio::sync::mpsc::UnboundedReceiver<Uuid> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut subscriber = lock_or_recover(&self.raised_interrupts);
+        assert!(
+            subscriber
+                .as_ref()
+                .is_none_or(|current| current.is_closed()),
+            "interrupt readiness has exactly one consuming owner"
+        );
+        *subscriber = Some(tx);
+        rx
+    }
+
+    fn publish_raised_identity(&self, interrupt_id: Uuid) {
+        let mut raised = lock_or_recover(&self.raised_interrupts);
+        if raised
+            .as_ref()
+            .is_some_and(|subscriber| subscriber.send(interrupt_id).is_err())
+        {
+            *raised = None;
         }
     }
 
@@ -1703,6 +1769,7 @@ impl InterruptHub {
             let active = open.first().map(|row| row.interrupt_id);
             if active != Some(interrupt_id) {
                 self.emit_queue_changed(active, open.len().saturating_sub(1));
+                self.publish_raised_identity(interrupt_id);
                 return;
             }
         }
@@ -1728,6 +1795,7 @@ impl InterruptHub {
                 },
             );
         }
+        self.publish_raised_identity(interrupt_id);
     }
 
     pub async fn emit_active_from_db(&self) {
@@ -2217,8 +2285,8 @@ async fn abort_unbound_host_capability_refresh_initialization(
 /// first, registers the existing continuation before any lifecycle delivery can
 /// settle it, binds that *same* Attention row to the requesting agent's durable
 /// decision, and then emits through the unchanged InterruptHub continuation.
-/// Tests and non-daemon helpers may not have a lifecycle instance; those retain
-/// the historical interrupt-only path.
+/// An ownerless user question may retain the historical isolated path; an
+/// ownerless host effect always fails closed in every build mode.
 pub(crate) async fn raise_and_wait_with_agent_tree(
     db: &crate::db::Db,
     interrupts: &InterruptHub,
@@ -2483,16 +2551,14 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
         return InterruptOutcome::Resolved(response);
     }
     // The normal turn dispatcher is intentionally usable by lightweight
-    // helpers too. An isolated caller has no typed owner, so only that
-    // explicit legacy case can use the historical name-keyed path.
+    // helpers too. An isolated caller has no typed owner, so only an ordinary
+    // user question can use the historical name-keyed path. Host effects need
+    // a durable AgentTree owner in every build mode.
     let Some(agent_instance_id) = agent_instance_id else {
-        // An isolated helper has no tree to own. Do not make the compatibility
-        // path affect normal production behavior. Unit tests exercise
-        // historical Approver prompt shapes without a daemon tree, so retain
-        // their isolated interrupt-only path; production host effects still
-        // fail closed below.
-        #[cfg(test)]
-        {
+        if matches!(
+            &decision_subject,
+            crate::agent_tree::HostDecisionSubject::UserQuestion
+        ) {
             return raise_and_wait_legacy(
                 db,
                 interrupts,
@@ -2504,26 +2570,8 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
             )
             .await;
         }
-        #[cfg(not(test))]
-        {
-            if matches!(
-                &decision_subject,
-                crate::agent_tree::HostDecisionSubject::UserQuestion
-            ) {
-                return raise_and_wait_legacy(
-                    db,
-                    interrupts,
-                    interrupt_session_id,
-                    agent,
-                    description,
-                    set,
-                    log_label,
-                )
-                .await;
-            }
-            tracing::warn!(%session_id, "host effect has no durable lifecycle owner");
-            return InterruptOutcome::Resolved(ResolveResponse::Cancel);
-        }
+        tracing::warn!(%session_id, "host effect has no durable lifecycle owner");
+        return InterruptOutcome::Resolved(ResolveResponse::Cancel);
     };
     let owner = match db.agent_instance(session_id, agent_instance_id).await {
         Ok(Some(owner)) => owner,
@@ -2905,6 +2953,42 @@ mod tests {
             ),
             receiver,
         )
+    }
+
+    #[tokio::test]
+    async fn ownerless_host_approval_fails_closed_without_raising_legacy_interrupt() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let operation = crate::agent_tree::HostApprovalOperation::new(
+            "ownerless-test-effect",
+            serde_json::json!({"command": "printf forbidden"}),
+        )
+        .unwrap();
+
+        let outcome = raise_and_wait_with_agent_tree(
+            &db,
+            &InterruptHub::detached(),
+            session.session_id,
+            "builder",
+            None,
+            "ownerless host approval",
+            question_set(),
+            crate::agent_tree::HostDecisionSubject::HostApproval { operation },
+            "ownerless host approval test",
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            InterruptOutcome::Resolved(ResolveResponse::Cancel)
+        ));
+        assert!(
+            db.list_open_interrupts(session.session_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "ownerless host effects must not fall back to a legacy prompt"
+        );
     }
 
     #[tokio::test]
@@ -3822,6 +3906,7 @@ mod tests {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/x", "builder").await.unwrap();
         let (hub, mut events) = attached_hub(db.clone(), session.session_id);
+        let mut raised = hub.subscribe_raised();
         let set = question_set();
         let first = db
             .raise_interrupt_questions(session.session_id, "a", "first", &set)
@@ -3835,6 +3920,10 @@ mod tests {
             .unwrap();
         hub.emit_raised(session.session_id, second, "b", "second", set)
             .await;
+
+        assert_eq!(raised.recv().await.unwrap(), first);
+        assert_eq!(raised.recv().await.unwrap(), second);
+        assert!(raised.try_recv().is_err(), "no stale readiness remains");
 
         assert!(matches!(
             events.recv().await.unwrap().event,
@@ -3891,6 +3980,27 @@ mod tests {
             }
                 if interrupt_id == second
         ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_raise_readiness_delivers_both_exact_identities() {
+        let hub = InterruptHub::detached();
+        let mut raised = hub.subscribe_raised();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let questions = question_set();
+
+        tokio::join!(
+            hub.emit_raised(Uuid::nil(), first, "a", "first", questions.clone()),
+            hub.emit_raised(Uuid::nil(), second, "b", "second", questions),
+        );
+
+        let observed = std::collections::BTreeSet::from([
+            raised.recv().await.unwrap(),
+            raised.recv().await.unwrap(),
+        ]);
+        assert_eq!(observed, std::collections::BTreeSet::from([first, second]));
+        assert!(raised.try_recv().is_err(), "no stale readiness remains");
     }
 
     #[tokio::test]

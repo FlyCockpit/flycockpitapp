@@ -406,6 +406,17 @@ pub enum DriverControl {
     },
 }
 
+/// Observation of the readiness guards owned by one driver-loop boundary.
+///
+/// This is deliberately an observation-only surface: publishing is
+/// best-effort and a missing or dropped observer cannot influence scheduling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DriverLoopBoundaryObservation {
+    sequence: u64,
+    human_input_already_ready: bool,
+    assistant_inbox_idle_poll_enabled: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct RecoveredInteractiveTaskChild {
     pub agent_instance_id: uuid::Uuid,
@@ -1551,12 +1562,11 @@ pub struct Driver {
     /// substantive turn also shadows its assembled request to each tandem
     /// model via the single job authority ([`Self::run_user_input`]).
     tandem_set: crate::engine::schedule::TandemSet,
-    /// Test-only injected (providers config, provider, model). Lets the
-    /// auto-prune/auto-compact trigger tests exercise the real
-    /// resolution + trigger paths deterministically without depending on the
-    /// test machine's on-disk config layers. Never set in production.
-    #[cfg(test)]
-    test_providers_override: Option<(crate::config::providers::ProvidersConfig, String, String)>,
+    /// Optional single-owner observer for driver-loop boundary readiness.
+    /// The unbounded send is non-blocking and failures are intentionally
+    /// ignored, keeping this surface observational in every build.
+    loop_boundary_observer: Option<mpsc::UnboundedSender<DriverLoopBoundaryObservation>>,
+    loop_boundary_sequence: u64,
     #[cfg(test)]
     test_fail_next_active_model_session_persist: bool,
     #[cfg(test)]
@@ -1691,8 +1701,6 @@ pub(in crate::engine::driver) enum CompactForceFailure {
 pub(in crate::engine::driver) struct NestedLaneTestHooks {
     pub test_compact_brief_script:
         Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<TestCompactSample>>>>,
-    pub test_providers_override:
-        Option<(crate::config::providers::ProvidersConfig, String, String)>,
     /// No-progress compaction charges applied to the lane budget after allot.
     pub lane_compact_guard_precharge: u32,
     /// When true, subagent compaction apply ignores lane forward progress.
@@ -2490,8 +2498,8 @@ impl Driver {
             pending_swap_marker_from: None,
             tool_call_owner: self.tool_call_owner.clone(),
             tandem_set: self.tandem_set.clone(),
-            #[cfg(test)]
-            test_providers_override: self.test_providers_override.clone(),
+            loop_boundary_observer: None,
+            loop_boundary_sequence: 0,
             #[cfg(test)]
             test_fail_next_active_model_session_persist: self
                 .test_fail_next_active_model_session_persist,
@@ -2885,8 +2893,8 @@ impl Driver {
             pending_swap_marker_from: None,
             tool_call_owner: std::collections::HashMap::new(),
             tandem_set: crate::engine::schedule::TandemSet::default(),
-            #[cfg(test)]
-            test_providers_override: None,
+            loop_boundary_observer: None,
+            loop_boundary_sequence: 0,
             #[cfg(test)]
             test_fail_next_active_model_session_persist: false,
             #[cfg(test)]
@@ -3546,13 +3554,16 @@ impl Driver {
         self.approver = Some(approver);
     }
 
-    #[cfg(test)]
-    pub(in crate::engine::driver) fn clear_approver(&mut self) {
-        self.approver = None;
-    }
-
     pub fn set_assistant_identity_prefix(&mut self, prefix: Option<String>) {
         self.assistant_identity_prefix = prefix;
+    }
+
+    fn set_loop_boundary_observer(
+        &mut self,
+        observer: Option<mpsc::UnboundedSender<DriverLoopBoundaryObservation>>,
+    ) {
+        self.loop_boundary_observer = observer;
+        self.loop_boundary_sequence = 0;
     }
 
     /// Install the daemon-owned local installation mapping captured at root
@@ -3620,13 +3631,6 @@ impl Driver {
         self.set_config_handle(
             crate::daemon::session_worker::SessionConfigHandle::detached(snapshot),
         );
-        if let Some((providers, provider, model)) = self.test_providers_override.as_mut() {
-            *providers = self.config.providers().clone();
-            if let Some(active) = providers.active_model.as_ref() {
-                *provider = active.provider.clone();
-                *model = active.model.clone();
-            }
-        }
         if let Some(active) = self.config.providers().active_model.clone()
             && let Ok(refreshed) = self.build_live_model_for_running(
                 &self.stack[0].agent.model,
@@ -3648,18 +3652,10 @@ impl Driver {
     }
 
     /// Hand the exact generation-pinned worker snapshot to a nested lane.
-    /// Scripted providers are a second test-only model-construction authority;
-    /// preserve their endpoint in the child snapshot while retaining the
-    /// generation and extended policy that were pinned at admission. Production
-    /// always forwards the worker-owned snapshot unchanged.
     fn config_for_noninteractive_child(
         &self,
     ) -> crate::daemon::session_worker::SessionConfigHandle {
-        let mut snapshot = (*self.config.snapshot()).clone();
-        #[cfg(test)]
-        if let Some((providers, _, _)) = &self.test_providers_override {
-            snapshot.providers = providers.clone();
-        }
+        let snapshot = (*self.config.snapshot()).clone();
         // A child attempt owns the exact parent snapshot selected at admission.
         // Never forward a live handle whose shared cell can advance before the
         // child constructs its model or nested scheduler driver.
@@ -6004,13 +6000,15 @@ impl Driver {
             // settling the in-memory plan.
             let waiting_for_keep_parked_siblings =
                 self.persist_on_reentry_owns_started_unsettled_siblings();
-            // Pending human input takes priority over a previously completed
-            // noninteractive result before the boundary select runs.
-            let human_input_already_pending =
-                input_queue.has_pending_for(Some(&active_target_id)).await;
+            // Ready human input takes priority over a previously completed
+            // noninteractive result before the boundary select runs. Deferred
+            // input remains owned by the queue but must not suppress idle work
+            // until its dequeue deadline.
+            let human_input_already_ready =
+                input_queue.has_ready_for(Some(&active_target_id)).await;
             if !waiting_for_keep_parked_siblings
                 && !self.pending_noninteractive_completions.is_empty()
-                && !human_input_already_pending
+                && !human_input_already_ready
                 && self
                     .run_next_pending_noninteractive_completion(&input_queue, tx)
                     .await?
@@ -6038,6 +6036,29 @@ impl Driver {
             // history or run a turn). Compact/Prune controls already defer
             // on the same predicate; auto-compact and prune-after-switch
             // must not bypass it.
+            let clear_boundary_observer = if let Some(observer) = &self.loop_boundary_observer {
+                let observation = DriverLoopBoundaryObservation {
+                    sequence: self.loop_boundary_sequence,
+                    human_input_already_ready,
+                    assistant_inbox_idle_poll_enabled: !waiting_for_keep_parked_siblings
+                        && !human_input_already_ready,
+                };
+                if observer.send(observation).is_ok() {
+                    if let Some(next) = self.loop_boundary_sequence.checked_add(1) {
+                        self.loop_boundary_sequence = next;
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                }
+            } else {
+                false
+            };
+            if clear_boundary_observer {
+                self.set_loop_boundary_observer(None);
+            }
             tokio::select! {
                 biased;
                 msg = input_queue.recv_group_order_for(Some(&active_target_id)),
@@ -6154,7 +6175,7 @@ impl Driver {
                     }
                 }
                 _ = assistant_inbox_idle_poll.tick(),
-                    if !waiting_for_keep_parked_siblings && !human_input_already_pending => {
+                    if !waiting_for_keep_parked_siblings && !human_input_already_ready => {
                     if self
                         .try_deliver_immediate_assistant_inbox(
                             &input_queue,
@@ -9998,15 +10019,10 @@ impl Driver {
         }
     }
 
-    /// Load the layered providers config for the live model switch, honoring a
-    /// test-injected config when present (mirrors [`Self::active_providers_config`])
-    /// and otherwise reading the worker's generation-aware config snapshot.
+    /// Load the layered providers config for the live model switch from the
+    /// worker's generation-aware config snapshot.
     /// Disk writes become visible here when the config watcher refreshes it.
     fn live_providers_config(&self) -> Result<crate::config::providers::ProvidersConfig> {
-        #[cfg(test)]
-        if let Some((providers, _, _)) = &self.test_providers_override {
-            return Ok(providers.clone());
-        }
         Ok(self.config.providers())
     }
 
@@ -10611,10 +10627,6 @@ impl Driver {
     fn frame_providers_config(
         &self,
     ) -> Option<(crate::config::providers::ProvidersConfig, String, String)> {
-        #[cfg(test)]
-        if let Some(o) = &self.test_providers_override {
-            return Some(o.clone());
-        }
         let frame = self.stack.last()?;
         let providers = self.config.providers();
         Some((
@@ -11086,15 +11098,6 @@ impl Driver {
         &self,
         model: &crate::engine::model::Model,
     ) -> Option<Arc<crate::engine::model::Model>> {
-        // Honor the test-injected providers config when present (mirrors
-        // `active_providers_config`), else load from the cwd config chain. Either
-        // way the store is OWNER-SCOPED to the exact providers config so a backup
-        // model can never resolve a foreign workspace's `$secret:`.
-        #[cfg(test)]
-        if let Some((providers, _, _)) = &self.test_providers_override {
-            let store = self.session.provider_credential_store(providers).ok();
-            return build_backup_model_with_store(providers, model, store);
-        }
         resolve_backup_model_for_session(&self.config, model, &self.session)
     }
 
@@ -11102,11 +11105,6 @@ impl Driver {
         &self,
         model: &crate::engine::model::Model,
     ) -> Vec<Arc<crate::engine::model::Model>> {
-        #[cfg(test)]
-        if let Some((providers, _, _)) = &self.test_providers_override {
-            let store = self.session.provider_credential_store(providers).ok();
-            return build_failover_models_with_store(providers, model, store);
-        }
         resolve_failover_models_for_session(&self.config, model, &self.session)
     }
 
@@ -11118,10 +11116,6 @@ impl Driver {
     fn active_providers_config(
         &self,
     ) -> Option<(crate::config::providers::ProvidersConfig, String, String)> {
-        #[cfg(test)]
-        if let Some(o) = &self.test_providers_override {
-            return Some(o.clone());
-        }
         let provider = self.session.active_provider()?;
         let model = self.session.active_model()?;
         let providers = self.config.providers();

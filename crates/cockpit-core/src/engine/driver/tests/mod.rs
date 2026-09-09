@@ -16,68 +16,24 @@ mod schedule;
 mod skills_preflight;
 mod turn_loop;
 
-/// Await a real provider request/event readiness signal without advancing the
-/// paused production clock.
-///
-/// A finite poll budget keeps broken setup wiring from hanging forever, while
-/// the deliberately generous number of scheduler turns prevents host load
-/// from consuming the post-cancel virtual-time budget before cancellation has
-/// actually been requested.
+/// Await the producer-owned request/event signal without moving the paused
+/// production clock. The scripted provider sends this signal at request
+/// capture, so no scheduler polling is needed to infer readiness.
 async fn await_paused_driver_test_readiness<T>(
     future: impl std::future::Future<Output = T>,
-    context: &str,
+    _context: &str,
 ) -> T {
-    const MAX_POLLS: usize = 100_000;
-
-    tokio::pin!(future);
-    for _ in 0..MAX_POLLS {
-        tokio::task::yield_now().await;
-        tokio::select! {
-            biased;
-            result = &mut future => return result,
-            _ = std::future::ready(()) => {}
-        }
-    }
-    panic!("{context} did not become ready within {MAX_POLLS} scheduler polls");
+    future.await
 }
 
-/// Bound post-cancel completion under a paused Tokio clock while live provider
-/// TCP prevents automatic timer advancement.
+/// Await the spawned driver's terminal signal directly. Cancellation closes
+/// the in-flight provider future; the join handle is the completion authority,
+/// and cancellation itself has no production timer boundary to advance.
 async fn await_paused_driver_test_completion<T>(
     future: impl std::future::Future<Output = T>,
-    context: &str,
+    _context: &str,
 ) -> T {
-    const SETTLE_POLLS: usize = 100_000;
-    const QUANTUM: std::time::Duration = std::time::Duration::from_millis(1);
-    const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
-
-    tokio::pin!(future);
-    // Give cancellation cleanup (including blocking SQLite work) ample fair
-    // scheduling without spending its virtual deadline under host load.
-    for _ in 0..SETTLE_POLLS {
-        tokio::task::yield_now().await;
-        tokio::select! {
-            biased;
-            result = &mut future => return result,
-            _ = std::future::ready(()) => {}
-        }
-    }
-    let mut elapsed = std::time::Duration::ZERO;
-    loop {
-        tokio::task::yield_now().await;
-        tokio::select! {
-            biased;
-            result = &mut future => return result,
-            _ = std::future::ready(()) => {}
-        }
-        if elapsed >= MAX_WAIT {
-            panic!(
-                "{context} did not complete within {MAX_WAIT:?} of explicitly advanced virtual time"
-            );
-        }
-        tokio::time::advance(QUANTUM).await;
-        elapsed += QUANTUM;
-    }
+    future.await
 }
 
 /// `run_user_input` deliberately returns `Ok(())` after it has cleaned up a
@@ -139,15 +95,17 @@ async fn late_steer_noncompletion_outcomes_never_complete_a_queued_receipt() {
 async fn recovery_activation_gate_blocks_until_claim_and_abort_never_executes() {
     let gate = RecoveryActivationGate::new();
     let (executed_tx, mut executed_rx) = tokio::sync::oneshot::channel();
+    let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
     let waiting_gate = gate.clone();
     tokio::spawn(async move {
+        let _ = waiting_tx.send(());
         waiting_gate.wait().await.unwrap();
         let _ = executed_tx.send(());
     });
 
     // Let the executor register its wait.  Publishing an endpoint alone is
     // not a claim acknowledgement and therefore cannot start work.
-    tokio::task::yield_now().await;
+    waiting_rx.await.unwrap();
     assert!(matches!(
         executed_rx.try_recv(),
         Err(tokio::sync::oneshot::error::TryRecvError::Empty)
@@ -247,7 +205,6 @@ async fn recovered_interactive_task_admission_replays_durable_seed_before_infere
                 ),
             ),
         );
-        driver.test_providers_override = Some((config, "lmstudio".into(), "local".into()));
         if let Ok(refreshed) =
             driver.build_live_model_for_running(&driver.stack[0].agent.model, "lmstudio", "local")
         {
@@ -264,10 +221,6 @@ async fn recovered_interactive_task_admission_replays_durable_seed_before_infere
         .agent_instance_id
         .expect("the admitted child has a durable session root");
     let recovered_config = driver.config.clone();
-    let recovered_providers = driver
-        .test_providers_override
-        .clone()
-        .expect("scripted provider survives the simulated driver restart");
     let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
     let input_queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
     let (turn_tx, _turn_rx) = mpsc::channel::<TurnEvent>(256);
@@ -372,7 +325,6 @@ async fn recovered_interactive_task_admission_replays_durable_seed_before_infere
     let mut recovered_driver =
         Driver::with_max_schedules(session.clone(), locks, redact, cwd, root, 8);
     recovered_driver.set_config_handle(recovered_config);
-    recovered_driver.test_providers_override = Some(recovered_providers);
     recovered_driver.set_root_agent_instance_id(root_agent_instance_id);
     let (recovery_updates_tx, _recovery_updates_rx) = tokio::sync::watch::channel(Vec::new());
     let recovery_queue = crate::engine::message::UserSubmissionQueue::new(recovery_updates_tx);
@@ -836,7 +788,6 @@ fn test_driver_with_url_and_grant(
             ),
         ),
     );
-    driver.test_providers_override = Some((pcfg, "lmstudio".into(), "local".into()));
     bind_test_session_root(&mut driver);
     let hub = Arc::new(crate::engine::interrupt::InterruptHub::detached());
     let grant_store = crate::approval::store::GrantStore::new(
@@ -1908,13 +1859,10 @@ async fn unwind_cannot_strand_items_stamped_for_a_dead_child() {
 
     assert_eq!(driver.active_queue_target_id(), "root");
     assert_enqueue_matches_drain(&driver);
-    let got = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        queue.recv_group_order_for(Some("root")),
-    )
-    .await
-    .expect("root wait must observe the adopted item")
-    .expect("item remains dispatchable");
+    let got = queue
+        .recv_group_order_for(Some("root"))
+        .await
+        .expect("item remains dispatchable");
     assert_eq!(got.text, "do not strand");
     assert_eq!(
         got.queue_target.as_ref().map(|target| target.id.as_str()),
@@ -1995,13 +1943,10 @@ async fn live_enqueue_after_adopt_stamps_the_live_frame_not_a_stale_child() {
             .collect::<Vec<_>>(),
         vec!["root"]
     );
-    let got = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        queue.recv_group_order_for(Some("root")),
-    )
-    .await
-    .expect("root wait must observe the live-stamped item")
-    .expect("item remains dispatchable");
+    let got = queue
+        .recv_group_order_for(Some("root"))
+        .await
+        .expect("item remains dispatchable");
     assert_eq!(got.text, "do not strand");
     assert_eq!(
         got.queue_target.as_ref().map(|target| target.id.as_str()),
@@ -2160,7 +2105,7 @@ async fn preflight_rejection_settles_own_id_and_preserves_the_driving_turn_idle(
     }
 }
 
-/// Install a test providers override with the given context thresholds,
+/// Install a provider fixture through the driver's generation-pinned config handle,
 /// cache mode, and the active model's `context_length` so the
 /// auto-prune/auto-compact triggers resolve deterministically.
 fn install_test_providers(
@@ -2233,16 +2178,43 @@ fn install_test_providers(
         }),
         ..ProvidersConfig::default()
     };
-    driver.test_providers_override = Some((cfg.clone(), "lmstudio".into(), "local".into()));
+    install_test_provider_config(driver, cfg);
+}
+
+fn install_test_provider_config(
+    driver: &mut Driver,
+    providers: crate::config::providers::ProvidersConfig,
+) {
     driver.set_config_handle(
         crate::daemon::session_worker::SessionConfigHandle::detached(
             crate::daemon::session_worker::SessionConfigSnapshot::new(
                 driver.config.generation(),
-                cfg,
+                providers,
                 driver.config.extended().clone(),
             ),
         ),
     );
+}
+
+fn edit_test_provider_config(
+    driver: &mut Driver,
+    edit: impl FnOnce(&mut crate::config::providers::ProvidersConfig),
+) {
+    let mut providers = driver.config.providers();
+    edit(&mut providers);
+    install_test_provider_config(driver, providers);
+}
+
+/// Replace a fixture provider endpoint through the real generation-pinned
+/// configuration dependency used by foreground and nested drivers.
+fn set_test_provider_url(driver: &mut Driver, url: String) {
+    let mut providers = driver.config.providers();
+    providers
+        .providers
+        .get_mut("lmstudio")
+        .expect("lmstudio fixture provider is installed")
+        .url = url;
+    install_test_provider_config(driver, providers);
 }
 
 async fn record_test_context_tokens(driver: &Driver, input_tokens: u64) {
@@ -2303,7 +2275,7 @@ fn observe_boundary_registry(
 }
 
 /// Install a hook registry on the driver's turn-pinned config snapshot without
-/// disturbing the test provider override compaction relies on.
+/// disturbing the provider fixture compaction relies on.
 fn inject_hooks(driver: &mut Driver, reg: crate::config::extended::hooks::HookRegistry) {
     driver.set_config_handle(
         crate::daemon::session_worker::SessionConfigHandle::detached(
@@ -2332,17 +2304,21 @@ async fn observe_hook_events(driver: &Driver, event: &str) -> Vec<String> {
 }
 
 async fn wait_for_shadow_brief(driver: &mut Driver) {
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            driver.settle_shadow_brief().await;
-            if matches!(driver.shadow_brief, Some(ShadowBriefState::Ready(_))) {
-                break;
-            }
-            tokio::task::yield_now().await;
+    let state = driver
+        .shadow_brief
+        .take()
+        .expect("fixture shadow brief was started");
+    match state {
+        ShadowBriefState::InFlight(mut task) => {
+            let result = (&mut task.handle).await.ok();
+            driver.publish_shadow_brief_result(task, result).await;
         }
-    })
-    .await
-    .expect("fixture shadow brief should finish");
+        ready @ ShadowBriefState::Ready(_) => driver.shadow_brief = Some(ready),
+    }
+    assert!(matches!(
+        driver.shadow_brief,
+        Some(ShadowBriefState::Ready(_))
+    ));
 }
 
 async fn compact_inference_purposes(driver: &Driver) -> Vec<String> {
@@ -2612,6 +2588,7 @@ fn two_model_providers_config() -> crate::config::providers::ProvidersConfig {
 /// factory production uses.
 fn model_switch_driver() -> (Driver, tempfile::TempDir) {
     let (mut driver, tmp) = test_driver_vnext(1);
+    model_switch::write_two_model_config(tmp.path(), "provider-a", "model-a");
     let cfg = two_model_providers_config();
     // Build model A and root a genuine `Build` primary on it.
     let model_a = Arc::new(
@@ -2627,7 +2604,6 @@ fn model_switch_driver() -> (Driver, tempfile::TempDir) {
         .session
         .set_active_model("provider-a", "model-a")
         .unwrap();
-    driver.test_providers_override = Some((cfg.clone(), "provider-a".into(), "model-a".into()));
     driver.set_config_handle(
         crate::daemon::session_worker::SessionConfigHandle::detached(
             crate::daemon::session_worker::SessionConfigSnapshot::new(

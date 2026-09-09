@@ -249,30 +249,11 @@ impl Drop for WriterInner {
 }
 
 impl Writer {
-    fn start(path: PathBuf) -> Result<Self> {
+    fn start(conn: Connection) -> Result<Self> {
         let (tx, rx) = mpsc::sync_channel::<WriteRequest>(1024);
-        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let join = std::thread::Builder::new()
             .name("cockpit-db-writer".into())
             .spawn(move || -> Result<()> {
-                let conn = match Connection::open(&path)
-                    .with_context(|| format!("opening sqlite writer at {}", path.display()))
-                    .and_then(|conn| {
-                        apply_connection_pragmas(&conn, true).with_context(|| {
-                            format!("setting writer pragmas on {}", path.display())
-                        })?;
-                        Ok(conn)
-                    }) {
-                    Ok(conn) => {
-                        let _ = ready_tx.send(Ok(()));
-                        conn
-                    }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e.to_string()));
-                        return Err(e);
-                    }
-                };
-
                 while let Ok(request) = rx.recv() {
                     let result = catch_unwind(AssertUnwindSafe(|| (request.job)(&conn)))
                         .map_err(|_| anyhow::anyhow!("db writer job panicked"))
@@ -299,18 +280,12 @@ impl Writer {
                 Ok(())
             })
             .context("spawning db writer thread")?;
-        match ready_rx.recv().context("waiting for db writer startup")? {
-            Ok(()) => Ok(Self {
-                inner: Arc::new(WriterInner {
-                    tx: Mutex::new(Some(tx)),
-                    join: Mutex::new(Some(join)),
-                }),
+        Ok(Self {
+            inner: Arc::new(WriterInner {
+                tx: Mutex::new(Some(tx)),
+                join: Mutex::new(Some(join)),
             }),
-            Err(e) => {
-                let _ = join.join();
-                anyhow::bail!(e)
-            }
-        }
+        })
     }
 
     fn submit<F, T>(&self, f: F) -> Result<mpsc::Receiver<Result<Box<dyn Any + Send>>>>
@@ -680,8 +655,11 @@ impl Db {
         reconcile_interrupted_sealed_value_acquisitions(&conn)?;
         timer.phase("migrate");
 
-        drop(conn);
-        let writer = Writer::start(path.to_path_buf())?;
+        // The migrated, pragma-configured connection becomes the writer's
+        // connection. Reopening and reapplying pragmas in a newly scheduled
+        // thread adds no readiness guarantee and can indefinitely delay boot
+        // under CPU contention before the daemon publishes its endpoint.
+        let writer = Writer::start(conn)?;
         let db = Self {
             memory: None,
             writer: Some(writer),

@@ -593,8 +593,13 @@ impl SecureKeyActor {
             .map_err(|e| SecureKeyError::Internal(e.to_string()))?;
 
         let (tx, rx) = mpsc::sync_channel::<Op>(SECURE_KEY_QUEUE_CAPACITY);
-        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), SecureKeyError>>(1);
         let register_on_thread = owns_default_store && injected_store.is_none();
+        let (ready_tx, ready_rx) = if register_on_thread {
+            let (tx, rx) = mpsc::sync_channel::<Result<(), SecureKeyError>>(1);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let join = thread::Builder::new()
             .name("cockpit-secure-key".into())
             .spawn(move || {
@@ -604,18 +609,20 @@ impl SecureKeyActor {
                             Ok(()) => Ok(production_native_store()),
                             Err(e) => Err(e),
                         }
-                    } else if let Some(s) = injected_store {
-                        Ok(s)
                     } else {
-                        Ok(production_native_store())
+                        Ok(injected_store.unwrap_or_else(production_native_store))
                     };
                 let store = match store_result {
                     Ok(s) => {
-                        let _ = ready_tx.send(Ok(()));
+                        if let Some(ready_tx) = ready_tx {
+                            let _ = ready_tx.send(Ok(()));
+                        }
                         s
                     }
                     Err(e) => {
-                        let _ = ready_tx.send(Err(e));
+                        if let Some(ready_tx) = ready_tx {
+                            let _ = ready_tx.send(Err(e));
+                        }
                         return;
                     }
                 };
@@ -626,23 +633,25 @@ impl SecureKeyActor {
         // Wait for actor-thread registration/construct before enqueueing.
         // Use a std channel so this constructor can run from a Tokio worker
         // (daemon boot and #[tokio::test]) without oneshot::blocking_recv.
-        match ready_rx.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                let _ = join.join();
-                if register_on_thread {
-                    unset_default_platform_store();
+        if let Some(ready_rx) = ready_rx {
+            match ready_rx.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    let _ = join.join();
+                    if register_on_thread {
+                        unset_default_platform_store();
+                    }
+                    return Err(e);
                 }
-                return Err(e);
-            }
-            Err(_) => {
-                let _ = join.join();
-                if register_on_thread {
-                    unset_default_platform_store();
+                Err(_) => {
+                    let _ = join.join();
+                    if register_on_thread {
+                        unset_default_platform_store();
+                    }
+                    return Err(SecureKeyError::Internal(
+                        "actor thread died before ready".into(),
+                    ));
                 }
-                return Err(SecureKeyError::Internal(
-                    "actor thread died before ready".into(),
-                ));
             }
         }
 

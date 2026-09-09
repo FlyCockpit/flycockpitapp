@@ -2361,11 +2361,15 @@ async fn run_foreground_inner_with_boot_db(
     let accept = server::run_accept_loop(ctx.clone(), listener);
     let result = accept.await;
 
-    // The accept loop has stopped (a drain began). Ensure the drain is
-    // marked even on the (impossible-by-construction, but defensive) path
-    // where the loop broke without `request_shutdown` having run, so the
-    // new-request gate is definitely closed before we await workers.
-    server::request_shutdown(&ctx);
+    // The accept loop normally stops because `request_shutdown` already began
+    // the drain. Do not call it a second time here: a second request is the
+    // explicit force-stop signal and would cancel the interrupt-park fence we
+    // are about to await. Only initialize the drain on the defensive path
+    // where the accept loop ended without a shutdown request.
+    if ctx.shutdown_signal().begin_drain() {
+        tracing::info!("daemon: graceful drain begun after accept loop exit");
+        ctx.broadcast_global(proto::Event::DaemonDraining { forced: false });
+    }
 
     // Bounded grace, then force. `drain_daemon_context` owns the shared
     // foreground/in-process force timer and result policy, so neither path

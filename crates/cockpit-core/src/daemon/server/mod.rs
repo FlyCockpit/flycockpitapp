@@ -4647,98 +4647,80 @@ pub(crate) async fn boot_with_db(
             crate::host_capabilities::collect_shared_host_probes(&boot_probe_inputs, false).await;
         let db_for_keys = db.clone();
         let keyring_probe = probes.keyring.clone();
-        let (boot_tx, boot_rx) = tokio::sync::oneshot::channel();
-        match std::thread::Builder::new()
-            .name("cockpit-secure-key-boot".into())
-            .spawn(move || {
-                let external = crate::external_journal::keys::ExternalJournalSpoolReconciler::new(
-                    db_for_keys.clone(),
-                );
-                let tool_media =
-                    crate::secure_key::ToolMediaSubjectBindingDbProbe::new(db_for_keys.clone());
-                let reconciler = std::sync::Arc::new(
-                    crate::secure_key::CompositeConsumerReconciler::new(external, tool_media),
-                );
-                let result = crate::secure_key::SecureKeyActor::start_production_resolved(
-                    db_for_keys,
-                    reconciler,
-                    &keyring_probe,
-                    None,
-                    crate::secure_key::SecretStoreInjected::default(),
-                );
-                let _ = boot_tx.send(result);
-            }) {
-            Ok(_handle) => match boot_rx.await {
-                Ok(Ok(actor)) => {
-                    ctx.attach_secure_key_actor(actor);
-                    timer.phase("secure_key_actor");
-                    if let Some(generation) = initial_host_capability_snapshot_generation {
-                        let authority = db
-                            .blocking_write_for_sync_maintenance(
-                                crate::db::secret_vault::load_authority_conn,
-                            )
-                            .ok()
-                            .flatten();
-                        let secret_store = crate::secure_key::project_secret_store_snapshot(
-                            authority.as_ref(),
-                            &probes.keyring,
-                        );
-                        let snapshot = crate::host_capabilities::build_host_capability_snapshot(
-                            generation,
-                            &probes,
-                            secret_store,
-                        );
-                        ctx.host_capabilities
-                            .accept_durable_refresh_reservation(generation)
-                            .map_err(anyhow::Error::msg)
-                            .context("accepting boot host capability generation")?;
-                        ctx.host_capabilities
-                            .publish_committed(snapshot)
-                            .map_err(anyhow::Error::msg)
-                            .context("publishing boot host capability snapshot")?;
-                    }
-                    timer.phase("host_capabilities");
+        let external =
+            crate::external_journal::keys::ExternalJournalSpoolReconciler::new(db_for_keys.clone());
+        let tool_media =
+            crate::secure_key::ToolMediaSubjectBindingDbProbe::new(db_for_keys.clone());
+        let reconciler = std::sync::Arc::new(crate::secure_key::CompositeConsumerReconciler::new(
+            external, tool_media,
+        ));
+        match crate::secure_key::SecureKeyActor::start_production_resolved(
+            db_for_keys,
+            reconciler,
+            &keyring_probe,
+            None,
+            crate::secure_key::SecretStoreInjected::default(),
+        ) {
+            Ok(actor) => {
+                ctx.attach_secure_key_actor(actor);
+                timer.phase("secure_key_actor");
+                if let Some(generation) = initial_host_capability_snapshot_generation {
+                    let authority = db
+                        .blocking_write_for_sync_maintenance(
+                            crate::db::secret_vault::load_authority_conn,
+                        )
+                        .ok()
+                        .flatten();
+                    let secret_store = crate::secure_key::project_secret_store_snapshot(
+                        authority.as_ref(),
+                        &probes.keyring,
+                    );
+                    let snapshot = crate::host_capabilities::build_host_capability_snapshot(
+                        generation,
+                        &probes,
+                        secret_store,
+                    );
+                    ctx.host_capabilities
+                        .accept_durable_refresh_reservation(generation)
+                        .map_err(anyhow::Error::msg)
+                        .context("accepting boot host capability generation")?;
+                    ctx.host_capabilities
+                        .publish_committed(snapshot)
+                        .map_err(anyhow::Error::msg)
+                        .context("publishing boot host capability snapshot")?;
                 }
-                Ok(Err(error)) => {
-                    if let Some(generation) = initial_host_capability_snapshot_generation {
-                        let secret_store = match &error {
-                            crate::secure_key::SecureKeyError::KekUnavailable {
-                                reason,
-                                fix_command,
-                            } => cockpit_proto::SecretStoreSnapshot {
-                                intent: cockpit_proto::SecretStoreIntent::Keyring,
-                                effective_placement:
-                                    cockpit_proto::SecretStorePlacement::Unavailable,
-                                fail_closed_reason: Some(reason.clone()),
-                                fix_command: fix_command.clone(),
-                            },
-                            _ => cockpit_proto::SecretStoreSnapshot::unconfigured_placeholder(),
-                        };
-                        let snapshot = crate::host_capabilities::build_host_capability_snapshot(
-                            generation,
-                            &probes,
-                            secret_store,
-                        );
-                        ctx.host_capabilities
-                            .accept_durable_refresh_reservation(generation)
-                            .map_err(anyhow::Error::msg)
-                            .context("accepting boot host capability generation")?;
-                        ctx.host_capabilities
-                            .publish_committed(snapshot)
-                            .map_err(anyhow::Error::msg)
-                            .context("publishing boot host capability snapshot")?;
-                    }
-                    timer.phase("host_capabilities");
-                    return Err(anyhow::anyhow!("secure key vault: {error}"));
-                }
-                Err(_) => {
-                    return Err(anyhow::anyhow!("secure key actor boot channel dropped"));
-                }
-            },
+                timer.phase("host_capabilities");
+            }
             Err(error) => {
-                return Err(anyhow::anyhow!(
-                    "secure key actor boot thread spawn failed: {error}"
-                ));
+                if let Some(generation) = initial_host_capability_snapshot_generation {
+                    let secret_store = match &error {
+                        crate::secure_key::SecureKeyError::KekUnavailable {
+                            reason,
+                            fix_command,
+                        } => cockpit_proto::SecretStoreSnapshot {
+                            intent: cockpit_proto::SecretStoreIntent::Keyring,
+                            effective_placement: cockpit_proto::SecretStorePlacement::Unavailable,
+                            fail_closed_reason: Some(reason.clone()),
+                            fix_command: fix_command.clone(),
+                        },
+                        _ => cockpit_proto::SecretStoreSnapshot::unconfigured_placeholder(),
+                    };
+                    let snapshot = crate::host_capabilities::build_host_capability_snapshot(
+                        generation,
+                        &probes,
+                        secret_store,
+                    );
+                    ctx.host_capabilities
+                        .accept_durable_refresh_reservation(generation)
+                        .map_err(anyhow::Error::msg)
+                        .context("accepting boot host capability generation")?;
+                    ctx.host_capabilities
+                        .publish_committed(snapshot)
+                        .map_err(anyhow::Error::msg)
+                        .context("publishing boot host capability snapshot")?;
+                }
+                timer.phase("host_capabilities");
+                return Err(anyhow::anyhow!("secure key vault: {error}"));
             }
         }
     }

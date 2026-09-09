@@ -79,11 +79,7 @@ async fn restart_running_daemon_replaces_pid_and_keeps_socket_usable() {
     let daemon = SpawnedDaemon::start().await;
     let old_pid = daemon.pid();
 
-    let output = daemon
-        .command()
-        .args(["daemon", "restart", "--grace", "0"])
-        .output()
-        .expect("daemon restart command");
+    let output = daemon.restart_via_command(0).await;
     assert!(output.status.success(), "{}", output_text(&output));
     assert!(output_text(&output).contains("daemon: restarted"));
 
@@ -97,22 +93,14 @@ async fn restart_running_daemon_replaces_pid_and_keeps_socket_usable() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_when_not_running_starts_daemon() {
     let daemon = SpawnedDaemon::start().await;
-    let stop = daemon
-        .command()
-        .args(["daemon", "stop", "--grace", "0"])
-        .output()
-        .expect("daemon stop command");
+    let stop = daemon.stop_via_command(0);
     assert!(stop.status.success(), "{}", output_text(&stop));
     wait_until("daemon pid cleanup", Duration::from_secs(5), || async {
         daemon.try_pid().is_none()
     })
     .await;
 
-    let output = daemon
-        .command()
-        .args(["daemon", "restart", "--grace", "0"])
-        .output()
-        .expect("daemon restart command");
+    let output = daemon.restart_via_command(0).await;
     assert!(output.status.success(), "{}", output_text(&output));
     assert!(
         output_text(&output).contains("daemon: was not running; started"),

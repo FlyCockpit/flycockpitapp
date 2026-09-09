@@ -234,11 +234,7 @@ async fn daemon_refuses_newer_migration_ledger() {
     // Doctor is read-only and never materializes SQLite. Boot (then stop) a
     // real daemon so the ledger exists before we seed a future migration row.
     let daemon = SpawnedDaemon::start().await;
-    let stop = daemon
-        .command()
-        .args(["daemon", "stop", "--grace", "0"])
-        .output()
-        .expect("stop daemon before seeding newer migration ledger");
+    let stop = daemon.stop_via_command(0);
     assert_success(
         "stop daemon before seeding newer migration ledger",
         &stop,

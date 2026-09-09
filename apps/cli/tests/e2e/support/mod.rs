@@ -306,6 +306,96 @@ impl SpawnedDaemon {
         self.wait_for_handshake().await;
     }
 
+    /// Exercise the product restart command without deadlocking on the exact
+    /// foreground child retained by this harness. The command asks that child
+    /// to exit, while this process (its parent) performs the corresponding
+    /// wait so the product can observe PID release. After proving the detached
+    /// product replacement is usable, normalize it back to an exactly owned
+    /// foreground child for the remainder of the test and unwind cleanup.
+    pub async fn restart_via_command(&self, grace_secs: u64) -> Output {
+        let had_owned_child = self.process.has_current();
+        let grace = grace_secs.to_string();
+        let mut command = self.home.cockpit();
+        let mut command_child = command
+            .args(["daemon", "restart", "--grace", &grace])
+            .env("COCKPIT_LOG", "warn,cockpit::startup=info")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("daemon restart command");
+
+        let owned_child_exited = self
+            .process
+            .reap_while_command_runs(&mut command_child, DAEMON_RESTART_HANDSHAKE_TIMEOUT)
+            .expect("coordinate daemon restart with exact child");
+        let output = command_child
+            .wait_with_output()
+            .expect("wait for daemon restart command");
+        assert!(
+            !had_owned_child || owned_child_exited,
+            "daemon restart command exited before its owned daemon; stdout:\n{}\nstderr:\n{}\nlog tail:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            log_tail(&self.home)
+        );
+        assert_success("daemon restart", &output, &self.home);
+
+        // The command's own detached replacement must publish a usable
+        // endpoint before the harness changes its ownership form.
+        if let Err(debug) =
+            wait_for_status_handshake_result(&self.home, DAEMON_RESTART_HANDSHAKE_TIMEOUT).await
+        {
+            let _ = self
+                .home
+                .cockpit()
+                .args(["daemon", "stop", "--grace", "0"])
+                .output();
+            panic!("timed out waiting for product restart handshake\n{debug}");
+        }
+        let stop = self
+            .home
+            .cockpit()
+            .args(["daemon", "stop", "--grace", "0"])
+            .output()
+            .expect("stop detached restart replacement");
+        assert_success("stop detached restart replacement", &stop, &self.home);
+
+        self.process.replace(spawn_foreground_daemon(&self.home));
+        self.wait_for_handshake().await;
+        output
+    }
+
+    /// Run the product stop command while reaping the exact child from its
+    /// actual parent. Without this wait, the exited child remains a zombie and
+    /// the product command correctly refuses to treat its PID as released.
+    pub fn stop_via_command(&self, grace_secs: u64) -> Output {
+        let grace = grace_secs.to_string();
+        let mut command = self.home.cockpit();
+        let mut command_child = command
+            .args(["daemon", "stop", "--grace", &grace])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("daemon stop command");
+        let owned_child_exited = self
+            .process
+            .reap_while_command_runs(&mut command_child, DAEMON_RESTART_HANDSHAKE_TIMEOUT)
+            .expect("coordinate daemon stop with exact child");
+        command_child
+            .wait_with_output()
+            .map(|output| {
+                assert!(
+                    owned_child_exited,
+                    "daemon stop command exited before its owned daemon; stdout:\n{}\nstderr:\n{}\nlog tail:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                    log_tail(&self.home)
+                );
+                output
+            })
+            .expect("wait for daemon stop command")
+    }
+
     pub fn command(&self) -> Command {
         self.home.cockpit()
     }
@@ -408,27 +498,6 @@ fn spawn_foreground_daemon(home: &IsolatedHome) -> std::process::Child {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     command.spawn().expect("spawn foreground daemon")
-}
-
-impl Drop for SpawnedDaemon {
-    fn drop(&mut self) {
-        let pid = self.try_pid();
-        let _ = self
-            .home
-            .cockpit()
-            .args(["daemon", "stop", "--grace", "0"])
-            .output();
-        #[cfg(unix)]
-        if let Some(pid) = pid
-            && !wait_for_pid_exit_blocking(pid, Duration::from_secs(2))
-        {
-            let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-            let _ = wait_for_pid_exit_blocking(pid, Duration::from_secs(2));
-        }
-        // `process` remains armed. Its Drop is the portable final authority:
-        // kill + wait the exact child before removing lifecycle metadata and
-        // before `home` removes the entire isolated tree.
-    }
 }
 
 pub fn assert_success(label: &str, output: &Output, home: &IsolatedHome) {
@@ -557,6 +626,15 @@ fn handshake_debug(home: &IsolatedHome) -> String {
 }
 
 async fn wait_for_status_handshake(home: &IsolatedHome, timeout: Duration) {
+    if let Err(debug) = wait_for_status_handshake_result(home, timeout).await {
+        panic!("timed out waiting for daemon status handshake\n{debug}");
+    }
+}
+
+async fn wait_for_status_handshake_result(
+    home: &IsolatedHome,
+    timeout: Duration,
+) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     let mut delay = Duration::from_millis(20);
     loop {
@@ -564,13 +642,11 @@ async fn wait_for_status_handshake(home: &IsolatedHome, timeout: Duration) {
             && let Ok(client) = DaemonClient::connect(&home.socket_path()).await
             && client.status().await.is_ok()
         {
-            return;
+            return Ok(());
         }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for daemon status handshake\n{}",
-            handshake_debug(home)
-        );
+        if Instant::now() >= deadline {
+            return Err(handshake_debug(home));
+        }
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(Duration::from_millis(200));
     }
@@ -737,6 +813,53 @@ impl EphemeralDaemonGuard {
         }
         if self.pid_file.exists() {
             let _ = std::fs::remove_file(&self.pid_file);
+        }
+    }
+
+    fn has_current(&self) -> bool {
+        self.child
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
+    }
+
+    fn reap_while_command_runs(
+        &self,
+        command: &mut std::process::Child,
+        timeout: Duration,
+    ) -> std::io::Result<bool> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let owned_exited = {
+                let mut slot = self.child.lock().unwrap_or_else(|error| error.into_inner());
+                match slot.as_mut() {
+                    Some(child) => {
+                        let exited = child.try_wait()?.is_some();
+                        if exited {
+                            slot.take();
+                        }
+                        exited
+                    }
+                    None => return Ok(false),
+                }
+            };
+            if owned_exited {
+                return Ok(true);
+            }
+            if command.try_wait()?.is_some() {
+                self.reap_current();
+                return Ok(false);
+            }
+            if Instant::now() >= deadline {
+                let _ = command.kill();
+                let _ = command.wait();
+                self.reap_current();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "daemon lifecycle command and owned child did not exit",
+                ));
+            }
+            std::thread::yield_now();
         }
     }
 }

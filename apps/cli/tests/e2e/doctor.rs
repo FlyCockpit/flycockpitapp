@@ -22,11 +22,7 @@ async fn reports_amended_migration() {
     // Doctor is read-only and never materializes SQLite. Boot (then stop) a
     // real daemon so the ledger exists, then amend it and re-run doctor.
     let daemon = SpawnedDaemon::start().await;
-    let stop = daemon
-        .command()
-        .args(["daemon", "stop", "--grace", "0"])
-        .output()
-        .unwrap();
+    let stop = daemon.stop_via_command(0);
     assert_success(
         "stop daemon before amending migration ledger",
         &stop,

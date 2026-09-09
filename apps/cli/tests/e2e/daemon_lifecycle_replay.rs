@@ -489,11 +489,7 @@ async fn wait_for_duplicate_resolve_processed(
 }
 
 async fn restart_daemon_gracefully(daemon: &SpawnedDaemon) {
-    let output = daemon
-        .command()
-        .args(["daemon", "restart", "--grace", "2"])
-        .output()
-        .expect("daemon restart command");
+    let output = daemon.restart_via_command(2).await;
     let text = output_text(&output);
     assert!(output.status.success(), "daemon restart failed: {text}");
     assert!(text.contains("daemon: restarted"));
@@ -856,22 +852,14 @@ fn lifecycle_restart_command_preserves_parked_session_and_starts_when_absent() {
         );
         drop(client);
 
-        let stop = daemon
-            .command()
-            .args(["daemon", "stop", "--grace", "0"])
-            .output()
-            .expect("daemon stop command");
+        let stop = daemon.stop_via_command(0);
         assert!(stop.status.success(), "{}", output_text(&stop));
         wait_until("daemon pid cleanup", Duration::from_secs(5), || async {
             daemon.try_pid().is_none()
         })
         .await;
 
-        let restart = daemon
-            .command()
-            .args(["daemon", "restart", "--grace", "0"])
-            .output()
-            .expect("daemon restart command");
+        let restart = daemon.restart_via_command(0).await;
         assert!(restart.status.success(), "{}", output_text(&restart));
         assert!(
             output_text(&restart).contains("daemon: was not running; started"),

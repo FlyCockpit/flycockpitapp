@@ -1124,6 +1124,10 @@ async fn plain_enter_leaves_an_existing_default_untouched() {
 async fn plain_enter_never_establishes_a_first_default() {
     let (mut driver, _tmp) = model_switch_driver();
     edit_model_switch_config(&mut driver, |cfg| cfg.active_model = None);
+    assert!(
+        driver.session.active_model_ref().is_none(),
+        "installing a provider snapshot without an active model must clear the session mirror too"
+    );
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
 
     driver

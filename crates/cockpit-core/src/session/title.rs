@@ -65,21 +65,19 @@ impl Session {
         if let Some(consumed) = consumed_time_prelude {
             *self.retracted_time_prelude.lock().unwrap() = Some(consumed);
         }
-        if outcome.title_progress_restored {
-            if generated_title.is_some() {
-                *self.title.lock().unwrap() = snapshot.title.clone();
-            }
-            self.user_content_tokens
-                .store(snapshot.user_content_tokens, Ordering::Relaxed);
-            self.user_content_turns
-                .store(snapshot.user_content_turns, Ordering::Relaxed);
-            self.title_stage
-                .store(snapshot.title_stage, Ordering::Relaxed);
-            self.title_nudge_slot_pending
-                .store(snapshot.title_nudge_slot_pending, Ordering::Relaxed);
-            self.title_failure_noticed
-                .store(snapshot.title_failure_noticed, Ordering::Relaxed);
+        if outcome.title_restored {
+            *self.title.lock().unwrap() = snapshot.title.clone();
         }
+        self.user_content_tokens
+            .store(snapshot.user_content_tokens, Ordering::Relaxed);
+        self.user_content_turns
+            .store(snapshot.user_content_turns, Ordering::Relaxed);
+        self.title_stage
+            .store(snapshot.title_stage, Ordering::Relaxed);
+        self.title_nudge_slot_pending
+            .store(snapshot.title_nudge_slot_pending, Ordering::Relaxed);
+        self.title_failure_noticed
+            .store(snapshot.title_failure_noticed, Ordering::Relaxed);
         Ok(true)
     }
 
@@ -642,6 +640,59 @@ mod metadata_tests {
             crate::db::sessions::TitleRecoveryNudgeState::None
         );
         assert!(session.claim_title_failure_notice());
+    }
+
+    #[tokio::test]
+    async fn retract_restores_progress_when_concurrent_manual_rename_wins_title_cas() {
+        let session = Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            PathBuf::from("/title-retract-rename-race"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let snapshot = session.title_progress_snapshot().await.unwrap();
+        assert_eq!(
+            session.note_user_content("cancelled prompt"),
+            TitleAction::Eager
+        );
+        assert!(session.set_auto_title("generated-title").unwrap());
+        let seq = session
+            .db
+            .insert_session_event(
+                session.id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &serde_json::json!({"text": "cancelled prompt"}),
+            )
+            .await
+            .unwrap();
+
+        session
+            .db
+            .rename_session(session.id, "manual-title")
+            .await
+            .unwrap();
+        assert!(
+            session
+                .retract_latest_user_message(seq, snapshot, Some("generated-title"))
+                .await
+                .unwrap()
+        );
+
+        let durable = session.db.get_session(session.id).await.unwrap().unwrap();
+        assert_eq!(durable.title.as_deref(), Some("manual-title"));
+        assert!(durable.user_renamed);
+        assert_eq!(durable.user_content_tokens, 0);
+        assert_eq!(durable.title_stage, 0);
+        assert_eq!(
+            durable.title_recovery_nudge_state,
+            crate::db::sessions::TitleRecoveryNudgeState::None
+        );
+        assert_eq!(session.user_content_tokens(), 0);
+        assert_eq!(session.user_content_turns(), 0);
+        assert_eq!(session.title_stage(), 0);
     }
 
     #[tokio::test]

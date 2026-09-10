@@ -8336,22 +8336,18 @@ mod tests {
 
     async fn wait_for_open_image_generation_interrupt(
         ctx: &crate::engine::tool::ToolCtx,
+        raised: &mut tokio::sync::mpsc::UnboundedReceiver<Uuid>,
     ) -> crate::db::needs_attention::NeedsAttentionRow {
-        loop {
-            let open = ctx
-                .session
-                .db
-                .list_open_interrupts(ctx.session.id)
-                .await
-                .unwrap();
-            if let Some(interrupt) = open
-                .iter()
-                .find(|interrupt| ctx.interrupts.has_waiter(interrupt.interrupt_id))
-            {
-                return interrupt.clone();
-            }
-            tokio::task::yield_now().await;
-        }
+        let interrupt_id = raised
+            .recv()
+            .await
+            .expect("image generation approval publishes its exact interrupt identity");
+        ctx.session
+            .db
+            .get_interrupt(interrupt_id)
+            .await
+            .unwrap()
+            .unwrap()
     }
 
     /// A parked session Allow must survive an unrelated session-generation bump
@@ -8367,7 +8363,32 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let output = root.path().join("out");
         std::fs::create_dir(&output).unwrap();
-        let (ctx, db) = crate::tools::common::test_ctx_with_db(root.path());
+        let (mut ctx, db) = crate::tools::common::test_ctx_with_db(root.path());
+        let owner = db
+            .ensure_session_root_agent(
+                ctx.session.id,
+                None,
+                crate::agent_tree::workspace_ref_for_host_path(root.path()).unwrap(),
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap();
+        let owner = match db
+            .transition_agent_instance(
+                ctx.session.id,
+                owner.agent_instance_id,
+                owner.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                r#"{"state":"running"}"#,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap()
+        {
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(owner) => owner,
+            outcome => panic!("image dispatch fixture root did not start: {outcome:?}"),
+        };
+        ctx.agent_instance_id = Some(owner.agent_instance_id);
         ctx.session
             .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
 
@@ -8435,20 +8456,49 @@ mod tests {
             .clone();
         let session = ctx.session.clone();
 
-        let dispatch = service.dispatch_generate_image(&session, approver.as_ref(), &args);
+        let mut raised = ctx.interrupts.subscribe_raised();
+        let dispatch = crate::engine::interrupt::with_host_approval_effect_scope(
+            "image_generation_dispatch_test",
+            tokio_util::sync::CancellationToken::new(),
+            service.dispatch_generate_image(&session, approver.as_ref(), &args),
+            |_| Some(true),
+        );
         let bump_then_allow = async {
-            let interrupt = wait_for_open_image_generation_interrupt(&ctx).await;
+            let interrupt = wait_for_open_image_generation_interrupt(&ctx, &mut raised).await;
             service
                 .publish_identity_stable_generation_for_test(99)
                 .await;
             let response = crate::daemon::proto::ResolveResponse::Single {
                 selected_id: crate::approval::ID_APPROVE_SESSION.to_string(),
             };
-            ctx.session
+            let decision = ctx
+                .session
                 .db
-                .resolve_interrupt(interrupt.interrupt_id, &response)
+                .decision_request_for_interrupt(ctx.session.id, interrupt.interrupt_id)
+                .await
+                .unwrap()
+                .expect("image generation dispatch prompt is lifecycle-bound");
+            let response_json = serde_json::to_string(&response).unwrap();
+            let settlement = crate::agent_tree::AgentTreeLifecycle::new(ctx.session.db.clone())
+                .resolve_host_approval(
+                    ctx.session.id,
+                    decision.decision_request_id,
+                    interrupt.interrupt_id,
+                    &response_json,
+                    crate::agent_tree::HostApprovalAuthority::for_durable_interrupt_binding(
+                        ctx.session.id,
+                        &decision,
+                        &interrupt,
+                    )
+                    .unwrap(),
+                    crate::agent_tree::system_now_unix_ms(),
+                )
                 .await
                 .unwrap();
+            assert!(matches!(
+                settlement,
+                crate::agent_tree::DecisionSettlement::Resolved(_)
+            ));
             assert!(ctx.interrupts.resolve(interrupt.interrupt_id, response));
         };
         let (outcome, _) = tokio::join!(dispatch, bump_then_allow);

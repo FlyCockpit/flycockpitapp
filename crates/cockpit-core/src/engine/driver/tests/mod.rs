@@ -2185,12 +2185,10 @@ fn install_test_provider_config(
     driver: &mut Driver,
     providers: crate::config::providers::ProvidersConfig,
 ) {
-    if let Some(selection) = providers.active_model.clone() {
-        driver
-            .session
-            .set_active_model_ref(selection)
-            .expect("fixture active model is installed through session state");
-    }
+    driver
+        .session
+        .set_active_model_selection(providers.active_model.clone())
+        .expect("fixture model selection is installed through session state");
     driver.set_config_handle(
         crate::daemon::session_worker::SessionConfigHandle::detached(
             crate::daemon::session_worker::SessionConfigSnapshot::new(

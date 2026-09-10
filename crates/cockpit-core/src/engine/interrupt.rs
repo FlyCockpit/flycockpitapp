@@ -1687,6 +1687,26 @@ impl InterruptHub {
     /// tool whose future is cancelled (e.g. the worker shuts down) never
     /// leaves a dangling sender.
     pub fn register(&self, interrupt_id: Uuid) -> PendingInterrupt<'_> {
+        self.register_inner(interrupt_id, None)
+    }
+
+    /// Register the exact durable interrupt continuation. `PendingInterrupt`
+    /// reconciles this row before blocking, closing the persist-before-register
+    /// window without polling or weakening the in-memory identity rendezvous.
+    fn register_durable(
+        &self,
+        db: &crate::db::Db,
+        session_id: Uuid,
+        interrupt_id: Uuid,
+    ) -> PendingInterrupt<'_> {
+        self.register_inner(interrupt_id, Some((db.clone(), session_id)))
+    }
+
+    fn register_inner(
+        &self,
+        interrupt_id: Uuid,
+        durable: Option<(crate::db::Db, Uuid)>,
+    ) -> PendingInterrupt<'_> {
         let (tx, rx) = oneshot::channel();
         lock_or_recover(&self.waiters).insert(interrupt_id, tx);
         let mut registered = lock_or_recover(&self.registered_interrupts);
@@ -1702,6 +1722,7 @@ impl InterruptHub {
         PendingInterrupt {
             hub: self,
             interrupt_id,
+            durable,
             rx: Some(rx),
         }
     }
@@ -2013,6 +2034,11 @@ pub struct ParkSweep {
 pub struct PendingInterrupt<'a> {
     hub: &'a InterruptHub,
     interrupt_id: Uuid,
+    /// Durable row identity used to reconcile a terminal write that committed
+    /// before this exact in-memory waiter was registered. The database clone
+    /// owns no lock from the hub; `wait` reads it only after registration, so
+    /// the ordering is waiter insert -> durable read -> oneshot await.
+    durable: Option<(crate::db::Db, Uuid)>,
     /// `Option` so [`Self::wait`] can take the receiver out of `self`
     /// without fighting the `Drop` guard (a `Drop` type can't be moved
     /// out of field-by-field).
@@ -2040,11 +2066,150 @@ impl PendingInterrupt<'_> {
     /// as parked: teardown must never auto-answer or auto-cancel a row.
     pub async fn wait(mut self) -> InterruptOutcome {
         let rx = self.rx.take().expect("wait called once");
+        if let Some((db, session_id)) = &self.durable {
+            match db.get_interrupt(self.interrupt_id).await {
+                Ok(Some(row)) if row.session_id == *session_id => match row.state {
+                    crate::db::needs_attention::InterruptState::Resolved
+                    | crate::db::needs_attention::InterruptState::Executing => {
+                        if let Some(response) = row.response {
+                            return InterruptOutcome::Resolved(response);
+                        }
+                        tracing::warn!(
+                            interrupt_id = %self.interrupt_id,
+                            state = ?row.state,
+                            "durable terminal interrupt lacks its response; parking waiter"
+                        );
+                        return InterruptOutcome::Parked;
+                    }
+                    crate::db::needs_attention::InterruptState::Parked
+                    | crate::db::needs_attention::InterruptState::Interrupted => {
+                        return InterruptOutcome::Parked;
+                    }
+                    crate::db::needs_attention::InterruptState::Open => {}
+                },
+                Ok(Some(row)) => {
+                    tracing::warn!(
+                        interrupt_id = %self.interrupt_id,
+                        expected_session_id = %session_id,
+                        actual_session_id = %row.session_id,
+                        "refusing to reconcile interrupt waiter across session identity"
+                    );
+                    return InterruptOutcome::Parked;
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        interrupt_id = %self.interrupt_id,
+                        expected_session_id = %session_id,
+                        "durable interrupt disappeared before waiter reconciliation; parking waiter"
+                    );
+                    return InterruptOutcome::Parked;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        interrupt_id = %self.interrupt_id,
+                        "loading durable interrupt while registering waiter failed"
+                    );
+                    return InterruptOutcome::Parked;
+                }
+            }
+        }
         match rx.await {
             Ok(outcome) => outcome,
             Err(_) => InterruptOutcome::Parked,
         }
     }
+}
+
+/// Settle the exact host-approval interrupt whose production raise boundary
+/// has published its identity. Test fixtures subscribe before starting the
+/// producer, so observing this UUID proves waiter registration, durable
+/// decision binding, and publication in the same order as a real client.
+#[cfg(test)]
+pub(crate) async fn settle_published_host_approval_for_test(
+    db: &crate::db::Db,
+    session_id: Uuid,
+    hub: &InterruptHub,
+    raised: &mut tokio::sync::mpsc::UnboundedReceiver<Uuid>,
+    response: ResolveResponse,
+) -> anyhow::Result<crate::db::db::needs_attention::NeedsAttentionRow> {
+    let interrupt_id = raised
+        .recv()
+        .await
+        .context("host approval producer ended before publishing its interrupt identity")?;
+    let interrupt = db
+        .get_interrupt(interrupt_id)
+        .await
+        .context("loading published host approval interrupt")?
+        .context("published host approval lost its durable attention row")?;
+    anyhow::ensure!(
+        interrupt.session_id == session_id,
+        "published host approval belongs to a different session"
+    );
+    anyhow::ensure!(
+        hub.has_waiter(interrupt_id),
+        "published host approval has no registered continuation"
+    );
+    let decision = db
+        .decision_request_for_interrupt(session_id, interrupt_id)
+        .await
+        .context("loading published host approval lifecycle decision")?
+        .context("published host approval is not bound to a lifecycle decision")?;
+    let offered = interrupt
+        .questions
+        .clone()
+        .or_else(|| {
+            interrupt
+                .question
+                .clone()
+                .map(|question| InterruptQuestionSet {
+                    questions: vec![question],
+                })
+        })
+        .context("published host approval has no offered question set")?;
+    let response = crate::approval::normalize_host_approval_response(&response, &offered);
+    let envelope =
+        serde_json::to_string(&response).context("serializing published host approval response")?;
+    let lifecycle = crate::agent_tree::AgentTreeLifecycle::new(db.clone());
+    let settlement = if crate::approval::host_approval_response_allows(&response, &offered) {
+        lifecycle
+            .resolve_host_approval(
+                session_id,
+                decision.decision_request_id,
+                interrupt_id,
+                &envelope,
+                crate::agent_tree::HostApprovalAuthority::for_durable_interrupt_binding(
+                    session_id, &decision, &interrupt,
+                )
+                .unwrap(),
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+    } else if crate::approval::host_approval_response_declines(&response, &offered) {
+        lifecycle
+            .cancel_host_approval(
+                session_id,
+                decision.decision_request_id,
+                interrupt_id,
+                &envelope,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+    } else {
+        anyhow::bail!("published host approval response is not an offered allow or decline option");
+    }?;
+    anyhow::ensure!(
+        matches!(
+            settlement,
+            crate::agent_tree::DecisionSettlement::Resolved(_)
+        ),
+        "published host approval did not win terminal settlement"
+    );
+    anyhow::ensure!(
+        hub.resolve(interrupt_id, response),
+        "published host approval continuation was not live at delivery"
+    );
+    Ok(interrupt)
 }
 
 impl Drop for PendingInterrupt<'_> {
@@ -2178,7 +2343,7 @@ async fn raise_and_wait_legacy(
             return InterruptOutcome::Resolved(ResolveResponse::Cancel);
         }
     };
-    let pending = interrupts.register(interrupt_id);
+    let pending = interrupts.register_durable(db, session_id, interrupt_id);
     interrupts
         .emit_raised(session_id, interrupt_id, agent, description, set.clone())
         .await;
@@ -2285,9 +2450,10 @@ async fn abort_unbound_host_capability_refresh_initialization(
 /// first, registers the existing continuation before any lifecycle delivery can
 /// settle it, binds that *same* Attention row to the requesting agent's durable
 /// decision, and then emits through the unchanged InterruptHub continuation.
-/// An ownerless caller on an isolated hub retains the historical interrupt
-/// path. A daemon-owned hub is identified by its live-session binding, and an
-/// ownerless host effect on that hub always fails closed.
+/// Only an ownerless user question may retain the historical interrupt path.
+/// Every host-affecting decision requires a durable AgentTree owner regardless
+/// of how the hub was constructed; hub topology is transport state, not
+/// authority.
 pub(crate) async fn raise_and_wait_with_agent_tree(
     db: &crate::db::Db,
     interrupts: &InterruptHub,
@@ -2552,18 +2718,15 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
         return InterruptOutcome::Resolved(response);
     }
     // The normal turn dispatcher is intentionally usable by lightweight
-    // helpers and the standalone shim too. Those callers deliberately use a
-    // hub without a daemon-owned live-session binding and have no AgentTree
-    // owner, so retain their single historical interrupt route. A daemon hub
-    // always carries `live_session`; host effects reaching it without a typed
-    // owner fail closed instead of silently creating a parallel decision path.
+    // helpers and the standalone shim too, but hub construction is never an
+    // authority fact. Retain the legacy route only for user questions. Every
+    // host-affecting subject must bind to a durable AgentTree owner before an
+    // interrupt is raised, on detached, standalone, and daemon hubs alike.
     let Some(agent_instance_id) = agent_instance_id else {
-        if interrupts.live_session.is_none()
-            || matches!(
-                &decision_subject,
-                crate::agent_tree::HostDecisionSubject::UserQuestion
-            )
-        {
+        if matches!(
+            &decision_subject,
+            crate::agent_tree::HostDecisionSubject::UserQuestion
+        ) {
             return raise_and_wait_legacy(
                 db,
                 interrupts,
@@ -2649,7 +2812,7 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
     // binding exists, so its terminal projection can never beat this waiter
     // and strand the original tool call. Every failure below drops this guard,
     // which removes the registry entry and leaves no synthetic continuation.
-    let pending = interrupts.register(interrupt_id);
+    let pending = interrupts.register_durable(db, interrupt_session_id, interrupt_id);
     let host_operation = decision_subject.host_approval_operation().cloned();
     let host_operation_id = host_operation
         .as_ref()
@@ -2960,8 +3123,85 @@ mod tests {
         )
     }
 
+    async fn assert_ownerless_host_approval_fails_closed(hub: &InterruptHub) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = std::sync::Arc::new(
+            crate::session::Session::create_for_test(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "builder",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let subjects = [
+            crate::agent_tree::HostDecisionSubject::HostApproval {
+                operation: crate::agent_tree::HostApprovalOperation::new(
+                    "ownerless-test-effect",
+                    serde_json::json!({"command": "printf forbidden"}),
+                )
+                .unwrap(),
+            },
+            crate::agent_tree::HostDecisionSubject::HostEffect(
+                crate::agent_tree::HostEffectClass::ExternalAction,
+            ),
+        ];
+        for subject in subjects {
+            let outcome = raise_and_wait_with_agent_tree(
+                &db,
+                hub,
+                session.id,
+                "builder",
+                None,
+                "ownerless host effect",
+                question_set(),
+                subject,
+                "ownerless host effect test",
+            )
+            .await;
+
+            assert!(matches!(
+                outcome,
+                InterruptOutcome::Resolved(ResolveResponse::Cancel)
+            ));
+        }
+        assert!(
+            db.list_open_interrupts(session.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "ownerless host effects must not fall back to a legacy prompt"
+        );
+    }
+
     #[tokio::test]
-    async fn ownerless_host_approval_fails_closed_without_raising_legacy_interrupt() {
+    async fn ownerless_host_approval_fails_closed_on_detached_hub() {
+        assert_ownerless_host_approval_fails_closed(&InterruptHub::detached()).await;
+    }
+
+    #[tokio::test]
+    async fn ownerless_host_approval_fails_closed_on_constructed_non_daemon_hub() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("project", "/repo", "builder")
+            .await
+            .unwrap();
+        let (events, _events_rx) = tokio::sync::broadcast::channel(4);
+        let hub = InterruptHub::new(
+            events,
+            std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(
+                crate::redact::RedactionTable::empty(),
+            ))),
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            db,
+            session.session_id,
+        );
+        assert_ownerless_host_approval_fails_closed(&hub).await;
+    }
+
+    #[tokio::test]
+    async fn ownerless_host_approval_fails_closed_on_daemon_hub() {
         let tmp = tempfile::tempdir().unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = std::sync::Arc::new(
@@ -2980,40 +3220,11 @@ mod tests {
                 crate::redact::RedactionTable::empty(),
             ))),
             std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
-            db.clone(),
+            db,
             session.id,
         )
-        .with_live_session(session.clone());
-        let operation = crate::agent_tree::HostApprovalOperation::new(
-            "ownerless-test-effect",
-            serde_json::json!({"command": "printf forbidden"}),
-        )
-        .unwrap();
-
-        let outcome = raise_and_wait_with_agent_tree(
-            &db,
-            &hub,
-            session.id,
-            "builder",
-            None,
-            "ownerless host approval",
-            question_set(),
-            crate::agent_tree::HostDecisionSubject::HostApproval { operation },
-            "ownerless host approval test",
-        )
-        .await;
-
-        assert!(matches!(
-            outcome,
-            InterruptOutcome::Resolved(ResolveResponse::Cancel)
-        ));
-        assert!(
-            db.list_open_interrupts(session.id)
-                .await
-                .unwrap()
-                .is_empty(),
-            "ownerless host effects must not fall back to a legacy prompt"
-        );
+        .with_live_session(session);
+        assert_ownerless_host_approval_fails_closed(&hub).await;
     }
 
     #[tokio::test]
@@ -3209,6 +3420,118 @@ mod tests {
         assert!(
             matches!(got, InterruptOutcome::Resolved(ResolveResponse::Single { selected_id }) if selected_id == "y")
         );
+    }
+
+    #[tokio::test]
+    async fn durable_registration_reconciles_resolution_that_preceded_waiter() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let hub = InterruptHub::detached();
+        let id = db
+            .raise_interrupt_questions(session.session_id, "a", "first", &question_set())
+            .await
+            .unwrap();
+        let response = ResolveResponse::Single {
+            selected_id: "settled-before-register".into(),
+        };
+
+        // This is the legacy race: the durable row settles after raise has
+        // committed but before its in-memory continuation is registered, so
+        // the resolver's hub delivery necessarily observes no waiter.
+        db.resolve_interrupt(id, &response).await.unwrap();
+        assert!(!hub.resolve(id, response.clone()));
+        let pending = hub.register_durable(&db, session.session_id, id);
+
+        assert!(matches!(
+            pending.wait().await,
+            InterruptOutcome::Resolved(ResolveResponse::Single { selected_id })
+                if selected_id == "settled-before-register"
+        ));
+        assert!(!hub.has_waiter(id));
+    }
+
+    #[tokio::test]
+    async fn durable_registration_reconciles_park_that_preceded_waiter() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let hub = InterruptHub::detached();
+        let id = db
+            .raise_interrupt_questions(session.session_id, "a", "first", &question_set())
+            .await
+            .unwrap();
+
+        assert!(db.park_interrupt(id).await.unwrap());
+        let pending = hub.register_durable(&db, session.session_id, id);
+
+        assert!(matches!(pending.wait().await, InterruptOutcome::Parked));
+        assert!(!hub.has_waiter(id));
+    }
+
+    #[tokio::test]
+    async fn durable_registration_parks_when_exact_row_is_missing() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let hub = InterruptHub::detached();
+        let id = Uuid::new_v4();
+
+        let pending = hub.register_durable(&db, session.session_id, id);
+
+        assert!(matches!(pending.wait().await, InterruptOutcome::Parked));
+        assert!(!hub.has_waiter(id));
+    }
+
+    #[tokio::test]
+    async fn durable_registration_parks_when_terminal_row_lacks_response() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let hub = InterruptHub::detached();
+        let id = db
+            .raise_interrupt_questions(session.session_id, "a", "first", &question_set())
+            .await
+            .unwrap();
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE needs_attention
+                    SET state='resolved', resolved_at=1, response_json=NULL
+                  WHERE interrupt_id=?1",
+                [id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let pending = hub.register_durable(&db, session.session_id, id);
+
+        assert!(matches!(pending.wait().await, InterruptOutcome::Parked));
+        assert!(!hub.has_waiter(id));
+    }
+
+    #[tokio::test]
+    async fn durable_registration_parks_when_durable_row_is_malformed() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let hub = InterruptHub::detached();
+        let id = db
+            .raise_interrupt_questions(session.session_id, "a", "first", &question_set())
+            .await
+            .unwrap();
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE needs_attention
+                    SET state='resolved', resolved_at=1, response_json='{}'
+                  WHERE interrupt_id=?1",
+                [id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let pending = hub.register_durable(&db, session.session_id, id);
+
+        assert!(matches!(pending.wait().await, InterruptOutcome::Parked));
+        assert!(!hub.has_waiter(id));
     }
 
     #[test]

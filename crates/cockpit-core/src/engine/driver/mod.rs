@@ -184,9 +184,6 @@ pub enum DriverControl {
             std::result::Result<Vec<RecoveredNoninteractiveResolverEndpoint>, String>,
         >,
     },
-    #[cfg(test)]
-    #[allow(dead_code)]
-    AbortForTest,
     /// Ask the driver to deliver send-now items at the next safe boundary.
     /// Never cancels an in-flight tool; backgroundable tools (`bash`) observe
     /// the queue escalation directly and transfer their process waiter to
@@ -404,17 +401,6 @@ pub enum DriverControl {
     SetTandemModels {
         targets: Vec<crate::engine::schedule::TandemTarget>,
     },
-}
-
-/// Observation of the readiness guards owned by one driver-loop boundary.
-///
-/// This is deliberately an observation-only surface: publishing is
-/// best-effort and a missing or dropped observer cannot influence scheduling.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DriverLoopBoundaryObservation {
-    sequence: u64,
-    human_input_already_ready: bool,
-    assistant_inbox_idle_poll_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1562,11 +1548,6 @@ pub struct Driver {
     /// substantive turn also shadows its assembled request to each tandem
     /// model via the single job authority ([`Self::run_user_input`]).
     tandem_set: crate::engine::schedule::TandemSet,
-    /// Optional single-owner observer for driver-loop boundary readiness.
-    /// The unbounded send is non-blocking and failures are intentionally
-    /// ignored, keeping this surface observational in every build.
-    loop_boundary_observer: Option<mpsc::UnboundedSender<DriverLoopBoundaryObservation>>,
-    loop_boundary_sequence: u64,
     #[cfg(test)]
     test_fail_next_active_model_session_persist: bool,
     #[cfg(test)]
@@ -2498,8 +2479,6 @@ impl Driver {
             pending_swap_marker_from: None,
             tool_call_owner: self.tool_call_owner.clone(),
             tandem_set: self.tandem_set.clone(),
-            loop_boundary_observer: None,
-            loop_boundary_sequence: 0,
             #[cfg(test)]
             test_fail_next_active_model_session_persist: self
                 .test_fail_next_active_model_session_persist,
@@ -2893,8 +2872,6 @@ impl Driver {
             pending_swap_marker_from: None,
             tool_call_owner: std::collections::HashMap::new(),
             tandem_set: crate::engine::schedule::TandemSet::default(),
-            loop_boundary_observer: None,
-            loop_boundary_sequence: 0,
             #[cfg(test)]
             test_fail_next_active_model_session_persist: false,
             #[cfg(test)]
@@ -3556,14 +3533,6 @@ impl Driver {
 
     pub fn set_assistant_identity_prefix(&mut self, prefix: Option<String>) {
         self.assistant_identity_prefix = prefix;
-    }
-
-    fn set_loop_boundary_observer(
-        &mut self,
-        observer: Option<mpsc::UnboundedSender<DriverLoopBoundaryObservation>>,
-    ) {
-        self.loop_boundary_observer = observer;
-        self.loop_boundary_sequence = 0;
     }
 
     /// Install the daemon-owned local installation mapping captured at root
@@ -6036,29 +6005,6 @@ impl Driver {
             // history or run a turn). Compact/Prune controls already defer
             // on the same predicate; auto-compact and prune-after-switch
             // must not bypass it.
-            let clear_boundary_observer = if let Some(observer) = &self.loop_boundary_observer {
-                let observation = DriverLoopBoundaryObservation {
-                    sequence: self.loop_boundary_sequence,
-                    human_input_already_ready,
-                    assistant_inbox_idle_poll_enabled: !waiting_for_keep_parked_siblings
-                        && !human_input_already_ready,
-                };
-                if observer.send(observation).is_ok() {
-                    if let Some(next) = self.loop_boundary_sequence.checked_add(1) {
-                        self.loop_boundary_sequence = next;
-                        false
-                    } else {
-                        true
-                    }
-                } else {
-                    true
-                }
-            } else {
-                false
-            };
-            if clear_boundary_observer {
-                self.set_loop_boundary_observer(None);
-            }
             tokio::select! {
                 biased;
                 msg = input_queue.recv_group_order_for(Some(&active_target_id)),
@@ -6143,10 +6089,6 @@ impl Driver {
                         // under a long turn it cannot fire until that turn
                         // ends, so a caller that waited for it here would be
                         // measuring turn length, not worker health.
-                        #[cfg(test)]
-                        Some(DriverControl::AbortForTest) => {
-                            anyhow::bail!("driver abort requested for test");
-                        }
                         Some(control) => {
                             self.run_control_with_input_queue(control, &input_queue, tx)
                                 .await
@@ -6660,8 +6602,6 @@ impl Driver {
             return;
         }
         match control {
-            #[cfg(test)]
-            DriverControl::AbortForTest => unreachable!("handled before run_control"),
             DriverControl::WakeGoal => {
                 if let Err(error) = self.maybe_continue_active_goal(input_queue, tx).await {
                     tracing::warn!(%error, "waking supervised goal failed");

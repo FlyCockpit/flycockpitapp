@@ -501,23 +501,13 @@ async fn assistant_inbox_timer_yields_to_ready_human_input() {
 
     let (queue, tx, mut rx) = event_harness();
     let target = driver.active_queue_target();
-    let (boundary_tx, mut boundary_rx) = mpsc::unbounded_channel();
-    driver.set_loop_boundary_observer(Some(boundary_tx));
     let (control_tx, control_rx) = mpsc::channel(1);
     let run_queue = queue.clone();
     let run_tx = tx.clone();
     let run =
         tokio::spawn(async move { driver.run_main_loop(run_queue, control_rx, &run_tx).await });
 
-    assert_eq!(
-        boundary_rx.recv().await,
-        Some(DriverLoopBoundaryObservation {
-            sequence: 0,
-            human_input_already_ready: false,
-            assistant_inbox_idle_poll_enabled: true,
-        }),
-        "the initial boundary establishes this observer's sequence"
-    );
+    synchronize_driver_idle(&control_tx).await;
     queue
         .requeue_front_after(
             UserSubmission::text("HUMAN_TIMER_MARKER"),
@@ -534,19 +524,9 @@ async fn assistant_inbox_timer_yields_to_ready_human_input() {
         "the delayed human submission must not disable the idle timer arm before its deadline"
     );
 
-    // Force re-entry after enqueuing, then await the producer-owned readiness
-    // snapshot emitted after every guard is computed and immediately before
-    // the select. Sequence 1 cannot be satisfied by the initial boundary.
-    synchronize_driver_idle(&control_tx).await;
-    assert_eq!(
-        boundary_rx.recv().await,
-        Some(DriverLoopBoundaryObservation {
-            sequence: 1,
-            human_input_already_ready: false,
-            assistant_inbox_idle_poll_enabled: true,
-        }),
-        "the deferred human item leaves the idle timer enabled at t0"
-    );
+    // The idle control receipt proves the production loop is selecting before
+    // the delayed item is queued. At the paused-clock deadline both the queue
+    // receive and inbox interval are ready; biased foreground input must win.
     tokio::time::advance(Duration::from_millis(250)).await;
     let request = provider.next_request_ready().await;
     synchronize_driver_idle(&control_tx).await;
@@ -568,14 +548,10 @@ async fn assistant_inbox_timer_yields_to_ready_human_input() {
         "the inbox is folded at the human turn boundary instead of starting a timer turn"
     );
 
-    control_tx.send(DriverControl::AbortForTest).await.unwrap();
-    let result = run.await.expect("driver task joins");
-    assert!(
-        result
-            .expect_err("test abort terminates the driver")
-            .to_string()
-            .contains("driver abort requested for test")
-    );
+    drop(control_tx);
+    run.await
+        .expect("driver task joins")
+        .expect("control channel shutdown terminates the idle driver");
 }
 
 #[tokio::test(start_paused = true)]
@@ -627,7 +603,14 @@ async fn simultaneously_ready_human_input_wins_before_control() {
         .push(UserSubmission::text("SIMULTANEOUS_HUMAN"), target)
         .await;
     let (control_tx, control_rx) = mpsc::channel(1);
-    control_tx.send(DriverControl::AbortForTest).await.unwrap();
+    let (respond_to, receipt) = tokio::sync::oneshot::channel();
+    control_tx
+        .send(DriverControl::SwapPrimary {
+            name: "Build".to_string(),
+            respond_to,
+        })
+        .await
+        .unwrap();
 
     let run = tokio::spawn(async move { driver.run_main_loop(queue, control_rx, &tx).await });
     let request = provider.next_request_ready().await;
@@ -639,13 +622,14 @@ async fn simultaneously_ready_human_input_wins_before_control() {
     assert!(prompt.contains("SIMULTANEOUS_HUMAN"));
 
     response_gate.add_permits(1);
-    let result = run.await.expect("driver task joins");
-    assert!(
-        result
-            .expect_err("queued control runs after the human turn")
-            .to_string()
-            .contains("driver abort requested for test")
-    );
+    receipt
+        .await
+        .expect("queued control runs after the human turn")
+        .expect("reselecting the current primary is a no-op");
+    drop(control_tx);
+    run.await
+        .expect("driver task joins")
+        .expect("control channel shutdown terminates the idle driver");
 }
 
 #[tokio::test(start_paused = true)]
@@ -660,7 +644,7 @@ async fn assistant_inbox_timer_yields_to_ready_control() {
 
     let (queue, tx, _rx) = event_harness();
     let (control_tx, control_rx) = mpsc::channel(1);
-    control_tx.send(DriverControl::AbortForTest).await.unwrap();
+    drop(control_tx);
     let run_queue = queue.clone();
     let run_tx = tx.clone();
     let run =
@@ -668,13 +652,9 @@ async fn assistant_inbox_timer_yields_to_ready_control() {
 
     tokio::time::advance(Duration::from_millis(250)).await;
 
-    let result = run.await.expect("driver task joins");
-    assert!(
-        result
-            .expect_err("ready control terminates the driver")
-            .to_string()
-            .contains("driver abort requested for test")
-    );
+    run.await
+        .expect("driver task joins")
+        .expect("ready control disconnect terminates the driver");
     assert_eq!(
         provider_posts(&provider).len(),
         0,
@@ -768,7 +748,14 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
         .push(UserSubmission::text("HUMAN_TURN_MARKER"), target)
         .await;
     let human_request = provider.next_request_ready().await;
-    synchronize_driver_idle(&control_tx).await;
+    // Closing the real input queue is the loop's production shutdown signal.
+    // Do it while the captured request is still in flight so the next biased
+    // idle boundary exits before any post-control idle utility work can start.
+    queue.close().await;
+    run.await
+        .expect("driver task joins")
+        .expect("closed input queue terminates the idle driver");
+    drop(control_tx);
     let _ = drain_events(&mut rx);
     assert_eq!(
         provider.request_count(),
@@ -794,15 +781,6 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
             .iter()
             .all(|item| item.delivered_at_unix_ms.is_some()),
         "idle immediate and heartbeat defer are acknowledged only after their turns accept them"
-    );
-
-    control_tx.send(DriverControl::AbortForTest).await.unwrap();
-    let result = run.await.expect("driver task joins");
-    assert!(
-        result
-            .expect_err("test abort terminates the driver")
-            .to_string()
-            .contains("driver abort requested for test")
     );
 }
 
@@ -1159,14 +1137,10 @@ fn persistent_user_event_failure_defers_exact_payload_and_services_controls() {
         .await;
         assert!(notice.contains("exact payload will be retried"), "{notice}");
 
-        control_tx.send(DriverControl::AbortForTest).await.unwrap();
-        let result = run.await.expect("driver task joins");
-        assert!(
-            result
-                .expect_err("test abort terminates the driver")
-                .to_string()
-                .contains("driver abort requested for test")
-        );
+        drop(control_tx);
+        run.await
+            .expect("driver task joins")
+            .expect("control channel shutdown terminates the idle driver");
         assert_eq!(provider_posts(&provider).len(), 0);
 
         // #275: the deferred retry must not settle the acked id. The

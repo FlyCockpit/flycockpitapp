@@ -269,7 +269,8 @@ async fn approval_for_escalation(
                 "bash",
                 &safety_args,
             )
-            .await;
+            .await
+            .unwrap();
             match escalation_route(ApprovalMode::Auto, Some(outcome)) {
                 EscalationRoute::RunUnconfinedOnce => Ok(EscalationApproval::RunUnconfinedOnce),
                 EscalationRoute::PromptHuman => prompt_user(ctx, command, row, grant_offer).await,
@@ -357,7 +358,7 @@ mod tests {
             .unwrap();
     }
 
-    fn ctx_with_approver(
+    async fn ctx_with_approver(
         root: &std::path::Path,
     ) -> (
         ToolCtx,
@@ -370,6 +371,31 @@ mod tests {
         let db = ctx.session.db.clone();
         let hub = Arc::new(crate::engine::interrupt::InterruptHub::detached());
         let session_id = ctx.session.id;
+        let root_agent = db
+            .ensure_session_root_agent(
+                session_id,
+                None,
+                crate::agent_tree::workspace_ref_for_host_path(root).unwrap(),
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap();
+        let root_agent = match db
+            .transition_agent_instance(
+                session_id,
+                root_agent.agent_instance_id,
+                root_agent.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                r#"{"state":"running"}"#,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap()
+        {
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(root) => root,
+            outcome => panic!("escalation fixture root did not start: {outcome:?}"),
+        };
+        ctx.agent_instance_id = Some(root_agent.agent_instance_id);
         let store = crate::approval::store::GrantStore::new(
             db.clone(),
             session_id,
@@ -393,21 +419,19 @@ mod tests {
         hub: Arc<crate::engine::interrupt::InterruptHub>,
         selected_id: &'static str,
     ) -> tokio::task::JoinHandle<()> {
+        let mut raised = hub.subscribe_raised();
         tokio::spawn(async move {
-            loop {
-                let open = db.list_open_interrupts(session_id).await.unwrap();
-                if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
-                    let response = crate::daemon::proto::ResolveResponse::Single {
-                        selected_id: selected_id.to_string(),
-                    };
-                    db.resolve_interrupt(row.interrupt_id, &response)
-                        .await
-                        .unwrap();
-                    assert!(hub.resolve(row.interrupt_id, response));
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
+            crate::engine::interrupt::settle_published_host_approval_for_test(
+                &db,
+                session_id,
+                &hub,
+                &mut raised,
+                crate::daemon::proto::ResolveResponse::Single {
+                    selected_id: selected_id.to_string(),
+                },
+            )
+            .await
+            .unwrap();
         })
     }
 
@@ -432,7 +456,7 @@ mod tests {
     #[tokio::test]
     async fn approval_routing_respects_manual_auto_and_yolo_grant_rules() {
         let tmp = tempfile::tempdir().unwrap();
-        let (ctx, approver, db, session_id, hub) = ctx_with_approver(tmp.path());
+        let (ctx, approver, db, session_id, hub) = ctx_with_approver(tmp.path()).await;
         ctx.session.set_sandbox_escalation_enabled(true);
         record_bash_call(&ctx, "call-route", Some(1)).await;
         let row = ctx
@@ -472,12 +496,21 @@ mod tests {
             hub.clone(),
             crate::approval::ID_ESCALATE_GRANT_SESSION,
         );
-        assert_eq!(
-            approval_for_escalation(&ctx, "printf escalated", &row, Some(&offer))
-                .await
-                .unwrap(),
-            EscalationApproval::GrantAndRetryConfined
-        );
+        let approval = crate::engine::interrupt::with_host_approval_effect_scope(
+            "escalation_approval_test",
+            tokio_util::sync::CancellationToken::new(),
+            approval_for_escalation(&ctx, "printf escalated", &row, Some(&offer)),
+            |approval| {
+                Some(matches!(
+                    approval,
+                    EscalationApproval::GrantAndRetryConfined
+                        | EscalationApproval::RunUnconfinedOnce
+                ))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(approval, EscalationApproval::GrantAndRetryConfined);
         resolver.await.unwrap();
         assert!(
             approver
@@ -521,7 +554,7 @@ mod tests {
     #[tokio::test]
     async fn standing_reject_escalate_copy_matches() {
         let tmp = tempfile::tempdir().unwrap();
-        let (ctx, approver, _db, _session_id, _hub) = ctx_with_approver(tmp.path());
+        let (ctx, approver, _db, _session_id, _hub) = ctx_with_approver(tmp.path()).await;
         ctx.session
             .set_approval_mode(crate::config::extended::ApprovalMode::Auto);
         ctx.session.set_sandbox_escalation_enabled(true);

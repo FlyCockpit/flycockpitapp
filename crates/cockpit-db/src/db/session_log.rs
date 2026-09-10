@@ -45,7 +45,7 @@ pub struct UserMessageRetractionTitleRestore {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserMessageRetractionOutcome {
     pub removed: bool,
-    pub title_progress_restored: bool,
+    pub title_restored: bool,
 }
 
 /// Structural, content-free redaction descriptor for a trusted-body JSON
@@ -1476,7 +1476,7 @@ impl Db {
                 )
                 .context("removing latest retractable user message")?;
             let removed = removed == 1;
-            let mut title_progress_restored = false;
+            let mut title_restored = false;
             if removed {
                 let retract_data = serde_json::json!({ "retracted_seq": seq }).to_string();
                 Self::insert_session_event_json_conn(
@@ -1509,30 +1509,43 @@ impl Db {
                     }
                 }
                 if let Some(restore) = restore {
-                    title_progress_restored = conn.execute(
+                    let progress_restored = conn.execute(
                         "UPDATE sessions
                             SET user_content_tokens = ?1,
                                 title_stage = ?2,
-                                title_recovery_nudge_state = ?3,
-                                title = CASE WHEN ?4 IS NULL THEN title ELSE ?5 END
-                          WHERE session_id = ?6
-                            AND user_renamed = ?7
-                            AND (?4 IS NULL OR title = ?4)",
+                                title_recovery_nudge_state = ?3
+                          WHERE session_id = ?4",
                         params![
                             restore.user_content_tokens,
                             restore.title_stage,
                             restore.title_recovery_nudge_state,
-                            restore.generated_title,
-                            restore.prior_title,
                             session_id.to_string(),
-                            restore.expected_user_renamed,
                         ],
-                    )? == 1;
+                    )?;
+                    ensure!(
+                        progress_restored == 1,
+                        "retracted user message lost its owning session"
+                    );
+                    if let Some(generated_title) = restore.generated_title {
+                        title_restored = conn.execute(
+                            "UPDATE sessions
+                                SET title = ?1
+                              WHERE session_id = ?2
+                                AND user_renamed = ?3
+                                AND title = ?4",
+                            params![
+                                restore.prior_title,
+                                session_id.to_string(),
+                                restore.expected_user_renamed,
+                                generated_title,
+                            ],
+                        )? == 1;
+                    }
                 }
             }
             Ok(UserMessageRetractionOutcome {
                 removed,
-                title_progress_restored,
+                title_restored,
             })
         })
         .await

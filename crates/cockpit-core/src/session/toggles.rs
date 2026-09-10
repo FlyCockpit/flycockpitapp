@@ -369,18 +369,33 @@ impl Session {
         &self,
         selection: crate::config::providers::ActiveModelRef,
     ) -> Result<()> {
+        self.set_active_model_selection(Some(selection))
+    }
+
+    /// Replace the active model selection, or clear it when configuration no
+    /// longer selects a model. The durable projections and in-process mirror
+    /// move together under the model-selection lock.
+    pub fn set_active_model_selection(
+        &self,
+        selection: Option<crate::config::providers::ActiveModelRef>,
+    ) -> Result<()> {
         let mut active = self.model_selection.lock().unwrap();
-        let selection_json =
-            serde_json::to_string(&selection).context("encoding session model selection")?;
-        let provider = selection.provider.clone();
-        let model = selection.model.clone();
+        let selection_json = selection
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("encoding session model selection")?;
+        let provider = selection
+            .as_ref()
+            .map(|selection| selection.provider.clone());
+        let model = selection.as_ref().map(|selection| selection.model.clone());
         if self.stage_pending_row(|row| {
-            row.provider = Some(provider.clone());
-            row.model = Some(model.clone());
-            row.model_selection_json = Some(selection_json.clone());
+            row.provider = provider.clone();
+            row.model = model.clone();
+            row.model_selection_json = selection_json.clone();
             row.active_model_revision = row.active_model_revision.saturating_add(1);
         }) {
-            *active = Some(selection);
+            *active = selection;
             return Ok(());
         }
         let session_id = self.live_id();
@@ -403,14 +418,16 @@ impl Session {
                             session_id.to_string()
                         ],
                     )
-                    .context("setting session model")?;
+                    .context("setting session model selection")?;
                 if changed != 1 {
-                    anyhow::bail!("session {session_id} not found while setting active model");
+                    anyhow::bail!(
+                        "session {session_id} not found while setting active model selection"
+                    );
                 }
                 Ok(())
             })
-            .context("persisting active model")?;
-        *active = Some(selection);
+            .context("persisting active model selection")?;
+        *active = selection;
         Ok(())
     }
 
@@ -624,5 +641,37 @@ mod tests {
         assert_eq!(live.title.as_deref(), Some("live-window-title"));
         assert_eq!(spawn.active_agent, "Build");
         assert_ne!(spawn.title.as_deref(), Some("live-window-title"));
+    }
+
+    #[tokio::test]
+    async fn clearing_active_model_updates_mirror_and_all_durable_projections() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Session::create_for_test(
+            db.clone(),
+            PathBuf::from("/clear-active-model"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        session
+            .set_active_model_ref(crate::config::providers::ActiveModelRef {
+                provider: "provider-a".to_string(),
+                model: "model-a".to_string(),
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            })
+            .unwrap();
+        let revision = session.active_model_revision().unwrap();
+
+        session.set_active_model_selection(None).unwrap();
+
+        assert!(session.active_model_ref().is_none());
+        assert_eq!(session.active_model_revision().unwrap(), revision + 1);
+        let row = db.get_session(session.id).await.unwrap().unwrap();
+        assert!(row.provider.is_none());
+        assert!(row.model.is_none());
+        assert!(row.model_selection_json.is_none());
+        assert_eq!(row.active_model_revision, revision + 1);
     }
 }

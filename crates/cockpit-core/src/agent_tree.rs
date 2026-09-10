@@ -2210,45 +2210,68 @@ mod tests {
             AutoResolutionBegin::WaitingForUser
         );
 
-        let prohibited = running_agent(&db, session.session_id, true).await;
-        let prohibited_contract = contract(&prohibited).with_host_subject(
-            HostDecisionSubject::HostEffect(HostEffectClass::Destructive),
-        );
-        let prohibited_decision = lifecycle
-            .request_decision(session.session_id, prohibited_contract, 22)
-            .await
-            .unwrap();
-        assert_eq!(
-            lifecycle
-                .begin_auto_resolution(
+        let mut prohibited_decision_ids = Vec::new();
+        for effect in [
+            HostEffectClass::Credential,
+            HostEffectClass::Authorization,
+            HostEffectClass::Destructive,
+            HostEffectClass::ExternalAction,
+            HostEffectClass::Publish,
+            HostEffectClass::Purchase,
+            HostEffectClass::Production,
+        ] {
+            let prohibited = running_agent(&db, session.session_id, true).await;
+            let prohibited_decision = lifecycle
+                .request_decision(
                     session.session_id,
-                    prohibited_decision.decision_request_id,
-                    &TestResolvers {
-                        parent_warm: true,
-                        utility_compatible: true
-                    },
-                    23,
+                    contract(&prohibited)
+                        .with_host_subject(HostDecisionSubject::HostEffect(effect)),
+                    22,
                 )
                 .await
-                .unwrap(),
-            AutoResolutionBegin::WaitingForUser
-        );
+                .unwrap();
+            assert_eq!(
+                lifecycle
+                    .begin_auto_resolution(
+                        session.session_id,
+                        prohibited_decision.decision_request_id,
+                        &TestResolvers {
+                            parent_warm: true,
+                            utility_compatible: true,
+                        },
+                        23,
+                    )
+                    .await
+                    .unwrap(),
+                AutoResolutionBegin::WaitingForUser,
+                "{effect:?} must remain manual even when every automatic resolver is available"
+            );
+            let persisted = db
+                .decision_request(session.session_id, prohibited_decision.decision_request_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(persisted.state, DecisionState::Pending);
+            assert!(persisted.resolver_route.is_none());
+            prohibited_decision_ids.push(prohibited_decision.decision_request_id);
+        }
 
         let deadline_agent = running_agent(&db, session.session_id, true).await;
         let deadline_decision = lifecycle
             .request_decision(session.session_id, contract(&deadline_agent), 24)
             .await
             .unwrap();
+        let mut expected_expired = vec![disabled_decision.decision_request_id];
+        expected_expired.extend(prohibited_decision_ids);
+        expected_expired.sort_unstable();
+        let mut expired = lifecycle
+            .expire_deadlines(session.session_id, 29)
+            .await
+            .unwrap();
+        expired.sort_unstable();
         assert_eq!(
-            lifecycle
-                .expire_deadlines(session.session_id, 29)
-                .await
-                .unwrap(),
-            vec![
-                disabled_decision.decision_request_id,
-                prohibited_decision.decision_request_id,
-            ],
-            "every pending profile deadline that is already due settles on this tick"
+            expired, expected_expired,
+            "every prohibited class remains pending for the manual route until its deadline"
         );
         assert_eq!(
             lifecycle

@@ -392,6 +392,19 @@ pub mod integration {
             .await
         }
 
+        /// Answer an interrupt with an option ID from its public wire payload.
+        pub async fn answer_interrupt_option(
+            &self,
+            interrupt_id: Uuid,
+            selected_id: String,
+        ) -> Result<()> {
+            self.resolve_interrupt(
+                interrupt_id,
+                crate::daemon::proto::ResolveResponse::Single { selected_id },
+            )
+            .await
+        }
+
         pub async fn approve_interrupt_project(&self, interrupt_id: Uuid) -> Result<()> {
             self.resolve_interrupt(
                 interrupt_id,

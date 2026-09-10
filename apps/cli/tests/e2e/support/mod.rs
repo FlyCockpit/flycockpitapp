@@ -481,8 +481,21 @@ impl SpawnedDaemon {
     #[cfg(target_os = "linux")]
     pub fn capture_owned_sandbox_descendants(&self) -> OwnedSandboxDescendants {
         let daemon_pid = self.pid();
-        let mut descendants = std::collections::BTreeSet::from([daemon_pid]);
+        // A child forked by a non-leader thread reports that thread's TID as
+        // PPid in /proc. The daemon's pinned process spawner intentionally has
+        // that topology, so ownership begins at every task in the daemon's
+        // thread group rather than only at its TGID.
+        let mut descendants = std::fs::read_dir(format!("/proc/{daemon_pid}/task"))
+            .expect("read daemon task identities")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            descendants.contains(&daemon_pid),
+            "daemon task identities include the thread-group leader"
+        );
         let mut processes = Vec::new();
+        let mut owned_commands = Vec::new();
         let mut proc_rows = std::fs::read_dir("/proc")
             .expect("read /proc for daemon descendants")
             .filter_map(Result::ok)
@@ -525,6 +538,7 @@ impl SpawnedDaemon {
                         .to_string()
                 })
                 .unwrap_or_else(|_| executable_name.clone());
+            owned_commands.push((pid, executable_name.clone(), command.clone()));
             if executable_name != "bwrap"
                 && !executable_name.contains("zerobox")
                 && !command.contains("zerobox-linux-sandbox")
@@ -563,7 +577,7 @@ impl SpawnedDaemon {
                 .iter()
                 .any(|process| process.executable_name.contains("zerobox")
                     || process.command.contains("zerobox-linux-sandbox")),
-            "no zerobox launcher descended from daemon {daemon_pid}"
+            "no zerobox launcher descended from daemon {daemon_pid}; owned descendants: {owned_commands:?}"
         );
         assert!(
             processes

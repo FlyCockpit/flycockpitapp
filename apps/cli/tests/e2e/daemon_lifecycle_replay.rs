@@ -16,6 +16,11 @@
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt as _;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::OpenOptionsExt as _;
+
 use crate::support::{IsolatedHome, SpawnedDaemon, log_tail, output_text, wait_until};
 use cockpit_cli::integration::{AttachedSession, DaemonEvent};
 use cockpit_test_support::provider::{ScriptedProvider, Turn};
@@ -77,6 +82,37 @@ fn interrupt_row(db_path: &Path, interrupt_id: Uuid) -> InterruptRow {
         },
     )
     .expect("interrupt row")
+}
+
+fn offered_approval_option(db_path: &Path, interrupt_id: Uuid) -> String {
+    let conn = open_db(db_path);
+    let questions_json: String = conn
+        .query_row(
+            "SELECT questions_json FROM needs_attention WHERE interrupt_id = ?1",
+            params![interrupt_id.to_string()],
+            |row| row.get(0),
+        )
+        .expect("persisted interrupt questions");
+    let questions: serde_json::Value =
+        serde_json::from_str(&questions_json).expect("parse persisted interrupt questions");
+    let offered = questions["questions"][0]["data"]["options"]
+        .as_array()
+        .expect("single persisted question options");
+    for candidate in [
+        cockpit_core::approval::ID_APPROVE_ONCE,
+        cockpit_core::approval::ID_APPROVE_PROJECT,
+        cockpit_core::approval::ID_APPROVE,
+        cockpit_core::approval::ID_ESCALATE_RUN_UNCONFINED_ONCE,
+        cockpit_core::approval::ID_GITIGNORE_FILE,
+    ] {
+        if offered
+            .iter()
+            .any(|option| option["id"].as_str() == Some(candidate))
+        {
+            return candidate.to_string();
+        }
+    }
+    panic!("persisted interrupt offers no affirmative option: {offered:?}")
 }
 
 fn paused_work_status(db_path: &Path, session_id: Uuid) -> Option<String> {
@@ -310,12 +346,29 @@ async fn create_parked_session() -> (ScriptedProvider, SpawnedDaemon, AttachedSe
 /// durable interrupt state becomes `executing`, SIGKILL therefore lands after
 /// the replay claim and before the effect can complete, without a product hook
 /// or a wall-clock race.
-async fn create_parked_session_with_blocked_replay()
--> (ScriptedProvider, SpawnedDaemon, AttachedSession, Uuid) {
+async fn create_parked_session_with_blocked_replay() -> (
+    ScriptedProvider,
+    SpawnedDaemon,
+    AttachedSession,
+    Uuid,
+    std::path::PathBuf,
+) {
     let home = IsolatedHome::new();
-    // `/dev/null` supplies one host-read approval boundary and `tail` remains
-    // live after spawn without a test timing hook or helper process.
-    let provider = lifecycle_provider_for_command("exec tail -f /dev/null").await;
+    let launch_fifo = home.project_path().join("sandbox-launched");
+    // The sandboxed shell writes one byte to the FIFO after launch. The harness
+    // observes that byte through a nonblocking descriptor, which is an exact
+    // launch barrier with no timing window or helper process.
+    #[cfg(target_os = "linux")]
+    let command = {
+        let fifo_c = std::ffi::CString::new(launch_fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo_c` is a valid NUL-terminated path and mode is private.
+        let created = unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) };
+        assert_eq!(created, 0, "create sandbox launch FIFO");
+        format!("dd if=/dev/zero of={} bs=1", launch_fifo.display())
+    };
+    #[cfg(not(target_os = "linux"))]
+    let command = "exec tail -f /dev/null".to_string();
+    let provider = lifecycle_provider_for_command(&command).await;
     home.write_local_provider_config(&provider.base_url());
     std::fs::write(
         home.config_dir().join("config.json"),
@@ -335,13 +388,14 @@ async fn create_parked_session_with_blocked_replay()
         .expect("send user message");
     let gate_interrupt =
         wait_for_interrupt(&client, &daemon, attached.session_id, Some("initial")).await;
+    let approve = offered_approval_option(&daemon.db_path(), gate_interrupt);
     client
-        .approve_interrupt_once(gate_interrupt)
+        .answer_interrupt_option(gate_interrupt, approve)
         .await
         .expect("approve blocked replay auto gate");
     let interrupt_id =
         wait_for_interrupt(&client, &daemon, attached.session_id, Some("initial")).await;
-    (provider, daemon, attached, interrupt_id)
+    (provider, daemon, attached, interrupt_id, launch_fifo)
 }
 
 async fn create_auto_gate_parked_session()
@@ -369,8 +423,9 @@ async fn create_auto_gate_parked_session()
         .expect("send user message");
     let gate_interrupt =
         wait_for_interrupt(&client, &daemon, attached.session_id, Some("initial")).await;
+    let approve = offered_approval_option(&daemon.db_path(), gate_interrupt);
     client
-        .approve_interrupt_once(gate_interrupt)
+        .answer_interrupt_option(gate_interrupt, approve)
         .await
         .expect("approve gate interrupt");
     let parked_interrupt =
@@ -737,8 +792,25 @@ async fn lifecycle_restart_command_preserves_parked_session_and_starts_when_abse
 
 #[tokio::test(flavor = "multi_thread")]
 async fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without_reexecute() {
-    let (_provider, daemon, attached, interrupt_id) =
+    let (_provider, daemon, attached, interrupt_id, launch_fifo) =
         create_parked_session_with_blocked_replay().await;
+    #[cfg(target_os = "linux")]
+    let launch_reader = {
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&launch_fifo)
+            .expect("open sandbox launch-barrier reader");
+        let keep_reader_live = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&launch_fifo)
+            .expect("keep sandbox launch-barrier reader live");
+        (
+            tokio::io::unix::AsyncFd::new(reader).expect("register sandbox launch-barrier reader"),
+            keep_reader_live,
+        )
+    };
 
     restart_daemon_gracefully(&daemon).await;
     let client = daemon.client().await;
@@ -750,8 +822,9 @@ async fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without
         wait_for_interrupt(&client, &daemon, attached.session_id, Some("rehydration")).await,
         interrupt_id
     );
+    let approve = offered_approval_option(&daemon.db_path(), interrupt_id);
     client
-        .approve_interrupt_project(interrupt_id)
+        .answer_interrupt_option(interrupt_id, approve)
         .await
         .expect("approve parked interrupt");
     wait_until("parked interrupt executing", Duration::from_secs(5), || {
@@ -765,6 +838,45 @@ async fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without
         "host-effect boundary must follow the durable executing claim"
     );
 
+    #[cfg(target_os = "linux")]
+    let _launch_barrier = {
+        let (reader, keep_reader_live) = launch_reader;
+        loop {
+            tokio::select! {
+                readiness = reader.readable() => {
+                    let mut readiness = readiness.expect("sandbox launch-barrier readiness");
+                    let mut byte = [0_u8; 1];
+                    match readiness.try_io(|inner| {
+                        std::io::Read::read_exact(&mut inner.get_ref(), &mut byte)
+                    }) {
+                        Ok(Ok(())) => {
+                            assert_eq!(byte, [0], "sandbox launch-barrier byte");
+                            drop(readiness);
+                            break (reader, keep_reader_live);
+                        }
+                        Ok(Err(err)) => panic!("read sandbox launch barrier: {err}"),
+                        Err(_would_block) => {}
+                    }
+                }
+                event = client.next_event(Duration::from_secs(20)) => {
+                    if let DaemonEvent::InterruptRaised {
+                        session_id,
+                        interrupt_id: launch_interrupt,
+                        ..
+                    } = event.expect("daemon event while crossing sandbox launch barrier")
+                        && session_id == attached.session_id
+                    {
+                        let approve =
+                            offered_approval_option(&daemon.db_path(), launch_interrupt);
+                        client
+                            .answer_interrupt_option(launch_interrupt, approve)
+                            .await
+                            .expect("approve sandbox launch-barrier read");
+                    }
+                }
+            }
+        }
+    };
     #[cfg(target_os = "linux")]
     let sandbox_descendants = daemon.capture_owned_sandbox_descendants();
 

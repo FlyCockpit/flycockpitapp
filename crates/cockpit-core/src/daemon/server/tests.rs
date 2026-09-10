@@ -38675,13 +38675,17 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         Response::UserMessageQueued { .. }
     ));
     wait_for_retraction_provider_request(&mut provider, "tool turn").await;
+    // The follow-up provider request is a causal barrier: the driver cannot
+    // issue it until the real tool call has returned and published ToolEnd.
+    // Wait on that boundary before applying the short event-delivery budget,
+    // so host I/O pressure cannot turn tool execution time into an event race.
+    wait_for_retraction_provider_request(&mut provider, "tool-result follow-up").await;
     wait_for_retraction_acceptance_event(
         &mut origin_events,
         "completed real read tool before cancel",
         |event| matches!(event, proto::Event::ToolEnd { call_id, .. } if call_id == "read-before-cancel"),
     )
     .await;
-    wait_for_retraction_provider_request(&mut provider, "tool-result follow-up").await;
     handle_request(Request::CancelTurn, &mut origin, &ctx)
         .await
         .expect("CancelTurn after tool is delivered");

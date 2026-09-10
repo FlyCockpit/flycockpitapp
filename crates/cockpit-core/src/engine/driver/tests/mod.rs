@@ -633,6 +633,14 @@ fn test_driver_with_url_vnext(
     test_driver_with_url_and_grant(max_schedules, provider_url, true)
 }
 
+fn test_driver_with_url_vnext_in(
+    max_schedules: usize,
+    provider_url: String,
+    tmp: tempfile::TempDir,
+) -> (Driver, tempfile::TempDir) {
+    test_driver_with_url_and_grant_in(max_schedules, provider_url, true, tmp)
+}
+
 /// Construct a vNext `EffectiveVnextGrant` for the test "Build" primary.
 ///
 /// The grant carries a broad `allowed_children` list so tests that delegate
@@ -702,10 +710,23 @@ fn test_driver_with_url_and_grant(
     provider_url: String,
     with_vnext_grant: bool,
 ) -> (Driver, tempfile::TempDir) {
+    test_driver_with_url_and_grant_in(
+        max_schedules,
+        provider_url,
+        with_vnext_grant,
+        tempfile::tempdir().unwrap(),
+    )
+}
+
+fn test_driver_with_url_and_grant_in(
+    max_schedules: usize,
+    provider_url: String,
+    with_vnext_grant: bool,
+    tmp: tempfile::TempDir,
+) -> (Driver, tempfile::TempDir) {
     use crate::config::providers::{ActiveModelRef, ProviderEntry, ProvidersConfig, WireApi};
     use std::collections::BTreeMap;
 
-    let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let db = crate::db::Db::open_in_memory().unwrap();
     let session = Arc::new(

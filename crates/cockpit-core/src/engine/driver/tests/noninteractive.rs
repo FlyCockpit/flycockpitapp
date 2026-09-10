@@ -219,7 +219,11 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
             // independent readiness source rather than an executor-ordering
             // accident under parallel nextest load.
             .start_blocking();
-        let (mut driver, tmp) = test_driver_with_url_vnext(8, provider.base_url());
+        // This regression intentionally drives five real journaled provider
+        // requests. Keep the production durability barrier and isolate only
+        // its temporary spool from unrelated shared-disk fsync latency.
+        let fixture_root = cockpit_test_support::latency_isolated_tempdir();
+        let (mut driver, tmp) = test_driver_with_url_vnext_in(8, provider.base_url(), fixture_root);
         std::fs::write(tmp.path().join("middle.txt"), "middle body").unwrap();
 
         let config_dir = tmp.path().join(".cockpit");

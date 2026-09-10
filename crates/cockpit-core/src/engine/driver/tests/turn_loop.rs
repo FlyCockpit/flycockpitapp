@@ -490,6 +490,75 @@ async fn turn_loop_text_only_turn_pushes_history_and_emits_events() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn gated_interval_preserves_due_tick_until_armed() {
+    use std::future::Future as _;
+
+    let mut idle_poll = GatedInterval::new(Duration::from_millis(250));
+    let mut defer_heartbeat = GatedInterval::new(Duration::from_secs(30));
+
+    tokio::time::advance(Duration::from_secs(30)).await;
+
+    let mut idle_tick = Box::pin(idle_poll.tick());
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(idle_tick.as_mut().poll(cx)))
+            .await
+            .is_pending(),
+        "a due idle-poll interval remains pending while its owned gate is disarmed"
+    );
+    drop(idle_tick);
+    let mut heartbeat_tick = Box::pin(defer_heartbeat.tick());
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(heartbeat_tick.as_mut().poll(cx)))
+            .await
+            .is_pending(),
+        "a due defer-heartbeat interval remains pending while its owned gate is disarmed"
+    );
+    drop(heartbeat_tick);
+
+    idle_poll.set_armed(true);
+    defer_heartbeat.set_armed(true);
+    let mut idle_tick = Box::pin(idle_poll.tick());
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(idle_tick.as_mut().poll(cx)))
+            .await
+            .is_ready(),
+        "arming exposes the idle poll's already-due tick"
+    );
+    let mut heartbeat_tick = Box::pin(defer_heartbeat.tick());
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(heartbeat_tick.as_mut().poll(cx)))
+            .await
+            .is_ready(),
+        "arming exposes the defer heartbeat's already-due tick"
+    );
+}
+
+#[test]
+fn assistant_inbox_select_sites_use_only_gated_interval_futures() {
+    let driver_source = include_str!("../mod.rs");
+
+    assert_eq!(
+        driver_source
+            .matches("_ = assistant_inbox_defer_heartbeat.tick() =>")
+            .count(),
+        1,
+        "the defer-heartbeat select site must use the gate-owned future without a parallel guard"
+    );
+    assert_eq!(
+        driver_source
+            .matches("_ = assistant_inbox_idle_poll.tick() =>")
+            .count(),
+        1,
+        "the idle-poll select site must use the gate-owned future without a parallel guard"
+    );
+    assert!(
+        !driver_source.contains("assistant_inbox_defer_heartbeat.interval.tick()")
+            && !driver_source.contains("assistant_inbox_idle_poll.interval.tick()"),
+        "assistant-inbox select sites must not bypass GatedInterval::tick"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn assistant_inbox_timer_yields_to_ready_human_input() {
     let mut provider = ScriptedProvider::builder()
         .dialect(WireDialect::ChatCompletions)
@@ -514,6 +583,7 @@ async fn assistant_inbox_timer_yields_to_ready_human_input() {
         Some(DriverLoopBoundaryObservation {
             sequence: 0,
             human_input_already_ready: false,
+            assistant_inbox_defer_heartbeat_armed: true,
             assistant_inbox_idle_poll_armed: true,
         }),
         "the initial semantic boundary has the inbox timer armed"
@@ -539,6 +609,7 @@ async fn assistant_inbox_timer_yields_to_ready_human_input() {
         Some(DriverLoopBoundaryObservation {
             sequence: 1,
             human_input_already_ready: false,
+            assistant_inbox_defer_heartbeat_armed: true,
             assistant_inbox_idle_poll_armed: true,
         }),
         "both boundary arms are pending at the paused-clock deadline"
@@ -564,6 +635,59 @@ async fn assistant_inbox_timer_yields_to_ready_human_input() {
         "the inbox is folded at the human turn boundary instead of starting a timer turn"
     );
 
+    drop(control_tx);
+    run.await
+        .expect("driver task joins")
+        .expect("control channel shutdown terminates the idle driver");
+}
+
+#[tokio::test(start_paused = true)]
+async fn assistant_inbox_timers_are_disarmed_for_already_ready_human_input() {
+    let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text("human turn handled".into()))
+        .with_response_gate(response_gate.clone())
+        .start()
+        .await;
+    let (mut driver, _tmp) = scripted_driver(&provider);
+    insert_pending_assistant_inbox_item(&driver, "immediate", "READY_INBOX_MARKER").await;
+
+    let (queue, tx, _rx) = event_harness();
+    let target = driver.active_queue_target();
+    queue
+        .push(UserSubmission::text("ALREADY_READY_HUMAN"), target)
+        .await;
+    let mut boundary_rx = driver.subscribe_loop_boundaries();
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let run = tokio::spawn(async move { driver.run_main_loop(queue, control_rx, &tx).await });
+
+    boundary_rx.changed().await.unwrap();
+    assert_eq!(
+        *boundary_rx.borrow_and_update(),
+        Some(DriverLoopBoundaryObservation {
+            sequence: 0,
+            human_input_already_ready: true,
+            assistant_inbox_defer_heartbeat_armed: false,
+            assistant_inbox_idle_poll_armed: false,
+        }),
+        "an already-ready foreground submission explicitly disables every assistant-inbox timer arm"
+    );
+
+    let request = provider.next_request_ready().await;
+    let prompt = chat_messages(&request)
+        .iter()
+        .map(message_content_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(prompt.contains("ALREADY_READY_HUMAN"));
+    assert!(
+        prompt.contains("READY_INBOX_MARKER"),
+        "inbox delivery is folded into the already-ready human turn"
+    );
+
+    response_gate.add_permits(1);
+    synchronize_driver_idle(&control_tx).await;
     drop(control_tx);
     run.await
         .expect("driver task joins")

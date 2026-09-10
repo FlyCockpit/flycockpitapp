@@ -67,7 +67,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use tokio::{
     sync::mpsc,
-    time::{Duration, Sleep},
+    time::{Duration, Instant, Interval, Sleep},
 };
 use uuid::Uuid;
 
@@ -86,6 +86,41 @@ use crate::{
 
 const AUTO_COMPACT_DEFAULT_PCT: u8 = 80;
 use crate::session::{InferenceSendIdentity, Session};
+
+/// An interval whose selectable future is authoritative for whether it is
+/// armed. Keeping the gate beside the interval prevents boundary observation
+/// and `select!` eligibility from becoming independently maintained booleans.
+struct GatedInterval {
+    interval: Interval,
+    armed: bool,
+}
+
+impl GatedInterval {
+    fn new(period: Duration) -> Self {
+        let mut interval = tokio::time::interval_at(Instant::now() + period, period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Self {
+            interval,
+            armed: false,
+        }
+    }
+
+    fn set_armed(&mut self, armed: bool) {
+        self.armed = armed;
+    }
+
+    fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    async fn tick(&mut self) {
+        if self.armed {
+            self.interval.tick().await;
+        } else {
+            std::future::pending().await
+        }
+    }
+}
 
 /// Serializes the detached automatic-title write with retraction of the user
 /// message that triggered it. A retraction either fences the write before it
@@ -435,6 +470,7 @@ pub struct RecoveredInteractiveTaskChild {
 pub struct DriverLoopBoundaryObservation {
     pub sequence: u64,
     pub human_input_already_ready: bool,
+    pub assistant_inbox_defer_heartbeat_armed: bool,
     pub assistant_inbox_idle_poll_armed: bool,
 }
 
@@ -5980,14 +6016,9 @@ impl Driver {
         }
 
         let mut goal_watchdog: Option<Pin<Box<Sleep>>> = None;
-        let mut assistant_inbox_idle_poll = tokio::time::interval(Duration::from_millis(250));
-        assistant_inbox_idle_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        assistant_inbox_idle_poll.tick().await;
+        let mut assistant_inbox_idle_poll = GatedInterval::new(Duration::from_millis(250));
         let mut assistant_inbox_defer_heartbeat =
-            tokio::time::interval(ASSISTANT_INBOX_DEFER_HEARTBEAT_INTERVAL);
-        assistant_inbox_defer_heartbeat
-            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        assistant_inbox_defer_heartbeat.tick().await;
+            GatedInterval::new(ASSISTANT_INBOX_DEFER_HEARTBEAT_INTERVAL);
         loop {
             let active_target_id = self.active_queue_target_id();
             // Persist-on-re-entry owns started-unsettled keep-parked
@@ -6006,6 +6037,14 @@ impl Driver {
             // until its dequeue deadline.
             let human_input_already_ready =
                 input_queue.has_ready_for(Some(&active_target_id)).await;
+            // Both assistant-inbox timers are lower-priority idle work. An
+            // input observed ready in this boundary snapshot disables both
+            // arms explicitly; the biased select remains the honest arbiter
+            // only for input that becomes ready after this snapshot.
+            let assistant_inbox_timers_armed =
+                !waiting_for_keep_parked_siblings && !human_input_already_ready;
+            assistant_inbox_defer_heartbeat.set_armed(assistant_inbox_timers_armed);
+            assistant_inbox_idle_poll.set_armed(assistant_inbox_timers_armed);
             if !waiting_for_keep_parked_siblings
                 && !self.pending_noninteractive_completions.is_empty()
                 && !human_input_already_ready
@@ -6040,8 +6079,9 @@ impl Driver {
                 .send_replace(Some(DriverLoopBoundaryObservation {
                     sequence: self.loop_boundary_sequence,
                     human_input_already_ready,
-                    assistant_inbox_idle_poll_armed: !waiting_for_keep_parked_siblings
-                        && !human_input_already_ready,
+                    assistant_inbox_defer_heartbeat_armed: assistant_inbox_defer_heartbeat
+                        .is_armed(),
+                    assistant_inbox_idle_poll_armed: assistant_inbox_idle_poll.is_armed(),
                 }));
             self.loop_boundary_sequence = self.loop_boundary_sequence.saturating_add(1);
             tokio::select! {
@@ -6139,8 +6179,7 @@ impl Driver {
                 // control. In a biased select, a timer that became ready
                 // while another turn was running must not start inference
                 // ahead of either already-ready boundary request.
-                _ = assistant_inbox_defer_heartbeat.tick(),
-                    if !waiting_for_keep_parked_siblings => {
+                _ = assistant_inbox_defer_heartbeat.tick() => {
                     match self.claim_assistant_inbox_text(true).await {
                         Ok(Some((text, inbox_item_ids))) => {
                             self.preempt_shadow_brief_for_foreground().await;
@@ -6155,8 +6194,7 @@ impl Driver {
                         Err(error) => tracing::warn!(%error, "assistant inbox deferred delivery failed"),
                     }
                 }
-                _ = assistant_inbox_idle_poll.tick(),
-                    if !waiting_for_keep_parked_siblings && !human_input_already_ready => {
+                _ = assistant_inbox_idle_poll.tick() => {
                     if self
                         .try_deliver_immediate_assistant_inbox(
                             &input_queue,

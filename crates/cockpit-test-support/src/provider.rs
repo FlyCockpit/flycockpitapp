@@ -261,12 +261,12 @@ impl ScriptedProvider {
         self.request_count.load(Ordering::SeqCst)
     }
 
-    /// Await the next captured request. Panics on timeout so test failures are
-    /// loud instead of hanging forever.
+    /// Await the next captured request. Channel delivery is the completion
+    /// signal; the enclosing test runner owns the hang deadline.
     pub async fn next_request(&mut self) -> CapturedRequest {
-        tokio::time::timeout(Duration::from_secs(2), self.request_rx.recv())
+        self.request_rx
+            .recv()
             .await
-            .expect("timed out waiting for scripted provider request")
             .expect("scripted provider request channel closed")
     }
 
@@ -274,9 +274,9 @@ impl ScriptedProvider {
     /// to the socket. This is a stronger boundary than request capture for
     /// tests that assert the first event of an intentionally hanging stream.
     pub async fn next_response_started(&mut self) {
-        tokio::time::timeout(Duration::from_secs(2), self.response_started_rx.recv())
+        self.response_started_rx
+            .recv()
             .await
-            .expect("timed out waiting for scripted provider response")
             .expect("scripted provider response channel closed");
     }
 

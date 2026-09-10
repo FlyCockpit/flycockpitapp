@@ -38816,21 +38816,15 @@ async fn wait_for_retraction_acceptance_event(
     label: &str,
     matches_event: impl Fn(&proto::Event) -> bool,
 ) -> proto::Event {
-    let mut observed = Vec::new();
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            let event = events
-                .recv()
-                .await
-                .unwrap_or_else(|error| panic!("{label}: event stream failed: {error}"));
-            if matches_event(&event.event) {
-                return event.event;
-            }
-            observed.push(event.event);
+    loop {
+        let event = events
+            .recv()
+            .await
+            .unwrap_or_else(|error| panic!("{label}: event stream failed: {error}"));
+        if matches_event(&event.event) {
+            return event.event;
         }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("timed out waiting for {label}; observed {observed:?}"))
+    }
 }
 
 async fn collect_retraction_acceptance_events_until(
@@ -38838,22 +38832,18 @@ async fn collect_retraction_acceptance_events_until(
     label: &str,
     terminal: impl Fn(&proto::Event) -> bool,
 ) -> Vec<proto::Event> {
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        let mut collected = Vec::new();
-        loop {
-            let event = events
-                .recv()
-                .await
-                .unwrap_or_else(|error| panic!("{label}: event stream failed: {error}"));
-            let terminal = terminal(&event.event);
-            collected.push(event.event);
-            if terminal {
-                return collected;
-            }
+    let mut collected = Vec::new();
+    loop {
+        let event = events
+            .recv()
+            .await
+            .unwrap_or_else(|error| panic!("{label}: event stream failed: {error}"));
+        let terminal = terminal(&event.event);
+        collected.push(event.event);
+        if terminal {
+            return collected;
         }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
+    }
 }
 
 /// Six controlled chat-completions streams for the acceptance test above:

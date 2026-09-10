@@ -501,25 +501,49 @@ async fn assistant_inbox_timer_yields_to_ready_human_input() {
 
     let (queue, tx, mut rx) = event_harness();
     let target = driver.active_queue_target();
+    let mut boundary_rx = driver.subscribe_loop_boundaries();
     let (control_tx, control_rx) = mpsc::channel(1);
-    queue
-        .requeue_front(UserSubmission::text("HUMAN_TIMER_MARKER"), target.clone())
-        .await;
-
-    // Hold the producer-owned queue fence across loop startup. The driver
-    // constructs and primes the production inbox interval, then blocks on its
-    // final pre-select queue-readiness load. Advancing the paused clock makes
-    // the interval tick ready; releasing the fence lets that load complete and
-    // the exact production select execute with both its queue receive and
-    // timer futures ready.
-    let queue_fence = queue.cancellation_fence().await;
     let run_queue = queue.clone();
     let run_tx = tx.clone();
     let run =
         tokio::spawn(async move { driver.run_main_loop(run_queue, control_rx, &run_tx).await });
 
+    boundary_rx.changed().await.unwrap();
+    assert_eq!(
+        *boundary_rx.borrow_and_update(),
+        Some(DriverLoopBoundaryObservation {
+            sequence: 0,
+            human_input_already_ready: false,
+            assistant_inbox_idle_poll_armed: true,
+        }),
+        "the initial semantic boundary has the inbox timer armed"
+    );
+    queue
+        .requeue_front_after(
+            UserSubmission::text("HUMAN_TIMER_MARKER"),
+            target.clone(),
+            Duration::from_millis(250),
+        )
+        .await;
+    assert!(queue.has_pending_for(Some(&target.id)).await);
+    assert!(!queue.has_ready_for(Some(&target.id)).await);
+
+    // A production control boundary makes the driver re-evaluate every guard
+    // after the delayed submission exists. The read-only scheduling watch then
+    // proves that the queue wait and idle-inbox timer are both armed before
+    // virtual time reaches their shared deadline.
+    synchronize_driver_idle(&control_tx).await;
+    boundary_rx.changed().await.unwrap();
+    assert_eq!(
+        *boundary_rx.borrow_and_update(),
+        Some(DriverLoopBoundaryObservation {
+            sequence: 1,
+            human_input_already_ready: false,
+            assistant_inbox_idle_poll_armed: true,
+        }),
+        "both boundary arms are pending at the paused-clock deadline"
+    );
     tokio::time::advance(Duration::from_millis(250)).await;
-    drop(queue_fence);
     let request = provider.next_request_ready().await;
     synchronize_driver_idle(&control_tx).await;
     let _ = drain_events(&mut rx);

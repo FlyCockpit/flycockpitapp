@@ -424,6 +424,20 @@ pub struct RecoveredInteractiveTaskChild {
     pub activation_gate: RecoveryActivationGate,
 }
 
+/// Read-only snapshot of the readiness predicates at a driver-loop select
+/// boundary.
+///
+/// The driver is the sole publisher. Observers can use this to distinguish a
+/// worker that is genuinely waiting for boundary work from one that is still
+/// finishing the previous iteration; subscribing never gates or otherwise
+/// influences scheduling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DriverLoopBoundaryObservation {
+    pub sequence: u64,
+    pub human_input_already_ready: bool,
+    pub assistant_inbox_idle_poll_armed: bool,
+}
+
 /// The durable identity of an accepted late-user steer supplied by the
 /// session-worker recovery pass. This is intentionally separate from the
 /// provider permit token: a recovered waiting executor may retain this
@@ -1548,6 +1562,11 @@ pub struct Driver {
     /// substantive turn also shadows its assembled request to each tandem
     /// model via the single job authority ([`Self::run_user_input`]).
     tandem_set: crate::engine::schedule::TandemSet,
+    /// Scheduling-state observable published immediately before each idle
+    /// select. It is always present and observation-only: receivers cannot
+    /// delay the driver, and the driver never branches on receiver state.
+    loop_boundary_state: tokio::sync::watch::Sender<Option<DriverLoopBoundaryObservation>>,
+    loop_boundary_sequence: u64,
     #[cfg(test)]
     test_fail_next_active_model_session_persist: bool,
     #[cfg(test)]
@@ -1988,6 +2007,14 @@ fn subagent_routing_event_data(
 const JOB_CHANNEL_CAPACITY: usize = 256;
 
 impl Driver {
+    /// Subscribe to semantic idle-select boundary state. The returned watch is
+    /// read-only and receives the most recent boundary immediately.
+    pub fn subscribe_loop_boundaries(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<DriverLoopBoundaryObservation>> {
+        self.loop_boundary_state.subscribe()
+    }
+
     pub fn set_guidance_proposal_service(
         &mut self,
         service: Arc<
@@ -2479,6 +2506,8 @@ impl Driver {
             pending_swap_marker_from: None,
             tool_call_owner: self.tool_call_owner.clone(),
             tandem_set: self.tandem_set.clone(),
+            loop_boundary_state: tokio::sync::watch::channel(None).0,
+            loop_boundary_sequence: 0,
             #[cfg(test)]
             test_fail_next_active_model_session_persist: self
                 .test_fail_next_active_model_session_persist,
@@ -2872,6 +2901,8 @@ impl Driver {
             pending_swap_marker_from: None,
             tool_call_owner: std::collections::HashMap::new(),
             tandem_set: crate::engine::schedule::TandemSet::default(),
+            loop_boundary_state: tokio::sync::watch::channel(None).0,
+            loop_boundary_sequence: 0,
             #[cfg(test)]
             test_fail_next_active_model_session_persist: false,
             #[cfg(test)]
@@ -6005,6 +6036,14 @@ impl Driver {
             // history or run a turn). Compact/Prune controls already defer
             // on the same predicate; auto-compact and prune-after-switch
             // must not bypass it.
+            self.loop_boundary_state
+                .send_replace(Some(DriverLoopBoundaryObservation {
+                    sequence: self.loop_boundary_sequence,
+                    human_input_already_ready,
+                    assistant_inbox_idle_poll_armed: !waiting_for_keep_parked_siblings
+                        && !human_input_already_ready,
+                }));
+            self.loop_boundary_sequence = self.loop_boundary_sequence.saturating_add(1);
             tokio::select! {
                 biased;
                 msg = input_queue.recv_group_order_for(Some(&active_target_id)),
@@ -6117,7 +6156,7 @@ impl Driver {
                     }
                 }
                 _ = assistant_inbox_idle_poll.tick(),
-                    if !waiting_for_keep_parked_siblings => {
+                    if !waiting_for_keep_parked_siblings && !human_input_already_ready => {
                     if self
                         .try_deliver_immediate_assistant_inbox(
                             &input_queue,

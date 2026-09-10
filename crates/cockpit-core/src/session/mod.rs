@@ -659,6 +659,11 @@ pub struct Session {
     /// memory only: the daemon re-evaluates the interval on every
     /// send, so re-attaching a resumed session naturally re-injects.
     pub last_time_prelude: Mutex<Option<DateTime<Utc>>>,
+    /// Exact `[time: ...]` prelude last injected onto a user message.
+    last_applied_time_prelude: Mutex<Option<String>>,
+    /// Prelude captured on reasoning-only retract so an identical resend
+    /// reproduces the same provider-visible prefix across interval buckets.
+    retracted_time_prelude_for_resend: Mutex<Option<(String, String)>>,
     /// Running token estimate of RAW typed user-authored content
     /// (pre-skill-injection) this session. Bumped by
     /// [`Self::note_user_content`] and retained for stats/compatibility.

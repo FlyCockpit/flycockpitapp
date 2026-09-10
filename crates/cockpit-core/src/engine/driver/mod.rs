@@ -14176,6 +14176,7 @@ impl Driver {
                         ).await {
                             tracing::warn!(%error, "auto_title: retract rollback lost");
                         }
+                        self.session.stash_retracted_time_prelude_for_resend(&raw_user_text);
                         if let Err(error) = crate::text_artifact_blob::reconcile_cleanup_intents(&self.session.db).await {
                             tracing::warn!(%error, seq, "retracted user-message blob cleanup remains pending");
                         }

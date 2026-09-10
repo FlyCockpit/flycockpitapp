@@ -12264,6 +12264,15 @@ async fn handle_serialized_request_impl(
         } => {
             let attached = require_attached(state)?;
             let tree_session_id = ensure_agent_tree_attached_session(session_id, &attached.handle)?;
+            if ctx
+                .db
+                .decision_request(tree_session_id, decision_request_id)
+                .await
+                .map_err(internal)?
+                .is_none()
+            {
+                return Err(bad_request("agent decision request is not available"));
+            }
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             attached
                 .handle
@@ -20173,6 +20182,15 @@ async fn handle_concurrent_request_impl(
             let attached = require_shared_attached(&shared)?;
             let tree_session_id =
                 ensure_agent_tree_attached_session(session_id, attached.handle())?;
+            if ctx
+                .db
+                .decision_request(tree_session_id, decision_request_id)
+                .await
+                .map_err(internal)?
+                .is_none()
+            {
+                return Err(bad_request("agent decision request is not available"));
+            }
             let handle = attached.handle().clone();
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             handle

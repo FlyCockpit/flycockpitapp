@@ -19780,10 +19780,10 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "cancel_media_upload"
         | "finalize_media_upload"
         | "discard_unreferenced_media_attachment"
-        | "resolve_agent_decision"
-        | "apply_agent_session_override" => {
-            AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
-        }
+        | "resolve_agent_decision" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        // Unknown agent nodes return a typed `AgentSessionOverrideOutcome`
+        // response (`RejectedNotFound`), not a transport-level error.
+        "apply_agent_session_override" => AuthzAllowedOutcome::Response,
         "list_leak_reports" | "list_secret_inventory" | "get_flycockpit_account" => {
             AuthzAllowedOutcome::Response
         }
@@ -19925,11 +19925,12 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "resolve_code_root_interrupt_v1"
         | "execute_storage_cleanup"
         | "set_primary_assistant_soul_edit_mode" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
-        // Root creation requires a configured model; the matrix daemon is
-        // intentionally model-less. Discovery and the owner configuration /
-        // storage read paths remain fully typed on an empty daemon.
-        "create_code_root_v1"
-        | "create_code_root_with_acp_ingress_v1" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
+        // Root creation attaches through the matrix daemon's stub provider
+        // catalog. Discovery and the owner configuration / storage read paths
+        // remain fully typed on the same daemon.
+        "create_code_root_v1" | "create_code_root_with_acp_ingress_v1" => {
+            AuthzAllowedOutcome::Response
+        }
         "discover_code_roots_v1"
         | "set_workspace_history_scope"
         | "get_workspace_history_scope"
@@ -38280,11 +38281,9 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         );
     let mut extended = crate::config::extended::ExtendedConfig::default();
     extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxIntent::Off;
-    // The scripted retraction model server owns a fixed stream sequence. A
-    // same-model metadata fork after a successful turn would consume the next
-    // stream and desynchronize the visible-text/tool/cancel-all boundaries.
-    extended.auto_title = Some("openai/gpt-4o-mini".to_string());
-    extended.auto_title_with_session_model = false;
+    // Keep metadata/title traffic off the scripted retraction endpoint so the
+    // fixed stream sequence cannot be shifted by utility-model probes.
+    extended.auto_title = None;
     extended.default_approval_mode = crate::config::extended::ApprovalMode::Yolo;
     let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
         providers, extended,
@@ -38378,7 +38377,12 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
     wait_for_retraction_acceptance_event(
         &mut origin_events,
         "real provider reasoning delta",
-        |event| matches!(event, proto::Event::AssistantDisplayReasoningDelta { .. }),
+        |event| {
+            matches!(
+                event,
+                proto::Event::AssistantDisplayReasoningDelta { delta, .. } if delta == "checking"
+            )
+        },
     )
     .await;
 
@@ -38438,9 +38442,10 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
                 matches!(
                     event,
                     proto::Event::AgentIdle {
+                        turn_id: Some(turn_id),
                         reason: proto::IdleReason::Interrupted,
                         ..
-                    }
+                    } if turn_id == retracted_submission.to_string()
                 )
             },
         )
@@ -38449,8 +38454,9 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
 
     // A resend must rebuild the identical provider request/cache prefix: the
     // retracted durable row and reasoning display delta are not model history.
+    let resend_submission = Uuid::now_v7();
     assert!(matches!(
-        handle_request(send(Uuid::now_v7(), "same resend"), &mut origin, &ctx)
+        handle_request(send(resend_submission, "same resend"), &mut origin, &ctx)
             .await
             .expect("resend is accepted after a real CancelTurn"),
         Response::UserMessageQueued { .. }
@@ -38463,10 +38469,18 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
     .await;
     for events in [&mut origin_events, &mut other_events] {
         wait_for_retraction_acceptance_event(events, "idle after resend", |event| {
-            matches!(event, proto::Event::AgentIdle { .. })
+            matches!(
+                event,
+                proto::Event::AgentIdle {
+                    turn_id: Some(turn_id),
+                    reason: proto::IdleReason::Completed,
+                    ..
+                } if turn_id == resend_submission.to_string()
+            )
         })
         .await;
     }
+    settle_retraction_event_streams([&mut origin_events, &mut other_events]).await;
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             if captured_requests.lock().unwrap().len() >= 2 {
@@ -38499,7 +38513,12 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
     wait_for_retraction_acceptance_event(
         &mut origin_events,
         "visible text before cancel",
-        |event| matches!(event, proto::Event::AssistantDisplayTextDelta { .. }),
+        |event| {
+            matches!(
+                event,
+                proto::Event::AssistantDisplayTextDelta { delta, .. } if delta == "visible answer"
+            )
+        },
     )
     .await;
     handle_request(Request::CancelTurn, &mut origin, &ctx)
@@ -38515,9 +38534,10 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
                     matches!(
                         event,
                         proto::Event::AgentIdle {
+                            turn_id: Some(turn_id),
                             reason: proto::IdleReason::Interrupted,
                             ..
-                        }
+                        } if turn_id == text_submission.to_string()
                     )
                 },
             )
@@ -38574,9 +38594,10 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
                     matches!(
                         event,
                         proto::Event::AgentIdle {
+                            turn_id: Some(turn_id),
                             reason: proto::IdleReason::Interrupted,
                             ..
-                        }
+                        } if turn_id == tool_submission.to_string()
                     )
                 },
             )
@@ -38616,7 +38637,12 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
     wait_for_retraction_acceptance_event(
         &mut origin_events,
         "live reasoning before cancel-all",
-        |event| matches!(event, proto::Event::AssistantDisplayReasoningDelta { .. }),
+        |event| {
+            matches!(
+                event,
+                proto::Event::AssistantDisplayReasoningDelta { delta, .. } if delta == "checking"
+            )
+        },
     )
     .await;
     handle_request(Request::CancelAllSessionWork, &mut origin, &ctx)
@@ -38632,9 +38658,10 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
                     matches!(
                         event,
                         proto::Event::AgentIdle {
+                            turn_id: Some(turn_id),
                             reason: proto::IdleReason::Interrupted,
                             ..
-                        }
+                        } if turn_id == cancel_all_submission.to_string()
                     )
                 },
             )
@@ -38665,6 +38692,17 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         .await
         .expect("real worker shuts down after acceptance test");
     model_server.abort();
+}
+
+async fn settle_retraction_event_streams(events: &mut [&mut crate::daemon::EventReceiver]) {
+    for stream in events {
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(100), stream.recv()).await {
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+    }
 }
 
 async fn wait_for_retraction_acceptance_event(
@@ -38795,7 +38833,10 @@ async fn retraction_acceptance_model_server() -> (
         "id": "retraction-4", "model": "retraction-model",
         "choices": [{ "delta": { "tool_calls": [{
             "index": 0, "id": "read-before-cancel", "type": "function",
-            "function": { "name": "read", "arguments": "{\\\"path\\\":\\\"fixture.txt\\\"}" }
+            "function": {
+                "name": "read",
+                "arguments": serde_json::json!({"path": "fixture.txt"}).to_string()
+            }
         }] }, "finish_reason": null }]
     });
     let tool_finish = serde_json::json!({
@@ -38811,7 +38852,7 @@ async fn retraction_acceptance_model_server() -> (
             false,
         ),
         (String::new(), true),
-        (format!("data: {reasoning}\n\n"), true),
+        (format!("data: {reasoning}\n\ndata: [DONE]\n\n"), false),
     ];
     let server = tokio::spawn(async move {
         for (stream_body, hang) in streams {

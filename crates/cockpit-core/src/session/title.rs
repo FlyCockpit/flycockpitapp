@@ -591,10 +591,34 @@ impl Session {
             return None;
         }
         *last = Some(now);
-        Some(format!(
+        let prelude = format!(
             "[time: {}]",
             time_prelude_timestamp(now, interval_minutes).to_rfc3339()
-        ))
+        );
+        *self.last_applied_time_prelude.lock().unwrap() = Some(prelude.clone());
+        Some(prelude)
+    }
+
+    pub(crate) fn stash_retracted_time_prelude_for_resend(&self, user_text: &str) {
+        if let Some(prelude) = self.last_applied_time_prelude.lock().unwrap().take() {
+            *self.retracted_time_prelude_for_resend.lock().unwrap() =
+                Some((prelude, user_text.to_string()));
+        }
+    }
+
+    pub(crate) fn take_retracted_time_prelude_for_resend(&self, user_text: &str) -> Option<String> {
+        let mut stash = self.retracted_time_prelude_for_resend.lock().unwrap();
+        match stash.as_ref() {
+            Some((prelude, expected)) if expected == user_text => {
+                let prelude = prelude.clone();
+                stash.take();
+                Some(prelude)
+            }
+            _ => {
+                stash.take();
+                None
+            }
+        }
     }
 }
 
@@ -655,6 +679,29 @@ mod metadata_tests {
             crate::db::sessions::TitleRecoveryNudgeState::None
         );
         assert!(session.claim_title_failure_notice());
+    }
+
+    #[tokio::test]
+    async fn retract_reuses_exact_time_prelude_on_identical_resend() {
+        let session = Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            PathBuf::from("/title-retract-time-resend"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let first = session.take_time_prelude(5).expect("first prelude");
+        session.stash_retracted_time_prelude_for_resend("same resend");
+        let second = session
+            .take_retracted_time_prelude_for_resend("same resend")
+            .expect("identical resend reuses the retracted prelude");
+        assert_eq!(first, second);
+        assert!(
+            session
+                .take_retracted_time_prelude_for_resend("different text")
+                .is_none(),
+            "a different resend must not inherit the retracted prelude"
+        );
     }
 
     #[tokio::test]

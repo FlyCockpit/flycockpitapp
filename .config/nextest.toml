@@ -29,6 +29,12 @@ slow-timeout = { period = "90s", terminate-after = 4 }
 filter = "test(=daemon::server::tests::authz_default_profile_owner_traverses_every_controlled_socket_path)"
 slow-timeout = { period = "90s", terminate-after = 4 }
 
+# Multi-scenario retraction acceptance against a live worker and scripted
+# provider streams; each boundary waits on real idle/tool events.
+[[profile.default.overrides]]
+filter = "test(=daemon::server::tests::cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns)"
+slow-timeout = { period = "90s", terminate-after = 4 }
+
 [[profile.default.overrides]]
 filter = "test(=daemon::server::tests::dispatch_matrix_mutating_dispatch_cases_traverse_socket_path)"
 slow-timeout = { period = "90s", terminate-after = 4 }

@@ -292,6 +292,14 @@ impl DeferredOrdinaryCall {
         self.scheduled.source_index
     }
 
+    pub(crate) fn set_execution_release_sender(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<usize>,
+    ) {
+        self.durable_permit
+            .set_execution_release_sender(self.scheduled.source_index, tx);
+    }
+
     pub(crate) async fn execute(
         self,
     ) -> (

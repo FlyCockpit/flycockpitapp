@@ -52,6 +52,12 @@ pub(in crate::engine::driver) fn injection_check_prompt_target(
 /// interval hasn't elapsed.
 impl Driver {
     pub(in crate::engine::driver) fn with_time_prelude(&self, user_text: String) -> String {
+        if let Some(prelude) = self
+            .session
+            .take_retracted_time_prelude_for_resend(&user_text)
+        {
+            return format!("{prelude}\n\n{user_text}");
+        }
         match self
             .session
             .take_time_prelude(self.time_injection_interval_minutes)

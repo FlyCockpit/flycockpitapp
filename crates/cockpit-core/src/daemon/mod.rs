@@ -608,16 +608,6 @@ fn runtime_dir() -> Option<PathBuf> {
     None
 }
 
-fn cache_dir() -> Option<PathBuf> {
-    if let Ok(s) = std::env::var("XDG_CACHE_HOME")
-        && !s.trim().is_empty()
-    {
-        return Some(PathBuf::from(s).join("cockpit"));
-    }
-    let home = dirs::home_dir()?;
-    Some(home.join(".cache/cockpit"))
-}
-
 /// Restores the process umask on drop, so a scoped tightening around a single
 /// syscall is undone on every path including an early `?` return.
 #[cfg(unix)]

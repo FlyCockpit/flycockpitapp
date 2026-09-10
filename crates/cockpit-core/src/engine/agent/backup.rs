@@ -2182,7 +2182,12 @@ mod backup_fallback_tests {
             )
             .unwrap(),
         );
-        let agent = agent_with(primary);
+        let mut agent = agent_with(primary);
+        // Production drivers bind one retry budget across the entire logical
+        // turn. Keep this cap test on that same path so each failover target
+        // cannot independently spend a fresh same-model retry allowance.
+        agent.params.retry_budget =
+            Some(crate::engine::delegation_budget::TurnRetryBudget::default());
         let mut fallbacks = Vec::new();
         for idx in 0..(MAX_FAILOVER_CANDIDATES + 2) {
             let provider = format!("dead-{idx}");

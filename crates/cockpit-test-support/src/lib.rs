@@ -8,6 +8,31 @@ use tokio::sync::{Mutex, MutexGuard};
 pub mod home_isolation;
 pub mod provider;
 
+/// Create a small test root on a latency-isolated temporary filesystem when
+/// the platform exposes one, with a normal OS temporary directory as the
+/// portable fallback.
+///
+/// Linux's conventional `/dev/shm` mount keeps fsync-heavy durability fixtures
+/// independent of shared workspace-disk latency. Creating the directory is
+/// the capability check: containers without that mount (or without access to
+/// it), and every other platform, safely fall back to `tempfile::tempdir`.
+/// Callers must still exercise their real durable write/flush path; this helper
+/// changes only the test root and never mutates `TMPDIR` or a user directory.
+pub fn latency_isolated_tempdir() -> tempfile::TempDir {
+    #[cfg(target_os = "linux")]
+    if let Ok(tempdir) = tempfile::Builder::new()
+        .prefix("cockpit-latency-isolated-")
+        .tempdir_in("/dev/shm")
+    {
+        return tempdir;
+    }
+
+    tempfile::Builder::new()
+        .prefix("cockpit-latency-isolated-")
+        .tempdir()
+        .expect("create latency-isolated test tempdir fallback")
+}
+
 #[cfg(test)]
 mod clippy_workflow_gate;
 

@@ -527,7 +527,7 @@ mod tests {
         );
     }
 
-    fn ctx_with_interrupt_hub(
+    async fn ctx_with_interrupt_hub(
         cwd: &std::path::Path,
         root: &std::path::Path,
         write_approval: Option<bool>,
@@ -536,23 +536,51 @@ mod tests {
         apply_test_config(&mut ctx, root, write_approval);
         ctx.session
             .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
+        let owner = db
+            .ensure_session_root_agent(
+                ctx.session.id,
+                None,
+                crate::agent_tree::workspace_ref_for_host_path(cwd).unwrap(),
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap();
+        let owner = match db
+            .transition_agent_instance(
+                ctx.session.id,
+                owner.agent_instance_id,
+                owner.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                r#"{"state":"running"}"#,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap()
+        {
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(owner) => owner,
+            outcome => panic!("skill fixture root did not start: {outcome:?}"),
+        };
+        ctx.agent_instance_id = Some(owner.agent_instance_id);
         let (events, _receiver) = tokio::sync::broadcast::channel(8);
         let redaction = Arc::new(std::sync::RwLock::new(Arc::new(
             crate::redact::RedactionTable::empty(),
         )));
-        ctx.interrupts = Arc::new(crate::engine::interrupt::InterruptHub::new(
-            events,
-            redaction,
-            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
-            db.clone(),
-            ctx.session.id,
-        ));
+        ctx.interrupts = Arc::new(
+            crate::engine::interrupt::InterruptHub::new(
+                events,
+                redaction,
+                Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+                db.clone(),
+                ctx.session.id,
+            )
+            .with_live_session(ctx.session.clone()),
+        );
         (Arc::new(ctx), db)
     }
 
     async fn assert_parks_without_writing(
         ctx: Arc<ToolCtx>,
-        db: &crate::db::Db,
+        _db: &crate::db::Db,
         args: Value,
         call_id: &str,
     ) -> uuid::Uuid {
@@ -571,6 +599,7 @@ mod tests {
             gate: None,
             verification: None,
         };
+        let mut raised = ctx.interrupts.subscribe_raised();
         let task_ctx = ctx.clone_for_dispatch();
         // Task-local state (the workspace trust policy) does not cross
         // `tokio::spawn`; re-scope the trusted policy inside the spawned
@@ -592,32 +621,11 @@ mod tests {
             .await
         });
 
-        let mut interrupt_id = None;
-        for _ in 0..1000 {
-            let open = db.list_open_interrupts(ctx.session.id).await.unwrap();
-            if let Some(row) = open
-                .iter()
-                .find(|row| ctx.interrupts.has_waiter(row.interrupt_id))
-            {
-                let row_id = row.interrupt_id;
-                if ctx.interrupts.park_all_registered().await == 1 {
-                    interrupt_id = Some(row_id);
-                    break;
-                }
-            }
-            tokio::task::yield_now().await;
-        }
-        let Some(interrupt_id) = interrupt_id else {
-            match tokio::time::timeout(std::time::Duration::from_secs(2), task).await {
-                Ok(joined) => panic!(
-                    "skill_manage call never raised an interrupt; task finished: {:?}",
-                    joined.map(|result| result.map(|out| out.content))
-                ),
-                Err(_still_running) => {
-                    panic!("skill_manage call never raised an interrupt; task still running")
-                }
-            }
-        };
+        let interrupt_id = raised
+            .recv()
+            .await
+            .expect("skill write approval is published after lifecycle binding");
+        assert!(ctx.interrupts.park(interrupt_id).await);
         let error = task.await.unwrap().unwrap_err();
         assert!(crate::engine::interrupt::is_parked(&error));
         interrupt_id
@@ -638,22 +646,51 @@ mod tests {
         })
     }
 
-    async fn replay_question_from_row(
+    async fn settle_parked_host_approval_and_replay_question(
         db: &crate::db::Db,
+        session_id: uuid::Uuid,
         interrupt_id: uuid::Uuid,
+        response: &ResolveResponse,
     ) -> crate::engine::interrupt::PreResolvedInterruptQuestion {
         let row = db
             .get_interrupt(interrupt_id)
             .await
             .unwrap()
             .expect("parked skill approval row");
-        crate::engine::interrupt::PreResolvedInterruptQuestion {
+        let question = crate::engine::interrupt::PreResolvedInterruptQuestion {
             agent_instance_id: row.agent_instance_id,
-            agent: row.agent_id,
-            description: row.description,
-            questions: row.questions.expect("parked skill approval question set"),
+            agent: row.agent_id.clone(),
+            description: row.description.clone(),
+            questions: row
+                .questions
+                .clone()
+                .expect("parked skill approval question set"),
             occurrence: 1,
-        }
+        };
+        let decision = db
+            .decision_request_for_interrupt(session_id, interrupt_id)
+            .await
+            .unwrap()
+            .expect("parked skill approval lifecycle decision");
+        let envelope = serde_json::to_string(response).unwrap();
+        assert!(matches!(
+            crate::agent_tree::AgentTreeLifecycle::new(db.clone())
+                .resolve_host_approval(
+                    session_id,
+                    decision.decision_request_id,
+                    interrupt_id,
+                    &envelope,
+                    crate::agent_tree::HostApprovalAuthority::for_durable_interrupt_binding(
+                        session_id, &decision, &row,
+                    )
+                    .unwrap(),
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await
+                .unwrap(),
+            crate::agent_tree::DecisionSettlement::Resolved(_)
+        ));
+        question
     }
 
     fn skill_write_replay_question(
@@ -1146,7 +1183,7 @@ mod tests {
         };
         crate::config::trust::scope_workspace_trust_policy(policy, async {
             let root = tmp.path().join("skills");
-            let (ctx, db) = ctx_with_interrupt_hub(tmp.path(), &root, None);
+            let (ctx, db) = ctx_with_interrupt_hub(tmp.path(), &root, None).await;
             assert!(ctx.config.extended().skills.write_approval);
             let args = create_value("default-gated");
 
@@ -1159,14 +1196,26 @@ mod tests {
             .await;
 
             assert!(!root.join("default-gated/SKILL.md").exists());
-            let question = replay_question_from_row(&db, interrupt_id).await;
-            let output = crate::engine::interrupt::with_pre_resolved_interrupt_question(
+            let response = ResolveResponse::Single {
+                selected_id: crate::approval::ID_APPROVE.to_string(),
+            };
+            let question = settle_parked_host_approval_and_replay_question(
+                &db,
+                ctx.session.id,
                 interrupt_id,
-                ResolveResponse::Single {
-                    selected_id: crate::approval::ID_APPROVE.to_string(),
-                },
-                question,
-                SkillManageTool.call(args, &ctx),
+                &response,
+            )
+            .await;
+            let output = crate::engine::interrupt::with_host_approval_effect_scope(
+                "skill_manage_replay_test",
+                ctx.cancel.clone(),
+                crate::engine::interrupt::with_pre_resolved_interrupt_question(
+                    interrupt_id,
+                    response,
+                    question,
+                    SkillManageTool.call(args, &ctx),
+                ),
+                |output| Some(output.content.contains("Created skill")),
             )
             .await
             .unwrap();
@@ -1284,7 +1333,7 @@ mod tests {
                     )
                     .await;
                 }
-                let (ctx, db) = ctx_with_interrupt_hub(tmp.path(), &root, None);
+                let (ctx, db) = ctx_with_interrupt_hub(tmp.path(), &root, None).await;
 
                 assert_parks_without_writing(
                     Arc::clone(&ctx),
@@ -1382,22 +1431,8 @@ mod tests {
         };
         crate::config::trust::scope_workspace_trust_policy(policy, async {
             let root = tmp.path().join("skills");
-            write_config(tmp.path(), &root, true);
-            let (mut ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
-            ctx.session
-                .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
-            let (events, _receiver) = tokio::sync::broadcast::channel(8);
-            let redaction = Arc::new(std::sync::RwLock::new(Arc::new(
-                crate::redact::RedactionTable::empty(),
-            )));
-            ctx.interrupts = Arc::new(crate::engine::interrupt::InterruptHub::new(
-                events,
-                redaction,
-                Arc::new(std::sync::atomic::AtomicUsize::new(1)),
-                db.clone(),
-                ctx.session.id,
-            ));
-            let mut ctx = Arc::new(ctx);
+            let (ctx, db) = ctx_with_interrupt_hub(tmp.path(), &root, Some(true)).await;
+            let mut ctx = ctx;
             let args = create_value("gated-skill");
             let payload = InterruptParkPayload {
                 tool: "skill_manage".to_string(),
@@ -1414,6 +1449,7 @@ mod tests {
                 gate: None,
                 verification: None,
             };
+            let mut raised = ctx.interrupts.subscribe_raised();
             let task_ctx = ctx.clone_for_dispatch();
             let task_args = args.clone();
             // Task-local trust policy does not cross `tokio::spawn`; re-scope
@@ -1433,19 +1469,11 @@ mod tests {
                 .await
             });
 
-            let interrupt_id = loop {
-                let open = db.list_open_interrupts(ctx.session.id).await.unwrap();
-                if let Some(row) = open
-                    .iter()
-                    .find(|row| ctx.interrupts.has_waiter(row.interrupt_id))
-                {
-                    let interrupt_id = row.interrupt_id;
-                    if ctx.interrupts.park_all_registered().await == 1 {
-                        break interrupt_id;
-                    }
-                }
-                tokio::task::yield_now().await;
-            };
+            let interrupt_id = raised
+                .recv()
+                .await
+                .expect("skill write approval is published after lifecycle binding");
+            assert!(ctx.interrupts.park(interrupt_id).await);
             let error = task.await.unwrap().unwrap_err();
             assert!(crate::engine::interrupt::is_parked(&error));
             assert!(!root.join("gated-skill/SKILL.md").exists());
@@ -1454,14 +1482,26 @@ mod tests {
             assert_eq!(parked.tool, "skill_manage");
             assert_eq!(parked.args, args);
 
-            let question = replay_question_from_row(&db, interrupt_id).await;
-            let output = crate::engine::interrupt::with_pre_resolved_interrupt_question(
+            let response = ResolveResponse::Single {
+                selected_id: crate::approval::ID_APPROVE.to_string(),
+            };
+            let question = settle_parked_host_approval_and_replay_question(
+                &db,
+                ctx.session.id,
                 interrupt_id,
-                ResolveResponse::Single {
-                    selected_id: crate::approval::ID_APPROVE.to_string(),
-                },
-                question,
-                SkillManageTool.call(args, &ctx),
+                &response,
+            )
+            .await;
+            let output = crate::engine::interrupt::with_host_approval_effect_scope(
+                "skill_manage_replay_test",
+                ctx.cancel.clone(),
+                crate::engine::interrupt::with_pre_resolved_interrupt_question(
+                    interrupt_id,
+                    response,
+                    question,
+                    SkillManageTool.call(args, &ctx),
+                ),
+                |output| Some(output.content.contains("Created skill")),
             )
             .await
             .unwrap();

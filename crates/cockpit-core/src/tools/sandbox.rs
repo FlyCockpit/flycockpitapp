@@ -773,7 +773,6 @@ mod tests {
     // ---- native-tool confinement (sandboxing part 2) ----------------------
 
     use std::sync::Arc;
-    use std::sync::atomic::AtomicUsize;
 
     use crate::approval::Approver;
     use crate::approval::ID_APPROVE_SESSION;
@@ -793,101 +792,6 @@ mod tests {
         spawn_resolve_next_path_prompt(ctx, ResolveResponse::Cancel)
     }
 
-    async fn next_open_interrupt(
-        db: &crate::db::Db,
-        session_id: uuid::Uuid,
-        seen: &[uuid::Uuid],
-    ) -> Option<uuid::Uuid> {
-        let open = db.list_open_interrupts(session_id).await.unwrap();
-        open.iter()
-            .find(|row| !seen.contains(&row.interrupt_id))
-            .map(|row| row.interrupt_id)
-    }
-
-    async fn settle_host_approval_interrupt(
-        db: &crate::db::Db,
-        session_id: uuid::Uuid,
-        hub: &Arc<InterruptHub>,
-        interrupt_id: uuid::Uuid,
-        response: ResolveResponse,
-    ) {
-        loop {
-            if hub.has_waiter(interrupt_id)
-                && db
-                    .decision_request_for_interrupt(session_id, interrupt_id)
-                    .await
-                    .unwrap()
-                    .is_some()
-            {
-                let interrupt = db
-                    .get_interrupt(interrupt_id)
-                    .await
-                    .unwrap()
-                    .expect("open interrupt remains available for lifecycle settlement");
-                let decision = db
-                    .decision_request_for_interrupt(session_id, interrupt_id)
-                    .await
-                    .unwrap()
-                    .expect("host approval interrupt has a bound lifecycle decision");
-                let response_json = serde_json::to_string(&response).unwrap();
-                let lifecycle = crate::agent_tree::AgentTreeLifecycle::new(db.clone());
-                if interrupt.questions.as_ref().is_some_and(|offered| {
-                    crate::approval::host_approval_response_allows(&response, offered)
-                }) {
-                    let authority =
-                        crate::agent_tree::HostApprovalAuthority::for_durable_interrupt_binding(
-                            session_id, &decision, &interrupt,
-                        )
-                        .expect("host approval response retains its durable interrupt binding");
-                    lifecycle
-                        .resolve_host_approval(
-                            session_id,
-                            decision.decision_request_id,
-                            interrupt_id,
-                            &response_json,
-                            authority,
-                            crate::agent_tree::system_now_unix_ms(),
-                        )
-                        .await
-                        .unwrap();
-                } else if interrupt.questions.as_ref().is_some_and(|offered| {
-                    crate::approval::host_approval_response_declines(&response, offered)
-                }) {
-                    lifecycle
-                        .cancel_host_approval(
-                            session_id,
-                            decision.decision_request_id,
-                            interrupt_id,
-                            &response_json,
-                            crate::agent_tree::system_now_unix_ms(),
-                        )
-                        .await
-                        .unwrap();
-                }
-                assert!(hub.resolve(interrupt_id, response));
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    }
-
-    async fn resolve_next_host_approval_interrupt(
-        db: &crate::db::Db,
-        session_id: uuid::Uuid,
-        hub: &Arc<InterruptHub>,
-        response: ResolveResponse,
-        seen: &[uuid::Uuid],
-    ) -> uuid::Uuid {
-        let interrupt_id = loop {
-            if let Some(interrupt_id) = next_open_interrupt(db, session_id, seen).await {
-                break interrupt_id;
-            }
-            tokio::task::yield_now().await;
-        };
-        settle_host_approval_interrupt(db, session_id, hub, interrupt_id, response).await;
-        interrupt_id
-    }
-
     fn spawn_resolve_next_path_prompt(
         ctx: &ToolCtx,
         response: ResolveResponse,
@@ -895,35 +799,97 @@ mod tests {
         let db = ctx.session.db.clone();
         let sid = ctx.session.id;
         let hub = ctx.interrupts.clone();
+        let mut raised = hub.subscribe_raised();
         tokio::spawn(async move {
-            resolve_next_host_approval_interrupt(&db, sid, &hub, response, &[]).await;
+            resolve_next_path_prompt(db, sid, hub, &mut raised, response).await;
         })
     }
 
-    async fn check_native_access_scoped(
+    async fn resolve_next_path_prompt(
+        db: crate::db::Db,
+        sid: uuid::Uuid,
+        hub: Arc<InterruptHub>,
+        raised: &mut tokio::sync::mpsc::UnboundedReceiver<uuid::Uuid>,
+        response: ResolveResponse,
+    ) {
+        let interrupt_id = raised
+            .recv()
+            .await
+            .expect("path prompt publishes its exact interrupt id");
+        assert!(hub.has_waiter(interrupt_id));
+        let decision = db
+            .decision_request_for_interrupt(sid, interrupt_id)
+            .await
+            .unwrap()
+            .expect("path prompt is bound to its durable decision");
+        let interrupt = db
+            .get_interrupt(interrupt_id)
+            .await
+            .unwrap()
+            .expect("path prompt interrupt remains available");
+        let offered = interrupt
+            .questions
+            .clone()
+            .or_else(|| {
+                interrupt.question.clone().map(|question| {
+                    crate::daemon::proto::InterruptQuestionSet {
+                        questions: vec![question],
+                    }
+                })
+            })
+            .expect("path prompt has an offered question set");
+        let lifecycle = crate::agent_tree::AgentTreeLifecycle::new(db.clone());
+        let envelope = serde_json::to_string(&response).unwrap();
+        let settlement = if crate::approval::host_approval_response_allows(&response, &offered) {
+            lifecycle
+                .resolve_host_approval(
+                    sid,
+                    decision.decision_request_id,
+                    interrupt_id,
+                    &envelope,
+                    crate::agent_tree::HostApprovalAuthority::for_durable_interrupt_binding(
+                        sid, &decision, &interrupt,
+                    )
+                    .unwrap(),
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await
+        } else {
+            lifecycle
+                .cancel_host_approval(
+                    sid,
+                    decision.decision_request_id,
+                    interrupt_id,
+                    &envelope,
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await
+        }
+        .unwrap();
+        assert!(matches!(
+            settlement,
+            crate::agent_tree::DecisionSettlement::Resolved(_)
+        ));
+        assert!(hub.resolve(interrupt_id, response));
+    }
+
+    /// Exercise native approval through the same concrete effect scope as a
+    /// production tool dispatch. A durable approval response is only a ready
+    /// capability; the filesystem boundary must claim its exact path before
+    /// the enclosing dispatcher can publish the terminal receipt.
+    async fn check_native_access_as_tool_effect(
         ctx: &ToolCtx,
         path: &std::path::Path,
         required: SandboxPathAccess,
-    ) -> Result<PathBuf> {
-        let cancel = ctx.cancel.clone();
+    ) -> anyhow::Result<std::path::PathBuf> {
         crate::engine::interrupt::with_host_approval_effect_scope(
-            "sandbox_native_access_gate",
-            cancel,
-            Box::pin(check_native_access(ctx, path, required)),
-            |_| Some(true),
-        )
-        .await
-    }
-
-    async fn check_gitignore_read_scoped(
-        ctx: &ToolCtx,
-        path: &std::path::Path,
-    ) -> anyhow::Result<Option<ToolOutput>> {
-        let cancel = ctx.cancel.clone();
-        crate::engine::interrupt::with_host_approval_effect_scope(
-            "sandbox_gitignore_read_gate",
-            cancel,
-            Box::pin(check_gitignore_read(ctx, path)),
+            "native_filesystem_access",
+            ctx.cancel.clone(),
+            async {
+                let checked = check_native_access(ctx, path, required).await?;
+                recheck_native_access_effect_boundary(&checked, required).await?;
+                Ok(checked)
+            },
             |_| Some(true),
         )
         .await
@@ -947,11 +913,35 @@ mod tests {
         let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
         let cfg = crate::config::extended::RedactConfig::default();
         let redact = Arc::new(crate::redact::RedactionTable::build(&cfg, cwd).unwrap());
+        let owner = db
+            .ensure_session_root_agent(
+                sid,
+                None,
+                crate::agent_tree::workspace_ref_for_host_path(cwd).unwrap(),
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap();
+        let owner = match db
+            .transition_agent_instance(
+                sid,
+                owner.agent_instance_id,
+                owner.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                r#"{"state":"running"}"#,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap()
+        {
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(owner) => owner,
+            outcome => panic!("sandbox fixture root did not start: {outcome:?}"),
+        };
         let (events, _events_rx) = tokio::sync::broadcast::channel(16);
         let hub = Arc::new(InterruptHub::new(
             events,
             Arc::new(std::sync::RwLock::new(redact.clone())),
-            Arc::new(AtomicUsize::new(1)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             db.clone(),
             sid,
         ));
@@ -961,46 +951,7 @@ mod tests {
             cwd.to_path_buf(),
             crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
         );
-        let approver = Arc::new(Approver::new(
-            store,
-            db.clone(),
-            sid,
-            "builder",
-            hub.clone(),
-        ));
-        let workspace_ref =
-            crate::agent_tree::workspace_ref_for_host_path(cwd).expect("test workspace ref");
-        let root_agent = db
-            .ensure_session_root_agent(
-                sid,
-                None,
-                workspace_ref,
-                crate::agent_tree::system_now_unix_ms(),
-            )
-            .await
-            .expect("session root agent");
-        let agent_instance_id = match db
-            .transition_agent_instance(
-                sid,
-                root_agent.agent_instance_id,
-                root_agent.revision,
-                crate::db::agent_tree_decisions::AgentInstanceState::Running,
-                "{}",
-                crate::agent_tree::system_now_unix_ms(),
-            )
-            .await
-            .expect("session root transition")
-        {
-            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(row) => {
-                row.agent_instance_id
-            }
-            crate::db::agent_tree_decisions::AgentTransitionOutcome::AlreadyTerminal(_) => {
-                root_agent.agent_instance_id
-            }
-            crate::db::agent_tree_decisions::AgentTransitionOutcome::RevisionConflict => {
-                panic!("session root transition raced");
-            }
-        };
+        let approver = Arc::new(Approver::new(store, db, sid, "builder", hub.clone()));
         (
             env,
             ToolCtx {
@@ -1009,7 +960,7 @@ mod tests {
                 executing_model_trusted: false,
                 knowledge_access_trusted: false,
                 caller_model: None,
-                agent_instance_id: Some(agent_instance_id),
+                agent_instance_id: Some(owner.agent_instance_id),
                 lock_identity: "builder".to_string().clone(),
                 write_scope: None,
                 dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
@@ -1037,7 +988,7 @@ mod tests {
                 mcp_builtin_registry: Arc::new(crate::mcp::builtin::BuiltinRegistry::default_with(
                     Vec::new(),
                 )),
-                has_tree: true,
+                has_tree: false,
                 has_bash: false,
                 events: None,
                 lsp: None,
@@ -1708,14 +1659,14 @@ mod tests {
             },
         );
         // First access prompts → granted → allowed.
-        check_native_access_scoped(&ctx, &target, SandboxPathAccess::Read)
+        check_native_access_as_tool_effect(&ctx, &target, SandboxPathAccess::Read)
             .await
             .unwrap();
         resolver.await.unwrap();
 
         // A second access to the same path is now granted with no prompt
         // (would block forever otherwise — no client attached).
-        check_native_access_scoped(&ctx, &target, SandboxPathAccess::Read)
+        check_native_access(&ctx, &target, SandboxPathAccess::Read)
             .await
             .unwrap();
     }
@@ -1764,7 +1715,7 @@ mod tests {
         let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         let target = outside.path().join("secret.txt");
 
-        let resolver = spawn_cancel_next_path_prompt(&ctx);
+        let resolver = spawn_resolve_next_path_prompt(&ctx, ResolveResponse::Cancel);
         let err = check_native_access(&ctx, &target, SandboxPathAccess::Read)
             .await
             .unwrap_err();
@@ -1930,40 +1881,43 @@ mod tests {
         let db = ctx.session.db.clone();
         let sid = ctx.session.id;
         let hub = ctx.interrupts.clone();
-        // Resolve stage 1 (file), then stage 2 (session). The detached hub
-        // doesn't clear the DB open-interrupt row, so wait for a *new* id at
-        // stage 2 (mirrors the compound-command approval test).
+        let mut raised = hub.subscribe_raised();
+        // Resolve stage 1 (file), then stage 2 (session) through the same
+        // durable decision settlement boundary as the daemon worker.
         let resolver = tokio::spawn(async move {
-            let mut seen = Vec::new();
-            let iid1 = resolve_next_host_approval_interrupt(
-                &db,
+            resolve_next_path_prompt(
+                db.clone(),
                 sid,
-                &hub,
+                hub.clone(),
+                &mut raised,
                 ResolveResponse::Single {
                     selected_id: ID_GITIGNORE_FILE.into(),
                 },
-                &seen,
             )
             .await;
-            seen.push(iid1);
-            resolve_next_host_approval_interrupt(
-                &db,
+            resolve_next_path_prompt(
+                db,
                 sid,
-                &hub,
+                hub,
+                &mut raised,
                 ResolveResponse::Single {
                     selected_id: ID_APPROVE_SESSION.into(),
                 },
-                &seen,
             )
             .await;
         });
-        let out = check_gitignore_read_scoped(&ctx, &tmp.path().join(".env"))
-            .await
-            .unwrap();
+        let out = crate::engine::interrupt::with_host_approval_effect_scope(
+            "native_filesystem_access",
+            ctx.cancel.clone(),
+            check_gitignore_read(&ctx, &tmp.path().join(".env")),
+            |_| Some(true),
+        )
+        .await
+        .unwrap();
         resolver.await.unwrap();
         assert!(out.is_none(), "approved read proceeds");
         // The session allowlist now holds the `.env` file glob → silent reread.
-        let out2 = check_gitignore_read_scoped(&ctx, &tmp.path().join(".env"))
+        let out2 = check_gitignore_read(&ctx, &tmp.path().join(".env"))
             .await
             .unwrap();
         assert!(out2.is_none(), "session glob recorded → silent reread");

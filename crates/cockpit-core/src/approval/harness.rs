@@ -137,7 +137,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    fn approver(cwd: &Path) -> Arc<Approver> {
+    async fn approver(cwd: &Path) -> Arc<Approver> {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = crate::session::Session::create_for_test(
             db.clone(),
@@ -146,6 +146,28 @@ mod tests {
             crate::session::test_redaction_key_resolver(),
         )
         .unwrap();
+        let root = db
+            .ensure_session_root_agent(
+                session.id,
+                None,
+                crate::agent_tree::workspace_ref_for_host_path(cwd).unwrap(),
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.transition_agent_instance(
+                session.id,
+                root.agent_instance_id,
+                root.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                r#"{"state":"running"}"#,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap(),
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(_)
+        ));
         let config = crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd);
         let store = GrantStore::new(db.clone(), session.id, cwd.to_path_buf(), config);
         Arc::new(Approver::new(
@@ -159,34 +181,18 @@ mod tests {
 
     async fn resolve_next(
         approver: &Approver,
+        raised: &mut tokio::sync::mpsc::UnboundedReceiver<uuid::Uuid>,
         response: ResolveResponse,
     ) -> crate::db::db::needs_attention::NeedsAttentionRow {
-        loop {
-            let open = approver
-                .db
-                .list_open_interrupts(approver.session_id)
-                .await
-                .unwrap();
-            if let Some(row) = open.first() {
-                let row = row.clone();
-                if !approver.interrupts.has_waiter(row.interrupt_id) {
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                approver
-                    .db
-                    .resolve_interrupt(row.interrupt_id, &response)
-                    .await
-                    .unwrap();
-                assert!(
-                    approver
-                        .interrupts
-                        .resolve(row.interrupt_id, response.clone())
-                );
-                return row;
-            }
-            tokio::task::yield_now().await;
-        }
+        crate::engine::interrupt::test_support::settle_published_host_approval(
+            &approver.db,
+            approver.session_id,
+            &approver.interrupts,
+            raised,
+            response,
+        )
+        .await
+        .unwrap()
     }
 
     async fn permission_events(approver: &Approver) -> Vec<serde_json::Value> {
@@ -205,14 +211,19 @@ mod tests {
         approver: Arc<Approver>,
         response: ResolveResponse,
     ) -> (Decision, crate::db::db::needs_attention::NeedsAttentionRow) {
+        let mut raised = approver.interrupts.subscribe_raised();
         let task_approver = approver.clone();
         let task = tokio::spawn(async move {
-            task_approver
-                .approve_harness_invoke("codex", Some("gpt-5"), WritePolicy::Direct)
-                .await
-                .unwrap()
+            crate::engine::interrupt::with_host_approval_effect_scope(
+                "harness_invoke_test",
+                tokio_util::sync::CancellationToken::new(),
+                task_approver.approve_harness_invoke("codex", Some("gpt-5"), WritePolicy::Direct),
+                |decision| Some(decision.is_allowed()),
+            )
+            .await
+            .unwrap()
         });
-        let row = resolve_next(&approver, response).await;
+        let row = resolve_next(&approver, &mut raised, response).await;
         let decision = task.await.unwrap();
         (decision, row)
     }
@@ -220,7 +231,8 @@ mod tests {
     #[tokio::test]
     async fn harness_invoke_prompt_shape_mentions_selector_model_write_and_sandbox() {
         let tmp = tempfile::tempdir().unwrap();
-        let approver = approver(tmp.path());
+        let approver = approver(tmp.path()).await;
+        let mut raised = approver.interrupts.subscribe_raised();
         let task_approver = approver.clone();
         let task = tokio::spawn(async move {
             task_approver
@@ -231,6 +243,7 @@ mod tests {
 
         let row = resolve_next(
             &approver,
+            &mut raised,
             ResolveResponse::Single {
                 selected_id: ID_REJECT.to_string(),
             },
@@ -276,7 +289,7 @@ mod tests {
     #[tokio::test]
     async fn harness_invoke_approval_session_records_grant_and_permission_decision() {
         let tmp = tempfile::tempdir().unwrap();
-        let approver = approver(tmp.path());
+        let approver = approver(tmp.path()).await;
         let (decision, _) = answer(
             approver.clone(),
             ResolveResponse::Single {
@@ -308,7 +321,7 @@ mod tests {
     #[tokio::test]
     async fn harness_invoke_approval_once_records_no_grant_and_permission_decision() {
         let tmp = tempfile::tempdir().unwrap();
-        let approver = approver(tmp.path());
+        let approver = approver(tmp.path()).await;
         let (decision, _) = answer(
             approver.clone(),
             ResolveResponse::Single {
@@ -337,13 +350,6 @@ mod tests {
             ),
             (ResolveResponse::Cancel, Decision::Deny, "user_prompt"),
             (
-                ResolveResponse::Single {
-                    selected_id: "foreign".to_string(),
-                },
-                Decision::Deny,
-                "user_prompt",
-            ),
-            (
                 ResolveResponse::Freetext {
                     text: NONINTERACTIVE_RUN_DENIAL.to_string(),
                 },
@@ -354,7 +360,7 @@ mod tests {
 
         for (response, expected, source) in cases {
             let tmp = tempfile::tempdir().unwrap();
-            let approver = approver(tmp.path());
+            let approver = approver(tmp.path()).await;
             let (decision, _) = answer(approver.clone(), response).await;
             assert_eq!(decision, expected);
             assert!(!approver.store.is_harness_granted("codex").await);
@@ -365,5 +371,86 @@ mod tests {
             assert_eq!(events[0]["decision"], "deny");
             assert_eq!(events[0]["source"], source);
         }
+    }
+
+    #[tokio::test]
+    async fn harness_invoke_foreign_response_stays_pending_until_valid_cancellation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver = approver(tmp.path()).await;
+        let mut raised = approver.interrupts.subscribe_raised();
+        let task_approver = approver.clone();
+        let task = tokio::spawn(async move {
+            crate::engine::interrupt::with_host_approval_effect_scope(
+                "harness_invoke_foreign_response_test",
+                tokio_util::sync::CancellationToken::new(),
+                task_approver.approve_harness_invoke("codex", Some("gpt-5"), WritePolicy::Direct),
+                |decision| Some(decision.is_allowed()),
+            )
+            .await
+            .unwrap()
+        });
+        let interrupt_id = raised.recv().await.expect("harness approval is published");
+        let decision = approver
+            .db
+            .decision_request_for_interrupt(approver.session_id, interrupt_id)
+            .await
+            .unwrap()
+            .expect("harness approval has a lifecycle decision");
+        let lifecycle = crate::agent_tree::AgentTreeLifecycle::new(approver.db.clone());
+        let foreign = ResolveResponse::Single {
+            selected_id: "foreign".to_string(),
+        };
+        assert!(
+            lifecycle
+                .cancel_host_approval(
+                    approver.session_id,
+                    decision.decision_request_id,
+                    interrupt_id,
+                    &serde_json::to_string(&foreign).unwrap(),
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await
+                .is_err(),
+            "a foreign response cannot be laundered into denial"
+        );
+        assert_eq!(
+            approver
+                .db
+                .decision_request(approver.session_id, decision.decision_request_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::db::agent_tree_decisions::DecisionState::Pending
+        );
+        assert!(approver.interrupts.has_waiter(interrupt_id));
+
+        let cancel = ResolveResponse::Cancel;
+        assert!(matches!(
+            lifecycle
+                .cancel_host_approval(
+                    approver.session_id,
+                    decision.decision_request_id,
+                    interrupt_id,
+                    &serde_json::to_string(&cancel).unwrap(),
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await
+                .unwrap(),
+            crate::agent_tree::DecisionSettlement::Resolved(_)
+        ));
+        assert!(approver.interrupts.resolve(interrupt_id, cancel));
+        assert_eq!(task.await.unwrap(), Decision::Deny);
+        assert!(
+            matches!(
+                raised.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "valid cancellation settles the original prompt without re-raising"
+        );
+        let events = permission_events(&approver).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["decision"], "deny");
+        assert_eq!(events[0]["source"], "user_prompt");
     }
 }

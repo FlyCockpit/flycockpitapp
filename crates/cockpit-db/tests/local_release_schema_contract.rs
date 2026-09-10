@@ -1375,6 +1375,16 @@ fn sql_state_check(declaration: &str) -> String {
 
 fn sql_only_edges(name: &str, trigger: &str) -> BTreeSet<String> {
     match name {
+        "agent_host_authorization_group" => BTreeSet::from([
+            "collecting>dispatching".to_owned(),
+            "collecting>completed".to_owned(),
+            "collecting>declined".to_owned(),
+            "collecting>cancelled".to_owned(),
+            "collecting>submission_unknown".to_owned(),
+            "dispatching>completed".to_owned(),
+            "dispatching>declined".to_owned(),
+            "dispatching>submission_unknown".to_owned(),
+        ]),
         "agent_host_approval_effect_handoff" => BTreeSet::from([
             "ready>dispatching".to_owned(),
             "ready>rejected".to_owned(),
@@ -1887,6 +1897,7 @@ fn ownership() -> BTreeMap<String, Ownership> {
     let explicit_guarded_tables = [
         "agent_editor_leases",
         "agent_host_approval_effect_handoffs",
+        "agent_host_authorization_groups",
         "agent_host_approval_operations",
         "external_journal_operations",
         "host_capability_refresh_initializations",

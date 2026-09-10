@@ -1900,11 +1900,43 @@ CREATE TABLE agent_transition_receipts (
         REFERENCES session_events(session_id, seq) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
--- Only the trusted daemon host creates these identities, before it raises a
--- host-approval decision.  Resolution joins this record rather than trusting
--- a caller-authored boolean or a string-shaped "operation" token.
+-- One authorization group is the durable consent/cancellation fence for one
+-- concrete host-effect scope. Individual prompts remain separately bound
+-- operations below, but adding a member never advances this revision: only a
+-- replacement effect plan may do that. This lets a compound invocation retain
+-- earlier member approvals while later members are being answered.
+CREATE TABLE agent_host_authorization_groups (
+    authorization_group_id TEXT PRIMARY KEY,
+    tool_call_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL,
+    concrete_effect_digest TEXT NOT NULL CHECK (length(concrete_effect_digest) = 64),
+    revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+    state TEXT NOT NULL CHECK (state IN ('collecting', 'dispatching', 'completed', 'declined', 'cancelled', 'submission_unknown')),
+    created_at_unix_ms INTEGER NOT NULL,
+    resolved_at_unix_ms INTEGER,
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
+);
+CREATE UNIQUE INDEX idx_agent_host_authorization_group_tool_call
+    ON agent_host_authorization_groups(session_id, tool_call_id);
+CREATE TRIGGER agent_host_authorization_group_state_is_forward_only
+BEFORE UPDATE OF state ON agent_host_authorization_groups
+WHEN NOT (
+    (OLD.state = 'collecting' AND NEW.state IN ('dispatching', 'completed', 'declined', 'cancelled', 'submission_unknown'))
+    OR (OLD.state = 'dispatching' AND NEW.state IN ('completed', 'declined', 'submission_unknown'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'host authorization group state transition is invalid');
+END;
+
+-- Only the trusted daemon host creates these ordered group members, before it
+-- raises their host-approval decisions. Resolution joins these records rather
+-- than trusting a caller-authored boolean or a string-shaped operation token.
 CREATE TABLE agent_host_approval_operations (
     operation_id TEXT PRIMARY KEY,
+    authorization_group_id TEXT NOT NULL,
+    member_index INTEGER NOT NULL CHECK (member_index >= 0),
     session_id TEXT NOT NULL,
     agent_instance_id TEXT NOT NULL,
     -- Immutable host-owned effect binding. The prompt UUID alone is never
@@ -1951,6 +1983,8 @@ CREATE TABLE agent_host_approval_operations (
     ),
     created_at_unix_ms INTEGER NOT NULL,
     resolved_at_unix_ms INTEGER,
+    UNIQUE (authorization_group_id, member_index),
+    FOREIGN KEY (authorization_group_id) REFERENCES agent_host_authorization_groups(authorization_group_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (agent_instance_id, session_id)
         REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
@@ -2044,6 +2078,19 @@ END;
 CREATE UNIQUE INDEX idx_agent_host_approval_pending
     ON agent_host_approval_operations(session_id, agent_instance_id)
     WHERE state = 'pending';
+
+CREATE TRIGGER agent_host_approval_member_matches_group
+BEFORE INSERT ON agent_host_approval_operations
+WHEN NOT EXISTS (
+    SELECT 1 FROM agent_host_authorization_groups approval_group
+     WHERE approval_group.authorization_group_id = NEW.authorization_group_id
+       AND approval_group.session_id = NEW.session_id
+       AND approval_group.agent_instance_id = NEW.agent_instance_id
+       AND approval_group.state = 'collecting'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'host approval member does not match a collecting authorization group');
+END;
 
 -- A host operation is reserved first by the host composition boundary. It may
 -- not be inserted already bound by a generic decision caller.

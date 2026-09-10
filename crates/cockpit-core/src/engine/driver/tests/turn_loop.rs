@@ -75,6 +75,21 @@ fn drain_events(rx: &mut mpsc::Receiver<TurnEvent>) -> Vec<TurnEvent> {
     events
 }
 
+async fn synchronize_driver_idle(control_tx: &mpsc::Sender<DriverControl>) {
+    let (respond_to, receipt) = tokio::sync::oneshot::channel();
+    control_tx
+        .send(DriverControl::SwapPrimary {
+            name: "Build".to_string(),
+            respond_to,
+        })
+        .await
+        .unwrap();
+    receipt
+        .await
+        .expect("driver returns the idle-boundary receipt")
+        .expect("reselecting the current primary at idle is a no-op");
+}
+
 fn scripted_driver(provider: &ScriptedProvider) -> (Driver, tempfile::TempDir) {
     let (driver, tmp) = test_driver_with_url(8, provider.base_url());
     driver
@@ -475,8 +490,77 @@ async fn turn_loop_text_only_turn_pushes_history_and_emits_events() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn gated_interval_preserves_due_tick_until_armed() {
+    use std::future::Future as _;
+
+    let mut idle_poll = GatedInterval::new(Duration::from_millis(250));
+    let mut defer_heartbeat = GatedInterval::new(Duration::from_secs(30));
+
+    tokio::time::advance(Duration::from_secs(30)).await;
+
+    let mut idle_tick = Box::pin(idle_poll.tick());
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(idle_tick.as_mut().poll(cx)))
+            .await
+            .is_pending(),
+        "a due idle-poll interval remains pending while its owned gate is disarmed"
+    );
+    drop(idle_tick);
+    let mut heartbeat_tick = Box::pin(defer_heartbeat.tick());
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(heartbeat_tick.as_mut().poll(cx)))
+            .await
+            .is_pending(),
+        "a due defer-heartbeat interval remains pending while its owned gate is disarmed"
+    );
+    drop(heartbeat_tick);
+
+    idle_poll.set_armed(true);
+    defer_heartbeat.set_armed(true);
+    let mut idle_tick = Box::pin(idle_poll.tick());
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(idle_tick.as_mut().poll(cx)))
+            .await
+            .is_ready(),
+        "arming exposes the idle poll's already-due tick"
+    );
+    let mut heartbeat_tick = Box::pin(defer_heartbeat.tick());
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(heartbeat_tick.as_mut().poll(cx)))
+            .await
+            .is_ready(),
+        "arming exposes the defer heartbeat's already-due tick"
+    );
+}
+
+#[test]
+fn assistant_inbox_select_sites_use_only_gated_interval_futures() {
+    let driver_source = include_str!("../mod.rs");
+
+    assert_eq!(
+        driver_source
+            .matches("_ = assistant_inbox_defer_heartbeat.tick() =>")
+            .count(),
+        1,
+        "the defer-heartbeat select site must use the gate-owned future without a parallel guard"
+    );
+    assert_eq!(
+        driver_source
+            .matches("_ = assistant_inbox_idle_poll.tick() =>")
+            .count(),
+        1,
+        "the idle-poll select site must use the gate-owned future without a parallel guard"
+    );
+    assert!(
+        !driver_source.contains("assistant_inbox_defer_heartbeat.interval.tick()")
+            && !driver_source.contains("assistant_inbox_idle_poll.interval.tick()"),
+        "assistant-inbox select sites must not bypass GatedInterval::tick"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn assistant_inbox_timer_yields_to_ready_human_input() {
-    let provider = ScriptedProvider::builder()
+    let mut provider = ScriptedProvider::builder()
         .dialect(WireDialect::ChatCompletions)
         .turn(Turn::Text("human turn handled".into()))
         .start()
@@ -484,29 +568,63 @@ async fn assistant_inbox_timer_yields_to_ready_human_input() {
     let (mut driver, _tmp) = scripted_driver(&provider);
     insert_pending_assistant_inbox_item(&driver, "immediate", "INBOX_TIMER_MARKER").await;
 
-    let (queue, tx, _rx) = event_harness();
+    let (queue, tx, mut rx) = event_harness();
     let target = driver.active_queue_target();
+    let mut boundary_rx = driver.subscribe_loop_boundaries();
     let (control_tx, control_rx) = mpsc::channel(1);
     let run_queue = queue.clone();
     let run_tx = tx.clone();
     let run =
         tokio::spawn(async move { driver.run_main_loop(run_queue, control_rx, &run_tx).await });
 
-    tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_millis(250)).await;
+    boundary_rx.changed().await.unwrap();
+    assert_eq!(
+        *boundary_rx.borrow_and_update(),
+        Some(DriverLoopBoundaryObservation {
+            sequence: 0,
+            human_input_already_ready: false,
+            assistant_inbox_defer_heartbeat_armed: true,
+            assistant_inbox_idle_poll_armed: true,
+        }),
+        "the initial semantic boundary has the inbox timer armed"
+    );
     queue
-        .push(UserSubmission::text("HUMAN_TIMER_MARKER"), target)
+        .requeue_front_after(
+            UserSubmission::text("HUMAN_TIMER_MARKER"),
+            target.clone(),
+            Duration::from_millis(250),
+        )
         .await;
-    for _ in 0..100 {
-        if provider_posts(&provider).len() == 1 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    assert!(queue.has_pending_for(Some(&target.id)).await);
+    assert!(!queue.has_ready_for(Some(&target.id)).await);
 
-    let posts = provider_posts(&provider);
-    assert_eq!(posts.len(), 1, "the ready human turn starts first");
-    let prompt = chat_messages(&posts[0])
+    // A production control boundary makes the driver re-evaluate every guard
+    // after the delayed submission exists. The read-only scheduling watch then
+    // proves that the queue wait and idle-inbox timer are both armed before
+    // virtual time reaches their shared deadline.
+    synchronize_driver_idle(&control_tx).await;
+    boundary_rx.changed().await.unwrap();
+    assert_eq!(
+        *boundary_rx.borrow_and_update(),
+        Some(DriverLoopBoundaryObservation {
+            sequence: 1,
+            human_input_already_ready: false,
+            assistant_inbox_defer_heartbeat_armed: true,
+            assistant_inbox_idle_poll_armed: true,
+        }),
+        "both boundary arms are pending at the paused-clock deadline"
+    );
+    tokio::time::advance(Duration::from_millis(250)).await;
+    let request = provider.next_request_ready().await;
+    synchronize_driver_idle(&control_tx).await;
+    let _ = drain_events(&mut rx);
+
+    assert_eq!(
+        provider.request_count(),
+        1,
+        "the ready human turn starts first"
+    );
+    let prompt = chat_messages(&request)
         .iter()
         .map(message_content_text)
         .collect::<Vec<_>>()
@@ -517,14 +635,141 @@ async fn assistant_inbox_timer_yields_to_ready_human_input() {
         "the inbox is folded at the human turn boundary instead of starting a timer turn"
     );
 
-    control_tx.send(DriverControl::AbortForTest).await.unwrap();
-    let result = run.await.expect("driver task joins");
-    assert!(
-        result
-            .expect_err("test abort terminates the driver")
-            .to_string()
-            .contains("driver abort requested for test")
+    drop(control_tx);
+    run.await
+        .expect("driver task joins")
+        .expect("control channel shutdown terminates the idle driver");
+}
+
+#[tokio::test(start_paused = true)]
+async fn assistant_inbox_timers_are_disarmed_for_already_ready_human_input() {
+    let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text("human turn handled".into()))
+        .with_response_gate(response_gate.clone())
+        .start()
+        .await;
+    let (mut driver, _tmp) = scripted_driver(&provider);
+    insert_pending_assistant_inbox_item(&driver, "immediate", "READY_INBOX_MARKER").await;
+
+    let (queue, tx, _rx) = event_harness();
+    let target = driver.active_queue_target();
+    queue
+        .push(UserSubmission::text("ALREADY_READY_HUMAN"), target)
+        .await;
+    let mut boundary_rx = driver.subscribe_loop_boundaries();
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let run = tokio::spawn(async move { driver.run_main_loop(queue, control_rx, &tx).await });
+
+    boundary_rx.changed().await.unwrap();
+    assert_eq!(
+        *boundary_rx.borrow_and_update(),
+        Some(DriverLoopBoundaryObservation {
+            sequence: 0,
+            human_input_already_ready: true,
+            assistant_inbox_defer_heartbeat_armed: false,
+            assistant_inbox_idle_poll_armed: false,
+        }),
+        "an already-ready foreground submission explicitly disables every assistant-inbox timer arm"
     );
+
+    let request = provider.next_request_ready().await;
+    let prompt = chat_messages(&request)
+        .iter()
+        .map(message_content_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(prompt.contains("ALREADY_READY_HUMAN"));
+    assert!(
+        prompt.contains("READY_INBOX_MARKER"),
+        "inbox delivery is folded into the already-ready human turn"
+    );
+
+    response_gate.add_permits(1);
+    synchronize_driver_idle(&control_tx).await;
+    drop(control_tx);
+    run.await
+        .expect("driver task joins")
+        .expect("control channel shutdown terminates the idle driver");
+}
+
+#[tokio::test(start_paused = true)]
+async fn queued_human_input_runs_before_control_disconnect_terminates_loop() {
+    let mut provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text("human turn handled".into()))
+        .start()
+        .await;
+    let (mut driver, _tmp) = scripted_driver(&provider);
+    let (queue, tx, _rx) = event_harness();
+    let target = driver.active_queue_target();
+    queue
+        .push(UserSubmission::text("QUEUED_BEFORE_DISCONNECT"), target)
+        .await;
+    let (control_tx, control_rx) = mpsc::channel(1);
+    drop(control_tx);
+
+    let run = tokio::spawn(async move { driver.run_main_loop(queue, control_rx, &tx).await });
+    let request = provider.next_request_ready().await;
+    run.await
+        .expect("driver task joins")
+        .expect("control disconnect terminates cleanly after queued input");
+
+    let prompt = chat_messages(&request)
+        .iter()
+        .map(message_content_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        prompt.contains("QUEUED_BEFORE_DISCONNECT"),
+        "biased input readiness must win before the disconnected control arm"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn simultaneously_ready_human_input_wins_before_control() {
+    let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text("human turn handled".into()))
+        .with_response_gate(response_gate.clone())
+        .start()
+        .await;
+    let (mut driver, _tmp) = scripted_driver(&provider);
+    let (queue, tx, _rx) = event_harness();
+    let target = driver.active_queue_target();
+    queue
+        .push(UserSubmission::text("SIMULTANEOUS_HUMAN"), target)
+        .await;
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (respond_to, receipt) = tokio::sync::oneshot::channel();
+    control_tx
+        .send(DriverControl::SwapPrimary {
+            name: "Build".to_string(),
+            respond_to,
+        })
+        .await
+        .unwrap();
+
+    let run = tokio::spawn(async move { driver.run_main_loop(queue, control_rx, &tx).await });
+    let request = provider.next_request_ready().await;
+    let prompt = chat_messages(&request)
+        .iter()
+        .map(message_content_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(prompt.contains("SIMULTANEOUS_HUMAN"));
+
+    response_gate.add_permits(1);
+    receipt
+        .await
+        .expect("queued control runs after the human turn")
+        .expect("reselecting the current primary is a no-op");
+    drop(control_tx);
+    run.await
+        .expect("driver task joins")
+        .expect("control channel shutdown terminates the idle driver");
 }
 
 #[tokio::test(start_paused = true)]
@@ -539,22 +784,17 @@ async fn assistant_inbox_timer_yields_to_ready_control() {
 
     let (queue, tx, _rx) = event_harness();
     let (control_tx, control_rx) = mpsc::channel(1);
+    drop(control_tx);
     let run_queue = queue.clone();
     let run_tx = tx.clone();
     let run =
         tokio::spawn(async move { driver.run_main_loop(run_queue, control_rx, &run_tx).await });
 
-    tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_millis(250)).await;
-    control_tx.send(DriverControl::AbortForTest).await.unwrap();
 
-    let result = run.await.expect("driver task joins");
-    assert!(
-        result
-            .expect_err("ready control terminates the driver")
-            .to_string()
-            .contains("driver abort requested for test")
-    );
+    run.await
+        .expect("driver task joins")
+        .expect("ready control disconnect terminates the driver");
     assert_eq!(
         provider_posts(&provider).len(),
         0,
@@ -564,7 +804,7 @@ async fn assistant_inbox_timer_yields_to_ready_control() {
 
 #[tokio::test(start_paused = true)]
 async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() {
-    let provider = ScriptedProvider::builder()
+    let mut provider = ScriptedProvider::builder()
         .dialect(WireDialect::ChatCompletions)
         .turn(Turn::Text("idle delivery handled".into()))
         .turn(Turn::Text("heartbeat delivery handled".into()))
@@ -572,12 +812,25 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
         .start()
         .await;
     let (mut driver, _tmp) = scripted_driver(&provider);
-    let main_session_id = driver.session.id;
+    let main_session_id = driver.session.live_id();
     let inbox_db = driver.session.db.clone();
+    assert_eq!(
+        main_session_id, driver.session.id,
+        "test session main id must match the live delivery id"
+    );
     insert_pending_assistant_inbox_item(&driver, "immediate", "IMMEDIATE_INBOX_MARKER").await;
     insert_pending_assistant_inbox_item(&driver, "defer", "DEFERRED_INBOX_MARKER").await;
+    let claimed = inbox_db
+        .claim_assistant_inbox_for_delivery(main_session_id, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        claimed.len(),
+        1,
+        "immediate inbox item must be claimable before the loop starts"
+    );
 
-    let (queue, tx, _rx) = event_harness();
+    let (queue, tx, mut rx) = event_harness();
     let target = driver.active_queue_target();
     let (control_tx, control_rx) = mpsc::channel(1);
     let run_queue = queue.clone();
@@ -585,21 +838,15 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
     let run =
         tokio::spawn(async move { driver.run_main_loop(run_queue, control_rx, &run_tx).await });
 
-    tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_millis(250)).await;
-    for _ in 0..100 {
-        if provider_posts(&provider).len() == 1 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    let posts = provider_posts(&provider);
+    let immediate_request = provider.next_request_ready().await;
+    synchronize_driver_idle(&control_tx).await;
+    let _ = drain_events(&mut rx);
     assert_eq!(
-        posts.len(),
+        provider.request_count(),
         1,
         "immediate delivery runs at the idle boundary"
     );
-    let immediate_prompt = chat_messages(&posts[0])
+    let immediate_prompt = chat_messages(&immediate_request)
         .iter()
         .map(message_content_text)
         .collect::<Vec<_>>()
@@ -607,26 +854,29 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
     assert!(immediate_prompt.contains("IMMEDIATE_INBOX_MARKER"));
     assert!(!immediate_prompt.contains("DEFERRED_INBOX_MARKER"));
 
+    let before_pre_heartbeat_advance = tokio::time::Instant::now();
     tokio::time::advance(Duration::from_secs(59)).await;
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
-    }
     assert_eq!(
-        provider_posts(&provider).len(),
+        tokio::time::Instant::now().duration_since(before_pre_heartbeat_advance),
+        Duration::from_secs(59),
+        "the pre-boundary assertion must be made at an exact paused-clock offset"
+    );
+    assert_eq!(
+        provider.request_count(),
         1,
         "defer waits for the next main-session heartbeat"
     );
 
     tokio::time::advance(Duration::from_secs(1)).await;
-    for _ in 0..100 {
-        if provider_posts(&provider).len() == 2 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    let posts = provider_posts(&provider);
-    assert_eq!(posts.len(), 2, "the heartbeat starts the deferred turn");
-    let heartbeat_prompt = chat_messages(&posts[1])
+    let heartbeat_request = provider.next_request_ready().await;
+    synchronize_driver_idle(&control_tx).await;
+    let _ = drain_events(&mut rx);
+    assert_eq!(
+        provider.request_count(),
+        2,
+        "the heartbeat starts the deferred turn"
+    );
+    let heartbeat_prompt = chat_messages(&heartbeat_request)
         .iter()
         .map(message_content_text)
         .collect::<Vec<_>>()
@@ -637,51 +887,40 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
     queue
         .push(UserSubmission::text("HUMAN_TURN_MARKER"), target)
         .await;
-    for _ in 0..100 {
-        if provider_posts(&provider).len() == 3 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    let posts = provider_posts(&provider);
-    assert_eq!(posts.len(), 3, "the human turn starts the third inference");
-    let human_prompt = chat_messages(&posts[2])
+    let human_request = provider.next_request_ready().await;
+    // Closing the real input queue is the loop's production shutdown signal.
+    // Do it while the captured request is still in flight so the next biased
+    // idle boundary exits before any post-control idle utility work can start.
+    queue.close().await;
+    run.await
+        .expect("driver task joins")
+        .expect("closed input queue terminates the idle driver");
+    drop(control_tx);
+    let _ = drain_events(&mut rx);
+    assert_eq!(
+        provider.request_count(),
+        3,
+        "the human turn starts the third inference"
+    );
+    let human_prompt = chat_messages(&human_request)
         .iter()
-        .map(message_content_text)
-        .collect::<Vec<_>>()
-        .join("\n");
+        .rev()
+        .find(|message| message_role(message) == "user")
+        .map(|message| message_content_text(message))
+        .expect("human request has a current user message");
     assert!(human_prompt.contains("HUMAN_TURN_MARKER"));
     assert!(!human_prompt.contains("DEFERRED_INBOX_MARKER"));
 
-    let mut visible = Vec::new();
-    for _ in 0..100 {
-        visible = inbox_db
-            .assistant_inbox_for_main(main_session_id, true, 10)
-            .await
-            .unwrap();
-        if visible
-            .iter()
-            .all(|item| item.delivered_at_unix_ms.is_some())
-        {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    let visible = inbox_db
+        .assistant_inbox_for_main(main_session_id, true, 10)
+        .await
+        .unwrap();
     assert_eq!(visible.len(), 2);
     assert!(
         visible
             .iter()
             .all(|item| item.delivered_at_unix_ms.is_some()),
         "idle immediate and heartbeat defer are acknowledged only after their turns accept them"
-    );
-
-    control_tx.send(DriverControl::AbortForTest).await.unwrap();
-    let result = run.await.expect("driver task joins");
-    assert!(
-        result
-            .expect_err("test abort terminates the driver")
-            .to_string()
-            .contains("driver abort requested for test")
     );
 }
 
@@ -1026,7 +1265,7 @@ fn persistent_user_event_failure_defers_exact_payload_and_services_controls() {
         let run_tx = tx.clone();
         let run =
             tokio::spawn(async move { driver.run_main_loop(run_queue, control_rx, &run_tx).await });
-        let notice = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let notice = async {
             loop {
                 if let Some(TurnEvent::Notice { text }) = rx.recv().await
                     && text.contains("exact payload will be retried")
@@ -1034,22 +1273,14 @@ fn persistent_user_event_failure_defers_exact_payload_and_services_controls() {
                     break text;
                 }
             }
-        })
-        .await
-        .expect("persistent failure emits a bounded retry notice");
+        }
+        .await;
         assert!(notice.contains("exact payload will be retried"), "{notice}");
 
-        control_tx.send(DriverControl::AbortForTest).await.unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), run)
-            .await
-            .expect("a driver control is serviced while the payload is deferred")
-            .expect("driver task joins");
-        assert!(
-            result
-                .expect_err("test abort terminates the driver")
-                .to_string()
-                .contains("driver abort requested for test")
-        );
+        drop(control_tx);
+        run.await
+            .expect("driver task joins")
+            .expect("control channel shutdown terminates the idle driver");
         assert_eq!(provider_posts(&provider).len(), 0);
 
         // #275: the deferred retry must not settle the acked id. The
@@ -1074,10 +1305,7 @@ fn persistent_user_event_failure_defers_exact_payload_and_services_controls() {
         let mut expected = submission;
         expected.queue_item_ids = vec![id];
         expected.queue_target = Some(target);
-        let retried = tokio::time::timeout(std::time::Duration::from_secs(2), queue.recv())
-            .await
-            .expect("deferred payload becomes runnable")
-            .expect("exact payload remains queued");
+        let retried = queue.recv().await.expect("exact payload remains queued");
         assert_eq!(
             serde_json::to_value(retried).unwrap(),
             serde_json::to_value(expected).unwrap(),
@@ -1429,6 +1657,7 @@ fn queued_user_fold_retry_does_not_duplicate_assistant_inbox_text() {
 fn continue_fold_failure_restores_tool_result_and_defers_exact_payload() {
     crate::test_env::run_async_with_large_stack(|| async {
         const QUEUED: &str = "continue-queued-exact-4bb2";
+        let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
         let mut provider = ScriptedProvider::builder()
             .dialect(WireDialect::ChatCompletions)
             .turn(Turn::ToolCall {
@@ -1436,7 +1665,7 @@ fn continue_fold_failure_restores_tool_result_and_defers_exact_payload() {
                 name: "read".into(),
                 arguments: serde_json::json!({ "path": "continue.txt" }),
             })
-            .with_delay(std::time::Duration::from_millis(500))
+            .with_response_gate(response_gate.clone())
             .turn(Turn::Text("initial turn complete".into()))
             .turn(Turn::Text("queued turn recovered".into()))
             .start()
@@ -1451,11 +1680,12 @@ fn continue_fold_failure_restores_tool_result_and_defers_exact_payload() {
 
         let run = driver.run_user_input(UserSubmission::text("start continue path"), &queue, &tx);
         let enqueue = async {
-            let _ = provider.next_request().await;
+            let _ = provider.next_request_ready().await;
             let (_, _, outcome) = queue
                 .push_idempotent(receipt, submission, target.clone())
                 .await;
             assert_eq!(outcome, crate::engine::message::IdempotentPush::Inserted);
+            response_gate.add_permits(1);
         };
         let (result, ()) = tokio::join!(run, enqueue);
         result.unwrap();
@@ -1523,10 +1753,11 @@ fn continue_fold_failure_restores_tool_result_and_defers_exact_payload() {
 fn done_fold_failure_defers_exact_payload_without_second_inference() {
     crate::test_env::run_async_with_large_stack(|| async {
         const QUEUED: &str = "done-queued-exact-6cc4";
+        let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
         let mut provider = ScriptedProvider::builder()
             .dialect(WireDialect::ChatCompletions)
             .turn(Turn::Text("initial done".into()))
-            .with_delay(std::time::Duration::from_millis(500))
+            .with_response_gate(response_gate.clone())
             .turn(Turn::Text("queued done recovered".into()))
             .start()
             .await;
@@ -1539,11 +1770,12 @@ fn done_fold_failure_defers_exact_payload_without_second_inference() {
 
         let run = driver.run_user_input(UserSubmission::text("start done path"), &queue, &tx);
         let enqueue = async {
-            let _ = provider.next_request().await;
+            let _ = provider.next_request_ready().await;
             let (_, _, outcome) = queue
                 .push_idempotent(receipt, submission, target.clone())
                 .await;
             assert_eq!(outcome, crate::engine::message::IdempotentPush::Inserted);
+            response_gate.add_permits(1);
         };
         let (result, ()) = tokio::join!(run, enqueue);
         result.unwrap();
@@ -1655,6 +1887,7 @@ fn turn_loop_tool_call_result_feeds_second_inference() {
 /// lane results from a `BTreeMap<usize, _>` even when more than the bound run.
 struct FifoLaneState {
     started: std::sync::Mutex<Vec<String>>,
+    started_tx: tokio::sync::watch::Sender<Vec<String>>,
     in_flight: std::sync::atomic::AtomicUsize,
     max_in_flight: std::sync::atomic::AtomicUsize,
     gates: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
@@ -1662,8 +1895,10 @@ struct FifoLaneState {
 
 impl FifoLaneState {
     fn new() -> Arc<Self> {
+        let (started_tx, _) = tokio::sync::watch::channel(Vec::new());
         Arc::new(Self {
             started: std::sync::Mutex::new(Vec::new()),
+            started_tx,
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             max_in_flight: std::sync::atomic::AtomicUsize::new(0),
             gates: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1684,6 +1919,10 @@ impl FifoLaneState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    fn started_rx(&self) -> tokio::sync::watch::Receiver<Vec<String>> {
+        self.started_tx.subscribe()
     }
 
     fn in_flight(&self) -> usize {
@@ -1736,13 +1975,6 @@ impl crate::engine::tool::Tool for FifoLaneTool {
             .unwrap_or("missing")
             .to_string();
         let gate = self.state.gate(&id);
-        {
-            self.state
-                .started
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(id.clone());
-        }
         let n = self
             .state
             .in_flight
@@ -1751,6 +1983,15 @@ impl crate::engine::tool::Tool for FifoLaneTool {
         self.state
             .max_in_flight
             .fetch_max(n, std::sync::atomic::Ordering::SeqCst);
+        {
+            let mut started = self
+                .state
+                .started
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            started.push(id.clone());
+            self.state.started_tx.send_replace(started.clone());
+        }
         gate.notified().await;
         self.state
             .in_flight
@@ -1759,17 +2000,11 @@ impl crate::engine::tool::Tool for FifoLaneTool {
     }
 }
 
-async fn wait_until_started(state: &FifoLaneState, count: usize) {
-    for _ in 0..200 {
-        if state.started().len() >= count {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!(
-        "timed out waiting for {count} fifo_lane starts; observed {:?}",
-        state.started()
-    );
+async fn wait_until_started(started: &mut tokio::sync::watch::Receiver<Vec<String>>, count: usize) {
+    started
+        .wait_for(|ids| ids.len() >= count)
+        .await
+        .expect("fifo lane readiness sender stays alive");
 }
 
 #[test]
@@ -1958,8 +2193,10 @@ fn failed_write_keeps_args_on_the_next_request() {
         let args = tool_call_arguments(write_calls[0]);
         assert_eq!(args["content"], serde_json::json!(content));
         let second_body = serde_json::to_string(&posts[1].body).unwrap();
+        let encoded_arguments = serde_json::to_string(&args).unwrap();
+        let nested_wire_arguments = serde_json::to_string(&encoded_arguments).unwrap();
         assert!(
-            second_body.contains(&content),
+            second_body.contains(&nested_wire_arguments),
             "failed write args must stay visible"
         );
     });
@@ -2007,6 +2244,7 @@ fn parallel_lane_respects_delegation_max_parallel_fifo() {
             .await;
         let (mut driver, tmp) = scripted_driver(&provider);
         let state = FifoLaneState::new();
+        let mut started = state.started_rx();
         let old = driver.stack[0].agent.clone();
         driver.stack[0].agent = Arc::new(Agent {
             name: old.name.clone(),
@@ -2063,12 +2301,11 @@ fn parallel_lane_respects_delegation_max_parallel_fifo() {
 
             tokio::select! {
                 result = &mut run => panic!("driver completed before the over-limit lane blocked: {result:?}"),
-                () = wait_until_started(&state, 2) => {}
+                () = wait_until_started(&mut started, 2) => {}
             }
             // Removing `ordinary_active + delegates.len() >= max_parallel` would
             // admit gamma/delta while alpha/beta are still held. Source-order
             // folding would still be green; in-flight count is the bound.
-            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
             assert_eq!(state.started(), vec!["alpha", "beta"]);
             assert_eq!(state.in_flight(), 2);
             assert_eq!(state.max_in_flight(), 2);
@@ -2076,9 +2313,8 @@ fn parallel_lane_respects_delegation_max_parallel_fifo() {
             state.release("alpha");
             tokio::select! {
                 result = &mut run => panic!("driver completed before the FIFO successor started: {result:?}"),
-                () = wait_until_started(&state, 3) => {}
+                () = wait_until_started(&mut started, 3) => {}
             }
-            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
             assert_eq!(state.started(), vec!["alpha", "beta", "gamma"]);
             assert!(
                 state.in_flight() <= 2,
@@ -2090,7 +2326,7 @@ fn parallel_lane_respects_delegation_max_parallel_fifo() {
             state.release("gamma");
             tokio::select! {
                 result = &mut run => panic!("driver completed before the last queued member started: {result:?}"),
-                () = wait_until_started(&state, 4) => {}
+                () = wait_until_started(&mut started, 4) => {}
             }
             assert_eq!(
                 state.started(),
@@ -2499,9 +2735,12 @@ async fn turn_loop_cancellation_mid_stream_does_not_persist_partial_output() {
             .unwrap();
         driver
     });
-    let _captured = provider.next_request().await;
+    await_paused_driver_test_readiness(provider.next_request_ready(), "hung request readiness")
+        .await;
     cancel.cancel_turn();
-    let driver = handle.await.unwrap();
+    let driver = await_paused_driver_test_completion(handle, "cancelled turn unwind")
+        .await
+        .unwrap();
 
     let events = drain_events(&mut rx);
     assert!(assistant_texts(&events).is_empty(), "{events:?}");
@@ -2542,9 +2781,12 @@ async fn stop_all_cancels_in_flight_turn_like_cancel_turn() {
             .unwrap();
         driver
     });
-    let _captured = provider.next_request().await;
+    await_paused_driver_test_readiness(provider.next_request_ready(), "hung request readiness")
+        .await;
     cancel.cancel_all_session_work();
-    let driver = handle.await.unwrap();
+    let driver = await_paused_driver_test_completion(handle, "stopped turn unwind")
+        .await
+        .unwrap();
 
     let events = drain_events(&mut rx);
     assert!(assistant_texts(&events).is_empty(), "{events:?}");
@@ -2619,6 +2861,34 @@ fn text_then_hang_sse() -> String {
     format!("data: {text}\n\n")
 }
 
+fn install_scripted_provider_snapshot(
+    driver: &mut Driver,
+    providers: crate::config::providers::ProvidersConfig,
+) {
+    let mut snapshot = (*driver.config.snapshot()).clone();
+    snapshot.providers = providers;
+    driver
+        .set_config_handle(crate::daemon::session_worker::SessionConfigHandle::detached(snapshot));
+    if let Some(active) = driver.config.providers().active_model.clone() {
+        driver.session.set_active_model_ref(active).unwrap();
+    }
+    if let Ok(refreshed) =
+        driver.build_live_model_for_running(&driver.stack[0].agent.model, "lmstudio", "local")
+    {
+        Arc::make_mut(&mut driver.stack[0].agent).model = Arc::new(refreshed);
+    }
+}
+
+fn trust_scripted_provider_for_streaming_test(driver: &mut Driver) {
+    let (_extended, mut providers) = driver.config.configs();
+    providers
+        .providers
+        .get_mut("lmstudio")
+        .expect("scripted driver has lmstudio")
+        .trust = Some(crate::config::providers::ModelTrust::Trusted);
+    install_scripted_provider_snapshot(driver, providers);
+}
+
 fn enable_reasoning_retraction(driver: &mut Driver) {
     let (_extended, mut providers) = driver.config.configs();
     let active = providers
@@ -2636,21 +2906,15 @@ fn enable_reasoning_retraction(driver: &mut Driver) {
             crate::config::providers::ThinkingMode::High,
             serde_json::json!({"reasoning_effort": "high"}),
         );
-    driver.set_config_handle(
-        crate::daemon::session_worker::SessionConfigHandle::detached(
-            crate::daemon::session_worker::SessionConfigSnapshot::new(
-                1,
-                providers,
-                super::test_extended_config(),
-            ),
-        ),
-    );
-    if let Some(active) = driver.config.providers().active_model.clone() {
-        driver.session.set_active_model_ref(active).unwrap();
-    }
+    providers
+        .providers
+        .get_mut("lmstudio")
+        .expect("scripted driver has lmstudio")
+        .trust = Some(crate::config::providers::ModelTrust::Trusted);
+    install_scripted_provider_snapshot(driver, providers);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn interactive_cancel_after_reasoning_retracts_the_durable_user_row() {
     let mut provider = ScriptedProvider::builder()
         .dialect(WireDialect::ChatCompletions)
@@ -2674,37 +2938,53 @@ async fn interactive_cancel_after_reasoning_retracts_the_durable_user_row() {
 
     let cancel = driver.cancel_handle();
     let (queue, tx, mut rx) = event_harness();
-    let run = tokio::spawn(async move {
+    let mut submission = UserSubmission::text("retract after thinking");
+    submission.origin = crate::engine::message::SubmissionOrigin::ExternalRoot;
+    let mut run = tokio::spawn(async move {
         driver
-            .run_user_input(UserSubmission::text("retract after thinking"), &queue, &tx)
+            .run_user_input(submission, &queue, &tx)
             .await
             .unwrap();
         driver
     });
-    let _ = provider.next_request().await;
-
-    let saw_reasoning = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if matches!(
-                rx.recv().await,
-                Some(TurnEvent::AssistantDisplayReasoningDelta { .. })
-            ) {
-                return;
+    await_paused_driver_test_readiness(
+        async {
+            tokio::select! {
+                _ = provider.next_request_ready() => {}
+                _ = &mut run => panic!("driver ended before the reasoning request was captured"),
             }
-        }
-    })
+        },
+        "reasoning request readiness",
+    )
     .await;
-    assert!(
-        saw_reasoning.is_ok(),
-        "the real provider reasoning delta must arrive before cancelling"
-    );
-    cancel.cancel_turn();
-    let driver = tokio::time::timeout(std::time::Duration::from_secs(2), run)
-        .await
-        .expect("interactive cancellation must unwind the worker-facing driver promptly")
-        .unwrap();
 
-    let events = drain_events(&mut rx);
+    let mut observed = Vec::new();
+    await_paused_driver_test_readiness(
+        async {
+            loop {
+                let event = rx
+                    .recv()
+                    .await
+                    .expect("turn event stream closed before the reasoning delta");
+                let saw_reasoning =
+                    matches!(event, TurnEvent::AssistantDisplayReasoningDelta { .. });
+                observed.push(event);
+                if saw_reasoning {
+                    break;
+                }
+            }
+        },
+        "reasoning delta readiness",
+    )
+    .await;
+    cancel.cancel_turn();
+    let driver =
+        await_paused_driver_test_completion(run, "interactive reasoning cancellation unwind")
+            .await
+            .unwrap();
+
+    observed.extend(drain_events(&mut rx));
+    let events = observed;
     assert!(
         events
             .iter()
@@ -2730,7 +3010,7 @@ async fn interactive_cancel_after_reasoning_retracts_the_durable_user_row() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn retracted_reasoning_only_turn_resends_with_an_identical_request_prefix() {
     let mut provider = ScriptedProvider::builder()
         .dialect(WireDialect::ChatCompletions)
@@ -2744,28 +3024,45 @@ async fn retracted_reasoning_only_turn_resends_with_an_identical_request_prefix(
     let (queue, tx, mut rx) = event_harness();
     let run_queue = queue.clone();
     let run_tx = tx.clone();
-    let run = tokio::spawn(async move {
+    let mut submission = UserSubmission::text("same resend");
+    submission.origin = crate::engine::message::SubmissionOrigin::ExternalRoot;
+    let mut run = tokio::spawn(async move {
         driver
-            .run_user_input(UserSubmission::text("same resend"), &run_queue, &run_tx)
+            .run_user_input(submission, &run_queue, &run_tx)
             .await
             .unwrap();
         driver
     });
-    let _ = provider.next_request().await;
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if matches!(
-                rx.recv().await,
-                Some(TurnEvent::AssistantDisplayReasoningDelta { .. })
-            ) {
-                return;
+    await_paused_driver_test_readiness(
+        async {
+            tokio::select! {
+                _ = provider.next_request_ready() => {}
+                _ = &mut run => panic!("driver ended before the reasoning request was captured"),
             }
-        }
-    })
-    .await
-    .expect("the cancellation follows actual reasoning output");
+        },
+        "reasoning resend request readiness",
+    )
+    .await;
+    await_paused_driver_test_readiness(
+        async {
+            loop {
+                let event = rx
+                    .recv()
+                    .await
+                    .expect("turn event stream closed before the reasoning delta");
+                if matches!(event, TurnEvent::AssistantDisplayReasoningDelta { .. }) {
+                    break;
+                }
+            }
+        },
+        "reasoning resend delta readiness",
+    )
+    .await;
     cancel.cancel_turn();
-    let mut driver = run.await.unwrap();
+    let mut driver =
+        await_paused_driver_test_completion(run, "reasoning resend cancellation unwind")
+            .await
+            .unwrap();
     let first_request = provider.captured()[0].body.clone();
     assert!(
         first_request.to_string().contains("[time:"),
@@ -2774,7 +3071,15 @@ async fn retracted_reasoning_only_turn_resends_with_an_identical_request_prefix(
     let _ = drain_events(&mut rx);
 
     driver
-        .run_user_input(UserSubmission::text("same resend"), &queue, &tx)
+        .run_user_input(
+            {
+                let mut submission = UserSubmission::text("same resend");
+                submission.origin = crate::engine::message::SubmissionOrigin::ExternalRoot;
+                submission
+            },
+            &queue,
+            &tx,
+        )
         .await
         .unwrap();
     let captured = provider.captured();
@@ -2785,7 +3090,7 @@ async fn retracted_reasoning_only_turn_resends_with_an_identical_request_prefix(
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn interactive_cancel_after_visible_text_keeps_the_durable_user_row() {
     let mut provider = ScriptedProvider::builder()
         .dialect(WireDialect::ChatCompletions)
@@ -2793,30 +3098,49 @@ async fn interactive_cancel_after_visible_text_keeps_the_durable_user_row() {
         .start()
         .await;
     let (mut driver, _tmp) = scripted_driver(&provider);
+    // This test observes live display streaming, not the untrusted-route leak
+    // barrier. A trusted local fixture keeps that independent contract active.
+    trust_scripted_provider_for_streaming_test(&mut driver);
     let cancel = driver.cancel_handle();
     let (queue, tx, mut rx) = event_harness();
-    let run = tokio::spawn(async move {
+    let mut submission = UserSubmission::text("keep after visible text");
+    submission.origin = crate::engine::message::SubmissionOrigin::ExternalRoot;
+    let mut run = tokio::spawn(async move {
         driver
-            .run_user_input(UserSubmission::text("keep after visible text"), &queue, &tx)
+            .run_user_input(submission, &queue, &tx)
             .await
             .unwrap();
         driver
     });
-    let _ = provider.next_request().await;
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if matches!(
-                rx.recv().await,
-                Some(TurnEvent::AssistantDisplayTextDelta { .. })
-            ) {
-                return;
+    await_paused_driver_test_readiness(
+        async {
+            tokio::select! {
+                _ = provider.next_request_ready() => {}
+                _ = &mut run => panic!("driver ended before the visible-text request was captured"),
             }
-        }
-    })
-    .await
-    .expect("visible text must close the retraction window before cancellation");
+        },
+        "visible-text request readiness",
+    )
+    .await;
+    await_paused_driver_test_readiness(
+        async {
+            loop {
+                let event = rx
+                    .recv()
+                    .await
+                    .expect("turn event stream closed before the visible-text delta");
+                if matches!(event, TurnEvent::AssistantDisplayTextDelta { .. }) {
+                    break;
+                }
+            }
+        },
+        "visible-text delta readiness",
+    )
+    .await;
     cancel.cancel_turn();
-    let driver = run.await.unwrap();
+    let driver = await_paused_driver_test_completion(run, "visible-text cancellation unwind")
+        .await
+        .unwrap();
 
     let events = drain_events(&mut rx);
     assert!(
@@ -2837,6 +3161,10 @@ async fn interactive_cancel_after_visible_text_keeps_the_durable_user_row() {
 #[test]
 fn interactive_cancel_after_tool_call_keeps_the_durable_user_row() {
     crate::test_env::run_async_with_large_stack(|| async {
+        // `run_async_with_large_stack` owns a fresh current-thread runtime, so
+        // freezing it here is isolated to this test and happens before any
+        // test future installs a timer.
+        tokio::time::pause();
         let mut provider = ScriptedProvider::builder()
             .dialect(WireDialect::ChatCompletions)
             .turn(Turn::ToolCall {
@@ -2849,21 +3177,63 @@ fn interactive_cancel_after_tool_call_keeps_the_durable_user_row() {
             .await;
         let (mut driver, tmp) = scripted_read_driver(&provider);
         std::fs::write(tmp.path().join("fixture.txt"), "fixture body").unwrap();
+        // This fixture exercises the cancel/retract boundary after a real tool
+        // completion. Keep the independent result-injection classifier out of
+        // the scripted provider sequence so its request cannot consume the
+        // deliberate post-tool Hang before ToolEnd is emitted.
+        Arc::make_mut(&mut driver.stack[0].agent).scan_tool_results = false;
         let cancel = driver.cancel_handle();
         let (queue, tx, mut rx) = event_harness();
-        let run = tokio::spawn(async move {
+        let mut run = tokio::spawn(async move {
             driver
                 .run_user_input(UserSubmission::text("read before cancel"), &queue, &tx)
                 .await
                 .unwrap();
             driver
         });
-        let _ = provider.next_request().await;
-        let _ = provider.next_request().await;
+        await_paused_driver_test_readiness(
+            provider.next_request_ready(),
+            "tool-call request readiness",
+        )
+        .await;
+        let mut observed = Vec::new();
+        await_paused_driver_test_readiness(
+            async {
+                loop {
+                    let event = rx
+                        .recv()
+                        .await
+                        .expect("turn event stream closed before tool completion");
+                    let tool_completed = matches!(
+                        &event,
+                        TurnEvent::ToolEnd { call_id, .. } if call_id == "read-before-cancel"
+                    );
+                    observed.push(event);
+                    if tool_completed {
+                        break;
+                    }
+                }
+            },
+            "tool completion event readiness",
+        )
+        .await;
+        await_paused_driver_test_readiness(
+            async {
+                tokio::select! {
+                    _ = provider.next_request_ready() => {}
+                    _ = &mut run => panic!("driver ended before the post-tool request"),
+                }
+            },
+            "post-tool hung request readiness",
+        )
+        .await;
         cancel.cancel_turn();
-        let driver = run.await.unwrap();
+        let driver = await_paused_driver_test_completion(run, "post-tool cancellation unwind")
+            .await
+            .unwrap();
 
-        let events = drain_events(&mut rx);
+        observed.extend(drain_events(&mut rx));
+        let events = observed;
         assert!(
             events.iter().any(|event| matches!(event, TurnEvent::ToolEnd { call_id, .. } if call_id == "read-before-cancel")),
             "the test must cancel only after the real tool call completed: {events:?}"
@@ -3348,9 +3718,15 @@ async fn root_stop_gate_not_entered_on_cancellation() {
             .unwrap();
         driver
     });
-    let _captured = provider.next_request().await;
+    await_paused_driver_test_readiness(
+        provider.next_request_ready(),
+        "stop-gate request readiness",
+    )
+    .await;
     cancel.cancel_turn();
-    let driver = handle.await.unwrap();
+    let driver = await_paused_driver_test_completion(handle, "stop-gate cancellation unwind")
+        .await
+        .unwrap();
 
     assert!(
         observe_hook_events(&driver, "stop").await.is_empty(),

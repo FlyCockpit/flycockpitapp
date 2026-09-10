@@ -11,6 +11,7 @@ impl Approver {
         question: InterruptQuestion,
         operation: crate::agent_tree::HostApprovalOperation,
     ) -> Result<ResolveResponse> {
+        let operation = crate::engine::interrupt::bind_current_host_authorization_group(operation);
         let set = InterruptQuestionSet {
             questions: vec![question],
         };

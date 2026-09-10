@@ -203,6 +203,30 @@ async fn dispatch(journal: &ExternalJournal, idempotency_key: &str) -> DispatchT
         .expect("begin dispatch")
 }
 
+#[tokio::test]
+async fn dispatch_commit_receipts_are_correlated_monotonic_and_retained() {
+    let env = Env::new();
+    let journal = env.journal();
+    let commits = journal.subscribe_dispatch_commits();
+    assert!(commits.borrow().is_none());
+
+    let first = dispatch(&journal, "receipt-1").await;
+    let first_receipt = first.dispatch_commit();
+    assert_eq!(first_receipt.operation_id(), first.operation_id);
+    assert_eq!(first_receipt.journal_version(), first.version());
+    assert_eq!(first_receipt.state(), ExternalJournalState::Dispatching);
+    assert_eq!(first_receipt.sequence(), 1);
+    assert_eq!(commits.borrow().as_ref(), Some(first_receipt));
+
+    let second = dispatch(&journal, "receipt-2").await;
+    let second_receipt = second.dispatch_commit();
+    assert_eq!(second_receipt.operation_id(), second.operation_id);
+    assert_eq!(second_receipt.journal_version(), second.version());
+    assert_eq!(second_receipt.state(), ExternalJournalState::Dispatching);
+    assert!(second_receipt.sequence() > first_receipt.sequence());
+    assert_eq!(commits.borrow().as_ref(), Some(second_receipt));
+}
+
 // ---- criterion 2: pre-dispatch ordering ---------------------------------
 
 #[tokio::test]
@@ -269,6 +293,7 @@ async fn external_journal_pre_dispatch_commits_everything_before_the_provider_ca
 /// spool empty, the capacity ledger empty, and the provider uncalled.
 async fn assert_zero_dispatch(env: &Env, journal: &ExternalJournal, idempotency_key: &str) {
     let provider = FakeProvider::default();
+    let commits = journal.subscribe_dispatch_commits();
     let projection = projection();
     let record = journal
         .prepare(&owner(), &key(idempotency_key), &projection, T0)
@@ -280,6 +305,10 @@ async fn assert_zero_dispatch(env: &Env, journal: &ExternalJournal, idempotency_
         .expect_err("dispatch must not be provisioned");
     // The provider is unreachable without a ticket.
     assert_eq!(provider.count(), 0, "provider was called despite {error}");
+    assert!(
+        commits.borrow().is_none(),
+        "a failed dispatch must not publish a ticket acknowledgement"
+    );
 
     let db = env.db();
     let after = db
@@ -1114,6 +1143,7 @@ async fn external_journal_redaction_sentinels_absent_from_every_surface() {
 async fn external_journal_pre_dispatch_post_commit_fault_retains_the_capsule() {
     let env = Env::new();
     let journal = env.journal();
+    let commits = journal.subscribe_dispatch_commits();
     let provider = FakeProvider::default();
     let projection = projection();
     let record = journal
@@ -1136,6 +1166,10 @@ async fn external_journal_pre_dispatch_post_commit_fault_retains_the_capsule() {
     );
     // No ticket, so no provider call. But this is NOT zero dispatch.
     assert_eq!(provider.count(), 0);
+    assert!(
+        commits.borrow().is_none(),
+        "a post-commit error that returns no ticket must not publish an acknowledgement"
+    );
 
     let after = env
         .db()

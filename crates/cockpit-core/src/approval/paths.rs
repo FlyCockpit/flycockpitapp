@@ -627,8 +627,8 @@ impl Approver {
         previous: &[u8],
         next: &[u8],
     ) -> Result<Decision> {
-        const FILE_SESSION: &str = "write_grant_file_session";
-        const DIRECTORY_SESSION: &str = "write_grant_directory_session";
+        const FILE_SESSION: &str = ApprovalOptionId::WriteGrantFileSession.as_str();
+        const DIRECTORY_SESSION: &str = ApprovalOptionId::WriteGrantDirectorySession.as_str();
         if self.store.is_path_rejected(path).await? {
             return Ok(Decision::Deny);
         }
@@ -665,30 +665,16 @@ impl Approver {
         let question = InterruptQuestion::Single {
             prompt: format!("Replace existing file `{target}`?"),
             options: vec![
-                InterruptOption {
-                    id: "approve_once".to_string(),
-                    label: "Approve once".to_string(),
-                    description: None,
-                    secondary: false,
-                },
-                InterruptOption {
-                    id: FILE_SESSION.to_string(),
-                    label: "Approve this file for this session".to_string(),
-                    description: None,
-                    secondary: false,
-                },
-                InterruptOption {
-                    id: DIRECTORY_SESSION.to_string(),
-                    label: "Approve this directory for this session".to_string(),
-                    description: None,
-                    secondary: false,
-                },
-                InterruptOption {
-                    id: "reject".to_string(),
-                    label: "Deny".to_string(),
-                    description: None,
-                    secondary: false,
-                },
+                opt(ApprovalOptionId::ApproveOnce, "Approve once"),
+                opt(
+                    ApprovalOptionId::WriteGrantFileSession,
+                    "Approve this file for this session",
+                ),
+                opt(
+                    ApprovalOptionId::WriteGrantDirectorySession,
+                    "Approve this directory for this session",
+                ),
+                opt(ApprovalOptionId::Reject, "Deny"),
             ],
             allow_freetext: false,
             command_detail: Some(Box::new(CommandDetail {
@@ -722,6 +708,15 @@ impl Approver {
             "previous": previous_commitment,
             "next": next_commitment,
         });
+        let set = ApprovalOptionSet::new(
+            "file_write_approval",
+            [
+                ApprovalOptionId::ApproveOnce,
+                ApprovalOptionId::WriteGrantFileSession,
+                ApprovalOptionId::WriteGrantDirectorySession,
+                ApprovalOptionId::Reject,
+            ],
+        );
         let choice = self
             .raise_and_decode(
                 "Existing file modification requires approval",
@@ -741,36 +736,18 @@ impl Approver {
                     // directory. Bind both complete candidate effects before
                     // the response can select one.
                     "candidate_effects": [
-                        {"selection": "approve_once", "write": write_effect.clone()},
+                        {"selection": ApprovalOptionId::ApproveOnce.as_str(), "write": write_effect.clone()},
                         {"selection": FILE_SESSION, "write": write_effect.clone(), "persist_grant": {"kind": "path", "path": path.display().to_string(), "scope": "session", "access": "read_write"}},
                         {"selection": DIRECTORY_SESSION, "write": write_effect, "persist_grant": {"kind": "path", "path": path.parent().unwrap_or(path).display().to_string(), "scope": "session", "access": "read_write"}},
-                        {"selection": "reject", "effect": "deny"}
+                        {"selection": ApprovalOptionId::Reject.as_str(), "effect": "deny"}
                     ],
                 }),
-                |response| {
-                    let selected = response_single_id(response).map(str::to_owned);
-                    match selected.as_deref() {
-                        None
-                        | Some("approve_once" | FILE_SESSION | DIRECTORY_SESSION | "reject") => {
-                            Ok(selected)
-                        }
-                        Some(received) => Err(ForeignOptionId {
-                            kind: "file_write_approval",
-                            offered: vec![
-                                "approve_once",
-                                FILE_SESSION,
-                                DIRECTORY_SESSION,
-                                "reject",
-                            ],
-                            received: received.to_string(),
-                        }),
-                    }
-                },
+                |response| decode_option_response(response, &set),
             )
             .await?;
-        match choice.as_deref() {
-            Some("approve_once") => Ok(Decision::Allow { scope: Scope::Once }),
-            Some(FILE_SESSION) => {
+        match choice {
+            Some(ApprovalOptionId::ApproveOnce) => Ok(Decision::Allow { scope: Scope::Once }),
+            Some(ApprovalOptionId::WriteGrantFileSession) => {
                 if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
                     "file_write_grant_persistence",
                     &[serde_json::json!({
@@ -799,7 +776,7 @@ impl Approver {
                     scope: Scope::Session,
                 })
             }
-            Some(DIRECTORY_SESSION) => {
+            Some(ApprovalOptionId::WriteGrantDirectorySession) => {
                 let parent = path.parent().unwrap_or(path);
                 if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
                     "file_write_directory_grant_persistence",
@@ -829,7 +806,8 @@ impl Approver {
                     scope: Scope::Session,
                 })
             }
-            _ => Ok(Decision::Deny),
+            None | Some(ApprovalOptionId::Reject) => Ok(Decision::Deny),
+            Some(_) => unreachable!("file-write option set admits only its four typed choices"),
         }
     }
 }
@@ -919,7 +897,7 @@ mod file_write_grant_tests {
     use super::*;
     use std::sync::Arc;
 
-    fn approver(cwd: &std::path::Path) -> Arc<Approver> {
+    async fn approver(cwd: &std::path::Path) -> Arc<Approver> {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = crate::session::Session::create_for_test(
             db.clone(),
@@ -928,6 +906,28 @@ mod file_write_grant_tests {
             crate::session::test_redaction_key_resolver(),
         )
         .unwrap();
+        let root = db
+            .ensure_session_root_agent(
+                session.id,
+                None,
+                crate::agent_tree::workspace_ref_for_host_path(cwd).unwrap(),
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.transition_agent_instance(
+                session.id,
+                root.agent_instance_id,
+                root.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                r#"{"state":"running"}"#,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap(),
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(_)
+        ));
         let store = GrantStore::new(
             db.clone(),
             session.id,
@@ -943,46 +943,42 @@ mod file_write_grant_tests {
         ))
     }
 
-    async fn resolve_next(approver: &Approver, selected_id: &str) {
-        loop {
-            let open = approver
-                .db
-                .list_open_interrupts(approver.session_id)
-                .await
-                .unwrap();
-            if let Some(row) = open.first() {
-                if !approver.interrupts.has_waiter(row.interrupt_id) {
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                let response = ResolveResponse::Single {
-                    selected_id: selected_id.to_string(),
-                };
-                approver
-                    .db
-                    .resolve_interrupt(row.interrupt_id, &response)
-                    .await
-                    .unwrap();
-                assert!(approver.interrupts.resolve(row.interrupt_id, response));
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
+    async fn resolve_next(
+        approver: &Approver,
+        raised: &mut tokio::sync::mpsc::UnboundedReceiver<uuid::Uuid>,
+        selected_id: &str,
+    ) {
+        crate::engine::interrupt::test_support::settle_published_host_approval(
+            &approver.db,
+            approver.session_id,
+            &approver.interrupts,
+            raised,
+            ResolveResponse::Single {
+                selected_id: selected_id.to_string(),
+            },
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn write_grant_scopes_suppress_prompts() {
         let tmp = tempfile::tempdir().unwrap();
         let first = tmp.path().join("a.txt");
-        let file_approver = approver(tmp.path());
+        let file_approver = approver(tmp.path()).await;
+        let mut raised = file_approver.interrupts.subscribe_raised();
         let task_approver = file_approver.clone();
         let task = tokio::spawn(async move {
-            task_approver
-                .approve_file_write(&first, b"old", b"new")
-                .await
-                .unwrap()
+            crate::engine::interrupt::with_host_approval_effect_scope(
+                "file_write_approval_test",
+                tokio_util::sync::CancellationToken::new(),
+                task_approver.approve_file_write(&first, b"old", b"new"),
+                |decision| Some(decision.is_allowed()),
+            )
+            .await
+            .unwrap()
         });
-        resolve_next(&file_approver, "write_grant_file_session").await;
+        resolve_next(&file_approver, &mut raised, "write_grant_file_session").await;
         assert_eq!(
             task.await.unwrap(),
             Decision::Allow {
@@ -1002,15 +998,25 @@ mod file_write_grant_tests {
         let directory = tempfile::tempdir().unwrap();
         let first = directory.path().join("a.txt");
         let sibling = directory.path().join("b.txt");
-        let directory_approver = approver(directory.path());
+        let directory_approver = approver(directory.path()).await;
+        let mut raised = directory_approver.interrupts.subscribe_raised();
         let task_approver = directory_approver.clone();
         let task = tokio::spawn(async move {
-            task_approver
-                .approve_file_write(&first, b"old", b"new")
-                .await
-                .unwrap()
+            crate::engine::interrupt::with_host_approval_effect_scope(
+                "directory_write_approval_test",
+                tokio_util::sync::CancellationToken::new(),
+                task_approver.approve_file_write(&first, b"old", b"new"),
+                |decision| Some(decision.is_allowed()),
+            )
+            .await
+            .unwrap()
         });
-        resolve_next(&directory_approver, "write_grant_directory_session").await;
+        resolve_next(
+            &directory_approver,
+            &mut raised,
+            "write_grant_directory_session",
+        )
+        .await;
         assert_eq!(
             task.await.unwrap(),
             Decision::Allow {
@@ -1032,7 +1038,8 @@ mod file_write_grant_tests {
     #[tokio::test]
     async fn workspace_grant_excludes_cockpit_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let approver = approver(tmp.path());
+        let approver = approver(tmp.path()).await;
+        let mut raised = approver.interrupts.subscribe_raised();
         approver
             .store()
             .record_path(tmp.path(), Scope::Session, SandboxPathAccess::ReadWrite)
@@ -1041,12 +1048,16 @@ mod file_write_grant_tests {
         let target = tmp.path().join(".cockpit/mcp.json");
         let task_approver = approver.clone();
         let task = tokio::spawn(async move {
-            task_approver
-                .approve_file_write(&target, b"old", b"new")
-                .await
-                .unwrap()
+            crate::engine::interrupt::with_host_approval_effect_scope(
+                "workspace_cockpit_write_approval_test",
+                tokio_util::sync::CancellationToken::new(),
+                task_approver.approve_file_write(&target, b"old", b"new"),
+                |decision| Some(decision.is_allowed()),
+            )
+            .await
+            .unwrap()
         });
-        resolve_next(&approver, "reject").await;
+        resolve_next(&approver, &mut raised, "reject").await;
         assert_eq!(task.await.unwrap(), Decision::Deny);
     }
 }

@@ -22,71 +22,63 @@ impl Session {
         })
     }
 
-    /// Best-effort rollback for the sole latest-message ledger retraction.
-    /// A concurrent manual rename wins the SQL predicate and is never clobbered.
-    pub(crate) async fn restore_title_progress_after_retract(
+    /// Retract the sole latest-message ledger row and restore its matching
+    /// title/accounting snapshot in one SQLite transaction. A concurrent
+    /// manual rename wins the title compare-and-set and is never clobbered.
+    pub(crate) async fn retract_latest_user_message(
         &self,
+        seq: i64,
         snapshot: TitleProgressSnapshot,
         generated_title: Option<&str>,
-    ) -> Result<()> {
-        // This stamp is in-memory-only, so it has no title-row compare-and-
-        // set to contend with. The durable user row has already been removed
-        // before this rollback is called; restore the consumed prelude even if
-        // a concurrent manual title update wins the separate title rollback.
-        *self.last_time_prelude.lock().unwrap() = snapshot.last_time_prelude.clone();
+    ) -> Result<bool> {
         let session_id = self.live_id();
-        let prior_title = snapshot.title.clone();
-        let generated_title = generated_title.map(str::to_owned);
-        let tokens = snapshot.user_content_tokens as i64;
-        let stage = i64::from(snapshot.title_stage);
-        let expected_user_renamed = snapshot.user_renamed;
-        let nudge_state = snapshot.title_recovery_nudge_state.as_i64();
-        let restoring_generated_title = generated_title.is_some();
-        let restored = self
+        let outcome = self
             .db
-            .transaction(move |conn| {
-                // One compare-and-set owns every durable rollback field.  A
-                // concurrent manual rename or another title producer wins as
-                // a whole; it cannot leave title progress restored without
-                // its matching title decision.
-                let restored = conn.execute(
-                    "UPDATE sessions
-                        SET user_content_tokens = ?1,
-                            title_stage = ?2,
-                            title_recovery_nudge_state = ?3,
-                            title = CASE WHEN ?4 IS NULL THEN title ELSE ?5 END
-                      WHERE session_id = ?6
-                        AND user_renamed = ?7
-                        AND (?4 IS NULL OR title = ?4)",
-                    params![
-                        tokens,
-                        stage,
-                        nudge_state,
-                        generated_title,
-                        prior_title,
-                        session_id.to_string(),
-                        expected_user_renamed
-                    ],
-                )?;
-                Ok(restored == 1)
-            })
+            .remove_latest_user_message_with_title_restore(
+                session_id,
+                seq,
+                crate::db::session_log::UserMessageRetractionTitleRestore {
+                    prior_title: snapshot.title.clone(),
+                    generated_title: generated_title.map(str::to_owned),
+                    expected_user_renamed: snapshot.user_renamed,
+                    user_content_tokens: snapshot.user_content_tokens as i64,
+                    title_stage: i64::from(snapshot.title_stage),
+                    title_recovery_nudge_state: snapshot.title_recovery_nudge_state.as_i64(),
+                },
+            )
             .await?;
-        if restored {
-            if restoring_generated_title {
-                *self.title.lock().unwrap() = snapshot.title;
-            }
-            self.user_content_tokens
-                .store(snapshot.user_content_tokens, Ordering::Relaxed);
-            self.user_content_turns
-                .store(snapshot.user_content_turns, Ordering::Relaxed);
-            self.title_stage
-                .store(snapshot.title_stage, Ordering::Relaxed);
-            self.title_nudge_slot_pending
-                .store(snapshot.title_nudge_slot_pending, Ordering::Relaxed);
-            self.title_failure_noticed
-                .store(snapshot.title_failure_noticed, Ordering::Relaxed);
+        if !outcome.removed {
+            return Ok(false);
         }
-        Ok(())
+
+        // These stamps are process-local projections. Apply them only after
+        // the indivisible durable transition commits. If this turn consumed no
+        // prelude, retain any older pending replay rather than erasing it.
+        let consumed_time_prelude = {
+            let mut last = self.last_time_prelude.lock().unwrap();
+            let consumed = (*last != snapshot.last_time_prelude)
+                .then(|| *last)
+                .flatten();
+            *last = snapshot.last_time_prelude;
+            consumed
+        };
+        if let Some(consumed) = consumed_time_prelude {
+            *self.retracted_time_prelude.lock().unwrap() = Some(consumed);
+        }
+        if outcome.title_restored {
+            *self.title.lock().unwrap() = snapshot.title.clone();
+        }
+        self.user_content_tokens
+            .store(snapshot.user_content_tokens, Ordering::Relaxed);
+        self.user_content_turns
+            .store(snapshot.user_content_turns, Ordering::Relaxed);
+        self.title_stage
+            .store(snapshot.title_stage, Ordering::Relaxed);
+        self.title_nudge_slot_pending
+            .store(snapshot.title_nudge_slot_pending, Ordering::Relaxed);
+        self.title_failure_noticed
+            .store(snapshot.title_failure_noticed, Ordering::Relaxed);
+        Ok(true)
     }
 
     /// Apply the combined output of the cache-reusing self-metadata fork.
@@ -573,14 +565,11 @@ impl Session {
     /// elapsed since the last prelude; otherwise `None`. Updating the
     /// per-session "last prelude" stamp is the side-effect of a
     /// `Some` return — call only when actually about to send.
-    ///
-    /// The injected timestamp is quantized to the interval bucket, so the
-    /// prelude string is a pure function of the wall-clock bucket rather
-    /// than of the injection instant: a request rebuilt within the same
-    /// interval (retract + resend, turn rollback) reproduces the identical,
-    /// cacheable prelude instead of fragmenting the provider prefix with a
-    /// fresh nanosecond timestamp.
     pub fn take_time_prelude(&self, interval_minutes: u32) -> Option<String> {
+        if let Some(retracted) = self.retracted_time_prelude.lock().unwrap().take() {
+            *self.last_time_prelude.lock().unwrap() = Some(retracted);
+            return Some(format!("[time: {}]", retracted.to_rfc3339()));
+        }
         let now = Utc::now();
         let mut last = self.last_time_prelude.lock().unwrap();
         let should_inject = match *last {
@@ -591,25 +580,8 @@ impl Session {
             return None;
         }
         *last = Some(now);
-        Some(format!(
-            "[time: {}]",
-            time_prelude_timestamp(now, interval_minutes).to_rfc3339()
-        ))
+        Some(format!("[time: {}]", now.to_rfc3339()))
     }
-}
-
-/// Quantize a prelude injection time to the configured interval. The bucket
-/// is epoch-aligned, so it is deterministic across processes and sessions:
-/// every injection inside one interval window renders the same string. A
-/// zero-minute interval is the always-inject test configuration and keeps
-/// the raw timestamp.
-fn time_prelude_timestamp(now: DateTime<Utc>, interval_minutes: u32) -> DateTime<Utc> {
-    if interval_minutes == 0 {
-        return now;
-    }
-    let interval_secs = i64::from(interval_minutes) * 60;
-    let bucket = now.timestamp() - now.timestamp().rem_euclid(interval_secs);
-    DateTime::<Utc>::from_timestamp(bucket, 0).unwrap_or(now)
 }
 
 #[cfg(test)]
@@ -634,11 +606,24 @@ mod metadata_tests {
             TitleAction::Eager
         );
         assert!(session.set_auto_title("cancelled-title").unwrap());
-
-        session
-            .restore_title_progress_after_retract(snapshot, Some("cancelled-title"))
+        let seq = session
+            .db
+            .insert_session_event(
+                session.id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &serde_json::json!({"text": "cancelled prompt"}),
+            )
             .await
             .unwrap();
+
+        assert!(
+            session
+                .retract_latest_user_message(seq, snapshot, Some("cancelled-title"))
+                .await
+                .unwrap()
+        );
 
         assert_eq!(session.title(), None);
         assert_eq!(session.user_content_tokens(), 0);
@@ -658,6 +643,59 @@ mod metadata_tests {
     }
 
     #[tokio::test]
+    async fn retract_restores_progress_when_concurrent_manual_rename_wins_title_cas() {
+        let session = Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            PathBuf::from("/title-retract-rename-race"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let snapshot = session.title_progress_snapshot().await.unwrap();
+        assert_eq!(
+            session.note_user_content("cancelled prompt"),
+            TitleAction::Eager
+        );
+        assert!(session.set_auto_title("generated-title").unwrap());
+        let seq = session
+            .db
+            .insert_session_event(
+                session.id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &serde_json::json!({"text": "cancelled prompt"}),
+            )
+            .await
+            .unwrap();
+
+        session
+            .db
+            .rename_session(session.id, "manual-title")
+            .await
+            .unwrap();
+        assert!(
+            session
+                .retract_latest_user_message(seq, snapshot, Some("generated-title"))
+                .await
+                .unwrap()
+        );
+
+        let durable = session.db.get_session(session.id).await.unwrap().unwrap();
+        assert_eq!(durable.title.as_deref(), Some("manual-title"));
+        assert!(durable.user_renamed);
+        assert_eq!(durable.user_content_tokens, 0);
+        assert_eq!(durable.title_stage, 0);
+        assert_eq!(
+            durable.title_recovery_nudge_state,
+            crate::db::sessions::TitleRecoveryNudgeState::None
+        );
+        assert_eq!(session.user_content_tokens(), 0);
+        assert_eq!(session.user_content_turns(), 0);
+        assert_eq!(session.title_stage(), 0);
+    }
+
+    #[tokio::test]
     async fn retract_restores_consumed_time_prelude_stamp() {
         let session = Session::create_for_test(
             crate::db::Db::open_in_memory().unwrap(),
@@ -667,17 +705,120 @@ mod metadata_tests {
         )
         .unwrap();
         let snapshot = session.title_progress_snapshot().await.unwrap();
-        assert!(session.take_time_prelude(5).is_some());
+        let consumed = session
+            .take_time_prelude(5)
+            .expect("first logical turn consumes a prelude");
         assert!(session.take_time_prelude(5).is_none());
-
-        session
-            .restore_title_progress_after_retract(snapshot, None)
+        let seq = session
+            .db
+            .insert_session_event(
+                session.id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &serde_json::json!({"text": "cancelled prompt"}),
+            )
             .await
             .unwrap();
 
         assert!(
-            session.take_time_prelude(5).is_some(),
-            "the retract rollback restores the pre-send time-prelude state"
+            session
+                .retract_latest_user_message(seq, snapshot, None)
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            session.take_time_prelude(5),
+            Some(consumed),
+            "the retract rollback replays the exact vanished request prelude"
+        );
+        assert!(session.take_time_prelude(5).is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_latest_row_retract_keeps_committed_title_progress() {
+        let session = Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            PathBuf::from("/title-retract-lost-race"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let snapshot = session.title_progress_snapshot().await.unwrap();
+        assert_eq!(
+            session.note_user_content("cancelled prompt"),
+            TitleAction::Eager
+        );
+        assert!(session.set_auto_title("retained-title").unwrap());
+        let seq = session
+            .db
+            .insert_session_event(
+                session.id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &serde_json::json!({"text": "cancelled prompt"}),
+            )
+            .await
+            .unwrap();
+        session
+            .db
+            .insert_session_event(
+                session.id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &serde_json::json!({"text": "newer prompt"}),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !session
+                .retract_latest_user_message(seq, snapshot, Some("retained-title"))
+                .await
+                .unwrap(),
+            "a superseded user row cannot be retracted"
+        );
+        assert_eq!(session.title().as_deref(), Some("retained-title"));
+        assert!(session.user_content_tokens() > 0);
+        assert_eq!(session.user_content_turns(), 1);
+    }
+
+    #[tokio::test]
+    async fn retract_without_consuming_prelude_preserves_pending_replay() {
+        let session = Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            PathBuf::from("/title-retract-pending-time"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let pending = Utc::now() - chrono::Duration::minutes(1);
+        *session.retracted_time_prelude.lock().unwrap() = Some(pending);
+        let snapshot = session.title_progress_snapshot().await.unwrap();
+        let seq = session
+            .db
+            .insert_session_event(
+                session.id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &serde_json::json!({"text": "cancelled before request assembly"}),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            session
+                .retract_latest_user_message(seq, snapshot, None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            session.take_time_prelude(5),
+            Some(format!("[time: {}]", pending.to_rfc3339()))
         );
     }
 

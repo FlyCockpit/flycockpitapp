@@ -1399,7 +1399,7 @@ fn spawn_resolve_next_interrupt_with_response(
     let mut raised = hub.subscribe_raised();
     tokio::spawn(async move {
         let row = loop {
-            let row = crate::engine::interrupt::settle_published_host_approval_for_test(
+            let row = crate::engine::interrupt::test_support::settle_published_host_approval(
                 &db,
                 sid,
                 &hub,
@@ -1414,6 +1414,19 @@ fn spawn_resolve_next_interrupt_with_response(
         };
         row.interrupt_id
     })
+}
+
+async fn call_bash_host_effect_for_test(
+    input: serde_json::Value,
+    ctx: &ToolCtx,
+) -> anyhow::Result<crate::engine::tool::ToolOutput> {
+    crate::engine::interrupt::with_host_approval_effect_scope(
+        "bash_test_dispatch",
+        tokio_util::sync::CancellationToken::new(),
+        BashTool::new().call(input, ctx),
+        |output| Some(output.exit_code == Some(0)),
+    )
+    .await
 }
 
 async fn settle_host_approval_interrupt(
@@ -2003,7 +2016,7 @@ async fn approved_outside_cwd_executes() {
             .await
         })
     };
-    crate::engine::interrupt::settle_published_host_approval_for_test(
+    crate::engine::interrupt::test_support::settle_published_host_approval(
         &ctx.session.db,
         ctx.session.id,
         &ctx.interrupts,
@@ -2539,8 +2552,7 @@ async fn ungranted_command_still_prompts_on_confined_failure() {
         ],
     );
 
-    let out = BashTool::new()
-        .call(serde_json::json!({ "command": "printf hi" }), &ctx)
+    let out = call_bash_host_effect_for_test(serde_json::json!({ "command": "printf hi" }), &ctx)
         .await
         .expect("bash call returns");
     resolver.await.unwrap();
@@ -2624,13 +2636,12 @@ async fn sandbox_denial_high_without_grant_raises_escalation() {
         ],
     );
 
-    let out = BashTool::new()
-        .call(
-            serde_json::json!({ "command": command, "cwd": work.display().to_string() }),
-            &ctx,
-        )
-        .await
-        .expect("bash call returns");
+    let out = call_bash_host_effect_for_test(
+        serde_json::json!({ "command": command, "cwd": work.display().to_string() }),
+        &ctx,
+    )
+    .await
+    .expect("bash call returns");
     let (_iid, escalation) = resolver.await.unwrap();
     let escalation = escalation.expect("escalation carries detail");
     let denial = escalation
@@ -3782,10 +3793,10 @@ async fn windows_unconfined_shell_takes_grant_or_ask() {
         [(false, shell_out("approved", "", 0))],
     );
 
-    let output = BashTool::new()
-        .call(serde_json::json!({ "command": "printf approved" }), &ctx)
-        .await
-        .expect("unconfined bash call returns");
+    let output =
+        call_bash_host_effect_for_test(serde_json::json!({ "command": "printf approved" }), &ctx)
+            .await
+            .expect("unconfined bash call returns");
     resolver.await.unwrap();
 
     assert!(output.content.contains("approved"));

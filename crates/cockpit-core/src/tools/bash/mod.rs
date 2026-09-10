@@ -412,6 +412,7 @@ async fn call_bash_inner(
     options: BashRunOptions,
 ) -> Result<ToolOutput> {
     let workspace_scratch_dir = ctx.session.workspace_scratch_dir();
+    let mut approved_outside_paths = Vec::new();
     if let Some(lease) = ctx.workspace_lease.as_ref()
         && (!lease.is_live(crate::workspace_lease::now_unix_ms()) || !lease.allows_execute())
     {
@@ -497,6 +498,7 @@ async fn call_bash_inner(
         )
     {
         approve_outside_working_directory(ctx, &outside).await?;
+        approved_outside_paths.push(outside);
     }
     if ctx.workspace_lease.is_none()
         && let Some(outside) = crate::tools::bash::command_directory_escape_with_workspace_scratch(
@@ -508,6 +510,9 @@ async fn call_bash_inner(
         )
     {
         approve_outside_working_directory(ctx, &outside).await?;
+        if !approved_outside_paths.contains(&outside) {
+            approved_outside_paths.push(outside);
+        }
     }
     let mut identity_denied_paths = Vec::new();
     let identity_accounting = match crate::assistants::identity::check_identity_shell(ctx).await? {
@@ -844,6 +849,7 @@ async fn call_bash_inner(
         &extra_sandbox_paths,
         &denied_knowledge_paths,
         &write_denied_knowledge_paths,
+        &approved_outside_paths,
         ctx,
         timeout_ms,
         &mut resource_lease,
@@ -990,6 +996,7 @@ async fn call_bash_inner(
                 &extra_sandbox_paths,
                 &denied_knowledge_paths,
                 &write_denied_knowledge_paths,
+                &approved_outside_paths,
                 ctx,
                 timeout_ms,
                 &mut resource_lease,
@@ -2889,6 +2896,7 @@ async fn run_shell(
     extra_sandbox_paths: &[crate::tools::shell_sandbox::ExtraSandboxPath],
     denied_knowledge_paths: &[PathBuf],
     write_denied_knowledge_paths: &[PathBuf],
+    approved_outside_paths: &[PathBuf],
     ctx: &ToolCtx,
     timeout_ms: u64,
     resource_lease: &mut Option<ResourceLeaseGuard>,
@@ -3001,6 +3009,24 @@ async fn run_shell(
                 ),
             }
         }));
+    }
+    // An outside-cwd approval is independent of sandbox mode. Preserve the
+    // exact path candidate selected by the user through to the process spawn
+    // fence; otherwise an unconfined command carries only its command effect
+    // and a path-only capability is rejected before the shell can start.
+    for path in approved_outside_paths {
+        let access = serde_json::json!({
+            "access": {
+                "path": path.display().to_string(),
+                "required_access": format!(
+                    "{:?}",
+                    crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite
+                ),
+            }
+        });
+        if !concrete_effects.contains(&access) {
+            concrete_effects.push(access);
+        }
     }
     run_prepared_command(
         cmd,

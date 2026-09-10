@@ -2121,95 +2121,101 @@ impl PendingInterrupt<'_> {
     }
 }
 
-/// Settle the exact host-approval interrupt whose production raise boundary
-/// has published its identity. Test fixtures subscribe before starting the
-/// producer, so observing this UUID proves waiter registration, durable
-/// decision binding, and publication in the same order as a real client.
 #[cfg(test)]
-pub(crate) async fn settle_published_host_approval_for_test(
-    db: &crate::db::Db,
-    session_id: Uuid,
-    hub: &InterruptHub,
-    raised: &mut tokio::sync::mpsc::UnboundedReceiver<Uuid>,
-    response: ResolveResponse,
-) -> anyhow::Result<crate::db::db::needs_attention::NeedsAttentionRow> {
-    let interrupt_id = raised
-        .recv()
-        .await
-        .context("host approval producer ended before publishing its interrupt identity")?;
-    let interrupt = db
-        .get_interrupt(interrupt_id)
-        .await
-        .context("loading published host approval interrupt")?
-        .context("published host approval lost its durable attention row")?;
-    anyhow::ensure!(
-        interrupt.session_id == session_id,
-        "published host approval belongs to a different session"
-    );
-    anyhow::ensure!(
-        hub.has_waiter(interrupt_id),
-        "published host approval has no registered continuation"
-    );
-    let decision = db
-        .decision_request_for_interrupt(session_id, interrupt_id)
-        .await
-        .context("loading published host approval lifecycle decision")?
-        .context("published host approval is not bound to a lifecycle decision")?;
-    let offered = interrupt
-        .questions
-        .clone()
-        .or_else(|| {
-            interrupt
-                .question
-                .clone()
-                .map(|question| InterruptQuestionSet {
-                    questions: vec![question],
-                })
-        })
-        .context("published host approval has no offered question set")?;
-    let response = crate::approval::normalize_host_approval_response(&response, &offered);
-    let envelope =
-        serde_json::to_string(&response).context("serializing published host approval response")?;
-    let lifecycle = crate::agent_tree::AgentTreeLifecycle::new(db.clone());
-    let settlement = if crate::approval::host_approval_response_allows(&response, &offered) {
-        lifecycle
-            .resolve_host_approval(
-                session_id,
-                decision.decision_request_id,
-                interrupt_id,
-                &envelope,
-                crate::agent_tree::HostApprovalAuthority::for_durable_interrupt_binding(
-                    session_id, &decision, &interrupt,
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Settle the exact host-approval interrupt whose production raise boundary
+    /// has published its identity. Test fixtures subscribe before starting the
+    /// producer, so observing this UUID proves waiter registration, durable
+    /// decision binding, and publication in the same order as a real client.
+    pub(crate) async fn settle_published_host_approval(
+        db: &crate::db::Db,
+        session_id: Uuid,
+        hub: &InterruptHub,
+        raised: &mut tokio::sync::mpsc::UnboundedReceiver<Uuid>,
+        response: ResolveResponse,
+    ) -> anyhow::Result<crate::db::db::needs_attention::NeedsAttentionRow> {
+        let interrupt_id = raised
+            .recv()
+            .await
+            .context("host approval producer ended before publishing its interrupt identity")?;
+        let interrupt = db
+            .get_interrupt(interrupt_id)
+            .await
+            .context("loading published host approval interrupt")?
+            .context("published host approval lost its durable attention row")?;
+        anyhow::ensure!(
+            interrupt.session_id == session_id,
+            "published host approval belongs to a different session"
+        );
+        anyhow::ensure!(
+            hub.has_waiter(interrupt_id),
+            "published host approval has no registered continuation"
+        );
+        let decision = db
+            .decision_request_for_interrupt(session_id, interrupt_id)
+            .await
+            .context("loading published host approval lifecycle decision")?
+            .context("published host approval is not bound to a lifecycle decision")?;
+        let offered = interrupt
+            .questions
+            .clone()
+            .or_else(|| {
+                interrupt
+                    .question
+                    .clone()
+                    .map(|question| InterruptQuestionSet {
+                        questions: vec![question],
+                    })
+            })
+            .context("published host approval has no offered question set")?;
+        let response = crate::approval::normalize_host_approval_response(&response, &offered);
+        let envelope = serde_json::to_string(&response)
+            .context("serializing published host approval response")?;
+        let lifecycle = crate::agent_tree::AgentTreeLifecycle::new(db.clone());
+        let settlement = if crate::approval::host_approval_response_allows(&response, &offered) {
+            lifecycle
+                .resolve_host_approval(
+                    session_id,
+                    decision.decision_request_id,
+                    interrupt_id,
+                    &envelope,
+                    crate::agent_tree::HostApprovalAuthority::for_durable_interrupt_binding(
+                        session_id, &decision, &interrupt,
+                    )
+                    .unwrap(),
+                    crate::agent_tree::system_now_unix_ms(),
                 )
-                .unwrap(),
-                crate::agent_tree::system_now_unix_ms(),
-            )
-            .await
-    } else if crate::approval::host_approval_response_declines(&response, &offered) {
-        lifecycle
-            .cancel_host_approval(
-                session_id,
-                decision.decision_request_id,
-                interrupt_id,
-                &envelope,
-                crate::agent_tree::system_now_unix_ms(),
-            )
-            .await
-    } else {
-        anyhow::bail!("published host approval response is not an offered allow or decline option");
-    }?;
-    anyhow::ensure!(
-        matches!(
-            settlement,
-            crate::agent_tree::DecisionSettlement::Resolved(_)
-        ),
-        "published host approval did not win terminal settlement"
-    );
-    anyhow::ensure!(
-        hub.resolve(interrupt_id, response),
-        "published host approval continuation was not live at delivery"
-    );
-    Ok(interrupt)
+                .await
+        } else if crate::approval::host_approval_response_declines(&response, &offered) {
+            lifecycle
+                .cancel_host_approval(
+                    session_id,
+                    decision.decision_request_id,
+                    interrupt_id,
+                    &envelope,
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await
+        } else {
+            anyhow::bail!(
+                "published host approval response is not an offered allow or decline option"
+            );
+        }?;
+        anyhow::ensure!(
+            matches!(
+                settlement,
+                crate::agent_tree::DecisionSettlement::Resolved(_)
+            ),
+            "published host approval did not win terminal settlement"
+        );
+        anyhow::ensure!(
+            hub.resolve(interrupt_id, response),
+            "published host approval continuation was not live at delivery"
+        );
+        Ok(interrupt)
+    }
 }
 
 impl Drop for PendingInterrupt<'_> {

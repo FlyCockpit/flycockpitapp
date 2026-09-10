@@ -6117,7 +6117,7 @@ impl Driver {
                     }
                 }
                 _ = assistant_inbox_idle_poll.tick(),
-                    if !waiting_for_keep_parked_siblings && !human_input_already_ready => {
+                    if !waiting_for_keep_parked_siblings => {
                     if self
                         .try_deliver_immediate_assistant_inbox(
                             &input_queue,

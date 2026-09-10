@@ -269,8 +269,7 @@ async fn approval_for_escalation(
                 "bash",
                 &safety_args,
             )
-            .await
-            .unwrap();
+            .await;
             match escalation_route(ApprovalMode::Auto, Some(outcome)) {
                 EscalationRoute::RunUnconfinedOnce => Ok(EscalationApproval::RunUnconfinedOnce),
                 EscalationRoute::PromptHuman => prompt_user(ctx, command, row, grant_offer).await,
@@ -421,7 +420,7 @@ mod tests {
     ) -> tokio::task::JoinHandle<()> {
         let mut raised = hub.subscribe_raised();
         tokio::spawn(async move {
-            crate::engine::interrupt::settle_published_host_approval_for_test(
+            crate::engine::interrupt::test_support::settle_published_host_approval(
                 &db,
                 session_id,
                 &hub,

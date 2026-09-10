@@ -935,7 +935,7 @@ mod tests {
         raised: &mut tokio::sync::mpsc::UnboundedReceiver<uuid::Uuid>,
         response: crate::daemon::proto::ResolveResponse,
     ) {
-        crate::engine::interrupt::settle_published_host_approval_for_test(
+        crate::engine::interrupt::test_support::settle_published_host_approval(
             db, session_id, hub, raised, response,
         )
         .await

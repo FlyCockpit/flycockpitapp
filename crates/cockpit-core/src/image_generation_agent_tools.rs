@@ -1750,7 +1750,7 @@ mod tests {
         let response = ResolveResponse::Single {
             selected_id: "reject".to_string(),
         };
-        let interrupt = crate::engine::interrupt::settle_published_host_approval_for_test(
+        let interrupt = crate::engine::interrupt::test_support::settle_published_host_approval(
             &ctx.session.db,
             ctx.session.id,
             &ctx.interrupts,

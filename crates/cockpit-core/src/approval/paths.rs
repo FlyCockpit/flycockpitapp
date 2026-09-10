@@ -171,8 +171,7 @@ impl Approver {
             decision,
             DecisionSource::UserPrompt,
         )
-        .await
-        .unwrap();
+        .await;
         Ok(decision)
     }
 
@@ -320,8 +319,7 @@ impl Approver {
             decision,
             DecisionSource::UserPrompt,
         )
-        .await
-        .unwrap();
+        .await;
         Ok(outcome)
     }
 
@@ -972,7 +970,7 @@ mod file_write_grant_tests {
         raised: &mut tokio::sync::mpsc::UnboundedReceiver<uuid::Uuid>,
         selected_id: &str,
     ) {
-        crate::engine::interrupt::settle_published_host_approval_for_test(
+        crate::engine::interrupt::test_support::settle_published_host_approval(
             &approver.db,
             approver.session_id,
             &approver.interrupts,

@@ -184,7 +184,7 @@ mod tests {
         raised: &mut tokio::sync::mpsc::UnboundedReceiver<uuid::Uuid>,
         response: ResolveResponse,
     ) -> crate::db::db::needs_attention::NeedsAttentionRow {
-        crate::engine::interrupt::settle_published_host_approval_for_test(
+        crate::engine::interrupt::test_support::settle_published_host_approval(
             &approver.db,
             approver.session_id,
             &approver.interrupts,

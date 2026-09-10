@@ -3146,16 +3146,12 @@ mod tests {
             .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
         let host = HostContext::from_tool_ctx(&ctx).with_builtin_registry(registry_with(tool));
 
-        let out = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            crate::mcp::sandbox::run_with_host(
-                "mcp.invoke('cockpit', 'mutating_probe', {})",
-                &crate::mcp::config::McpConfig::default(),
-                &host,
-            ),
+        let out = crate::mcp::sandbox::run_with_host(
+            "mcp.invoke('cockpit', 'mutating_probe', {})",
+            &crate::mcp::config::McpConfig::default(),
+            &host,
         )
         .await
-        .expect("script must not deadlock")
         .unwrap();
         let value: Value = serde_json::from_str(&out).unwrap();
 
@@ -3181,11 +3177,18 @@ mod tests {
             .await
         });
 
-        let interrupt_id = tokio::time::timeout(std::time::Duration::from_secs(2), raised.recv())
-            .await
-            .expect("approval prompt must be raised")
-            .expect("approval publisher remains alive");
-        let row = db.get_interrupt(interrupt_id).await.unwrap().unwrap();
+        let response = crate::daemon::proto::ResolveResponse::Single {
+            selected_id: crate::approval::ID_APPROVE.to_string(),
+        };
+        let row = crate::engine::interrupt::test_support::settle_published_host_approval(
+            &db,
+            session_id,
+            &hub,
+            &mut raised,
+            response,
+        )
+        .await
+        .expect("published MCP approval settles through its exact continuation");
 
         assert!(
             row.description.contains("mutating_probe"),
@@ -3218,40 +3221,7 @@ mod tests {
             "{options:?}"
         );
 
-        let response = crate::daemon::proto::ResolveResponse::Single {
-            selected_id: crate::approval::ID_APPROVE.to_string(),
-        };
-        let decision = db
-            .decision_request_for_interrupt(session_id, row.interrupt_id)
-            .await
-            .unwrap()
-            .expect("MCP approval prompt is lifecycle-bound");
-        let response_json = serde_json::to_string(&response).unwrap();
-        let settlement = crate::agent_tree::AgentTreeLifecycle::new(db.clone())
-            .resolve_host_approval(
-                session_id,
-                decision.decision_request_id,
-                row.interrupt_id,
-                &response_json,
-                crate::agent_tree::HostApprovalAuthority::for_durable_interrupt_binding(
-                    session_id, &decision, &row,
-                )
-                .unwrap(),
-                crate::agent_tree::system_now_unix_ms(),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            settlement,
-            crate::agent_tree::DecisionSettlement::Resolved(_)
-        ));
-        assert!(hub.resolve(row.interrupt_id, response));
-
-        let out = tokio::time::timeout(std::time::Duration::from_secs(2), script)
-            .await
-            .expect("script must resume after approval")
-            .unwrap()
-            .unwrap();
+        let out = script.await.unwrap().unwrap();
         let value: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(value, Value::String("approved output".to_string()));
     }

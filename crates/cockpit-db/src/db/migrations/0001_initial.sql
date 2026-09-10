@@ -1920,9 +1920,6 @@ CREATE TABLE agent_host_authorization_groups (
 );
 CREATE UNIQUE INDEX idx_agent_host_authorization_group_tool_call
     ON agent_host_authorization_groups(session_id, tool_call_id);
-CREATE UNIQUE INDEX idx_agent_host_authorization_group_live
-    ON agent_host_authorization_groups(session_id, agent_instance_id)
-    WHERE state IN ('collecting', 'dispatching');
 CREATE TRIGGER agent_host_authorization_group_state_is_forward_only
 BEFORE UPDATE OF state ON agent_host_authorization_groups
 WHEN NOT (

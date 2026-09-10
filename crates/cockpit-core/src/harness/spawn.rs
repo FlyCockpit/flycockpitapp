@@ -135,8 +135,7 @@ pub async fn run_to_completion(
         cmd.process_group(0);
     }
 
-    let mut child = cmd
-        .spawn()
+    let mut child = cockpit_host::process::spawn_pinned(cmd)
         .with_context(|| format!("spawning harness `{command}`"))?;
 
     // The TempFile handle must outlive the child (its path is in argv).

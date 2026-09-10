@@ -94,6 +94,7 @@ pub struct ScriptedProvider {
     captured: Arc<Mutex<Vec<CapturedRequest>>>,
     request_count: Arc<AtomicUsize>,
     request_rx: mpsc::UnboundedReceiver<CapturedRequest>,
+    response_started_rx: mpsc::UnboundedReceiver<()>,
     shutdown_tx: broadcast::Sender<()>,
     accept_task: JoinHandle<()>,
 }
@@ -108,6 +109,7 @@ struct SharedState {
     request_count: Arc<AtomicUsize>,
     captured: Arc<Mutex<Vec<CapturedRequest>>>,
     request_tx: mpsc::UnboundedSender<CapturedRequest>,
+    response_started_tx: mpsc::UnboundedSender<()>,
 }
 
 #[derive(Debug)]
@@ -201,6 +203,7 @@ impl ScriptedProviderBuilder {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let request_count = Arc::new(AtomicUsize::new(0));
         let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (response_started_tx, response_started_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, _) = broadcast::channel(1);
         let state = Arc::new(SharedState {
             dialect: self.dialect,
@@ -211,6 +214,7 @@ impl ScriptedProviderBuilder {
             request_count: Arc::clone(&request_count),
             captured: Arc::clone(&captured),
             request_tx,
+            response_started_tx,
         });
         let accept_task = spawn_accept_loop(listener, Arc::clone(&state), shutdown_tx.subscribe());
         ScriptedProvider {
@@ -218,6 +222,7 @@ impl ScriptedProviderBuilder {
             captured,
             request_count,
             request_rx,
+            response_started_rx,
             shutdown_tx,
             accept_task,
         }
@@ -263,6 +268,16 @@ impl ScriptedProvider {
             .await
             .expect("timed out waiting for scripted provider request")
             .expect("scripted provider request channel closed")
+    }
+
+    /// Await the point at which the next scripted response has been flushed
+    /// to the socket. This is a stronger boundary than request capture for
+    /// tests that assert the first event of an intentionally hanging stream.
+    pub async fn next_response_started(&mut self) {
+        tokio::time::timeout(Duration::from_secs(2), self.response_started_rx.recv())
+            .await
+            .expect("timed out waiting for scripted provider response")
+            .expect("scripted provider response channel closed");
     }
 
     /// All requests captured so far, in arrival order.
@@ -329,6 +344,7 @@ async fn handle_connection(
             &format!("{{\"error\":\"no route for {}\"}}", parsed.path),
         )
         .await;
+        let _ = state.response_started_tx.send(());
         return;
     }
 
@@ -340,6 +356,7 @@ async fn handle_connection(
             "{\"error\":\"script exhausted\"}",
         )
         .await;
+        let _ = state.response_started_tx.send(());
         return;
     };
 
@@ -353,21 +370,36 @@ async fn handle_connection(
     match &turn.turn {
         Turn::HttpError { status, body } => {
             write_response(&mut stream, *status, "application/json", body).await;
+            let _ = state.response_started_tx.send(());
         }
         Turn::Hang => {
             let _ = shutdown_rx.recv().await;
         }
         Turn::SseHeadersThenHang => {
-            write_sse_then_hang(&mut stream, None, &mut shutdown_rx).await;
+            write_sse_then_hang(
+                &mut stream,
+                None,
+                &state.response_started_tx,
+                &mut shutdown_rx,
+            )
+            .await;
         }
         Turn::RawSse(payload) => {
             write_response(&mut stream, 200, "text/event-stream", payload).await;
+            let _ = state.response_started_tx.send(());
         }
         Turn::RawSseThenHang(payload) => {
-            write_sse_then_hang(&mut stream, Some(payload), &mut shutdown_rx).await;
+            write_sse_then_hang(
+                &mut stream,
+                Some(payload),
+                &state.response_started_tx,
+                &mut shutdown_rx,
+            )
+            .await;
         }
         Turn::RawJson(body) => {
             write_response(&mut stream, 200, "application/json", &body.to_string()).await;
+            let _ = state.response_started_tx.send(());
         }
         other => {
             let payload = emit_turn(
@@ -376,6 +408,7 @@ async fn handle_connection(
                 turn.usage.as_ref(),
             );
             write_response(&mut stream, 200, "text/event-stream", &payload).await;
+            let _ = state.response_started_tx.send(());
         }
     }
 }
@@ -499,6 +532,7 @@ async fn write_response(stream: &mut TcpStream, status: u16, content_type: &str,
 async fn write_sse_then_hang(
     stream: &mut TcpStream,
     payload: Option<&str>,
+    response_started_tx: &mpsc::UnboundedSender<()>,
     shutdown_rx: &mut broadcast::Receiver<()>,
 ) {
     // Chunked framing lets a caller either expose the SSE stream without a
@@ -517,6 +551,7 @@ async fn write_sse_then_hang(
     if stream.flush().await.is_err() {
         return;
     }
+    let _ = response_started_tx.send(());
     let _ = shutdown_rx.recv().await;
 }
 

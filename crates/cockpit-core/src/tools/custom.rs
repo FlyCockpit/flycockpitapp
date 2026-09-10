@@ -321,7 +321,7 @@ impl Tool for CustomBashTool {
             })],
         )
         .await?;
-        let mut child = command.spawn()?;
+        let mut child = cockpit_host::process::spawn_pinned(command)?;
         let child_pid = child.id();
         let stdout_task = cockpit_host::process::spawn_bounded_pipe_drain(
             child.stdout.take(),

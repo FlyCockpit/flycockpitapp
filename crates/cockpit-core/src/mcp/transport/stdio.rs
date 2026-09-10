@@ -152,7 +152,7 @@ impl StdioClient {
             ));
         #[cfg(unix)]
         cmd.process_group(0);
-        let mut child = match cmd.spawn() {
+        let mut child = match cockpit_host::process::spawn_pinned(cmd) {
             Ok(child) => child,
             Err(error) => {
                 // Never embed args, env, or cwd — only a short spawn cause.

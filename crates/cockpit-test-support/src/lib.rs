@@ -33,6 +33,21 @@ fn test_env_mutex() -> &'static Mutex<()> {
     TEST_ENV_MUTEX.get_or_init(|| Mutex::new(()))
 }
 
+/// Create an isolated Cockpit home without coupling daemon/storage acceptance
+/// tests to unrelated compiler and linker traffic on the workspace disk.
+/// The HOME/XDG production inputs still provide every path consumed by the
+/// code under test; only the backing filesystem differs on Linux.
+pub fn isolated_tempdir() -> tempfile::TempDir {
+    #[cfg(target_os = "linux")]
+    {
+        tempfile::tempdir_in("/dev/shm").expect("create isolated Cockpit home on tmpfs")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        tempfile::tempdir().expect("create isolated Cockpit home tempdir")
+    }
+}
+
 #[must_use]
 pub struct TestEnvGuard {
     _guard: MutexGuard<'static, ()>,
@@ -61,7 +76,7 @@ impl TestEnvGuard {
     }
 
     pub fn isolated_cockpit_home() -> Self {
-        let tempdir = tempfile::tempdir().expect("create isolated cockpit home tempdir");
+        let tempdir = isolated_tempdir();
         let root = tempdir.path().to_path_buf();
         let mut guard = Self::blocking_lock();
         guard.set_isolated_home(&root);
@@ -70,7 +85,7 @@ impl TestEnvGuard {
     }
 
     pub async fn isolated_cockpit_home_async() -> Self {
-        let tempdir = tempfile::tempdir().expect("create isolated cockpit home tempdir");
+        let tempdir = isolated_tempdir();
         let root = tempdir.path().to_path_buf();
         let mut guard = Self::lock().await;
         guard.set_isolated_home(&root);

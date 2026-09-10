@@ -1,7 +1,7 @@
 //! Shared child-process helpers.
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock, mpsc},
     time::{Duration, Instant},
 };
 
@@ -19,6 +19,131 @@ pub const CHILD_PIPE_CAPTURE_TAIL_BYTES: usize =
     CHILD_PIPE_CAPTURE_BYTES - CHILD_PIPE_CAPTURE_HEAD_BYTES;
 
 const PIPE_DRAIN_CHUNK_BYTES: usize = 8 * 1024;
+
+const PINNED_SPAWN_QUEUE_CAPACITY: usize = 64;
+
+enum PinnedSpawnRequest {
+    Tokio {
+        command: tokio::process::Command,
+        runtime: tokio::runtime::Handle,
+        response: mpsc::SyncSender<std::io::Result<tokio::process::Child>>,
+    },
+    Std {
+        command: std::process::Command,
+        response: mpsc::SyncSender<std::io::Result<std::process::Child>>,
+    },
+}
+
+static PINNED_SPAWNER: OnceLock<mpsc::SyncSender<PinnedSpawnRequest>> = OnceLock::new();
+
+/// Start the process-wide child spawner on one dedicated, long-lived OS
+/// thread. Linux parent-death signals are bound to the thread that calls
+/// `fork`, so routing every protected spawn through this thread makes the
+/// parent identity stable for the daemon's entire lifetime.
+pub fn start_pinned_spawner() -> std::io::Result<()> {
+    if PINNED_SPAWNER.get().is_some() {
+        return Ok(());
+    }
+    let (sender, receiver) = mpsc::sync_channel::<PinnedSpawnRequest>(PINNED_SPAWN_QUEUE_CAPACITY);
+    std::thread::Builder::new()
+        .name("cockpit-process-spawner".into())
+        .spawn(move || {
+            while let Ok(request) = receiver.recv() {
+                match request {
+                    PinnedSpawnRequest::Tokio {
+                        mut command,
+                        runtime,
+                        response,
+                    } => {
+                        let _runtime = runtime.enter();
+                        let _ = response.send(command.spawn());
+                    }
+                    PinnedSpawnRequest::Std {
+                        mut command,
+                        response,
+                    } => {
+                        let _ = response.send(command.spawn());
+                    }
+                }
+            }
+        })?;
+    // Another caller can win only in a unit-test race. Its identical worker
+    // exits when this sender is dropped; all production calls use the winner.
+    let _ = PINNED_SPAWNER.set(sender);
+    Ok(())
+}
+
+/// Spawn a protected Tokio child from the dedicated process spawner.
+///
+/// On Linux the direct child is armed with `PDEATHSIG(SIGKILL)` before exec,
+/// then rechecks that its parent is still the daemon process recorded before
+/// the request crossed the channel. The recheck closes the fork/prctl race.
+pub fn spawn_pinned(
+    mut command: tokio::process::Command,
+) -> std::io::Result<tokio::process::Child> {
+    start_pinned_spawner()?;
+    arm_parent_death(command.as_std_mut());
+    let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+        std::io::Error::other(format!("protected spawn requires a Tokio runtime: {error}"))
+    })?;
+    let (response, result) = mpsc::sync_channel(1);
+    PINNED_SPAWNER
+        .get()
+        .expect("pinned spawner initialized")
+        .send(PinnedSpawnRequest::Tokio {
+            command,
+            runtime,
+            response,
+        })
+        .map_err(|_| std::io::Error::other("protected process spawner stopped"))?;
+    result
+        .recv()
+        .map_err(|_| std::io::Error::other("protected process spawner dropped its response"))?
+}
+
+/// Synchronous-command counterpart to [`spawn_pinned`]. This is used by
+/// blocking host probes and capture helpers that still require the same
+/// daemon-crash containment contract.
+pub fn spawn_std_pinned(
+    mut command: std::process::Command,
+) -> std::io::Result<std::process::Child> {
+    start_pinned_spawner()?;
+    arm_parent_death(&mut command);
+    let (response, result) = mpsc::sync_channel(1);
+    PINNED_SPAWNER
+        .get()
+        .expect("pinned spawner initialized")
+        .send(PinnedSpawnRequest::Std { command, response })
+        .map_err(|_| std::io::Error::other("protected process spawner stopped"))?;
+    result
+        .recv()
+        .map_err(|_| std::io::Error::other("protected process spawner dropped its response"))?
+}
+
+fn arm_parent_death(command: &mut std::process::Command) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        let daemon_pid = unsafe { libc::getpid() };
+        // SAFETY: this closure runs after fork and before exec and calls only
+        // async-signal-safe libc functions. It neither allocates nor touches
+        // locks inherited from the multithreaded daemon.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != daemon_pid {
+                    return Err(std::io::Error::from_raw_os_error(libc::ECANCELED));
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = command;
+}
 
 /// Unix process-group membership recorded on a [`ProcessTreeGuard`].
 ///
@@ -139,12 +264,8 @@ impl ProcessTreeGuard {
     /// Apply spawn flags so the next child can join this guard. Never starts
     /// user instructions: Windows uses `CREATE_SUSPENDED`, Unix a fresh group.
     ///
-    /// Do not install Linux `PR_SET_PDEATHSIG` here. Linux defines its parent
-    /// as the particular thread that called `fork`, not the containing
-    /// process. Commands are commonly spawned from Tokio worker threads, so a
-    /// worker's ordinary retirement would spuriously kill a healthy child.
-    /// Explicit shutdown remains owned by this guard; crash containment must
-    /// come from a process-scoped sandbox primitive.
+    /// Linux parent-death containment is installed by [`spawn_pinned`], which
+    /// performs the actual fork from the daemon's stable spawner thread.
     pub fn apply_spawn_flags(&self, command: &mut tokio::process::Command) {
         let _ = self;
         #[cfg(unix)]

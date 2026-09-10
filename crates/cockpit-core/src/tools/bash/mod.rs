@@ -3068,7 +3068,7 @@ async fn run_prepared_command(
     {
         return RunOutcome::SpawnError(std::io::Error::other(error.to_string()));
     }
-    let mut child = match cmd.spawn() {
+    let mut child = match cockpit_host::process::spawn_pinned(cmd) {
         Ok(c) => c,
         Err(e) => return RunOutcome::SpawnError(e),
     };

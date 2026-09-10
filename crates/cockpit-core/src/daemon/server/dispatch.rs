@@ -20505,6 +20505,7 @@ async fn handle_concurrent_request_impl(
         Request::GetAgentEditSnapshot { project_root, name } => {
             crate::daemon::agent_management::edit_snapshot(&ctx, project_root, name).await
         }
+        Request::GetStorageReport => super::storage::report(&ctx).await,
         // Settlement polling is a pure read over the durable lease registry and
         // must stay reachable while the serialized queue is busy — a client
         // recovering an interrupted `CompleteAgentEditorLease` polls this while

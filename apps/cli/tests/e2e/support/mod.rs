@@ -50,7 +50,7 @@ pub struct IsolatedHome {
 
 impl IsolatedHome {
     pub fn new() -> Self {
-        let root = tempfile::tempdir().expect("integration temp root");
+        let root = cockpit_test_support::isolated_tempdir();
         let config_home = root.path().join("config");
         let data_home = root.path().join("data");
         let state_home = root.path().join("state");

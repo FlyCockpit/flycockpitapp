@@ -66,7 +66,7 @@ use anyhow::Context;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 
 pub use crate::cli::public_v0_1_command;
@@ -668,6 +668,10 @@ pub fn main_entry() -> ExitCode {
     // install the PATH-prepend alias BEFORE the tokio runtime starts.
     tools::shell_sandbox::init();
     terminal_host::install_factory();
+    if let Err(error) = cockpit_host::process::start_pinned_spawner() {
+        eprintln!("Error: starting protected process spawner: {error}");
+        return ExitCode::FAILURE;
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -835,7 +839,17 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         crate::cli::PublicCli::from_arg_matches(&crate::cli::public_v0_1_command().get_matches())?
             .into();
 
-    init_tracing(cli.log_level.as_deref(), cli.print_logs);
+    // File-backed tracing must never put filesystem latency on the daemon's
+    // boot/publication path. Keep the worker guard alive for the whole command
+    // so shutdown can drain the bounded queue before the process exits.
+    let foreground_daemon = matches!(
+        cli.command.as_ref(),
+        Some(Command::Daemon(crate::cli::DaemonCommand::Start {
+            detach: false,
+            ..
+        }))
+    );
+    let _log_worker = init_tracing(cli.log_level.as_deref(), cli.print_logs, !foreground_daemon);
 
     if cli.debug_last_message {
         match std::env::current_dir() {
@@ -970,7 +984,11 @@ fn tui_mode_for_command(command: Option<&Command>) -> Option<commands::tui::Sess
     }
 }
 
-fn init_tracing(level: Option<&str>, print_logs: bool) {
+fn init_tracing(
+    level: Option<&str>,
+    print_logs: bool,
+    drain_logs_on_exit: bool,
+) -> Option<LogWorkerGuard> {
     use tracing_subscriber::{EnvFilter, fmt};
 
     let filter = match level {
@@ -983,22 +1001,25 @@ fn init_tracing(level: Option<&str>, print_logs: bool) {
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
             .init();
-        return;
+        return None;
     }
 
     match open_log_file() {
         Some(file) => {
+            let (writer, guard) = NonBlockingLog::start(file, drain_logs_on_exit)?;
             fmt()
                 .with_env_filter(filter)
                 .with_ansi(false)
-                .with_writer(file)
+                .with_writer(writer)
                 .init();
+            Some(guard)
         }
         None => {
             fmt()
                 .with_env_filter(filter)
                 .with_writer(std::io::sink)
                 .init();
+            None
         }
     }
 }
@@ -1017,6 +1038,105 @@ struct RotatingLogState {
 }
 struct RotatingLogWriter {
     state: Arc<Mutex<RotatingLogState>>,
+}
+
+const LOG_QUEUE_CAPACITY: usize = 4096;
+
+#[derive(Clone)]
+struct NonBlockingLog {
+    sender: mpsc::SyncSender<Vec<u8>>,
+}
+
+struct NonBlockingLogWriter {
+    sender: mpsc::SyncSender<Vec<u8>>,
+    bytes: Vec<u8>,
+}
+
+struct LogWorkerGuard {
+    shutdown: mpsc::Sender<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    drain_on_drop: bool,
+}
+
+impl NonBlockingLog {
+    fn start(sink: RotatingLog, drain_on_drop: bool) -> Option<(Self, LogWorkerGuard)> {
+        let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(LOG_QUEUE_CAPACITY);
+        let (shutdown, shutdown_rx) = mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("cockpit-log-writer".into())
+            .spawn(move || {
+                let mut writer = RotatingLogWriter { state: sink.state };
+                loop {
+                    if shutdown_rx.try_recv().is_ok() {
+                        for bytes in receiver.try_iter() {
+                            let _ = writer.write_all(&bytes);
+                        }
+                        let _ = writer.flush();
+                        break;
+                    }
+                    match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+                        Ok(bytes) => {
+                            let _ = writer.write_all(&bytes);
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            let _ = writer.flush();
+                            break;
+                        }
+                    }
+                }
+            })
+            .ok()?;
+        Some((
+            Self { sender },
+            LogWorkerGuard {
+                shutdown,
+                worker: Some(worker),
+                drain_on_drop,
+            },
+        ))
+    }
+}
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for NonBlockingLog {
+    type Writer = NonBlockingLogWriter;
+
+    fn make_writer(&self) -> Self::Writer {
+        NonBlockingLogWriter {
+            sender: self.sender.clone(),
+            bytes: Vec::new(),
+        }
+    }
+}
+
+impl Write for NonBlockingLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for NonBlockingLogWriter {
+    fn drop(&mut self) {
+        if !self.bytes.is_empty() {
+            let _ = self.sender.try_send(std::mem::take(&mut self.bytes));
+        }
+    }
+}
+
+impl Drop for LogWorkerGuard {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(());
+        if self.drain_on_drop
+            && let Some(worker) = self.worker.take()
+        {
+            let _ = worker.join();
+        }
+    }
 }
 
 impl tracing_subscriber::fmt::MakeWriter<'_> for RotatingLog {

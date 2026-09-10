@@ -7877,7 +7877,7 @@ fn disk_test_ctx(db_path: &Path, spool_path: &Path) -> Arc<DaemonContext> {
 /// intentionally leaked (`into_path`) — it lives for the context's lifetime
 /// and is cleaned by the OS.
 fn unique_test_paths(ephemeral: bool) -> DaemonPaths {
-    let dir = tempfile::tempdir().expect("temp dir").into_path();
+    let dir = cockpit_test_support::isolated_tempdir().into_path();
     DaemonPaths {
         socket: dir.join("cockpit.sock"),
         pid_file: dir.join("cockpit.pid"),
@@ -19763,8 +19763,11 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "list_guidance_proposals"
         | "clean_managed_workspace_lease"
         | "restart_if_idle"
-        | "stop_daemon"
-        | "refresh_host_capabilities" => AuthzAllowedOutcome::Response,
+        | "stop_daemon" => AuthzAllowedOutcome::Response,
+        // The matrix deliberately drops the attached worker after its prelude;
+        // refresh is authorized, then fails closed when fanout observes that
+        // exact worker shutdown.
+        "refresh_host_capabilities" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
         "count_pinned_messages"
         | "list_pinned_message_seqs"
         | "list_pinned_messages_with_text"
@@ -19791,7 +19794,6 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         "cancel_sealed_owner_operation" => AuthzAllowedOutcome::Response,
         "sealed_owner_inventory"
         | "list_sealed_actions"
-        | "create_sealed_action"
         | "create_declared_sealed_action"
         | "retire_sealed_action" => AuthzAllowedOutcome::Response,
         "edit_sealed_owner_description"
@@ -19881,7 +19883,6 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "cancel_turn"
         | "resolve_interrupt"
         | "archive_session"
-        | "discard_session"
         | "set_active_model"
         | "set_agent"
         | "set_tool_surface_override"
@@ -19898,6 +19899,10 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "resume_from_compaction"
         | "pin"
         | "promote_conversation_rule" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
+        // Discard is deliberately idempotent. The owner reaches the handler,
+        // and an unknown/already-removed ephemeral lineage acknowledges
+        // without inventing state.
+        "discard_session" => AuthzAllowedOutcome::Response,
         // `recover_security_blocked_media` validates the owner-principal binding
         // first, then short-circuits on the missing storage authority before the
         // attach check, so a detached owner reaches the `Internal` "media storage
@@ -19914,16 +19919,17 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
         "admit_image_ingress"
-        | "discard_image_ingress_draft"
         | "begin_media_upload"
         | "append_media_upload_chunk"
         | "cancel_media_upload"
         | "finalize_media_upload"
-        | "discard_unreferenced_media_attachment"
-        | "resolve_agent_decision"
-        | "apply_agent_session_override" => {
+        | "discard_unreferenced_media_attachment" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
+        "discard_image_ingress_draft" | "resolve_agent_decision" => {
+            AuthzAllowedOutcome::Error(ErrorCode::Internal)
+        }
+        "apply_agent_session_override" => AuthzAllowedOutcome::Response,
         "list_leak_reports" | "list_secret_inventory" | "get_flycockpit_account" => {
             AuthzAllowedOutcome::Response
         }
@@ -19999,6 +20005,10 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "set_flycockpit_connector_enabled"
         | "sync_flycockpit_org_policy"
         | "enroll_flycockpit_org_sync" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        // The legacy catalog constructor remains on the wire for an explicit,
+        // typed retirement error. Authorization succeeds for the owner before
+        // dispatch directs callers to the owner-declared sink replacement.
+        "create_sealed_action" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         // `import_policy` and `apply_setup_wizard` validate their caller-supplied
         // payload inside the owner handler, which maps every parse /
         // unsupported-descriptor failure through `internal` (not `bad_request`),
@@ -20034,16 +20044,14 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // live session. The session-writer gate passes, then the store lookup
         // maps a missing media-egress verdict to the typed `NotFound`.
         "revoke_media_egress_verdict" => AuthzAllowedOutcome::Error(ErrorCode::NotFound),
-        // Image-sidecar Get is a concurrent handler with its own attach
-        // gate (`BadRequest`). Create/Revoke go through serialized
-        // `require_attached` (`NotAttached`). The default owner matrix
-        // probe is detached, so the owner cell surfaces those attach
-        // errors after the owner-only check.
+        // Image-sidecar Get has its own attach gate. Create/Revoke traverse the
+        // attached owner path, then reject the matrix's deliberately fabricated
+        // candidate/grant identities as typed request errors.
         "get_image_sidecar_authority_snapshot" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
         "create_image_sidecar_grant" | "revoke_image_sidecar_grant" => {
-            AuthzAllowedOutcome::Error(ErrorCode::NotAttached)
+            AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
         // Coordinator failures are carried in a typed redacted DTO, so every
         // owner-authorized installation endpoint reaches a response rather
@@ -20055,29 +20063,34 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // Code-root capability probes deliberately use fresh, unknown opaque
         // authorities. The owner reaches the handler, which rejects the
         // forged authority after the central owner gate.
-        "attach_existing_code_root_v1"
-        | "close_code_root_attachment_v1"
-        | "attach_existing_code_root_with_acp_ingress_v1"
+        "close_code_root_attachment_v1"
         | "close_acp_code_root_attachment_v1"
         | "read_code_root_v1"
         | "read_code_root_deliveries_v1"
         | "ack_code_root_deliveries_v1"
-        | "resolve_code_root_interrupt_v1"
-        | "execute_storage_cleanup"
-        | "set_primary_assistant_soul_edit_mode" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
-        // Root creation requires a configured model; the matrix daemon is
-        // intentionally model-less. Discovery and the owner configuration /
-        // storage read paths remain fully typed on an empty daemon.
+        | "resolve_code_root_interrupt_v1" => {
+            AuthzAllowedOutcome::Error(ErrorCode::Authorization)
+        }
+        "set_primary_assistant_soul_edit_mode" => {
+            AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
+        }
+        "execute_storage_cleanup" => AuthzAllowedOutcome::Error(ErrorCode::Conflict),
+        // The matrix has a configured stub model and a trusted isolated root,
+        // so owner-authorized root creation and attachment return their typed
+        // capabilities. Forged follow-up capabilities fail above with the
+        // authorization error, never a content-dependent lookup error.
         "create_code_root_v1"
-        | "create_code_root_with_acp_ingress_v1" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
+        | "attach_existing_code_root_v1"
+        | "create_code_root_with_acp_ingress_v1"
+        | "attach_existing_code_root_with_acp_ingress_v1" => AuthzAllowedOutcome::Response,
         "discover_code_roots_v1"
         | "set_workspace_history_scope"
         | "get_workspace_history_scope"
         | "get_storage_report"
         | "preview_storage_cleanup"
-        | "cancel_all_session_work"
         | "exit_guard_status"
         | "release_exit_guard" => AuthzAllowedOutcome::Response,
+        "cancel_all_session_work" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
         // The authz probe intentionally uses an unknown inbox item. Reaching
         // the writer handler must therefore fail after authorization rather
         // than manufacture a durable acknowledgement.
@@ -20943,54 +20956,85 @@ async fn authz_dispatch_matrix_covers_every_controlled_kind() {
 // invalid-state traversal for every dispatchable command.
 #[tokio::test(flavor = "multi_thread")]
 async fn authz_default_profile_owner_traverses_every_controlled_socket_path() {
-    assert_dispatch_matrix_coverage_complete();
-    for case in authz_dispatch_cases() {
-        let ctx = test_ctx();
-        let tmp = tempfile::tempdir().unwrap();
-        // Stamp a minimal `.cockpit/config.json` so config-bearing requests
-        // (e.g. `set_default_model`) find a retained default target under
-        // the trusted workspace policy.
-        let cockpit_dir = tmp.path().join(".cockpit");
-        std::fs::create_dir_all(&cockpit_dir).unwrap();
-        std::fs::write(cockpit_dir.join("config.json"), "{}").unwrap();
-        let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
-        ctx.db
-            .set_session_shared_with_collaborators(session_id, true)
-            .await
-            .unwrap();
-        ctx.db
-            .insert_session_event(
-                session_id,
-                crate::db::session_log::SessionEventKind::UserMessage,
-                Some("Build"),
-                None,
-                &serde_json::json!({"text": "local owner authz matrix"}),
-            )
-            .await
-            .unwrap();
+    use futures::StreamExt as _;
 
-        let needs_attached = authz_kind_needs_attached_state(case.kind, AuthzLevel::Owner);
-        let prelude = if needs_attached {
-            vec![attach_existing_request(session_id, tmp.path())]
-        } else {
-            Vec::new()
-        };
-        let worker_rx_to_drop_after_prelude = needs_attached.then_some(work_rx);
-        let result = dispatch_authz_request_after(
-            &ctx,
-            ClientPrincipal::owner(),
-            prelude,
-            None,
-            worker_rx_to_drop_after_prelude,
-            authz_matrix_request(case.kind, session_id, tmp.path()),
-        )
+    assert_dispatch_matrix_coverage_complete();
+    // Each matrix row models an independent connection to an independent
+    // daemon home. Exercise a small bounded set concurrently, just as real
+    // local daemons are allowed to boot concurrently, while keeping every
+    // row's storage and worker state isolated by construction.
+    let failures =
+        futures::stream::iter(authz_dispatch_cases().into_iter().map(|case| async move {
+            let ctx = test_ctx();
+            let tmp = cockpit_test_support::isolated_tempdir();
+            // Stamp a minimal `.cockpit/config.json` so config-bearing requests
+            // (e.g. `set_default_model`) find a retained default target under
+            // the trusted workspace policy.
+            let cockpit_dir = tmp.path().join(".cockpit");
+            std::fs::create_dir_all(&cockpit_dir).unwrap();
+            std::fs::write(cockpit_dir.join("config.json"), "{}").unwrap();
+            let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
+            ctx.db
+                .set_session_shared_with_collaborators(session_id, true)
+                .await
+                .unwrap();
+            ctx.db
+                .insert_session_event(
+                    session_id,
+                    crate::db::session_log::SessionEventKind::UserMessage,
+                    Some("Build"),
+                    None,
+                    &serde_json::json!({"text": "local owner authz matrix"}),
+                )
+                .await
+                .unwrap();
+
+            let needs_attached = authz_kind_needs_attached_state(case.kind, AuthzLevel::Owner);
+            let prelude = if needs_attached {
+                vec![attach_existing_request(session_id, tmp.path())]
+            } else {
+                Vec::new()
+            };
+            let worker_rx_to_drop_after_prelude = needs_attached.then_some(work_rx);
+            let result = dispatch_authz_request_after(
+                &ctx,
+                ClientPrincipal::owner(),
+                prelude,
+                None,
+                worker_rx_to_drop_after_prelude,
+                authz_matrix_request(case.kind, session_id, tmp.path()),
+            )
+            .await;
+            #[cfg_attr(not(feature = "remote"), allow(irrefutable_let_patterns))]
+            let AuthzExpectation::Allow(expected) = case.expectation(AuthzLevel::Owner) else {
+                panic!("{} must authorize the local owner", case.kind);
+            };
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_authz_allowed_outcome(case.kind, AuthzLevel::Owner, expected, result);
+            })) {
+                let detail = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| {
+                        payload
+                            .downcast_ref::<&str>()
+                            .map(|value| (*value).to_string())
+                    })
+                    .unwrap_or_else(|| "non-string assertion failure".to_string());
+                Some(format!("{}: {detail}", case.kind))
+            } else {
+                None
+            }
+        }))
+        .buffer_unordered(3)
+        .filter_map(|failure| async move { failure })
+        .collect::<Vec<_>>()
         .await;
-        #[cfg_attr(not(feature = "remote"), allow(irrefutable_let_patterns))]
-        let AuthzExpectation::Allow(expected) = case.expectation(AuthzLevel::Owner) else {
-            panic!("{} must authorize the local owner", case.kind);
-        };
-        assert_authz_allowed_outcome(case.kind, AuthzLevel::Owner, expected, result);
-    }
+    assert!(
+        failures.is_empty(),
+        "owner authz matrix failures:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[cfg(feature = "remote")]
@@ -31713,7 +31757,7 @@ fn tool_media_subject_binding_replay_and_propagation_daemon_restart_and_release(
 
 async fn image_submission_exact_retry_case() {
     let mut ctx = test_ctx();
-    let media_dir = tempfile::tempdir().unwrap();
+    let media_dir = cockpit_test_support::isolated_tempdir();
     let db = ctx.db.clone();
     // V2 attachment acceptance requires durable media storage; provision it
     // so staged identities materialize and remain reusable.
@@ -31725,7 +31769,7 @@ async fn image_submission_exact_retry_case() {
         .unwrap(),
     ));
     attach_fake_secure_key_actor(&mut ctx).await;
-    let project = tempfile::tempdir().unwrap();
+    let project = cockpit_test_support::isolated_tempdir();
     ctx.db
         .set_workspace_trust(
             project.path(),
@@ -31955,10 +31999,12 @@ async fn image_submission_exact_retry_case() {
     .expect_err("same UUID with a different fingerprint must conflict");
     assert_eq!(conflict.code, ErrorCode::Conflict);
 
+    let reused_operation_id = Uuid::now_v7();
+    let reused_submission_id = Uuid::now_v7();
     let reused = handle_request(
         request(
-            Uuid::now_v7(),
-            Uuid::now_v7(),
+            reused_operation_id,
+            reused_submission_id,
             "inspect this image",
             image_ref,
         ),
@@ -31969,33 +32015,36 @@ async fn image_submission_exact_retry_case() {
     .expect("one immutable attachment version is reusable by another submission");
     assert!(matches!(reused, Response::UserMessageQueued { .. }));
 
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        loop {
-            let user_messages = ctx
-                .db
-                .list_session_events(session_id)
-                .await
-                .unwrap()
-                .into_iter()
-                .filter(|event| event.kind == "user_message")
-                .count();
-            if user_messages >= 2 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("second distinct submission becomes durable");
-    let user_messages = ctx
+    // Dispatch acknowledges only after the operation/submission join commits.
+    // Assert that durable boundary directly: provider scheduling and later
+    // transcript projection are deliberately outside attachment idempotency.
+    let reused_receipt = ctx
         .db
-        .list_session_events(session_id)
+        .message_receipt_status(session_id, *reused_operation_id.as_bytes())
         .await
-        .unwrap()
-        .into_iter()
-        .filter(|event| event.kind == "user_message")
-        .count();
-    assert_eq!(user_messages, 2, "exact retry must not duplicate inference");
+        .expect("read second durable operation receipt")
+        .expect("second distinct submission is durable before acknowledgement");
+    assert_eq!(
+        reused_receipt.client_submission_id,
+        *reused_submission_id.as_bytes()
+    );
+    assert_eq!(reused_receipt.attachments.len(), 1);
+    let durable_operation_count: i64 = ctx
+        .db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM message_operation_receipts WHERE session_id=?1",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .expect("count durable operation identities");
+    assert_eq!(
+        durable_operation_count, 2,
+        "the exact retry reuses its operation while the distinct submission commits once"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -38315,25 +38364,23 @@ async fn attach_since_seq_replays_retracted_user_row_identity() {
 async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     use crate::config::providers::{
-        ActiveModelRef, ModelEntry, ProviderEntry, ProvidersConfig, ThinkingMode,
+        ActiveModelRef, ProviderEntry, ProvidersConfig, ThinkingMode, WireApi,
     };
 
-    let (model_url, captured_requests, model_server) = retraction_acceptance_model_server().await;
+    let mut provider = retraction_acceptance_model_server().await;
+    let model_url = provider.base_url();
     let mut providers = ProvidersConfig::default();
     providers.providers.insert(
         "lmstudio".to_string(),
         ProviderEntry {
             url: model_url,
-            models: vec![ModelEntry {
-                id: "retraction-model".to_string(),
-                ..ModelEntry::default()
-            }],
+            wire_api: WireApi::Completions,
             ..ProviderEntry::default()
         },
     );
     providers.active_model = Some(ActiveModelRef {
         provider: "lmstudio".to_string(),
-        model: "retraction-model".to_string(),
+        model: "local".to_string(),
         reasoning_effort: None,
         thinking_mode: Some(ThinkingMode::High),
         prompt_cache_retention: None,
@@ -38353,7 +38400,13 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
     let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
         providers, extended,
     ));
-    let project = tempfile::tempdir().unwrap();
+    let project = cockpit_test_support::isolated_tempdir();
+    ctx.registry.set_external_journal(Arc::new(
+        crate::external_journal::ExternalJournal::for_test_at(
+            ctx.db.clone(),
+            &project.path().join("external-journal"),
+        ),
+    ));
     std::fs::write(project.path().join("fixture.txt"), "fixture body").unwrap();
     trust_workspace_root(&ctx, project.path()).await;
 
@@ -38439,6 +38492,7 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         proto::Event::UserMessageRecorded { seq, .. } => seq,
         _ => unreachable!("predicate selected a user row"),
     };
+    wait_for_retraction_provider_request(&mut provider, "initial reasoning turn").await;
     wait_for_retraction_acceptance_event(
         &mut origin_events,
         "real provider reasoning delta",
@@ -38519,6 +38573,7 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
             .expect("resend is accepted after a real CancelTurn"),
         Response::UserMessageQueued { .. }
     ));
+    wait_for_retraction_provider_request(&mut provider, "resent turn").await;
     wait_for_retraction_acceptance_event(
         &mut origin_events,
         "resent visible response",
@@ -38531,19 +38586,10 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         })
         .await;
     }
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if captured_requests.lock().unwrap().len() >= 2 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("model captured the original and resent provider requests");
-    let requests = captured_requests.lock().unwrap().clone();
+    let requests = provider.captured();
+    assert!(requests.len() >= 2, "model captured both provider requests");
     assert_eq!(
-        requests[0], requests[1],
+        requests[0].body, requests[1].body,
         "retract + resend preserves the exact provider request, including its cacheable prefix"
     );
 
@@ -38560,6 +38606,7 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         .expect("visible-text case is accepted"),
         Response::UserMessageQueued { .. }
     ));
+    wait_for_retraction_provider_request(&mut provider, "visible-text turn").await;
     wait_for_retraction_acceptance_event(
         &mut origin_events,
         "visible text before cancel",
@@ -38619,12 +38666,14 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         .expect("tool case is accepted"),
         Response::UserMessageQueued { .. }
     ));
+    wait_for_retraction_provider_request(&mut provider, "tool turn").await;
     wait_for_retraction_acceptance_event(
         &mut origin_events,
         "completed real read tool before cancel",
         |event| matches!(event, proto::Event::ToolEnd { call_id, .. } if call_id == "read-before-cancel"),
     )
     .await;
+    wait_for_retraction_provider_request(&mut provider, "tool-result follow-up").await;
     handle_request(Request::CancelTurn, &mut origin, &ctx)
         .await
         .expect("CancelTurn after tool is delivered");
@@ -38677,6 +38726,7 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         .expect("cancel-all boundary case is accepted"),
         Response::UserMessageQueued { .. }
     ));
+    wait_for_retraction_provider_request(&mut provider, "cancel-all turn").await;
     wait_for_retraction_acceptance_event(
         &mut origin_events,
         "live reasoning before cancel-all",
@@ -38728,7 +38778,7 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         })
         .await
         .expect("real worker shuts down after acceptance test");
-    model_server.abort();
+    drop(provider);
 }
 
 async fn wait_for_retraction_acceptance_event(
@@ -38736,6 +38786,7 @@ async fn wait_for_retraction_acceptance_event(
     label: &str,
     matches_event: impl Fn(&proto::Event) -> bool,
 ) -> proto::Event {
+    let mut observed = Vec::new();
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
             let event = events
@@ -38745,10 +38796,11 @@ async fn wait_for_retraction_acceptance_event(
             if matches_event(&event.event) {
                 return event.event;
             }
+            observed.push(event.event);
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
+    .unwrap_or_else(|_| panic!("timed out waiting for {label}; observed {observed:?}"))
 }
 
 async fn collect_retraction_acceptance_events_until(
@@ -38779,121 +38831,83 @@ async fn collect_retraction_acceptance_events_until(
 /// hang, then reasoning/hang for the `CancelAllSessionWork` boundary. Hanging
 /// the socket after a real delta forces production cancellation to abort a
 /// live HTTP stream; it cannot be simulated by a completed turn.
-async fn retraction_acceptance_model_server() -> (
-    String,
-    Arc<StdMutex<Vec<String>>>,
-    tokio::task::JoinHandle<()>,
-) {
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-    };
+async fn retraction_acceptance_model_server() -> cockpit_test_support::provider::ScriptedProvider {
+    use cockpit_test_support::provider::{ScriptedProvider, Turn, WireDialect};
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let captured = Arc::new(StdMutex::new(Vec::new()));
-    let captured_server = captured.clone();
+    let assistant_role = serde_json::json!({
+        "id": "c", "model": "local",
+        "choices": [{
+            "index": 0,
+            "delta": { "role": "assistant", "content": "" },
+            "finish_reason": null
+        }],
+        "usage": null
+    });
     let reasoning = serde_json::json!({
-        "id": "retraction-1", "model": "retraction-model",
-        "choices": [{ "delta": { "reasoning_content": "checking" }, "finish_reason": null }]
+        "id": "c", "model": "local",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "content": null,
+                "reasoning_content": "checking",
+                "tool_calls": []
+            },
+            "finish_reason": null
+        }],
+        "usage": null
     });
     let resent = serde_json::json!({
-        "id": "retraction-2", "model": "retraction-model",
+        "id": "c", "model": "local",
         "choices": [{ "delta": { "content": "resent answer" }, "finish_reason": null }]
     });
     let visible = serde_json::json!({
-        "id": "retraction-3", "model": "retraction-model",
+        "id": "c", "model": "local",
         "choices": [{ "delta": { "content": "visible answer" }, "finish_reason": null }]
     });
     let tool = serde_json::json!({
-        "id": "retraction-4", "model": "retraction-model",
+        "id": "c", "model": "local",
         "choices": [{ "delta": { "tool_calls": [{
             "index": 0, "id": "read-before-cancel", "type": "function",
             "function": { "name": "read", "arguments": "{\\\"path\\\":\\\"fixture.txt\\\"}" }
         }] }, "finish_reason": null }]
     });
     let tool_finish = serde_json::json!({
-        "id": "retraction-4", "model": "retraction-model",
+        "id": "c", "model": "local",
         "choices": [{ "delta": {}, "finish_reason": "tool_calls" }]
     });
-    let streams = vec![
-        (format!("data: {reasoning}\n\n"), true),
-        (format!("data: {resent}\n\ndata: [DONE]\n\n"), false),
-        (format!("data: {visible}\n\n"), true),
-        (
-            format!("data: {tool}\n\ndata: {tool_finish}\n\ndata: [DONE]\n\n"),
-            false,
-        ),
-        (String::new(), true),
-        (format!("data: {reasoning}\n\n"), true),
-    ];
-    let server = tokio::spawn(async move {
-        for (stream_body, hang) in streams {
-            let (mut socket, _) = listener.accept().await.expect("model accepts request");
-            let request = read_retraction_acceptance_http_request(&mut socket).await;
-            if std::env::var("COCKPIT_RETRACT_DBG").is_ok() {
-                eprintln!(
-                    "RETRACT-DBG model server accepted request ({} bytes): {}",
-                    request.len(),
-                    &request[..request.len().min(240)]
-                );
-            }
-            captured_server.lock().unwrap().push(request);
-            socket
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-                )
-                .await
-                .expect("model writes stream headers");
-            socket
-                .write_all(stream_body.as_bytes())
-                .await
-                .expect("model writes stream body");
-            socket.flush().await.expect("model flushes stream body");
-            if hang {
-                let mut eof = [0_u8; 1];
-                let _ = socket.read(&mut eof).await;
-            }
-        }
-    });
-    (format!("http://{address}/v1"), captured, server)
+    ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::RawSseThenHang(format!(
+            "data: {assistant_role}\n\ndata: {reasoning}\n\n"
+        )))
+        .turn(Turn::RawSse(format!("data: {resent}\n\ndata: [DONE]\n\n")))
+        .turn(Turn::RawSseThenHang(format!("data: {visible}\n\n")))
+        .turn(Turn::RawSse(format!(
+            "data: {tool}\n\ndata: {tool_finish}\n\ndata: [DONE]\n\n"
+        )))
+        .turn(Turn::SseHeadersThenHang)
+        .turn(Turn::RawSseThenHang(format!(
+            "data: {assistant_role}\n\ndata: {reasoning}\n\n"
+        )))
+        .start()
+        .await
 }
 
-async fn read_retraction_acceptance_http_request(socket: &mut tokio::net::TcpStream) -> String {
-    use tokio::io::AsyncReadExt;
-
-    let mut bytes = Vec::new();
-    let mut scratch = [0_u8; 4096];
-    loop {
-        let read = socket
-            .read(&mut scratch)
-            .await
-            .expect("model reads request");
-        assert!(read > 0, "model request ended before its HTTP headers");
-        bytes.extend_from_slice(&scratch[..read]);
-        let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
-            continue;
-        };
-        let headers = std::str::from_utf8(&bytes[..header_end]).expect("ASCII HTTP headers");
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                line.split_once(':').and_then(|(name, value)| {
-                    name.eq_ignore_ascii_case("content-length").then(|| {
-                        value
-                            .trim()
-                            .parse::<usize>()
-                            .expect("numeric content length")
-                    })
-                })
-            })
-            .expect("model request has a content length");
-        let body_start = header_end + 4;
-        if bytes.len() >= body_start + content_length {
-            return String::from_utf8(bytes[body_start..body_start + content_length].to_vec())
-                .expect("UTF-8 JSON request body");
-        }
-    }
+async fn wait_for_retraction_provider_request(
+    provider: &mut cockpit_test_support::provider::ScriptedProvider,
+    label: &str,
+) {
+    let request = provider.next_request().await;
+    assert!(
+        request.request_line.contains("/chat/completions"),
+        "{label} used the wrong provider surface: {}",
+        request.request_line
+    );
+    assert_eq!(
+        request.body.get("stream"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    provider.next_response_started().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

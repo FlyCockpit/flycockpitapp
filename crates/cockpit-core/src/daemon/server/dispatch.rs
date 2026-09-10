@@ -3776,7 +3776,12 @@ async fn handle_send_user_message_v2(
         crate::db::db::message_attachments::AcceptMessageResult::Replayed { safe_outcome } => {
             use crate::db::db::message_attachments::MessageSafeOutcome;
             match safe_outcome {
-                MessageSafeOutcome::Accepted { .. } => {}
+                // Acceptance durably enqueues the canonical message in the
+                // same transaction as its operation and attachment receipts.
+                // An exact retry must therefore acknowledge that committed
+                // intent instead of attempting a second in-memory delivery;
+                // recovery owns draining the durable queue after a crash.
+                MessageSafeOutcome::Accepted { .. } => return Ok(Response::Ack),
                 MessageSafeOutcome::Materialized { .. } => return Ok(Response::Ack),
                 MessageSafeOutcome::TerminalRejected => {
                     if let Err(error) = ctx

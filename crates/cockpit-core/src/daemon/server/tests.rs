@@ -31846,24 +31846,26 @@ async fn image_submission_exact_retry_case() {
         .expect("read durable media reference");
     assert_eq!(retained_reference_count, 1);
 
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        loop {
-            if ctx
-                .db
-                .client_submission_receipt(session_id, client_submission_id)
-                .await
-                .expect("durable receipt lookup")
-                .is_some()
-            {
-                break;
-            }
-            // Do not yield_now()-spin: this test pins a 2-thread runtime so a
-            // busy waiter can starve the session driver that persists the event.
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the accepted submission becomes durable");
+    // `UserMessageQueued` for an attachment-bearing V2 request is downstream
+    // of the transactional message-operation and attachment receipts above.
+    // Do not wait for the driver's later transcript materialization: a crash
+    // immediately after this acknowledgement must already be replayable from
+    // the acceptance ledger.
+    let accepted_receipt = ctx
+        .db
+        .message_receipt_status(session_id, *operation_id.as_bytes())
+        .await
+        .expect("synchronous durable replay lookup")
+        .expect("queued attachment acknowledgement establishes its durable replay fence");
+    assert_eq!(
+        accepted_receipt.client_submission_id,
+        *client_submission_id.as_bytes()
+    );
+    assert!(matches!(
+        accepted_receipt.safe_outcome,
+        crate::db::message_attachments::MessageSafeOutcome::Accepted { .. }
+            | crate::db::message_attachments::MessageSafeOutcome::Materialized { .. }
+    ));
     // Simulate a daemon process restart by dropping the entire per-client
     // attachment state, then reconnecting. Neither the old client nor the
     // daemon replay cache has the bytes now; the durable wire receipt alone

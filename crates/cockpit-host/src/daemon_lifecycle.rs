@@ -113,6 +113,33 @@ impl VerifiedDaemonProcess {
             Err(error) => Err(error),
         }
     }
+
+    /// Await the kernel's exit notification for this exact process.
+    ///
+    /// A pidfd becomes readable when the process exits even if its parent has
+    /// not reaped the resulting zombie. Unlike numeric-PID probing, this
+    /// completion signal cannot be confused by either a zombie or PID reuse.
+    pub async fn wait_for_exit(self) -> std::io::Result<()> {
+        let pidfd = tokio::io::unix::AsyncFd::new(self.pidfd)?;
+        loop {
+            let mut ready = pidfd.readable().await?;
+            let mut poll_fd = libc::pollfd {
+                fd: std::os::fd::AsRawFd::as_raw_fd(pidfd.get_ref()),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll_fd points to one initialized pollfd and a zero
+            // timeout only inspects the readiness already reported by Tokio.
+            let result = unsafe { libc::poll(&mut poll_fd, 1, 0) };
+            if result < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if result > 0 && poll_fd.revents != 0 {
+                return Ok(());
+            }
+            ready.clear_ready();
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]

@@ -28,9 +28,10 @@ pub mod test_env {
 pub(crate) mod daemon {
     pub(crate) use cockpit_core::daemon::{
         DaemonPaths, DaemonProbe, DaemonStatus, EventSender, SharedRedactionTable, caffeinate,
-        daemon_pid, derive_restart_no_sandbox, discover, proto, restart_release_timeout,
-        run_foreground, run_foreground_with_resume, send_current_event, server, session_worker,
-        spawn_detached_with_resume, stop, terminal, wait_for_restart_release,
+        capture_restart_release, daemon_pid, derive_restart_no_sandbox, discover, proto,
+        restart_release_timeout, run_foreground, run_foreground_with_resume, send_current_event,
+        server, session_worker, spawn_detached_with_resume, stop, terminal,
+        wait_for_restart_release,
     };
     pub(crate) mod client {
         pub(crate) use cockpit_core::daemon::client::{

@@ -57,6 +57,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
         DaemonCommand::Stop { grace } => {
             validate_grace(grace)?;
             let old_pid = daemon::daemon_pid(&paths);
+            let release = daemon::capture_restart_release(&paths, old_pid);
             if let Ok(client) = DaemonClient::connect(&paths.socket).await {
                 client
                     .request_ok(Request::StopDaemon { grace_secs: grace })
@@ -64,7 +65,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                 drop(client);
                 if !daemon::wait_for_restart_release(
                     &paths,
-                    old_pid,
+                    release,
                     daemon::restart_release_timeout(grace),
                 )
                 .await
@@ -97,6 +98,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
         } => {
             validate_grace(grace)?;
             let old_pid = daemon::daemon_pid(&paths);
+            let release = daemon::capture_restart_release(&paths, old_pid);
             let discovered = daemon::discover().await;
             let should_stop = restart_should_stop(discovered.status);
             let restarted = should_stop && old_pid.is_some();
@@ -121,7 +123,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                 };
                 let released = daemon::wait_for_restart_release(
                     &paths,
-                    old_pid,
+                    release,
                     restart_release_timeout_for_stop_path(grace, stop_via_socket),
                 )
                 .await;

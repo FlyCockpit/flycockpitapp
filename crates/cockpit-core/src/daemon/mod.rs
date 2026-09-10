@@ -1108,6 +1108,41 @@ pub fn daemon_pid(paths: &DaemonPaths) -> Option<u32> {
     read_pid_file(&paths.pid_file)
 }
 
+/// Stable evidence for the predecessor whose shutdown is about to be
+/// requested. Linux pins the verified process before the request can unlink
+/// its receipt, allowing restart to await the pidfd exit signal rather than a
+/// reusable numeric PID.
+pub struct RestartReleaseWitness {
+    expected_pid: Option<u32>,
+    #[cfg(target_os = "linux")]
+    process: Option<cockpit_host::daemon_lifecycle::VerifiedDaemonProcess>,
+}
+
+pub fn capture_restart_release(
+    paths: &DaemonPaths,
+    expected_pid: Option<u32>,
+) -> RestartReleaseWitness {
+    #[cfg(target_os = "linux")]
+    let process = match cockpit_host::daemon_lifecycle::read_daemon_pid_record(&paths.pid_file) {
+        Some(cockpit_host::daemon_lifecycle::DaemonPidRecord::Receipt(receipt))
+            if expected_pid == Some(receipt.pid) =>
+        {
+            match cockpit_host::daemon_lifecycle::acquire_verified_daemon_process(&receipt) {
+                cockpit_host::daemon_lifecycle::VerifiedProcessOutcome::Verified(process) => {
+                    Some(process)
+                }
+                cockpit_host::daemon_lifecycle::VerifiedProcessOutcome::Identity(_) => None,
+            }
+        }
+        _ => None,
+    };
+    RestartReleaseWitness {
+        expected_pid,
+        #[cfg(target_os = "linux")]
+        process,
+    }
+}
+
 pub fn restart_release_timeout(grace_secs: Option<u64>) -> Duration {
     let drain = grace_secs
         .map(Duration::from_secs)
@@ -1117,9 +1152,17 @@ pub fn restart_release_timeout(grace_secs: Option<u64>) -> Duration {
 
 pub async fn wait_for_restart_release(
     paths: &DaemonPaths,
-    expected_pid: Option<u32>,
+    witness: RestartReleaseWitness,
     timeout: Duration,
 ) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Some(process) = witness.process {
+        return matches!(
+            tokio::time::timeout(timeout, process.wait_for_exit()).await,
+            Ok(Ok(()))
+        ) && restart_paths_released(paths, witness.expected_pid);
+    }
+    let expected_pid = witness.expected_pid;
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if restart_metadata_released(paths, expected_pid) {
@@ -1130,6 +1173,12 @@ pub async fn wait_for_restart_release(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+fn restart_paths_released(paths: &DaemonPaths, expected_pid: Option<u32>) -> bool {
+    expected_pid.is_none_or(|pid| read_pid_file(&paths.pid_file) != Some(pid))
+        && !paths.pid_file.exists()
+        && !paths.socket.exists()
 }
 
 fn restart_metadata_released(paths: &DaemonPaths, expected_pid: Option<u32>) -> bool {
@@ -3825,7 +3874,8 @@ mod tests {
         std::fs::write(&paths.pid_file, "123").unwrap();
         std::fs::write(&paths.socket, "").unwrap();
 
-        wait_for_restart_release(&paths, Some(123), Duration::ZERO).await;
+        let release = capture_restart_release(&paths, Some(123));
+        wait_for_restart_release(&paths, release, Duration::ZERO).await;
 
         assert!(paths.pid_file.exists());
         assert!(paths.socket.exists());

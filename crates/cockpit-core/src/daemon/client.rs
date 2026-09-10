@@ -587,6 +587,7 @@ async fn promote_ephemeral_owner_with_recovery_policy(
             anyhow!("ephemeral daemon owner identity is unavailable for promotion")
         })?;
         let old_pid = Some(expected_predecessor.1.pid);
+        let release = crate::daemon::capture_restart_release(&current_paths, old_pid);
         let client = match connect_local_daemon(&current_paths.socket).await {
             Ok(client) => client,
             Err(error) if replacement_required => {
@@ -771,7 +772,7 @@ async fn promote_ephemeral_owner_with_recovery_policy(
 
         if !crate::daemon::wait_for_restart_release(
             &current_paths,
-            old_pid,
+            release,
             recovery.predecessor_release_timeout,
         )
         .await

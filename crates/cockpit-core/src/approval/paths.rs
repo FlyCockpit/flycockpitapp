@@ -627,8 +627,8 @@ impl Approver {
         previous: &[u8],
         next: &[u8],
     ) -> Result<Decision> {
-        const FILE_SESSION: &str = "write_grant_file_session";
-        const DIRECTORY_SESSION: &str = "write_grant_directory_session";
+        const FILE_SESSION: &str = ApprovalOptionId::WriteGrantFileSession.as_str();
+        const DIRECTORY_SESSION: &str = ApprovalOptionId::WriteGrantDirectorySession.as_str();
         if self.store.is_path_rejected(path).await? {
             return Ok(Decision::Deny);
         }
@@ -665,30 +665,16 @@ impl Approver {
         let question = InterruptQuestion::Single {
             prompt: format!("Replace existing file `{target}`?"),
             options: vec![
-                InterruptOption {
-                    id: "approve_once".to_string(),
-                    label: "Approve once".to_string(),
-                    description: None,
-                    secondary: false,
-                },
-                InterruptOption {
-                    id: FILE_SESSION.to_string(),
-                    label: "Approve this file for this session".to_string(),
-                    description: None,
-                    secondary: false,
-                },
-                InterruptOption {
-                    id: DIRECTORY_SESSION.to_string(),
-                    label: "Approve this directory for this session".to_string(),
-                    description: None,
-                    secondary: false,
-                },
-                InterruptOption {
-                    id: "reject".to_string(),
-                    label: "Deny".to_string(),
-                    description: None,
-                    secondary: false,
-                },
+                opt(ApprovalOptionId::ApproveOnce, "Approve once"),
+                opt(
+                    ApprovalOptionId::WriteGrantFileSession,
+                    "Approve this file for this session",
+                ),
+                opt(
+                    ApprovalOptionId::WriteGrantDirectorySession,
+                    "Approve this directory for this session",
+                ),
+                opt(ApprovalOptionId::Reject, "Deny"),
             ],
             allow_freetext: false,
             command_detail: Some(Box::new(CommandDetail {
@@ -722,6 +708,15 @@ impl Approver {
             "previous": previous_commitment,
             "next": next_commitment,
         });
+        let set = ApprovalOptionSet::new(
+            "file_write_approval",
+            [
+                ApprovalOptionId::ApproveOnce,
+                ApprovalOptionId::WriteGrantFileSession,
+                ApprovalOptionId::WriteGrantDirectorySession,
+                ApprovalOptionId::Reject,
+            ],
+        );
         let choice = self
             .raise_and_decode(
                 "Existing file modification requires approval",
@@ -741,36 +736,18 @@ impl Approver {
                     // directory. Bind both complete candidate effects before
                     // the response can select one.
                     "candidate_effects": [
-                        {"selection": "approve_once", "write": write_effect.clone()},
+                        {"selection": ApprovalOptionId::ApproveOnce.as_str(), "write": write_effect.clone()},
                         {"selection": FILE_SESSION, "write": write_effect.clone(), "persist_grant": {"kind": "path", "path": path.display().to_string(), "scope": "session", "access": "read_write"}},
                         {"selection": DIRECTORY_SESSION, "write": write_effect, "persist_grant": {"kind": "path", "path": path.parent().unwrap_or(path).display().to_string(), "scope": "session", "access": "read_write"}},
-                        {"selection": "reject", "effect": "deny"}
+                        {"selection": ApprovalOptionId::Reject.as_str(), "effect": "deny"}
                     ],
                 }),
-                |response| {
-                    let selected = response_single_id(response).map(str::to_owned);
-                    match selected.as_deref() {
-                        None
-                        | Some("approve_once" | FILE_SESSION | DIRECTORY_SESSION | "reject") => {
-                            Ok(selected)
-                        }
-                        Some(received) => Err(ForeignOptionId {
-                            kind: "file_write_approval",
-                            offered: vec![
-                                "approve_once",
-                                FILE_SESSION,
-                                DIRECTORY_SESSION,
-                                "reject",
-                            ],
-                            received: received.to_string(),
-                        }),
-                    }
-                },
+                |response| decode_option_response(response, &set),
             )
             .await?;
-        match choice.as_deref() {
-            Some("approve_once") => Ok(Decision::Allow { scope: Scope::Once }),
-            Some(FILE_SESSION) => {
+        match choice {
+            Some(ApprovalOptionId::ApproveOnce) => Ok(Decision::Allow { scope: Scope::Once }),
+            Some(ApprovalOptionId::WriteGrantFileSession) => {
                 if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
                     "file_write_grant_persistence",
                     &[serde_json::json!({
@@ -799,7 +776,7 @@ impl Approver {
                     scope: Scope::Session,
                 })
             }
-            Some(DIRECTORY_SESSION) => {
+            Some(ApprovalOptionId::WriteGrantDirectorySession) => {
                 let parent = path.parent().unwrap_or(path);
                 if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
                     "file_write_directory_grant_persistence",
@@ -829,7 +806,8 @@ impl Approver {
                     scope: Scope::Session,
                 })
             }
-            _ => Ok(Decision::Deny),
+            None | Some(ApprovalOptionId::Reject) => Ok(Decision::Deny),
+            Some(_) => unreachable!("file-write option set admits only its four typed choices"),
         }
     }
 }

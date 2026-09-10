@@ -368,7 +368,17 @@ fn edit_model_switch_config(
     driver: &mut Driver,
     edit: impl FnOnce(&mut crate::config::providers::ProvidersConfig),
 ) {
-    edit_test_provider_config(driver, edit);
+    let mut providers = driver.config.providers();
+    edit(&mut providers);
+    driver.set_config_handle(
+        crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                driver.config.generation(),
+                providers,
+                driver.config.extended().clone(),
+            ),
+        ),
+    );
 }
 
 #[test]
@@ -1123,7 +1133,9 @@ async fn plain_enter_leaves_an_existing_default_untouched() {
 #[tokio::test]
 async fn plain_enter_never_establishes_a_first_default() {
     let (mut driver, _tmp) = model_switch_driver();
-    edit_model_switch_config(&mut driver, |cfg| cfg.active_model = None);
+    let mut providers = driver.config.providers();
+    providers.active_model = None;
+    install_test_provider_config(&mut driver, providers);
     assert!(
         driver.session.active_model_ref().is_none(),
         "installing a provider snapshot without an active model must clear the session mirror too"

@@ -3149,8 +3149,32 @@ mod tests {
                 )
                 .unwrap(),
             },
+            crate::agent_tree::HostDecisionSubject::HostCapabilitiesRefresh {
+                operation: crate::agent_tree::HostCapabilitiesRefreshOperation::new(),
+            },
+            crate::agent_tree::HostDecisionSubject::HostEffect(
+                crate::agent_tree::HostEffectClass::LocalMetadataRefresh,
+            ),
+            crate::agent_tree::HostDecisionSubject::HostEffect(
+                crate::agent_tree::HostEffectClass::Credential,
+            ),
+            crate::agent_tree::HostDecisionSubject::HostEffect(
+                crate::agent_tree::HostEffectClass::Authorization,
+            ),
+            crate::agent_tree::HostDecisionSubject::HostEffect(
+                crate::agent_tree::HostEffectClass::Destructive,
+            ),
             crate::agent_tree::HostDecisionSubject::HostEffect(
                 crate::agent_tree::HostEffectClass::ExternalAction,
+            ),
+            crate::agent_tree::HostDecisionSubject::HostEffect(
+                crate::agent_tree::HostEffectClass::Publish,
+            ),
+            crate::agent_tree::HostDecisionSubject::HostEffect(
+                crate::agent_tree::HostEffectClass::Purchase,
+            ),
+            crate::agent_tree::HostDecisionSubject::HostEffect(
+                crate::agent_tree::HostEffectClass::Production,
             ),
         ];
         for subject in subjects {

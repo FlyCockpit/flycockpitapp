@@ -18,12 +18,21 @@ pub enum ApprovalOptionId {
     GitignoreFile,
     GitignoreParent,
     GitignoreReject,
+    WriteGrantFileSession,
+    WriteGrantDirectorySession,
     RepeatAcceptOnce,
     RepeatRejectOnce,
     RepeatAcceptSession,
     RepeatRejectSession,
     RepeatAcceptProject,
     RepeatRejectProject,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostApprovalSelection {
+    EffectBearing,
+    PureDecline,
+    Navigation,
 }
 
 impl ApprovalOptionId {
@@ -47,6 +56,8 @@ impl ApprovalOptionId {
             Self::GitignoreFile => "gitignore_file",
             Self::GitignoreParent => "gitignore_parent",
             Self::GitignoreReject => "gitignore_reject",
+            Self::WriteGrantFileSession => "write_grant_file_session",
+            Self::WriteGrantDirectorySession => "write_grant_directory_session",
             Self::RepeatAcceptOnce => "approve_repeat_once",
             Self::RepeatRejectOnce => "reject_repeat_once",
             Self::RepeatAcceptSession => "approve_repeat_session",
@@ -76,6 +87,8 @@ impl ApprovalOptionId {
             "gitignore_file" => Self::GitignoreFile,
             "gitignore_parent" => Self::GitignoreParent,
             "gitignore_reject" => Self::GitignoreReject,
+            "write_grant_file_session" => Self::WriteGrantFileSession,
+            "write_grant_directory_session" => Self::WriteGrantDirectorySession,
             "approve_repeat_once" => Self::RepeatAcceptOnce,
             "reject_repeat_once" => Self::RepeatRejectOnce,
             "approve_repeat_session" => Self::RepeatAcceptSession,
@@ -84,6 +97,40 @@ impl ApprovalOptionId {
             "reject_repeat_project" => Self::RepeatRejectProject,
             _ => return None,
         })
+    }
+
+    /// Classify every typed option at the durable host-approval boundary.
+    /// Keep this match wildcard-free: adding a new wire option must make its
+    /// effect-bearing, decline-only, or navigation semantics explicit.
+    pub(crate) const fn host_approval_selection(self) -> HostApprovalSelection {
+        match self {
+            Self::Approve
+            | Self::ApproveOnce
+            | Self::ApproveSession
+            | Self::ApproveProject
+            | Self::ApproveGlobal
+            | Self::RejectSession
+            | Self::RejectProject
+            | Self::RejectGlobal
+            | Self::ApproveAllOnce
+            | Self::EscalateGrantSession
+            | Self::EscalateGrantProject
+            | Self::EscalateGrantGlobal
+            | Self::EscalateRunUnconfinedOnce
+            | Self::GitignoreFile
+            | Self::GitignoreParent
+            | Self::WriteGrantFileSession
+            | Self::WriteGrantDirectorySession
+            | Self::RepeatAcceptOnce
+            | Self::RepeatAcceptSession
+            | Self::RepeatRejectSession
+            | Self::RepeatAcceptProject
+            | Self::RepeatRejectProject => HostApprovalSelection::EffectBearing,
+            Self::Reject | Self::GitignoreReject | Self::RepeatRejectOnce => {
+                HostApprovalSelection::PureDecline
+            }
+            Self::MoreOptions => HostApprovalSelection::Navigation,
+        }
     }
 }
 

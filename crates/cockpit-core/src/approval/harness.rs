@@ -350,13 +350,6 @@ mod tests {
             ),
             (ResolveResponse::Cancel, Decision::Deny, "user_prompt"),
             (
-                ResolveResponse::Single {
-                    selected_id: "foreign".to_string(),
-                },
-                Decision::Deny,
-                "user_prompt",
-            ),
-            (
                 ResolveResponse::Freetext {
                     text: NONINTERACTIVE_RUN_DENIAL.to_string(),
                 },
@@ -378,5 +371,86 @@ mod tests {
             assert_eq!(events[0]["decision"], "deny");
             assert_eq!(events[0]["source"], source);
         }
+    }
+
+    #[tokio::test]
+    async fn harness_invoke_foreign_response_stays_pending_until_valid_cancellation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver = approver(tmp.path()).await;
+        let mut raised = approver.interrupts.subscribe_raised();
+        let task_approver = approver.clone();
+        let task = tokio::spawn(async move {
+            crate::engine::interrupt::with_host_approval_effect_scope(
+                "harness_invoke_foreign_response_test",
+                tokio_util::sync::CancellationToken::new(),
+                task_approver.approve_harness_invoke("codex", Some("gpt-5"), WritePolicy::Direct),
+                |decision| Some(decision.is_allowed()),
+            )
+            .await
+            .unwrap()
+        });
+        let interrupt_id = raised.recv().await.expect("harness approval is published");
+        let decision = approver
+            .db
+            .decision_request_for_interrupt(approver.session_id, interrupt_id)
+            .await
+            .unwrap()
+            .expect("harness approval has a lifecycle decision");
+        let lifecycle = crate::agent_tree::AgentTreeLifecycle::new(approver.db.clone());
+        let foreign = ResolveResponse::Single {
+            selected_id: "foreign".to_string(),
+        };
+        assert!(
+            lifecycle
+                .cancel_host_approval(
+                    approver.session_id,
+                    decision.decision_request_id,
+                    interrupt_id,
+                    &serde_json::to_string(&foreign).unwrap(),
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await
+                .is_err(),
+            "a foreign response cannot be laundered into denial"
+        );
+        assert_eq!(
+            approver
+                .db
+                .decision_request(approver.session_id, decision.decision_request_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::db::agent_tree_decisions::DecisionState::Pending
+        );
+        assert!(approver.interrupts.has_waiter(interrupt_id));
+
+        let cancel = ResolveResponse::Cancel;
+        assert!(matches!(
+            lifecycle
+                .cancel_host_approval(
+                    approver.session_id,
+                    decision.decision_request_id,
+                    interrupt_id,
+                    &serde_json::to_string(&cancel).unwrap(),
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await
+                .unwrap(),
+            crate::agent_tree::DecisionSettlement::Resolved(_)
+        ));
+        assert!(approver.interrupts.resolve(interrupt_id, cancel));
+        assert_eq!(task.await.unwrap(), Decision::Deny);
+        assert!(
+            matches!(
+                raised.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "valid cancellation settles the original prompt without re-raising"
+        );
+        let events = permission_events(&approver).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["decision"], "deny");
+        assert_eq!(events[0]["source"], "user_prompt");
     }
 }

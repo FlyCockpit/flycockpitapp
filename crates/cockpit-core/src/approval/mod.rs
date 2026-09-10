@@ -151,31 +151,9 @@ pub(crate) fn host_approval_response_allows(
     if !offered_here {
         return false;
     }
-    matches!(
-        ApprovalOptionId::from_str(id),
-        Some(
-            ApprovalOptionId::Approve
-                | ApprovalOptionId::ApproveOnce
-                | ApprovalOptionId::ApproveSession
-                | ApprovalOptionId::ApproveProject
-                | ApprovalOptionId::ApproveGlobal
-                | ApprovalOptionId::ApproveAllOnce
-                | ApprovalOptionId::EscalateGrantSession
-                | ApprovalOptionId::EscalateGrantProject
-                | ApprovalOptionId::EscalateGrantGlobal
-                | ApprovalOptionId::EscalateRunUnconfinedOnce
-                | ApprovalOptionId::GitignoreFile
-                | ApprovalOptionId::GitignoreParent
-                | ApprovalOptionId::RepeatAcceptOnce
-                | ApprovalOptionId::RepeatAcceptSession
-                | ApprovalOptionId::RepeatAcceptProject
-                | ApprovalOptionId::RepeatRejectSession
-                | ApprovalOptionId::RepeatRejectProject
-                | ApprovalOptionId::RejectSession
-                | ApprovalOptionId::RejectProject
-                | ApprovalOptionId::RejectGlobal
-        )
-    )
+    ApprovalOptionId::from_str(id).is_some_and(|id| {
+        id.host_approval_selection() == options::HostApprovalSelection::EffectBearing
+    })
 }
 
 /// Validate the only response shapes that may terminally decline a real host
@@ -200,19 +178,9 @@ pub(crate) fn host_approval_response_declines(
             if !options.iter().any(|option| option.id == *selected_id) {
                 return false;
             }
-            matches!(
-                ApprovalOptionId::from_str(selected_id),
-                Some(
-                    ApprovalOptionId::Reject
-                        | ApprovalOptionId::RejectSession
-                        | ApprovalOptionId::RejectProject
-                        | ApprovalOptionId::RejectGlobal
-                        | ApprovalOptionId::GitignoreReject
-                        | ApprovalOptionId::RepeatRejectOnce
-                        | ApprovalOptionId::RepeatRejectSession
-                        | ApprovalOptionId::RepeatRejectProject
-                )
-            )
+            ApprovalOptionId::from_str(selected_id).is_some_and(|id| {
+                id.host_approval_selection() == options::HostApprovalSelection::PureDecline
+            })
         }
         ResolveResponse::Multi { .. }
         | ResolveResponse::Freetext { .. }
@@ -2085,21 +2053,95 @@ mod tests {
     async fn approval_vocab_foreign_id_reraises_once_per_fresh_answer() {
         let tmp = tempfile::tempdir().unwrap();
         let (approver, _) = approver(tmp.path());
-        let resolver =
-            resolve_sequence_collecting_prompts(&approver, &[ID_LOOP_ACCEPT_ONCE, ID_APPROVE_ONCE])
-                .await;
-
-        let decision =
-            run_host_approval_effect_for_test(approver.approve_command("rm file"), |decision| {
-                Some(decision.is_allowed())
-            })
+        let approver = Arc::new(approver);
+        ensure_fixture_lifecycle_owner(&approver).await;
+        let mut raised = approver.interrupts.subscribe_raised();
+        let task_approver = approver.clone();
+        let task = tokio::spawn(async move {
+            run_host_approval_effect_for_test(
+                task_approver.approve_command("rm file"),
+                |decision| Some(decision.is_allowed()),
+            )
             .await
+            .unwrap()
+        });
+        let interrupt_id = raised.recv().await.expect("approval prompt is published");
+        let interrupt = approver
+            .db
+            .get_interrupt(interrupt_id)
+            .await
+            .unwrap()
             .unwrap();
-        let prompts = resolver.await.unwrap();
+        let decision = approver
+            .db
+            .decision_request_for_interrupt(approver.session_id, interrupt_id)
+            .await
+            .unwrap()
+            .expect("approval prompt has a lifecycle decision");
+        let lifecycle = crate::agent_tree::AgentTreeLifecycle::new(approver.db.clone());
+        let foreign = ResolveResponse::Single {
+            selected_id: ID_LOOP_ACCEPT_ONCE.to_string(),
+        };
+        let foreign_envelope = serde_json::to_string(&foreign).unwrap();
+        assert!(
+            lifecycle
+                .cancel_host_approval(
+                    approver.session_id,
+                    decision.decision_request_id,
+                    interrupt_id,
+                    &foreign_envelope,
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await
+                .is_err(),
+            "a foreign option must not cancel the live host approval"
+        );
+        assert_eq!(
+            approver
+                .db
+                .decision_request(approver.session_id, decision.decision_request_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::db::agent_tree_decisions::DecisionState::Pending
+        );
+        assert!(approver.interrupts.has_waiter(interrupt_id));
 
-        assert_eq!(decision, Decision::Allow { scope: Scope::Once });
-        assert_eq!(prompts.len(), 2);
-        assert_eq!(prompts[0], prompts[1]);
+        let valid = ResolveResponse::Single {
+            selected_id: ID_APPROVE_ONCE.to_string(),
+        };
+        let valid_envelope = serde_json::to_string(&valid).unwrap();
+        assert!(matches!(
+            lifecycle
+                .resolve_host_approval(
+                    approver.session_id,
+                    decision.decision_request_id,
+                    interrupt_id,
+                    &valid_envelope,
+                    crate::agent_tree::HostApprovalAuthority::for_durable_interrupt_binding(
+                        approver.session_id,
+                        &decision,
+                        &interrupt,
+                    )
+                    .unwrap(),
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await
+                .unwrap(),
+            crate::agent_tree::DecisionSettlement::Resolved(_)
+        ));
+        assert!(approver.interrupts.resolve(interrupt_id, valid));
+        let outcome = task.await.unwrap();
+
+        assert_eq!(outcome, Decision::Allow { scope: Scope::Once });
+        assert!(
+            matches!(
+                raised.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "rejecting a foreign response must not invent a replacement prompt"
+        );
     }
 
     #[test]
@@ -4855,8 +4897,25 @@ mod tests {
     async fn interactive_reject_session_records_standing_reject() {
         let tmp = tempfile::tempdir().unwrap();
         let (approver, _) = approver(tmp.path());
+        let approver = Arc::new(approver);
         let resolver = resolve_sequence(&approver, &[ID_REJECT_SESSION]).await;
-        let decision = approver.approve_command("gh pr create").await.unwrap();
+        let effect_approver = approver.clone();
+        let effect_key = ApprovalKey {
+            program: "gh".into(),
+            subcommand: Some("pr".into()),
+            option_names: std::collections::BTreeSet::new(),
+        };
+        let decision = run_host_approval_effect_for_test(
+            async move {
+                let decision = effect_approver.approve_command("gh pr create").await?;
+                let persisted = effect_approver.store.is_command_rejected(&effect_key).await;
+                Ok((decision, persisted))
+            },
+            |(_, persisted)| Some(*persisted),
+        )
+        .await
+        .unwrap()
+        .0;
         resolver.await.unwrap();
         assert_eq!(decision, Decision::Deny);
 
@@ -5646,6 +5705,7 @@ mod tests {
     async fn interactive_repeat_always_reject_session_records_rule() {
         let tmp = tempfile::tempdir().unwrap();
         let (approver, _) = approver(tmp.path());
+        let approver = Arc::new(approver);
         ensure_fixture_lifecycle_owner(&approver).await;
         let db = approver.db.clone();
         let session_id = approver.session_id;
@@ -5659,7 +5719,23 @@ mod tests {
             },
         );
         let input = serde_json::json!({"command": "spin"});
-        let decision = approver.approve_repeat("bash", &input, true).await.unwrap();
+        let effect_approver = approver.clone();
+        let effect_input = input.clone();
+        let effect_signature = GrantStore::loop_signature("bash", &input);
+        let decision = run_host_approval_effect_for_test(
+            async move {
+                let decision = effect_approver
+                    .approve_repeat("bash", &effect_input, true)
+                    .await?;
+                let persisted = effect_approver.store.loop_rule(&effect_signature).await?
+                    == Some(LoopVerdict::Reject);
+                Ok((decision, persisted))
+            },
+            |(_, persisted)| Some(*persisted),
+        )
+        .await
+        .unwrap()
+        .0;
         resolver.await.unwrap();
         assert_eq!(decision, RepeatDecision::Reject);
         // The always-reject-session rule was persisted, so a later
@@ -5868,6 +5944,36 @@ mod tests {
             ),
             "a globally recognized allow id from a different prompt must not approve"
         );
+    }
+
+    #[test]
+    fn host_approval_typed_file_write_grants_are_effect_bearing_selections() {
+        for option_id in [
+            ApprovalOptionId::WriteGrantFileSession,
+            ApprovalOptionId::WriteGrantDirectorySession,
+        ] {
+            let offered = InterruptQuestionSet {
+                questions: vec![InterruptQuestion::Single {
+                    prompt: "Approve this write grant?".into(),
+                    options: vec![InterruptOption {
+                        id: option_id.as_str().into(),
+                        label: "Approve".into(),
+                        description: None,
+                        secondary: false,
+                    }],
+                    allow_freetext: false,
+                    command_detail: None,
+                    permission: true,
+                    approval_class: Some(GrantKind::Path),
+                    sandbox_escalation: None,
+                }],
+            };
+            let response = ResolveResponse::Single {
+                selected_id: option_id.as_str().into(),
+            };
+            assert!(host_approval_response_allows(&response, &offered));
+            assert!(!host_approval_response_declines(&response, &offered));
+        }
     }
 
     #[test]

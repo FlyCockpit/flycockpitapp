@@ -1059,6 +1059,7 @@ fn learn_driver(
     let redact = Arc::new(RedactionTable::empty());
     let mut driver =
         Driver::with_max_schedules(session, locks, redact, tmp.path().to_path_buf(), agent, 1);
+    bind_test_session_root(&mut driver);
     let policy = crate::config::trust::WorkspaceTrustPolicy {
         root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
         mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,

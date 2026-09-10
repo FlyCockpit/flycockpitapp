@@ -4235,6 +4235,20 @@ async fn tool_hook_runner_native_process_tree_guard_runs_body() {
     assert!(!out.spawn_failed);
 }
 
+#[test]
+fn production_hook_runner_forks_through_pinned_spawner() {
+    let source = include_str!("../hooks.rs");
+    let pinned_spawn = ["process::spawn", "_pinned(cmd)"].concat();
+    assert!(
+        source.contains(&pinned_spawn),
+        "contained hooks must use the stable pinned-spawner parent for Linux PDEATHSIG"
+    );
+    assert!(
+        !source.contains("match cmd.spawn()"),
+        "contained hooks must not bypass the pinned spawner"
+    );
+}
+
 #[tokio::test]
 async fn tool_hook_runner_without_handle_is_unsupported() {
     // Drive the REAL production entry point `CommandRunner::run` on a runner with

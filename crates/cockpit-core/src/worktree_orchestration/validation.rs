@@ -21,9 +21,9 @@ use super::integration::ExclusiveTargetHold;
 /// the daemon sweeper cannot reclaim a live overlay/apply/cargo/restore hold.
 const VALIDATION_LOCK_REFRESH: Duration = super::integration::EXCLUSIVE_HOLD_REFRESH;
 
-/// Cap for Drop-path process-group SIGKILL wait. SIGKILL is immediate; this
-/// only bounds an unkillable leftover (D-state, or a process that left the
-/// group) so restore and exclusive-lock release can still proceed.
+/// Cap for Drop-path containment teardown. This stays far below the five-minute
+/// lock expiry: failure to prove quiescence by this deadline fail-stops before
+/// restore or exclusive-lock release.
 const WRAPPER_GROUP_TEARDOWN: Duration = Duration::from_secs(2);
 
 /// Evidence recorded with an artifact. Never includes a cargo invocation
@@ -308,30 +308,42 @@ async fn run_wrapper(
     // runtime while cargo mutates the overlaid primary tree. A blocking
     // `Command::output()` would starve the heartbeat (and the sweeper) on
     // a current-thread runtime.
-    let mut cmd = tokio::process::Command::new(&validation.wrapper);
-    cmd.args(cargo_args)
-        .current_dir(&validation.primary)
-        .env("WT_TEST_PRIMARY", &validation.primary)
-        .env("WT_TEST_CARGO", &validation.cargo_bin)
-        .env("WT_TEST_LOCK_HELD", "1")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    // Own a process group so Drop SIGKILLs cargo and rustc/test-binary
-    // descendants before overlay/patch restore. Tokio `kill_on_drop` is
-    // SIGKILL of the wrapper PID only; `wt-test.sh` `exec`s cargo into
-    // that PID when `WT_TEST_LOCK_HELD=1`.
-    #[cfg(unix)]
-    cmd.process_group(0);
+    #[cfg(target_os = "linux")]
+    let supervised = cockpit_host::process::spawn_validation_supervisor(
+        validation.wrapper.as_os_str(),
+        cargo_args,
+        &validation.primary,
+        &[
+            ("WT_TEST_PRIMARY", validation.primary.as_os_str()),
+            ("WT_TEST_CARGO", validation.cargo_bin.as_os_str()),
+            ("WT_TEST_LOCK_HELD", std::ffi::OsStr::new("1")),
+        ],
+    );
+    #[cfg(not(target_os = "linux"))]
+    let supervised = {
+        let mut cmd = tokio::process::Command::new(&validation.wrapper);
+        cmd.args(cargo_args)
+            .current_dir(&validation.primary)
+            .env("WT_TEST_PRIMARY", &validation.primary)
+            .env("WT_TEST_CARGO", &validation.cargo_bin)
+            .env("WT_TEST_LOCK_HELD", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
+        cockpit_host::process::spawn_pinned(cmd)
+    };
     let mut child = GroupedWrapper {
-        child: cmd.spawn().with_context(|| {
+        child: supervised.with_context(|| {
             format!(
                 "launching `{}` in `{}`",
                 validation.wrapper.display(),
                 validation.primary.display()
             )
         })?,
+        containment_pending: true,
     };
     let status = child.wait().await.with_context(|| {
         format!(
@@ -353,18 +365,109 @@ async fn run_wrapper(
 /// is gone. Sibling destructors (`AppliedPatch`, `PathOverlaySnapshot`,
 /// `ExclusiveTargetHold`) must not run while cargo descendants still write.
 struct GroupedWrapper {
+    #[cfg(target_os = "linux")]
+    child: cockpit_host::process::ValidationSupervisor,
+    #[cfg(not(target_os = "linux"))]
     child: tokio::process::Child,
+    // Single-owner teardown obligation, not containment evidence or a lock.
+    // Only a Quiesced outcome (or a successful non-Unix direct wait) consumes
+    // it; cancellation and every earlier error leave Drop responsible.
+    containment_pending: bool,
 }
 
 impl GroupedWrapper {
     async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.child.wait().await
+        #[cfg(target_os = "linux")]
+        {
+            match self.child.wait().await {
+                Ok(status) => {
+                    self.containment_pending = false;
+                    return Ok(status);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "fatal: validation supervisor could not prove workload quiescence: {error}"
+                    );
+                    std::process::abort();
+                }
+            }
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            let pid = self.child.id().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "wrapper child was already reaped before containment cleanup",
+                )
+            })?;
+            // Preserve the leader as a zombie after normal exit. Its unreaped
+            // identity pins the process group while cleanup kills descendants;
+            // only the cleanup helper may reap and return the leader status.
+            cockpit_host::process::wait_for_exit_without_reaping(pid).await?;
+            let status = require_wrapper_containment(
+                cockpit_host::process::terminate_group_kill_wait_status(
+                    &mut self.child,
+                    WRAPPER_GROUP_TEARDOWN,
+                ),
+            );
+            self.containment_pending = false;
+            return Ok(status);
+        }
+        #[cfg(not(unix))]
+        {
+            let status = self.child.wait().await?;
+            self.containment_pending = false;
+            Ok(status)
+        }
     }
 }
 
 impl Drop for GroupedWrapper {
     fn drop(&mut self) {
-        cockpit_host::process::terminate_group_kill_wait(&mut self.child, WRAPPER_GROUP_TEARDOWN);
+        if !self.containment_pending {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let Err(error) = self.child.terminate_and_wait(WRAPPER_GROUP_TEARDOWN) {
+            eprintln!("fatal: validation supervisor could not prove workload quiescence: {error}");
+            std::process::abort();
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ =
+            require_wrapper_containment(cockpit_host::process::terminate_group_kill_wait_status(
+                &mut self.child,
+                WRAPPER_GROUP_TEARDOWN,
+            ));
+    }
+}
+
+/// Restoration and both write-exclusion guards are outside `GroupedWrapper`.
+/// Unwinding here would therefore violate their destructor order. Fail-stop
+/// keeps Rust destructors from restoring/releasing after an ambiguous group
+/// teardown; Linux's dedicated supervisor also kills the workload group when
+/// its daemon-owned control channel closes. An uninterruptible descendant
+/// prevents supervisor completion, so the bounded Drop path aborts before
+/// restoration or lock release rather than fabricating absence.
+#[cfg(any(not(target_os = "linux"), test))]
+fn require_wrapper_containment(
+    outcome: cockpit_host::process::GroupKillWaitOutcome,
+) -> std::process::ExitStatus {
+    match outcome {
+        cockpit_host::process::GroupKillWaitOutcome::Quiesced(status) => status,
+        cockpit_host::process::GroupKillWaitOutcome::Unproven {
+            leader_status,
+            failure,
+        } => {
+            eprintln!(
+                "fatal: candidate wrapper containment is unproven before restoration or lock release: leader_status={leader_status:?}, failure={failure:?}"
+            );
+            tracing::error!(
+                ?leader_status,
+                ?failure,
+                "candidate wrapper containment is unproven; aborting before restoration or lock release"
+            );
+            std::process::abort();
+        }
     }
 }
 
@@ -843,6 +946,37 @@ mod tests {
         (Arc::new(LockManager::in_memory(db)), session.session_id)
     }
 
+    #[cfg(unix)]
+    fn validation_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("primary");
+        std::fs::create_dir_all(&root).unwrap();
+        crate::git::run_git_checked(&root, &["init", "-q", "-b", "main"]).unwrap();
+        crate::git::run_git_checked(&root, &["config", "user.email", "t@t"]).unwrap();
+        crate::git::run_git_checked(&root, &["config", "user.name", "t"]).unwrap();
+        crate::git::run_git_checked(&root, &["config", "commit.gpgsign", "false"]).unwrap();
+        std::fs::write(root.join("a.txt"), b"before\n").unwrap();
+        crate::git::run_git_checked(&root, &["add", "--", "a.txt"]).unwrap();
+        crate::git::run_git_checked(&root, &["commit", "-q", "-m", "init"]).unwrap();
+
+        let wrapper = dir.path().join("wrapper.sh");
+        std::fs::write(&wrapper, b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&wrapper).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&wrapper, permissions).unwrap();
+        (dir, root, wrapper)
+    }
+
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn exclusive_target_hold_survives_idle_sweep_while_mutation_runs() {
         let dir = tempfile::tempdir().unwrap();
@@ -969,23 +1103,161 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn normal_exit_overlay_waits_for_descendant_before_restoration() {
+        let (_dir, root, wrapper) = validation_fixture();
+        let fifo = root.parent().unwrap().join("normal-descendant.fifo");
+        make_fifo(&fifo);
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/sh\n(exec cat '{}') &\nexit 7\n", fifo.display()),
+        )
+        .unwrap();
+        let (locks, session) = lock_session().await;
+        let mut validation = CandidateValidation::for_primary(&root).with_locks(
+            locks.clone(),
+            "orchestrator",
+            session,
+        );
+        validation.wrapper = wrapper;
+        let mut overlay = BTreeMap::new();
+        overlay.insert(PathBuf::from("a.txt"), b"candidate\n".to_vec());
+
+        let evidence = validation.validate_overlay(&overlay, &[]).await.unwrap();
+        assert_eq!(
+            evidence.exit_code, 7,
+            "natural leader status must survive group drain"
+        );
+        assert!(evidence.restored);
+        assert_eq!(std::fs::read(&root.join("a.txt")).unwrap(), b"before\n");
+        assert!(locks.holder(&root).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_overlay_kills_descendant_before_restoration_and_lock_release() {
+        let (_dir, root, wrapper) = validation_fixture();
+        let fifo = root.parent().unwrap().join("dropped-descendant.fifo");
+        let ready = root.parent().unwrap().join("wrapper-ready");
+        make_fifo(&fifo);
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\ntouch '{}'\n(exec cat '{}') &\nwait\n",
+                ready.display(),
+                fifo.display()
+            ),
+        )
+        .unwrap();
+        let (locks, session) = lock_session().await;
+        let mut validation = CandidateValidation::for_primary(&root).with_locks(
+            locks.clone(),
+            "orchestrator",
+            session,
+        );
+        validation.wrapper = wrapper;
+        let mut overlay = BTreeMap::new();
+        overlay.insert(PathBuf::from("a.txt"), b"candidate\n".to_vec());
+        let join = tokio::spawn(async move { validation.validate_overlay(&overlay, &[]).await });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "wrapper never reached its blocking descendant fixture"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(std::fs::read(&root.join("a.txt")).unwrap(), b"candidate\n");
+        assert!(locks.holder(&root).is_some());
+
+        join.abort();
+        let _ = join.await;
+        assert_eq!(std::fs::read(&root.join("a.txt")).unwrap(), b"before\n");
+        assert!(
+            locks.holder(&root).is_none(),
+            "exclusive target hold must release only after GroupedWrapper Drop proves quiescence"
+        );
+    }
+
     #[test]
-    fn run_wrapper_owns_a_process_group_and_waits_for_group_death_on_drop() {
+    fn run_wrapper_owns_a_descendant_supervisor_before_launch() {
         let source = include_str!("validation.rs");
+        #[cfg(not(target_os = "linux"))]
         let process_group = ["process_group", "(0)"].concat();
+        #[cfg(not(target_os = "linux"))]
         let kill_wait = ["terminate_group_kill", "_wait"].concat();
         let grouped = ["Grouped", "Wrapper"].concat();
+        #[cfg(not(target_os = "linux"))]
+        let pinned_spawn = ["process::spawn", "_pinned(cmd)"].concat();
+        #[cfg(target_os = "linux")]
+        let supervisor = ["process::spawn_validation", "_supervisor"].concat();
+        #[cfg(not(target_os = "linux"))]
         assert!(
             source.contains(&process_group),
             "run_wrapper must put the cargo wrapper in its own process group"
         );
+        #[cfg(not(target_os = "linux"))]
         assert!(
             source.contains(&kill_wait),
             "wrapper Drop must wait for cargo descendants to die before restore"
         );
         assert!(
             source.contains(&grouped),
-            "run_wrapper must own the Child so Drop can wait for the process group"
+            "run_wrapper must retain containment ownership through Drop"
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert!(
+            source.contains(&pinned_spawn),
+            "non-Linux validation must retain the repository's protected spawn path"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            source.contains(&supervisor),
+            "Linux validation must register the dedicated descendant supervisor before launch"
+        );
+    }
+
+    #[test]
+    fn unproven_containment_fail_stops_before_guard_release() {
+        const CHILD_MARKER: &str = "COCKPIT_TEST_UNPROVEN_WRAPPER_CHILD";
+
+        struct ReleaseMarker(PathBuf);
+        impl Drop for ReleaseMarker {
+            fn drop(&mut self) {
+                std::fs::write(&self.0, b"released").unwrap();
+            }
+        }
+
+        if let Some(marker) = std::env::var_os(CHILD_MARKER) {
+            let _restore_and_lock_guard = ReleaseMarker(PathBuf::from(marker));
+            let _ = require_wrapper_containment(
+                cockpit_host::process::GroupKillWaitOutcome::Unproven {
+                    leader_status: None,
+                    failure: cockpit_host::process::GroupContainmentFailure::GroupDrainDeadline(
+                        cockpit_host::process::GroupMemberSnapshot::default(),
+                    ),
+                },
+            );
+            unreachable!("unproven containment must fail-stop");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("guard-released");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("unproven_containment_fail_stops_before_guard_release")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, &marker)
+            .status()
+            .unwrap();
+        assert!(
+            !status.success(),
+            "child must fail-stop on unproven containment"
+        );
+        assert!(
+            !marker.exists(),
+            "restoration and lock-release destructors must not run after containment becomes unproven"
         );
     }
 

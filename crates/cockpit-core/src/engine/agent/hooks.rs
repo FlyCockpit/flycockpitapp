@@ -1177,7 +1177,7 @@ async fn spawn_real_hook_child(
         cmd.current_dir(directory.canonical_path());
     }
 
-    let mut child = match cmd.spawn() {
+    let mut child = match cockpit_host::process::spawn_pinned(cmd) {
         Ok(child) => child,
         Err(_) => {
             return ChildRunOutcome {

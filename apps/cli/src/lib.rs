@@ -855,14 +855,11 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
     // File-backed tracing must never put filesystem latency on the daemon's
     // boot/publication path. Keep the worker guard alive for the whole command
     // so shutdown can drain the bounded queue before the process exits.
-    let foreground_daemon = matches!(
-        cli.command.as_ref(),
-        Some(Command::Daemon(crate::cli::DaemonCommand::Start {
-            detach: false,
-            ..
-        }))
+    let _log_worker = init_tracing(
+        cli.log_level.as_deref(),
+        cli.print_logs,
+        drain_logs_on_exit(cli.command.as_ref()),
     );
-    let _log_worker = init_tracing(cli.log_level.as_deref(), cli.print_logs, !foreground_daemon);
 
     if cli.debug_last_message {
         match std::env::current_dir() {
@@ -997,6 +994,16 @@ fn tui_mode_for_command(command: Option<&Command>) -> Option<commands::tui::Sess
     }
 }
 
+/// A daemon-start process must never wait for cache-backed tracing teardown.
+/// This covers both the long-lived foreground child and the short-lived
+/// detached launcher; either can have its writer blocked opening the cache.
+fn drain_logs_on_exit(command: Option<&Command>) -> bool {
+    !matches!(
+        command,
+        Some(Command::Daemon(crate::cli::DaemonCommand::Start { .. }))
+    )
+}
+
 fn init_tracing(
     level: Option<&str>,
     print_logs: bool,
@@ -1017,9 +1024,13 @@ fn init_tracing(
         return None;
     }
 
-    match open_log_file() {
-        Some(file) => {
-            let (writer, guard) = NonBlockingLog::start(file, drain_logs_on_exit)?;
+    match dirs::cache_dir().map(|dir| dir.join("cockpit")) {
+        Some(log_dir) => {
+            // Directory validation, file open/metadata, rotation, and all
+            // subsequent writes belong to the log worker. In particular, a
+            // slow cache filesystem cannot delay daemon boot or endpoint
+            // publication before the first trace event has even been queued.
+            let (writer, guard) = NonBlockingLog::start(log_dir, drain_logs_on_exit)?;
             fmt()
                 .with_env_filter(filter)
                 .with_ansi(false)
@@ -1072,28 +1083,41 @@ struct LogWorkerGuard {
 }
 
 impl NonBlockingLog {
-    fn start(sink: RotatingLog, drain_on_drop: bool) -> Option<(Self, LogWorkerGuard)> {
+    fn start(log_dir: PathBuf, drain_on_drop: bool) -> Option<(Self, LogWorkerGuard)> {
         let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(LOG_QUEUE_CAPACITY);
         let (shutdown, shutdown_rx) = mpsc::channel();
         let worker = std::thread::Builder::new()
             .name("cockpit-log-writer".into())
             .spawn(move || {
-                let mut writer = RotatingLogWriter { state: sink.state };
+                // Opening the sink can involve directory walks, metadata, and
+                // host filesystem I/O. Keep all of it off the caller/boot
+                // thread. Failure leaves a functional bounded queue whose
+                // consumer intentionally discards records.
+                let mut writer =
+                    open_log_file_at(log_dir).map(|sink| RotatingLogWriter { state: sink.state });
                 loop {
                     if shutdown_rx.try_recv().is_ok() {
                         for bytes in receiver.try_iter() {
-                            let _ = writer.write_all(&bytes);
+                            if let Some(writer) = writer.as_mut() {
+                                let _ = writer.write_all(&bytes);
+                            }
                         }
-                        let _ = writer.flush();
+                        if let Some(writer) = writer.as_mut() {
+                            let _ = writer.flush();
+                        }
                         break;
                     }
                     match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
                         Ok(bytes) => {
-                            let _ = writer.write_all(&bytes);
+                            if let Some(writer) = writer.as_mut() {
+                                let _ = writer.write_all(&bytes);
+                            }
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            let _ = writer.flush();
+                            if let Some(writer) = writer.as_mut() {
+                                let _ = writer.flush();
+                            }
                             break;
                         }
                     }
@@ -1195,9 +1219,6 @@ impl Write for RotatingLogWriter {
     }
 }
 
-fn open_log_file() -> Option<RotatingLog> {
-    open_log_file_at(dirs::cache_dir()?.join("cockpit"))
-}
 fn open_log_file_at(dir: PathBuf) -> Option<RotatingLog> {
     // Logging stays non-fatal: an insecure cache directory disables logging
     // rather than aborting the CLI, but the typed error is logged, not
@@ -1604,6 +1625,71 @@ mod tests {
             })
             .sum();
         assert!(total <= LOG_FILE_MAX_BYTES * (LOG_BACKUP_COUNT as u64 + 1));
+    }
+
+    #[test]
+    fn nonblocking_log_worker_queues_before_sink_setup() {
+        let root = tempfile::tempdir().unwrap();
+        let log_dir = root.path().join("not-created-on-caller").join("cockpit");
+        assert!(!log_dir.exists());
+
+        let (log, guard) = NonBlockingLog::start(log_dir.clone(), true).unwrap();
+        let mut writer = tracing_subscriber::fmt::MakeWriter::make_writer(&log);
+        writer.write_all(b"queued before sink setup\n").unwrap();
+        drop(writer);
+        drop(guard);
+
+        assert_eq!(
+            std::fs::read(log_dir.join("cockpit.log")).unwrap(),
+            b"queued before sink setup\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_draining_log_guard_does_not_join_worker_blocked_opening_sink() {
+        let root = tempfile::tempdir().unwrap();
+        let log_dir = root.path().join("cockpit");
+        std::fs::create_dir(&log_dir).unwrap();
+        let fifo = log_dir.join("cockpit.log");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        let (log, guard) = NonBlockingLog::start(log_dir, false).unwrap();
+        let mut writer = tracing_subscriber::fmt::MakeWriter::make_writer(&log);
+        writer
+            .write_all(b"queued while sink open is blocked\n")
+            .unwrap();
+        drop(writer);
+
+        // No reader exists yet, so the worker's FIFO open cannot complete.
+        // Launcher teardown must only signal it, never join it.
+        drop(guard);
+
+        // Release the blocked open. The private-file verifier then rejects the
+        // FIFO as non-regular; the blocking reader rendezvous is the
+        // deterministic barrier proving setup had not completed earlier.
+        let mut reader = std::fs::File::open(&fifo).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
+        assert!(bytes.is_empty(), "a non-regular log sink must be rejected");
+    }
+
+    #[test]
+    fn daemon_start_never_drains_cache_log_worker_on_exit() {
+        for detach in [false, true] {
+            let command = Command::Daemon(crate::cli::DaemonCommand::Start {
+                foreground: !detach,
+                detach,
+                no_sandbox: false,
+                resume_all_sessions: false,
+            });
+            assert!(
+                !drain_logs_on_exit(Some(&command)),
+                "daemon start mode detach={detach} must not join a cache-blocked log worker"
+            );
+        }
+        assert!(drain_logs_on_exit(None));
     }
 
     // FINDING B: rotation is fd-anchored. Given a held directory fd, the shift

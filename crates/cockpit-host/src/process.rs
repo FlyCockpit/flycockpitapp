@@ -10,6 +10,9 @@ use tokio::{
     task::JoinHandle,
 };
 
+#[cfg(target_os = "linux")]
+use std::os::unix::{ffi::OsStrExt as _, process::ExitStatusExt as _};
+
 /// Default retained bytes per child-process pipe.
 pub const CHILD_PIPE_CAPTURE_BYTES: usize = 256 * 1024;
 /// Head budget for command tools that need both the beginning and end of output.
@@ -35,6 +38,751 @@ enum PinnedSpawnRequest {
 }
 
 static PINNED_SPAWNER: OnceLock<mpsc::SyncSender<PinnedSpawnRequest>> = OnceLock::new();
+
+/// A Linux validation workload owned by a dedicated subreaper process.
+///
+/// The daemon never becomes a subreaper and never waits for workload PIDs.
+/// Closing the control file asks the supervisor to kill and reap its process
+/// group; the owner thread waits only for the exact supervisor PID.
+#[cfg(target_os = "linux")]
+pub struct ValidationSupervisor {
+    control: Option<std::fs::File>,
+    completion: Arc<ValidationSupervisorCompletion>,
+    finished: bool,
+}
+
+#[cfg(target_os = "linux")]
+struct ValidationSupervisorCompletion {
+    result: Mutex<Option<std::io::Result<std::process::ExitStatus>>>,
+    ready: std::sync::Condvar,
+    notify: tokio::sync::Notify,
+}
+
+#[cfg(target_os = "linux")]
+impl ValidationSupervisor {
+    pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        loop {
+            let notified = self.completion.notify.notified();
+            if let Some(result) = self
+                .completion
+                .result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                self.control.take();
+                self.finished = true;
+                return result;
+            }
+            notified.await;
+        }
+    }
+
+    /// Close the supervisor control channel and synchronously await its exact
+    /// status. This is suitable for a destructor that must prove quiescence
+    /// before later destructors restore files or release locks.
+    pub fn terminate_and_wait(
+        &mut self,
+        timeout: Duration,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        if self.finished {
+            return Err(std::io::Error::other(
+                "validation supervisor completion was already consumed",
+            ));
+        }
+        self.control.take();
+        let mut result = self
+            .completion
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let deadline = Instant::now() + timeout;
+        while result.is_none() {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "validation supervisor teardown deadline elapsed",
+                ));
+            };
+            let (next, wait) = self
+                .completion
+                .ready
+                .wait_timeout(result, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            result = next;
+            if wait.timed_out() && result.is_none() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "validation supervisor teardown deadline elapsed",
+                ));
+            }
+        }
+        self.finished = true;
+        result.take().expect("completion checked")
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ValidationSupervisor {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.control.take();
+            eprintln!("fatal: validation supervisor dropped without proven workload quiescence");
+            std::process::abort();
+        }
+    }
+}
+
+/// Spawn a validation command behind a process-local Linux subreaper.
+#[cfg(target_os = "linux")]
+pub fn spawn_validation_supervisor(
+    program: &std::ffi::OsStr,
+    args: &[&str],
+    cwd: &std::path::Path,
+    env: &[(&str, &std::ffi::OsStr)],
+) -> std::io::Result<ValidationSupervisor> {
+    use std::ffi::{CString, OsString};
+    use std::os::fd::FromRawFd as _;
+
+    fn cstring(bytes: &[u8]) -> std::io::Result<CString> {
+        CString::new(bytes).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "process argument contains NUL",
+            )
+        })
+    }
+
+    let resolved = resolve_linux_program(program, cwd)?;
+    let program = cstring(resolved.as_os_str().as_bytes())?;
+    let cwd = cstring(cwd.as_os_str().as_bytes())?;
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(program.clone());
+    for arg in args {
+        argv.push(cstring(arg.as_bytes())?);
+    }
+    let mut environment: std::collections::BTreeMap<OsString, OsString> =
+        std::env::vars_os().collect();
+    for (key, value) in env {
+        environment.insert(OsString::from(key), (*value).to_os_string());
+    }
+    let environment = environment
+        .into_iter()
+        .map(|(key, value)| {
+            let mut bytes = key.as_os_str().as_bytes().to_vec();
+            bytes.push(b'=');
+            bytes.extend_from_slice(value.as_os_str().as_bytes());
+            cstring(&bytes)
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let completion = Arc::new(ValidationSupervisorCompletion {
+        result: Mutex::new(None),
+        ready: std::sync::Condvar::new(),
+        notify: tokio::sync::Notify::new(),
+    });
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let thread_completion = completion.clone();
+    std::thread::Builder::new()
+        .name("cockpit-validation-supervisor-owner".into())
+        .spawn(move || {
+            let spawned =
+                unsafe { spawn_linux_validation_supervisor(&program, &argv, &cwd, &environment) };
+            let (supervisor_pid, control_fd, report_fd) = match spawned {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = started_tx.send(Err(error));
+                    return;
+                }
+            };
+            let control = unsafe { std::fs::File::from_raw_fd(control_fd) };
+            if let Err(error) = started_tx.send(Ok(control)) {
+                drop(error.0);
+            }
+            let result = wait_linux_validation_supervisor(supervisor_pid, report_fd);
+            *thread_completion
+                .result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+            thread_completion.ready.notify_all();
+            thread_completion.notify.notify_waiters();
+        })?;
+    let control = started_rx
+        .recv()
+        .map_err(|_| std::io::Error::other("validation supervisor owner stopped"))??;
+    Ok(ValidationSupervisor {
+        control: Some(control),
+        completion,
+        finished: false,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_linux_program(
+    program: &std::ffi::OsStr,
+    cwd: &std::path::Path,
+) -> std::io::Result<std::path::PathBuf> {
+    let path = std::path::Path::new(program);
+    if path.components().count() > 1 {
+        return Ok(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        });
+    }
+    for directory in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+        let candidate = directory.join(path);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("executable `{}` not found", path.display()),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn spawn_linux_validation_supervisor(
+    program: &std::ffi::CStr,
+    argv: &[std::ffi::CString],
+    cwd: &std::ffi::CStr,
+    environment: &[std::ffi::CString],
+) -> std::io::Result<(libc::pid_t, libc::c_int, libc::c_int)> {
+    let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|value| value.as_ptr()).collect();
+    argv_ptrs.push(std::ptr::null());
+    let mut env_ptrs: Vec<*const libc::c_char> =
+        environment.iter().map(|value| value.as_ptr()).collect();
+    env_ptrs.push(std::ptr::null());
+    let mut control = [-1; 2];
+    let mut startup = [-1; 2];
+    let mut report = [-1; 2];
+    if unsafe { libc::pipe2(control.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::pipe2(startup.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(control[0]);
+            libc::close(control[1]);
+        }
+        return Err(error);
+    }
+    if unsafe { libc::pipe2(report.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(control[0]);
+            libc::close(control[1]);
+            libc::close(startup[0]);
+            libc::close(startup[1]);
+        }
+        return Err(error);
+    }
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let error = std::io::Error::last_os_error();
+        for pipe in [&control, &startup, &report] {
+            unsafe {
+                libc::close(pipe[0]);
+                libc::close(pipe[1]);
+            }
+        }
+        return Err(error);
+    }
+    if pid == 0 {
+        unsafe {
+            libc::close(control[1]);
+            libc::close(startup[0]);
+            libc::close(report[0]);
+            linux_validation_supervisor_main(
+                control[0],
+                startup[1],
+                report[1],
+                program,
+                argv,
+                cwd,
+                environment,
+                argv_ptrs.as_ptr(),
+                env_ptrs.as_ptr(),
+            );
+        }
+    }
+    unsafe {
+        libc::close(control[0]);
+        libc::close(startup[1]);
+        libc::close(report[1]);
+    }
+    let mut exec_errno: libc::c_int = 0;
+    let read = unsafe {
+        libc::read(
+            startup[0],
+            (&mut exec_errno as *mut libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>(),
+        )
+    };
+    unsafe { libc::close(startup[0]) };
+    if read == std::mem::size_of::<libc::c_int>() as isize && exec_errno != 0 {
+        unsafe {
+            libc::close(control[1]);
+            libc::close(report[0]);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+        return Err(std::io::Error::from_raw_os_error(exec_errno));
+    }
+    if read != 0 {
+        unsafe {
+            libc::close(control[1]);
+            libc::close(report[0]);
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+        return Err(std::io::Error::other(
+            "validation supervisor startup protocol failed",
+        ));
+    }
+    Ok((pid, control[1], report[0]))
+}
+
+/// Runs after fork on the dedicated owner thread. Only libc/syscall-facing
+/// operations are permitted before the workload's exec.
+#[cfg(target_os = "linux")]
+unsafe fn linux_validation_supervisor_main(
+    control_fd: libc::c_int,
+    startup_fd: libc::c_int,
+    report_fd: libc::c_int,
+    program: &std::ffi::CStr,
+    _argv: &[std::ffi::CString],
+    cwd: &std::ffi::CStr,
+    _environment: &[std::ffi::CString],
+    argv_ptrs: *const *const libc::c_char,
+    env_ptrs: *const *const libc::c_char,
+) -> ! {
+    unsafe {
+        if libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) != 0 {
+            supervisor_startup_error(startup_fd);
+        }
+        let owner_pid = libc::getppid();
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 || libc::getppid() != owner_pid {
+            supervisor_startup_error(startup_fd);
+        }
+        let mut mask: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut mask);
+        libc::sigaddset(&mut mask, libc::SIGCHLD);
+        libc::sigaddset(&mut mask, libc::SIGTERM);
+        let mut child_action: libc::sigaction = std::mem::zeroed();
+        let mut prior_child_action: libc::sigaction = std::mem::zeroed();
+        child_action.sa_sigaction = libc::SIG_DFL;
+        child_action.sa_flags = libc::SA_NOCLDSTOP;
+        libc::sigemptyset(&mut child_action.sa_mask);
+        if libc::sigaction(libc::SIGCHLD, &child_action, &mut prior_child_action) != 0 {
+            supervisor_startup_error(startup_fd);
+        }
+        let mut prior_mask: libc::sigset_t = std::mem::zeroed();
+        if libc::sigprocmask(libc::SIG_BLOCK, &mask, &mut prior_mask) != 0 {
+            supervisor_startup_error(startup_fd);
+        }
+        let signal_fd = libc::signalfd(-1, &mask, libc::SFD_CLOEXEC);
+        if signal_fd < 0 {
+            supervisor_startup_error(startup_fd);
+        }
+        let mut exec_error = [-1; 2];
+        if libc::pipe2(exec_error.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+            supervisor_startup_error(startup_fd);
+        }
+        let workload = libc::fork();
+        if workload < 0 {
+            supervisor_startup_error(startup_fd);
+        }
+        if workload == 0 {
+            libc::close(exec_error[0]);
+            libc::sigprocmask(libc::SIG_SETMASK, &prior_mask, std::ptr::null_mut());
+            libc::sigaction(libc::SIGCHLD, &prior_child_action, std::ptr::null_mut());
+            let supervisor_pid = libc::getppid();
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0
+                || libc::getppid() != supervisor_pid
+                || libc::setpgid(0, 0) != 0
+                || libc::chdir(cwd.as_ptr()) != 0
+            {
+                let errno = *libc::__errno_location();
+                libc::write(
+                    exec_error[1],
+                    (&errno as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>(),
+                );
+                libc::_exit(127);
+            }
+            let null_fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+            if null_fd < 0 {
+                let errno = *libc::__errno_location();
+                libc::write(
+                    exec_error[1],
+                    (&errno as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>(),
+                );
+                libc::_exit(127);
+            }
+            libc::dup2(null_fd, libc::STDIN_FILENO);
+            libc::dup2(null_fd, libc::STDOUT_FILENO);
+            libc::dup2(null_fd, libc::STDERR_FILENO);
+            if null_fd > libc::STDERR_FILENO {
+                libc::close(null_fd);
+            }
+            libc::execve(program.as_ptr(), argv_ptrs, env_ptrs);
+            let errno = *libc::__errno_location();
+            libc::write(
+                exec_error[1],
+                (&errno as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>(),
+            );
+            libc::_exit(127);
+        }
+        libc::close(exec_error[1]);
+        let mut exec_errno = 0;
+        let exec_read = libc::read(
+            exec_error[0],
+            (&mut exec_errno as *mut libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>(),
+        );
+        libc::close(exec_error[0]);
+        if exec_read != 0 {
+            libc::write(
+                startup_fd,
+                (&exec_errno as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>(),
+            );
+            libc::close(startup_fd);
+            libc::waitpid(workload, std::ptr::null_mut(), 0);
+            libc::_exit(125);
+        }
+        libc::close(startup_fd);
+        close_linux_fds_except(control_fd, report_fd, signal_fd);
+
+        let mut leader_status = 0;
+        loop {
+            let mut poll_fds = [
+                libc::pollfd {
+                    fd: control_fd,
+                    events: libc::POLLIN | libc::POLLHUP,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: signal_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            if libc::poll(poll_fds.as_mut_ptr(), 2, -1) < 0
+                && *libc::__errno_location() == libc::EINTR
+            {
+                continue;
+            }
+            let control_closed = poll_fds[0].revents != 0;
+            if poll_fds[1].revents != 0 {
+                let mut info: libc::signalfd_siginfo = std::mem::zeroed();
+                let _ = libc::read(
+                    signal_fd,
+                    (&mut info as *mut libc::signalfd_siginfo).cast(),
+                    std::mem::size_of::<libc::signalfd_siginfo>(),
+                );
+            }
+            if control_closed {
+                libc::kill(-workload, libc::SIGKILL);
+                let mut waited;
+                loop {
+                    waited = libc::waitpid(workload, &mut leader_status, 0);
+                    if waited >= 0 || *libc::__errno_location() != libc::EINTR {
+                        break;
+                    }
+                }
+                if waited != workload {
+                    libc::_exit(125);
+                }
+                if !reap_all_linux_supervisor_children() {
+                    libc::_exit(125);
+                }
+                libc::write(
+                    report_fd,
+                    (&leader_status as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>(),
+                );
+                libc::close(report_fd);
+                libc::_exit(0);
+            }
+            if poll_fds[1].revents != 0 {
+                match linux_exact_child_exited(workload) {
+                    0 => {
+                        // SIGCHLD also reports adopted descendants. Reap only
+                        // exact exited children owned by this subreaper, never
+                        // infer that the still-live workload leader exited.
+                        if !reap_exited_linux_supervisor_children(workload) {
+                            libc::_exit(125);
+                        }
+                    }
+                    1 => {
+                        // Preserve the leader's natural status. WNOWAIT pins
+                        // its PID/group identity until the group signal below.
+                        libc::kill(-workload, libc::SIGKILL);
+                        let mut waited;
+                        loop {
+                            waited = libc::waitpid(workload, &mut leader_status, 0);
+                            if waited >= 0 || *libc::__errno_location() != libc::EINTR {
+                                break;
+                            }
+                        }
+                        if waited != workload || !reap_all_linux_supervisor_children() {
+                            libc::_exit(125);
+                        }
+                        libc::write(
+                            report_fd,
+                            (&leader_status as *const libc::c_int).cast(),
+                            std::mem::size_of::<libc::c_int>(),
+                        );
+                        libc::close(report_fd);
+                        libc::_exit(0);
+                    }
+                    _ => libc::_exit(125),
+                }
+            }
+        }
+    }
+}
+
+/// Observe the exact workload leader without consuming its status.
+/// Returns 1 for exited, 0 for live, and -1 for an observation failure.
+#[cfg(target_os = "linux")]
+unsafe fn linux_exact_child_exited(pid: libc::pid_t) -> libc::c_int {
+    unsafe {
+        loop {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            if libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            ) == 0
+            {
+                return libc::c_int::from(info.si_pid() != 0);
+            }
+            if *libc::__errno_location() != libc::EINTR {
+                return -1;
+            }
+        }
+    }
+}
+
+/// Reap exited adopted children while leaving the exact workload leader
+/// untouched. Repeating discovers grandchildren adopted when a parent reap
+/// changes their parentage.
+#[cfg(target_os = "linux")]
+unsafe fn reap_exited_linux_supervisor_children(workload: libc::pid_t) -> bool {
+    unsafe {
+        loop {
+            let fd = libc::open(
+                c"/proc/thread-self/children".as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            );
+            if fd < 0 {
+                return false;
+            }
+            let mut bytes = [0_u8; 64 * 1024];
+            let count = libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len());
+            libc::close(fd);
+            if count < 0 || count as usize == bytes.len() {
+                return false;
+            }
+            let mut reaped = false;
+            let mut pid = 0_i32;
+            let mut in_pid = false;
+            for byte in bytes[..count as usize]
+                .iter()
+                .copied()
+                .chain(std::iter::once(b' '))
+            {
+                if byte.is_ascii_digit() {
+                    in_pid = true;
+                    let Some(next) = pid
+                        .checked_mul(10)
+                        .and_then(|value| value.checked_add(i32::from(byte - b'0')))
+                    else {
+                        return false;
+                    };
+                    pid = next;
+                } else if in_pid {
+                    if pid != workload {
+                        loop {
+                            let waited = libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG);
+                            if waited == pid {
+                                reaped = true;
+                                break;
+                            }
+                            if waited == 0 {
+                                break;
+                            }
+                            if waited < 0 && *libc::__errno_location() == libc::EINTR {
+                                continue;
+                            }
+                            return false;
+                        }
+                    }
+                    pid = 0;
+                    in_pid = false;
+                } else if !byte.is_ascii_whitespace() {
+                    return false;
+                }
+            }
+            if !reaped {
+                return true;
+            }
+        }
+    }
+}
+
+/// Kill and reap every exact child adopted by the dedicated supervisor.
+/// `/proc/thread-self/children` is an ownership inventory, not a global PID
+/// scan; exact `waitpid(pid)` calls therefore cannot consume another owner's
+/// status. Repeating handles deeper descendants as each killed parent is
+/// reaped and its children are adopted by the subreaper.
+#[cfg(target_os = "linux")]
+unsafe fn reap_all_linux_supervisor_children() -> bool {
+    unsafe {
+        loop {
+            let fd = libc::open(
+                c"/proc/thread-self/children".as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            );
+            if fd < 0 {
+                return false;
+            }
+            let mut bytes = [0_u8; 64 * 1024];
+            let count = libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len());
+            libc::close(fd);
+            if count < 0 || count as usize == bytes.len() {
+                return false;
+            }
+            let bytes = &bytes[..count as usize];
+            let mut found = false;
+            let mut pid = 0_i32;
+            let mut in_pid = false;
+            for byte in bytes.iter().copied().chain(std::iter::once(b' ')) {
+                if byte.is_ascii_digit() {
+                    in_pid = true;
+                    let Some(next) = pid
+                        .checked_mul(10)
+                        .and_then(|value| value.checked_add(i32::from(byte - b'0')))
+                    else {
+                        return false;
+                    };
+                    pid = next;
+                } else if in_pid {
+                    found = true;
+                    libc::kill(pid, libc::SIGKILL);
+                    loop {
+                        let waited = libc::waitpid(pid, std::ptr::null_mut(), 0);
+                        if waited == pid {
+                            break;
+                        }
+                        if waited < 0 && *libc::__errno_location() == libc::EINTR {
+                            continue;
+                        }
+                        return false;
+                    }
+                    pid = 0;
+                    in_pid = false;
+                } else if !byte.is_ascii_whitespace() {
+                    return false;
+                }
+            }
+            if !found {
+                return true;
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn close_linux_fds_except(
+    first_keep: libc::c_int,
+    second_keep: libc::c_int,
+    third_keep: libc::c_int,
+) {
+    unsafe {
+        let mut keep = [first_keep, second_keep, third_keep];
+        keep.sort_unstable();
+        let mut first = 3_u32;
+        let mut close_range_supported = true;
+        for kept in keep {
+            let Ok(kept) = u32::try_from(kept) else {
+                continue;
+            };
+            if first < kept && libc::syscall(libc::SYS_close_range, first, kept - 1, 0) != 0 {
+                close_range_supported = false;
+                break;
+            }
+            first = kept.saturating_add(1);
+        }
+        if close_range_supported {
+            let _ = libc::syscall(libc::SYS_close_range, first, u32::MAX, 0);
+            return;
+        }
+        let mut limit: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return;
+        }
+        let upper = limit.rlim_cur.min(i32::MAX as libc::rlim_t) as libc::c_int;
+        for fd in 3..upper {
+            if !keep.contains(&fd) {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn supervisor_startup_error(startup_fd: libc::c_int) -> ! {
+    unsafe {
+        let errno = *libc::__errno_location();
+        libc::write(
+            startup_fd,
+            (&errno as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>(),
+        );
+        libc::_exit(125);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_linux_validation_supervisor(
+    pid: libc::pid_t,
+    report_fd: libc::c_int,
+) -> std::io::Result<std::process::ExitStatus> {
+    let mut workload_status = 0;
+    let read = unsafe {
+        libc::read(
+            report_fd,
+            (&mut workload_status as *mut libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>(),
+        )
+    };
+    unsafe { libc::close(report_fd) };
+    let mut supervisor_status = 0;
+    loop {
+        let waited = unsafe { libc::waitpid(pid, &mut supervisor_status, 0) };
+        if waited == pid {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error);
+        }
+    }
+    if read != std::mem::size_of::<libc::c_int>() as isize
+        || !std::process::ExitStatus::from_raw(supervisor_status).success()
+    {
+        return Err(std::io::Error::other(
+            "validation supervisor failed before proving workload quiescence",
+        ));
+    }
+    Ok(std::process::ExitStatus::from_raw(workload_status))
+}
 
 /// Start the process-wide child spawner on one dedicated, long-lived OS
 /// thread. Linux parent-death signals are bound to the thread that calls
@@ -1192,44 +1940,280 @@ pub fn terminate_group_start(child: &mut tokio::process::Child) {
 /// `kill_on_drop` is SIGKILL of the leader PID only. Callers must spawn with
 /// `process_group(0)` on Unix. Windows has no process groups; only the
 /// leader is killed and waited.
-pub fn terminate_group_kill_wait(child: &mut tokio::process::Child, timeout: Duration) {
-    if child.try_wait().ok().flatten().is_some() {
-        return;
-    }
+pub fn terminate_group_kill_wait(
+    child: &mut tokio::process::Child,
+    timeout: Duration,
+) -> GroupKillWaitOutcome {
+    terminate_group_kill_wait_status(child, timeout)
+}
+
+/// Why a destructive process-group teardown could not prove that no member
+/// remains. A reaped leader is deliberately carried separately: its exit is
+/// not evidence that descendants have left the group.
+#[derive(Debug)]
+pub enum GroupContainmentFailure {
+    LeaderPinUnavailable,
+    GroupSignal(std::io::Error),
+    GroupProbe(std::io::Error),
+    LeaderPoll(std::io::Error),
+    GroupInventory(std::io::Error),
+    GroupDrainDeadline(GroupMemberSnapshot),
+}
+
+/// Bounded, non-secret kernel identity snapshot for an unproven group drain.
+#[derive(Debug, Default)]
+pub struct GroupMemberSnapshot {
+    pub members: Vec<GroupMemberIdentity>,
+    pub truncated: bool,
+}
+
+#[derive(Debug)]
+pub struct GroupMemberIdentity {
+    pub pid: i32,
+    pub state: char,
+    pub parent_pid: i32,
+}
+
+/// Result of destructive process-group teardown.
+///
+/// Only `Quiesced` proves both facts needed by callers that restore shared
+/// files or release write-exclusion: the group empty oracle fired and the
+/// leader was reaped. `Unproven` may still carry the leader's status, but that
+/// status must never be used as a substitute for group absence.
+#[derive(Debug)]
+pub enum GroupKillWaitOutcome {
+    Quiesced(std::process::ExitStatus),
+    Unproven {
+        leader_status: Option<std::process::ExitStatus>,
+        failure: GroupContainmentFailure,
+    },
+}
+
+/// [`terminate_group_kill_wait`] with the reaped leader status preserved.
+///
+/// The first operation on Unix is capture-and-signal while the leader is
+/// still unreaped. In particular, do not call `try_wait` before this: a
+/// normally exited leader can leave live descendants in its process group,
+/// and reaping it would discard the identity pin needed to signal that group.
+pub fn terminate_group_kill_wait_status(
+    child: &mut tokio::process::Child,
+    timeout: Duration,
+) -> GroupKillWaitOutcome {
     let deadline = Instant::now() + timeout;
     #[cfg(unix)]
     {
-        if let Some((pgid, start)) = child
+        let Some((pgid, start)) = child
             .id()
             .and_then(|pid| i32::try_from(pid).ok())
             .and_then(capture_leader_pin)
-        {
-            match signal_pinned_group(pgid, start, libc::SIGKILL) {
-                Err(error) if is_esrch(&error) => {
-                    let _ = child.try_wait();
-                    return;
+        else {
+            let _ = child.start_kill();
+            return GroupKillWaitOutcome::Unproven {
+                leader_status: child.try_wait().ok().flatten(),
+                failure: GroupContainmentFailure::LeaderPinUnavailable,
+            };
+        };
+        match signal_pinned_group(pgid, start, libc::SIGKILL) {
+            Err(error) if is_esrch(&error) => match child.try_wait() {
+                Ok(Some(observed)) => return GroupKillWaitOutcome::Quiesced(observed),
+                Ok(None) => {
+                    return GroupKillWaitOutcome::Unproven {
+                        leader_status: None,
+                        failure: GroupContainmentFailure::LeaderPinUnavailable,
+                    };
                 }
-                _ => {}
+                Err(error) => {
+                    return GroupKillWaitOutcome::Unproven {
+                        leader_status: None,
+                        failure: GroupContainmentFailure::LeaderPoll(error),
+                    };
+                }
+            },
+            Err(error) => {
+                let _ = child.start_kill();
+                return GroupKillWaitOutcome::Unproven {
+                    leader_status: child.try_wait().ok().flatten(),
+                    failure: GroupContainmentFailure::GroupSignal(error),
+                };
             }
-            while Instant::now() < deadline {
-                let _ = child.try_wait();
-                // Existence probe only: a recycled pgid can delay return
-                // (false populated) but cannot become a SIGKILL target.
-                match signal_group(pgid, 0) {
-                    Err(error) if is_esrch(&error) => return,
-                    _ => std::thread::sleep(Duration::from_millis(1)),
+            Ok(()) => {}
+        }
+        let mut leader_status = None;
+        while Instant::now() < deadline {
+            let nonleader_remains = match group_has_live_nonleader(pgid) {
+                Ok(remains) => remains,
+                Err(error) => {
+                    return GroupKillWaitOutcome::Unproven {
+                        leader_status: None,
+                        failure: GroupContainmentFailure::GroupInventory(error),
+                    };
+                }
+            };
+            if !nonleader_remains {
+                if leader_status.is_none() {
+                    match child.try_wait() {
+                        Ok(Some(observed)) => leader_status = Some(observed),
+                        Ok(None) => {}
+                        Err(error) => {
+                            return GroupKillWaitOutcome::Unproven {
+                                leader_status: None,
+                                failure: GroupContainmentFailure::LeaderPoll(error),
+                            };
+                        }
+                    }
+                }
+                if let Some(observed) = leader_status {
+                    #[cfg(target_os = "linux")]
+                    return GroupKillWaitOutcome::Quiesced(observed);
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        // The destructive signal already happened under the
+                        // leader pin. Continue this observation-only probe for
+                        // the original deadline: a recycled PGID can cause a
+                        // safe false-populated result, but can never become a
+                        // signal or reap target.
+                        match signal_group(pgid, 0) {
+                            Err(error) if is_esrch(&error) => {
+                                return GroupKillWaitOutcome::Quiesced(observed);
+                            }
+                            Err(error) if error.raw_os_error() != Some(libc::EPERM) => {
+                                return GroupKillWaitOutcome::Unproven {
+                                    leader_status: Some(observed),
+                                    failure: GroupContainmentFailure::GroupProbe(error),
+                                };
+                            }
+                            Ok(()) | Err(_) => {}
+                        }
+                    }
+                }
+            }
+            std::thread::yield_now();
+        }
+        return GroupKillWaitOutcome::Unproven {
+            leader_status,
+            failure: GroupContainmentFailure::GroupDrainDeadline(group_member_snapshot(pgid)),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let status = None;
+        let _ = child.start_kill();
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(observed)) => return GroupKillWaitOutcome::Quiesced(observed),
+                Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+                Err(error) => {
+                    return GroupKillWaitOutcome::Unproven {
+                        leader_status: status,
+                        failure: GroupContainmentFailure::LeaderPoll(error),
+                    };
                 }
             }
         }
-    }
-    let _ = child.start_kill();
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) => std::thread::sleep(Duration::from_millis(1)),
-            Err(_) => return,
+        GroupKillWaitOutcome::Unproven {
+            leader_status: status,
+            failure: GroupContainmentFailure::GroupDrainDeadline(GroupMemberSnapshot::default()),
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn group_member_snapshot(pgid: libc::pid_t) -> GroupMemberSnapshot {
+    const MAX_MEMBERS: usize = 32;
+    let mut snapshot = GroupMemberSnapshot::default();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return snapshot;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some((_, fields)) = stat.rsplit_once(") ") else {
+            continue;
+        };
+        let mut fields = fields.split_whitespace();
+        let state = fields.next().and_then(|value| value.chars().next());
+        let parent_pid = fields.next().and_then(|value| value.parse::<i32>().ok());
+        let member_pgid = fields.next().and_then(|value| value.parse::<i32>().ok());
+        if member_pgid != Some(pgid) {
+            continue;
+        }
+        if snapshot.members.len() == MAX_MEMBERS {
+            snapshot.truncated = true;
+            break;
+        }
+        if let (Some(state), Some(parent_pid)) = (state, parent_pid) {
+            snapshot.members.push(GroupMemberIdentity {
+                pid,
+                state,
+                parent_pid,
+            });
+        }
+    }
+    snapshot
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn group_member_snapshot(_pgid: libc::pid_t) -> GroupMemberSnapshot {
+    GroupMemberSnapshot::default()
+}
+
+/// Report whether the pinned group contains any non-zombie member other than
+/// its leader. The daemon is deliberately not a subreaper: orphan zombies are
+/// owned by their real reaper and are inert, while any process capable of
+/// further filesystem effects keeps the outcome unproven.
+#[cfg(target_os = "linux")]
+fn group_has_live_nonleader(pgid: libc::pid_t) -> std::io::Result<bool> {
+    let mut member_remains = false;
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        if pid == pgid {
+            continue;
+        }
+        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let Some((_, fields)) = stat.rsplit_once(") ") else {
+            continue;
+        };
+        let mut fields = fields.split_whitespace();
+        let state = fields.next();
+        let _ppid = fields.next();
+        let member_pgid = fields
+            .next()
+            .and_then(|value| value.parse::<libc::pid_t>().ok());
+        if member_pgid != Some(pgid) {
+            continue;
+        }
+        if state != Some("Z") {
+            member_remains = true;
+        }
+    }
+    Ok(member_remains)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn group_has_live_nonleader(_pgid: libc::pid_t) -> std::io::Result<bool> {
+    // These hosts do not expose Linux's adopted-child `/proc` inventory.
+    // Reap the leader, then let the non-destructive group oracle decide: any
+    // surviving descendant (including a zombie) remains populated/unproven.
+    Ok(false)
 }
 
 /// Terminate a caller-created Unix process group and reap its leader.
@@ -1441,6 +2425,46 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn validation_supervisor_reaps_adopted_exit_without_killing_live_leader() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let release = tmp.path().join("release.fifo");
+        let orphan_pid = tmp.path().join("orphan.pid");
+        let fifo = std::ffi::CString::new(release.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let script = format!(
+            "supervisor=$PPID\n\
+             sh -c '(read ignored < \"$1\") & echo \"$!\" > \"$2\"' inner '{}' '{}'\n\
+             orphan=$(cat '{}')\n\
+             while :; do set -- $(cat \"/proc/$orphan/stat\"); [ \"$4\" = \"$supervisor\" ] && break; done\n\
+             printf x > '{}'\n\
+             while [ -e \"/proc/$orphan\" ]; do :; done\n\
+             exit 7\n",
+            release.display(),
+            orphan_pid.display(),
+            orphan_pid.display(),
+            release.display(),
+        );
+        let mut supervisor = spawn_validation_supervisor(
+            std::ffi::OsStr::new("sh"),
+            &["-c", &script],
+            tmp.path(),
+            &[],
+        )
+        .unwrap();
+
+        let status = supervisor.wait().await.unwrap();
+
+        assert_eq!(
+            status.code(),
+            Some(7),
+            "an adopted-child SIGCHLD must not replace the live leader's natural result"
+        );
     }
 
     #[cfg(unix)]
@@ -1908,7 +2932,11 @@ mod tests {
         wait_for_file(&heartbeat);
 
         let started = std::time::Instant::now();
-        terminate_group_kill_wait(&mut child, Duration::from_secs(2));
+        let outcome = terminate_group_kill_wait_status(&mut child, Duration::from_secs(2));
+        assert!(
+            matches!(outcome, GroupKillWaitOutcome::Quiesced(_)),
+            "successful group drain must be distinguished from leader-only exit: {outcome:?}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "group SIGKILL wait should reap well under its timeout cap"
@@ -1925,6 +2953,69 @@ mod tests {
             mtime_after_kill, mtime_later,
             "descendant heartbeat kept updating after terminate_group_kill_wait returned"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_group_kill_wait_reports_signal_failure_as_unproven() {
+        use std::process::Stdio;
+
+        let mut command = tokio::process::Command::new("cat");
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut child = runtime.block_on(async { command.spawn().unwrap() });
+        let _stdin = child.stdin.take().unwrap();
+
+        inject_next_group_signal_errno(libc::EPERM);
+        let outcome = terminate_group_kill_wait_status(&mut child, Duration::ZERO);
+        assert!(matches!(
+            outcome,
+            GroupKillWaitOutcome::Unproven {
+                failure: GroupContainmentFailure::GroupSignal(ref error),
+                ..
+            } if error.raw_os_error() == Some(libc::EPERM)
+        ));
+
+        let cleanup = terminate_group_kill_wait_status(&mut child, Duration::from_secs(2));
+        assert!(matches!(cleanup, GroupKillWaitOutcome::Quiesced(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_group_kill_wait_reports_zero_budget_drain_as_unproven() {
+        use std::process::Stdio;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut command = tokio::process::Command::new("cat");
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = runtime.block_on(async { command.spawn().unwrap() });
+        let _stdin = child.stdin.take().unwrap();
+
+        let outcome = terminate_group_kill_wait_status(&mut child, Duration::ZERO);
+        assert!(matches!(
+            outcome,
+            GroupKillWaitOutcome::Unproven {
+                failure: GroupContainmentFailure::GroupDrainDeadline(_),
+                ..
+            }
+        ));
+
+        let cleanup = terminate_group_kill_wait_status(&mut child, Duration::from_secs(2));
+        assert!(matches!(cleanup, GroupKillWaitOutcome::Quiesced(_)));
     }
 
     #[cfg(windows)]

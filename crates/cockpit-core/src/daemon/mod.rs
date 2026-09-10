@@ -1378,15 +1378,8 @@ fn spawn_detached_child(
         .arg("start")
         .arg("--foreground")
         .stdin(Stdio::null())
-        .stdout(Stdio::null());
-    match open_detach_child_log() {
-        Some(file) => {
-            command.stderr(file);
-        }
-        None => {
-            command.stderr(Stdio::null());
-        }
-    }
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     if no_sandbox {
         command.arg("--no-sandbox");
     }
@@ -1431,17 +1424,6 @@ fn spawn_detached_child(
     // the matching launch ticket in memory for the peer-credential exchange.
     cockpit_client::launch_provenance::set_process_launch_ticket(launch_ticket);
     Ok(child)
-}
-
-#[cfg(any(unix, windows))]
-fn open_detach_child_log() -> Option<std::fs::File> {
-    let dir = cache_dir().or_else(|| dirs::cache_dir().map(|dir| dir.join("cockpit")))?;
-    cockpit_host::private_fs::ensure_private_dir(&dir).ok()?;
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("cockpit.log"))
-        .ok()
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -3799,6 +3781,35 @@ mod tests {
         assert!(restart_no_sandbox_from_argv(&unsandboxed, false));
         assert!(!restart_no_sandbox_from_argv(&unrelated, false));
         assert!(restart_no_sandbox_from_argv(&sandboxed, true));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn detached_spawn_does_no_cache_io_before_child_creation() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("fn spawn_detached_child(\n")
+            .expect("detached spawn function");
+        let body = &source[start..];
+        let end = body
+            .find("#[cfg(not(any(unix, windows)))]")
+            .expect("end of platform detached spawn function");
+        let body = &body[..end];
+
+        assert!(
+            body.contains(".stderr(Stdio::null())"),
+            "detached stdout/stderr must remain disconnected from the terminal"
+        );
+        assert!(
+            body.contains("command.spawn()"),
+            "detached child must spawn"
+        );
+        for forbidden in ["cache_dir", "ensure_private_dir", "OpenOptions"] {
+            assert!(
+                !body.contains(forbidden),
+                "detached launch must not perform cache filesystem I/O: {forbidden}"
+            );
+        }
     }
 
     #[test]

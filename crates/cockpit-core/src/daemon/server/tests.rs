@@ -21157,7 +21157,7 @@ async fn assert_authz_known_hole_socket_case(kind: &'static str, known_hole: Aut
 #[cfg(feature = "remote")]
 async fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSocketScenario {
     let ctx = test_ctx();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = cockpit_test_support::isolated_tempdir();
     // Stamp a minimal `.cockpit/config.json` so config-bearing requests
     // (e.g. `set_default_model`) find a retained default target under
     // the trusted workspace policy.
@@ -21219,7 +21219,7 @@ async fn authz_cross_session_paused_work_scenario(
     level: AuthzLevel,
 ) -> AuthzSocketScenario {
     let ctx = test_ctx();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = cockpit_test_support::isolated_tempdir();
     let accessible_root = tmp.path().join("accessible");
     let target_root = tmp.path().join("target");
     std::fs::create_dir_all(&accessible_root).unwrap();
@@ -38360,11 +38360,18 @@ async fn attach_since_seq_replays_retracted_user_row_identity() {
 /// model sends a real reasoning-only SSE delta before stalling, so this also
 /// locks the narrow retraction boundary to actual stream state rather than a
 /// test-only `CancelHandle` call.
-#[tokio::test(flavor = "multi_thread")]
-async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
-    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+#[test]
+fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
+    crate::test_env::run_async_with_large_stack(
+        cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns_inner,
+    );
+}
+
+async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns_inner() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     use crate::config::providers::{
-        ActiveModelRef, ModelTrust, ProviderEntry, ProvidersConfig, ThinkingMode, WireApi,
+        ActiveModelRef, ModelEntry, ModelTrust, ProviderEntry, ProvidersConfig, ThinkingMode,
+        WireApi,
     };
 
     let mut provider = retraction_acceptance_model_server().await;
@@ -38375,6 +38382,16 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         ProviderEntry {
             url: model_url,
             wire_api: WireApi::Completions,
+            // The active selection must also exist in the provider catalog.
+            // Otherwise vNext model acquisition can fail before the engine
+            // constructs or streams the chat-completions request.
+            models: vec![ModelEntry {
+                id: "local".to_string(),
+                thinking_modes: vec![ThinkingMode::High],
+                context_length: Some(128_000),
+                wire_api: WireApi::Completions,
+                ..ModelEntry::default()
+            }],
             // This acceptance test must observe a live reasoning delta before
             // cancelling the intentionally hanging stream. Untrusted routes
             // correctly withhold every plaintext delta until classification,
@@ -38409,19 +38426,20 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
     let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
         providers, extended,
     ));
-    let project = cockpit_test_support::isolated_tempdir();
+    let fixture_root = env.path().expect("owned isolated-home root");
+    let project = fixture_root.join("project");
+    let spool = fixture_root.join("external-journal");
+    assert!(project.starts_with(fixture_root) && spool.starts_with(fixture_root));
+    std::fs::create_dir(&project).unwrap();
     ctx.registry.set_external_journal(Arc::new(
-        crate::external_journal::ExternalJournal::for_test_at(
-            ctx.db.clone(),
-            &project.path().join("external-journal"),
-        ),
+        crate::external_journal::ExternalJournal::for_test_at(ctx.db.clone(), &spool),
     ));
-    std::fs::write(project.path().join("fixture.txt"), "fixture body").unwrap();
-    trust_workspace_root(&ctx, project.path()).await;
+    std::fs::write(project.join("fixture.txt"), "fixture body").unwrap();
+    trust_workspace_root(&ctx, &project).await;
     let attach_request = |session_id| Request::Attach {
         session_id,
         since_seq: None,
-        project_root: Some(project.path().to_string_lossy().into_owned()),
+        project_root: Some(project.to_string_lossy().into_owned()),
         initial_model: None,
         no_sandbox: false,
         interactive: true,

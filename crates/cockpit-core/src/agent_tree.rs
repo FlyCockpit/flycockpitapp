@@ -3149,6 +3149,10 @@ mod tests {
         )
         .unwrap();
         let operation_id = operation.operation_id;
+        let authorization_group_id = operation.authorization_group_id;
+        let tool_call_id = operation.tool_call_id.clone();
+        let member_index = operation.member_index;
+        let concrete_effect_digest = operation.concrete_effect_digest.clone();
         let operation_kind = operation.operation_kind.clone();
         let canonical_input_json = operation.canonical_input_json.clone();
         let input_digest = operation.input_digest.clone();
@@ -3200,6 +3204,10 @@ mod tests {
             session.session_id,
             agent.agent_instance_id,
             operation_id,
+            authorization_group_id,
+            tool_call_id,
+            member_index,
+            concrete_effect_digest,
             operation_kind.clone(),
             canonical_input_json.clone(),
             input_digest.clone(),
@@ -3480,6 +3488,10 @@ mod tests {
             session.session_id,
             agent.agent_instance_id,
             operation.operation_id,
+            operation.authorization_group_id,
+            operation.tool_call_id.clone(),
+            operation.member_index,
+            operation.concrete_effect_digest.clone(),
             operation.operation_kind.clone(),
             operation.canonical_input_json.clone(),
             operation.input_digest.clone(),
@@ -3597,6 +3609,9 @@ mod tests {
             }),
         )
         .unwrap();
+        let authorization_group_id = binding.authorization_group_id.to_string();
+        let tool_call_id = binding.tool_call_id;
+        let concrete_effect_digest = binding.concrete_effect_digest;
         let operation_kind = binding.operation_kind;
         let canonical_input_json = binding.canonical_input_json;
         let input_digest = binding.input_digest;
@@ -3633,12 +3648,24 @@ mod tests {
         let approved_revision = agent.revision;
         db.write(move |conn| {
             conn.execute(
+                "INSERT INTO agent_host_authorization_groups (
+                     authorization_group_id, tool_call_id, session_id, agent_instance_id,
+                     concrete_effect_digest, state, created_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'collecting', 20)",
+                rusqlite::params![
+                    authorization_group_id.clone(), tool_call_id, session_id.clone(),
+                    agent_id.clone(), concrete_effect_digest,
+                ],
+            )?;
+            conn.execute(
                 "INSERT INTO agent_host_approval_operations (
-                     operation_id, session_id, agent_instance_id, operation_kind, canonical_input_json, input_digest,
+                     operation_id, authorization_group_id, member_index,
+                     session_id, agent_instance_id, operation_kind, canonical_input_json, input_digest,
                      selected_response_json, selected_candidate_json, state, approved_agent_revision, created_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'approved', ?9, 20)",
+                 ) VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'approved', ?10, 20)",
                 rusqlite::params![
                     approved_operation,
+                    authorization_group_id.clone(),
                     session_id.clone(),
                     agent_id.clone(),
                     operation_kind_for_insert,
@@ -3670,11 +3697,13 @@ mod tests {
             )?;
             conn.execute(
                 "INSERT INTO agent_host_approval_operations (
-                     operation_id, session_id, agent_instance_id, operation_kind, canonical_input_json, input_digest,
+                     operation_id, authorization_group_id, member_index,
+                     session_id, agent_instance_id, operation_kind, canonical_input_json, input_digest,
                      selected_response_json, selected_candidate_json, state, approved_agent_revision, created_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'dispatching', ?9, 20)",
+                 ) VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'dispatching', ?10, 20)",
                 rusqlite::params![
                     dispatching_operation,
+                    authorization_group_id.clone(),
                     session_id.clone(),
                     agent_id.clone(),
                     operation_kind.clone(),
@@ -3684,6 +3713,11 @@ mod tests {
                     selected_candidate_json.clone(),
                     approved_revision,
                 ],
+            )?;
+            conn.execute(
+                "UPDATE agent_host_authorization_groups SET state = 'dispatching'
+                  WHERE authorization_group_id = ?1",
+                [authorization_group_id],
             )?;
             conn.execute(
                 "INSERT INTO agent_host_approval_effect_handoffs (
@@ -3868,7 +3902,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn boot_rejects_ready_host_handoff_without_replaying_approval() {
+    async fn boot_preserves_ready_host_handoff_for_group_recovery() {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = db.create_session("project", "/repo", "tree").await.unwrap();
         let agent = running_agent(&db, session.session_id, false).await;
@@ -3891,6 +3925,9 @@ mod tests {
         )
         .unwrap();
         let operation_id = operation.operation_id;
+        let authorization_group_id = operation.authorization_group_id.to_string();
+        let tool_call_id = operation.tool_call_id.clone();
+        let concrete_effect_digest = operation.concrete_effect_digest.clone();
         let session_id = session.session_id.to_string();
         let agent_id = agent.agent_instance_id.to_string();
         let operation_kind = operation.operation_kind.clone();
@@ -3899,15 +3936,30 @@ mod tests {
         let selected_candidate_for_handoff = selected_candidate.clone();
         db.write(move |conn| {
             conn.execute(
+                "INSERT INTO agent_host_authorization_groups (
+                     authorization_group_id, tool_call_id, session_id, agent_instance_id,
+                     concrete_effect_digest, state, created_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'collecting', 20)",
+                rusqlite::params![
+                    authorization_group_id.clone(),
+                    tool_call_id,
+                    session_id.clone(),
+                    agent_id.clone(),
+                    concrete_effect_digest,
+                ],
+            )?;
+            conn.execute(
                 "INSERT INTO agent_host_approval_operations (
-                     operation_id, session_id, agent_instance_id, operation_kind,
+                     operation_id, authorization_group_id, member_index,
+                     session_id, agent_instance_id, operation_kind,
                      canonical_input_json, input_digest, selected_response_json,
                      selected_candidate_json, state, approved_agent_revision, created_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'approved', ?9, 20)",
+                 ) VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'approved', ?10, 20)",
                 rusqlite::params![
                     operation_id.to_string(),
-                    session_id,
-                    agent_id,
+                    authorization_group_id,
+                    session_id.clone(),
+                    agent_id.clone(),
                     operation_kind.clone(),
                     canonical_input_json.clone(),
                     input_digest.clone(),
@@ -3945,7 +3997,7 @@ mod tests {
             0,
             "only irrevocably dispatching handoffs count as submission-unknown reconciliation"
         );
-        let states: (String, String, String) = db
+        let states: (String, String, Option<String>) = db
             .read(move |conn| {
                 Ok((
                     conn.query_row(
@@ -3967,9 +4019,9 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(states.0, "rejected");
-        assert_eq!(states.1, "rejected");
-        assert!(states.2.contains("not_submitted"));
+        assert_eq!(states.0, "approved");
+        assert_eq!(states.1, "ready");
+        assert!(states.2.is_none());
     }
 }
 
@@ -4207,6 +4259,17 @@ impl HostCapabilitiesRefreshOperation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HostApprovalOperation {
     pub operation_id: Uuid,
+    /// Durable consent unit shared by every prompt raised inside the same
+    /// concrete host-effect scope.
+    pub authorization_group_id: Uuid,
+    /// Stable effect-scope identity. It is deliberately distinct from each
+    /// prompt/decision UUID.
+    pub tool_call_id: String,
+    /// Ordered position of this prompt within the authorization group.
+    pub member_index: u32,
+    /// Digest of the concrete effect identity chosen when the group is first
+    /// raised. Later members retain it without advancing the group revision.
+    pub concrete_effect_digest: String,
     pub operation_kind: String,
     /// Canonical JSON for the complete candidate set the host composition
     /// point derived. It is private durable state, never prompt prose or a
@@ -4236,17 +4299,37 @@ impl HostApprovalOperation {
         let mut digest = Sha256::new();
         digest.update(b"flycockpit.host-approval-input.v1\0");
         digest.update(&canonical);
+        let operation_id = Uuid::now_v7();
+        let input_digest: String = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         Ok(Self {
-            operation_id: Uuid::now_v7(),
+            operation_id,
+            authorization_group_id: operation_id,
+            tool_call_id: operation_id.to_string(),
+            member_index: 0,
+            concrete_effect_digest: input_digest.clone(),
             operation_kind,
             canonical_input_json: String::from_utf8(canonical)
                 .context("canonical host approval input was not UTF-8")?,
-            input_digest: digest
-                .finalize()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect(),
+            input_digest,
         })
+    }
+
+    pub(crate) fn bind_authorization_group(
+        mut self,
+        authorization_group_id: Uuid,
+        tool_call_id: String,
+        member_index: u32,
+        concrete_effect_digest: String,
+    ) -> Self {
+        self.authorization_group_id = authorization_group_id;
+        self.tool_call_id = tool_call_id;
+        self.member_index = member_index;
+        self.concrete_effect_digest = concrete_effect_digest;
+        self
     }
 
     /// Rehydrate the durable operation identity after the caller has

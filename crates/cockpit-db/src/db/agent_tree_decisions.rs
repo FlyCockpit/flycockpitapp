@@ -4726,6 +4726,10 @@ impl Db {
         session_id: Uuid,
         agent_instance_id: Uuid,
         operation_id: Uuid,
+        authorization_group_id: Uuid,
+        tool_call_id: String,
+        member_index: u32,
+        concrete_effect_digest: String,
         operation_kind: String,
         canonical_input_json: String,
         input_digest: String,
@@ -4733,10 +4737,13 @@ impl Db {
         now_unix_ms: i64,
     ) -> Result<()> {
         ensure!(
-            !operation_id.is_nil(),
-            "host approval operation id must not be nil"
+            !operation_id.is_nil()
+                && !authorization_group_id.is_nil()
+                && !tool_call_id.trim().is_empty(),
+            "host approval operation and group identities must not be empty"
         );
         validate_host_operation_binding(&operation_kind, &input_digest)?;
+        validate_host_operation_binding("authorization_group", &concrete_effect_digest)?;
         validate_host_operation_canonical_input(&canonical_input_json, &input_digest)?;
         self.transaction(move |conn| {
             ensure!(
@@ -4744,12 +4751,45 @@ impl Db {
                 "host approval operation owner is not authorized for this session"
             );
             conn.execute(
+                "INSERT INTO agent_host_authorization_groups (
+                     authorization_group_id, tool_call_id, session_id, agent_instance_id,
+                     concrete_effect_digest, revision, state, created_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 0, 'collecting', ?6)
+                 ON CONFLICT(authorization_group_id) DO NOTHING",
+                params![
+                    authorization_group_id.to_string(),
+                    tool_call_id,
+                    session_id.to_string(),
+                    agent_instance_id.to_string(),
+                    concrete_effect_digest,
+                    now_unix_ms,
+                ],
+            )?;
+            let exact_group: i64 = conn.query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM agent_host_authorization_groups
+                      WHERE authorization_group_id = ?1 AND tool_call_id = ?2
+                        AND session_id = ?3 AND agent_instance_id = ?4
+                        AND concrete_effect_digest = ?5 AND revision = 0
+                        AND state = 'collecting'
+                 )",
+                params![
+                    authorization_group_id.to_string(), tool_call_id,
+                    session_id.to_string(), agent_instance_id.to_string(), concrete_effect_digest,
+                ],
+                |row| row.get(0),
+            )?;
+            ensure!(exact_group != 0, "host approval member group binding changed");
+            conn.execute(
                 "INSERT INTO agent_host_approval_operations (
-                     operation_id, session_id, agent_instance_id, operation_kind, canonical_input_json, input_digest,
+                     operation_id, authorization_group_id, member_index,
+                     session_id, agent_instance_id, operation_kind, canonical_input_json, input_digest,
                      decision_request_id, state, created_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 'pending', ?7)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, 'pending', ?9)",
                 params![
                     operation_id.to_string(),
+                    authorization_group_id.to_string(),
+                    i64::from(member_index),
                     session_id.to_string(),
                     agent_instance_id.to_string(),
                     operation_kind,
@@ -4806,16 +4846,23 @@ impl Db {
                 .query_row(
                     "SELECT 1
                        FROM agent_host_approval_operations AS operation
+                       JOIN agent_host_authorization_groups AS approval_group
+                         ON approval_group.authorization_group_id = operation.authorization_group_id
                        JOIN agent_instances AS agent
-                         ON agent.agent_instance_id = operation.agent_instance_id
-                        AND agent.session_id = operation.session_id
+                         ON agent.agent_instance_id = approval_group.agent_instance_id
+                        AND agent.session_id = approval_group.session_id
                       WHERE operation.operation_id = ?1 AND operation.session_id = ?2
                         AND operation.agent_instance_id = ?3 AND operation.operation_kind = ?4
                         AND operation.canonical_input_json = ?5 AND operation.input_digest = ?6
                         AND operation.selected_response_json IS NOT NULL
                         AND operation.selected_candidate_json IS NOT NULL
                         AND operation.state = 'approved'
-                        AND operation.approved_agent_revision = agent.revision
+                        AND approval_group.state = 'collecting'
+                        AND NOT EXISTS (
+                            SELECT 1 FROM agent_host_approval_operations member
+                             WHERE member.authorization_group_id = approval_group.authorization_group_id
+                               AND member.state NOT IN ('approved', 'dispatching', 'completed')
+                        )
                         AND agent.state = 'running'",
                     params![
                         operation_id.to_string(),
@@ -4980,15 +5027,15 @@ impl Db {
                 )?,
                 "host approval effect handoff is not bound to its exact interrupt"
             );
-            let selected_candidate: Option<String> = conn
+            let current: Option<(String, String)> = conn
                 .query_row(
-                    "SELECT operation.selected_candidate_json
+                    "SELECT operation.selected_candidate_json, operation.authorization_group_id
                        FROM agent_host_approval_operations AS operation
-                       JOIN agent_host_approval_effect_handoffs AS handoff
-                         ON handoff.operation_id = operation.operation_id
+                       JOIN agent_host_authorization_groups AS approval_group
+                         ON approval_group.authorization_group_id = operation.authorization_group_id
                        JOIN agent_instances AS agent
-                         ON agent.agent_instance_id = operation.agent_instance_id
-                        AND agent.session_id = operation.session_id
+                         ON agent.agent_instance_id = approval_group.agent_instance_id
+                        AND agent.session_id = approval_group.session_id
                       WHERE operation.operation_id = ?1
                         AND operation.session_id = ?2
                         AND operation.agent_instance_id = ?3
@@ -4997,12 +5044,8 @@ impl Db {
                         AND operation.input_digest = ?6
                         AND operation.selected_response_json IS NOT NULL
                         AND operation.selected_candidate_json IS NOT NULL
-                        AND operation.state = 'approved'
-                        AND handoff.state = 'ready'
-                        AND handoff.canonical_input_json = operation.canonical_input_json
-                        AND handoff.selected_candidate_json = operation.selected_candidate_json
-                        AND handoff.idempotency_key = operation.operation_id
-                        AND operation.approved_agent_revision = agent.revision
+                        AND operation.state IN ('approved', 'dispatching')
+                        AND approval_group.state IN ('collecting', 'dispatching')
                         AND agent.state = 'running'",
                     params![
                         operation_id.to_string(),
@@ -5012,10 +5055,10 @@ impl Db {
                         canonical_input_json,
                         input_digest,
                     ],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
-            let Some(selected_candidate) = selected_candidate else {
+            let Some((selected_candidate, authorization_group_id)) = current else {
                 return Ok(HostApprovalEffectFence::NotLive);
             };
             let selected_candidate: Value = serde_json::from_str(&selected_candidate)
@@ -5026,50 +5069,118 @@ impl Db {
             ) {
                 return Ok(HostApprovalEffectFence::DifferentCandidate);
             }
+            let mut statement = conn.prepare(
+                "SELECT operation.selected_candidate_json, operation.state,
+                        COALESCE(handoff.state, '')
+                   FROM agent_host_approval_operations operation
+                   LEFT JOIN agent_host_approval_effect_handoffs handoff
+                     ON handoff.operation_id = operation.operation_id
+                  WHERE operation.authorization_group_id = ?1
+                  ORDER BY operation.member_index ASC",
+            )?;
+            let members = statement
+                .query_map([authorization_group_id.clone()], |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ensure!(
+                !members.is_empty(),
+                "host authorization group has no members"
+            );
+            let mut approved_members = 0;
+            let mut ready_handoffs = 0;
+            let mut group_fully_matches = true;
+            for (candidate, operation_state, handoff_state) in &members {
+                let Some(candidate) = candidate else {
+                    group_fully_matches = false;
+                    continue;
+                };
+                if !matches!(operation_state.as_str(), "approved" | "dispatching")
+                    || !matches!(handoff_state.as_str(), "ready" | "dispatching")
+                {
+                    group_fully_matches = false;
+                    continue;
+                }
+                approved_members += usize::from(operation_state == "approved");
+                ready_handoffs += usize::from(handoff_state == "ready");
+                let candidate: Value = serde_json::from_str(candidate)
+                    .context("persisted host approval group candidate is malformed")?;
+                if !host_operation_candidate_matches_any_concrete_effect(
+                    &candidate,
+                    &concrete_effects,
+                ) {
+                    group_fully_matches = false;
+                }
+            }
+            drop(statement);
             // Recheck the live owner in the same write transaction that
             // changes the irreversible handoff state. A cancellation that has
             // already reached the durable agent state wins this compare and
             // leaves the capability ready/unsubmitted.
-            let operation_changed = conn.execute(
-                "UPDATE agent_host_approval_operations AS operation
-                    SET state = 'dispatching'
-                  WHERE operation.operation_id = ?1 AND operation.session_id = ?2
-                    AND operation.agent_instance_id = ?3 AND operation.state = 'approved'
-                    AND operation.approved_agent_revision = (
-                        SELECT agent.revision FROM agent_instances AS agent
-                         WHERE agent.agent_instance_id = operation.agent_instance_id
-                           AND agent.session_id = operation.session_id
-                           AND agent.state = 'running'
-                    )",
-                params![
-                    operation_id.to_string(),
-                    session_id.to_string(),
-                    agent_instance_id.to_string(),
-                ],
-            )?;
-            if operation_changed != 1 {
-                return Ok(HostApprovalEffectFence::NotLive);
+            if !group_fully_matches {
+                let operation_changed = conn.execute(
+                    "UPDATE agent_host_approval_operations SET state = 'dispatching'
+                      WHERE operation_id = ?1 AND authorization_group_id = ?2
+                        AND state = 'approved'",
+                    params![operation_id.to_string(), authorization_group_id],
+                )?;
+                if operation_changed == 0 {
+                    let already_claimed: bool = conn.query_row(
+                        "SELECT EXISTS (
+                             SELECT 1 FROM agent_host_approval_operations operation
+                             JOIN agent_host_approval_effect_handoffs handoff
+                               ON handoff.operation_id = operation.operation_id
+                            WHERE operation.operation_id = ?1
+                              AND operation.authorization_group_id = ?2
+                              AND operation.state = 'dispatching'
+                              AND handoff.state = 'dispatching'
+                        )",
+                        params![operation_id.to_string(), authorization_group_id],
+                        |row| row.get(0),
+                    )?;
+                    return Ok(if already_claimed {
+                        HostApprovalEffectFence::Claimed
+                    } else {
+                        HostApprovalEffectFence::NotLive
+                    });
+                }
+                let handoff_changed = conn.execute(
+                    "UPDATE agent_host_approval_effect_handoffs
+                        SET state = 'dispatching', dispatch_started_at_unix_ms = ?1
+                      WHERE operation_id = ?2 AND state = 'ready'",
+                    params![now_unix_ms, operation_id.to_string()],
+                )?;
+                ensure!(
+                    handoff_changed == 1,
+                    "host approval member handoff claim diverged"
+                );
+                return Ok(HostApprovalEffectFence::Claimed);
             }
+            let operation_changed = conn.execute(
+                "UPDATE agent_host_approval_operations SET state = 'dispatching'
+                  WHERE authorization_group_id = ?1 AND state = 'approved'",
+                [authorization_group_id.clone()],
+            )?;
+            ensure!(
+                operation_changed == approved_members,
+                "host authorization group operation claim diverged"
+            );
             let handoff_changed = conn.execute(
                 "UPDATE agent_host_approval_effect_handoffs
                     SET state = 'dispatching', dispatch_started_at_unix_ms = ?1
-                  WHERE operation_id = ?2 AND session_id = ?3 AND agent_instance_id = ?4
-                    AND operation_kind = ?5 AND canonical_input_json = ?6 AND input_digest = ?7
-                    AND idempotency_key = ?8 AND state = 'ready'",
-                params![
-                    now_unix_ms,
-                    operation_id.to_string(),
-                    session_id.to_string(),
-                    agent_instance_id.to_string(),
-                    operation_kind,
-                    canonical_input_json,
-                    input_digest,
-                    operation_id.to_string(),
-                ],
+                  WHERE state = 'ready' AND operation_id IN (
+                        SELECT operation_id FROM agent_host_approval_operations
+                         WHERE authorization_group_id = ?2
+                    )",
+                params![now_unix_ms, authorization_group_id,],
             )?;
             ensure!(
-                handoff_changed == 1,
-                "host approval effect handoff lost its final dispatch claim"
+                handoff_changed == ready_handoffs,
+                "host authorization group handoff claim diverged"
             );
             Ok(HostApprovalEffectFence::Claimed)
         })
@@ -5116,13 +5227,20 @@ impl Db {
                        FROM agent_host_approval_operations AS operation
                        JOIN agent_host_approval_effect_handoffs AS handoff
                          ON handoff.operation_id = operation.operation_id
+                       JOIN agent_host_authorization_groups AS approval_group
+                         ON approval_group.authorization_group_id = operation.authorization_group_id
+                       JOIN agent_instances AS agent
+                         ON agent.agent_instance_id = approval_group.agent_instance_id
+                        AND agent.session_id = approval_group.session_id
                       WHERE operation.operation_id = ?1 AND operation.session_id = ?2
                         AND operation.agent_instance_id = ?3 AND operation.operation_kind = ?4
                         AND operation.canonical_input_json = ?5 AND operation.input_digest = ?6
                         AND operation.state = 'dispatching' AND handoff.state = 'dispatching'
                         AND handoff.canonical_input_json = operation.canonical_input_json
                         AND handoff.selected_candidate_json = operation.selected_candidate_json
-                        AND handoff.idempotency_key = operation.operation_id",
+                        AND handoff.idempotency_key = operation.operation_id
+                        AND approval_group.state IN ('collecting', 'dispatching')
+                        AND agent.state = 'running'",
                     params![
                         operation_id.to_string(),
                         session_id.to_string(),
@@ -5179,6 +5297,66 @@ impl Db {
                 )?,
                 "host approval effect handoff is not bound to its exact interrupt"
             );
+            let group: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT approval_group.authorization_group_id, approval_group.state
+                       FROM agent_host_approval_operations operation
+                       JOIN agent_host_authorization_groups approval_group
+                         ON approval_group.authorization_group_id = operation.authorization_group_id
+                      WHERE operation.operation_id = ?1 AND operation.session_id = ?2
+                        AND operation.agent_instance_id = ?3",
+                    params![
+                        operation_id.to_string(),
+                        session_id.to_string(),
+                        agent_instance_id.to_string(),
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((authorization_group_id, group_state)) = group {
+                if group_state == "declined" {
+                    conn.execute(
+                        "UPDATE agent_host_approval_effect_handoffs
+                            SET state = 'rejected', completed_at_unix_ms = ?1,
+                                completion_receipt_json = '{\"outcome\":\"not_submitted\"}'
+                          WHERE state = 'ready' AND operation_id IN (
+                                SELECT operation_id FROM agent_host_approval_operations
+                                 WHERE authorization_group_id = ?2
+                            )",
+                        params![now_unix_ms, authorization_group_id],
+                    )?;
+                    conn.execute(
+                        "UPDATE agent_host_approval_operations SET state = 'rejected'
+                          WHERE authorization_group_id = ?1 AND state = 'approved'",
+                        [authorization_group_id],
+                    )?;
+                    return Ok(true);
+                }
+                if group_state == "collecting" {
+                    conn.execute(
+                        "UPDATE agent_host_approval_effect_handoffs
+                            SET state = 'rejected', completed_at_unix_ms = ?1,
+                                completion_receipt_json = '{\"outcome\":\"not_submitted\"}'
+                          WHERE state = 'ready' AND operation_id IN (
+                                SELECT operation_id FROM agent_host_approval_operations
+                                 WHERE authorization_group_id = ?2
+                            )",
+                        params![now_unix_ms, authorization_group_id],
+                    )?;
+                    conn.execute(
+                        "UPDATE agent_host_approval_operations SET state = 'rejected'
+                          WHERE authorization_group_id = ?1 AND state = 'approved'",
+                        [authorization_group_id.clone()],
+                    )?;
+                    let changed = conn.execute(
+                        "UPDATE agent_host_authorization_groups
+                            SET state = 'declined', resolved_at_unix_ms = ?1
+                          WHERE authorization_group_id = ?2 AND state = 'collecting'",
+                        params![now_unix_ms, authorization_group_id],
+                    )?;
+                    return Ok(changed == 1);
+                }
+            }
             let changed = conn.execute(
                 "UPDATE agent_host_approval_effect_handoffs
                     SET state = 'rejected', completed_at_unix_ms = ?1,
@@ -5244,6 +5422,15 @@ impl Db {
                 changed == 1,
                 "unclaimed host approval operation lost its rejection CAS"
             );
+            conn.execute(
+                "UPDATE agent_host_authorization_groups
+                    SET state = 'declined', resolved_at_unix_ms = ?1
+                  WHERE authorization_group_id = (
+                        SELECT authorization_group_id FROM agent_host_approval_operations
+                         WHERE operation_id = ?2
+                    ) AND state IN ('collecting', 'dispatching')",
+                params![now_unix_ms, operation_id.to_string()],
+            )?;
             Ok(true)
         })
         .await
@@ -5286,53 +5473,82 @@ impl Db {
             );
             let handoff_state = if succeeded { "succeeded" } else { "rejected" };
             let operation_state = if succeeded { "completed" } else { "rejected" };
+            let group_state = if succeeded { "completed" } else { "declined" };
+            let group: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT approval_group.authorization_group_id, approval_group.state
+                       FROM agent_host_approval_operations operation
+                       JOIN agent_host_authorization_groups approval_group
+                         ON approval_group.authorization_group_id = operation.authorization_group_id
+                      WHERE operation.operation_id = ?1 AND operation.session_id = ?2
+                        AND operation.agent_instance_id = ?3 AND operation.operation_kind = ?4
+                        AND operation.canonical_input_json = ?5 AND operation.input_digest = ?6",
+                    params![
+                        operation_id.to_string(),
+                        session_id.to_string(),
+                        agent_instance_id.to_string(),
+                        operation_kind,
+                        canonical_input_json,
+                        input_digest,
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((authorization_group_id, current_group_state)) = group else {
+                return Ok(false);
+            };
+            if current_group_state == group_state {
+                return Ok(true);
+            }
+            if !matches!(current_group_state.as_str(), "collecting" | "dispatching") {
+                return Ok(false);
+            }
             let changed = conn.execute(
                 "UPDATE agent_host_approval_effect_handoffs
                     SET state = ?1, completed_at_unix_ms = ?2, completion_receipt_json = ?3
-                  WHERE operation_id = ?4 AND session_id = ?5 AND agent_instance_id = ?6
-                    AND operation_kind = ?7 AND canonical_input_json = ?8 AND input_digest = ?9 AND idempotency_key = ?10
-                    AND state = 'dispatching'
-                    AND EXISTS (
-                        SELECT 1 FROM agent_host_approval_operations operation
+                  WHERE state = 'dispatching' AND operation_id IN (
+                        SELECT operation.operation_id FROM agent_host_approval_operations operation
                         JOIN agent_instances agent
                           ON agent.agent_instance_id = operation.agent_instance_id
                          AND agent.session_id = operation.session_id
-                         WHERE operation.operation_id = ?4
-                           AND operation.session_id = ?5
-                           AND operation.agent_instance_id = ?6
-                           AND operation.state = 'dispatching'
-                           AND agent.state = 'running'
-                           AND agent.revision = operation.approved_agent_revision
+                         WHERE operation.authorization_group_id = ?4
+                           AND operation.state = 'dispatching' AND agent.state = 'running'
+                    )
+                    AND EXISTS (
+                        SELECT 1 FROM agent_host_authorization_groups approval_group
+                         WHERE approval_group.authorization_group_id = ?4
+                           AND approval_group.state IN ('collecting', 'dispatching')
                     )",
                 params![
                     handoff_state,
                     now_unix_ms,
                     completion_receipt_json,
-                    operation_id.to_string(),
-                    session_id.to_string(),
-                    agent_instance_id.to_string(),
-                    operation_kind,
-                    canonical_input_json,
-                    input_digest,
-                    operation_id.to_string(),
+                    authorization_group_id,
                 ],
             )?;
-            if changed != 1 {
+            if changed == 0 {
                 return Ok(false);
             }
-            let changed = conn.execute(
+            let operation_changed = conn.execute(
                 "UPDATE agent_host_approval_operations
                     SET state = ?1
-                  WHERE operation_id = ?2 AND session_id = ?3 AND agent_instance_id = ?4
-                    AND state = 'dispatching'",
-                params![
-                    operation_state,
-                    operation_id.to_string(),
-                    session_id.to_string(),
-                    agent_instance_id.to_string(),
-                ],
+                  WHERE authorization_group_id = ?2 AND state = 'dispatching'",
+                params![operation_state, authorization_group_id],
             )?;
-            ensure!(changed == 1, "host approval operation lost its dispatch completion CAS");
+            ensure!(
+                operation_changed == changed,
+                "host authorization group completion diverged"
+            );
+            let group_changed = conn.execute(
+                "UPDATE agent_host_authorization_groups
+                    SET state = ?1, resolved_at_unix_ms = ?2
+                  WHERE authorization_group_id = ?3 AND state IN ('collecting', 'dispatching')",
+                params![group_state, now_unix_ms, authorization_group_id],
+            )?;
+            ensure!(
+                group_changed == 1,
+                "host authorization group lost completion CAS"
+            );
             Ok(true)
         })
         .await
@@ -5400,6 +5616,15 @@ impl Db {
                 ],
             )?;
             ensure!(changed == 1, "host approval operation lost its submission-unknown CAS");
+            conn.execute(
+                "UPDATE agent_host_authorization_groups
+                    SET state = 'submission_unknown', resolved_at_unix_ms = ?1
+                  WHERE authorization_group_id = (
+                        SELECT authorization_group_id FROM agent_host_approval_operations
+                         WHERE operation_id = ?2
+                    ) AND state IN ('collecting', 'dispatching')",
+                params![now_unix_ms, operation_id.to_string()],
+            )?;
             Ok(true)
         })
         .await
@@ -5407,11 +5632,12 @@ impl Db {
 
     /// Startup reconciliation for host-approval effect handoffs.
     ///
-    /// An `approved` operation or `ready` handoff did not cross a concrete
-    /// effect boundary, so it is known not submitted and is closed as a
-    /// rejection. A `dispatching` row is the opposite: the exact boundary had
-    /// accepted the durable capability but the daemon did not record a final
-    /// receipt, so it becomes `submission_unknown` and is never replayed.
+    /// `approved` members and `ready` handoffs remain durable inside a
+    /// collecting authorization group: recovery must re-raise only unanswered
+    /// members without discarding consent already recorded for this exact
+    /// effect. A `dispatching` row is different: the exact boundary accepted
+    /// the capability but no final receipt was recorded, so the entire group
+    /// becomes `submission_unknown` and is never replayed.
     #[cfg(feature = "host-approval-composition")]
     pub async fn reconcile_host_approval_dispatches(
         &self,
@@ -5419,21 +5645,32 @@ impl Db {
         now_unix_ms: i64,
     ) -> Result<usize> {
         self.transaction(move |conn| {
-            // Approval is deliberately not ambient across a worker crash.
-            // This also covers the tiny safe interval after the decision
-            // transaction has recorded its selected candidate but before the
-            // continuation materializes a ready handoff.
+            // A crash may land after the member decision transaction commits
+            // but before its continuation materializes the ready handoff.
+            // Reconstruct that purely durable pre-dispatch capability; the
+            // group claim still requires every member to be allowed and the
+            // live resumed member's exact interrupt authority.
             conn.execute(
-                "UPDATE agent_host_approval_operations
-                    SET state = 'rejected'
-                  WHERE session_id = ?1 AND state = 'approved'",
-                params![session_id.to_string()],
-            )?;
-            conn.execute(
-                "UPDATE agent_host_approval_effect_handoffs
-                    SET state = 'rejected', completed_at_unix_ms = ?1,
-                        completion_receipt_json = '{\"outcome\":\"not_submitted\",\"recovery\":true}'
-                  WHERE session_id = ?2 AND state = 'ready'",
+                "INSERT INTO agent_host_approval_effect_handoffs (
+                     operation_id, session_id, agent_instance_id, operation_kind,
+                     canonical_input_json, input_digest, selected_candidate_json,
+                     idempotency_key, state, dispatch_started_at_unix_ms
+                 ) SELECT operation.operation_id, operation.session_id,
+                          operation.agent_instance_id, operation.operation_kind,
+                          operation.canonical_input_json, operation.input_digest,
+                          operation.selected_candidate_json, operation.operation_id,
+                          'ready', ?1
+                     FROM agent_host_approval_operations operation
+                     JOIN agent_host_authorization_groups approval_group
+                       ON approval_group.authorization_group_id = operation.authorization_group_id
+                    WHERE operation.session_id = ?2 AND operation.state = 'approved'
+                      AND operation.selected_response_json IS NOT NULL
+                      AND operation.selected_candidate_json IS NOT NULL
+                      AND approval_group.state = 'collecting'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM agent_host_approval_effect_handoffs handoff
+                           WHERE handoff.operation_id = operation.operation_id
+                      )",
                 params![now_unix_ms, session_id.to_string()],
             )?;
             let dispatching_handoffs = conn.execute(
@@ -5452,6 +5689,17 @@ impl Db {
                 dispatching_operations == dispatching_handoffs,
                 "host approval handoff and operation reconciliation diverged"
             );
+            conn.execute(
+                "UPDATE agent_host_authorization_groups
+                    SET state = 'submission_unknown', resolved_at_unix_ms = ?1
+                  WHERE session_id = ?2 AND state IN ('collecting', 'dispatching')
+                    AND EXISTS (
+                        SELECT 1 FROM agent_host_approval_operations member
+                         WHERE member.authorization_group_id = agent_host_authorization_groups.authorization_group_id
+                           AND member.state = 'submission_unknown'
+                    )",
+                params![now_unix_ms, session_id.to_string()],
+            )?;
             Ok(dispatching_handoffs)
         })
         .await
@@ -7320,6 +7568,37 @@ impl Db {
                         ],
                     )?;
                     ensure!(changed == 1, "host approval operation is not pending for this decision");
+                    conn.execute(
+                        "UPDATE agent_host_approval_effect_handoffs
+                            SET state = 'rejected', completed_at_unix_ms = ?1,
+                                completion_receipt_json = '{\"outcome\":\"not_submitted\",\"reason\":\"group_declined\"}'
+                          WHERE operation_id IN (
+                                SELECT sibling.operation_id FROM agent_host_approval_operations sibling
+                                 WHERE sibling.authorization_group_id = (
+                                       SELECT authorization_group_id FROM agent_host_approval_operations
+                                        WHERE operation_id = ?2
+                                 ) AND sibling.state = 'approved'
+                            ) AND state = 'ready'",
+                        params![now_unix_ms, operation_id.to_string()],
+                    )?;
+                    conn.execute(
+                        "UPDATE agent_host_approval_operations
+                            SET state = 'cancelled', resolved_at_unix_ms = ?1
+                          WHERE authorization_group_id = (
+                                SELECT authorization_group_id FROM agent_host_approval_operations
+                                 WHERE operation_id = ?2
+                            ) AND state = 'approved'",
+                        params![now_unix_ms, operation_id.to_string()],
+                    )?;
+                    conn.execute(
+                        "UPDATE agent_host_authorization_groups
+                            SET state = 'declined', resolved_at_unix_ms = ?1
+                          WHERE authorization_group_id = (
+                                SELECT authorization_group_id FROM agent_host_approval_operations
+                                 WHERE operation_id = ?2
+                            ) AND state = 'collecting'",
+                        params![now_unix_ms, operation_id.to_string()],
+                    )?;
                 }
                 conn.execute(
                     "INSERT INTO decision_receipts (
@@ -8615,6 +8894,21 @@ fn cancel_owned_decisions_for_subtree(
                 SELECT operation_id FROM agent_host_approval_operations
                  WHERE session_id = ?2 AND agent_instance_id IN tree AND state = 'approved'
             )",
+        params![root_id.to_string(), session_id.to_string(), now_unix_ms],
+    )?;
+    conn.execute(
+        "WITH RECURSIVE tree(agent_instance_id) AS (
+             SELECT agent_instance_id FROM agent_instances
+              WHERE agent_instance_id = ?1 AND session_id = ?2
+             UNION ALL
+             SELECT child.agent_instance_id FROM agent_instances child
+             JOIN tree parent ON child.parent_agent_instance_id = parent.agent_instance_id
+              WHERE child.session_id = ?2
+         )
+         UPDATE agent_host_authorization_groups
+            SET state = 'cancelled', resolved_at_unix_ms = ?3
+          WHERE session_id = ?2 AND agent_instance_id IN tree
+            AND state = 'collecting'",
         params![root_id.to_string(), session_id.to_string(), now_unix_ms],
     )?;
     conn.execute(
@@ -16931,11 +17225,24 @@ mod tests {
         let input_digest_first = input_digest.clone();
         db.write(move |conn| {
             conn.execute(
+                "INSERT INTO agent_host_authorization_groups (
+                     authorization_group_id, tool_call_id, session_id, agent_instance_id,
+                     concrete_effect_digest, state, created_at_unix_ms
+                 ) VALUES (?1, ?1, ?2, ?3, ?4, 'collecting', 3)",
+                params![
+                    operation_id.to_string(),
+                    session_id_for_bind.clone(),
+                    agent_id_for_bind.clone(),
+                    input_digest_first.clone(),
+                ],
+            )?;
+            conn.execute(
                 "INSERT INTO agent_host_approval_operations (
-                     operation_id, session_id, agent_instance_id, operation_kind,
+                     operation_id, authorization_group_id, member_index,
+                     session_id, agent_instance_id, operation_kind,
                      canonical_input_json, input_digest, decision_request_id, state,
                      created_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, 'test', ?4, ?5, NULL, 'pending', 3)",
+                 ) VALUES (?1, ?1, 0, ?2, ?3, 'test', ?4, ?5, NULL, 'pending', 3)",
                 params![
                     operation_id.to_string(),
                     session_id_for_bind,
@@ -17038,12 +17345,14 @@ mod tests {
             )?;
             conn.execute(
                 "INSERT INTO agent_host_approval_operations (
-                     operation_id, session_id, agent_instance_id, operation_kind,
+                     operation_id, authorization_group_id, member_index,
+                     session_id, agent_instance_id, operation_kind,
                      canonical_input_json, input_digest, decision_request_id, state,
                      created_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, 'test', ?4, ?5, NULL, 'pending', 4)",
+                 ) VALUES (?1, ?2, 0, ?3, ?4, 'test', ?5, ?6, NULL, 'pending', 4)",
                 params![
                     mismatched_operation_id.to_string(),
+                    operation_id.to_string(),
                     session_id.to_string(),
                     agent.agent_instance_id.to_string(),
                     operation_input,

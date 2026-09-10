@@ -954,8 +954,9 @@ pub(crate) async fn execute_ordinary_call(
     // from within the tool itself. Without this enclosing scope a gate could
     // consume a host approval before any effect boundary existed to own it.
     crate::tools::trusted_child_acquisition::scope_inherited_acquisition_runtime(
-        crate::engine::interrupt::with_host_approval_effect_scope(
+        crate::engine::interrupt::with_host_approval_effect_scope_for_tool(
             "ordinary_tool_dispatch_gate",
+            &tc.id,
             env.ctx.cancel.clone(),
             Box::pin(execute_ordinary_call_unscoped(
                 env,

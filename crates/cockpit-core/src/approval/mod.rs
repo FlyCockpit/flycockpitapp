@@ -5263,6 +5263,267 @@ mod tests {
         assert_eq!(decision, Decision::Allow { scope: Scope::Once });
     }
 
+    async fn authorization_group_snapshot(
+        approver: &Approver,
+    ) -> (String, i64, Vec<(i64, String)>) {
+        let session_id = approver.session_id.to_string();
+        approver
+            .db
+            .read(move |conn| {
+                let (group_id, state, revision): (String, String, i64) = conn.query_row(
+                    "SELECT authorization_group_id, state, revision
+                       FROM agent_host_authorization_groups
+                      WHERE session_id = ?1 ORDER BY created_at_unix_ms DESC LIMIT 1",
+                    [session_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+                let mut statement = conn.prepare(
+                    "SELECT member_index, state FROM agent_host_approval_operations
+                      WHERE authorization_group_id = ?1 ORDER BY member_index",
+                )?;
+                let members = statement
+                    .query_map([group_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok((state, revision, members))
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn authorization_group_two_member_allow_executes_effect_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        let resolver = resolve_sequence(&approver, &[ID_APPROVE_ONCE, ID_APPROVE_ONCE]).await;
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let effect_counter = effects.clone();
+        let decision = crate::engine::interrupt::with_host_approval_effect_scope_for_tool(
+            "authorization_group_bridge_test",
+            "tool-call-compound-1",
+            tokio_util::sync::CancellationToken::new(),
+            async {
+                let decision = approver
+                    .approve_command("git push origin main && cargo build")
+                    .await?;
+                if decision.is_allowed()
+                    && crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                        "authorization_group_bridge_effect",
+                        &[serde_json::json!({"execute": {"command": "git push origin main && cargo build"}})],
+                    )
+                    .await
+                    .is_ok()
+                {
+                    effect_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(decision)
+            },
+            |decision| Some(decision.is_allowed()),
+        )
+        .await
+        .unwrap();
+        resolver.await.unwrap();
+        assert!(decision.is_allowed());
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let session_id = approver.session_id.to_string();
+        let tool_call_id: String = approver
+            .db
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT tool_call_id FROM agent_host_authorization_groups
+                      WHERE session_id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(tool_call_id, "tool-call-compound-1");
+        assert_eq!(
+            authorization_group_snapshot(&approver).await,
+            (
+                "completed".into(),
+                0,
+                vec![(0, "completed".into()), (1, "completed".into())]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_group_allow_then_decline_never_executes_effect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        let resolver = resolve_sequence(&approver, &[ID_APPROVE_ONCE, ID_REJECT]).await;
+        let decision = run_host_approval_effect_for_test(
+            approver.approve_command("git push origin main && cargo build"),
+            |decision| Some(decision.is_allowed()),
+        )
+        .await
+        .unwrap();
+        resolver.await.unwrap();
+        assert_eq!(decision, Decision::Deny);
+        let (state, revision, members) = authorization_group_snapshot(&approver).await;
+        assert_eq!((state.as_str(), revision), ("declined", 0));
+        assert_eq!(
+            members,
+            vec![(0, "cancelled".into()), (1, "cancelled".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_group_cancel_mid_group_cancels_every_member() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        ensure_fixture_lifecycle_owner(&approver).await;
+        let approver = Arc::new(approver);
+        let task_approver = approver.clone();
+        let mut raised = approver.interrupts.subscribe_raised();
+        let task = tokio::spawn(async move {
+            run_host_approval_effect_for_test(
+                task_approver.approve_command("git push origin main && cargo build"),
+                |decision| Some(decision.is_allowed()),
+            )
+            .await
+        });
+        let first = raised.recv().await.unwrap();
+        resolve_waiting_interrupt(
+            &approver.db,
+            &approver.interrupts,
+            first,
+            ResolveResponse::Single {
+                selected_id: ID_APPROVE_ONCE.into(),
+            },
+        )
+        .await;
+        let second = raised.recv().await.unwrap();
+        let root = approver
+            .db
+            .session_root_agent(approver.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            approver
+                .db
+                .transition_agent_instance(
+                    approver.session_id,
+                    root.agent_instance_id,
+                    root.revision,
+                    crate::db::agent_tree_decisions::AgentInstanceState::Cancelled,
+                    r#"{"state":"cancelled"}"#,
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await
+                .unwrap(),
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(_)
+        ));
+        assert!(approver.interrupts.resolve(second, ResolveResponse::Cancel));
+        let _ = task.await.unwrap();
+        let (state, _, members) = authorization_group_snapshot(&approver).await;
+        assert_eq!(state, "cancelled");
+        assert!(members.iter().all(|(_, state)| state == "cancelled"));
+    }
+
+    #[tokio::test]
+    async fn authorization_group_recovery_exposes_only_unanswered_member() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        ensure_fixture_lifecycle_owner(&approver).await;
+        let approver = Arc::new(approver);
+        let task_approver = approver.clone();
+        let mut raised = approver.interrupts.subscribe_raised();
+        let task = tokio::spawn(async move {
+            run_host_approval_effect_for_test(
+                task_approver.approve_command("git push origin main && cargo build"),
+                |decision| Some(decision.is_allowed()),
+            )
+            .await
+        });
+        let first = raised.recv().await.unwrap();
+        resolve_waiting_interrupt(
+            &approver.db,
+            &approver.interrupts,
+            first,
+            ResolveResponse::Single {
+                selected_id: ID_APPROVE_ONCE.into(),
+            },
+        )
+        .await;
+        let second = raised.recv().await.unwrap();
+        assert_eq!(
+            approver
+                .db
+                .reconcile_host_approval_dispatches(
+                    approver.session_id,
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await
+                .unwrap(),
+            0
+        );
+        let page = approver
+            .db
+            .recoverable_decision_requests_page(
+                approver.session_id,
+                None,
+                crate::db::agent_tree_decisions::MAX_AGENT_TREE_PAGE_SIZE,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(
+            approver
+                .db
+                .decision_request_for_interrupt(approver.session_id, second)
+                .await
+                .unwrap()
+                .unwrap()
+                .decision_request_id,
+            page.entries[0].decision_request_id,
+        );
+        let (state, revision, members) = authorization_group_snapshot(&approver).await;
+        assert_eq!((state.as_str(), revision), ("collecting", 0));
+        assert_eq!(members, vec![(0, "approved".into()), (1, "pending".into())]);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn authorization_group_standing_reject_precedes_group_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        let info = classify::classify("cargo build").simple_commands()[0].clone();
+        approver
+            .store
+            .record_command_reject(&info, Scope::Session)
+            .await
+            .unwrap();
+        let decision = run_host_approval_effect_for_test(
+            approver.approve_command("git push origin main && cargo build"),
+            |decision| Some(decision.is_allowed()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            decision,
+            Decision::StandingReject {
+                scope: Scope::Session
+            }
+        );
+        let session_id = approver.session_id.to_string();
+        let groups: i64 = approver
+            .db
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM agent_host_authorization_groups WHERE session_id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(groups, 0);
+    }
+
     #[tokio::test]
     async fn wrapper_prompt_shows_full_command_once_only() {
         // A wrapper (`bash -c …`) offers only the once verdict forms (Approve

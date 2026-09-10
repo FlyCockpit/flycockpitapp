@@ -40,7 +40,15 @@ fn test_env_mutex() -> &'static Mutex<()> {
 pub fn isolated_tempdir() -> tempfile::TempDir {
     #[cfg(target_os = "linux")]
     {
-        tempfile::tempdir_in("/dev/shm").expect("create isolated Cockpit home on tmpfs")
+        // Respect the platform-standard override so loaded acceptance runs can
+        // exercise the ordinary disk-backed fallback explicitly. Otherwise
+        // prefer tmpfs, but do not make its presence a correctness condition.
+        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+            return tempfile::tempdir_in(tmpdir).expect("create isolated Cockpit home in TMPDIR");
+        }
+        tempfile::tempdir_in("/dev/shm")
+            .or_else(|_| tempfile::tempdir())
+            .expect("create isolated Cockpit home")
     }
     #[cfg(not(target_os = "linux"))]
     {

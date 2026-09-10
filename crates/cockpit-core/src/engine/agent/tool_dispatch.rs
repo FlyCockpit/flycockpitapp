@@ -4601,27 +4601,6 @@ mod tests {
         })
     }
 
-    async fn park_next_interrupt(
-        db: crate::db::Db,
-        session_id: Uuid,
-        interrupts: Arc<crate::engine::interrupt::InterruptHub>,
-    ) {
-        for _ in 0..100 {
-            if let Some(row) = db
-                .list_open_interrupts(session_id)
-                .await
-                .unwrap()
-                .into_iter()
-                .next()
-            {
-                assert!(interrupts.park(row.interrupt_id).await);
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
-        panic!("timed out waiting for interrupt to park");
-    }
-
     async fn assert_parked_call_has_no_result(
         session: &Session,
         history: &[Message],
@@ -6063,11 +6042,14 @@ mod tests {
         let call = tool_call("interrupt_wait", serde_json::json!({}));
         let mut history = Vec::new();
         push_assistant_call(&mut history, &call);
-        let parker = tokio::spawn(park_next_interrupt(
-            session.db.clone(),
-            session.id,
-            interrupts,
-        ));
+        let mut raised = interrupts.subscribe_raised();
+        let parker = tokio::spawn(async move {
+            let interrupt_id = raised
+                .recv()
+                .await
+                .expect("interrupt raise publisher remains live");
+            assert!(interrupts.park(interrupt_id).await);
+        });
 
         let err = execute_ordinary_call(
             &env,
@@ -6166,11 +6148,14 @@ mod tests {
         );
         let mut history = Vec::new();
         push_assistant_call(&mut history, &call);
-        let parker = tokio::spawn(park_next_interrupt(
-            session.db.clone(),
-            session.id,
-            interrupts,
-        ));
+        let mut raised = interrupts.subscribe_raised();
+        let parker = tokio::spawn(async move {
+            let interrupt_id = raised
+                .recv()
+                .await
+                .expect("interrupt raise publisher remains live");
+            assert!(interrupts.park(interrupt_id).await);
+        });
 
         let err =
             execute_ordinary_call(&env, &mut history, &call, "question", Recovery::Clean, None)
@@ -6250,11 +6235,14 @@ mod tests {
         let mut history = Vec::new();
         push_assistant_call(&mut history, &call);
         let _gate = set_safety_gate_test_override(GateOutcome::Run { recheck: true });
-        let parker = tokio::spawn(park_next_interrupt(
-            session.db.clone(),
-            session.id,
-            interrupts,
-        ));
+        let mut raised = interrupts.subscribe_raised();
+        let parker = tokio::spawn(async move {
+            let interrupt_id = raised
+                .recv()
+                .await
+                .expect("interrupt raise publisher remains live");
+            assert!(interrupts.park(interrupt_id).await);
+        });
 
         let err = execute_ordinary_call(&env, &mut history, &call, "bash", Recovery::Clean, None)
             .await

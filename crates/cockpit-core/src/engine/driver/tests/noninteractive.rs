@@ -220,10 +220,16 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
             // accident under parallel nextest load.
             .start_blocking();
         // This regression intentionally drives five real journaled provider
-        // requests. Keep the production durability barrier and isolate only
-        // its temporary spool from unrelated shared-disk fsync latency.
-        let fixture_root = cockpit_test_support::latency_isolated_tempdir();
+        // requests on ordinary disk-backed temporary storage. Progress is
+        // observed at the production durable-commit boundary below, so tmpfs
+        // may optimize other fixtures but is not required for correctness.
+        let fixture_root = tempfile::tempdir().unwrap();
         let (mut driver, tmp) = test_driver_with_url_vnext_in(8, provider.base_url(), fixture_root);
+        let mut dispatch_commits = driver
+            .session
+            .external_journal()
+            .expect("scheduler fixture installs the production journal")
+            .subscribe_dispatch_commits();
         std::fs::write(tmp.path().join("middle.txt"), "middle body").unwrap();
 
         let config_dir = tmp.path().join(".cockpit");
@@ -309,17 +315,27 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
             tokio::pin!(run);
             for expected_request in 1..=3 {
                 // Request one is the root planning turn. Requests two and three
-                // can only be the two distinct delegated calls. Poll the driver
-                // concurrently with the provider readiness channel: merely pinning
-                // a future does not drive it.
+                // can only be the two distinct delegated calls. Drive the
+                // driver concurrently with durable receipt observation:
+                // merely pinning a future does not drive it.
+                tokio::select! {
+                    result = &mut run => panic!(
+                        "driver completed after only {} provider requests: {result:?}",
+                        expected_request - 1,
+                    ),
+                    result = dispatch_commits.wait_for(|receipt| {
+                        receipt.as_ref().is_some_and(|receipt| {
+                            receipt.sequence() >= expected_request
+                        })
+                    }) => {
+                        result.expect("journal commit observer remains live");
+                    }
+                }
                 let request = tokio::select! {
                     result = &mut run => panic!(
                         "driver completed after only {} provider requests: {result:?}",
                         expected_request - 1,
                     ),
-                    // The provider's existing short failure guard prevents a
-                    // broken admission path from hanging the suite; overlap is
-                    // proved by the response gate, never by this timeout.
                     request = provider.next_request_ready() => request,
                 };
                 assert!(request.request_line.starts_with("POST "));
@@ -331,6 +347,14 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
             child_response_gate.add_permits(2);
             run.await.unwrap();
         }
+        dispatch_commits
+            .wait_for(|receipt| {
+                receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.sequence() >= 5)
+            })
+            .await
+            .expect("journal commit observer remains live");
         drop(approver);
 
         let mut events = Vec::new();

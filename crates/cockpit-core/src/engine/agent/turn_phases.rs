@@ -5,6 +5,7 @@ use super::*;
 pub(crate) struct InferenceJournalAttempt {
     journal: Arc<crate::external_journal::ExternalJournal>,
     ticket: crate::external_journal::DispatchTicket,
+    dispatch_commit: crate::external_journal::DispatchCommit,
 }
 
 pub(crate) async fn prepare_inference_journal(
@@ -56,7 +57,12 @@ pub(crate) async fn prepare_inference_journal(
         .begin_dispatch(prepared.operation_id, &projection, now)
         .await
         .map_err(|_| anyhow::anyhow!("inference audit dispatching commit failed"))?;
-    Ok(Some(InferenceJournalAttempt { journal, ticket }))
+    let dispatch_commit = ticket.dispatch_commit().clone();
+    Ok(Some(InferenceJournalAttempt {
+        journal,
+        ticket,
+        dispatch_commit,
+    }))
 }
 
 pub(crate) async fn settle_inference_journal_success(
@@ -96,7 +102,7 @@ pub(crate) async fn settle_inference_journal_error(
     if crate::engine::model::is_cancelled(error) {
         if attempt
             .journal
-            .request_cancellation(attempt.ticket.operation_id, now)
+            .request_cancellation(attempt.dispatch_commit.operation_id(), now)
             .await
             .is_err()
         {
@@ -4626,27 +4632,6 @@ mod tests {
         ))
     }
 
-    async fn park_next_interrupt(
-        db: crate::db::Db,
-        session_id: uuid::Uuid,
-        interrupts: Arc<crate::engine::interrupt::InterruptHub>,
-    ) {
-        for _ in 0..100 {
-            if let Some(row) = db
-                .list_open_interrupts(session_id)
-                .await
-                .unwrap()
-                .into_iter()
-                .next()
-            {
-                assert!(interrupts.park(row.interrupt_id).await);
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
-        panic!("timed out waiting for interrupt to park");
-    }
-
     async fn deferred_plan_for_tests(
         agent: &Agent,
         session: Arc<Session>,
@@ -5875,11 +5860,14 @@ mod tests {
         plan.attach_parkable_interrupt_hub_for_tests(interrupts.clone(), Some(approver));
 
         let mut history = Vec::new();
-        let parker = tokio::spawn(park_next_interrupt(
-            session.db.clone(),
-            session.id,
-            interrupts,
-        ));
+        let mut raised = interrupts.subscribe_raised();
+        let parker = tokio::spawn(async move {
+            let interrupt_id = raised
+                .recv()
+                .await
+                .expect("interrupt raise publisher remains live");
+            assert!(interrupts.park(interrupt_id).await);
+        });
         let err = plan
             .advance_for_driver(&agent, &mut history)
             .await
@@ -6114,10 +6102,23 @@ mod tests {
 
         let record = session
             .db
-            .external_operation(attempt.ticket.operation_id)
+            .external_operation(attempt.dispatch_commit.operation_id())
             .await
             .unwrap()
             .expect("durable journal record exists after the barrier");
+        assert_eq!(
+            attempt.dispatch_commit.operation_id(),
+            attempt.ticket.operation_id
+        );
+        assert_eq!(
+            attempt.dispatch_commit.journal_version(),
+            attempt.ticket.version()
+        );
+        assert_eq!(
+            attempt.dispatch_commit.state(),
+            crate::db::external_journal::ExternalJournalState::Dispatching
+        );
+        assert!(attempt.dispatch_commit.sequence() >= 1);
         assert_eq!(
             record.state,
             crate::db::external_journal::ExternalJournalState::Dispatching,

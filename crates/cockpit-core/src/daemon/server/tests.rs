@@ -21342,6 +21342,7 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "compact"
             | "resume_from_compaction"
             | "pin"
+            | "promote_conversation_rule"
             | "refresh_env"
             | "refresh_config"
             | "refresh_host_capabilities"
@@ -21783,7 +21784,13 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             project_id: "proj".into(),
             description: "notify".into(),
             declaration: proto::SealedActionDeclaration::CommandArgument {
-                argv: vec!["notify".into(), "{{sealed_value}}".into()],
+                argv: vec![
+                    std::env::current_exe()
+                        .expect("authz fixture executable")
+                        .to_string_lossy()
+                        .into_owned(),
+                    "{{sealed_value}}".into(),
+                ],
             },
         },
         "revise_sealed_action_description" => Request::ReviseSealedActionDescription {

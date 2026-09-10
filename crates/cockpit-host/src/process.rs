@@ -72,38 +72,6 @@ pub enum GroupPopulation {
 #[cfg(unix)]
 pub const PROCESS_GROUP_MEMBERSHIP_UNATTRIBUTABLE: &str = "process_group_membership_unattributable";
 
-/// Arm a direct child to die when its spawning process dies uncatchably.
-///
-/// Linux `PR_SET_PDEATHSIG` is inherited across exec but not fork, which is
-/// exactly the desired boundary: the daemon's direct launcher dies with the
-/// daemon, and launchers such as bwrap propagate that death through their own
-/// child-containment contract. Other platforms use their native containment
-/// owner (for example a Windows kill-on-close Job Object).
-pub fn configure_parent_death_signal(command: &mut tokio::process::Command) {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::process::CommandExt as _;
-
-        let parent = unsafe { libc::getpid() };
-        // SAFETY: the closure runs after fork and before exec. It invokes only
-        // async-signal-safe libc operations and constructs no shared-process
-        // state. Checking PPID after arming closes the fork -> prctl race.
-        unsafe {
-            command.as_std_mut().pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::getppid() != parent {
-                    return Err(std::io::Error::from_raw_os_error(libc::ECANCELED));
-                }
-                Ok(())
-            });
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = command;
-}
-
 /// A descendant-containment boundary prepared before spawn and attached
 /// before child code is allowed to execute. Unix uses a fresh process group.
 /// Windows uses a pre-created kill-on-close Job Object and a suspended child,
@@ -169,15 +137,20 @@ impl ProcessTreeGuard {
     }
 
     /// Apply spawn flags so the next child can join this guard. Never starts
-    /// user instructions: Windows uses `CREATE_SUSPENDED`, Unix a fresh group,
-    /// and Linux additionally kills the direct child if this parent dies.
+    /// user instructions: Windows uses `CREATE_SUSPENDED`, Unix a fresh group.
+    ///
+    /// Do not install Linux `PR_SET_PDEATHSIG` here. Linux defines its parent
+    /// as the particular thread that called `fork`, not the containing
+    /// process. Commands are commonly spawned from Tokio worker threads, so a
+    /// worker's ordinary retirement would spuriously kill a healthy child.
+    /// Explicit shutdown remains owned by this guard; crash containment must
+    /// come from a process-scoped sandbox primitive.
     pub fn apply_spawn_flags(&self, command: &mut tokio::process::Command) {
         let _ = self;
         #[cfg(unix)]
         {
             command.process_group(0);
         }
-        configure_parent_death_signal(command);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt as _;

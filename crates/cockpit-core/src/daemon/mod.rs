@@ -2357,12 +2357,23 @@ async fn run_foreground_inner_with_boot_db(
     // Schedule the accept loop before startup logging after bind. This keeps
     // a slow log sink from extending the socket-visible/hello-ready interval.
     let accept = tokio::spawn(server::run_accept_loop(ctx.clone(), listener));
+    // Retention is ordinary periodic maintenance, not database/config boot or
+    // crash-authority reconciliation. Start the initial pass only after the
+    // accept loop is runnable so a contended sweep cannot delay the first
+    // protocol hello. The pass uses the same transactional implementation as
+    // later interval ticks and may safely overlap client reads.
+    let initial_retention = tokio::spawn(server::run_retention_pass(
+        ctx.db.clone(),
+        server::retention_config(),
+        chrono::Utc::now().timestamp(),
+    ));
     timer.phase("socket_bind");
     boot_dbg!("after_bind");
     timer.phase("endpoint_published");
     boot_dbg!("after_endpoint_publish");
     timer.done();
     let result = accept.await.context("daemon accept loop task stopped")?;
+    let _ = initial_retention.await;
 
     // The accept loop normally stops because `request_shutdown` already began
     // the drain. Do not call it a second time here: a second request is the

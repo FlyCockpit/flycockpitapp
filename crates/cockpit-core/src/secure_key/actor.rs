@@ -557,6 +557,32 @@ impl SecureKeyActor {
             ))),
             reconciler,
             owns_default_store,
+            None,
+        )
+    }
+
+    /// Start the production actor from the secret-store authority already
+    /// resolved by daemon boot. The daemon uses one resolution for redaction,
+    /// context construction, and this actor so startup never repeats the same
+    /// durable vault migration/open sequence before publishing its socket.
+    pub(crate) fn start_production_with_effective_store(
+        db: Db,
+        reconciler: Arc<dyn ConsumerReconciler>,
+        effective: super::resolve::EffectiveSecretStore,
+    ) -> Result<Self, SecureKeyError> {
+        let owns_default_store =
+            effective.placement == cockpit_proto::SecretStorePlacement::Keyring;
+        let installation =
+            InstallationIdentity::from_hex_checked(effective.vault.installation_hex().to_owned())
+                .map_err(|error| SecureKeyError::Internal(error.to_string()))?;
+        Self::start_inner(
+            db,
+            Some(Box::new(super::vault_store::VaultNativeStore::new(
+                effective.vault,
+            ))),
+            reconciler,
+            owns_default_store,
+            Some(installation),
         )
     }
 
@@ -567,7 +593,7 @@ impl SecureKeyActor {
         store: Box<dyn NativeKeyStore>,
         reconciler: Arc<dyn ConsumerReconciler>,
     ) -> Result<Self, SecureKeyError> {
-        Self::start_inner(db, Some(store), reconciler, false)
+        Self::start_inner(db, Some(store), reconciler, false, None)
     }
 
     fn start_inner(
@@ -575,22 +601,26 @@ impl SecureKeyActor {
         injected_store: Option<Box<dyn NativeKeyStore>>,
         reconciler: Arc<dyn ConsumerReconciler>,
         owns_default_store: bool,
+        installation: Option<InstallationIdentity>,
     ) -> Result<Self, SecureKeyError> {
-        let installation = db
-            .blocking_write_for_sync_maintenance(|conn| {
-                conn.execute_batch("BEGIN IMMEDIATE;")?;
-                let result = ensure_installation_identity_conn(conn);
-                match &result {
-                    Ok(_) => {
-                        conn.execute_batch("COMMIT;")?;
+        let installation = match installation {
+            Some(installation) => installation,
+            None => db
+                .blocking_write_for_sync_maintenance(|conn| {
+                    conn.execute_batch("BEGIN IMMEDIATE;")?;
+                    let result = ensure_installation_identity_conn(conn);
+                    match &result {
+                        Ok(_) => {
+                            conn.execute_batch("COMMIT;")?;
+                        }
+                        Err(_) => {
+                            let _ = conn.execute_batch("ROLLBACK;");
+                        }
                     }
-                    Err(_) => {
-                        let _ = conn.execute_batch("ROLLBACK;");
-                    }
-                }
-                result
-            })
-            .map_err(|e| SecureKeyError::Internal(e.to_string()))?;
+                    result
+                })
+                .map_err(|e| SecureKeyError::Internal(e.to_string()))?,
+        };
 
         let (tx, rx) = mpsc::sync_channel::<Op>(SECURE_KEY_QUEUE_CAPACITY);
         let register_on_thread = owns_default_store && injected_store.is_none();

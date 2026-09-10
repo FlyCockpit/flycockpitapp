@@ -38364,7 +38364,7 @@ async fn attach_since_seq_replays_retracted_user_row_identity() {
 async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     use crate::config::providers::{
-        ActiveModelRef, ProviderEntry, ProvidersConfig, ThinkingMode, WireApi,
+        ActiveModelRef, ModelTrust, ProviderEntry, ProvidersConfig, ThinkingMode, WireApi,
     };
 
     let mut provider = retraction_acceptance_model_server().await;
@@ -38375,6 +38375,11 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         ProviderEntry {
             url: model_url,
             wire_api: WireApi::Completions,
+            // This acceptance test must observe a live reasoning delta before
+            // cancelling the intentionally hanging stream. Untrusted routes
+            // correctly withhold every plaintext delta until classification,
+            // which cannot finish while the stream is open.
+            trust: Some(ModelTrust::Trusted),
             ..ProviderEntry::default()
         },
     );
@@ -38397,6 +38402,10 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         );
     let mut extended = crate::config::extended::ExtendedConfig::default();
     extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxIntent::Off;
+    // Keep automatic title work on a distinct, unavailable utility selector.
+    // It then terminates at model resolution without consuming this fixture's
+    // strictly ordered foreground provider responses.
+    extended.auto_title = Some("metadata-fixture:disabled".to_string());
     let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
         providers, extended,
     ));
@@ -38409,7 +38418,6 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
     ));
     std::fs::write(project.path().join("fixture.txt"), "fixture body").unwrap();
     trust_workspace_root(&ctx, project.path()).await;
-
     let attach_request = |session_id| Request::Attach {
         session_id,
         since_seq: None,
@@ -38858,33 +38866,46 @@ async fn retraction_acceptance_model_server() -> cockpit_test_support::provider:
     });
     let resent = serde_json::json!({
         "id": "c", "model": "local",
-        "choices": [{ "delta": { "content": "resent answer" }, "finish_reason": null }]
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "content": "resent answer",
+                "reasoning_content": null,
+                "tool_calls": []
+            },
+            "finish_reason": null
+        }],
+        "usage": null
     });
     let visible = serde_json::json!({
         "id": "c", "model": "local",
-        "choices": [{ "delta": { "content": "visible answer" }, "finish_reason": null }]
-    });
-    let tool = serde_json::json!({
-        "id": "c", "model": "local",
-        "choices": [{ "delta": { "tool_calls": [{
-            "index": 0, "id": "read-before-cancel", "type": "function",
-            "function": { "name": "read", "arguments": "{\\\"path\\\":\\\"fixture.txt\\\"}" }
-        }] }, "finish_reason": null }]
-    });
-    let tool_finish = serde_json::json!({
-        "id": "c", "model": "local",
-        "choices": [{ "delta": {}, "finish_reason": "tool_calls" }]
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "content": "visible answer",
+                "reasoning_content": null,
+                "tool_calls": []
+            },
+            "finish_reason": null
+        }],
+        "usage": null
     });
     ScriptedProvider::builder()
         .dialect(WireDialect::ChatCompletions)
         .turn(Turn::RawSseThenHang(format!(
             "data: {assistant_role}\n\ndata: {reasoning}\n\n"
         )))
-        .turn(Turn::RawSse(format!("data: {resent}\n\ndata: [DONE]\n\n")))
-        .turn(Turn::RawSseThenHang(format!("data: {visible}\n\n")))
         .turn(Turn::RawSse(format!(
-            "data: {tool}\n\ndata: {tool_finish}\n\ndata: [DONE]\n\n"
+            "data: {assistant_role}\n\ndata: {resent}\n\ndata: [DONE]\n\n"
         )))
+        .turn(Turn::RawSseThenHang(format!(
+            "data: {assistant_role}\n\ndata: {visible}\n\n"
+        )))
+        .turn(Turn::ToolCall {
+            id: "read-before-cancel".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({"path": "fixture.txt"}),
+        })
         .turn(Turn::SseHeadersThenHang)
         .turn(Turn::RawSseThenHang(format!(
             "data: {assistant_role}\n\ndata: {reasoning}\n\n"

@@ -19,6 +19,7 @@ impl Session {
             title_recovery_nudge_state: row.title_recovery_nudge_state,
             title_failure_noticed: self.title_failure_noticed.load(Ordering::Relaxed),
             last_time_prelude: self.last_time_prelude.lock().unwrap().clone(),
+            replay_time_prelude: self.replay_time_prelude.lock().unwrap().clone(),
         })
     }
 
@@ -33,7 +34,16 @@ impl Session {
         // set to contend with. The durable user row has already been removed
         // before this rollback is called; restore the consumed prelude even if
         // a concurrent manual title update wins the separate title rollback.
-        *self.last_time_prelude.lock().unwrap() = snapshot.last_time_prelude.clone();
+        let consumed_prelude = {
+            let mut last = self.last_time_prelude.lock().unwrap();
+            let consumed = (*last != snapshot.last_time_prelude)
+                .then(|| last.as_ref().cloned())
+                .flatten();
+            *last = snapshot.last_time_prelude.clone();
+            consumed
+        };
+        *self.replay_time_prelude.lock().unwrap() =
+            consumed_prelude.or(snapshot.replay_time_prelude);
         let session_id = self.live_id();
         let prior_title = snapshot.title.clone();
         let generated_title = generated_title.map(str::to_owned);
@@ -574,6 +584,10 @@ impl Session {
     /// per-session "last prelude" stamp is the side-effect of a
     /// `Some` return — call only when actually about to send.
     pub fn take_time_prelude(&self, interval_minutes: u32) -> Option<String> {
+        if let Some(replay) = self.replay_time_prelude.lock().unwrap().take() {
+            *self.last_time_prelude.lock().unwrap() = Some(replay);
+            return Some(format!("[time: {}]", replay.to_rfc3339()));
+        }
         let now = Utc::now();
         let mut last = self.last_time_prelude.lock().unwrap();
         let should_inject = match *last {
@@ -655,6 +669,39 @@ mod metadata_tests {
             session.take_time_prelude(5).is_some(),
             "the retract rollback restores the pre-send time-prelude state"
         );
+    }
+
+    #[tokio::test]
+    async fn retract_replays_the_exact_consumed_time_prelude_across_repeated_cancels() {
+        let session = Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            PathBuf::from("/title-retract-exact-time"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let first_snapshot = session.title_progress_snapshot().await.unwrap();
+        let first = session.take_time_prelude(5).unwrap();
+        session
+            .restore_title_progress_after_retract(first_snapshot, None)
+            .await
+            .unwrap();
+
+        let second_snapshot = session.title_progress_snapshot().await.unwrap();
+        assert_eq!(
+            session.take_time_prelude(5).as_deref(),
+            Some(first.as_str())
+        );
+        session
+            .restore_title_progress_after_retract(second_snapshot, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session.take_time_prelude(5).as_deref(),
+            Some(first.as_str())
+        );
+        assert!(session.take_time_prelude(5).is_none());
     }
 
     #[test]

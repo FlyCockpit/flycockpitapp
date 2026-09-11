@@ -9691,10 +9691,12 @@ pub(super) async fn run_worker(
     // live loop is not born with a ready maintenance arm that can win
     // Tokio's randomized select over an already-queued Shutdown.
     agent_tree_event_relay.tick().await;
-    if abort_startup_if_only_stop(&mut startup_inbox, &mut work_rx) {
-        driver_handle.abort();
-        return;
-    }
+    // Once startup reconciliation has published this worker to attach callers,
+    // queued stop work must enter the ordinary worker loop. That path owns the
+    // generation-bound lock teardown and durable `Session::end` receipt. The
+    // pre-publication fast-exit checks above remain safe; fast-returning here
+    // would let the task join without completing terminal cleanup.
+    let _ = startup_inbox.drain(&mut work_rx);
     let stop = 'worker: loop {
         if consume_host_capability_terminalization_failure_fence(
             &host_capability_terminalization_failure_fence,

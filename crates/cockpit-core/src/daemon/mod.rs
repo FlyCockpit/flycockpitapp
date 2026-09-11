@@ -3754,7 +3754,7 @@ mod tests {
             )
             .await
         });
-        wait_until(|| paths.socket.exists(), Duration::from_secs(30)).await;
+        wait_until(|| paths.socket.exists(), Duration::from_secs(2)).await;
 
         // The clients attach through the first-party Code-root surface: the
         // generic `Request::Attach` route can no longer express a Code root,
@@ -3820,14 +3820,8 @@ mod tests {
         );
 
         drop(client_b);
-        let diag_started = std::time::Instant::now();
-        let joined = tokio::time::timeout(Duration::from_secs(30), daemon_task).await;
-        eprintln!(
-            "EPHEMERAL-DIAG daemon join outcome after {:?}: completed={}",
-            diag_started.elapsed(),
-            joined.is_ok()
-        );
-        joined
+        tokio::time::timeout(Duration::from_secs(3), daemon_task)
+            .await
             .expect("last socket client must drain and reap the ephemeral owner")
             .expect("daemon task joins")
             .expect("daemon drain cancels attached session work cleanly");
@@ -3939,7 +3933,7 @@ mod tests {
         let harness = DaemonTestHarness::new();
         let _env =
             crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(&harness.state_home).await;
-        let dir = tempfile::tempdir().expect("paths");
+        let dir = cockpit_test_support::isolated_tempdir();
         let paths = test_paths(&dir);
         let endpoint = endpoint_file_for_state(paths.pid_file.parent().expect("state dir"));
         std::fs::create_dir(&endpoint).expect("block endpoint file publication");

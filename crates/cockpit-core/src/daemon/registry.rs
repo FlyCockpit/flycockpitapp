@@ -2742,7 +2742,7 @@ impl SessionRegistry {
         // Snapshot + take the join handles. Taking them out of the map means
         // a worker that exits on its own mid-drain (and calls `forget`)
         // can't race us for its handle.
-        let mut joins: Vec<(Uuid, WorkerJoin)> = {
+        let joins: Vec<(Uuid, WorkerJoin)> = {
             let mut joins = crate::sync::lock_or_recover(&self.inner.worker_joins);
             joins.drain().collect()
         };

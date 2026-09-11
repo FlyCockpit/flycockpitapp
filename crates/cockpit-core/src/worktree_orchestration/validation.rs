@@ -333,16 +333,45 @@ async fn run_wrapper(
             .kill_on_drop(true);
         #[cfg(unix)]
         cmd.process_group(0);
-        cockpit_host::process::spawn_pinned(cmd)
+        #[cfg(windows)]
+        let containment = cockpit_host::process::ProcessTreeGuard::prepare(&mut cmd)?;
+        let child = cockpit_host::process::spawn_pinned(cmd)?;
+        #[cfg(windows)]
+        containment.attach(&child)?;
+        #[cfg(windows)]
+        let result = (child, containment);
+        #[cfg(not(windows))]
+        let result = child;
+        Ok::<_, anyhow::Error>(result)
     };
+    #[cfg(target_os = "linux")]
+    let wrapped_child = supervised.with_context(|| {
+        format!(
+            "launching `{}` in `{}`",
+            validation.wrapper.display(),
+            validation.primary.display()
+        )
+    })?;
+    #[cfg(windows)]
+    let (wrapped_child, containment) = supervised.with_context(|| {
+        format!(
+            "launching `{}` in `{}`",
+            validation.wrapper.display(),
+            validation.primary.display()
+        )
+    })?;
+    #[cfg(all(not(target_os = "linux"), not(windows)))]
+    let wrapped_child = supervised.with_context(|| {
+        format!(
+            "launching `{}` in `{}`",
+            validation.wrapper.display(),
+            validation.primary.display()
+        )
+    })?;
     let mut child = GroupedWrapper {
-        child: supervised.with_context(|| {
-            format!(
-                "launching `{}` in `{}`",
-                validation.wrapper.display(),
-                validation.primary.display()
-            )
-        })?,
+        child: wrapped_child,
+        #[cfg(windows)]
+        containment,
         containment_pending: true,
     };
     let status = child.wait().await.with_context(|| {
@@ -369,6 +398,8 @@ struct GroupedWrapper {
     child: cockpit_host::process::ValidationSupervisor,
     #[cfg(not(target_os = "linux"))]
     child: tokio::process::Child,
+    #[cfg(windows)]
+    containment: cockpit_host::process::ProcessTreeGuard,
     // Single-owner teardown obligation, not containment evidence or a lock.
     // Only a Quiesced outcome (or a successful non-Unix direct wait) consumes
     // it; cancellation and every earlier error leave Drop responsible.
@@ -416,6 +447,10 @@ impl GroupedWrapper {
         #[cfg(not(unix))]
         {
             let status = self.child.wait().await?;
+            #[cfg(windows)]
+            self.containment
+                .terminate_and_wait_empty(WRAPPER_GROUP_TEARDOWN)
+                .map_err(std::io::Error::other)?;
             self.containment_pending = false;
             Ok(status)
         }
@@ -432,12 +467,29 @@ impl Drop for GroupedWrapper {
             eprintln!("fatal: validation supervisor could not prove workload quiescence: {error}");
             std::process::abort();
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(all(not(target_os = "linux"), not(windows)))]
         let _ =
             require_wrapper_containment(cockpit_host::process::terminate_group_kill_wait_status(
                 &mut self.child,
                 WRAPPER_GROUP_TEARDOWN,
             ));
+        #[cfg(windows)]
+        {
+            if let Err(error) = self
+                .containment
+                .terminate_and_wait_empty(WRAPPER_GROUP_TEARDOWN)
+            {
+                eprintln!("fatal: validation job did not become empty: {error:#}");
+                std::process::abort();
+            }
+            match self.child.try_wait() {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => {
+                    eprintln!("fatal: validation wrapper was not reapable after job quiescence");
+                    std::process::abort();
+                }
+            }
+        }
     }
 }
 

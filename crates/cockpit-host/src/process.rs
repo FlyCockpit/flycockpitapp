@@ -1459,6 +1459,38 @@ impl ProcessTreeGuard {
         }
         Ok(info.ActiveProcesses)
     }
+
+    /// Terminate the Windows job and block on the job handle's kernel empty
+    /// transition. A direct wrapper exit is not sufficient because its
+    /// descendants remain members and may still mutate the overlaid tree.
+    #[cfg(windows)]
+    pub fn terminate_and_wait_empty(&self, timeout: Duration) -> anyhow::Result<()> {
+        use windows_sys::Win32::{
+            Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+            System::{JobObjects::TerminateJobObject, Threading::WaitForSingleObject},
+        };
+        let job = self
+            .job
+            .lock()
+            .map_err(|_| anyhow::anyhow!("process tree job lock poisoned"))?
+            .ok_or_else(|| anyhow::anyhow!("process tree job already closed"))?;
+        if unsafe { TerminateJobObject(job, 1) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+        match unsafe { WaitForSingleObject(job, millis) } {
+            WAIT_OBJECT_0 => {
+                let active = self.active_process_count()?;
+                if active == 0 {
+                    Ok(())
+                } else {
+                    anyhow::bail!("job signaled while {active} processes remain")
+                }
+            }
+            WAIT_TIMEOUT => anyhow::bail!("job did not become empty before deadline"),
+            _ => Err(std::io::Error::last_os_error().into()),
+        }
+    }
 }
 
 /// Wait until a Unix child has exited without reaping it.

@@ -1481,14 +1481,30 @@ impl ForegroundMetadataGuard {
         let lifetime = acquire_daemon_lifetime(&pid_file).with_context(|| {
             format!("acquiring daemon lifetime lock for {}", pid_file.display())
         })?;
-        Ok(Self {
+        Ok(Self::new_with_lifetime(
+            pid_file,
+            socket,
+            endpoint_record,
+            receipt,
+            lifetime,
+        ))
+    }
+
+    pub fn new_with_lifetime(
+        pid_file: PathBuf,
+        socket: PathBuf,
+        endpoint_record: Option<PathBuf>,
+        receipt: DaemonPidReceipt,
+        lifetime: DaemonLifetimeGuard,
+    ) -> Self {
+        Self {
             pid_file,
             socket,
             endpoint_record,
             receipt,
             lifetime: Some(lifetime),
             armed: true,
-        })
+        }
     }
 
     pub fn cleanup(&mut self) -> anyhow::Result<()> {

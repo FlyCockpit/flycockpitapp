@@ -2188,6 +2188,11 @@ async fn run_foreground_inner_with_boot_db(
     // touching the shared socket so a losing concurrent starter cannot unlink
     // the winner's newly bound endpoint.
     boot_dbg!("before_reserve");
+    // Lifetime is acquired before the short metadata transaction. Cleanup
+    // follows the same lifetime -> lifecycle order, preventing inversion, and
+    // no PID receipt is ever observable without its kernel witness held.
+    let daemon_lifetime = cockpit_host::daemon_lifecycle::acquire_daemon_lifetime(&paths.pid_file)
+        .with_context(|| format!("acquiring daemon lifetime for {}", paths.pid_file.display()))?;
     let pid_receipt = reclaim_stale_and_reserve(
         &paths.pid_file,
         &paths.socket,
@@ -2198,12 +2203,13 @@ async fn run_foreground_inner_with_boot_db(
     .with_context(|| format!("reserving pid file {}", paths.pid_file.display()))?;
     timer.phase("pid_reserve");
     boot_dbg!("after_reserve");
-    let mut metadata_guard = ForegroundMetadataGuard::new(
+    let mut metadata_guard = ForegroundMetadataGuard::new_with_lifetime(
         paths.pid_file.clone(),
         paths.socket.clone(),
         endpoint_record,
         pid_receipt.clone(),
-    )?;
+        daemon_lifetime,
+    );
     match std::fs::remove_file(&paths.socket) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

@@ -1161,18 +1161,22 @@ pub async fn wait_for_restart_release(
     timeout: Duration,
 ) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
-    #[cfg(target_os = "linux")]
-    if let Some(process) = witness.process {
-        if !matches!(
-            tokio::time::timeout_at(deadline, process.wait_for_exit()).await,
-            Ok(Ok(()))
-        ) {
-            return false;
-        }
-    }
     let Some(lifetime) = witness.lifetime else {
         return false;
     };
+    #[cfg(target_os = "linux")]
+    if let Some(process) = witness.process {
+        // Start both kernel waits together. The advisory lock is the portable
+        // contract; pidfd is an additional exact-process fast path and must
+        // not consume the lock witness's deadline before it is armed.
+        let (process_exit, lifetime_release) = tokio::join!(
+            tokio::time::timeout_at(deadline, process.wait_for_exit()),
+            lifetime.wait(timeout),
+        );
+        return matches!(process_exit, Ok(Ok(())))
+            && lifetime_release.is_ok_and(|released| released)
+            && restart_paths_released(paths, witness.expected_pid);
+    }
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     lifetime
         .wait(remaining)

@@ -18,9 +18,8 @@ const EMPTY_PROMPT: &str = "/";
 const MAX_ITEMS: u32 = 32;
 
 pub struct MockSecretService {
-    daemon: Child,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
-    service: Option<JoinHandle<()>>,
+    owner: Option<JoinHandle<()>>,
     pub address: String,
 }
 
@@ -29,10 +28,18 @@ impl Drop for MockSecretService {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
-        let _ = self.daemon.kill();
-        let _ = self.daemon.wait();
-        if let Some(handle) = self.service.take() {
-            let _ = handle.join();
+        if let Some(owner) = self.owner.take() {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                // The owner performs all child teardown before it exits. Do
+                // not synchronously join it from a Tokio runtime worker.
+                let _ = std::thread::Builder::new()
+                    .name("cockpit-e2e-secret-service-reaper".into())
+                    .spawn(move || {
+                        let _ = owner.join();
+                    });
+            } else {
+                let _ = owner.join();
+            }
         }
     }
 }
@@ -67,77 +74,84 @@ fn hermetic_command(path: &Path) -> Command {
     cmd
 }
 
-struct StartingMockSecretService {
-    daemon: KillOnDrop,
+struct StartingMockSecretService<R> {
     stop: tokio::sync::oneshot::Sender<()>,
-    service: JoinHandle<()>,
-    address: String,
-    sync_ready: Option<std::sync::mpsc::Receiver<()>>,
-    async_ready: Option<tokio::sync::oneshot::Receiver<()>>,
+    owner: JoinHandle<()>,
+    ready: R,
 }
 
-impl StartingMockSecretService {
-    fn finish(mut self) -> MockSecretService {
+impl<R> StartingMockSecretService<R> {
+    fn finish(self, address: String) -> MockSecretService {
         MockSecretService {
-            daemon: self.daemon.0.take().expect("dbus-daemon child"),
             stop: Some(self.stop),
-            service: Some(self.service),
-            address: self.address,
+            owner: Some(self.owner),
+            address,
         }
     }
 }
 
-fn begin_mock_secret_service() -> StartingMockSecretService {
-    let dbus = resolve_host_binary("dbus-daemon");
-    let daemon = hermetic_command(&dbus)
-        .args(["--session", "--nofork", "--print-address=1"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn dbus-daemon for mock secret service");
-    let mut daemon = KillOnDrop(Some(daemon));
-    let mut address = String::new();
-    BufReader::new(
-        daemon
-            .0
-            .as_mut()
-            .expect("dbus-daemon child")
-            .stdout
-            .take()
-            .expect("dbus-daemon stdout"),
-    )
-    .read_line(&mut address)
-    .expect("read dbus-daemon address");
-    let address = address.trim().to_string();
-    assert!(
-        !address.is_empty(),
-        "dbus-daemon printed no session address"
-    );
+enum ReadySender {
+    Sync(std::sync::mpsc::SyncSender<String>),
+    Async(tokio::sync::oneshot::Sender<String>),
+}
 
-    let address_for_thread = address.clone();
-    let (sync_ready_tx, sync_ready_rx) = std::sync::mpsc::sync_channel(1);
-    let (async_ready_tx, async_ready_rx) = tokio::sync::oneshot::channel();
+impl ReadySender {
+    fn send(self, address: String) {
+        match self {
+            Self::Sync(sender) => {
+                let _ = sender.send(address);
+            }
+            Self::Async(sender) => {
+                let _ = sender.send(address);
+            }
+        }
+    }
+}
+
+fn begin_mock_secret_service<R>(ready: R, sender: ReadySender) -> StartingMockSecretService<R> {
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let handle = std::thread::Builder::new()
         .name("cockpit-e2e-secret-service".into())
         .spawn(move || {
+            let dbus = resolve_host_binary("dbus-daemon");
+            let daemon = hermetic_command(&dbus)
+                .args(["--session", "--nofork", "--print-address=1"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn dbus-daemon for mock secret service");
+            let mut daemon = KillOnDrop(Some(daemon));
+            let mut address = String::new();
+            BufReader::new(
+                daemon
+                    .0
+                    .as_mut()
+                    .expect("dbus-daemon child")
+                    .stdout
+                    .take()
+                    .expect("dbus-daemon stdout"),
+            )
+            .read_line(&mut address)
+            .expect("read dbus-daemon address");
+            let address = address.trim().to_string();
+            assert!(
+                !address.is_empty(),
+                "dbus-daemon printed no session address"
+            );
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("secret-service runtime");
             runtime.block_on(async move {
-                serve(&address_for_thread, sync_ready_tx, async_ready_tx, stop_rx).await;
+                serve(&address, sender, stop_rx).await;
             });
         })
         .expect("spawn secret-service thread");
 
     StartingMockSecretService {
-        daemon,
         stop: stop_tx,
-        service: handle,
-        address,
-        sync_ready: Some(sync_ready_rx),
-        async_ready: Some(async_ready_rx),
+        owner: handle,
+        ready,
     }
 }
 
@@ -149,33 +163,30 @@ pub fn start_mock_secret_service() -> MockSecretService {
         tokio::runtime::Handle::try_current().is_err(),
         "async callers must await start_mock_secret_service_async"
     );
-    let mut starting = begin_mock_secret_service();
-    starting
-        .sync_ready
-        .take()
-        .expect("readiness receiver")
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let starting = begin_mock_secret_service(ready_rx, ReadySender::Sync(ready_tx));
+    let address = starting
+        .ready
         .recv()
         .expect("mock secret service failed before claiming the bus");
-    starting.finish()
+    starting.finish(address)
 }
 
 pub async fn start_mock_secret_service_async() -> MockSecretService {
-    let mut starting = begin_mock_secret_service();
-    starting
-        .async_ready
-        .take()
-        .expect("readiness receiver")
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let StartingMockSecretService { stop, owner, ready } =
+        begin_mock_secret_service(ready_rx, ReadySender::Async(ready_tx));
+    let address = ready
         .await
         .expect("mock secret service failed before claiming the bus");
-    starting.finish()
+    MockSecretService {
+        stop: Some(stop),
+        owner: Some(owner),
+        address,
+    }
 }
 
-async fn serve(
-    address: &str,
-    sync_ready: std::sync::mpsc::SyncSender<()>,
-    async_ready: tokio::sync::oneshot::Sender<()>,
-    stop_rx: tokio::sync::oneshot::Receiver<()>,
-) {
+async fn serve(address: &str, ready: ReadySender, stop_rx: tokio::sync::oneshot::Receiver<()>) {
     let state = Arc::new(Mutex::new(ServiceState::new()));
     let mut builder = connection::Builder::address(address)
         .expect("session bus builder")
@@ -208,12 +219,7 @@ async fn serve(
             .expect("serve item slot");
     }
     let _conn = builder.build().await.expect("start mock secret service");
-    sync_ready
-        .send(())
-        .expect("signal synchronous secret-service readiness");
-    async_ready
-        .send(())
-        .expect("signal asynchronous secret-service readiness");
+    ready.send(address.to_owned());
     let _ = stop_rx.await;
 }
 
@@ -233,6 +239,12 @@ struct StoredItem {
 
 #[cfg(test)]
 mod startup_tests {
+    #[test]
+    fn mock_secret_service_startup_is_sync_safe() {
+        let service = super::start_mock_secret_service();
+        assert!(!service.address.is_empty());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn mock_secret_service_startup_is_async_runtime_safe() {
         assert!(

@@ -982,7 +982,12 @@ impl HermeticCockpit {
         self.pty = None;
 
         let daemon_pid = self.daemon_pid.take();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            windows
+        ))]
         let daemon_exit = daemon_pid.map(super::ExactProcessExit::capture);
         if daemon_pid.is_some() {
             self.reaped_daemon_pid = daemon_pid;
@@ -995,13 +1000,14 @@ impl HermeticCockpit {
                 .output();
             let _ = stop;
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            windows
+        ))]
         if let Some(exit) = daemon_exit {
             exit.wait();
-        }
-        #[cfg(all(unix, not(target_os = "linux")))]
-        if let Some(pid) = daemon_pid {
-            super::wait_for_pid_exit_blocking(pid);
         }
 
         let socket = self.socket_path();

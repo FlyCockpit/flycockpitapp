@@ -123,7 +123,12 @@ use cockpit_host::daemon_lifecycle::{
     with_lifecycle_lock,
 };
 use cockpit_host::daemon_lifecycle::{DaemonPidRecord, read_daemon_pid_record, read_pid_file};
-#[cfg(target_os = "linux")]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    windows
+))]
 use cockpit_host::daemon_lifecycle::{VerifiedProcessOutcome, acquire_verified_daemon_process};
 #[cfg(any(unix, windows))]
 use cockpit_host::daemon_lifecycle::{legacy_pid_identity, verify_cockpit_daemon_receipt_identity};
@@ -150,7 +155,7 @@ use crate::redact::RedactionTable;
 /// scheduled, unwind its tasks, and release owned pid/socket metadata. This is
 /// deliberately separate from the user-selected drain grace: even a zero-
 /// grace shutdown still needs a bounded process-cleanup allowance under load.
-const RESTART_RELEASE_CLEANUP_GRACE: Duration = Duration::from_secs(10);
+const RESTART_RELEASE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// In-daemon event broadcast item. The wire schema remains proto::Event;
 /// the envelope pins the accumulated redaction table that was live when the
@@ -1115,7 +1120,12 @@ pub fn daemon_pid(paths: &DaemonPaths) -> Option<u32> {
 pub struct RestartReleaseWitness {
     expected_pid: Option<u32>,
     lifetime: Option<cockpit_host::daemon_lifecycle::DaemonLifetimeReleaseWitness>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        windows
+    ))]
     process: Option<cockpit_host::daemon_lifecycle::VerifiedDaemonProcess>,
 }
 
@@ -1126,7 +1136,12 @@ pub fn capture_restart_release(
     let lifetime = expected_pid.and_then(|_| {
         cockpit_host::daemon_lifecycle::capture_daemon_lifetime_release(&paths.pid_file).ok()
     });
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        windows
+    ))]
     let process = match cockpit_host::daemon_lifecycle::read_daemon_pid_record(&paths.pid_file) {
         Some(cockpit_host::daemon_lifecycle::DaemonPidRecord::Receipt(receipt))
             if expected_pid == Some(receipt.pid) =>
@@ -1143,16 +1158,18 @@ pub fn capture_restart_release(
     RestartReleaseWitness {
         expected_pid,
         lifetime,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            windows
+        ))]
         process,
     }
 }
 
-pub fn restart_release_timeout(grace_secs: Option<u64>) -> Duration {
-    let drain = grace_secs
-        .map(Duration::from_secs)
-        .unwrap_or(shutdown::SHUTDOWN_DRAIN_GRACE);
-    drain.saturating_add(RESTART_RELEASE_CLEANUP_GRACE)
+pub fn restart_release_timeout(_grace_secs: Option<u64>) -> Duration {
+    RESTART_RELEASE_DEADLINE
 }
 
 pub async fn wait_for_restart_release(
@@ -1164,25 +1181,23 @@ pub async fn wait_for_restart_release(
     let Some(lifetime) = witness.lifetime else {
         return false;
     };
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        windows
+    ))]
     if let Some(process) = witness.process {
-        // Start both kernel waits together. The advisory lock is the portable
-        // contract; pidfd is an additional exact-process fast path and must
-        // not consume the lock witness's deadline before it is armed.
-        let (process_exit, lifetime_release) = tokio::join!(
-            tokio::time::timeout_at(deadline, process.wait_for_exit()),
-            lifetime.wait(timeout),
-        );
-        return matches!(process_exit, Ok(Ok(())))
-            && lifetime_release.is_ok_and(|released| released)
+        let process_exit = process
+            .wait_for_exit(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await;
+        return process_exit.is_ok_and(|exited| exited)
+            && lifetime.released().is_ok_and(|released| released)
             && restart_paths_released(paths, witness.expected_pid);
     }
-    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    lifetime
-        .wait(remaining)
-        .await
-        .is_ok_and(|released| released)
-        && restart_paths_released(paths, witness.expected_pid)
+    // Without a stable process handle, starting a blocking flock/LockFileEx
+    // waiter would outlive timeout or cancellation. Fail closed instead.
+    false
 }
 
 fn restart_paths_released(paths: &DaemonPaths, expected_pid: Option<u32>) -> bool {
@@ -3829,19 +3844,10 @@ mod tests {
     }
 
     #[test]
-    fn restart_release_timeout_uses_default_drain_plus_cleanup_window() {
-        assert_eq!(
-            restart_release_timeout(None),
-            shutdown::SHUTDOWN_DRAIN_GRACE + RESTART_RELEASE_CLEANUP_GRACE
-        );
-        assert_eq!(
-            restart_release_timeout(Some(0)),
-            RESTART_RELEASE_CLEANUP_GRACE
-        );
-        assert_eq!(
-            restart_release_timeout(Some(7)),
-            Duration::from_secs(7) + RESTART_RELEASE_CLEANUP_GRACE
-        );
+    fn restart_release_timeout_is_always_the_production_deadline() {
+        assert_eq!(restart_release_timeout(None), RESTART_RELEASE_DEADLINE);
+        assert_eq!(restart_release_timeout(Some(0)), RESTART_RELEASE_DEADLINE);
+        assert_eq!(restart_release_timeout(Some(7)), RESTART_RELEASE_DEADLINE);
     }
 
     #[tokio::test]
@@ -3852,7 +3858,7 @@ mod tests {
         std::fs::write(&paths.socket, "").unwrap();
 
         let release = capture_restart_release(&paths, Some(123));
-        wait_for_restart_release(&paths, release, Duration::ZERO).await;
+        assert!(!wait_for_restart_release(&paths, release, Duration::ZERO).await);
 
         assert!(paths.pid_file.exists());
         assert!(paths.socket.exists());

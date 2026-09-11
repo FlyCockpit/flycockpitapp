@@ -430,6 +430,16 @@ impl SpawnedDaemon {
     /// actual parent. Without this wait, the exited child remains a zombie and
     /// the product command correctly refuses to treat its PID as released.
     pub fn stop_via_command(&self, grace_secs: u64) -> Output {
+        self.stop_via_command_with_socket(grace_secs, true)
+    }
+
+    pub fn stop_via_unreachable_socket(&self) -> Output {
+        std::fs::remove_file(self.home.socket_path())
+            .expect("remove daemon socket to drive signal fallback");
+        self.stop_via_command_with_socket(0, false)
+    }
+
+    fn stop_via_command_with_socket(&self, grace_secs: u64, socket_reachable: bool) -> Output {
         let grace = grace_secs.to_string();
         let mut command = self.home.cockpit();
         let mut command_child = command
@@ -447,7 +457,7 @@ impl SpawnedDaemon {
             .map(|output| {
                 assert!(
                     owned_child_exited,
-                    "daemon stop command exited before its owned daemon; stdout:\n{}\nstderr:\n{}\nlog tail:\n{}",
+                    "daemon stop command exited before its owned daemon (socket reachable: {socket_reachable}); stdout:\n{}\nstderr:\n{}\nlog tail:\n{}",
                     String::from_utf8_lossy(&output.stdout),
                     String::from_utf8_lossy(&output.stderr),
                     log_tail(&self.home)
@@ -963,9 +973,119 @@ impl ExactProcessExit {
     }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-pub(crate) fn wait_for_pid_exit_blocking(_pid: u32) {
-    panic!("exact daemon-exit waiting is unsupported on this non-Linux platform");
+#[cfg(windows)]
+pub(crate) struct ExactProcessExit {
+    pid: u32,
+    process: std::os::windows::io::OwnedHandle,
+}
+
+#[cfg(windows)]
+impl ExactProcessExit {
+    pub(crate) fn capture(pid: u32) -> Self {
+        use std::os::windows::io::FromRawHandle as _;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Threading::{OpenProcess, SYNCHRONIZE};
+        // SAFETY: SYNCHRONIZE opens a wait-only stable process handle.
+        let raw = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+        assert!(
+            !raw.is_null() && raw != INVALID_HANDLE_VALUE,
+            "open exact daemon pid {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+        Self {
+            pid,
+            process: unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw) },
+        }
+    }
+
+    pub(crate) fn wait(self) {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+        // SAFETY: the stable process handle remains owned for the wait.
+        assert_eq!(
+            unsafe { WaitForSingleObject(self.process.as_raw_handle(), INFINITE) },
+            WAIT_OBJECT_0,
+            "wait for exact daemon pid {}: {}",
+            self.pid,
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub(crate) struct ExactProcessExit {
+    pid: u32,
+    kqueue: std::os::fd::OwnedFd,
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+impl ExactProcessExit {
+    pub(crate) fn capture(pid: u32) -> Self {
+        use std::os::fd::FromRawFd as _;
+        // SAFETY: kqueue returns a fresh owned descriptor on success.
+        let raw = unsafe { libc::kqueue() };
+        assert!(
+            raw >= 0,
+            "create kqueue: {}",
+            std::io::Error::last_os_error()
+        );
+        let kqueue = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        let change = libc::kevent {
+            ident: pid as libc::uintptr_t,
+            filter: libc::EVFILT_PROC,
+            flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
+            fflags: libc::NOTE_EXIT,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        // SAFETY: change is initialized and kqueue remains owned by Self.
+        let registered = unsafe {
+            libc::kevent(
+                std::os::fd::AsRawFd::as_raw_fd(&kqueue),
+                &change,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(
+            registered,
+            0,
+            "register exact pid {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+        Self { pid, kqueue }
+    }
+
+    pub(crate) fn wait(self) {
+        use std::os::fd::AsRawFd as _;
+        let mut event = std::mem::MaybeUninit::<libc::kevent>::uninit();
+        // SAFETY: event has space for one result; null timeout is a blocking
+        // kernel wait on the registered process identity, not PID polling.
+        let count = unsafe {
+            libc::kevent(
+                self.kqueue.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                event.as_mut_ptr(),
+                1,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(
+            count,
+            1,
+            "wait for exact pid {}: {}",
+            self.pid,
+            std::io::Error::last_os_error()
+        );
+        let event = unsafe { event.assume_init() };
+        assert_eq!(event.ident, self.pid as libc::uintptr_t);
+        assert_eq!(event.filter, libc::EVFILT_PROC);
+        assert_ne!(event.fflags & libc::NOTE_EXIT, 0);
+    }
 }
 
 /// Panic/unwind guard for foreground test daemons. Ensures the exact child is

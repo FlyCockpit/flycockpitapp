@@ -79,6 +79,17 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             }
             let stopped = daemon::stop(&paths)?;
             if stopped {
+                if !daemon::wait_for_restart_release(
+                    &paths,
+                    release,
+                    daemon::restart_release_timeout(None),
+                )
+                .await
+                {
+                    bail!(
+                        "timed out waiting for the previous daemon process to exit and release its pid and socket"
+                    );
+                }
                 if grace.is_some() {
                     println!(
                         "daemon: stopped (socket unreachable; used SIGTERM with default grace)"
@@ -577,8 +588,9 @@ mod tests {
         restart_release_timeout_for_stop_path, restart_should_stop, restart_started_message,
         running_json_status, validate_grace, version_skew_reason,
     };
+    use crate::daemon::DaemonStatus;
     use crate::daemon::proto;
-    use crate::daemon::{self, DaemonStatus};
+    use std::time::Duration;
 
     #[test]
     fn grace_validation_allows_zero_and_rejects_absurd_values() {
@@ -612,14 +624,14 @@ mod tests {
     }
 
     #[test]
-    fn restart_fallback_release_wait_uses_default_grace_when_override_cannot_be_forwarded() {
+    fn restart_release_wait_has_one_bounded_correctness_deadline() {
         assert_eq!(
             restart_release_timeout_for_stop_path(Some(0), true),
-            daemon::restart_release_timeout(Some(0))
+            Duration::from_secs(30)
         );
         assert_eq!(
-            restart_release_timeout_for_stop_path(Some(0), false),
-            daemon::restart_release_timeout(None)
+            restart_release_timeout_for_stop_path(Some(24 * 60 * 60), false),
+            Duration::from_secs(30)
         );
     }
 

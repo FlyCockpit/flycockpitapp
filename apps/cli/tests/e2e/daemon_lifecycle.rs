@@ -112,6 +112,23 @@ async fn restart_when_not_running_starts_daemon() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_with_unreachable_socket_waits_for_exact_daemon_retirement() {
+    let daemon = SpawnedDaemon::start().await;
+    let output = daemon.stop_via_unreachable_socket();
+
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(
+        output_text(&output).contains("socket unreachable; used SIGTERM"),
+        "{}",
+        output_text(&output)
+    );
+    assert!(
+        daemon.try_pid().is_none(),
+        "stop success must retire pid metadata"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sigterm_operation_allows_restart_against_same_home() {
     let daemon = SpawnedDaemon::start().await;
     let old_pid = daemon.pid();

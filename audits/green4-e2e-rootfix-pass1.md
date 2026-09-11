@@ -4,7 +4,7 @@ Baseline: `0b3ca2a4b`. Scope: STEP0-F1 through STEP0-F4.
 
 | Site / operation | Result | Evidence |
 | --- | --- | --- |
-| daemon PID reservation -> lifetime publication | holds | `run_foreground` completes the short `lifecycle.lock` reservation, then `ForegroundMetadataGuard::new` acquires `lifetime.lock`; no nested acquisition |
+| daemon lifetime -> PID reservation | holds | `run_foreground` acquires `lifetime.lock` before entering the short `lifecycle.lock` reservation, so no PID receipt is observable without its witness; cleanup uses the same lifetime-to-lifecycle order |
 | daemon normal shutdown / boot failure | holds | guard retires PID, socket, and endpoint under `lifecycle.lock`, then drops lifetime lock; `Drop` retains fail-cleanup behavior |
 | daemon crash | holds | Unix `flock` and Windows `LockFileEx` are released by kernel handle teardown |
 | restart capture / timeout / release | holds | capture opens the same lifetime file; one blocking kernel acquisition runs under `tokio::time::timeout`; Linux pidfd and lock waits are armed concurrently; exact paths are checked after both |

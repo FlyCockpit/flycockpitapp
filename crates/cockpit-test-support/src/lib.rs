@@ -262,7 +262,6 @@ pub fn workspace_root() -> PathBuf {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[derive(Clone, Copy)]
     struct AllowedMutation {
@@ -306,36 +305,38 @@ mod tests {
 
     #[tokio::test]
     async fn guard_serializes_concurrent_async_acquisition() {
-        let first_entered = Arc::new(AtomicBool::new(false));
-        let first_can_finish = Arc::new(AtomicBool::new(false));
-        let second_entered_while_first_held = Arc::new(AtomicBool::new(false));
-
-        let first_entered_for_task = Arc::clone(&first_entered);
-        let first_can_finish_for_task = Arc::clone(&first_can_finish);
+        let (first_entered_tx, first_entered_rx) = tokio::sync::oneshot::channel();
+        let (first_can_finish_tx, first_can_finish_rx) = tokio::sync::oneshot::channel();
+        let (second_entered_tx, mut second_entered_rx) = tokio::sync::oneshot::channel();
         let first = tokio::spawn(async move {
             let _guard = TestEnvGuard::lock().await;
-            first_entered_for_task.store(true, Ordering::SeqCst);
-            while !first_can_finish_for_task.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
+            first_entered_tx
+                .send(())
+                .expect("signal first guard acquisition");
+            first_can_finish_rx.await.expect("release first guard");
         });
 
-        while !first_entered.load(Ordering::SeqCst) {
-            tokio::task::yield_now().await;
-        }
+        first_entered_rx
+            .await
+            .expect("observe first guard acquisition");
 
-        let second_entered_while_first_held_for_task = Arc::clone(&second_entered_while_first_held);
         let second = tokio::spawn(async move {
             let _guard = TestEnvGuard::lock().await;
-            second_entered_while_first_held_for_task.store(true, Ordering::SeqCst);
+            second_entered_tx
+                .send(())
+                .expect("signal second guard acquisition");
         });
 
-        tokio::task::yield_now().await;
-        assert!(!second_entered_while_first_held.load(Ordering::SeqCst));
-        first_can_finish.store(true, Ordering::SeqCst);
+        assert!(
+            second_entered_rx.try_recv().is_err(),
+            "second guard acquired while first was held"
+        );
+        first_can_finish_tx.send(()).expect("release first guard");
         first.await.unwrap();
+        second_entered_rx
+            .await
+            .expect("observe second guard acquisition");
         second.await.unwrap();
-        assert!(second_entered_while_first_held.load(Ordering::SeqCst));
     }
 
     #[test]

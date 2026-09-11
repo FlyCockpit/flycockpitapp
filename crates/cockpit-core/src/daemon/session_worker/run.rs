@@ -6731,6 +6731,7 @@ pub(super) async fn run_worker(
     let live_for_forward = live.clone();
     let sandbox_notice_armed_for_forward = sandbox_notice_armed.clone();
     let session_for_forward = session.clone();
+    let container_manager_for_forward = crate::container::container_manager_for_db(&session.db);
     let authoritative_active_model_state_for_forward = authoritative_active_model_state.clone();
     let tree_resolver_registry_for_forward = tree_resolver_registry.clone();
     let driver_control_for_forward = driver_control_tx.clone();
@@ -6776,6 +6777,7 @@ pub(super) async fn run_worker(
                             "idle with no attached clients",
                         );
                         schedule_session_container_release(
+                            container_manager_for_forward.clone(),
                             interactive_clients_for_forward.clone(),
                             live_for_forward.clone(),
                             session_id,

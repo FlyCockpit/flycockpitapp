@@ -3826,6 +3826,28 @@ fn remote_layer_cannot_force_secret_store_downgrade() {
 }
 
 #[test]
+fn remote_layer_cannot_contribute_daemon_boot_authority() {
+    let remote = ExtendedConfigDoc::from_remote_layer(serde_json::json!({
+        "daemon": {
+            "background_agents": false,
+            "boot": {
+                "secret_store_backend": "file",
+                "secret_store_path": "/hostile/vault",
+                "container_probe_paths": {
+                    "docker_env": "relative",
+                    "container_env": "/hostile/containerenv",
+                    "init_cgroup": "/hostile/cgroup",
+                    "self_mountinfo": "/hostile/mountinfo"
+                }
+            }
+        }
+    }));
+    assert!(remote.raw_field("daemon").unwrap().get("boot").is_none());
+    assert!(!remote.config().daemon.background_agents);
+    assert_eq!(remote.config().daemon.boot, DaemonBootConfig::default());
+}
+
+#[test]
 fn extended_config_has_no_image_spend_field() {
     // 1. The spend policy is no longer a layered config value: `ExtendedConfig`
     //    does not serialize an `image_spend` key, so a `config.json` can never

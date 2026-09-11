@@ -1153,69 +1153,23 @@ pub fn restart_release_timeout(grace_secs: Option<u64>) -> Duration {
 pub async fn wait_for_restart_release(
     paths: &DaemonPaths,
     witness: RestartReleaseWitness,
-    timeout: Duration,
+    _timeout: Duration,
 ) -> bool {
     #[cfg(target_os = "linux")]
     if let Some(process) = witness.process {
-        return matches!(
-            tokio::time::timeout(timeout, process.wait_for_exit()).await,
-            Ok(Ok(()))
-        ) && restart_paths_released(paths, witness.expected_pid);
+        return process.wait_for_exit().await.is_ok()
+            && restart_paths_released(paths, witness.expected_pid);
     }
-    let expected_pid = witness.expected_pid;
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if restart_metadata_released(paths, expected_pid) {
-            return true;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    // Restart may proceed only from an exact, PID-reuse-safe completion
+    // primitive. Platforms (or stale metadata) that cannot provide one fail
+    // closed instead of polling a numeric PID or guessed deadline.
+    false
 }
 
 fn restart_paths_released(paths: &DaemonPaths, expected_pid: Option<u32>) -> bool {
     expected_pid.is_none_or(|pid| read_pid_file(&paths.pid_file) != Some(pid))
         && !paths.pid_file.exists()
         && !paths.socket.exists()
-}
-
-fn restart_metadata_released(paths: &DaemonPaths, expected_pid: Option<u32>) -> bool {
-    let pid_file_released =
-        expected_pid.is_none_or(|pid| read_pid_file(&paths.pid_file) != Some(pid));
-    // The exclusive SQLite boot lock is a kernel flock on the dying
-    // process. Pid/socket files are unlinked during drain *before* that
-    // process exits; spawning the replacement then fails with
-    // `database already has a live exclusive owner`.
-    let process_released = expected_pid.is_none_or(|pid| {
-        #[cfg(any(unix, windows))]
-        {
-            if !cockpit_host::daemon_lifecycle::process_exists(pid) {
-                return true;
-            }
-            match cockpit_host::daemon_lifecycle::read_daemon_pid_record(&paths.pid_file) {
-                Some(cockpit_host::daemon_lifecycle::DaemonPidRecord::Receipt(receipt))
-                    if receipt.pid == pid =>
-                {
-                    matches!(
-                        cockpit_host::daemon_lifecycle::verify_cockpit_daemon_receipt_identity(
-                            &receipt
-                        ),
-                        cockpit_host::daemon_lifecycle::PidIdentity::Missing
-                            | cockpit_host::daemon_lifecycle::PidIdentity::NotDaemon
-                    )
-                }
-                _ => false,
-            }
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = pid;
-            true
-        }
-    });
-    pid_file_released && process_released && !paths.pid_file.exists() && !paths.socket.exists()
 }
 
 /// Spawn a detached ephemeral daemon at the canonical ledger endpoint.
@@ -2154,9 +2108,6 @@ async fn run_foreground_inner_with_boot_db(
     let global_config_dir = (!paths.ephemeral).then(|| {
         tokio::task::spawn_blocking(crate::config::config::dirs::ensure_global_config_dir)
     });
-    #[cfg(not(test))]
-    crate::daemon::server::begin_early_keyring_probe();
-    timer.phase("early_keyring_probe");
     // The global config layer belongs to the user, not the workspace. Make it
     // durable and writable before a persistent daemon can accept onboarding
     // work. Ephemeral diagnostic owners (notably `cockpit doctor`) stay
@@ -3879,17 +3830,6 @@ mod tests {
 
         assert!(paths.pid_file.exists());
         assert!(paths.socket.exists());
-    }
-
-    #[test]
-    fn restart_release_waits_for_old_pid_exit_not_just_unlinked_metadata() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = test_paths(&dir);
-        assert!(
-            !restart_metadata_released(&paths, Some(std::process::id())),
-            "a still-live predecessor must block replacement spawn even after pid/socket unlink"
-        );
-        assert!(restart_metadata_released(&paths, None));
     }
 
     #[test]

@@ -14192,7 +14192,7 @@ async fn handle_serialized_request_impl(
                 mode: applied.effective,
                 enabled: applied.effective.enabled(),
                 container_network_enabled: att.handle.container_network_enabled(),
-                container_availability: crate::container::availability_snapshot(),
+                container_availability: crate::container::availability_snapshot_for_db(&ctx.db),
                 persisted_intent: Some(applied.persisted_intent.into()),
             };
             finish_nonrepeatable_response!(remote_operation, ctx, "set_sandbox", response)
@@ -20783,13 +20783,21 @@ async fn migrate_kek_placement_request(
         None => crate::secure_key::probe_platform_keyring(),
     };
     let db = ctx.db.clone();
-    let snapshot = tokio::task::spawn_blocking(move || {
-        crate::secure_key::migrate_installation_kek(
+    let kek_dir = ctx.secret_store_path.clone();
+    let snapshot = tokio::task::spawn_blocking(move || match kek_dir {
+        Some(kek_dir) => crate::secure_key::migrate_installation_kek_at(
+            &db,
+            dest,
+            &probe,
+            &kek_dir,
+            crate::secure_key::SecretStoreInjected::default(),
+        ),
+        None => crate::secure_key::migrate_installation_kek(
             &db,
             dest,
             &probe,
             crate::secure_key::SecretStoreInjected::default(),
-        )
+        ),
     })
     .await
     .map_err(|e| ErrorPayload {

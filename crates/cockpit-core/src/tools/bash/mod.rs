@@ -2725,9 +2725,8 @@ async fn run_container_shell(
     identity_accounting: Option<crate::assistants::identity::IdentityShellAccounting>,
     approved_access_effects: &[serde_json::Value],
 ) -> RunOutcome {
-    let manager = crate::container::container_manager()
-        .get_or_init(|| async { crate::container::ContainerManager::detect() })
-        .await;
+    let manager = crate::container::container_manager_for_db(&ctx.session.db)
+        .unwrap_or_else(|| std::sync::Arc::new(crate::container::ContainerManager::detect()));
     // Atomic reselect + capture: owned runtime is immutable for this launch.
     let runtime = match manager.select_for_launch() {
         Ok(runtime) => runtime,

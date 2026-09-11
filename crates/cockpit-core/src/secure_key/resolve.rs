@@ -157,6 +157,9 @@ impl From<KekUnavailable> for SecureKeyError {
 }
 
 pub fn kek_dir_for_db(db: &Db) -> Result<PathBuf, SecureKeyError> {
+    if let Some(configured) = db.secret_vault_dir() {
+        return Ok(configured.to_path_buf());
+    }
     let path = db.path().ok_or_else(|| {
         SecureKeyError::Internal(
             "in-memory database has no KEK directory; inject KekStore / file-backed Db".into(),
@@ -199,12 +202,22 @@ pub fn migrate_installation_kek(
     probe: &KeyringProbeResult,
     injected: SecretStoreInjected,
 ) -> Result<SecretStoreSnapshot, SecureKeyError> {
-    let dest = secret_store_dest_placement(dest)?;
     let kek_dir = kek_dir_for_db(db)?;
+    migrate_installation_kek_at(db, dest, probe, &kek_dir, injected)
+}
+
+pub fn migrate_installation_kek_at(
+    db: &Db,
+    dest: SecretStorePlacement,
+    probe: &KeyringProbeResult,
+    kek_dir: &Path,
+    injected: SecretStoreInjected,
+) -> Result<SecretStoreSnapshot, SecureKeyError> {
+    let dest = secret_store_dest_placement(dest)?;
     let current = ensure_secret_vault(
         db,
         probe,
-        &kek_dir,
+        kek_dir,
         SecretStoreInjected {
             file_kek: injected.file_kek.clone(),
             keyring_kek: injected.keyring_kek.clone(),
@@ -216,7 +229,7 @@ pub fn migrate_installation_kek(
         current.vault.installation_hex(),
     )
     .map_err(|e| SecureKeyError::Internal(e.to_string()))?;
-    let dest_store = kek_store_for_placement(dest, &kek_dir, &installation, &injected, false)
+    let dest_store = kek_store_for_placement(dest, kek_dir, &installation, &injected, false)
         .map_err(SecureKeyError::from)?;
     let _ = super::migrate::migrate_kek_placement(
         &current.vault,
@@ -363,8 +376,12 @@ pub fn ensure_secret_vault_with_options(
     injected: SecretStoreInjected,
     mut options: SecretVaultOpenOptions,
 ) -> Result<EffectiveSecretStore, KekUnavailable> {
-    let installation = db
-        .blocking_write_for_sync_maintenance(|conn| {
+    // Reopening an initialized vault is the common boot path. Read it on the
+    // actual DB read pool; only absence enters the writer transaction, whose
+    // ensure helper rechecks and preserves the first-run single winner.
+    let installation = match db.load_installation_identity_for_sync_boot() {
+        Ok(Some(existing)) => Ok(existing),
+        Ok(None) => db.blocking_write_for_sync_maintenance(|conn| {
             conn.execute_batch("BEGIN IMMEDIATE;")?;
             let result = ensure_installation_identity_conn(conn);
             match &result {
@@ -374,12 +391,14 @@ pub fn ensure_secret_vault_with_options(
                 }
             }
             result
-        })
-        .map_err(|e| KekUnavailable {
-            reason: format!("installation identity: {e}"),
-            fix_command: None,
-            intent: SecretStoreIntent::Unconfigured,
-        })?;
+        }),
+        Err(error) => Err(error),
+    }
+    .map_err(|e| KekUnavailable {
+        reason: format!("installation identity: {e}"),
+        fix_command: None,
+        intent: SecretStoreIntent::Unconfigured,
+    })?;
 
     let mut authority = db
         .blocking_write_for_sync_maintenance(load_authority_conn)

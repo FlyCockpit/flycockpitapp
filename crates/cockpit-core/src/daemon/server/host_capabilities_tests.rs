@@ -70,6 +70,7 @@ fn injected_probes(
         catalog: CatalogProbeSource::Injected(empty_catalog()),
         platform: crate::external_runtime::HostPlatform::GenericLinux,
         cwd: tmp.path().to_path_buf(),
+        container_probe_paths: crate::config::extended::DaemonContainerProbePaths::default(),
     }
 }
 
@@ -454,8 +455,8 @@ async fn host_capabilities_container_rows_reuse_one_detect_call() {
     )));
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut probes = injected_probes(&tmp, Arc::new(AtomicUsize::new(0)));
-    probes.container = ContainerProbeSource::ReuseSnapshot;
-    let _ctx = test_ctx();
+    let ctx = test_ctx();
+    probes.container = ContainerProbeSource::ReuseSnapshot(ctx.container_manager.availability());
     let before = crate::container::detect_runtime_call_count();
     let collected = collect_shared_host_probes(&probes, false).await;
     let after = crate::container::detect_runtime_call_count();
@@ -649,11 +650,21 @@ fn host_capabilities_snapshot_wire_includes_secret_store() {
 
 #[tokio::test]
 async fn host_capabilities_boot_with_db_populates_snapshot_when_keyring_missing() {
-    let _guard = lock_keyring_probe_tests();
-    reset_keyring_probe_cache_for_test();
     let tmp = tempfile::tempdir().expect("tempdir");
     let db_path = tmp.path().join("cockpit.db");
     let db = crate::db::Db::open(&db_path).expect("temp db");
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.daemon.boot.secret_store_backend =
+        crate::config::extended::DaemonSecretStoreBackend::File;
+    extended.daemon.boot.secret_store_path = Some(tmp.path().join("configured-vault"));
+    let probe_root = tmp.path().join("container-probes");
+    extended.daemon.boot.container_probe_paths =
+        crate::config::extended::DaemonContainerProbePaths {
+            docker_env: probe_root.join("dockerenv"),
+            container_env: probe_root.join("containerenv"),
+            init_cgroup: probe_root.join("cgroup"),
+            self_mountinfo: probe_root.join("mountinfo"),
+        };
     let mut timer = crate::startup::PhaseTimer::start("host_capabilities_boot_with_db");
     let ctx = boot_with_db(
         DaemonPaths {
@@ -664,7 +675,10 @@ async fn host_capabilities_boot_with_db_populates_snapshot_when_keyring_missing(
         db,
         &mut timer,
         crate::daemon::terminal::test_host_factory(),
-        crate::daemon::config_source::ConfigSource::production(),
+        crate::daemon::config_source::ConfigSource::fixed(
+            crate::config::providers::ProvidersConfig::default(),
+            extended,
+        ),
     )
     .await
     .expect("boot_with_db");
@@ -673,19 +687,16 @@ async fn host_capabilities_boot_with_db_populates_snapshot_when_keyring_missing(
         .current()
         .expect("boot_with_db must publish a snapshot after shared probes");
     assert_eq!(
-        crate::secure_key::keyring_probe_construct_count(),
-        1,
-        "boot path must invoke the keyring probe once"
-    );
-    assert_eq!(
         snapshot
             .feature(FEATURE_SECRET_STORE_KEYRING)
             .map(|row| row.state),
         Some(FeatureCapabilityState::Missing)
     );
+    assert_eq!(snapshot.secret_store.intent, SecretStoreIntent::Database);
     assert_eq!(
-        snapshot.secret_store.intent,
-        SecretStoreIntent::Unconfigured
+        snapshot.secret_store.effective_placement,
+        SecretStorePlacement::Database
     );
-    reset_keyring_probe_cache_for_test();
+    assert!(snapshot.secret_store.fail_closed_reason.is_none());
+    assert!(snapshot.secret_store.fix_command.is_none());
 }

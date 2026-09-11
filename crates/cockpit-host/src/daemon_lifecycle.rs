@@ -134,7 +134,13 @@ impl VerifiedDaemonProcess {
             if result < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if result > 0 && poll_fd.revents != 0 {
+            if result > 0 && poll_fd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                return Err(std::io::Error::other(format!(
+                    "pidfd returned invalid readiness {:#x}",
+                    poll_fd.revents
+                )));
+            }
+            if result > 0 && poll_fd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
                 return Ok(());
             }
             ready.clear_ready();

@@ -184,9 +184,6 @@ pub enum DriverControl {
             std::result::Result<Vec<RecoveredNoninteractiveResolverEndpoint>, String>,
         >,
     },
-    #[cfg(test)]
-    #[allow(dead_code)]
-    AbortForTest,
     /// Ask the driver to deliver send-now items at the next safe boundary.
     /// Never cancels an in-flight tool; backgroundable tools (`bash`) observe
     /// the queue escalation directly and transfer their process waiter to
@@ -6088,10 +6085,6 @@ impl Driver {
                         // under a long turn it cannot fire until that turn
                         // ends, so a caller that waited for it here would be
                         // measuring turn length, not worker health.
-                        #[cfg(test)]
-                        Some(DriverControl::AbortForTest) => {
-                            anyhow::bail!("driver abort requested for test");
-                        }
                         Some(control) => {
                             self.run_control_with_input_queue(control, &input_queue, tx)
                                 .await
@@ -6608,8 +6601,6 @@ impl Driver {
             return;
         }
         match control {
-            #[cfg(test)]
-            DriverControl::AbortForTest => unreachable!("handled before run_control"),
             DriverControl::WakeGoal => {
                 if let Err(error) = self.maybe_continue_active_goal(input_queue, tx).await {
                     tracing::warn!(%error, "waking supervised goal failed");

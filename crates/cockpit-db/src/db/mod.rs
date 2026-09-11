@@ -134,7 +134,7 @@ use std::io::Seek as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -444,6 +444,10 @@ pub struct Db {
     read_pool: Option<Arc<ReadPool>>,
     /// `None` for in-memory databases (tests).
     path: Option<PathBuf>,
+    /// Process-lifetime installation authority for file-vault placement.
+    /// Kept on the clone-shared DB handle so DB-only production consumers
+    /// cannot silently reconstruct a database-relative default after boot.
+    secret_vault_dir: Arc<OnceLock<PathBuf>>,
     /// Kernel-backed exclusive ownership retained by every clone until the
     /// final file-backed daemon handle is dropped.
     _owner_lock: Option<Arc<files::DatabaseOwnerLock>>,
@@ -666,6 +670,7 @@ impl Db {
             writer: Some(writer),
             read_pool: Some(Arc::new(ReadPool::new(path.to_path_buf()))),
             path: Some(path.to_path_buf()),
+            secret_vault_dir: Arc::new(OnceLock::new()),
             _owner_lock: owner_lock,
             _diagnostic_lock: None,
             read_only: false,
@@ -689,6 +694,7 @@ impl Db {
             writer: None,
             read_pool: None,
             path: None,
+            secret_vault_dir: Arc::new(OnceLock::new()),
             _owner_lock: None,
             _diagnostic_lock: None,
             read_only: false,
@@ -785,6 +791,7 @@ impl Db {
             writer: None,
             read_pool: None,
             path: Some(path),
+            secret_vault_dir: Arc::new(OnceLock::new()),
             _owner_lock: None,
             _diagnostic_lock: diagnostic_lock,
             read_only: true,
@@ -804,6 +811,33 @@ impl Db {
     /// File path the database is backed by, or `None` for in-memory.
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    /// Publish the installation's effective file-vault directory once.
+    /// Re-publishing the identical authority is harmless; a conflict fails
+    /// closed instead of leaving clone-dependent placement.
+    pub fn configure_secret_vault_dir(&self, path: PathBuf) -> Result<()> {
+        if let Some(existing) = self.secret_vault_dir.get() {
+            anyhow::ensure!(
+                existing == &path,
+                "conflicting secret-vault directory authority: {} versus {}",
+                existing.display(),
+                path.display()
+            );
+            return Ok(());
+        }
+        match self.secret_vault_dir.set(path.clone()) {
+            Ok(()) => Ok(()),
+            Err(_) if self.secret_vault_dir.get() == Some(&path) => Ok(()),
+            Err(_) => anyhow::bail!(
+                "secret-vault directory authority raced with a conflicting publication: {}",
+                path.display()
+            ),
+        }
+    }
+
+    pub fn secret_vault_dir(&self) -> Option<&Path> {
+        self.secret_vault_dir.get().map(PathBuf::as_path)
     }
 
     /// Acquire the shared history-disclosure fence. The permit must be held

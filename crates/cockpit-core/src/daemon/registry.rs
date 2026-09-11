@@ -967,7 +967,7 @@ impl SessionRegistry {
         *crate::sync::lock_or_recover(&self.inner.write_scope) = Some(coordinator);
     }
 
-    fn write_scope_source(&self) -> crate::write_scope::WriteScopeSource {
+    pub(crate) fn write_scope_source(&self) -> crate::write_scope::WriteScopeSource {
         self.inner.write_scope.clone()
     }
 
@@ -1040,22 +1040,10 @@ impl SessionRegistry {
         *crate::sync::lock_or_recover(&self.inner.process_containment) = Some(handle);
     }
 
-    fn process_containment(&self) -> Option<crate::process_containment::ProcessContainmentHandle> {
-        crate::sync::lock_or_recover(&self.inner.process_containment).clone()
-    }
-
-    #[cfg(test)]
-    pub fn process_containment_for_test(
+    pub(crate) fn process_containment(
         &self,
     ) -> Option<crate::process_containment::ProcessContainmentHandle> {
-        self.process_containment()
-    }
-
-    #[cfg(test)]
-    pub fn write_scope_for_test(
-        &self,
-    ) -> Option<std::sync::Arc<crate::write_scope::WriteScopeCoordinator>> {
-        crate::sync::lock_or_recover(&self.inner.write_scope).clone()
+        crate::sync::lock_or_recover(&self.inner.process_containment).clone()
     }
 
     /// Install the daemon's shared protected redaction-history key resolver.

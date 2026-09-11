@@ -283,34 +283,37 @@ impl OwnedSandboxDescendants {
     pub fn assert_exited(self) {
         use std::os::fd::AsRawFd as _;
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut survivors = Vec::new();
         for process in &self.processes {
             let mut pollfd = libc::pollfd {
                 fd: process.pidfd.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             };
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let timeout_ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
-            // SAFETY: `pollfd` points to one initialized entry whose fd is an
-            // owned pidfd retained by `process` for the whole call.
-            let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
-            assert!(
-                ready >= 0,
-                "waiting for owned sandbox descendant {} failed: {}",
-                process.pid,
-                std::io::Error::last_os_error()
-            );
-            if pollfd.revents & libc::POLLIN == 0 {
-                survivors.push(format!("{} {}", process.pid, process.command));
+            loop {
+                // SAFETY: `pollfd` points to one initialized entry whose fd is
+                // an owned pidfd retained by `process` for the whole call. A
+                // pidfd becoming readable is the kernel completion signal for
+                // this exact process; the enclosing test runner owns hangs.
+                let ready = unsafe { libc::poll(&mut pollfd, 1, -1) };
+                if ready > 0 && pollfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                    panic!(
+                        "waiting for owned sandbox descendant {} ({}) returned invalid pidfd readiness {:#x}",
+                        process.pid, process.command, pollfd.revents
+                    );
+                }
+                if ready > 0 && pollfd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if ready < 0 && error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                panic!(
+                    "waiting for owned sandbox descendant {} ({}) failed: {error}",
+                    process.pid, process.command
+                );
             }
         }
-        assert!(
-            survivors.is_empty(),
-            "sandbox descendants outlived their killed daemon:\n{}",
-            survivors.join("\n")
-        );
     }
 }
 
@@ -906,16 +909,61 @@ pub(crate) fn pid_is_live(pid: u32) -> bool {
     cockpit_host::daemon_lifecycle::process_exists(pid)
 }
 
-#[cfg(unix)]
-pub(crate) fn wait_for_pid_exit_blocking(pid: u32, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if !pid_is_live(pid) {
-            return true;
-        }
-        std::thread::yield_now();
+#[cfg(target_os = "linux")]
+pub(crate) struct ExactProcessExit {
+    pid: u32,
+    pidfd: std::os::fd::OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+impl ExactProcessExit {
+    pub(crate) fn capture(pid: u32) -> Self {
+        use std::os::fd::{FromRawFd as _, OwnedFd};
+        // SAFETY: pidfd_open has no pointer arguments. The returned descriptor
+        // is newly owned on success and pins the process identity against PID
+        // reuse before the lifecycle command is allowed to stop it.
+        let raw_fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        assert!(
+            raw_fd >= 0,
+            "capture exact daemon pid {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: successful pidfd_open returns a fresh owned descriptor.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(raw_fd as std::os::fd::RawFd) };
+        Self { pid, pidfd }
     }
-    !pid_is_live(pid)
+
+    pub(crate) fn wait(self) {
+        use std::os::fd::AsRawFd as _;
+        let mut pollfd = libc::pollfd {
+            fd: self.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            // SAFETY: pollfd is initialized and pidfd remains owned here.
+            let ready = unsafe { libc::poll(&mut pollfd, 1, -1) };
+            if ready > 0 && pollfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                panic!(
+                    "waiting for daemon pid {} returned invalid pidfd readiness {:#x}",
+                    self.pid, pollfd.revents
+                );
+            }
+            if ready > 0 && pollfd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                return;
+            }
+            let error = std::io::Error::last_os_error();
+            if ready < 0 && error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            panic!("waiting for daemon pid {} exit failed: {error}", self.pid);
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn wait_for_pid_exit_blocking(_pid: u32) {
+    panic!("exact daemon-exit waiting is unsupported on this non-Linux platform");
 }
 
 /// Panic/unwind guard for foreground test daemons. Ensures the exact child is
@@ -994,50 +1042,22 @@ impl EphemeralDaemonGuard {
     fn reap_while_command_runs(
         &self,
         command: &mut std::process::Child,
-        timeout: Duration,
+        _timeout: Duration,
     ) -> std::io::Result<bool> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let owned_exited = {
-                let mut slot = self.child.lock().unwrap_or_else(|error| error.into_inner());
-                match slot.as_mut() {
-                    Some(child) => {
-                        let exited = child.try_wait()?.is_some();
-                        if exited {
-                            slot.take();
-                        }
-                        exited
-                    }
-                    None => return Ok(false),
-                }
-            };
-            if owned_exited {
-                return Ok(true);
-            }
-            if let Some(status) = command.try_wait()? {
-                if !status.success() {
-                    self.reap_current();
-                    return Ok(false);
-                }
-                // A successful lifecycle command has durably reported that
-                // the old daemon stopped. Its exact Child can become
-                // waitable just after the command itself exits, particularly
-                // after a forced graceful-shutdown fallback. Keep reaping
-                // that exact child within the same bounded operation instead
-                // of turning this scheduling race into a false failure (or
-                // killing the replacement's metadata in reap_current()).
-            }
-            if Instant::now() >= deadline {
-                let _ = command.kill();
-                let _ = command.wait();
-                self.reap_current();
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "daemon lifecycle command and owned child did not exit",
-                ));
-            }
-            std::thread::yield_now();
+        if !command.wait()?.success() {
+            self.reap_current();
+            return Ok(false);
         }
+        let Some(mut child) = self
+            .child
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        else {
+            return Ok(false);
+        };
+        child.wait()?;
+        Ok(true)
     }
 }
 

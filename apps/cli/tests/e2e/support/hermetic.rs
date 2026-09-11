@@ -955,26 +955,11 @@ impl HermeticCockpit {
         self.pty.as_ref().map(|pty| (pty.cols, pty.rows))
     }
 
-    pub fn child_exited(&mut self) -> bool {
+    pub fn wait_for_child_exit(&mut self) {
         let Some(pty) = self.pty.as_mut() else {
-            return true;
+            return;
         };
-        matches!(pty.child.try_wait(), Ok(Some(_)))
-    }
-
-    pub fn wait_for_child_exit(&mut self, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        let mut delay = Duration::from_millis(2);
-        loop {
-            if self.child_exited() {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return self.child_exited();
-            }
-            std::thread::sleep(delay);
-            delay = (delay * 2).min(Duration::from_millis(50));
-        }
+        pty.child.wait().expect("wait for exact PTY child exit");
     }
 
     /// Stop the PTY child and owned daemon. Safe to call more than once.
@@ -997,6 +982,8 @@ impl HermeticCockpit {
         self.pty = None;
 
         let daemon_pid = self.daemon_pid.take();
+        #[cfg(target_os = "linux")]
+        let daemon_exit = daemon_pid.map(super::ExactProcessExit::capture);
         if daemon_pid.is_some() {
             self.reaped_daemon_pid = daemon_pid;
         }
@@ -1008,11 +995,13 @@ impl HermeticCockpit {
                 .output();
             let _ = stop;
         }
+        #[cfg(target_os = "linux")]
+        if let Some(exit) = daemon_exit {
+            exit.wait();
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
         if let Some(pid) = daemon_pid {
-            assert!(
-                super::wait_for_pid_exit_blocking(pid, Duration::from_secs(2)),
-                "daemon pid {pid} still live after `cockpit daemon stop`; not sending SIGKILL to a numeric PID"
-            );
+            super::wait_for_pid_exit_blocking(pid);
         }
 
         let socket = self.socket_path();

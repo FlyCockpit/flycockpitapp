@@ -2512,13 +2512,10 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
     // helpers too. An isolated caller has no typed owner, so only that
     // explicit legacy case can use the historical name-keyed path.
     let Some(agent_instance_id) = agent_instance_id else {
-        // An isolated helper has no tree to own. Do not make the compatibility
-        // path affect normal production behavior. Unit tests exercise
-        // historical Approver prompt shapes without a daemon tree, so retain
-        // their isolated interrupt-only path; production host effects still
-        // fail closed below.
-        #[cfg(test)]
-        {
+        if matches!(
+            &decision_subject,
+            crate::agent_tree::HostDecisionSubject::UserQuestion
+        ) {
             return raise_and_wait_legacy(
                 db,
                 interrupts,
@@ -2530,26 +2527,8 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
             )
             .await;
         }
-        #[cfg(not(test))]
-        {
-            if matches!(
-                &decision_subject,
-                crate::agent_tree::HostDecisionSubject::UserQuestion
-            ) {
-                return raise_and_wait_legacy(
-                    db,
-                    interrupts,
-                    interrupt_session_id,
-                    agent,
-                    description,
-                    set,
-                    log_label,
-                )
-                .await;
-            }
-            tracing::warn!(%session_id, "host effect has no durable lifecycle owner");
-            return InterruptOutcome::Resolved(ResolveResponse::Cancel);
-        }
+        tracing::warn!(%session_id, "host effect has no durable lifecycle owner");
+        return InterruptOutcome::Resolved(ResolveResponse::Cancel);
     };
     let owner = match db.agent_instance(session_id, agent_instance_id).await {
         Ok(Some(owner)) => owner,

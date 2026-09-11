@@ -10,22 +10,18 @@
 //! On Windows the control identity file names a per-user private pipe; the
 //! reveal sibling is `{control_pipe}-leak-reveal` with the same owner ACL.
 
-#[cfg(test)]
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-#[cfg(test)]
 use tokio::io::AsyncWrite;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use zeroize::Zeroize;
 
 use crate::daemon::{DaemonListener, DaemonStream};
 
-#[cfg(test)]
 use crate::daemon::leak_reveal::LeakRevealDenied;
 use crate::daemon::leak_reveal::{RevealedLeakSecret, consume_leak_reveal};
-#[cfg(test)]
 use crate::daemon::leak_reveal_frame::{
     LEAK_REVEAL_FRAME_VERSION, LEAK_REVEAL_MAX_REPORT_ID_LEN, decode_response, encode_request,
 };
@@ -35,13 +31,11 @@ use crate::daemon::leak_reveal_frame::{
 };
 use crate::daemon::server::{DaemonContext, validate_peer_owner};
 use crate::daemon::shutdown::ShutdownPhase;
-#[cfg(test)]
 use crate::leaks::LEAK_REVEAL_MAX_PLAINTEXT_BYTES;
 
 /// Bounded wait for the whole reveal exchange (connect + write + read) so a
 /// stalled/misbehaving daemon can never hang the caller. Same-host, same-uid,
 /// sub-millisecond in practice; a generous ceiling fails closed.
-#[cfg(test)]
 const LEAK_REVEAL_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Bounded wait for a client to deliver its complete fixed-length request, so a
@@ -181,8 +175,7 @@ where
 /// attached TUI. A malformed capability (not 64 hex chars) fails closed as
 /// `Unauthorized` without contacting the daemon; connect failure (stale/missing
 /// socket after restart) is `UnavailablePlatform`.
-#[cfg(test)]
-pub(crate) async fn reveal_leak_secret_over_socket(
+pub async fn reveal_leak_secret_over_socket(
     reveal_socket: &Path,
     capability: &crate::daemon::proto::LeakRevealToken,
 ) -> Result<RevealedLeakSecret, LeakRevealDenied> {
@@ -249,7 +242,6 @@ pub(crate) async fn reveal_leak_secret_over_socket(
 /// for [`decode_response`]. Returns `None` on any short read, oversize field,
 /// or connection error. Never waits for EOF, so the exchange terminates as soon
 /// as a full frame is received.
-#[cfg(test)]
 async fn connect_reveal(reveal_socket: &Path) -> Result<impl AsyncRead + AsyncWrite + Unpin> {
     #[cfg(unix)]
     {
@@ -262,7 +254,6 @@ async fn connect_reveal(reveal_socket: &Path) -> Result<impl AsyncRead + AsyncWr
     }
 }
 
-#[cfg(test)]
 async fn read_response_frame<S>(stream: &mut S) -> Option<Vec<u8>>
 where
     S: AsyncRead + Unpin,

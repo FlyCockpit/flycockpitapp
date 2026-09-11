@@ -471,7 +471,7 @@ async fn assistant_inbox_timer_yields_to_ready_human_input() {
 
     let (queue, tx, _rx) = event_harness();
     let target = driver.active_queue_target();
-    let (control_tx, control_rx) = mpsc::channel(1);
+    let (_control_tx, control_rx) = mpsc::channel(1);
     let run_queue = queue.clone();
     let run_tx = tx.clone();
     let run =
@@ -502,14 +502,9 @@ async fn assistant_inbox_timer_yields_to_ready_human_input() {
         "the inbox is folded at the human turn boundary instead of starting a timer turn"
     );
 
-    control_tx.send(DriverControl::AbortForTest).await.unwrap();
+    queue.close().await;
     let result = run.await.expect("driver task joins");
-    assert!(
-        result
-            .expect_err("test abort terminates the driver")
-            .to_string()
-            .contains("driver abort requested for test")
-    );
+    result.expect("closed input queue terminates the driver cleanly");
 }
 
 #[tokio::test(start_paused = true)]
@@ -531,15 +526,10 @@ async fn assistant_inbox_timer_yields_to_ready_control() {
 
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_millis(250)).await;
-    control_tx.send(DriverControl::AbortForTest).await.unwrap();
+    drop(control_tx);
 
     let result = run.await.expect("driver task joins");
-    assert!(
-        result
-            .expect_err("ready control terminates the driver")
-            .to_string()
-            .contains("driver abort requested for test")
-    );
+    result.expect("closed control channel terminates the driver cleanly");
     assert_eq!(
         provider_posts(&provider).len(),
         0,
@@ -564,7 +554,7 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
 
     let (queue, tx, _rx) = event_harness();
     let target = driver.active_queue_target();
-    let (control_tx, control_rx) = mpsc::channel(1);
+    let (_control_tx, control_rx) = mpsc::channel(1);
     let run_queue = queue.clone();
     let run_tx = tx.clone();
     let run =
@@ -660,14 +650,9 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
         "idle immediate and heartbeat defer are acknowledged only after their turns accept them"
     );
 
-    control_tx.send(DriverControl::AbortForTest).await.unwrap();
+    queue.close().await;
     let result = run.await.expect("driver task joins");
-    assert!(
-        result
-            .expect_err("test abort terminates the driver")
-            .to_string()
-            .contains("driver abort requested for test")
-    );
+    result.expect("closed input queue terminates the driver cleanly");
 }
 
 #[tokio::test]
@@ -996,7 +981,7 @@ fn persistent_user_event_failure_defers_exact_payload_and_services_controls() {
             .await;
         assert_eq!(outcome, crate::engine::message::IdempotentPush::Inserted);
 
-        let (control_tx, control_rx) = mpsc::channel(4);
+        let (_control_tx, control_rx) = mpsc::channel(4);
         let run_queue = queue.clone();
         let run_tx = tx.clone();
         let run =
@@ -1014,17 +999,9 @@ fn persistent_user_event_failure_defers_exact_payload_and_services_controls() {
         .expect("persistent failure emits a bounded retry notice");
         assert!(notice.contains("exact payload will be retried"), "{notice}");
 
-        control_tx.send(DriverControl::AbortForTest).await.unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), run)
-            .await
-            .expect("a driver control is serviced while the payload is deferred")
-            .expect("driver task joins");
-        assert!(
-            result
-                .expect_err("test abort terminates the driver")
-                .to_string()
-                .contains("driver abort requested for test")
-        );
+        queue.close().await;
+        let result = run.await.expect("driver task joins");
+        result.expect("closed input queue terminates the driver cleanly");
         assert_eq!(provider_posts(&provider).len(), 0);
 
         // #275: the deferred retry must not settle the acked id. The

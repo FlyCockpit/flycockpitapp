@@ -31,6 +31,7 @@ pub(super) fn schedule_session_locks_unattended(
 }
 
 pub(super) fn schedule_session_container_release(
+    manager: Option<Arc<crate::container::ContainerManager>>,
     counter: Arc<AtomicUsize>,
     live: Arc<LiveState>,
     session_id: Uuid,
@@ -38,12 +39,13 @@ pub(super) fn schedule_session_container_release(
 ) {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(release_session_container_unattended(
-            counter, live, session_id, reason,
+            manager, counter, live, session_id, reason,
         ));
     }
 }
 
 pub(super) async fn release_session_container_unattended(
+    manager: Option<Arc<crate::container::ContainerManager>>,
     counter: Arc<AtomicUsize>,
     live: Arc<LiveState>,
     session_id: Uuid,
@@ -52,7 +54,7 @@ pub(super) async fn release_session_container_unattended(
     if counter.load(Ordering::SeqCst) != 0 || live.processing() || live.has_active_schedules() {
         return;
     }
-    let Some(manager) = crate::container::container_manager().get() else {
+    let Some(manager) = manager else {
         return;
     };
     if counter.load(Ordering::SeqCst) != 0 || live.processing() || live.has_active_schedules() {

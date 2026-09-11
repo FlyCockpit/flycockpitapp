@@ -1462,7 +1462,9 @@ impl SessionWorkerHandle {
                 mode: new,
                 enabled: new.enabled(),
                 container_network_enabled: self.session.container_network_enabled(),
-                container_availability: crate::container::availability_snapshot(),
+                container_availability: crate::container::availability_snapshot_for_db(
+                    &self.session.db,
+                ),
                 persisted_intent: Some(applied.persisted_intent.into()),
             },
         );
@@ -1694,6 +1696,15 @@ impl Drop for InteractiveClientGuard {
                 "last detach while idle",
             );
             schedule_session_container_release(
+                crate::container::container_manager_for_db(
+                    &self
+                        .lease
+                        .state
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .session
+                        .db,
+                ),
                 self.counter.clone(),
                 self.live.clone(),
                 self.session_id,
@@ -2189,7 +2200,9 @@ impl SessionWorkerHandle {
                 mode,
                 enabled: mode.enabled(),
                 container_network_enabled: self.session.container_network_enabled(),
-                container_availability: crate::container::availability_snapshot(),
+                container_availability: crate::container::availability_snapshot_for_db(
+                    &self.session.db,
+                ),
                 persisted_intent: Some(snapshot.extended.sandbox.default_mode.into()),
             },
         );

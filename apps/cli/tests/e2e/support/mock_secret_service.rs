@@ -19,7 +19,7 @@ const MAX_ITEMS: u32 = 32;
 
 pub struct MockSecretService {
     daemon: Child,
-    stop: Option<std::sync::mpsc::Sender<()>>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
     service: Option<JoinHandle<()>>,
     pub address: String,
 }
@@ -95,9 +95,8 @@ pub fn start_mock_secret_service() -> MockSecretService {
     );
 
     let address_for_thread = address.clone();
-    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let ready_flag = Arc::clone(&ready);
-    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let handle = std::thread::Builder::new()
         .name("cockpit-e2e-secret-service".into())
         .spawn(move || {
@@ -106,19 +105,14 @@ pub fn start_mock_secret_service() -> MockSecretService {
                 .build()
                 .expect("secret-service runtime");
             runtime.block_on(async move {
-                serve(&address_for_thread, ready_flag, stop_rx).await;
+                serve(&address_for_thread, ready_tx, stop_rx).await;
             });
         })
         .expect("spawn secret-service thread");
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !ready.load(std::sync::atomic::Ordering::SeqCst) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "mock secret service failed to claim the bus"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    ready_rx
+        .blocking_recv()
+        .expect("mock secret service failed before claiming the bus");
 
     MockSecretService {
         daemon: daemon.0.take().expect("dbus-daemon child"),
@@ -130,8 +124,8 @@ pub fn start_mock_secret_service() -> MockSecretService {
 
 async fn serve(
     address: &str,
-    ready: Arc<std::sync::atomic::AtomicBool>,
-    stop_rx: std::sync::mpsc::Receiver<()>,
+    ready: tokio::sync::oneshot::Sender<()>,
+    stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
     let state = Arc::new(Mutex::new(ServiceState::new()));
     let mut builder = connection::Builder::address(address)
@@ -165,10 +159,8 @@ async fn serve(
             .expect("serve item slot");
     }
     let _conn = builder.build().await.expect("start mock secret service");
-    ready.store(true, std::sync::atomic::Ordering::SeqCst);
-    while stop_rx.try_recv().is_err() {
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    ready.send(()).expect("signal secret-service readiness");
+    let _ = stop_rx.await;
 }
 
 struct ServiceState {

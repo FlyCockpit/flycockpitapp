@@ -891,6 +891,49 @@ struct SchedulerLaneSettled {
     terminal: crate::engine::agent::turn_scheduler::SchedulerTerminalOutcome,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::engine::driver) enum OrdinarySchedulerSignal<T> {
+    Completion(T),
+    CompletionClosed,
+    Slot(usize),
+    SlotClosed,
+}
+
+pub(in crate::engine::driver) async fn await_ordinary_scheduler_signal<T>(
+    completion_rx: &mut mpsc::Receiver<T>,
+    completion_pending: usize,
+    slot_rx: &mut mpsc::UnboundedReceiver<usize>,
+    slot_active: usize,
+) -> OrdinarySchedulerSignal<T> {
+    tokio::select! {
+        biased;
+        // A buffered terminal completion is authoritative. In particular, it
+        // must win over closure of the sibling slot-readiness channel.
+        completion = completion_rx.recv(), if completion_pending > 0 => {
+            completion.map_or(
+                OrdinarySchedulerSignal::CompletionClosed,
+                OrdinarySchedulerSignal::Completion,
+            )
+        }
+        slot = slot_rx.recv(), if slot_active > 0 => {
+            slot.map_or(
+                OrdinarySchedulerSignal::SlotClosed,
+                OrdinarySchedulerSignal::Slot,
+            )
+        }
+        else => std::future::pending().await,
+    }
+}
+
+pub(in crate::engine::driver) async fn enqueue_ordinary_scheduler_completion<T>(
+    completion_tx: &mpsc::Sender<T>,
+    completion: T,
+    slot_liveness: mpsc::UnboundedSender<usize>,
+) {
+    let _ = completion_tx.send(completion).await;
+    drop(slot_liveness);
+}
+
 /// Select the error to propagate from a scheduler lane that contained one or
 /// more interrupted calls.
 ///
@@ -3529,25 +3572,27 @@ impl Driver {
 
         enum Ready {
             OrdinarySlot(usize),
+            OrdinarySlotClosed,
             Ordinary((usize, SchedulerLaneSettled, Option<anyhow::Error>)),
+            OrdinaryClosed,
             Delegate(Option<BackgroundNoninteractiveCompletion>),
         }
         let ready = if let Some(completion) = completion {
             Ready::Delegate(Some(completion))
         } else {
             tokio::select! {
-                slot = ordinary_slot_rx.recv(), if *ordinary_active > 0 => {
-                    match slot {
-                        Some(source_index) => Ready::OrdinarySlot(source_index),
-                        None => Ready::Delegate(None),
-                    }
-                }
-                ordinary = ordinary_rx.recv(), if *ordinary_pending > 0 => {
-                    match ordinary {
-                        Some(completion) => Ready::Ordinary(completion),
-                        None => Ready::Delegate(None),
-                    }
-                }
+                biased;
+                ordinary = await_ordinary_scheduler_signal(
+                    ordinary_rx,
+                    *ordinary_pending,
+                    ordinary_slot_rx,
+                    *ordinary_active,
+                ) => match ordinary {
+                    OrdinarySchedulerSignal::Completion(completion) => Ready::Ordinary(completion),
+                    OrdinarySchedulerSignal::CompletionClosed => Ready::OrdinaryClosed,
+                    OrdinarySchedulerSignal::Slot(source_index) => Ready::OrdinarySlot(source_index),
+                    OrdinarySchedulerSignal::SlotClosed => Ready::OrdinarySlotClosed,
+                },
                 delegate = self.noninteractive_complete_rx.recv(), if !delegates.is_empty() => {
                     Ready::Delegate(delegate)
                 }
@@ -3558,6 +3603,12 @@ impl Driver {
                 if released_ordinary_slots.insert(source_index) {
                     *ordinary_active = ordinary_active.saturating_sub(1);
                 }
+            }
+            Ready::OrdinarySlotClosed => {
+                assert_eq!(
+                    *ordinary_active, 0,
+                    "scheduler ordinary-slot channel closed with {ordinary_active} active call(s)"
+                );
             }
             Ready::Ordinary((source_index, settled, error)) => {
                 *ordinary_pending = ordinary_pending.saturating_sub(1);
@@ -3580,6 +3631,12 @@ impl Driver {
                         errors.insert(source_index, error);
                     }
                 }
+            }
+            Ready::OrdinaryClosed => {
+                assert_eq!(
+                    *ordinary_pending, 0,
+                    "scheduler ordinary completion channel closed with {ordinary_pending} pending completion(s)"
+                );
             }
             Ready::Delegate(Some(completion)) => {
                 let task_call_id = completion.task_call_id().to_string();
@@ -3624,8 +3681,6 @@ impl Driver {
                 self.reap_finished_noninteractive_jobs();
             }
             Ready::Delegate(None) => {
-                *ordinary_active = 0;
-                *ordinary_pending = 0;
                 let first_source_index = delegates
                     .values()
                     .map(|(source_index, _)| *source_index)
@@ -3697,6 +3752,11 @@ impl Driver {
                 crate::engine::agent::DeferredParallelCall::Ordinary(mut call) => {
                     let source_index = call.source_index();
                     let completion_tx = ordinary_tx.clone();
+                    // Keep one slot sender owned by this exact call until its
+                    // terminal completion is enqueued. Thus slot-channel
+                    // closure can never overtake a completion still owed by a
+                    // live call, including cancellation/drop paths.
+                    let slot_liveness = ordinary_slot_tx.clone();
                     ordinary_active += 1;
                     ordinary_pending += 1;
                     call.set_execution_release_sender(ordinary_slot_tx.clone());
@@ -3709,8 +3769,9 @@ impl Driver {
                         );
                     tokio::spawn(async move {
                         let (messages, error, terminal_record, terminal) = lane_future.await;
-                        let _ = completion_tx
-                            .send((
+                        enqueue_ordinary_scheduler_completion(
+                            &completion_tx,
+                            (
                                 source_index,
                                 SchedulerLaneSettled {
                                     messages,
@@ -3718,8 +3779,10 @@ impl Driver {
                                     terminal,
                                 },
                                 error,
-                            ))
-                            .await;
+                            ),
+                            slot_liveness,
+                        )
+                        .await;
                     });
                 }
                 crate::engine::agent::DeferredParallelCall::Delegate(mut delegate) => {

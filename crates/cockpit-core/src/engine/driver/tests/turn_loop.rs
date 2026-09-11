@@ -2007,6 +2007,61 @@ async fn wait_until_started(started: &mut tokio::sync::watch::Receiver<Vec<Strin
         .expect("fifo lane readiness sender stays alive");
 }
 
+fn install_fifo_lane_tool(driver: &mut Driver, state: Arc<FifoLaneState>) {
+    let old = driver.stack[0].agent.clone();
+    driver.stack[0].agent = Arc::new(Agent {
+        name: old.name.clone(),
+        system: old.system.clone(),
+        role_prompt: old.role_prompt.clone(),
+        tools: crate::engine::tool::ToolBox::new().with(Arc::new(FifoLaneTool { state })),
+        model: old.model.clone(),
+        params: old.params.clone(),
+        scan_tool_results: old.scan_tool_results,
+        tool_steering: old.tool_steering,
+        posture: old.posture.clone(),
+        context_policy: old.context_policy.clone(),
+        lock_identity: "Build".to_string(),
+        write_scope: None,
+        workspace_lease: old.workspace_lease.clone(),
+        delegated: old.delegated,
+        delegation_recursion: old.delegation_recursion.clone(),
+        vnext_grant: old.vnext_grant.clone(),
+        env_overlay: old.env_overlay.clone(),
+        definition: None,
+        assistant_identity_prefix: None,
+        mcp_resolver: old.mcp_resolver.clone(),
+    });
+}
+
+fn configure_fifo_lane_parallelism(
+    driver: &mut Driver,
+    root: &std::path::Path,
+    provider_url: &str,
+    max_parallel: usize,
+) {
+    std::fs::create_dir_all(root.join(".cockpit/providers")).unwrap();
+    std::fs::write(
+        root.join(".cockpit/config.json"),
+        serde_json::json!({
+            "active_model": { "provider": "lmstudio", "model": "local" },
+            "delegation": { "maxParallel": max_parallel }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(".cockpit/providers/lmstudio.json"),
+        serde_json::json!({
+            "url": provider_url,
+            "wire_api": "completions",
+            "models": [{ "id": "local" }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    driver.refresh_config_from_disk_for_tests();
+}
+
 #[test]
 fn large_write_elides_only_after_a_newer_assistant_turn_exists() {
     crate::test_env::run_async_with_large_stack(|| async {
@@ -2198,6 +2253,315 @@ fn failed_write_keeps_args_on_the_next_request() {
         assert!(
             second_body.contains(&nested_wire_arguments),
             "failed write args must stay visible"
+        );
+    });
+}
+
+#[test]
+fn full_driver_drains_buffered_ordinary_completions_after_all_slot_senders_close() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        let provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::ParallelToolCalls(vec![
+                (
+                    "closed-alpha".into(),
+                    "fifo_lane".into(),
+                    serde_json::json!({ "id": "alpha" }),
+                ),
+                (
+                    "closed-beta".into(),
+                    "fifo_lane".into(),
+                    serde_json::json!({ "id": "beta" }),
+                ),
+                (
+                    "closed-gamma".into(),
+                    "fifo_lane".into(),
+                    serde_json::json!({ "id": "gamma" }),
+                ),
+            ]))
+            .turn(Turn::Text("all buffered results retained".into()))
+            .start()
+            .await;
+        let (mut driver, tmp) = scripted_driver(&provider);
+        let state = FifoLaneState::new();
+        let mut started = state.started_rx();
+        install_fifo_lane_tool(&mut driver, state.clone());
+        configure_fifo_lane_parallelism(&mut driver, tmp.path(), &provider.base_url(), 3);
+        let (queue, tx, mut rx) = event_harness();
+
+        {
+            let run = driver.run_user_input(UserSubmission::text("drain every lane"), &queue, &tx);
+            tokio::pin!(run);
+            tokio::select! {
+                result = &mut run => panic!("driver completed before every ordinary sender was live: {result:?}"),
+                () = wait_until_started(&mut started, 3) => {}
+            }
+            for id in ["alpha", "beta", "gamma"] {
+                state.release(id);
+            }
+            run.await.unwrap();
+        }
+
+        let events = drain_events(&mut rx);
+        let results = tool_results_including_errors(&events);
+        assert_eq!(
+            results,
+            vec![
+                ("closed-alpha", "fifo_lane", "alpha body"),
+                ("closed-beta", "fifo_lane", "beta body"),
+                ("closed-gamma", "fifo_lane", "gamma body"),
+            ]
+        );
+        assert_eq!(
+            assistant_texts(&events),
+            vec!["all buffered results retained"]
+        );
+        let durable = session_events(&driver).await;
+        for kind in ["tool_call_started", "tool_call", "tool_call_completed"] {
+            assert_eq!(
+                durable
+                    .iter()
+                    .filter(|event| event.kind == kind)
+                    .filter_map(|event| event.call_id.as_deref())
+                    .collect::<Vec<_>>(),
+                vec!["closed-alpha", "closed-beta", "closed-gamma"],
+                "{kind} must retain every terminal lane in source order"
+            );
+        }
+        let continuations = driver
+            .session
+            .db
+            .read({
+                let session_id = driver.session.id;
+                move |conn| crate::db::Db::list_turn_scheduler_continuations_conn(conn, session_id)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            continuations
+                .iter()
+                .map(|row| {
+                    (
+                        row.call_id.as_str(),
+                        row.terminal_outcome.as_deref(),
+                        row.terminal_result_body.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                ("closed-alpha", Some("completed"), Some("alpha body")),
+                ("closed-beta", Some("completed"), Some("beta body")),
+                ("closed-gamma", Some("completed"), Some("gamma body")),
+            ]
+        );
+    });
+}
+
+#[test]
+fn scheduler_completion_wins_after_success_slot_senders_close() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        let (completion_tx, mut completion_rx) = mpsc::channel(1);
+        let (slot_tx, mut slot_rx) = mpsc::unbounded_channel();
+        let slot_liveness = slot_tx.clone();
+        drop(slot_tx);
+        assert_eq!(slot_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+
+        crate::engine::driver::noninteractive::enqueue_ordinary_scheduler_completion(
+            &completion_tx,
+            ("closed-success", "success body"),
+            slot_liveness,
+        )
+        .await;
+        drop(completion_tx);
+        assert_eq!(
+            slot_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        );
+        assert_eq!(
+            crate::engine::driver::noninteractive::await_ordinary_scheduler_signal(
+                &mut completion_rx,
+                1,
+                &mut slot_rx,
+                1,
+            )
+            .await,
+            crate::engine::driver::noninteractive::OrdinarySchedulerSignal::Completion((
+                "closed-success",
+                "success body",
+            ))
+        );
+        assert_eq!(
+            slot_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected),
+            "the buffered completion must be consumed after every slot sender has closed"
+        );
+    });
+}
+
+#[test]
+fn scheduler_completion_wins_after_cancel_slot_senders_close() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        let (completion_tx, mut completion_rx) = mpsc::channel(1);
+        let (slot_tx, mut slot_rx) = mpsc::unbounded_channel();
+        let slot_liveness = slot_tx.clone();
+        drop(slot_tx);
+        assert_eq!(slot_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+        let cancelled = "tool `fifo_lane` was cancelled by the user and abandoned";
+
+        crate::engine::driver::noninteractive::enqueue_ordinary_scheduler_completion(
+            &completion_tx,
+            ("closed-cancel", cancelled),
+            slot_liveness,
+        )
+        .await;
+        drop(completion_tx);
+        assert_eq!(
+            slot_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        );
+        assert_eq!(
+            crate::engine::driver::noninteractive::await_ordinary_scheduler_signal(
+                &mut completion_rx,
+                1,
+                &mut slot_rx,
+                1,
+            )
+            .await,
+            crate::engine::driver::noninteractive::OrdinarySchedulerSignal::Completion((
+                "closed-cancel",
+                cancelled,
+            ))
+        );
+        assert_eq!(
+            slot_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected),
+            "cancel/retract draining must consume the terminal before closed-slot observation"
+        );
+    });
+}
+
+#[test]
+fn full_driver_cancel_drains_every_closed_sender_terminal_before_retract_decision() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        let provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::ParallelToolCalls(vec![
+                (
+                    "cancel-alpha".into(),
+                    "fifo_lane".into(),
+                    serde_json::json!({ "id": "alpha" }),
+                ),
+                (
+                    "cancel-beta".into(),
+                    "fifo_lane".into(),
+                    serde_json::json!({ "id": "beta" }),
+                ),
+                (
+                    "cancel-gamma".into(),
+                    "fifo_lane".into(),
+                    serde_json::json!({ "id": "gamma" }),
+                ),
+            ]))
+            .start()
+            .await;
+        let (mut driver, tmp) = scripted_driver(&provider);
+        let state = FifoLaneState::new();
+        let mut started = state.started_rx();
+        install_fifo_lane_tool(&mut driver, state);
+        configure_fifo_lane_parallelism(&mut driver, tmp.path(), &provider.base_url(), 3);
+        let cancel = driver.cancel_handle();
+        let (queue, tx, mut rx) = event_harness();
+        let run = tokio::spawn(async move {
+            driver
+                .run_user_input(UserSubmission::text("cancel every lane"), &queue, &tx)
+                .await
+                .unwrap();
+            driver
+        });
+
+        wait_until_started(&mut started, 3).await;
+        cancel.cancel_turn();
+        let driver = await_paused_driver_test_completion(run, "closed-sender cancellation drain")
+            .await
+            .unwrap();
+        let events = drain_events(&mut rx);
+        let results = tool_results_including_errors(&events);
+        assert_eq!(
+            results,
+            vec![
+                (
+                    "cancel-alpha",
+                    "fifo_lane",
+                    "tool `fifo_lane` was cancelled by the user and abandoned",
+                ),
+                (
+                    "cancel-beta",
+                    "fifo_lane",
+                    "tool `fifo_lane` was cancelled by the user and abandoned",
+                ),
+                (
+                    "cancel-gamma",
+                    "fifo_lane",
+                    "tool `fifo_lane` was cancelled by the user and abandoned",
+                ),
+            ]
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TurnEvent::UserMessageRetracted { .. })),
+            "started tool lanes close the reasoning-only retract window"
+        );
+        let durable = session_events(&driver).await;
+        for kind in ["tool_call_started", "tool_call", "tool_call_completed"] {
+            assert_eq!(
+                durable
+                    .iter()
+                    .filter(|event| event.kind == kind)
+                    .filter_map(|event| event.call_id.as_deref())
+                    .collect::<Vec<_>>(),
+                vec!["cancel-alpha", "cancel-beta", "cancel-gamma"],
+                "{kind} must retain every cancelled terminal lane in source order"
+            );
+        }
+        let continuations = driver
+            .session
+            .db
+            .read({
+                let session_id = driver.session.id;
+                move |conn| crate::db::Db::list_turn_scheduler_continuations_conn(conn, session_id)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            continuations
+                .iter()
+                .map(|row| {
+                    (
+                        row.call_id.as_str(),
+                        row.terminal_outcome.as_deref(),
+                        row.terminal_result_body.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "cancel-alpha",
+                    Some("completed"),
+                    Some("tool `fifo_lane` was cancelled by the user and abandoned"),
+                ),
+                (
+                    "cancel-beta",
+                    Some("completed"),
+                    Some("tool `fifo_lane` was cancelled by the user and abandoned"),
+                ),
+                (
+                    "cancel-gamma",
+                    Some("completed"),
+                    Some("tool `fifo_lane` was cancelled by the user and abandoned"),
+                ),
+            ],
+            "cancelled dispatches return canonical tool results, so the scheduler durably completes each exact paired body in source order"
         );
     });
 }

@@ -5322,6 +5322,158 @@ async fn failed_interrupt_settlement_does_not_emit_interrupted_event() {
     }
 }
 
+fn parked_replay_test_payload() -> crate::db::needs_attention::InterruptParkPayload {
+    crate::db::needs_attention::InterruptParkPayload {
+        tool: "question".to_string(),
+        args: serde_json::json!({}),
+        call_id: "call-1".to_string(),
+        resume: crate::db::needs_attention::InterruptResumeAnchor {
+            agent_id: "Build".to_string(),
+            call_id: "call-1".to_string(),
+            provider_item_id: None,
+            provider_call_id: None,
+            assistant_seq: None,
+            call_origin: crate::db::needs_attention::InterruptCallOrigin::Foreground,
+        },
+        gate: None,
+        verification: None,
+    }
+}
+
+async fn executing_parked_interrupt(
+    db: &Db,
+    session_id: Uuid,
+) -> (Uuid, crate::db::needs_attention::NeedsAttentionRow) {
+    let set = proto::InterruptQuestionSet {
+        questions: vec![proto::InterruptQuestion::Freetext {
+            prompt: "Why?".to_string(),
+            masked: false,
+        }],
+    };
+    let interrupt_id = db
+        .raise_interrupt_questions_with_payload(
+            session_id,
+            "Build",
+            "context",
+            &set,
+            Some(&parked_replay_test_payload()),
+        )
+        .await
+        .unwrap();
+    assert!(db.park_interrupt(interrupt_id).await.unwrap());
+    assert!(
+        db.begin_parked_interrupt_execution(
+            interrupt_id,
+            &proto::ResolveResponse::Freetext {
+                text: "answer".to_string(),
+            },
+        )
+        .await
+        .unwrap()
+    );
+    let row = db.get_interrupt(interrupt_id).await.unwrap().unwrap();
+    (interrupt_id, row)
+}
+
+#[tokio::test]
+async fn parked_replay_failure_emits_exact_interrupted_completion_after_commit() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_for_test(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let session_id = session.id;
+    let (interrupt_id, _) = executing_parked_interrupt(&db, session_id).await;
+    let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(8);
+    let redaction: SharedRedactionTable = Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
+    let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached());
+
+    assert!(
+        !finish_parked_replay_completion(
+            &session,
+            &event_tx,
+            &redaction,
+            &interrupts,
+            session_id,
+            ParkedReplayCompletion {
+                interrupt_id,
+                decision: None,
+                was_active: true,
+                result: Err("executor disappeared".to_string()),
+            },
+        )
+        .await
+    );
+    assert!(matches!(
+        event_rx.try_recv().expect("typed completion").event,
+        proto::Event::InterruptInterrupted {
+            session_id: got_session_id,
+            interrupt_id: got_interrupt_id,
+        } if got_session_id == session_id && got_interrupt_id == interrupt_id
+    ));
+    assert_eq!(
+        db.get_interrupt(interrupt_id).await.unwrap().unwrap().state,
+        crate::db::needs_attention::InterruptState::Interrupted
+    );
+}
+
+#[tokio::test]
+async fn malformed_claimed_parked_rows_emit_exact_interrupted_completion_after_commit() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_for_test(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let session_id = session.id;
+    let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(8);
+    let redaction: SharedRedactionTable = Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
+
+    for malformed in [
+        ClaimedParkedReplayError::MissingPayload,
+        ClaimedParkedReplayError::MissingQuestion,
+    ] {
+        let (interrupt_id, mut row) = executing_parked_interrupt(&db, session_id).await;
+        match malformed {
+            ClaimedParkedReplayError::MissingPayload => row.parked = None,
+            ClaimedParkedReplayError::MissingQuestion => {
+                row.question = None;
+                row.questions = None;
+            }
+        }
+        assert_eq!(claimed_parked_replay_parts(&row), Err(malformed));
+        assert!(
+            mark_client_visible_interrupt_interrupted(
+                &session,
+                &event_tx,
+                &redaction,
+                session_id,
+                interrupt_id,
+                false,
+            )
+            .await
+        );
+        assert!(matches!(
+            event_rx.try_recv().expect("typed completion").event,
+            proto::Event::InterruptInterrupted {
+                session_id: got_session_id,
+                interrupt_id: got_interrupt_id,
+            } if got_session_id == session_id && got_interrupt_id == interrupt_id
+        ));
+        assert_eq!(
+            db.get_interrupt(interrupt_id).await.unwrap().unwrap().state,
+            crate::db::needs_attention::InterruptState::Interrupted
+        );
+    }
+}
+
 #[tokio::test]
 async fn shutdown_durability_commit_parks_interrupt_and_writes_paused_work_atomically() {
     let tmp = tempfile::TempDir::new().unwrap();

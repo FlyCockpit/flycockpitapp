@@ -4266,10 +4266,15 @@ pub(super) async fn finish_parked_replay_completion(
             // it here would discard an already-recorded user response and
             // cause the child to re-run its pre-interrupt model prompt.
             if completion.decision.is_none() {
-                let _ = session
-                    .db
-                    .mark_interrupt_interrupted(completion.interrupt_id)
-                    .await;
+                mark_client_visible_interrupt_interrupted(
+                    session,
+                    event_tx,
+                    redaction,
+                    session_id,
+                    completion.interrupt_id,
+                    false,
+                )
+                .await;
             }
             tracing::warn!(
                 %error,
@@ -4446,6 +4451,48 @@ pub(super) fn validate_parked_interrupt_payload(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClaimedParkedReplayError {
+    MissingPayload,
+    MissingQuestion,
+}
+
+pub(super) fn claimed_parked_replay_parts(
+    row: &crate::db::needs_attention::NeedsAttentionRow,
+) -> std::result::Result<
+    (
+        crate::db::needs_attention::InterruptParkPayload,
+        crate::daemon::proto::InterruptQuestionSet,
+    ),
+    ClaimedParkedReplayError,
+> {
+    let payload = row
+        .parked
+        .clone()
+        .ok_or(ClaimedParkedReplayError::MissingPayload)?;
+    let questions = row
+        .questions
+        .clone()
+        .or_else(|| {
+            row.question
+                .clone()
+                .map(|question| crate::daemon::proto::InterruptQuestionSet {
+                    questions: vec![question],
+                })
+        })
+        .ok_or(ClaimedParkedReplayError::MissingQuestion)?;
+    Ok((payload, questions))
+}
+
+impl ClaimedParkedReplayError {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::MissingPayload => "missing replay payload",
+            Self::MissingQuestion => "missing replay question",
+        }
+    }
+}
+
 fn interrupt_restart_notice_text(interrupt_id: Uuid, payload: Result<(), &'static str>) -> String {
     match payload {
         Ok(()) => format!(
@@ -4463,6 +4510,39 @@ pub(super) async fn settle_unrecoverable_interrupt(
     interrupt_id: Uuid,
     linked: bool,
     notice_text: String,
+) -> bool {
+    let committed = mark_client_visible_interrupt_interrupted(
+        session,
+        event_tx,
+        redaction,
+        session_id,
+        interrupt_id,
+        linked,
+    )
+    .await;
+    send_current_session_event(
+        session,
+        event_tx,
+        redaction,
+        proto::Event::Notice {
+            session_id,
+            text: notice_text,
+        },
+        NoticeSource::DaemonDirect,
+    );
+    committed
+}
+
+/// The sole daemon-worker writer for a client-visible transition to
+/// `interrupted`. The typed completion is published only after the exact
+/// state-changing commit; conflicts and storage failures publish nothing.
+pub(super) async fn mark_client_visible_interrupt_interrupted(
+    session: &crate::session::Session,
+    event_tx: &EventSender,
+    redaction: &SharedRedactionTable,
+    session_id: Uuid,
+    interrupt_id: Uuid,
+    linked: bool,
 ) -> bool {
     let marked = if linked {
         session
@@ -4502,16 +4582,6 @@ pub(super) async fn settle_unrecoverable_interrupt(
             },
         );
     }
-    send_current_session_event(
-        session,
-        event_tx,
-        redaction,
-        proto::Event::Notice {
-            session_id,
-            text: notice_text,
-        },
-        NoticeSource::DaemonDirect,
-    );
     committed
 }
 
@@ -12505,45 +12575,34 @@ pub(super) async fn run_worker(
                             interrupts.emit_queue_state().await;
                             continue;
                         }
-                        let Some(payload) = row.parked.clone() else {
-                            let _ = session.db.mark_interrupt_interrupted(interrupt_id).await;
-                            send_current_session_event(
-                                &session,
-                                &event_tx,
-                                &redaction,
-                                proto::Event::Notice {
+                        let (payload, questions) = match claimed_parked_replay_parts(row) {
+                            Ok(parts) => parts,
+                            Err(error) => {
+                                let reason = error.reason();
+                                mark_client_visible_interrupt_interrupted(
+                                    &session,
+                                    &event_tx,
+                                    &redaction,
                                     session_id,
-                                    text: format!(
-                                        "Interrupted parked request {interrupt_id}: missing replay payload."
-                                    ),
-                                },
-                                NoticeSource::DaemonDirect,
-                            );
-                            interrupts.emit_queue_state().await;
-                            continue;
-                        };
-                        let Some(questions) = row.questions.clone().or_else(|| {
-                            row.question.clone().map(|question| {
-                                crate::daemon::proto::InterruptQuestionSet {
-                                    questions: vec![question],
-                                }
-                            })
-                        }) else {
-                            let _ = session.db.mark_interrupt_interrupted(interrupt_id).await;
-                            send_current_session_event(
-                                &session,
-                                &event_tx,
-                                &redaction,
-                                proto::Event::Notice {
-                                    session_id,
-                                    text: format!(
-                                        "Interrupted parked request {interrupt_id}: missing replay question."
-                                    ),
-                                },
-                                NoticeSource::DaemonDirect,
-                            );
-                            interrupts.emit_queue_state().await;
-                            continue;
+                                    interrupt_id,
+                                    tree_decision.is_some(),
+                                )
+                                .await;
+                                send_current_session_event(
+                                    &session,
+                                    &event_tx,
+                                    &redaction,
+                                    proto::Event::Notice {
+                                        session_id,
+                                        text: format!(
+                                            "Interrupted parked request {interrupt_id}: {reason}."
+                                        ),
+                                    },
+                                    NoticeSource::DaemonDirect,
+                                );
+                                interrupts.emit_queue_state().await;
+                                continue;
+                            }
                         };
                         let occurrence = match session
                             .db

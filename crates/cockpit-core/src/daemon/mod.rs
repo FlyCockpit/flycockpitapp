@@ -2225,6 +2225,13 @@ async fn run_foreground_inner_with_boot_db(
         pid_receipt.clone(),
         daemon_lifetime,
     );
+    // The product daemon is a process owner: its lifetime witness is released
+    // by kernel process teardown, including every early-return and panic path.
+    // Injected in-process daemons keep RAII ownership so their test process can
+    // host later generations after the supervisor has fully joined.
+    if boot_db.is_none() {
+        metadata_guard.hold_lifetime_until_process_exit();
+    }
     match std::fs::remove_file(&paths.socket) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2321,7 +2328,7 @@ async fn run_foreground_inner_with_boot_db(
     // daemon-internal periodic task that reclaims locks whose holder has
     // gone idle past the 5-minute threshold, so a hung/abandoned holder
     // can't block a waiting `read` forever.
-    let _lock_sweeper = server::spawn_lock_sweeper(ctx.clone());
+    let lock_sweeper = server::spawn_lock_sweeper(ctx.clone());
     #[cfg(feature = "remote")]
     let org_sync_task = org_sync::spawn_background(ctx.clone());
     #[cfg(feature = "remote")]
@@ -2415,29 +2422,46 @@ async fn run_foreground_inner_with_boot_db(
         tracing::warn!(%error, "daemon shutdown was not clean");
     }
 
-    // Cleanup on every path, but only while the pid file still names this
-    // process. A restart replacement may have taken ownership of the shared
-    // canonical paths before the old daemon finishes draining.
-    let metadata_result = metadata_guard.cleanup();
-
     signal_task.abort();
+    let _ = signal_task.await;
+    lock_sweeper.abort();
+    let _ = lock_sweeper.await;
     if let Some(task) = lifecycle_task {
         task.abort();
+        let _ = task.await;
     }
     #[cfg(feature = "remote")]
-    org_sync_task.abort();
+    {
+        org_sync_task.abort();
+        let _ = org_sync_task.await;
+    }
     #[cfg(feature = "remote")]
-    remote_audit_upload_task.abort();
+    {
+        remote_audit_upload_task.abort();
+        let _ = remote_audit_upload_task.await;
+    }
     #[cfg(feature = "remote")]
-    connector_task.abort();
+    {
+        connector_task.abort();
+        let _ = connector_task.await;
+    }
     #[cfg(feature = "remote")]
-    remote_outbox_task.abort();
+    {
+        remote_outbox_task.abort();
+        let _ = remote_outbox_task.await;
+    }
     #[cfg(any(unix, windows))]
     if let Some(task) = leak_reveal_task {
         task.abort();
+        let _ = task.await;
     }
     #[cfg(any(unix, windows))]
     let _ = std::fs::remove_file(paths.leak_reveal_socket());
+
+    // Retire metadata only after every foreground-owned task has acknowledged
+    // cancellation. This never releases the lifetime witness: production
+    // ownership ends at process teardown, and injected ownership ends at Drop.
+    let metadata_result = metadata_guard.cleanup();
     let mut failures = Vec::new();
     if let Err(error) = result {
         failures.push(format!("daemon accept loop: {error}"));
@@ -2557,7 +2581,12 @@ pub fn stop(paths: &DaemonPaths) -> Result<bool> {
     };
     #[cfg(target_os = "linux")]
     return stop_linux(paths, record);
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    return stop_kqueue_unix(paths, record);
+    #[cfg(all(
+        unix,
+        not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
+    ))]
     return stop_unix_without_stable_handle(paths, record);
     #[cfg(windows)]
     return stop_windows(paths, record);
@@ -2579,7 +2608,12 @@ pub(crate) fn stop_exact(paths: &DaemonPaths, expected: &DaemonPidReceipt) -> Re
     }
     #[cfg(target_os = "linux")]
     return stop_linux(paths, DaemonPidRecord::Receipt(expected.clone()));
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    return stop_kqueue_unix(paths, DaemonPidRecord::Receipt(expected.clone()));
+    #[cfg(all(
+        unix,
+        not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
+    ))]
     return stop_unix_without_stable_handle(paths, DaemonPidRecord::Receipt(expected.clone()));
     #[cfg(windows)]
     return stop_windows(paths, DaemonPidRecord::Receipt(expected.clone()));
@@ -2654,7 +2688,52 @@ fn stop_linux(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
     Ok(true)
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn stop_kqueue_unix(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
+    let receipt = match record {
+        DaemonPidRecord::LegacyNumeric(pid) => return settle_legacy_stop(paths, pid),
+        DaemonPidRecord::Receipt(receipt) => receipt,
+    };
+    let process = match acquire_verified_daemon_process(&receipt) {
+        VerifiedProcessOutcome::Verified(process) => process,
+        VerifiedProcessOutcome::Identity(PidIdentity::Missing | PidIdentity::NotDaemon) => {
+            cleanup_receipt_metadata(paths, &receipt)?;
+            return Ok(false);
+        }
+        VerifiedProcessOutcome::Identity(PidIdentity::Unverified) => {
+            anyhow::bail!("refusing to signal daemon: PID receipt could not be verified");
+        }
+        VerifiedProcessOutcome::Identity(PidIdentity::VerifiedDaemon) => unreachable!(),
+    };
+    if read_daemon_pid_record(&paths.pid_file) != Some(DaemonPidRecord::Receipt(receipt.clone())) {
+        anyhow::bail!(
+            "daemon PID receipt changed after exact kqueue witness acquisition; refusing signal"
+        );
+    }
+    if let Err(error) = process.send_sigterm() {
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            cleanup_receipt_metadata(paths, &receipt)?;
+            return Ok(true);
+        }
+        return Err(error).with_context(|| format!("signaling daemon PID {}", receipt.pid));
+    }
+    if !process
+        .wait_for_exit_blocking(restart_release_timeout(None))
+        .with_context(|| format!("waiting for exact daemon PID {} exit", receipt.pid))?
+    {
+        anyhow::bail!(
+            "timed out waiting for daemon PID {} to stop; preserving its receipt and socket metadata",
+            receipt.pid
+        );
+    }
+    cleanup_receipt_metadata(paths, &receipt)?;
+    Ok(true)
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
+))]
 fn stop_unix_without_stable_handle(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
     match record {
         DaemonPidRecord::LegacyNumeric(pid) => settle_legacy_stop(paths, pid),
@@ -3848,6 +3927,40 @@ mod tests {
         assert_eq!(restart_release_timeout(None), RESTART_RELEASE_DEADLINE);
         assert_eq!(restart_release_timeout(Some(0)), RESTART_RELEASE_DEADLINE);
         assert_eq!(restart_release_timeout(Some(7)), RESTART_RELEASE_DEADLINE);
+    }
+
+    #[test]
+    fn stop_routing_uses_exact_kqueue_witness_on_macos_and_freebsd() {
+        let source = include_str!("mod.rs");
+        let start = source.find("pub fn stop(paths:").expect("stop entry");
+        let exact = source
+            .find("pub(crate) fn stop_exact")
+            .expect("exact stop entry");
+        let stable = source
+            .find("fn stop_kqueue_unix")
+            .expect("kqueue stop backend");
+        let unsupported = source
+            .find("fn stop_unix_without_stable_handle")
+            .expect("unsupported Unix backend");
+
+        for body in [&source[start..exact], &source[exact..stable]] {
+            assert!(
+                body.contains("target_os = \"macos\"")
+                    && body.contains("target_os = \"freebsd\"")
+                    && body.contains("stop_kqueue_unix"),
+                "macOS and FreeBSD stop entries must route through the exact kqueue witness"
+            );
+        }
+        assert!(
+            source[stable..unsupported].contains("wait_for_exit_blocking"),
+            "the kqueue backend must consume exact exit evidence"
+        );
+        assert!(
+            source[unsupported.saturating_sub(160)..unsupported].contains(
+                "not(any(target_os = \"linux\", target_os = \"macos\", target_os = \"freebsd\"))"
+            ),
+            "only Unix targets without a kernel witness may use the fail-closed backend"
+        );
     }
 
     #[tokio::test]

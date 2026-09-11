@@ -377,6 +377,58 @@ async fn wait_for_verified_process_exit(
 }
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+impl VerifiedDaemonProcess {
+    /// Deliver SIGTERM only after this exact process has been registered with
+    /// kqueue and its receipt has been verified. The kqueue registration is
+    /// retained to prove completion without observing the numeric PID again.
+    pub fn send_sigterm(&self) -> std::io::Result<()> {
+        let pid = libc::pid_t::try_from(self.receipt.pid)
+            .map_err(|_| std::io::Error::other("daemon PID does not fit pid_t"))?;
+        // SAFETY: pid was range-checked and the caller retains the exact
+        // kqueue process witness across signal delivery.
+        if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    /// Consume the exact kqueue witness in a single deadline-bounded wait.
+    pub fn wait_for_exit_blocking(self, timeout: std::time::Duration) -> std::io::Result<bool> {
+        use std::os::fd::AsRawFd as _;
+        let seconds = libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX);
+        let nanos = libc::c_long::from(timeout.subsec_nanos());
+        let deadline = libc::timespec {
+            tv_sec: seconds,
+            tv_nsec: nanos,
+        };
+        let mut event = std::mem::MaybeUninit::<libc::kevent>::uninit();
+        // SAFETY: event has capacity for one returned event and deadline is a
+        // normalized relative timespec.
+        let count = unsafe {
+            libc::kevent(
+                self.kqueue.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                event.as_mut_ptr(),
+                1,
+                &deadline,
+            )
+        };
+        if count < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if count == 0 {
+            return Ok(false);
+        }
+        let event = unsafe { event.assume_init() };
+        Ok(event.ident == self.receipt.pid as libc::uintptr_t
+            && event.filter == libc::EVFILT_PROC
+            && event.fflags & libc::NOTE_EXIT != 0)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub fn acquire_verified_daemon_process(receipt: &DaemonPidReceipt) -> VerifiedProcessOutcome {
     use std::os::fd::FromRawFd as _;
     let Ok(pid) = libc::pid_t::try_from(receipt.pid) else {
@@ -480,9 +532,8 @@ async fn wait_for_verified_process_exit(
 pub fn acquire_verified_daemon_process(receipt: &DaemonPidReceipt) -> VerifiedProcessOutcome {
     use std::os::windows::io::FromRawHandle as _;
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZE,
-    };
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
     let raw = unsafe {
         OpenProcess(
             PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
@@ -1753,8 +1804,18 @@ impl ForegroundMetadataGuard {
             )?;
         }
         self.armed = false;
-        self.lifetime.take();
         Ok(())
+    }
+
+    /// Transfer the advisory lifetime lock to the process itself.
+    ///
+    /// Product foreground daemons call this immediately after reservation so
+    /// no Rust return path can release the lock before kernel process teardown.
+    /// Injected in-process daemons intentionally retain ordinary RAII ownership.
+    pub fn hold_lifetime_until_process_exit(&mut self) {
+        if let Some(lifetime) = self.lifetime.take() {
+            std::mem::forget(lifetime);
+        }
     }
 }
 
@@ -1776,7 +1837,18 @@ mod tests {
     #[test]
     fn daemon_lifetime_witness_observes_real_child_exit() {
         if let Some(path) = std::env::var_os(LIFETIME_CHILD_PATH) {
-            let _guard = acquire_daemon_lifetime(Path::new(&path)).expect("child lifetime lock");
+            let pid_file = PathBuf::from(path);
+            let socket = pid_file.with_extension("sock");
+            let receipt = write_pid_file(
+                &pid_file,
+                std::process::id(),
+                &std::env::current_exe().expect("child executable"),
+            )
+            .expect("child receipt");
+            let mut guard = ForegroundMetadataGuard::new(pid_file, socket, None, receipt)
+                .expect("child lifetime lock");
+            guard.hold_lifetime_until_process_exit();
+            guard.cleanup().expect("retire child metadata");
             println!("lifetime-lock-held");
             use std::io::Read as _;
             let mut byte = [0_u8; 1];
@@ -1835,7 +1907,13 @@ mod tests {
             "live child process witness must honor an expired deadline"
         );
 
-        let witness = capture_daemon_lifetime_release(&pid_file).expect("capture witness");
+        let live_witness =
+            capture_daemon_lifetime_release(&pid_file).expect("capture live witness");
+        assert!(
+            !live_witness.released().expect("probe live product owner"),
+            "explicit metadata cleanup must not release a product daemon's lifetime lock"
+        );
+        let witness = capture_daemon_lifetime_release(&pid_file).expect("capture release witness");
         let release_process = VerifiedDaemonProcess {
             receipt: DaemonPidReceipt {
                 pid: child.id(),
@@ -2215,6 +2293,15 @@ mod tests {
         )
         .expect("lifetime guard");
         guard.cleanup().expect("guard cleanup");
+
+        let competing = capture_daemon_lifetime_release(&pid_file)
+            .expect("capture cleaned-guard lifetime")
+            .released()
+            .expect("probe lifetime while cleaned guard remains alive");
+        assert!(
+            !competing,
+            "metadata cleanup must not release the daemon lifetime lock"
+        );
 
         assert!(!pid_file.exists());
         assert!(!socket.exists());

@@ -984,7 +984,8 @@ impl ExactProcessExit {
     pub(crate) fn capture(pid: u32) -> Self {
         use std::os::windows::io::FromRawHandle as _;
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-        use windows_sys::Win32::System::Threading::{OpenProcess, SYNCHRONIZE};
+        use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+        use windows_sys::Win32::System::Threading::OpenProcess;
         // SAFETY: SYNCHRONIZE opens a wait-only stable process handle.
         let raw = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
         assert!(

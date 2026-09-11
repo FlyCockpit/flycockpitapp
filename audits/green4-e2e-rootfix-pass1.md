@@ -8,7 +8,8 @@ review findings R1-R6.
 
 | Site / operation | Result | Evidence |
 | --- | --- | --- |
-| foreground daemon boot / publication | holds | `lifetime.lock` is acquired before the short `lifecycle.lock` PID reservation; boot failure and normal shutdown retire PID, socket, and endpoint before releasing lifetime ownership |
+| foreground daemon boot / publication | holds | `lifetime.lock` is acquired before the short `lifecycle.lock` PID reservation; product ownership is immediately transferred to kernel process teardown, while injected in-process ownership remains RAII-scoped |
+| foreground shutdown / early return / panic | holds | signal, lifecycle, lock-sweeper, remote, and reveal tasks are abort-and-await joined before exact metadata retirement; cleanup never releases lifetime ownership, and every product return/panic path remains locked until process teardown |
 | socket Stop / fallback Stop | holds | both capture the predecessor before requesting shutdown and report success only after exact-process completion, the final lifetime-lock acquisition, and PID/socket retirement; e2e removes the live socket to exercise the SIGTERM fallback |
 | socket Restart / fallback Restart / re-entry | holds | both stop paths consume the same release witness before spawning; replacement cannot be mistaken for the predecessor because process identity is pinned before shutdown and the final nonblocking lock acquisition fails closed if a replacement already owns the path |
 | release success / failure / timeout / cancellation | holds | Linux pidfd, macOS/FreeBSD kqueue, or Windows process HANDLE is captured before shutdown; the platform deadline is internal to the wait; only after exact exit does one nonblocking `flock`/`LockFileEx` acquisition occur, so timeout/cancellation leaves no indefinitely blocked lifetime-lock worker |
@@ -18,18 +19,21 @@ review findings R1-R6.
 | hermetic daemon reap, Windows | holds | a `SYNCHRONIZE` process HANDLE is opened before stop and consumed by `WaitForSingleObject` |
 | mock Secret Service setup, sync | holds | the caller only receives mode-specific readiness; dbus lookup/spawn/stdout read, zbus build, runtime, child, and cleanup are owned by one dedicated thread |
 | mock Secret Service setup, current-thread async | holds | work before the first await is channel creation and thread spawn only; readiness is a Tokio oneshot and no runtime worker blocks |
-| mock Secret Service receiver drop / shutdown | holds | readiness send is non-panicking; stop send transfers shutdown to the owner; async-context Drop delegates join to a finite reaper while the owner kills and waits for dbus before exit; synchronous Drop joins directly |
+| mock Secret Service receiver drop / shutdown | holds | required async ownership awaits `shutdown`, whose join runs off the Tokio worker and returns an asserted termination ack after the owner killed/waited for dbus; the sync test asserts the equivalent blocking ack; async Drop remains a nonblocking cancellation/panic fallback |
 | replay launch / durable crash boundary | holds | Unix FIFO and Windows named-pipe barriers remain platform-owned; durable `executing` is asserted before the witness and daemon termination occurs only after the byte |
 | replay/validation descendant cleanup | holds | Linux pidfd/cgroup evidence, non-Linux Unix process-group empty evidence, and Windows Job Object empty evidence remain the relevant platform witnesses |
 
-Ownership and ordering: the daemon owns `lifetime.lock` for its entire published
-generation. It acquires lifetime before lifecycle and, on shutdown, takes
-lifecycle only long enough to retire metadata before dropping lifetime. A
-restart observer opens the lifetime file and captures the exact process handle
+Ownership and ordering: the product daemon owns `lifetime.lock` until kernel
+process teardown, including after explicit metadata cleanup. It acquires
+lifetime before lifecycle and, on shutdown, takes lifecycle only long enough to
+retire metadata without releasing lifetime. Injected in-process daemons retain
+RAII ownership and release only after their supervisor/task shutdown boundary.
+A restart observer opens the lifetime file and captures the exact process handle
 before the stop effect. It awaits exact process completion, performs one final
 nonblocking lifetime acquisition, and only then checks metadata. The Secret
 Service owner thread exclusively owns its dbus child and runtime; callers own
 only stop/readiness endpoints and the join handle, with no shared lock order.
+Async callers await the explicit shutdown boundary before fixture teardown.
 
 ## Class sweeps
 
@@ -48,10 +52,11 @@ closed rather than claiming success.
 Class sweep: searched all `MockSecretService`, `start_mock_secret_service`,
 `block_on`, readiness, child `kill`/`wait`, and `JoinHandle::join` sites under
 `apps/cli/tests/e2e`. The two public startup modes and Drop were affected.
-Enforcement is single-thread ownership plus mode-specific readiness. Exact sync,
-current-thread async, and local-offline acceptance tests verify the consumers.
-There is no product hook; asynchronous Drop hands finite cleanup to a reaper
-because Rust has no async Drop.
+Enforcement is single-thread ownership plus mode-specific readiness and an
+explicit async `shutdown` boundary. The sole async caller awaits stop and owner
+join; exact sync, current-thread async, and local-offline acceptance tests verify
+the consumers. There is no product hook; asynchronous Drop hands finite cleanup
+to a reaper only as cancellation/panic fallback because Rust has no async Drop.
 
 ### R3 — portable exact completion
 
@@ -82,12 +87,37 @@ graceful drain behavior is separately configured in shutdown. Enforcement is
 the 30-second constant. Unit coverage asserts default, zero, ordinary explicit,
 and maximum CLI grace behavior; witness tests exercise both timeout and success.
 
+### R6 — lifetime ownership survives metadata cleanup
+
+Class sweep: searched `ForegroundMetadataGuard`, `metadata_guard.cleanup`, and
+`run_foreground_inner_with_boot_db` across `crates` and `apps`. The single
+foreground product owner and the injected in-process sibling were affected.
+Enforcement is immediate product transfer to process teardown; cleanup only
+retires receipt-bound metadata, and foreground task joins precede cleanup.
+Verification exercises cleanup while a real product-path child remains alive,
+failed successor acquisition, exact child exit, eventual acquisition, and the
+releasable in-process sibling. Remaining exception: injected in-process owners
+release after their fully joined logical daemon lifetime so the host test
+process can start another generation.
+
+### R7 — macOS/FreeBSD stop routing
+
+Class sweep: searched `stop`, `stop_exact`,
+`stop_unix_without_stable_handle`, `acquire_verified_daemon_process`, and every
+stable-process cfg. Both public and receipt-exact stop entries were affected.
+Enforcement routes macOS/FreeBSD through a receipt-verified kqueue witness,
+delivers SIGTERM while retaining it, consumes `NOTE_EXIT` with one bounded
+kernel wait, and only then retires metadata. Unsupported Unix stays fail-closed
+only outside Linux/macOS/FreeBSD. Structural coverage proves both entry routes,
+exact-exit consumption, and the unsupported-set exclusion; the targets are not
+installed on this Linux host.
+
 ## Added Linux/not-Linux gate bound
 
 Command:
 `git diff --unified=0 origin/green-the-rust-4..HEAD -- '*.rs'`, counting each
 added line containing `target_os = "linux"` or `not(target_os = "linux")`.
-At the final working tree the count is **70 additions across 9 files**:
+At the final working tree the count is **73 additions across 9 files**:
 
 | File | Added gate lines | Classification |
 | --- | ---: | --- |
@@ -95,7 +125,7 @@ At the final working tree the count is **70 additions across 9 files**:
 | `crates/cockpit-core/src/worktree_orchestration/validation.rs` | 19 | Linux supervisor/cgroup validation versus non-Linux Unix process-group and Windows Job Object containment |
 | `crates/cockpit-host/src/daemon_lifecycle.rs` | 7 | Linux pidfd fields/acquisition/wait/test inside the stable-process abstraction whose siblings are macOS/FreeBSD kqueue and Windows HANDLE |
 | `apps/cli/tests/e2e/support/mod.rs` | 7 | Linux pidfd exact-exit and Linux-only Secret Service fixture; portable exact-exit siblings are separately gated |
-| `crates/cockpit-core/src/daemon/mod.rs` | 5 | platform set selecting stable predecessor handles and Linux-specific daemon signaling |
+| `crates/cockpit-core/src/daemon/mod.rs` | 8 | stable predecessor selection; Linux pidfd and macOS/FreeBSD kqueue stop routing; unsupported Unix exclusion |
 | `apps/cli/tests/e2e/daemon_lifecycle_replay.rs` | 2 | Linux-only descendant pidfd evidence after shared replay barriers |
 | `apps/cli/tests/e2e/support/hermetic.rs` | 2 | supported-platform exact process witness selection around daemon reap |
 | `apps/cli/tests/e2e/run_noninteractive.rs` | 2 | expected Linux sandbox-dependent approval result in shared acceptance cases |
@@ -113,8 +143,17 @@ serial mutex, ignored test, weakened assertion, or product test hook was added.
 | targeted nextest: deadline, mock sync/async, local-offline, socket Stop/Restart, fallback Stop | pass: 7 matched, 0 failed |
 | targeted nextest: exact host real-child timeout/release witness | pass: 1 matched, 0 failed |
 | `cargo fmt --all --check` | pass |
+| `cargo check --locked -p cockpit-host --tests` | pass; existing warnings only |
+| `cargo check --locked -p cockpit-core --tests` | pass; existing warnings only |
+| focused nextest: product lifetime child + cleanup-retains-lock | pass: 2 matched, 0 failed |
+| focused nextest: restart release + macOS/FreeBSD routing structure | pass: 6 matched, 0 failed |
+| focused CLI e2e: mock sync/async cleanup, local-offline failure, connected stop/restart, unreachable stop | pass: 6 matched, 0 failed |
+| final focused core: kqueue routing + injected shutdown | routing passed; injected case failed at its pre-shutdown 2-second socket startup wait under host load, so the new lock-sweeper join was not reached; no retry or timeout widening |
+| post-ack mock-only rerun | not started because the coordinated build lane remained occupied; the earlier six-test run exercised the same async join boundary before its return value became an explicit asserted ack |
+| Windows cockpit-host targeted check | changed `SYNCHRONIZE` sites compile; blocked later by pre-existing host-leaf `cockpit_config` references and missing `Read` in `named_pipe.rs` |
 
 All Cargo commands used `CARGO_TARGET_DIR=target`, at most three build jobs, and
 the required tracked-file touch immediately before invocation. No full-workspace
-test was run. macOS/Windows target compilation was unavailable on this Linux
-host.
+test was run. The macOS/FreeBSD targets are not installed. The installed Windows
+target verified the changed import sites before encountering the unrelated
+errors recorded above; CLI e2e no-run was therefore not feasible.

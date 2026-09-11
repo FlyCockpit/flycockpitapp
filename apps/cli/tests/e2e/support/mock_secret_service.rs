@@ -44,6 +44,38 @@ impl Drop for MockSecretService {
     }
 }
 
+impl MockSecretService {
+    /// Stop the owner and await its thread boundary without blocking a Tokio
+    /// worker. Successful completion proves the dbus child was killed and
+    /// waited before fixture storage may be removed.
+    pub async fn shutdown(mut self) -> bool {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(owner) = self.owner.take() {
+            tokio::task::spawn_blocking(move || owner.join())
+                .await
+                .expect("mock Secret Service join worker failed")
+                .expect("mock Secret Service owner panicked");
+        }
+        true
+    }
+
+    pub fn shutdown_blocking(mut self) -> bool {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "async callers must await MockSecretService::shutdown"
+        );
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(owner) = self.owner.take() {
+            owner.join().expect("mock Secret Service owner panicked");
+        }
+        true
+    }
+}
+
 struct KillOnDrop(Option<Child>);
 
 impl Drop for KillOnDrop {
@@ -243,6 +275,7 @@ mod startup_tests {
     fn mock_secret_service_startup_is_sync_safe() {
         let service = super::start_mock_secret_service();
         assert!(!service.address.is_empty());
+        assert!(service.shutdown_blocking(), "owner must terminate and ack");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -253,6 +286,7 @@ mod startup_tests {
         );
         let service = super::start_mock_secret_service_async().await;
         assert!(!service.address.is_empty());
+        assert!(service.shutdown().await, "owner must terminate and ack");
     }
 }
 

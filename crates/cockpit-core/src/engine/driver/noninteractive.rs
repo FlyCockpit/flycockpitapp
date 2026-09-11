@@ -3498,6 +3498,9 @@ impl Driver {
         &mut self,
         ordinary_rx: &mut mpsc::Receiver<(usize, SchedulerLaneSettled, Option<anyhow::Error>)>,
         ordinary_active: &mut usize,
+        ordinary_pending: &mut usize,
+        ordinary_slot_rx: &mut mpsc::UnboundedReceiver<usize>,
+        released_ordinary_slots: &mut std::collections::HashSet<usize>,
         delegates: &mut std::collections::HashMap<
             String,
             (usize, crate::engine::agent::DeferredDelegateCall),
@@ -3525,6 +3528,7 @@ impl Driver {
             .and_then(|call_id| self.take_pending_noninteractive_completion(call_id));
 
         enum Ready {
+            OrdinarySlot(usize),
             Ordinary((usize, SchedulerLaneSettled, Option<anyhow::Error>)),
             Delegate(Option<BackgroundNoninteractiveCompletion>),
         }
@@ -3532,7 +3536,13 @@ impl Driver {
             Ready::Delegate(Some(completion))
         } else {
             tokio::select! {
-                ordinary = ordinary_rx.recv(), if *ordinary_active > 0 => {
+                slot = ordinary_slot_rx.recv(), if *ordinary_active > 0 => {
+                    match slot {
+                        Some(source_index) => Ready::OrdinarySlot(source_index),
+                        None => Ready::Delegate(None),
+                    }
+                }
+                ordinary = ordinary_rx.recv(), if *ordinary_pending > 0 => {
                     match ordinary {
                         Some(completion) => Ready::Ordinary(completion),
                         None => Ready::Delegate(None),
@@ -3544,8 +3554,16 @@ impl Driver {
             }
         };
         match ready {
+            Ready::OrdinarySlot(source_index) => {
+                if released_ordinary_slots.insert(source_index) {
+                    *ordinary_active = ordinary_active.saturating_sub(1);
+                }
+            }
             Ready::Ordinary((source_index, settled, error)) => {
-                *ordinary_active = ordinary_active.saturating_sub(1);
+                *ordinary_pending = ordinary_pending.saturating_sub(1);
+                if released_ordinary_slots.insert(source_index) {
+                    *ordinary_active = ordinary_active.saturating_sub(1);
+                }
                 if error
                     .as_ref()
                     .is_some_and(crate::engine::interrupt::is_parked)
@@ -3607,6 +3625,7 @@ impl Driver {
             }
             Ready::Delegate(None) => {
                 *ordinary_active = 0;
+                *ordinary_pending = 0;
                 let first_source_index = delegates
                     .values()
                     .map(|(source_index, _)| *source_index)
@@ -3647,7 +3666,10 @@ impl Driver {
     ) -> Result<()> {
         let max_parallel = lane.max_parallel.max(1);
         let (ordinary_tx, mut ordinary_rx) = mpsc::channel(max_parallel);
+        let (ordinary_slot_tx, mut ordinary_slot_rx) = mpsc::unbounded_channel();
         let mut ordinary_active = 0usize;
+        let mut ordinary_pending = 0usize;
+        let mut released_ordinary_slots = std::collections::HashSet::new();
         let mut delegates = std::collections::HashMap::<
             String,
             (usize, crate::engine::agent::DeferredDelegateCall),
@@ -3660,6 +3682,9 @@ impl Driver {
                 self.await_one_scheduler_lane_completion(
                     &mut ordinary_rx,
                     &mut ordinary_active,
+                    &mut ordinary_pending,
+                    &mut ordinary_slot_rx,
+                    &mut released_ordinary_slots,
                     &mut delegates,
                     &mut results,
                     &mut errors,
@@ -3669,10 +3694,12 @@ impl Driver {
             }
 
             match call {
-                crate::engine::agent::DeferredParallelCall::Ordinary(call) => {
+                crate::engine::agent::DeferredParallelCall::Ordinary(mut call) => {
                     let source_index = call.source_index();
                     let completion_tx = ordinary_tx.clone();
                     ordinary_active += 1;
+                    ordinary_pending += 1;
+                    call.set_execution_release_sender(ordinary_slot_tx.clone());
                     // Build the lane future here, before the spawn: the
                     // acquisition task-local exists only in this task, and
                     // the wrapper captures it at its call site.
@@ -3810,10 +3837,13 @@ impl Driver {
                         }
                     };
                     if !concurrently_admissible {
-                        while ordinary_active > 0 || !delegates.is_empty() {
+                        while ordinary_pending > 0 || !delegates.is_empty() {
                             self.await_one_scheduler_lane_completion(
                                 &mut ordinary_rx,
                                 &mut ordinary_active,
+                                &mut ordinary_pending,
+                                &mut ordinary_slot_rx,
+                                &mut released_ordinary_slots,
                                 &mut delegates,
                                 &mut results,
                                 &mut errors,
@@ -3893,10 +3923,13 @@ impl Driver {
                         }
                     }
                     if !concurrently_admissible {
-                        while ordinary_active > 0 || !delegates.is_empty() {
+                        while ordinary_pending > 0 || !delegates.is_empty() {
                             self.await_one_scheduler_lane_completion(
                                 &mut ordinary_rx,
                                 &mut ordinary_active,
+                                &mut ordinary_pending,
+                                &mut ordinary_slot_rx,
+                                &mut released_ordinary_slots,
                                 &mut delegates,
                                 &mut results,
                                 &mut errors,
@@ -3909,10 +3942,14 @@ impl Driver {
             }
         }
         drop(ordinary_tx);
-        while ordinary_active > 0 || !delegates.is_empty() {
+        drop(ordinary_slot_tx);
+        while ordinary_pending > 0 || !delegates.is_empty() {
             self.await_one_scheduler_lane_completion(
                 &mut ordinary_rx,
                 &mut ordinary_active,
+                &mut ordinary_pending,
+                &mut ordinary_slot_rx,
+                &mut released_ordinary_slots,
                 &mut delegates,
                 &mut results,
                 &mut errors,
@@ -4188,7 +4225,7 @@ impl Driver {
                 self.locks.clone(),
                 self.redact.clone(),
                 child_cwd.resolved,
-                self.config.clone(),
+                self.config_for_noninteractive_child(),
                 self.guidance_compiler.clone(),
                 self.interrupts.clone(),
                 cancel,
@@ -5033,7 +5070,7 @@ impl Driver {
                         self.locks.clone(),
                         self.redact.clone(),
                         child_cwd.resolved.clone(),
-                        self.config.clone(),
+                        self.config_for_noninteractive_child(),
                         self.guidance_compiler.clone(),
                         self.interrupts.clone(),
                         cancel,
@@ -12207,6 +12244,25 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                     continue 'turns;
                 }
                 let pending = std::mem::take(&mut pending_computer_continuations);
+                scheduled_lane_driver.repin_config_for_turn();
+                match scheduled_lane_driver.build_live_model_for_running(
+                    &agent.model,
+                    agent.model.provider_id(),
+                    agent.model.model_id_ref(),
+                ) {
+                    Ok(refreshed) => {
+                        let mut refreshed_agent = (*agent).clone();
+                        refreshed_agent.model = Arc::new(refreshed);
+                        agent = Arc::new(refreshed_agent);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            agent = %agent.name,
+                            "refreshing noninteractive model from config failed"
+                        );
+                    }
+                }
                 let mut turn_agent =
                     super::computer_native::with_live_loop_native_computer_geometry(
                         agent.as_ref().clone(),

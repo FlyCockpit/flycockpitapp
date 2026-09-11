@@ -3679,6 +3679,16 @@ impl Driver {
         self.set_config_handle(
             crate::daemon::session_worker::SessionConfigHandle::detached(snapshot),
         );
+        if let Some(active) = self.config.providers().active_model.clone()
+            && let Ok(refreshed) = self.build_live_model_for_running(
+                &self.stack[0].agent.model,
+                &active.provider,
+                &active.model,
+            )
+        {
+            Arc::make_mut(&mut self.stack[0].agent).model = Arc::new(refreshed);
+            self.schedule.set_agent(self.stack[0].agent.clone());
+        }
     }
 
     /// The session config reader, re-pinned to the current generation for a
@@ -3687,6 +3697,17 @@ impl Driver {
     fn repin_config_for_turn(&mut self) {
         self.config = self.config.repin();
         self.schedule.set_config_handle(self.config.clone());
+    }
+
+    /// Hand the exact generation-pinned worker snapshot to a nested lane.
+    fn config_for_noninteractive_child(
+        &self,
+    ) -> crate::daemon::session_worker::SessionConfigHandle {
+        let snapshot = (*self.config.snapshot()).clone();
+        // A child attempt owns the exact parent snapshot selected at admission.
+        // Never forward a live handle whose shared cell can advance before the
+        // child constructs its model or nested scheduler driver.
+        crate::daemon::session_worker::SessionConfigHandle::detached(snapshot)
     }
 
     pub fn set_resource_scheduler(
@@ -5328,9 +5349,13 @@ impl Driver {
             hooks: snapshot.hooks(),
         };
         let frame = self.stack.last_mut().context("driver stack is empty")?;
-        frame.history.push(brief);
         crate::engine::seed_reads::execute_declared_seed_calls(&env, &mut frame.history, pending)
             .await?;
+        // Keep every declared assistant tool call adjacent to its paired
+        // result. Appending the handoff brief first makes request rehydration
+        // treat the call as dangling and synthesize an interrupted result,
+        // hiding the freshly executed seed from the child.
+        frame.history.push(brief);
         Ok(crate::engine::seed_reads::completion_prompt())
     }
 
@@ -14876,7 +14901,7 @@ impl Driver {
                     let task_args_json = serde_json::to_string(&serde_json::json!({
                         "child_agent": &child_agent,
                         "model": model_selector_json(&model),
-                        "remaining_depth": remaining_depth,
+                        "remaining_depth": child_recursion.remaining_depth,
                         "granted_tools": &granted_tools,
                         "seed_reads": &seed_reads,
                         "todo_ids": &todo_ids,
@@ -16320,6 +16345,8 @@ impl Driver {
         model: Option<crate::engine::model_roles::DelegationModelSelector>,
         recursion: crate::engine::builtin::DelegationRecursionContext,
     ) -> crate::engine::builtin::SpawnArgs {
+        let mut inherited = self.spawn_args(interactive);
+        inherited.config = self.config_for_noninteractive_child();
         let parent = self.stack.last().expect("stack never empty");
         let inherited_vnext_root_pin = parent.agent.vnext_grant.is_some()
             && self.model_override.as_ref().is_some_and(|override_model| {
@@ -16364,7 +16391,7 @@ impl Driver {
                 .stack
                 .last()
                 .map(|frame| frame.agent.mcp_resolver.catalog().admitted_entries()),
-            ..self.spawn_args(interactive)
+            ..inherited
         }
     }
 
@@ -16404,6 +16431,8 @@ impl Driver {
         recursion: crate::engine::builtin::DelegationRecursionContext,
         confinement: DelegationConfinement,
     ) -> crate::engine::builtin::SpawnArgs {
+        let mut inherited = self.spawn_args(interactive);
+        inherited.config = self.config_for_noninteractive_child();
         let parent = self.stack.last().expect("stack never empty");
         let inherited_vnext_root_pin = parent.agent.vnext_grant.is_some()
             && self.model_override.as_ref().is_some_and(|override_model| {
@@ -16448,7 +16477,7 @@ impl Driver {
                 .last()
                 .map(|frame| frame.agent.mcp_resolver.catalog().admitted_entries()),
             workspace_lease: confinement.workspace_lease,
-            ..self.spawn_args(interactive)
+            ..inherited
         }
     }
 

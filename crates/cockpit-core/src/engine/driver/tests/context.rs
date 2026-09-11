@@ -4713,15 +4713,7 @@ async fn noninteractive_executor_returns_partial_on_compact_guard_trip() {
         },
         10_000,
     );
-    driver
-        .test_providers_override
-        .as_mut()
-        .unwrap()
-        .0
-        .providers
-        .get_mut("lmstudio")
-        .unwrap()
-        .url = provider.base_url();
+    set_test_provider_url(&mut driver, provider.base_url());
     Arc::make_mut(&mut driver.stack[0].agent).context_policy = Some(crate::agents::ContextPolicy {
         auto_compact_pct: Some(50),
         inline_caps: None,
@@ -4842,15 +4834,7 @@ async fn noninteractive_executor_returns_partial_when_compact_charges_exhaust_bu
         },
         10_000,
     );
-    driver
-        .test_providers_override
-        .as_mut()
-        .unwrap()
-        .0
-        .providers
-        .get_mut("lmstudio")
-        .unwrap()
-        .url = provider.base_url();
+    set_test_provider_url(&mut driver, provider.base_url());
     Arc::make_mut(&mut driver.stack[0].agent).context_policy = Some(crate::agents::ContextPolicy {
         auto_compact_pct: Some(50),
         inline_caps: None,

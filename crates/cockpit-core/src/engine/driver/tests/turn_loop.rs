@@ -2203,7 +2203,7 @@ fn failed_write_keeps_args_on_the_next_request() {
 }
 
 #[test]
-fn parallel_lane_respects_delegation_max_parallel_fifo() {
+fn later_parallel_completion_frees_capacity_before_earlier_durable_commit() {
     crate::test_env::run_async_with_large_stack(|| async {
         let provider = ScriptedProvider::builder()
             .dialect(WireDialect::ChatCompletions)
@@ -2310,7 +2310,11 @@ fn parallel_lane_respects_delegation_max_parallel_fifo() {
             assert_eq!(state.in_flight(), 2);
             assert_eq!(state.max_in_flight(), 2);
 
-            state.release("alpha");
+            // Beta (source 1) completes while alpha (source 0) remains inside
+            // tool execution. Beta must release execution capacity before its
+            // source-ordered durable commit can pass alpha, allowing gamma
+            // (source 2) to start without exceeding maxParallel=2.
+            state.release("beta");
             tokio::select! {
                 result = &mut run => panic!("driver completed before the FIFO successor started: {result:?}"),
                 () = wait_until_started(&mut started, 3) => {}
@@ -2322,7 +2326,12 @@ fn parallel_lane_respects_delegation_max_parallel_fifo() {
             );
             assert_eq!(state.max_in_flight(), 2);
 
-            state.release("beta");
+            assert_eq!(
+                state.in_flight(),
+                2,
+                "alpha remains active while gamma reuses beta's released execution slot"
+            );
+            state.release("alpha");
             state.release("gamma");
             tokio::select! {
                 result = &mut run => panic!("driver completed before the last queued member started: {result:?}"),

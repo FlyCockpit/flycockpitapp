@@ -2520,7 +2520,15 @@ impl Driver {
         // `compact_prompt` (the brief-prompt override) and `compact_model`
         // (the dedicated drafting model).
         #[cfg(test)]
-        let (mut extended, providers) = self.config.configs();
+        let (mut extended, providers) =
+            if let Some((providers, _, _)) = &self.test_providers_override {
+                (
+                    crate::config::extended::ExtendedConfig::default(),
+                    providers.clone(),
+                )
+            } else {
+                self.config.configs()
+            };
         #[cfg(test)]
         if let Some(model_ref) = &self.test_compact_model_ref {
             extended.compact_model = Some(model_ref.clone());

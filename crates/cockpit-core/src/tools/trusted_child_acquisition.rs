@@ -119,6 +119,16 @@ where
     CURRENT_ACQUISITION_RUNTIME.scope(runtime, future).await
 }
 
+/// Whether the active acquisition has committed to its single terminal move.
+/// The noninteractive driver checks this only after the scheduled tool plan has
+/// fully advanced, so tool history and audit settlement remain durable while a
+/// terminal capture cannot trigger another provider turn.
+pub(crate) fn terminal_move_selected() -> bool {
+    CURRENT_ACQUISITION_RUNTIME
+        .try_with(|runtime| runtime.state.lock().unwrap().terminal.is_some())
+        .unwrap_or(false)
+}
+
 /// Preserve the active acquisition task-local across an await boundary in the
 /// current task. Parallel scheduler lanes use [`with_inherited_acquisition_runtime`]
 /// at the spawn call site instead; serial dispatch uses this helper.

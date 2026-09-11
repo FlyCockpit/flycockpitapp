@@ -5184,6 +5184,11 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, mut listener: DaemonListen
                     break;
                 }
             }
+            joined = clients.join_next(), if !clients.is_empty() => {
+                if let Some(Err(error)) = joined {
+                    tracing::warn!(%error, "daemon client task failed");
+                }
+            }
             _ = retention_interval.tick() => {
                 run_retention_tick(ctx.clone(), retention_cfg).await;
             }

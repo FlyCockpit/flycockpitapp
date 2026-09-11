@@ -763,7 +763,17 @@ pub fn main_entry() -> ExitCode {
         .max_blocking_threads(16)
         .build();
     let result = match runtime {
-        Ok(runtime) => runtime.block_on(async_main(launch_start)),
+        Ok(runtime) => {
+            let result = runtime.block_on(async_main(launch_start));
+            // Command completion is the ownership boundary: foreground daemon
+            // shutdown has already aborted and joined every task that may own
+            // durable state, child processes, or lifecycle metadata. Do not
+            // add Tokio's unbounded blocking-pool Drop wait after that proven
+            // boundary; a leftover best-effort blocking task must not retain
+            // the process-wide daemon lifetime lock past successful shutdown.
+            runtime.shutdown_background();
+            result
+        }
         Err(err) => Err(anyhow::Error::new(err)),
     };
     match result {

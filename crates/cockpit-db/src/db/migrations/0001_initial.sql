@@ -1919,7 +1919,7 @@ CREATE TABLE agent_host_authorization_groups (
         REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 CREATE UNIQUE INDEX idx_agent_host_authorization_group_tool_call
-    ON agent_host_authorization_groups(session_id, tool_call_id);
+    ON agent_host_authorization_groups(agent_instance_id, session_id, tool_call_id);
 CREATE TRIGGER agent_host_authorization_group_state_is_forward_only
 BEFORE UPDATE OF state ON agent_host_authorization_groups
 WHEN NOT (

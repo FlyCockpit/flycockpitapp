@@ -2,8 +2,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use crate::support::{
-    EphemeralDaemonGuard, IsolatedHome, SpawnedDaemon, assert_failure, assert_success, output_text,
-    wait_for_daemon_handshake_on_socket,
+    DAEMON_START_HANDSHAKE_TIMEOUT, EphemeralDaemonGuard, IsolatedHome, SpawnedDaemon,
+    assert_failure, assert_success, output_text, wait_for_daemon_handshake_on_socket,
 };
 use cockpit_cli::integration::{DaemonClient, DaemonEvent};
 use cockpit_test_support::provider::{ScriptedProvider, Turn};
@@ -99,10 +99,16 @@ async fn ephemeral_session_resumes_on_shared_daemon() {
     // endpoint. A shared follow-up daemon must discover the exact same socket
     // and durable session after this owner exits.
     let ephemeral_socket = home.socket_path();
+    let launch_ticket = format!(
+        "{:032x}{:032x}",
+        uuid::Uuid::new_v4().as_u128(),
+        uuid::Uuid::new_v4().as_u128()
+    );
     let mut daemon_command = home.cockpit();
     daemon_command
         .args(["daemon", "start", "--foreground"])
         .env("COCKPIT_DAEMON_LIFETIME", "ephemeral")
+        .env("COCKPIT_DAEMON_LAUNCH_TICKET", launch_ticket)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -114,7 +120,7 @@ async fn ephemeral_session_resumes_on_shared_daemon() {
     wait_for_daemon_handshake_on_socket(
         &ephemeral_socket,
         &home.pid_file(),
-        Duration::from_secs(5),
+        DAEMON_START_HANDSHAKE_TIMEOUT,
         || {
             if let Ok(Some(status)) = ephemeral_guard.try_wait() {
                 panic!(

@@ -742,7 +742,7 @@ pub fn output_text(output: &Output) -> String {
 
 // Keep startup waits bounded while requiring the real status handshake rather
 // than substituting socket existence for readiness.
-const DAEMON_START_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
+pub const DAEMON_START_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
 const DAEMON_RESTART_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn daemon_transport_ready_for_home(home: &IsolatedHome) -> bool {

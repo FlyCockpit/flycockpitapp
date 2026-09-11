@@ -3497,9 +3497,30 @@ pub(crate) fn probe_directory_writable_from_retained_directory(
             Err(error) => return Err(error).with_context(|| format!("creating {display:?}")),
         };
         probe.write_all(b"probe")?;
-        probe.sync_all()?;
         drop(probe);
-        remove_leaf_from_retained_directory(directory, &leaf, &display)?;
+        // This leaf is an ephemeral permission probe, not durable state. Its
+        // create/remove cycle must remain capability-relative, but neither the
+        // file nor its deletion needs a persistence barrier. Durable config
+        // publication continues to fsync its staged file and parent directory.
+        #[cfg(unix)]
+        unlink_file_at(directory, &leaf)
+            .with_context(|| format!("removing writability probe {}", display.display()))?;
+        #[cfg(windows)]
+        {
+            use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
+            use windows_sys::Win32::Storage::FileSystem::{
+                DELETE, FILE_READ_ATTRIBUTES, SYNCHRONIZE,
+            };
+            let file = open_windows_relative_nofollow(
+                directory,
+                &leaf,
+                false,
+                DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                FILE_OPEN,
+            )?;
+            reject_windows_reparse_handle(&file, &display)?;
+            remove_open_file_on_windows(&file)?;
+        }
         return Ok(());
     }
     anyhow::bail!("could not allocate a private retained-directory writability probe")

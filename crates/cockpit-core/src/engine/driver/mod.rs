@@ -5183,24 +5183,17 @@ impl Driver {
             cwd: &self.cwd,
             hooks: config_snapshot.hooks(),
         };
-        let audit_exists =
-            delegation_helpers::parked_tool_call_audit_exists(&self.session, &payload.call_id)
-                .await?;
-        if !audit_exists {
-            if let Some(frame) = self.stack.last_mut() {
-                delegation_helpers::strip_rehydrated_tool_result_for_replay(
-                    &mut frame.history,
-                    &payload.call_id,
-                );
-            }
-        }
-        let call_completed = audit_exists
-            && self.stack.last().is_some_and(|frame| {
-                crate::engine::agent::history_ends_with_tool_result_call(
-                    &frame.history,
-                    &payload.call_id,
-                )
-            });
+        let history_has_result = self.stack.last().is_some_and(|frame| {
+            crate::engine::agent::history_ends_with_tool_result_call(
+                &frame.history,
+                &payload.call_id,
+            )
+        });
+        // A paired history result is not an execution receipt. The process may
+        // have stopped after appending it but before the ordinary audit row was
+        // committed, so only the durable audit permits replay to skip dispatch.
+        let call_completed = history_has_result
+            && delegation_helpers::parked_tool_audit_is_committed(&self.session, &payload).await?;
         if !call_completed {
             crate::engine::interrupt::with_pre_resolved_interrupt_question(
                 interrupt_id,
@@ -5224,6 +5217,7 @@ impl Driver {
             )
             .await?;
         }
+        ensure_parked_tool_audit_committed(&self.session, &payload).await?;
         if payload.call_id.starts_with("seed-read-") {
             let pending = self
                 .stack
@@ -6110,6 +6104,11 @@ impl Driver {
             self.loop_boundary_sequence = self.loop_boundary_sequence.saturating_add(1);
             tokio::select! {
                 biased;
+                // Queue closure is lifecycle control, not user input. Keep it
+                // observable even while a parked-continuation fence disables
+                // dequeueing; otherwise graceful shutdown can wait forever
+                // for a driver that intentionally refuses the message arm.
+                _ = input_queue.wait_closed() => break,
                 msg = input_queue.recv_group_order_for(Some(&active_target_id)),
                     if !waiting_for_keep_parked_siblings => {
                     goal_watchdog = None;
@@ -13588,7 +13587,16 @@ impl Driver {
         let title_progress_before_turn = self.session.title_progress_snapshot().await?;
         let (extended, providers) = self.config.configs();
         let use_session_model_metadata = use_session_model_for_auto_title(&extended);
-        let (title_action, mut metadata_work) = if use_session_model_metadata {
+        // A durable run invocation owns an exact provider-turn budget and
+        // terminal. Metadata/title inference is deliberately outside the
+        // conversation, so launching it here would spend unaccounted provider
+        // turns that can outlive this invocation and consume another
+        // invocation's responses. Headless runs therefore defer metadata
+        // inference; interactive turns retain the existing title cadence.
+        let run_invocation_owns_provider_budget = run_invocation_id.is_some();
+        let (title_action, mut metadata_work) = if run_invocation_owns_provider_budget {
+            (crate::session::TitleAction::None, None)
+        } else if use_session_model_metadata {
             (
                 crate::session::TitleAction::None,
                 self.session
@@ -13598,7 +13606,9 @@ impl Driver {
             (self.session.note_user_content(&canonical_user_text), None)
         };
         let mut auto_title_task = None;
-        if !use_session_model_metadata && !matches!(title_action, crate::session::TitleAction::None)
+        if !run_invocation_owns_provider_budget
+            && !use_session_model_metadata
+            && !matches!(title_action, crate::session::TitleAction::None)
         {
             let session = self.session.clone();
             let content_prefix = if artifact_frame.is_some() {

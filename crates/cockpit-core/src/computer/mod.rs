@@ -2156,12 +2156,12 @@ impl VirtualDisplayBackend {
             .stderr(Stdio::null());
         #[cfg(unix)]
         command.process_group(0);
-        let child = command
-            .spawn()
-            .map_err(|error| ComputerError::CommandFailed {
+        let child = cockpit_host::process::spawn_std_pinned(command).map_err(|error| {
+            ComputerError::CommandFailed {
                 program: "Xvfb".to_string(),
                 detail: error.to_string(),
-            })?;
+            }
+        })?;
         Ok(Self {
             display,
             backend_kind: target::BackendKind::VirtualDisplay,

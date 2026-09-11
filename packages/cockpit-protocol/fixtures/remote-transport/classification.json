@@ -51,7 +51,7 @@
     }
   ],
   "counts": {
-    "event": 87,
+    "event": 88,
     "request": 289,
     "response": 202
   },
@@ -350,6 +350,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "interrupt_queue_changed"
+      },
+      {
+        "class": "approval",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "interrupt_interrupted"
       },
       {
         "class": "approval",

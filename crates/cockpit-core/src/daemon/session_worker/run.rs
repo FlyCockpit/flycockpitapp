@@ -3242,10 +3242,10 @@ pub(super) fn stored_goal_settings_override(
 }
 
 pub(super) struct ParkedReplayCompletion {
-    interrupt_id: uuid::Uuid,
-    decision: Option<proto::InterruptDecision>,
-    was_active: bool,
-    result: std::result::Result<crate::engine::driver::ParkedReplayOutcome, String>,
+    pub(super) interrupt_id: uuid::Uuid,
+    pub(super) decision: Option<proto::InterruptDecision>,
+    pub(super) was_active: bool,
+    pub(super) result: std::result::Result<crate::engine::driver::ParkedReplayOutcome, String>,
 }
 
 /// Persist `Err` after a live replay must retry persist-enter on this
@@ -4266,10 +4266,15 @@ pub(super) async fn finish_parked_replay_completion(
             // it here would discard an already-recorded user response and
             // cause the child to re-run its pre-interrupt model prompt.
             if completion.decision.is_none() {
-                let _ = session
-                    .db
-                    .mark_interrupt_interrupted(completion.interrupt_id)
-                    .await;
+                mark_client_visible_interrupt_interrupted(
+                    session,
+                    event_tx,
+                    redaction,
+                    session_id,
+                    completion.interrupt_id,
+                    false,
+                )
+                .await;
             }
             tracing::warn!(
                 %error,
@@ -4390,7 +4395,7 @@ async fn settle_or_replay_executing_interrupt(
     session_id: Uuid,
     row: crate::db::needs_attention::NeedsAttentionRow,
     terminal_tree_interrupt_replays: &mut Vec<crate::db::needs_attention::NeedsAttentionRow>,
-) {
+) -> bool {
     let linked_decision = match session
         .db
         .decision_request_for_interrupt(session_id, row.interrupt_id)
@@ -4403,7 +4408,7 @@ async fn settle_or_replay_executing_interrupt(
                 interrupt_id = %row.interrupt_id,
                 "loading executing interrupt lifecycle decision failed"
             );
-            return;
+            return false;
         }
     };
     if let Some(decision) = linked_decision.as_ref()
@@ -4411,7 +4416,7 @@ async fn settle_or_replay_executing_interrupt(
         && should_replay_terminal_linked_tool(&row, decision)
     {
         terminal_tree_interrupt_replays.push(row);
-        return;
+        return true;
     }
     settle_unrecoverable_interrupt(
         session,
@@ -4422,7 +4427,7 @@ async fn settle_or_replay_executing_interrupt(
         linked_decision.is_some(),
         interrupt_restart_notice_text(row.interrupt_id, Ok(())),
     )
-    .await;
+    .await
 }
 
 pub(super) fn validate_parked_interrupt_payload(
@@ -4446,6 +4451,48 @@ pub(super) fn validate_parked_interrupt_payload(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClaimedParkedReplayError {
+    MissingPayload,
+    MissingQuestion,
+}
+
+pub(super) fn claimed_parked_replay_parts(
+    row: &crate::db::needs_attention::NeedsAttentionRow,
+) -> std::result::Result<
+    (
+        crate::db::needs_attention::InterruptParkPayload,
+        crate::daemon::proto::InterruptQuestionSet,
+    ),
+    ClaimedParkedReplayError,
+> {
+    let payload = row
+        .parked
+        .clone()
+        .ok_or(ClaimedParkedReplayError::MissingPayload)?;
+    let questions = row
+        .questions
+        .clone()
+        .or_else(|| {
+            row.question
+                .clone()
+                .map(|question| crate::daemon::proto::InterruptQuestionSet {
+                    questions: vec![question],
+                })
+        })
+        .ok_or(ClaimedParkedReplayError::MissingQuestion)?;
+    Ok((payload, questions))
+}
+
+impl ClaimedParkedReplayError {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::MissingPayload => "missing replay payload",
+            Self::MissingQuestion => "missing replay question",
+        }
+    }
+}
+
 fn interrupt_restart_notice_text(interrupt_id: Uuid, payload: Result<(), &'static str>) -> String {
     match payload {
         Ok(()) => format!(
@@ -4455,7 +4502,7 @@ fn interrupt_restart_notice_text(interrupt_id: Uuid, payload: Result<(), &'stati
     }
 }
 
-async fn settle_unrecoverable_interrupt(
+pub(super) async fn settle_unrecoverable_interrupt(
     session: &crate::session::Session,
     event_tx: &EventSender,
     redaction: &SharedRedactionTable,
@@ -4463,29 +4510,16 @@ async fn settle_unrecoverable_interrupt(
     interrupt_id: Uuid,
     linked: bool,
     notice_text: String,
-) {
-    let marked = if linked {
-        session
-            .db
-            .mark_executing_linked_interrupt_interrupted(session_id, interrupt_id)
-            .await
-    } else {
-        session.db.mark_interrupt_interrupted(interrupt_id).await
-    };
-    match marked {
-        Ok(true) => {}
-        Ok(false) => tracing::error!(
-            %interrupt_id,
-            %session_id,
-            linked,
-            "settling unrecoverable interrupt did not change the durable row"
-        ),
-        Err(error) => tracing::warn!(
-            %error,
-            %interrupt_id,
-            "marking unrecoverable interrupt failed"
-        ),
-    }
+) -> bool {
+    let committed = mark_client_visible_interrupt_interrupted(
+        session,
+        event_tx,
+        redaction,
+        session_id,
+        interrupt_id,
+        linked,
+    )
+    .await;
     send_current_session_event(
         session,
         event_tx,
@@ -4496,6 +4530,59 @@ async fn settle_unrecoverable_interrupt(
         },
         NoticeSource::DaemonDirect,
     );
+    committed
+}
+
+/// The sole daemon-worker writer for a client-visible transition to
+/// `interrupted`. The typed completion is published only after the exact
+/// state-changing commit; conflicts and storage failures publish nothing.
+pub(super) async fn mark_client_visible_interrupt_interrupted(
+    session: &crate::session::Session,
+    event_tx: &EventSender,
+    redaction: &SharedRedactionTable,
+    session_id: Uuid,
+    interrupt_id: Uuid,
+    linked: bool,
+) -> bool {
+    let marked = if linked {
+        session
+            .db
+            .mark_executing_linked_interrupt_interrupted(session_id, interrupt_id)
+            .await
+    } else {
+        session.db.mark_interrupt_interrupted(interrupt_id).await
+    };
+    let committed = match marked {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::error!(
+                %interrupt_id,
+                %session_id,
+                linked,
+                "settling unrecoverable interrupt did not change the durable row"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                %interrupt_id,
+                "marking unrecoverable interrupt failed"
+            );
+            false
+        }
+    };
+    if committed {
+        send_current_event(
+            event_tx,
+            redaction,
+            proto::Event::InterruptInterrupted {
+                session_id,
+                interrupt_id,
+            },
+        );
+    }
+    committed
 }
 
 pub(super) async fn forward_queue_updates(
@@ -5240,7 +5327,9 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
             run_invocation_id,
             delivery_class,
         };
-        let fingerprint = submission.client_fingerprint();
+        // The canonical FCM2 digest, rather than replay-neutral reconstructed
+        // fields, is the durable content identity shared with live handoff.
+        let fingerprint = wire_fingerprint.clone();
         submission
             .client_submissions
             .push(crate::engine::message::ClientSubmissionReceipt {
@@ -5392,7 +5481,9 @@ pub(crate) async fn replay_accepted_message_attachment_queue(
             delivery_class: request.resolved_delivery_class.unwrap_or_default(),
             delivery_class_override: request.delivery_class_override,
         };
-        let fingerprint = submission.client_fingerprint();
+        // Match live V2 handoff: replay-neutral reconstructed fields are not
+        // part of the durable FCM2 content identity.
+        let fingerprint = wire_fingerprint.clone();
         submission
             .client_submissions
             .push(crate::engine::message::ClientSubmissionReceipt {
@@ -6198,7 +6289,7 @@ pub(super) async fn run_worker(
                 &mut driver_failed,
                 message,
             );
-            park_commit.report_startup_reconciled();
+            park_commit.report_startup_reconciliation_failed();
             return;
         }
     };
@@ -6720,6 +6811,7 @@ pub(super) async fn run_worker(
     let live_for_forward = live.clone();
     let sandbox_notice_armed_for_forward = sandbox_notice_armed.clone();
     let session_for_forward = session.clone();
+    let container_manager_for_forward = crate::container::container_manager_for_db(&session.db);
     let authoritative_active_model_state_for_forward = authoritative_active_model_state.clone();
     let tree_resolver_registry_for_forward = tree_resolver_registry.clone();
     let driver_control_for_forward = driver_control_tx.clone();
@@ -6765,6 +6857,7 @@ pub(super) async fn run_worker(
                             "idle with no attached clients",
                         );
                         schedule_session_container_release(
+                            container_manager_for_forward.clone(),
                             interactive_clients_for_forward.clone(),
                             live_for_forward.clone(),
                             session_id,
@@ -7346,22 +7439,48 @@ pub(super) async fn run_worker(
         .await;
     }
 
-    // Releasable, debug-build + env-gated pause point
-    // (`daemon-lifecycle-replay-timing-robustness.md`, §3 / criterion 1): hold
-    // the attach reconciliation BEFORE the crash-surviving `Open → Parked`
-    // write so a test can prove the attach path awaits the park-commit signal.
-    // Bounded (self-releasing) so the fixed code's reconciliation still lands
-    // within `INTERRUPT_PARK_COMMIT_DEADLINE`; not the irreversible
-    // `COCKPIT_TEST_PAUSE_PARKED_REPLAY_EXECUTING` loop. Unreachable in release.
-    test_injected_park_delay("COCKPIT_TEST_DELAY_STARTUP_RECONCILE_MS").await;
     // A terminal AgentTree decision may have claimed a parked QuestionTool
     // continuation immediately before a worker crash.  Keep the exact row so
     // the fresh root executor can replay it after it attaches below; treating
     // that durable `executing` claim as an interrupted orphan would discard
     // the original continuation and its already-recorded answer.
     let mut terminal_tree_interrupt_replays = Vec::new();
-    match session.db.list_reconcilable_interrupts(session_id).await {
+    let mut startup_reconciliation_committed = true;
+    match session
+        .db
+        .list_reconcilable_interrupts(session.live_id())
+        .await
+    {
         Ok(rows) => {
+            // Crash reconciliation uses the same atomic park-and-summary
+            // boundary as graceful drain. A SIGKILL can leave `open` durable
+            // work, but startup must never publish `Parked` without also
+            // publishing the stable session's recovery row.
+            let has_crash_surviving_open = rows.iter().any(|row| {
+                row.state == crate::db::needs_attention::InterruptState::Open
+                    && validate_parked_interrupt_payload(row).is_ok()
+            });
+            if has_crash_surviving_open {
+                if let Err(error) = session
+                    .db
+                    .park_session_for_resume(
+                        session_id,
+                        session.live_id(),
+                        &root_agent_name,
+                        &project_root.display().to_string(),
+                        "daemon restart recovered interrupted work",
+                        0,
+                        proto::DAEMON_VERSION,
+                    )
+                    .await
+                {
+                    startup_reconciliation_committed = false;
+                    tracing::warn!(
+                        %error,
+                        "atomically parking crash-surviving interrupts failed"
+                    );
+                }
+            }
             for row in rows {
                 // A host-capability refresh is a daemon RPC with a durable
                 // decision, not a parked driver tool call. It intentionally
@@ -7380,6 +7499,7 @@ pub(super) async fn run_worker(
                     Ok(true) => continue,
                     Ok(false) => {}
                     Err(error) => {
+                        startup_reconciliation_committed = false;
                         tracing::warn!(
                             %error,
                             interrupt_id = %row.interrupt_id,
@@ -7391,13 +7511,10 @@ pub(super) async fn run_worker(
                     crate::db::needs_attention::InterruptState::Open
                         if validate_parked_interrupt_payload(&row).is_ok() =>
                     {
-                        if let Err(error) = session.db.park_interrupt(row.interrupt_id).await {
-                            tracing::warn!(
-                                %error,
-                                interrupt_id = %row.interrupt_id,
-                                "parking crash-surviving interrupt failed"
-                            );
-                        }
+                        // The shared transaction above already parked every
+                        // renderable open row. Keep using this pre-transaction
+                        // snapshot only to classify the remaining recovery
+                        // work; no second per-row write may split the invariant.
                     }
                     crate::db::needs_attention::InterruptState::Parked
                         if validate_parked_interrupt_payload(&row).is_ok() => {}
@@ -7405,7 +7522,7 @@ pub(super) async fn run_worker(
                         if validate_parked_interrupt_payload(&row).is_ok()
                             && row.response.is_some() =>
                     {
-                        settle_or_replay_executing_interrupt(
+                        startup_reconciliation_committed &= settle_or_replay_executing_interrupt(
                             &session,
                             &event_tx,
                             &redaction,
@@ -7425,12 +7542,13 @@ pub(super) async fn run_worker(
                         {
                             Ok(decision) => decision,
                             Err(error) => {
+                                startup_reconciliation_committed = false;
                                 tracing::error!(
                                     %error,
                                     interrupt_id = %row.interrupt_id,
                                     "loading unrecoverable interrupt lifecycle decision failed"
                                 );
-                                settle_unrecoverable_interrupt(
+                                startup_reconciliation_committed &= settle_unrecoverable_interrupt(
                                     &session,
                                     &event_tx,
                                     &redaction,
@@ -7456,7 +7574,7 @@ pub(super) async fn run_worker(
                         if waiting_host {
                             continue;
                         }
-                        settle_unrecoverable_interrupt(
+                        startup_reconciliation_committed &= settle_unrecoverable_interrupt(
                             &session,
                             &event_tx,
                             &redaction,
@@ -7475,17 +7593,10 @@ pub(super) async fn run_worker(
             }
         }
         Err(error) => {
+            startup_reconciliation_committed = false;
             tracing::warn!(%error, "interrupt reconciliation failed");
         }
     }
-    // Publish the attach-path park-commit edge
-    // (`daemon-lifecycle-replay-timing-robustness.md`, §3): the crash-surviving
-    // `Open → Parked` reconciliation above has now committed (or there was
-    // nothing to reconcile), so a client that attached and is awaiting this
-    // signal can observe the durable `Parked` row. Always fired (even on the
-    // error/empty paths) so `attach` never blocks to the deadline needlessly.
-    park_commit.report_startup_reconciled();
-
     // Session-only redaction source overrides (`/toggle-redaction`). The
     // base config is reloaded at every turn boundary so dotenv/settings/SSH
     // changes made after session start are picked up before the next provider
@@ -8243,7 +8354,11 @@ pub(super) async fn run_worker(
     // driver has attached. Re-read just the terminal execution claims after
     // that durable pass so the original continuation is replayed rather than
     // being stranded until another user action happens.
-    match session.db.list_reconcilable_interrupts(session_id).await {
+    match session
+        .db
+        .list_reconcilable_interrupts(session.live_id())
+        .await
+    {
         Ok(rows) => {
             for row in rows {
                 if row.state != crate::db::needs_attention::InterruptState::Executing
@@ -8255,7 +8370,7 @@ pub(super) async fn run_worker(
                 {
                     continue;
                 }
-                settle_or_replay_executing_interrupt(
+                startup_reconciliation_committed &= settle_or_replay_executing_interrupt(
                     &session,
                     &event_tx,
                     &redaction,
@@ -8267,8 +8382,17 @@ pub(super) async fn run_worker(
             }
         }
         Err(error) => {
+            startup_reconciliation_committed = false;
             tracing::warn!(%error, %session_id, "scanning post-recovery terminal interrupt claims failed")
         }
+    }
+    // Agent-tree recovery can create a terminal execution claim after the
+    // initial Open -> Parked sweep. Publish the attach-path park-commit edge
+    // only after both startup interrupt passes have durably settled.
+    if startup_reconciliation_committed {
+        park_commit.report_startup_reconciled();
+    } else {
+        park_commit.report_startup_reconciliation_failed();
     }
     let root_claimed = tree_recovery
         .claimed_agents
@@ -8394,7 +8518,7 @@ pub(super) async fn run_worker(
         };
         let root_has_parked_continuation = match session
             .db
-            .list_reconcilable_interrupts(session_id)
+            .list_reconcilable_interrupts(session.live_id())
             .await
         {
             Ok(rows) => match expected_parked_interrupt_id {
@@ -12451,57 +12575,34 @@ pub(super) async fn run_worker(
                             interrupts.emit_queue_state().await;
                             continue;
                         }
-                        // Process-boundary lifecycle tests kill the daemon while
-                        // a parked replay is durably `executing`. The hook is
-                        // debug-build + env-gated, so release production binaries
-                        // cannot enter this pause.
-                        if cfg!(debug_assertions)
-                            && std::env::var_os("COCKPIT_TEST_PAUSE_PARKED_REPLAY_EXECUTING")
-                                .is_some()
-                        {
-                            loop {
-                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        let (payload, questions) = match claimed_parked_replay_parts(row) {
+                            Ok(parts) => parts,
+                            Err(error) => {
+                                let reason = error.reason();
+                                mark_client_visible_interrupt_interrupted(
+                                    &session,
+                                    &event_tx,
+                                    &redaction,
+                                    session_id,
+                                    interrupt_id,
+                                    tree_decision.is_some(),
+                                )
+                                .await;
+                                send_current_session_event(
+                                    &session,
+                                    &event_tx,
+                                    &redaction,
+                                    proto::Event::Notice {
+                                        session_id,
+                                        text: format!(
+                                            "Interrupted parked request {interrupt_id}: {reason}."
+                                        ),
+                                    },
+                                    NoticeSource::DaemonDirect,
+                                );
+                                interrupts.emit_queue_state().await;
+                                continue;
                             }
-                        }
-                        let Some(payload) = row.parked.clone() else {
-                            let _ = session.db.mark_interrupt_interrupted(interrupt_id).await;
-                            send_current_session_event(
-                                &session,
-                                &event_tx,
-                                &redaction,
-                                proto::Event::Notice {
-                                    session_id,
-                                    text: format!(
-                                        "Interrupted parked request {interrupt_id}: missing replay payload."
-                                    ),
-                                },
-                                NoticeSource::DaemonDirect,
-                            );
-                            interrupts.emit_queue_state().await;
-                            continue;
-                        };
-                        let Some(questions) = row.questions.clone().or_else(|| {
-                            row.question.clone().map(|question| {
-                                crate::daemon::proto::InterruptQuestionSet {
-                                    questions: vec![question],
-                                }
-                            })
-                        }) else {
-                            let _ = session.db.mark_interrupt_interrupted(interrupt_id).await;
-                            send_current_session_event(
-                                &session,
-                                &event_tx,
-                                &redaction,
-                                proto::Event::Notice {
-                                    session_id,
-                                    text: format!(
-                                        "Interrupted parked request {interrupt_id}: missing replay question."
-                                    ),
-                                },
-                                NoticeSource::DaemonDirect,
-                            );
-                            interrupts.emit_queue_state().await;
-                            continue;
                         };
                         let occurrence = match session
                             .db
@@ -13857,7 +13958,15 @@ pub(super) async fn run_worker(
                 }
                 SessionWork::Shutdown { pause_for_resume } => {
                     let (active, pending_tool_count, initial_committed) =
-                        shutdown_activity_snapshot(&session, session_id, &interrupts, &live).await;
+                        shutdown_activity_snapshot(
+                            &session,
+                            session_id,
+                            &root_agent_name,
+                            &project_root,
+                            &interrupts,
+                            &live,
+                        )
+                        .await;
                     shutdown_park_committed = initial_committed;
                     break WorkerStop::Shutdown {
                         pause_for_resume,
@@ -13897,10 +14006,19 @@ pub(super) async fn run_worker(
     if !driver_joined {
         if graceful_park {
             loop {
-                // Park first so a driver blocked on an interrupt is woken
-                // immediately (its tool returns Parked → the turn ends).
-                let sweep = interrupts.park_all_registered_collect().await;
-                shutdown_park_committed = shutdown_park_committed && sweep.all_committed;
+                // Commit the park and recovery summary before waking a driver
+                // blocked on an interrupt (its tool then returns Parked and
+                // the turn ends).
+                let (_, committed) = commit_shutdown_park_sweep(
+                    &session,
+                    session_id,
+                    &root_agent_name,
+                    &project_root,
+                    &interrupts,
+                    0,
+                )
+                .await;
+                shutdown_park_committed = shutdown_park_committed && committed;
                 match tokio::time::timeout(PARK_DRAIN_POLL_INTERVAL, &mut driver_handle).await {
                     Ok(join_result) => {
                         let outcome = driver_join_outcome(join_result);
@@ -13926,30 +14044,34 @@ pub(super) async fn run_worker(
         // be registered. Persist resumable work *before* publishing the
         // shutdown park-commit: drain waits on that signal to release pid and
         // socket, and a successor must already see the paused row.
-        let sweep = interrupts.park_all_registered_collect().await;
-        shutdown_park_committed = shutdown_park_committed && sweep.all_committed;
         if let WorkerStop::Shutdown {
             pause_for_resume: true,
-            active,
+            active: _,
             pending_tool_count,
         } = &stop
         {
-            let pending = session
+            let pending = match session
                 .db
-                .list_open_interrupts(session.live_id())
+                .count_nonterminal_interrupts(session.live_id())
                 .await
-                .map(|rows| rows.len() as i64)
-                .unwrap_or(*pending_tool_count);
-            if *active || pending > 0 {
-                persist_paused_session_work(
-                    &session,
-                    session_id,
-                    &root_agent_name,
-                    &project_root,
-                    pending,
-                )
-                .await;
-            }
+            {
+                Ok(rows) => rows.max(*pending_tool_count),
+                Err(error) => {
+                    tracing::error!(%error, "final shutdown interrupt reconciliation scan failed");
+                    shutdown_park_committed = false;
+                    (*pending_tool_count).max(1)
+                }
+            };
+            let (_, committed) = commit_shutdown_park_sweep(
+                &session,
+                session_id,
+                &root_agent_name,
+                &project_root,
+                &interrupts,
+                pending,
+            )
+            .await;
+            shutdown_park_committed = shutdown_park_committed && committed;
         }
         interrupts.report_shutdown_commit(shutdown_park_committed);
     }
@@ -14230,37 +14352,18 @@ fn update_authoritative_active_model_state(
     }
 }
 
-/// Releasable, debug-build + env-gated injected pause point
-/// (`daemon-lifecycle-replay-timing-robustness.md`, matching
-/// `COCKPIT_TEST_PAUSE_PARKED_REPLAY_EXECUTING`'s `cfg!(debug_assertions)` +
-/// env shape). Sleeps `<var>` milliseconds so a test can force the worst-case
-/// drain interleaving deterministically — the park write lands *after* the
-/// `--grace` deadline would have fired on the pre-fix code — without relying on
-/// host CPU starvation. Bounded/self-releasing, so the fixed drain path still
-/// observes a committed park within `INTERRUPT_PARK_COMMIT_DEADLINE`.
-/// Compiled out of release binaries entirely.
-async fn test_injected_park_delay(_var: &str) {
-    #[cfg(debug_assertions)]
-    {
-        if let Some(ms) =
-            std::env::var_os(_var).and_then(|raw| raw.to_str().and_then(|s| s.parse::<u64>().ok()))
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-        }
-    }
-}
-
-async fn persist_paused_session_work(
+pub(super) async fn persist_paused_session_work(
     session: &Session,
     session_id: Uuid,
     root_agent_name: &str,
     project_root: &std::path::Path,
     pending_tool_count: i64,
-) {
-    if let Err(error) = session
+) -> anyhow::Result<i64> {
+    session
         .db
-        .upsert_paused_session_work(
+        .park_session_for_resume(
             session_id,
+            session.live_id(),
             root_agent_name,
             &project_root.display().to_string(),
             "daemon shutdown paused active work",
@@ -14268,41 +14371,75 @@ async fn persist_paused_session_work(
             proto::DAEMON_VERSION,
         )
         .await
-    {
-        tracing::warn!(%error, "persisting paused session work failed");
-    }
+        .context("persisting paused session work")
 }
 
 pub(super) async fn shutdown_activity_snapshot(
     session: &Session,
     session_id: Uuid,
+    root_agent_name: &str,
+    project_root: &std::path::Path,
     interrupts: &crate::engine::interrupt::InterruptHub,
     live: &LiveState,
 ) -> (bool, i64, bool) {
-    // Injected worst-case interleaving for criteria 2/3/8: delay the shutdown
-    // park commit so the pre-fix drain path (which released pid/socket at the
-    // `--grace` deadline) races ahead of it, while the fixed path awaits the
-    // park-commit signal below.
-    test_injected_park_delay("COCKPIT_TEST_DELAY_SHUTDOWN_PARK_MS").await;
-    // Initial sweep only — the shutdown park-commit is NOT reported here.
-    // The worker re-parks (finding 2 registration barrier) and reports once,
-    // after the driver task exits, so `Committed` cannot be observed while an
-    // in-flight turn could still register a fresh interrupt. The sweep's
-    // write-commit status is threaded out so a failed *initial* park (whose
-    // waiter is then gone from the map and cannot be re-detected by a later
-    // sweep) still surfaces as a non-clean terminal.
-    let sweep = interrupts.park_all_registered_collect().await;
-    let pending_tool_count = session
-        .db
-        .list_open_interrupts(session.live_id())
-        .await
-        .map(|rows| rows.len() as i64)
-        .unwrap_or(sweep.count as i64);
+    // Initial atomic park-and-summary commit only — the shutdown terminal is
+    // NOT reported here. The worker repeats this transaction (finding 2
+    // registration barrier) and reports once after the driver exits, so
+    // `Committed` cannot be observed while an in-flight turn could still
+    // register fresh durable work. The commit status is threaded out so an
+    // initial write failure still surfaces as a non-clean terminal.
+    let (pending_tool_count, scan_committed) = commit_shutdown_park_sweep(
+        session,
+        session_id,
+        root_agent_name,
+        project_root,
+        interrupts,
+        0,
+    )
+    .await;
     let active = {
         let (has_schedules, processing) = (live.has_active_schedules(), live.processing());
         has_schedules || processing || pending_tool_count > 0
     };
-    (active, pending_tool_count, sweep.all_committed)
+    (active, pending_tool_count, scan_committed)
+}
+
+async fn commit_shutdown_park_sweep(
+    session: &Session,
+    session_id: Uuid,
+    root_agent_name: &str,
+    project_root: &std::path::Path,
+    interrupts: &crate::engine::interrupt::InterruptHub,
+    pending_floor: i64,
+) -> (i64, bool) {
+    // Write-ahead invariant: park every durable continuation and publish the
+    // stable recovery summary in one SQLite transaction before waking a live
+    // waiter. Every shutdown source (restart command and SIGTERM included)
+    // enters this shared worker drain, and the final sweep closes late
+    // registration after the driver has quiesced.
+    let committed = persist_paused_session_work(
+        session,
+        session_id,
+        root_agent_name,
+        project_root,
+        pending_floor,
+    )
+    .await;
+    let woke = interrupts.wake_all_registered_after_durable_park();
+    match committed {
+        Ok(pending) => (shutdown_pending_tool_count(pending, woke), true),
+        Err(error) => {
+            tracing::error!(%error, "committing shutdown park transaction failed");
+            (
+                shutdown_pending_tool_count(pending_floor.max(1), woke),
+                false,
+            )
+        }
+    }
+}
+
+pub(super) fn shutdown_pending_tool_count(nonterminal_rows: i64, parked_waiters: usize) -> i64 {
+    nonterminal_rows.max(i64::try_from(parked_waiters).unwrap_or(i64::MAX))
 }
 
 #[cfg(test)]

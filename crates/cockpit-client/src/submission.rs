@@ -238,9 +238,83 @@ impl ClientUserSubmission {
     }
 }
 
+/// Derive a submission id that is stable for retries of the same payload within
+/// one CLI invocation and unique across distinct invocations.
+pub fn derive_client_submission_id(invocation_nonce: Uuid, payload_fingerprint: &str) -> Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(b"flycockpit.client-submission-id.v1");
+    hasher.update(invocation_nonce.as_bytes());
+    hasher.update((payload_fingerprint.len() as u64).to_be_bytes());
+    hasher.update(payload_fingerprint.as_bytes());
+
+    let digest = hasher.finalize();
+    // RFC 9562 UUIDv7 carries the Unix-millisecond timestamp in the first
+    // 48 bits. Invocation nonces are v7 UUIDs, so retain that sortable time
+    // field and derive only the random portion from the bound payload.
+    let mut bytes = [0_u8; 16];
+    bytes[..6].copy_from_slice(&invocation_nonce.as_bytes()[..6]);
+    bytes[6..].copy_from_slice(&digest[..10]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+/// Payload fingerprint for a noninteractive `cockpit run` user message, aligned
+/// with the daemon's local-owner V2 terminal probe.
+pub fn run_user_message_submission_fingerprint(text: &str) -> String {
+    ClientUserSubmission {
+        origin: SubmissionOrigin::ExternalRoot,
+        text: text.to_owned(),
+        ..Default::default()
+    }
+    .client_fingerprint()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distinct_payloads_never_share_submission_id_within_invocation() {
+        let nonce = Uuid::now_v7();
+        let first = ClientUserSubmission::text("first payload");
+        let second = ClientUserSubmission::text("second payload");
+        assert_ne!(
+            derive_client_submission_id(nonce, &first.client_fingerprint()),
+            derive_client_submission_id(nonce, &second.client_fingerprint()),
+        );
+    }
+
+    #[test]
+    fn same_payload_retried_twice_dedups_within_invocation() {
+        let nonce = Uuid::now_v7();
+        let fingerprint = ClientUserSubmission::text("same payload").client_fingerprint();
+        assert_eq!(
+            derive_client_submission_id(nonce, &fingerprint),
+            derive_client_submission_id(nonce, &fingerprint),
+        );
+    }
+
+    #[test]
+    fn derived_submission_id_is_non_nil_rfc4122_uuid_v7() {
+        let id = derive_client_submission_id(
+            Uuid::from_u128(0x018f_6b7a_4c2d_7000_8000_0000_0000_0001),
+            "payload fingerprint",
+        );
+        assert!(!id.is_nil());
+        assert_eq!(id.get_version_num(), 7);
+        assert_eq!(id.get_variant(), uuid::Variant::RFC4122);
+        assert_eq!(&id.as_bytes()[..6], &[0x01, 0x8f, 0x6b, 0x7a, 0x4c, 0x2d]);
+    }
+
+    #[test]
+    fn distinct_invocations_never_collide_on_same_payload() {
+        let fingerprint = ClientUserSubmission::text("same payload").client_fingerprint();
+        assert_ne!(
+            derive_client_submission_id(Uuid::now_v7(), &fingerprint),
+            derive_client_submission_id(Uuid::now_v7(), &fingerprint),
+        );
+    }
 
     #[test]
     fn client_fingerprint_binds_submission_origin() {

@@ -274,6 +274,10 @@ pub(crate) struct TitleProgressSnapshot {
     /// provider request. A successful user-message retract must put it back
     /// so the resend produces the same request/cache prefix.
     last_time_prelude: Option<DateTime<Utc>>,
+    /// Exact prelude already owed by an earlier retract. Capturing it makes a
+    /// second cancel/resend cycle replay the same value again rather than
+    /// replacing it with the wall clock at the later attempt.
+    replay_time_prelude: Option<DateTime<Utc>>,
 }
 
 /// Work due for the cache-reusing, same-model metadata fork. The title slots
@@ -659,10 +663,11 @@ pub struct Session {
     /// memory only: the daemon re-evaluates the interval on every
     /// send, so re-attaching a resumed session naturally re-injects.
     pub last_time_prelude: Mutex<Option<DateTime<Utc>>>,
-    /// A reasoning-only user cancellation retracts the whole logical turn.
-    /// Preserve the exact prelude consumed by that vanished request so the
-    /// next accepted turn reuses the same cacheable timestamp once.
-    retracted_time_prelude: Mutex<Option<DateTime<Utc>>>,
+    /// Exact timestamp consumed by a retracted request and owed to its resend.
+    /// This is kept separately from `last_time_prelude`: the latter must be
+    /// rolled back for cadence accounting, while this value preserves the
+    /// provider request/cache prefix byte-for-byte.
+    replay_time_prelude: Mutex<Option<DateTime<Utc>>>,
     /// Running token estimate of RAW typed user-authored content
     /// (pre-skill-injection) this session. Bumped by
     /// [`Self::note_user_content`] and retained for stats/compatibility.

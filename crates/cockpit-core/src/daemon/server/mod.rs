@@ -129,12 +129,10 @@ fn build_daemon_redaction_table(
     Ok(Arc::new(built))
 }
 
-fn refresh_global_redaction_table(
+fn union_built_redaction_table(
     shared: &SharedRedactionTable,
-    config_source: &crate::daemon::config_source::ConfigSource,
-    vault: &Arc<crate::secure_key::SecretVault>,
+    fresh: Arc<RedactionTable>,
 ) -> Result<Arc<RedactionTable>> {
-    let fresh = build_daemon_redaction_table(config_source, vault)?;
     let table = Arc::new(
         current_redaction(shared)
             .union(&fresh)
@@ -142,6 +140,15 @@ fn refresh_global_redaction_table(
     );
     set_current_redaction(shared, table.clone());
     Ok(table)
+}
+
+fn refresh_global_redaction_table(
+    shared: &SharedRedactionTable,
+    config_source: &crate::daemon::config_source::ConfigSource,
+    vault: &Arc<crate::secure_key::SecretVault>,
+) -> Result<Arc<RedactionTable>> {
+    let fresh = build_daemon_redaction_table(config_source, vault)?;
+    union_built_redaction_table(shared, fresh)
 }
 
 fn scrub_json_strings(value: &mut serde_json::Value, redact: &RedactionTable) {
@@ -1056,6 +1063,10 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             interrupt_id: _,
             decision: _,
             seq: _,
+        }
+        | proto::Event::InterruptInterrupted {
+            session_id: _,
+            interrupt_id: _,
         }
         | proto::Event::AgentIdle {
             session_id: _,
@@ -2681,14 +2692,22 @@ pub struct DaemonContext {
     /// Started under the single-instance lock after installation identity
     /// is loaded; process-global keyring registration is drained on drop.
     pub secure_key: Option<crate::secure_key::SecureKeyHandle>,
+    /// Effective production file-vault directory selected at boot. Runtime
+    /// placement migrations must reuse it rather than silently falling back
+    /// to the database-relative default.
+    pub(crate) secret_store_path: Option<PathBuf>,
+    /// Context-owned container runtime authority. The DB-keyed weak registry
+    /// lets tool/session siblings locate this exact manager without making a
+    /// process-global first-writer selection authoritative.
+    pub(crate) container_manager: Arc<crate::container::ContainerManager>,
     /// Owns the actor thread; kept so Drop drains before unset_default_store.
     _secure_key_actor: Option<crate::secure_key::SecureKeyActor>,
     /// Shared production protected redaction-history key resolver, built from
     /// [`Self::secure_key`] when the actor attaches and also installed on the
     /// registry so every session shares one cache. `None` in production until
-    /// the actor attaches; unit tests (which never start the native actor) seed
-    /// a real test resolver in [`Self::new`]. Consumers that require it fail
-    /// closed via [`Self::redaction_key_resolver`].
+    /// the actor attaches; synthetic server fixtures explicitly install a cheap
+    /// test resolver, while actor lifecycle tests attach their own actor.
+    /// Consumers that require it fail closed via [`Self::redaction_key_resolver`].
     redaction_key_resolver:
         Option<Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>>,
     /// Generic durable journal for ambiguous external side effects
@@ -2749,22 +2768,7 @@ pub struct DaemonContext {
 
 #[cfg(test)]
 pub(crate) fn test_context_for_daemon_modules() -> Arc<DaemonContext> {
-    let db = Db::open_in_memory().expect("in-memory test db");
-    let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
-    Arc::new(DaemonContext::new(
-        db,
-        locks,
-        DaemonPaths {
-            socket: PathBuf::from("/tmp/cockpit-module-test.sock"),
-            pid_file: PathBuf::from("/tmp/cockpit-module-test.pid"),
-            ephemeral: true,
-        },
-        crate::daemon::terminal::test_host_factory(),
-        crate::daemon::config_source::ConfigSource::fixed(
-            crate::config::providers::ProvidersConfig::default(),
-            crate::config::extended::ExtendedConfig::default(),
-        ),
-    ))
+    tests::test_ctx()
 }
 
 impl DaemonContext {
@@ -3129,6 +3133,50 @@ impl DaemonContext {
         terminal_factory: crate::daemon::terminal::TerminalHostFactory,
         config_source: crate::daemon::config_source::ConfigSource,
     ) -> Self {
+        Self::assemble(
+            db,
+            locks,
+            paths,
+            terminal_factory,
+            config_source,
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_boot_authority(
+        db: Db,
+        locks: Arc<LockManager>,
+        paths: DaemonPaths,
+        terminal_factory: crate::daemon::terminal::TerminalHostFactory,
+        config_source: crate::daemon::config_source::ConfigSource,
+        boot_redaction: Arc<RedactionTable>,
+        boot_secret_vault: Arc<crate::secure_key::SecretVault>,
+        boot_container: Arc<crate::container::ContainerManager>,
+    ) -> Self {
+        Self::assemble(
+            db,
+            locks,
+            paths,
+            terminal_factory,
+            config_source,
+            Some(boot_redaction),
+            Some(boot_secret_vault),
+            Some(boot_container),
+        )
+    }
+
+    fn assemble(
+        db: Db,
+        locks: Arc<LockManager>,
+        paths: DaemonPaths,
+        terminal_factory: crate::daemon::terminal::TerminalHostFactory,
+        config_source: crate::daemon::config_source::ConfigSource,
+        boot_redaction: Option<Arc<RedactionTable>>,
+        boot_secret_vault: Option<Arc<crate::secure_key::SecretVault>>,
+        boot_container: Option<Arc<crate::container::ContainerManager>>,
+    ) -> Self {
         let daemon_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let canonical_cwd = daemon_cwd.canonicalize().unwrap_or(daemon_cwd);
         let ephemeral_lifetime = paths.ephemeral;
@@ -3153,20 +3201,6 @@ impl DaemonContext {
         if let Some(state) = paths.pid_file.parent() {
             registry.set_daemon_agents_dir(state.join("agents"));
         }
-        // Production installs the real resolver when the secure-key actor
-        // attaches (`attach_secure_key_actor`), which tests skip. Give the
-        // registry and this context a real test resolver so session builds and
-        // resume fallbacks succeed in tests without the native actor (decision
-        // 16 — never absent, never `Option` at the point of use).
-        #[cfg(test)]
-        let redaction_key_resolver: Option<
-            Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
-        > = {
-            let resolver = crate::session::test_redaction_key_resolver();
-            registry.set_redaction_key_resolver(resolver.clone());
-            Some(resolver)
-        };
-        #[cfg(not(test))]
         let redaction_key_resolver: Option<
             Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
         > = None;
@@ -3174,15 +3208,19 @@ impl DaemonContext {
         #[cfg(feature = "remote")]
         let (connector_wake, _) = watch::channel(0u64);
         let (global_events, _) = broadcast::channel(GLOBAL_EVENT_CAPACITY);
-        let secret_vault = crate::secure_key::open_for_db(&db)
-            .unwrap_or_else(|error| panic!("daemon vault required at construction: {error}"));
+        let secret_vault = boot_secret_vault.unwrap_or_else(|| {
+            crate::secure_key::open_for_db(&db)
+                .unwrap_or_else(|error| panic!("daemon vault required at construction: {error}"))
+        });
         registry.set_secret_vault(secret_vault.clone());
         config_source.install_vault(secret_vault.clone());
-        let global_redaction = Arc::new(std::sync::RwLock::new(
-            build_daemon_redaction_table(&config_source, &secret_vault).unwrap_or_else(|error| {
-                panic!("daemon redaction table required at construction: {error}")
-            }),
-        ));
+        let global_redaction = Arc::new(std::sync::RwLock::new(boot_redaction.unwrap_or_else(
+            || {
+                build_daemon_redaction_table(&config_source, &secret_vault).unwrap_or_else(
+                    |error| panic!("daemon redaction table required at construction: {error}"),
+                )
+            },
+        )));
         // MCP connections retain only the vault handle, not the full daemon
         // context. Install the owner publication seam here so an in-band
         // OAuth refresh cannot commit a new token while leaving the active
@@ -3210,8 +3248,10 @@ impl DaemonContext {
             global_redaction.clone(),
             terminal_temp_root(&paths),
         );
-        let container = Arc::new(crate::container::ContainerManager::detect());
-        let _ = crate::container::container_manager().set((*container).clone());
+        let container = boot_container
+            .unwrap_or_else(|| Arc::new(crate::container::ContainerManager::detect()));
+        crate::container::publish_container_manager(&db, container.clone())
+            .expect("conflicting daemon container-manager authority");
         spawn_terminal_reaper(terminal_host.clone(), shutdown.clone());
         crate::daemon::bulk_staging::spawn_reaper(shutdown.clone());
         registry
@@ -3227,8 +3267,10 @@ impl DaemonContext {
             registry.set_scheduler(handle.clone());
         }
         let host_capabilities = crate::host_capabilities::HostCapabilitySnapshotStore::new();
-        let host_capability_probes =
+        let mut host_capability_probes =
             crate::host_capabilities::HostCapabilityProbeInputs::production(canonical_cwd.clone());
+        host_capability_probes.container =
+            crate::host_capabilities::ContainerProbeSource::ReuseSnapshot(container.availability());
         registry.set_host_capabilities(host_capabilities.clone(), host_capability_probes.clone());
         struct DaemonMediaClock(Instant);
         impl crate::media_reservation::MonotonicClock for DaemonMediaClock {
@@ -3322,7 +3364,7 @@ impl DaemonContext {
                 );
             }
         }
-        let mut ctx = Self {
+        Self {
             guidance_proposals: registry.guidance_proposals(),
             db,
             media_ledger,
@@ -3378,6 +3420,8 @@ impl DaemonContext {
             #[cfg(debug_assertions)]
             agent_installation_fixture,
             secure_key: None,
+            secret_store_path: None,
+            container_manager: container,
             _secure_key_actor: None,
             redaction_key_resolver,
             external_journal: None,
@@ -3401,37 +3445,7 @@ impl DaemonContext {
             redaction_refresh_failure: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             persistent_endpoint_publication_failure: AtomicBool::new(false),
-        };
-        #[cfg(test)]
-        {
-            let db = ctx.db.clone();
-            // `start_with_store` performs synchronous bootstrap/reconciliation.
-            // Server fixtures are frequently constructed from a current-thread
-            // Tokio runtime, where a failing startup would otherwise attempt a
-            // `blocking_recv` on the runtime worker.  Keep that sync boundary
-            // off the runtime just as production boot does.
-            let actor = std::thread::spawn(move || {
-                crate::secure_key::SecureKeyActor::start_with_store(
-                    db.clone(),
-                    Box::new(crate::secure_key::fake::FakeNativeStore::new()),
-                    std::sync::Arc::new(crate::secure_key::CompositeConsumerReconciler::new(
-                        crate::external_journal::keys::ExternalJournalSpoolReconciler::new(
-                            db.clone(),
-                        ),
-                        crate::secure_key::ToolMediaSubjectBindingDbProbe::new(db),
-                    )),
-                )
-            })
-            .join();
-            let actor = match actor {
-                Ok(Ok(actor)) => Some(actor),
-                Ok(Err(_)) | Err(_) => None,
-            };
-            if let Some(actor) = actor {
-                ctx.attach_secure_key_actor(actor);
-            }
         }
-        ctx
     }
 
     /// Install the deny-closed remote project resolver consulted by the
@@ -4350,8 +4364,36 @@ pub(crate) async fn boot_with_db(
     terminal_factory: crate::daemon::terminal::TerminalHostFactory,
     config_source: crate::daemon::config_source::ConfigSource,
 ) -> Result<DaemonContext> {
-    #[cfg(not(test))]
-    let mut containment_recovered = false;
+    let daemon_boot = config_source
+        .load_boot()
+        .context("loading installation daemon boot configuration")?;
+    daemon_boot
+        .validate_paths()
+        .context("validating daemon boot paths")?;
+    let default_kek_dir = crate::secure_key::kek_dir_for_db(&db)
+        .context("resolving default daemon vault directory")?;
+    let effective_kek_dir = daemon_boot
+        .secret_store_path
+        .clone()
+        .unwrap_or(default_kek_dir);
+    anyhow::ensure!(
+        effective_kek_dir.is_absolute()
+            && !effective_kek_dir
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir)),
+        "effective daemon secret-store path must be absolute and traversal-free"
+    );
+    let db_parent = db
+        .path()
+        .and_then(Path::parent)
+        .context("file-backed daemon database has no parent directory")?;
+    anyhow::ensure!(
+        effective_kek_dir.starts_with(db_parent),
+        "daemon secret_store_path must remain inside the installation data directory {}",
+        db_parent.display()
+    );
+    db.configure_secret_vault_dir(effective_kek_dir.clone())
+        .context("publishing daemon vault directory authority")?;
     timer.phase("db_open_and_migrate");
     let locks = Arc::new(
         LockManager::from_db(db.clone())
@@ -4382,8 +4424,84 @@ pub(crate) async fn boot_with_db(
         .context("checking global host capability refresh execution fence")?,
         "host capability refresh execution fence remains live after boot reconciliation"
     );
-    #[cfg_attr(test, allow(unused_mut))]
-    let mut ctx = DaemonContext::new(db.clone(), locks, paths, terminal_factory, config_source);
+    let keyring_probe = match daemon_boot.secret_store_backend {
+        crate::config::extended::DaemonSecretStoreBackend::Auto => {
+            tokio::task::spawn_blocking(crate::secure_key::probe_platform_keyring)
+                .await
+                .context("daemon keyring probe task failed")?
+        }
+        crate::config::extended::DaemonSecretStoreBackend::File => {
+            crate::secure_key::KeyringProbeResult {
+                state: cockpit_proto::FeatureCapabilityState::Missing,
+                reason: "file-backed vault selected by daemon configuration".into(),
+                fix_command: None,
+                remedy_text: None,
+            }
+        }
+    };
+    let container_probe_paths = daemon_boot.container_probe_paths.clone();
+    let boot_container_task = tokio::task::spawn_blocking(move || {
+        crate::container::ContainerManager::detect_with_probe_paths(container_probe_paths)
+    });
+    let boot_redaction_task = tokio::task::spawn_blocking({
+        let config_source = config_source.clone();
+        let db = db.clone();
+        let keyring_probe = keyring_probe.clone();
+        let configured_kek_dir = effective_kek_dir.clone();
+        move || {
+            let kek_dir = configured_kek_dir;
+            let effective = crate::secure_key::ensure_secret_vault(
+                &db,
+                &keyring_probe,
+                &kek_dir,
+                crate::secure_key::SecretStoreInjected::default(),
+            )
+            .map_err(|error| error.into_error())
+            .context("opening daemon vault for redaction")?;
+            let redaction = build_daemon_redaction_table(&config_source, &effective.vault)?;
+            Ok::<_, anyhow::Error>((effective, redaction, kek_dir))
+        }
+    });
+    let boot_container = Arc::new(
+        boot_container_task
+            .await
+            .context("daemon container detection task failed")?,
+    );
+    crate::container::publish_container_manager(&db, boot_container.clone())
+        .map_err(anyhow::Error::msg)
+        .context("publishing daemon container-manager authority")?;
+    let boot_host_probes = {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let cwd = cwd.canonicalize().unwrap_or(cwd);
+        let mut inputs = crate::host_capabilities::HostCapabilityProbeInputs::production(cwd);
+        inputs.container_probe_paths = daemon_boot.container_probe_paths.clone();
+        inputs.container = crate::host_capabilities::ContainerProbeSource::ReuseSnapshot(
+            boot_container.availability(),
+        );
+        inputs.keyring = crate::host_capabilities::KeyringProbeSource::Injected {
+            result: keyring_probe.clone(),
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        tokio::spawn(async move {
+            crate::host_capabilities::collect_shared_host_probes(&inputs, false).await
+        })
+    };
+    let (boot_secret_store, boot_redaction, boot_secret_store_path) =
+        boot_redaction_task
+            .await
+            .context("daemon redaction build task failed")??;
+    timer.phase("redaction_table");
+    let mut ctx = DaemonContext::new_with_boot_authority(
+        db.clone(),
+        locks,
+        paths,
+        terminal_factory,
+        config_source,
+        boot_redaction,
+        boot_secret_store.vault.clone(),
+        boot_container,
+    );
+    ctx.secret_store_path = Some(boot_secret_store_path);
     // A capability refresh receipt is daemon-global state, not a per-session
     // cache. Seed only from an already-published durable generation, then
     // replay the completed outbox below in order. Seeding from the newest
@@ -4531,12 +4649,6 @@ pub(crate) async fn boot_with_db(
             .await
             .context("media retention recovery")?;
     }
-    run_retention_pass(
-        db.clone(),
-        retention_config(),
-        chrono::Utc::now().timestamp(),
-    )
-    .await;
     timer.phase("media_upload_reconcile");
     // Shared host-capability probes run once here. The TUI in-process doctor
     // snapshot is not the daemon's capability authority.
@@ -4545,140 +4657,106 @@ pub(crate) async fn boot_with_db(
     // path. Vault start consumes that probe and must not construct the
     // platform store a second time. Snapshot publish waits until after vault
     // start so `secretStore` is filled from the authority row.
-    #[cfg(not(test))]
-    {
-        let probes = crate::host_capabilities::collect_shared_host_probes(
-            &ctx.host_capability_probes,
-            false,
-        )
-        .await;
-        let db_for_keys = db.clone();
-        let keyring_probe = probes.keyring.clone();
-        let (boot_tx, boot_rx) = tokio::sync::oneshot::channel();
-        match std::thread::Builder::new()
-            .name("cockpit-secure-key-boot".into())
-            .spawn(move || {
-                let external = crate::external_journal::keys::ExternalJournalSpoolReconciler::new(
-                    db_for_keys.clone(),
+    let probes = boot_host_probes
+        .await
+        .context("daemon host capability probe task failed")?;
+    let db_for_keys = db.clone();
+    let external =
+        crate::external_journal::keys::ExternalJournalSpoolReconciler::new(db_for_keys.clone());
+    let tool_media = crate::secure_key::ToolMediaSubjectBindingDbProbe::new(db_for_keys.clone());
+    let reconciler = std::sync::Arc::new(crate::secure_key::CompositeConsumerReconciler::new(
+        external, tool_media,
+    ));
+    match crate::secure_key::SecureKeyActor::start_production_with_effective_store(
+        db_for_keys,
+        reconciler,
+        boot_secret_store,
+    ) {
+        Ok(actor) => {
+            ctx.attach_secure_key_actor(actor);
+            timer.phase("secure_key_actor");
+            if let Some(generation) = initial_host_capability_snapshot_generation {
+                let authority = db
+                    .blocking_write_for_sync_maintenance(
+                        crate::db::secret_vault::load_authority_conn,
+                    )
+                    .ok()
+                    .flatten();
+                let secret_store = crate::secure_key::project_secret_store_snapshot(
+                    authority.as_ref(),
+                    &probes.keyring,
                 );
-                let tool_media =
-                    crate::secure_key::ToolMediaSubjectBindingDbProbe::new(db_for_keys.clone());
-                let reconciler = std::sync::Arc::new(
-                    crate::secure_key::CompositeConsumerReconciler::new(external, tool_media),
+                let snapshot = crate::host_capabilities::build_host_capability_snapshot(
+                    generation,
+                    &probes,
+                    secret_store,
                 );
-                let result = crate::secure_key::SecureKeyActor::start_production_resolved(
-                    db_for_keys,
-                    reconciler,
-                    &keyring_probe,
-                    None,
-                    crate::secure_key::SecretStoreInjected::default(),
-                );
-                let _ = boot_tx.send(result);
-            }) {
-            Ok(_handle) => match boot_rx.await {
-                Ok(Ok(actor)) => {
-                    ctx.attach_secure_key_actor(actor);
-                    timer.phase("secure_key_actor");
-                    if let Some(generation) = initial_host_capability_snapshot_generation {
-                        let authority = db
-                            .blocking_write_for_sync_maintenance(
-                                crate::db::secret_vault::load_authority_conn,
-                            )
-                            .ok()
-                            .flatten();
-                        let secret_store = crate::secure_key::project_secret_store_snapshot(
-                            authority.as_ref(),
-                            &probes.keyring,
-                        );
-                        let snapshot = crate::host_capabilities::build_host_capability_snapshot(
-                            generation,
-                            &probes,
-                            secret_store,
-                        );
-                        let _ = ctx.host_capabilities.publish(snapshot);
-                    }
-                    timer.phase("host_capabilities");
-                }
-                Ok(Err(error)) => {
-                    if let Some(generation) = initial_host_capability_snapshot_generation {
-                        let secret_store = match &error {
-                            crate::secure_key::SecureKeyError::KekUnavailable {
-                                reason,
-                                fix_command,
-                            } => cockpit_proto::SecretStoreSnapshot {
-                                intent: cockpit_proto::SecretStoreIntent::Keyring,
-                                effective_placement:
-                                    cockpit_proto::SecretStorePlacement::Unavailable,
-                                fail_closed_reason: Some(reason.clone()),
-                                fix_command: fix_command.clone(),
-                            },
-                            _ => cockpit_proto::SecretStoreSnapshot::unconfigured_placeholder(),
-                        };
-                        let snapshot = crate::host_capabilities::build_host_capability_snapshot(
-                            generation,
-                            &probes,
-                            secret_store,
-                        );
-                        let _ = ctx.host_capabilities.publish(snapshot);
-                    }
-                    timer.phase("host_capabilities");
-                    return Err(anyhow::anyhow!("secure key vault: {error}"));
-                }
-                Err(_) => {
-                    return Err(anyhow::anyhow!("secure key actor boot channel dropped"));
-                }
-            },
-            Err(error) => {
-                return Err(anyhow::anyhow!(
-                    "secure key actor boot thread spawn failed: {error}"
-                ));
+                ctx.host_capabilities
+                    .accept_durable_refresh_reservation(generation)
+                    .map_err(anyhow::Error::msg)
+                    .context("accepting boot host capability generation")?;
+                ctx.host_capabilities
+                    .publish_committed(snapshot)
+                    .map_err(anyhow::Error::msg)
+                    .context("publishing boot host capability snapshot")?;
             }
+            timer.phase("host_capabilities");
         }
-    }
-    #[cfg(test)]
-    {
-        let _ = &db;
-        if let Some(generation) = initial_host_capability_snapshot_generation {
-            let probes = crate::host_capabilities::collect_shared_host_probes(
-                &ctx.host_capability_probes,
-                false,
-            )
-            .await;
-            let snapshot = crate::host_capabilities::build_host_capability_snapshot(
-                generation,
-                &probes,
-                cockpit_proto::SecretStoreSnapshot::unconfigured_placeholder(),
-            );
-            let _ = ctx.host_capabilities.publish(snapshot);
+        Err(error) => {
+            if let Some(generation) = initial_host_capability_snapshot_generation {
+                let secret_store = match &error {
+                    crate::secure_key::SecureKeyError::KekUnavailable {
+                        reason,
+                        fix_command,
+                    } => cockpit_proto::SecretStoreSnapshot {
+                        intent: cockpit_proto::SecretStoreIntent::Keyring,
+                        effective_placement: cockpit_proto::SecretStorePlacement::Unavailable,
+                        fail_closed_reason: Some(reason.clone()),
+                        fix_command: fix_command.clone(),
+                    },
+                    _ => cockpit_proto::SecretStoreSnapshot::unconfigured_placeholder(),
+                };
+                let snapshot = crate::host_capabilities::build_host_capability_snapshot(
+                    generation,
+                    &probes,
+                    secret_store,
+                );
+                ctx.host_capabilities
+                    .accept_durable_refresh_reservation(generation)
+                    .map_err(anyhow::Error::msg)
+                    .context("accepting boot host capability generation")?;
+                ctx.host_capabilities
+                    .publish_committed(snapshot)
+                    .map_err(anyhow::Error::msg)
+                    .context("publishing boot host capability snapshot")?;
+            }
+            timer.phase("host_capabilities");
+            return Err(anyhow::anyhow!("secure key vault: {error}"));
         }
-        timer.phase("host_capabilities");
-        timer.phase("secure_key_actor_skipped");
     }
     // Process containment actor: durable generation-bound descendant groups.
-    // Under unit tests the actor is opt-in via `attach_process_containment_actor`
-    // so paused-time daemon lifecycle tests are not blocked by a cross-runtime
-    // barrier; production always installs and recovers.
-    #[cfg(not(test))]
+    // Recovery always uses the production platform adapter and the configured
+    // daemon's database. Tests isolate that durable state through the same
+    // file-backed boot path rather than substituting an adapter.
     {
         let adapter = crate::process_containment::default_host_adapter();
         let actor = crate::process_containment::ProcessContainmentActor::start(db.clone(), adapter);
         let handle = actor.handle();
         ctx.attach_process_containment_actor(actor);
-        // Publish to the registry so every worker session installs the same
-        // handle and spawns its lifecycle hooks under a proven containment lease.
-        ctx.registry.set_process_containment(handle.clone());
         match handle.recover().await {
             Ok(outcomes) => {
-                containment_recovered = true;
                 tracing::info!(
                     recovered = outcomes.len(),
                     "process containment recovery finished"
                 );
             }
             Err(error) => {
-                tracing::warn!(error = %error, "process containment recovery failed");
+                return Err(error).context("process containment recovery failed");
             }
         }
+        // Publish only after recovery succeeds: a failed recover must not leave
+        // sessions observing a containment handle the boot path abandoned.
+        ctx.registry.set_process_containment(handle.clone());
         timer.phase("process_containment_actor");
 
         // Durable write-scope authority. One coordinator per daemon: `recover`
@@ -4704,7 +4782,7 @@ pub(crate) async fn boot_with_db(
                 tracing::info!(recovered = outcomes.len(), "write scope recovery finished");
             }
             Err(error) => {
-                tracing::warn!(error = %error, "write scope recovery failed");
+                return Err(error).context("write scope recovery failed");
             }
         }
         // Publish to the registry so every session worker installs the same
@@ -4713,17 +4791,6 @@ pub(crate) async fn boot_with_db(
         ctx.write_scope = Some(coordinator);
         timer.phase("write_scope_coordinator");
     }
-    #[cfg(test)]
-    {
-        let _ = db;
-        timer.phase("process_containment_actor_skipped");
-    }
-    // External side-effect journal: recover the capsule spool and revalidate
-    // recovery capacity BEFORE any external dispatch can be enabled. The
-    // handle is published only once both succeed, so a consumer that cannot
-    // see `ctx.external_journal` cannot start a non-idempotent external
-    // action. Startup needs the secure-key handle for spool HMAC material.
-    #[cfg(not(test))]
     {
         match &ctx.secure_key {
             Some(secure_key) => {
@@ -4768,16 +4835,11 @@ pub(crate) async fn boot_with_db(
             }
         }
     }
-    #[cfg(test)]
-    {
-        timer.phase("external_journal_skipped");
-    }
     let recovery_wall_ms = chrono::Utc::now()
         .timestamp_millis()
         .try_into()
         .unwrap_or(0);
-    #[cfg(not(test))]
-    if containment_recovered {
+    {
         // The only production local media owner is currently the attachment
         // path, whose collected and decoded bytes are process memory. Reaped
         // daemon containment is therefore positive cleanup evidence for every
@@ -4839,10 +4901,8 @@ pub(crate) async fn boot_with_db(
 
 const TERMINAL_REAPER_POLL: Duration = Duration::from_secs(30);
 
-#[cfg(not(test))]
 struct RestartEphemeralMediaCleanup;
 
-#[cfg(not(test))]
 impl crate::media_reservation::LocalExpiryCleanup for RestartEphemeralMediaCleanup {
     fn kill_reap_and_cleanup(&self, reservation_id: &str) -> anyhow::Result<String> {
         Ok(format!(
@@ -5094,6 +5154,7 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, mut listener: DaemonListen
     #[cfg(feature = "remote")]
     dispatch::debug_assert_ledger_site_registry_consistent();
     let mut shutdown = ctx.shutdown.subscribe();
+    let mut clients = tokio::task::JoinSet::new();
     let retention_cfg = retention_config();
     let mut retention_interval = tokio::time::interval(std::time::Duration::from_secs(
         (retention_cfg.sweep_interval_hours.max(1) as u64) * 60 * 60,
@@ -5121,6 +5182,11 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, mut listener: DaemonListen
                 if changed.is_err() || ctx.shutdown.is_draining() {
                     tracing::info!("daemon: drain begun, closing accept loop");
                     break;
+                }
+            }
+            joined = clients.join_next(), if !clients.is_empty() => {
+                if let Some(Err(error)) = joined {
+                    tracing::warn!(%error, "daemon client task failed");
                 }
             }
             _ = retention_interval.tick() => {
@@ -5155,7 +5221,7 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, mut listener: DaemonListen
                             continue;
                         }
                         let ctx = ctx.clone();
-                        tokio::spawn(async move {
+                        clients.spawn(async move {
                             if let Err(e) = handle_client(stream, ctx).await {
                                 tracing::warn!(error = ?e, "client task ended with error");
                             }
@@ -5170,10 +5236,18 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, mut listener: DaemonListen
         }
     }
 
+    // Client handlers retain the central context, database handles, and their
+    // reader/writer/executor children.  Keep them under the accept loop's
+    // ownership so foreground shutdown has an explicit cancellation
+    // completion boundary instead of leaving process teardown to Tokio's
+    // runtime-drop scheduling.
+    clients.abort_all();
+    while clients.join_next().await.is_some() {}
+
     Ok(())
 }
 
-fn retention_config() -> RetentionConfig {
+pub(super) fn retention_config() -> RetentionConfig {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     ConfigSource::production()
         .load(&cwd)
@@ -5205,7 +5279,7 @@ fn log_retention_outcome(outcome: crate::db::retention::RetentionOutcome) {
     }
 }
 
-async fn run_retention_pass(db: Db, cfg: RetentionConfig, now_secs: i64) {
+pub(super) async fn run_retention_pass(db: Db, cfg: RetentionConfig, now_secs: i64) {
     match db.run_retention_pass(&cfg, now_secs).await {
         Ok(outcome) => log_retention_outcome(outcome),
         Err(error) => tracing::warn!(error = %error, "session payload retention pass failed"),
@@ -6334,6 +6408,7 @@ enum ClientEventCommand {
         rendered_interrupts: Arc<StdMutex<HashSet<Uuid>>>,
     },
     Detach,
+    Barrier(oneshot::Sender<()>),
 }
 
 async fn send_writer_envelope(
@@ -6532,6 +6607,9 @@ async fn run_client_event_forwarder(
                         session_id = None;
                         session_event_rx = None;
                         rendered_interrupts = None;
+                    }
+                    Some(ClientEventCommand::Barrier(done)) => {
+                        let _ = done.send(());
                     }
                     None => return,
                 }

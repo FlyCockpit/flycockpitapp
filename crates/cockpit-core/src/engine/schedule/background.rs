@@ -794,7 +794,7 @@ async fn run_background(
             .await;
         return;
     }
-    let mut cmd = match build_background_command(&command, &cwd, &launch).await {
+    let cmd = match build_background_command(&command, &cwd, &launch).await {
         Ok(cmd) => cmd,
         Err(e) => {
             let _ = event_tx
@@ -811,7 +811,7 @@ async fn run_background(
         }
     };
 
-    let mut child = match cmd.spawn() {
+    let mut child = match cockpit_host::process::spawn_pinned(cmd) {
         Ok(c) => c,
         Err(e) => {
             let _ = event_tx

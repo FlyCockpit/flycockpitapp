@@ -45,10 +45,7 @@ fn tui_pty_fixture_launches_and_reaps() {
         .expect("resize current-screen assertion");
 
     session.type_line("/exit");
-    assert!(
-        session.wait_for_child_exit(Duration::from_secs(10)),
-        "PTY child did not exit after /exit"
-    );
+    session.wait_for_child_exit();
     session.reap();
     session.assert_reaped();
 }

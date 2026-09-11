@@ -2472,7 +2472,7 @@ async fn execute_ordinary_call_unscoped(
     let ledger_original = ordinary_ledger_args(env, resolved_name, &original);
     let ledger_wire = model_history_args(env, resolved_name, &args);
     scheduler_await_commit().await;
-    if let Err(e) = env
+    let tool_audit_committed = match env
         .session
         .record_tool_call_journaled(
             ToolCallRow {
@@ -2516,10 +2516,14 @@ async fn execute_ordinary_call_unscoped(
         )
         .await
     {
-        // Auditing must not break the live conversation. Log and
-        // continue — the model still sees the tool result.
-        tracing::warn!(error = %e, tool = %resolved_name, "persisting tool_call_event failed");
-    }
+        Ok(()) => true,
+        Err(e) => {
+            // Auditing must not break the live conversation. Log and
+            // continue — the model still sees the tool result.
+            tracing::warn!(error = %e, tool = %resolved_name, "persisting tool_call_event failed");
+            false
+        }
+    };
 
     let event_canonical_output = result.as_ref().ok().and_then(|output| {
         (!hard_fail
@@ -2987,7 +2991,10 @@ async fn execute_ordinary_call_unscoped(
                 tool: resolved_name.to_string(),
                 error: event_data["output"].as_str().unwrap_or("").to_string(),
                 kind: fail_kind.unwrap_or(crate::engine::tool::ToolFailKind::Execution),
-                seq: tool_call_seq,
+                // A sequenced terminal is also the completion witness for the
+                // ordinary audit row. Keep display-only delivery on audit
+                // failure, but never claim durable completion with `seq`.
+                seq: tool_call_seq.filter(|_| tool_audit_committed),
             })
             .await;
     } else {
@@ -2999,7 +3006,9 @@ async fn execute_ordinary_call_unscoped(
                 tool: resolved_name.to_string(),
                 output: event_data["output"].as_str().unwrap_or("").to_string(),
                 truncated,
-                seq: tool_call_seq,
+                // See the ToolError branch above: `Some(seq)` proves both the
+                // audit row and its session timeline row committed.
+                seq: tool_call_seq.filter(|_| tool_audit_committed),
                 hint: bash_hint.as_ref().map(|h| h.user_chip.text.clone()),
             })
             .await;
@@ -7031,9 +7040,14 @@ mod tests {
         assert!(
             matches!(rx.recv().await, Some(TurnEvent::ToolStart { tool, .. }) if tool == "fail")
         );
-        assert!(
-            matches!(rx.recv().await, Some(TurnEvent::ToolError { error, .. }) if error.contains("intentional failure"))
-        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(TurnEvent::ToolError {
+                error,
+                seq: Some(_),
+                ..
+            }) if error.contains("intentional failure")
+        ));
         let row = session
             .db
             .list_tool_calls_for_session(session.id)
@@ -7044,6 +7058,82 @@ mod tests {
         assert_eq!(row.tool, "fail");
         assert!(row.hard_fail);
         assert!(row.output.contains("intentional failure"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_tool_terminal_seq_requires_committed_audit_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(FailTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, mut rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        session
+            .db
+            .write(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_ordinary_tool_audit
+                     BEFORE INSERT ON tool_call_events
+                     BEGIN
+                         SELECT RAISE(FAIL, 'forced ordinary tool audit failure');
+                     END;",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let call = tool_call("fail", serde_json::json!({}));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(&env, &mut history, &call, "fail", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(TurnEvent::ToolStart { tool, .. }) if tool == "fail"
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(TurnEvent::ToolError {
+                tool,
+                seq: None,
+                ..
+            }) if tool == "fail"
+        ));
+        assert!(
+            session
+                .db
+                .list_tool_calls_for_session(session.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "audit failure must not be presented as sequenced durable completion"
+        );
+        assert!(
+            session
+                .db
+                .list_session_events(session.id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "tool_call"),
+            "the distinguishing edge is an audit failure after timeline persistence succeeds"
+        );
     }
 
     #[tokio::test]

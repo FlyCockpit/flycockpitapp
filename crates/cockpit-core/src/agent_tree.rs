@@ -3373,6 +3373,22 @@ mod tests {
         assert_eq!(operation_state, "approved");
         assert_eq!(handoff_state, "ready");
         assert_eq!(handoff_key, operation_id.to_string());
+        assert!(
+            db.consume_host_approval_final_operation(
+                HostApprovalAuthority::trusted_host().into_db(),
+                interrupt_id,
+                session.session_id,
+                agent.agent_instance_id,
+                operation_id,
+                operation_kind.clone(),
+                canonical_input_json.clone(),
+                input_digest.clone(),
+                26,
+            )
+            .await
+            .unwrap(),
+            "an exact durable ready handoff must remain adoptable after replay"
+        );
         assert_eq!(
             db.claim_host_approval_effect_handoff(
                 HostApprovalAuthority::trusted_host().into_db(),
@@ -3387,7 +3403,7 @@ mod tests {
                     "execute": {"operation": "test"},
                 })])
                 .unwrap(),
-                26,
+                27,
             )
             .await
             .unwrap(),
@@ -3404,7 +3420,7 @@ mod tests {
                 operation_kind.clone(),
                 canonical_input_json.clone(),
                 input_digest.clone(),
-                27,
+                28,
             )
             .await
             .unwrap(),
@@ -3422,7 +3438,7 @@ mod tests {
                 input_digest.clone(),
                 true,
                 r#"{"outcome":"completed"}"#.into(),
-                28,
+                29,
             )
             .await
             .unwrap()
@@ -3437,7 +3453,7 @@ mod tests {
                 operation_kind,
                 canonical_input_json,
                 input_digest,
-                29,
+                30,
             )
             .await
             .unwrap(),

@@ -1462,7 +1462,9 @@ impl SessionWorkerHandle {
                 mode: new,
                 enabled: new.enabled(),
                 container_network_enabled: self.session.container_network_enabled(),
-                container_availability: crate::container::availability_snapshot(),
+                container_availability: crate::container::availability_snapshot_for_db(
+                    &self.session.db,
+                ),
                 persisted_intent: Some(applied.persisted_intent.into()),
             },
         );
@@ -1694,6 +1696,15 @@ impl Drop for InteractiveClientGuard {
                 "last detach while idle",
             );
             schedule_session_container_release(
+                crate::container::container_manager_for_db(
+                    &self
+                        .lease
+                        .state
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .session
+                        .db,
+                ),
                 self.counter.clone(),
                 self.live.clone(),
                 self.session_id,
@@ -2176,6 +2187,30 @@ impl SessionWorkerHandle {
         );
     }
 
+    /// Replay every exact durable `interrupted` identity after an attach has
+    /// subscribed. Startup crash reconciliation can commit before any client
+    /// exists, so its live edge alone cannot hydrate a reconnecting client.
+    /// Reading the committed rows here also makes a failed transition
+    /// ineligible for publication.
+    pub async fn broadcast_interrupted_interrupts(&self) -> Result<()> {
+        let interrupted = self
+            .session
+            .db
+            .list_interrupted_interrupts(self.session.live_id())
+            .await?;
+        for row in interrupted {
+            send_current_event(
+                &self.event_tx,
+                &self.redaction,
+                proto::Event::InterruptInterrupted {
+                    session_id: row.session_id,
+                    interrupt_id: row.interrupt_id,
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// Broadcast intent vs effective sandbox mode so attach/reconnect can
     /// show "intent Sandbox, effective Refuse (missing bwrap)".
     pub fn broadcast_sandbox_state(&self) {
@@ -2189,7 +2224,9 @@ impl SessionWorkerHandle {
                 mode,
                 enabled: mode.enabled(),
                 container_network_enabled: self.session.container_network_enabled(),
-                container_availability: crate::container::availability_snapshot(),
+                container_availability: crate::container::availability_snapshot_for_db(
+                    &self.session.db,
+                ),
                 persisted_intent: Some(snapshot.extended.sandbox.default_mode.into()),
             },
         );

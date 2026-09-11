@@ -14,6 +14,11 @@ const PROTOCOL_MISMATCH_STATUS_REMEDY: &str =
     "run `cockpit daemon restart` to restart the daemon on this version";
 
 pub async fn run(cmd: DaemonCommand) -> Result<()> {
+    let lifecycle_deadline = matches!(
+        &cmd,
+        DaemonCommand::Stop { .. } | DaemonCommand::Restart { .. }
+    )
+    .then(|| tokio::time::Instant::now() + daemon::restart_release_timeout(None));
     let paths = DaemonPaths::resolve()?;
     match cmd {
         DaemonCommand::Start {
@@ -56,16 +61,26 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
         }
         DaemonCommand::Stop { grace } => {
             validate_grace(grace)?;
+            let deadline = lifecycle_deadline.expect("stop command deadline");
             let old_pid = daemon::daemon_pid(&paths);
-            if let Ok(client) = DaemonClient::connect(&paths.socket).await {
-                client
-                    .request_ok(Request::StopDaemon { grace_secs: grace })
-                    .await?;
+            let release = daemon::capture_restart_release(&paths, old_pid);
+            if let Ok(Ok(client)) = tokio::time::timeout(
+                remaining_command_budget(deadline),
+                DaemonClient::connect(&paths.socket),
+            )
+            .await
+            {
+                tokio::time::timeout(
+                    remaining_command_budget(deadline),
+                    client.request_ok(Request::StopDaemon { grace_secs: grace }),
+                )
+                .await
+                .context("timed out delivering daemon stop within the command deadline")??;
                 drop(client);
                 if !daemon::wait_for_restart_release(
                     &paths,
-                    old_pid,
-                    daemon::restart_release_timeout(grace),
+                    release,
+                    remaining_command_budget(deadline),
                 )
                 .await
                 {
@@ -76,8 +91,25 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                 println!("daemon: stopped");
                 return Ok(());
             }
-            let stopped = daemon::stop(&paths)?;
+            let stop_paths = paths.clone();
+            let stop_budget = remaining_command_budget(deadline);
+            let stopped = tokio::task::spawn_blocking(move || {
+                daemon::stop_with_timeout(&stop_paths, stop_budget)
+            })
+            .await
+            .context("joining platform daemon stop")??;
             if stopped {
+                if !daemon::wait_for_restart_release(
+                    &paths,
+                    release,
+                    remaining_command_budget(deadline),
+                )
+                .await
+                {
+                    bail!(
+                        "timed out waiting for the previous daemon process to exit and release its pid and socket"
+                    );
+                }
                 if grace.is_some() {
                     println!(
                         "daemon: stopped (socket unreachable; used SIGTERM with default grace)"
@@ -96,8 +128,13 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             no_sandbox,
         } => {
             validate_grace(grace)?;
+            let deadline = lifecycle_deadline.expect("restart command deadline");
             let old_pid = daemon::daemon_pid(&paths);
-            let discovered = daemon::discover().await;
+            let release = daemon::capture_restart_release(&paths, old_pid);
+            let discovered =
+                tokio::time::timeout(remaining_command_budget(deadline), daemon::discover())
+                    .await
+                    .context("timed out discovering daemon within the restart command deadline")?;
             let should_stop = restart_should_stop(discovered.status);
             let restarted = should_stop && old_pid.is_some();
             let replacement_no_sandbox = if should_stop {
@@ -108,21 +145,34 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             let resume = !no_resume;
 
             if should_stop {
-                let stop_via_socket = if let Ok(client) = DaemonClient::connect(&paths.socket).await
+                if let Ok(Ok(client)) = tokio::time::timeout(
+                    remaining_command_budget(deadline),
+                    DaemonClient::connect(&paths.socket),
+                )
+                .await
                 {
-                    client
-                        .request_ok(Request::StopDaemon { grace_secs: grace })
-                        .await?;
+                    tokio::time::timeout(
+                        remaining_command_budget(deadline),
+                        client.request_ok(Request::StopDaemon { grace_secs: grace }),
+                    )
+                    .await
+                    .context(
+                        "timed out delivering daemon restart stop within the command deadline",
+                    )??;
                     drop(client);
-                    true
                 } else {
-                    let _ = daemon::stop(&paths)?;
-                    false
-                };
+                    let stop_paths = paths.clone();
+                    let stop_budget = remaining_command_budget(deadline);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        daemon::stop_with_timeout(&stop_paths, stop_budget)
+                    })
+                    .await
+                    .context("joining platform daemon restart stop")??;
+                }
                 let released = daemon::wait_for_restart_release(
                     &paths,
-                    old_pid,
-                    restart_release_timeout_for_stop_path(grace, stop_via_socket),
+                    release,
+                    remaining_command_budget(deadline),
                 )
                 .await;
                 if !released {
@@ -545,12 +595,15 @@ fn restart_should_stop(status: DaemonStatus) -> bool {
     )
 }
 
-fn restart_release_timeout_for_stop_path(grace: Option<u64>, stop_via_socket: bool) -> Duration {
-    if stop_via_socket {
-        daemon::restart_release_timeout(grace)
-    } else {
-        daemon::restart_release_timeout(None)
-    }
+fn remaining_command_budget(deadline: tokio::time::Instant) -> Duration {
+    remaining_command_budget_at(deadline, tokio::time::Instant::now())
+}
+
+fn remaining_command_budget_at(
+    deadline: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> Duration {
+    deadline.saturating_duration_since(now)
 }
 
 fn restart_started_message(restarted: bool, pid: u32, socket: &std::path::Path) -> String {
@@ -571,12 +624,13 @@ fn restart_started_message(restarted: bool, pid: u32, socket: &std::path::Path) 
 mod tests {
     use super::{
         DaemonVersions, RunningJsonStatus, incompatible_protocol_json_status,
-        render_incompatible_protocol_status, render_running_status,
-        restart_release_timeout_for_stop_path, restart_should_stop, restart_started_message,
-        running_json_status, validate_grace, version_skew_reason,
+        remaining_command_budget_at, render_incompatible_protocol_status, render_running_status,
+        restart_should_stop, restart_started_message, running_json_status, validate_grace,
+        version_skew_reason,
     };
+    use crate::daemon::DaemonStatus;
     use crate::daemon::proto;
-    use crate::daemon::{self, DaemonStatus};
+    use std::time::Duration;
 
     #[test]
     fn grace_validation_allows_zero_and_rejects_absurd_values() {
@@ -610,14 +664,20 @@ mod tests {
     }
 
     #[test]
-    fn restart_fallback_release_wait_uses_default_grace_when_override_cannot_be_forwarded() {
+    fn stop_and_restart_operations_consume_one_shared_deadline() {
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_secs(30);
         assert_eq!(
-            restart_release_timeout_for_stop_path(Some(0), true),
-            daemon::restart_release_timeout(Some(0))
+            remaining_command_budget_at(deadline, started),
+            Duration::from_secs(30),
         );
         assert_eq!(
-            restart_release_timeout_for_stop_path(Some(0), false),
-            daemon::restart_release_timeout(None)
+            remaining_command_budget_at(deadline, started + Duration::from_secs(11)),
+            Duration::from_secs(19),
+        );
+        assert_eq!(
+            remaining_command_budget_at(deadline, deadline + Duration::from_secs(1)),
+            Duration::ZERO,
         );
     }
 

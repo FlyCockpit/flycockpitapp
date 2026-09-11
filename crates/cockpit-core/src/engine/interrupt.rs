@@ -1240,7 +1240,7 @@ struct ParkCommitInner {
     /// whether this worker owes a shutdown park-commit.
     registered: AtomicUsize,
     shutdown: watch::Sender<ShutdownParkState>,
-    startup_reconciled: watch::Sender<bool>,
+    startup_reconciled: watch::Sender<ShutdownParkState>,
 }
 
 impl Default for ParkCommit {
@@ -1255,7 +1255,7 @@ impl ParkCommit {
             inner: Arc::new(ParkCommitInner {
                 registered: AtomicUsize::new(0),
                 shutdown: watch::channel(ShutdownParkState::Pending).0,
-                startup_reconciled: watch::channel(false).0,
+                startup_reconciled: watch::channel(ShutdownParkState::Pending).0,
             }),
         }
     }
@@ -1308,7 +1308,17 @@ impl ParkCommit {
     /// Producer (worker startup): the crash-reconciliation pass finished; any
     /// stale `Open` interrupt has been flipped to `Parked` (or none needed it).
     pub fn report_startup_reconciled(&self) {
-        let _ = self.inner.startup_reconciled.send_replace(true);
+        let _ = self
+            .inner
+            .startup_reconciled
+            .send_replace(ShutdownParkState::Committed);
+    }
+
+    pub fn report_startup_reconciliation_failed(&self) {
+        let _ = self
+            .inner
+            .startup_reconciled
+            .send_replace(ShutdownParkState::FailedWrite);
     }
 
     /// Consumer (drain): await the shutdown park-commit, bounded by `deadline`.
@@ -1344,26 +1354,35 @@ impl ParkCommit {
     }
 
     /// Consumer (attach): await the worker's startup reconciliation pass,
-    /// bounded by `deadline`. Returns `true` if the pass committed within the
-    /// deadline, `false` if the worker wedged (attach then proceeds anyway —
-    /// the reconciliation is idempotent and re-runs on the next attach).
-    pub async fn await_startup_reconciled(&self, deadline: std::time::Duration) -> bool {
+    /// bounded by `deadline`. Every attach caller rejects a non-clean result;
+    /// otherwise a failed or timed-out `Open -> Parked` write could be exposed.
+    pub async fn await_startup_reconciled(
+        &self,
+        deadline: std::time::Duration,
+    ) -> ParkCommitTerminal {
         let mut rx = self.inner.startup_reconciled.subscribe();
-        if *rx.borrow_and_update() {
-            return true;
+        match *rx.borrow_and_update() {
+            ShutdownParkState::Committed => return ParkCommitTerminal::Committed,
+            ShutdownParkState::FailedWrite => return ParkCommitTerminal::KnownFailedWrite,
+            ShutdownParkState::Pending => {}
         }
         let resolved = tokio::time::timeout(deadline, async {
             loop {
                 if rx.changed().await.is_err() {
-                    return false;
+                    return ShutdownParkState::Pending;
                 }
-                if *rx.borrow_and_update() {
-                    return true;
+                match *rx.borrow_and_update() {
+                    ShutdownParkState::Pending => continue,
+                    other => return other,
                 }
             }
         })
         .await;
-        matches!(resolved, Ok(true))
+        match resolved {
+            Ok(ShutdownParkState::Committed) => ParkCommitTerminal::Committed,
+            Ok(ShutdownParkState::FailedWrite) => ParkCommitTerminal::KnownFailedWrite,
+            Ok(ShutdownParkState::Pending) | Err(_) => ParkCommitTerminal::DeadlineUnresolved,
+        }
     }
 
     /// Test-only: simulate a worker registering an interrupt waiter without a
@@ -2027,13 +2046,10 @@ impl InterruptHub {
     }
 
     /// Park every currently-registered interrupt waiter WITHOUT publishing the
-    /// shutdown park-commit terminal. The worker's `SessionWork::Shutdown` drain
-    /// calls this repeatedly — re-parking any interrupt the in-flight turn
-    /// registered after an earlier sweep (`daemon-lifecycle-replay-timing-
-    /// robustness.md`, finding 2) — and only reports once, via
-    /// [`Self::report_shutdown_commit`], after the driver task has exited and no
-    /// further registration is possible. Returns the woken count and whether
-    /// every `park_interrupt` write in this sweep committed.
+    /// shutdown park-commit terminal. Runtime suspension paths use this narrow
+    /// operation; graceful shutdown instead commits its broader atomic
+    /// park-and-summary transaction before waking waiters. Returns the woken
+    /// count and whether every `park_interrupt` write in this sweep committed.
     pub async fn park_all_registered_collect(&self) -> ParkSweep {
         let interrupt_ids = {
             let guard = lock_or_recover(&self.waiters);
@@ -2056,16 +2072,35 @@ impl InterruptHub {
         }
     }
 
-    /// Park every currently-registered interrupt waiter and publish the
-    /// shutdown park-commit terminal in one shot. Retained for non-drain
-    /// callers (loop/skill runners, tests) whose hubs carry no [`ParkCommit`]
-    /// so the report is a no-op; the worker's graceful drain instead uses
-    /// [`Self::park_all_registered_collect`] + a deferred
+    /// Wake every registered waiter after the caller has parked the matching
+    /// durable rows in a broader transaction. This is shutdown-only: the
+    /// worker first commits both `needs_attention` and `paused_session_work`,
+    /// then releases the blocked driver so no acknowledgement can outrun the
+    /// recovery summary.
+    pub fn wake_all_registered_after_durable_park(&self) -> usize {
+        let interrupt_ids = {
+            let guard = lock_or_recover(&self.waiters);
+            guard.keys().copied().collect::<Vec<_>>()
+        };
+        let mut count = 0;
+        for interrupt_id in interrupt_ids {
+            if let Some(tx) = lock_or_recover(&self.waiters).remove(&interrupt_id) {
+                let _ = tx.send(InterruptOutcome::Parked);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Park every currently-registered interrupt waiter without publishing a
+    /// shutdown terminal. Runtime callers use this to suspend a gate/tool
+    /// continuation, and production worker hubs carry a [`ParkCommit`]; marking
+    /// that one-shot shutdown fence here would let a later daemon drain observe
+    /// a stale `Committed` value before its paused-work summary is durable.
+    /// The graceful drain is the sole publisher via
     /// [`Self::report_shutdown_commit`].
     pub async fn park_all_registered(&self) -> usize {
-        let sweep = self.park_all_registered_collect().await;
-        self.report_shutdown_commit(sweep.all_committed);
-        sweep.count
+        self.park_all_registered_collect().await.count
     }
 
     /// Publish the shutdown park-commit terminal for this worker (no-op when no
@@ -2647,7 +2682,7 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                         )
                         .await;
                     match dispatched {
-                        Ok(true) => {
+                        Ok(true)
                             if register_host_approval_effect_handoff(
                                 HostApprovalEffectHandoff::new(
                                     db.clone(),
@@ -2657,21 +2692,22 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                                     interrupt_id,
                                     operation.clone(),
                                 ),
-                            ) {
-                                response
-                            } else if let Some(handoff) = adopt_live_host_approval_effect_handoff(
-                                db,
-                                authority,
-                                session_id,
-                                decision.agent_instance_id,
-                                interrupt_id,
-                                &operation,
-                            )
-                            .await
-                            {
-                                if !handoff.claimed
-                                    && register_host_approval_effect_handoff(handoff)
-                                {
+                            ) =>
+                        {
+                            response
+                        }
+                        Ok(true) => match adopt_live_host_approval_effect_handoff(
+                            db,
+                            authority,
+                            session_id,
+                            decision.agent_instance_id,
+                            interrupt_id,
+                            &operation,
+                        )
+                        .await
+                        {
+                            Some(handoff) if !handoff.claimed => {
+                                if register_host_approval_effect_handoff(handoff) {
                                     response
                                 } else {
                                     let _ = db
@@ -2689,7 +2725,8 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                                         .await;
                                     ResolveResponse::Cancel
                                 }
-                            } else {
+                            }
+                            _ => {
                                 let _ = db
                                     .reject_unclaimed_host_approval_final_operation(
                                         db_authority,
@@ -2705,7 +2742,7 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                                     .await;
                                 ResolveResponse::Cancel
                             }
-                        }
+                        },
                         // A pre-resolved replay that observes an existing
                         // dispatch is deliberately denied.  We cannot prove
                         // whether a non-idempotent shell/MCP/harness/fs
@@ -2714,64 +2751,17 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                         // duplicate effect.  Promote a still-dispatching
                         // handoff to the explicit audit state when possible;
                         // completed/rejected rows make this a fenced no-op.
-                        Ok(false) => {
-                            if let Some(handoff) = adopt_live_host_approval_effect_handoff(
-                                db,
-                                authority,
-                                session_id,
-                                decision.agent_instance_id,
-                                interrupt_id,
-                                &operation,
-                            )
-                            .await
-                            {
-                                if !handoff.claimed
-                                    && register_host_approval_effect_handoff(handoff)
-                                {
-                                    response
-                                } else {
-                                    let _ = db
-                                        .reject_unclaimed_host_approval_final_operation(
-                                            db_authority,
-                                            interrupt_id,
-                                            session_id,
-                                            decision.agent_instance_id,
-                                            operation_id,
-                                            operation.operation_kind.clone(),
-                                            operation.canonical_input_json.clone(),
-                                            operation.input_digest.clone(),
-                                            crate::agent_tree::system_now_unix_ms(),
-                                        )
-                                        .await;
-                                    let _ = db
-                                        .mark_host_approval_final_operation_submission_unknown(
-                                            db_authority,
-                                            interrupt_id,
-                                            session_id,
-                                            decision.agent_instance_id,
-                                            operation_id,
-                                            operation.operation_kind.clone(),
-                                            operation.canonical_input_json.clone(),
-                                            operation.input_digest.clone(),
-                                            crate::agent_tree::system_now_unix_ms(),
-                                        )
-                                        .await;
-                                    ResolveResponse::Cancel
-                                }
-                            } else {
-                                let _ = db
-                                    .reject_unclaimed_host_approval_final_operation(
-                                        db_authority,
-                                        interrupt_id,
-                                        session_id,
-                                        decision.agent_instance_id,
-                                        operation_id,
-                                        operation.operation_kind.clone(),
-                                        operation.canonical_input_json.clone(),
-                                        operation.input_digest.clone(),
-                                        crate::agent_tree::system_now_unix_ms(),
-                                    )
-                                    .await;
+                        Ok(false) => match adopt_live_host_approval_effect_handoff(
+                            db,
+                            authority,
+                            session_id,
+                            decision.agent_instance_id,
+                            interrupt_id,
+                            &operation,
+                        )
+                        .await
+                        {
+                            Some(handoff) if handoff.claimed => {
                                 let _ = db
                                     .mark_host_approval_final_operation_submission_unknown(
                                         db_authority,
@@ -2787,7 +2777,43 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                                     .await;
                                 ResolveResponse::Cancel
                             }
-                        }
+                            Some(handoff) => {
+                                if register_host_approval_effect_handoff(handoff) {
+                                    response
+                                } else {
+                                    let _ = db
+                                        .reject_unclaimed_host_approval_final_operation(
+                                            db_authority,
+                                            interrupt_id,
+                                            session_id,
+                                            decision.agent_instance_id,
+                                            operation_id,
+                                            operation.operation_kind.clone(),
+                                            operation.canonical_input_json.clone(),
+                                            operation.input_digest.clone(),
+                                            crate::agent_tree::system_now_unix_ms(),
+                                        )
+                                        .await;
+                                    ResolveResponse::Cancel
+                                }
+                            }
+                            None => {
+                                let _ = db
+                                    .reject_unclaimed_host_approval_final_operation(
+                                        db_authority,
+                                        interrupt_id,
+                                        session_id,
+                                        decision.agent_instance_id,
+                                        operation_id,
+                                        operation.operation_kind.clone(),
+                                        operation.canonical_input_json.clone(),
+                                        operation.input_digest.clone(),
+                                        crate::agent_tree::system_now_unix_ms(),
+                                    )
+                                    .await;
+                                ResolveResponse::Cancel
+                            }
+                        },
                         Err(_) => ResolveResponse::Cancel,
                     }
                 }
@@ -3057,9 +3083,9 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
     let InterruptOutcome::Resolved(response) = &outcome else {
         return outcome;
     };
-    let Some(operation_id) = host_operation_id else {
+    if host_operation_id.is_none() {
         return outcome;
-    };
+    }
     let Some(operation) = host_operation else {
         return InterruptOutcome::Resolved(ResolveResponse::Cancel);
     };
@@ -3144,23 +3170,69 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                 InterruptOutcome::Resolved(ResolveResponse::Cancel)
             }
         }
-        Ok(false) => {
-            if let Some(handoff) = adopt_live_host_approval_effect_handoff(
-                db,
-                authority,
-                session_id,
-                agent_instance_id,
-                interrupt_id,
-                &operation,
-            )
-            .await
-                && register_host_approval_effect_handoff(handoff)
-            {
-                outcome
-            } else {
+        Ok(false) => match adopt_live_host_approval_effect_handoff(
+            db,
+            authority,
+            session_id,
+            agent_instance_id,
+            interrupt_id,
+            &operation,
+        )
+        .await
+        {
+            Some(handoff) if handoff.claimed => {
+                let _ = db
+                    .mark_host_approval_final_operation_submission_unknown(
+                        db_authority,
+                        interrupt_id,
+                        session_id,
+                        agent_instance_id,
+                        operation.operation_id,
+                        operation.operation_kind,
+                        operation.canonical_input_json,
+                        operation.input_digest,
+                        crate::agent_tree::system_now_unix_ms(),
+                    )
+                    .await;
                 InterruptOutcome::Resolved(ResolveResponse::Cancel)
             }
-        }
+            Some(handoff) => {
+                if register_host_approval_effect_handoff(handoff) {
+                    outcome
+                } else {
+                    let _ = db
+                        .reject_unclaimed_host_approval_final_operation(
+                            db_authority,
+                            interrupt_id,
+                            session_id,
+                            agent_instance_id,
+                            operation.operation_id,
+                            operation.operation_kind,
+                            operation.canonical_input_json,
+                            operation.input_digest,
+                            crate::agent_tree::system_now_unix_ms(),
+                        )
+                        .await;
+                    InterruptOutcome::Resolved(ResolveResponse::Cancel)
+                }
+            }
+            None => {
+                let _ = db
+                    .reject_unclaimed_host_approval_final_operation(
+                        db_authority,
+                        interrupt_id,
+                        session_id,
+                        agent_instance_id,
+                        operation.operation_id,
+                        operation.operation_kind,
+                        operation.canonical_input_json,
+                        operation.input_digest,
+                        crate::agent_tree::system_now_unix_ms(),
+                    )
+                    .await;
+                InterruptOutcome::Resolved(ResolveResponse::Cancel)
+            }
+        },
         Err(_) => InterruptOutcome::Resolved(ResolveResponse::Cancel),
     }
 }
@@ -4590,10 +4662,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn park_all_registered_reports_committed_to_park_commit() {
-        // The real shutdown path: `park_all_registered` on a hub with a
-        // ParkCommit publishes `Committed` once every registered park has
-        // landed durably, which the drain path then observes.
+    async fn runtime_park_does_not_precommit_a_future_shutdown() {
+        // Runtime gate/tool parking uses the same production hub as shutdown.
+        // It must not satisfy the later shutdown durability rendezvous.
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/x", "builder").await.unwrap();
         let (hub, _events) = attached_hub(db.clone(), session.session_id);
@@ -4608,9 +4679,9 @@ mod tests {
         assert_eq!(hub.park_all_registered().await, 1);
         assert_eq!(
             park_commit
-                .await_shutdown_commit(std::time::Duration::from_secs(1))
+                .await_shutdown_commit(std::time::Duration::ZERO)
                 .await,
-            ParkCommitTerminal::Committed
+            ParkCommitTerminal::DeadlineUnresolved
         );
     }
 
@@ -4658,6 +4729,42 @@ mod tests {
         );
 
         // The deferred report (after the driver quiesces) publishes Committed.
+        hub.report_shutdown_commit(true);
+        assert_eq!(
+            park_commit
+                .await_shutdown_commit(std::time::Duration::from_secs(1))
+                .await,
+            ParkCommitTerminal::Committed
+        );
+    }
+
+    #[tokio::test]
+    async fn park_all_registered_collect_commits_before_shutdown_park_report() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let (hub, _events) = attached_hub(db.clone(), session.session_id);
+        let park_commit = ParkCommit::new();
+        let hub = InterruptHub::with_park_commit(hub, park_commit.clone());
+        let interrupt_id = db
+            .raise_interrupt_questions(session.session_id, "a", "park-me", &question_set())
+            .await
+            .unwrap();
+        let pending = hub.register(interrupt_id);
+
+        let sweep = hub.park_all_registered_collect().await;
+        assert_eq!(sweep.count, 1);
+        assert!(sweep.all_committed);
+        assert_eq!(
+            db.get_interrupt(interrupt_id)
+                .await
+                .unwrap()
+                .expect("row")
+                .state,
+            crate::db::needs_attention::InterruptState::Parked,
+            "park must be durably committed before the shutdown park report"
+        );
+        assert!(matches!(pending.wait().await, InterruptOutcome::Parked));
+
         hub.report_shutdown_commit(true);
         assert_eq!(
             park_commit
@@ -4718,18 +4825,26 @@ mod tests {
     #[tokio::test]
     async fn await_startup_reconciled_gates_on_report() {
         let park_commit = ParkCommit::new();
-        let consumer = {
-            let park_commit = park_commit.clone();
-            tokio::spawn(async move {
-                park_commit
-                    .await_startup_reconciled(std::time::Duration::from_secs(5))
-                    .await
-            })
-        };
-        tokio::task::yield_now().await;
-        assert!(!consumer.is_finished());
+        let mut consumer =
+            Box::pin(park_commit.await_startup_reconciled(std::time::Duration::from_secs(5)));
+        assert!(matches!(
+            futures::poll!(&mut consumer),
+            std::task::Poll::Pending
+        ));
         park_commit.report_startup_reconciled();
-        assert!(consumer.await.unwrap());
+        assert_eq!(consumer.await, ParkCommitTerminal::Committed);
+    }
+
+    #[tokio::test]
+    async fn await_startup_reconciled_surfaces_failed_write() {
+        let park_commit = ParkCommit::new();
+        park_commit.report_startup_reconciliation_failed();
+        assert_eq!(
+            park_commit
+                .await_startup_reconciled(std::time::Duration::from_secs(1))
+                .await,
+            ParkCommitTerminal::KnownFailedWrite
+        );
     }
 
     #[tokio::test]

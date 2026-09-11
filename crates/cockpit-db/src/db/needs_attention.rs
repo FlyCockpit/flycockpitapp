@@ -10,7 +10,7 @@
 
 use anyhow::{Context, Result, ensure};
 use chrono::Utc;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -443,6 +443,41 @@ impl Db {
         .await
     }
 
+    /// Durable interrupted-state snapshot used to hydrate clients that attach
+    /// after crash reconciliation committed and its live broadcast had no
+    /// subscribers. Unlike reconcilable rows, these entries are terminal for
+    /// replay and must never be executed again.
+    pub async fn list_interrupted_interrupts(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<NeedsAttentionRow>> {
+        self.read(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT interrupt_id, session_id, agent_id, agent_instance_id, description,
+                            question_json, questions_json, raised_at, resolved_at, response_json,
+                            state, parked_tool, parked_args_json, parked_call_id,
+                            parked_resume_json, parked_gate_json, parked_verification_json
+                       FROM needs_attention
+                      WHERE session_id = ?1
+                        AND (decision_request_id IS NULL
+                             OR question_json IS NOT NULL OR questions_json IS NOT NULL)
+                        AND state = 'interrupted'
+                      ORDER BY raised_at ASC, rowid ASC",
+                )
+                .context("preparing list_interrupted_interrupts")?;
+            let rows = stmt
+                .query_map([session_id.to_string()], decode_row)
+                .context("querying interrupted needs_attention")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding interrupted needs_attention row")?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     pub async fn list_reconcilable_interrupts(
         &self,
         session_id: Uuid,
@@ -470,6 +505,26 @@ impl Db {
                 out.push(r.context("decoding reconcilable needs_attention row")?);
             }
             Ok(out)
+        })
+        .await
+    }
+
+    /// Count durable interrupt work that must survive a daemon lifecycle
+    /// boundary. Unlike the client/replay projection queries, this deliberately
+    /// does not require a renderable question projection: linked decisions can
+    /// own an exact parked continuation after those presentation columns have
+    /// been consumed.
+    pub async fn count_nonterminal_interrupts(&self, session_id: Uuid) -> Result<i64> {
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*)
+                   FROM needs_attention
+                  WHERE session_id = ?1
+                    AND state IN ('open', 'parked', 'executing')",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .context("counting nonterminal needs_attention rows")
         })
         .await
     }
@@ -553,66 +608,70 @@ impl Db {
     }
 
     pub async fn park_interrupt(&self, interrupt_id: Uuid) -> Result<bool> {
-        self.transaction(move |conn| {
-            // A real QuestionTool interrupt can be bound to a pending
-            // AgentTree decision.  Parking is still part of the original
-            // continuation protocol, so make that one reversible projection
-            // update under the same short-lived DB guard used by terminal
-            // decision settlement.  Synthetic Attention rows never reach
-            // this branch because they have no question payload.
-            let linked_decision: Option<(String, String)> = conn
-                .query_row(
-                    "SELECT decision_request_id, session_id
+        self.transaction(move |conn| Self::park_interrupt_conn(conn, interrupt_id))
+            .await
+    }
+
+    /// Connection-scoped interrupt park used when the park must commit with a
+    /// broader lifecycle record (for example `paused_session_work`).
+    pub fn park_interrupt_conn(conn: &Connection, interrupt_id: Uuid) -> Result<bool> {
+        // A real QuestionTool interrupt can be bound to a pending
+        // AgentTree decision.  Parking is still part of the original
+        // continuation protocol, so make that one reversible projection
+        // update under the same short-lived DB guard used by terminal
+        // decision settlement.  Synthetic Attention rows never reach
+        // this branch because they have no question payload.
+        let linked_decision: Option<(String, String)> = conn
+            .query_row(
+                "SELECT decision_request_id, session_id
                        FROM needs_attention
                       WHERE interrupt_id = ?1
                         AND state = 'open'
                         AND decision_request_id IS NOT NULL
                         AND (question_json IS NOT NULL OR questions_json IS NOT NULL)",
-                    [interrupt_id.to_string()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            if let Some((decision_request_id, session_id)) = linked_decision.as_ref() {
-                conn.execute(
-                    "INSERT INTO decision_attention_mutation_guards (decision_request_id, session_id)
+                [interrupt_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((decision_request_id, session_id)) = linked_decision.as_ref() {
+            conn.execute(
+                "INSERT INTO decision_attention_mutation_guards (decision_request_id, session_id)
                      VALUES (?1, ?2)",
-                    params![decision_request_id, session_id],
-                )?;
-            }
-            let affected = conn
-                .execute(
-                    "UPDATE needs_attention
+                params![decision_request_id, session_id],
+            )?;
+        }
+        let affected = conn
+            .execute(
+                "UPDATE needs_attention
                         SET state = 'parked', revision = revision + 1
                       WHERE interrupt_id = ?1 AND state = 'open'
                         AND (decision_request_id IS NULL
                              OR question_json IS NOT NULL OR questions_json IS NOT NULL)",
-                    params![interrupt_id.to_string()],
-                )
-                .context("parking needs_attention")?;
-            if affected == 1
-                && let Some((decision_request_id, session_id)) = linked_decision.as_ref()
-            {
-                crate::db::agent_tree_decisions::insert_control_event(
-                    conn,
-                    Uuid::parse_str(session_id).context("decoding linked interrupt session id")?,
-                    "attention_transition",
-                    Uuid::parse_str(decision_request_id)
-                        .context("decoding linked interrupt decision id")?,
-                    InterruptState::Parked.as_str(),
-                    Utc::now().timestamp_millis(),
-                )?;
-            }
-            if let Some((decision_request_id, session_id)) = linked_decision {
-                let removed = conn.execute(
-                    "DELETE FROM decision_attention_mutation_guards
+                params![interrupt_id.to_string()],
+            )
+            .context("parking needs_attention")?;
+        if affected == 1
+            && let Some((decision_request_id, session_id)) = linked_decision.as_ref()
+        {
+            crate::db::agent_tree_decisions::insert_control_event(
+                conn,
+                Uuid::parse_str(session_id).context("decoding linked interrupt session id")?,
+                "attention_transition",
+                Uuid::parse_str(decision_request_id)
+                    .context("decoding linked interrupt decision id")?,
+                InterruptState::Parked.as_str(),
+                Utc::now().timestamp_millis(),
+            )?;
+        }
+        if let Some((decision_request_id, session_id)) = linked_decision {
+            let removed = conn.execute(
+                "DELETE FROM decision_attention_mutation_guards
                      WHERE decision_request_id = ?1 AND session_id = ?2",
-                    params![decision_request_id, session_id],
-                )?;
-                ensure!(removed == 1, "parked interrupt decision guard disappeared");
-            }
-            Ok(affected > 0)
-        })
-        .await
+                params![decision_request_id, session_id],
+            )?;
+            ensure!(removed == 1, "parked interrupt decision guard disappeared");
+        }
+        Ok(affected > 0)
     }
 
     pub async fn mark_interrupt_interrupted(&self, interrupt_id: Uuid) -> Result<bool> {
@@ -1091,6 +1150,12 @@ mod tests {
             .raise_interrupt_questions(session.session_id, "Build", "approval required", &questions)
             .await
             .unwrap();
+        assert_eq!(
+            db.count_nonterminal_interrupts(session.session_id)
+                .await
+                .unwrap(),
+            1
+        );
 
         let open = db.list_open_interrupts(session.session_id).await.unwrap();
         assert_eq!(open.len(), 1);
@@ -1116,6 +1181,12 @@ mod tests {
         let resolved = db.get_interrupt(interrupt_id).await.unwrap().unwrap();
         assert_eq!(resolved.state, InterruptState::Resolved);
         assert!(resolved.response.is_some());
+        assert_eq!(
+            db.count_nonterminal_interrupts(session.session_id)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1452,6 +1523,16 @@ mod tests {
         assert!(db.mark_interrupt_interrupted(iid).await.unwrap());
         let row = db.get_interrupt(iid).await.unwrap().unwrap();
         assert_eq!(row.state, InterruptState::Interrupted);
+        let interrupted = db.list_interrupted_interrupts(s.session_id).await.unwrap();
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0].interrupt_id, iid);
+        assert_eq!(interrupted[0].state, InterruptState::Interrupted);
+        assert!(
+            db.list_reconcilable_interrupts(s.session_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(!db.complete_executing_interrupt(iid).await.unwrap());
     }
 

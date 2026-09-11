@@ -1040,10 +1040,11 @@ impl Driver {
         self.publish_shadow_brief_result(task, result).await;
     }
 
-    /// Drain shadow work when the owning driver is exiting.  Unlike an idle
-    /// poll, this joins an in-flight task so a successful rolling summary
-    /// cannot be discarded between its final turn boundary and durable
-    /// persistence during shutdown.
+    /// Drain shadow work when the owning driver is exiting. A result that is
+    /// already complete is persisted, but unfinished utility inference is
+    /// cancelled and joined. Utility work must never hold the daemon's
+    /// interrupt-park commit (and therefore pid/socket replacement) behind an
+    /// unbounded provider response during shutdown.
     pub(in crate::engine::driver) async fn drain_shadow_brief_on_shutdown(&mut self) {
         let Some(state) = self.shadow_brief.take() else {
             return;
@@ -1052,8 +1053,15 @@ impl Driver {
             self.shadow_brief = Some(state);
             return;
         };
-        let result = (&mut task.handle).await.ok();
-        self.publish_shadow_brief_result(task, result).await;
+        if task.handle.is_finished() {
+            let result = (&mut task.handle).await.ok();
+            self.publish_shadow_brief_result(task, result).await;
+        } else {
+            task.cancel.cancel();
+            task.handle.abort();
+            let _ = (&mut task.handle).await;
+            self.shadow_brief_generation = self.shadow_brief_generation.wrapping_add(1);
+        }
     }
 
     pub(in crate::engine::driver) async fn publish_shadow_brief_result(

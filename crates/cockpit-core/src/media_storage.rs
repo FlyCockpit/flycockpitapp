@@ -5900,7 +5900,8 @@ async fn run_bounded_runtime(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let mut child = command.spawn().context("model_runtime_unavailable")?;
+    let mut child =
+        cockpit_host::process::spawn_pinned(command).context("model_runtime_unavailable")?;
     let mut stdin = child.stdin.take().context("model_runtime_unavailable")?;
     let stdout = child.stdout.take().context("model_runtime_unavailable")?;
     let stderr = child.stderr.take().context("model_runtime_unavailable")?;

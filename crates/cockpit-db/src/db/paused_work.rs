@@ -78,8 +78,32 @@ impl Db {
         let reason = reason.to_owned();
         let daemon_version = daemon_version.to_owned();
         self.write(move |conn| {
-            conn.execute(
-                "INSERT INTO paused_session_work (
+            Self::upsert_paused_session_work_conn(
+                conn,
+                session_id,
+                &active_agent,
+                &project_root,
+                &reason,
+                pending_tool_count,
+                &daemon_version,
+                now,
+            )
+        })
+        .await
+    }
+
+    pub fn upsert_paused_session_work_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        active_agent: &str,
+        project_root: &str,
+        reason: &str,
+        pending_tool_count: i64,
+        daemon_version: &str,
+        now: i64,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT INTO paused_session_work (
                     session_id, status, active_agent, project_root, reason,
                     pending_tool_count, daemon_version, created_at, updated_at
                  ) VALUES (?1, 'paused', ?2, ?3, ?4, ?5, ?6, ?7, ?7)
@@ -92,18 +116,88 @@ impl Db {
                     daemon_version = excluded.daemon_version,
                     updated_at = excluded.updated_at,
                     resolved_at = NULL",
-                params![
-                    session_id.to_string(),
-                    active_agent,
-                    project_root,
-                    reason,
-                    pending_tool_count,
-                    daemon_version,
+            params![
+                session_id.to_string(),
+                active_agent,
+                project_root,
+                reason,
+                pending_tool_count,
+                daemon_version,
+                now,
+            ],
+        )
+        .context("upserting paused session work")?;
+        Ok(())
+    }
+
+    /// Atomically park every parkable interrupt for the live session and
+    /// publish the stable session's resumable-work summary. This is the single
+    /// crash boundary used by graceful drain and restart reconciliation: a
+    /// committed parked continuation can never exist without its recovery row.
+    pub async fn park_session_for_resume(
+        &self,
+        owner_session_id: Uuid,
+        interrupt_session_id: Uuid,
+        active_agent: &str,
+        project_root: &str,
+        reason: &str,
+        pending_floor: i64,
+        daemon_version: &str,
+    ) -> Result<i64> {
+        let active_agent = active_agent.to_owned();
+        let project_root = project_root.to_owned();
+        let reason = reason.to_owned();
+        let daemon_version = daemon_version.to_owned();
+        let now = Utc::now().timestamp();
+        self.transaction(move |conn| {
+            let interrupt_ids = {
+                let mut statement = conn
+                    .prepare(
+                        "SELECT interrupt_id
+                           FROM needs_attention
+                          WHERE session_id = ?1
+                            AND state = 'open'
+                            AND (decision_request_id IS NULL
+                                 OR question_json IS NOT NULL OR questions_json IS NOT NULL)
+                          ORDER BY raised_at ASC, rowid ASC",
+                    )
+                    .context("preparing resumable interrupt park scan")?;
+                statement
+                    .query_map([interrupt_session_id.to_string()], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .context("querying resumable interrupts")?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for raw_id in interrupt_ids {
+                let interrupt_id =
+                    Uuid::parse_str(&raw_id).context("decoding resumable interrupt id")?;
+                Self::park_interrupt_conn(conn, interrupt_id)?;
+            }
+            let durable_pending: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*)
+                       FROM needs_attention
+                      WHERE session_id = ?1
+                        AND state IN ('open', 'parked', 'executing')",
+                    [interrupt_session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .context("counting resumable interrupts in park transaction")?;
+            let pending = durable_pending.max(pending_floor);
+            if pending > 0 {
+                Self::upsert_paused_session_work_conn(
+                    conn,
+                    owner_session_id,
+                    &active_agent,
+                    &project_root,
+                    &reason,
+                    pending,
+                    &daemon_version,
                     now,
-                ],
-            )
-            .context("upserting paused session work")?;
-            Ok(())
+                )?;
+            }
+            Ok(pending)
         })
         .await
     }
@@ -179,7 +273,7 @@ impl Db {
                             created_at, updated_at, resolved_at
                        FROM paused_session_work
                       WHERE status = 'paused'
-                      ORDER BY updated_at DESC",
+                      ORDER BY updated_at ASC, created_at ASC, session_id ASC",
                 )
                 .context("preparing paused session work query")?;
             let rows = stmt
@@ -215,6 +309,30 @@ fn decode_paused_work(row: &rusqlite::Row<'_>) -> rusqlite::Result<PausedWorkRow
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn repeated_upsert_keeps_exactly_one_paused_row() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/tmp/p", "Build").await.unwrap();
+
+        for pending in [1_i64, 2, 2] {
+            db.upsert_paused_session_work(
+                session.session_id,
+                "Build",
+                "/tmp/p",
+                "daemon shutdown paused active work",
+                pending,
+                "0.1.test",
+            )
+            .await
+            .unwrap();
+        }
+
+        let rows = db.paused_session_work_all().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pending_tool_count, 2);
+        assert_eq!(rows[0].status, PausedWorkStatus::Paused);
+    }
 
     #[tokio::test]
     async fn db_async_approval_paused_work_roundtrip_through_async_api() {
@@ -300,6 +418,46 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_work_recovery_order_is_oldest_first_and_stable() {
+        let db = Db::open_in_memory().unwrap();
+        let older = db.create_session("p", "/tmp/older", "Build").await.unwrap();
+        let newer = db.create_session("p", "/tmp/newer", "Build").await.unwrap();
+        for session in [&older, &newer] {
+            db.upsert_paused_session_work(
+                session.session_id,
+                "Build",
+                &session.project_root,
+                "daemon shutdown",
+                1,
+                "0.1.test",
+            )
+            .await
+            .unwrap();
+        }
+        let older_id = older.session_id;
+        let newer_id = newer.session_id;
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE paused_session_work SET created_at = 10, updated_at = 10 WHERE session_id = ?1",
+                rusqlite::params![older_id.to_string()],
+            )?;
+            conn.execute(
+                "UPDATE paused_session_work SET created_at = 20, updated_at = 20 WHERE session_id = ?1",
+                rusqlite::params![newer_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let rows = db.paused_session_work_all().await.unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.session_id).collect::<Vec<_>>(),
+            vec![older_id, newer_id]
         );
     }
 }

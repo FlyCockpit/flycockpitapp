@@ -1476,7 +1476,7 @@ impl Session {
             ),
             knowledge_read_snapshots: Mutex::new(super::KnowledgeReadSnapshotStore::default()),
             last_time_prelude: Mutex::new(None),
-            retracted_time_prelude: Mutex::new(None),
+            replay_time_prelude: Mutex::new(None),
             user_content_tokens: AtomicUsize::new(row.user_content_tokens.max(0) as usize),
             user_content_turns: AtomicUsize::new(user_content_turns),
             title_stage: AtomicU8::new(normalize_title_slot(row.title_stage)),

@@ -250,7 +250,7 @@ pub(crate) async fn run_injected_process(
     if let Some((name, value)) = environment {
         command.env(name, value);
     }
-    let mut child = command.spawn().map_err(map_spawn_error)?;
+    let mut child = cockpit_host::process::spawn_pinned(command).map_err(map_spawn_error)?;
     let stdout = child
         .stdout
         .take()
@@ -468,7 +468,7 @@ async fn run_subprocess_inner(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let mut child = command.spawn().map_err(map_spawn_error)?;
+    let mut child = cockpit_host::process::spawn_pinned(command).map_err(map_spawn_error)?;
 
     let stdout = child
         .stdout

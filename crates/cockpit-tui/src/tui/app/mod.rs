@@ -334,6 +334,8 @@ pub(crate) struct DeferredFenceDispatch {
     pub display: String,
     pub submission: ClientUserSubmission,
     pub tag_expansions: Vec<cockpit_proto::TagExpansionMeta>,
+    /// Present until model/probe assembly has produced the final payload.
+    pub identity_nonce: Option<uuid::Uuid>,
     pub waiting_model_selection: Option<uuid::Uuid>,
     pub parked_fence_sequence: Option<u64>,
 }

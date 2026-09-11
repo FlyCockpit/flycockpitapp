@@ -206,6 +206,32 @@ pub(super) fn ensure_or_restore_parked_tool_call(
     }
 }
 
+/// A parked continuation is acknowledged only after its ordinary tool audit
+/// row is durable. Live history can already contain the paired result after a
+/// crash (or after a best-effort audit insert failed), so history pairing alone
+/// is not authority to resolve `needs_attention`.
+pub(super) async fn ensure_parked_tool_audit_committed(
+    session: &crate::session::Session,
+    payload: &crate::db::needs_attention::InterruptParkPayload,
+) -> Result<()> {
+    anyhow::ensure!(
+        parked_tool_audit_is_committed(session, payload).await?,
+        "parked replay tool audit is not durable"
+    );
+    Ok(())
+}
+
+pub(super) async fn parked_tool_audit_is_committed(
+    session: &crate::session::Session,
+    payload: &crate::db::needs_attention::InterruptParkPayload,
+) -> Result<bool> {
+    Ok(session
+        .db
+        .get_tool_call_by_call_id(session.id, &payload.call_id)
+        .await?
+        .is_some())
+}
+
 enum ToolCallAnchorState {
     Present,
     Missing,
@@ -221,6 +247,46 @@ mod parked_call_tests {
         InterruptCallOrigin, InterruptParkPayload, InterruptResumeAnchor,
     };
     use crate::engine::message::AssistantContent;
+
+    #[tokio::test]
+    async fn parked_replay_without_a_durable_tool_audit_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = crate::session::Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let payload = InterruptParkPayload {
+            tool: "bash".to_string(),
+            args: serde_json::json!({ "command": "true" }),
+            call_id: "missing-audit".to_string(),
+            resume: InterruptResumeAnchor {
+                agent_id: "Build".to_string(),
+                call_id: "missing-audit".to_string(),
+                provider_item_id: None,
+                provider_call_id: None,
+                assistant_seq: None,
+                call_origin: InterruptCallOrigin::Foreground,
+            },
+            gate: None,
+            verification: None,
+        };
+
+        assert!(
+            !parked_tool_audit_is_committed(&session, &payload)
+                .await
+                .unwrap(),
+            "a paired history result without an audit row is not completed"
+        );
+        assert!(
+            ensure_parked_tool_audit_committed(&session, &payload)
+                .await
+                .is_err(),
+            "history pairing without an audit row must not acknowledge replay"
+        );
+    }
 
     #[test]
     fn parked_restore_round_trips_and_reuses_dual_provider_identity() {

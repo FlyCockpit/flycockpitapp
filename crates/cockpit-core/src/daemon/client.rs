@@ -587,6 +587,7 @@ async fn promote_ephemeral_owner_with_recovery_policy(
             anyhow!("ephemeral daemon owner identity is unavailable for promotion")
         })?;
         let old_pid = Some(expected_predecessor.1.pid);
+        let release = crate::daemon::capture_restart_release(&current_paths, old_pid);
         let client = match connect_local_daemon(&current_paths.socket).await {
             Ok(client) => client,
             Err(error) if replacement_required => {
@@ -771,7 +772,7 @@ async fn promote_ephemeral_owner_with_recovery_policy(
 
         if !crate::daemon::wait_for_restart_release(
             &current_paths,
-            old_pid,
+            release,
             recovery.predecessor_release_timeout,
         )
         .await
@@ -1418,9 +1419,14 @@ async fn wait_for_shared_daemon(
     // so the first retry must land near that mark, not 50ms later. Ramp gently
     // to a 50ms ceiling so a slow/contended spawn doesn't busy-spin.
     let mut backoff = Duration::from_millis(2);
+    let mut endpoint_observed = false;
 
     loop {
-        if crate::daemon::server::in_process_context(socket).is_some() || socket.exists() {
+        if daemon_transport_ready(socket) {
+            if !endpoint_observed {
+                timer.phase("endpoint_observed");
+                endpoint_observed = true;
+            }
             // A connect error just means the socket exists but accept hasn't
             // started yet — fall through to the backoff retry. A registered
             // in-process owner hellos here without an OS socket.
@@ -1442,6 +1448,25 @@ async fn wait_for_shared_daemon(
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_millis(50));
     }
+}
+
+fn daemon_transport_ready(socket: &Path) -> bool {
+    if crate::daemon::server::in_process_context(socket).is_some() {
+        return true;
+    }
+    if let Ok(canonical) = crate::daemon::DaemonPaths::resolve_canonical() {
+        if canonical.socket == socket {
+            return crate::daemon::canonical_socket_endpoint_published(socket);
+        }
+    }
+    if let Some(parent) = socket.parent() {
+        let pid_file = parent.join("cockpit.pid");
+        let endpoint = parent.join("daemon-endpoint.json");
+        if endpoint.exists() || pid_file.exists() {
+            return crate::daemon::isolated_socket_transport_ready(socket, &pid_file);
+        }
+    }
+    socket.exists()
 }
 
 #[cfg(test)]

@@ -1570,6 +1570,22 @@ impl UserSubmissionQueue {
         self.notify.notify_waiters();
     }
 
+    /// Wait until the producer side is closed without consuming queued input.
+    ///
+    /// Driver states that deliberately fence dequeueing (for example a parked
+    /// continuation awaiting replay) still need an always-enabled shutdown
+    /// edge. Registering the notification before inspecting `closed` prevents
+    /// a close between the state check and the await from being lost.
+    pub async fn wait_closed(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.inner.lock().await.closed {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     async fn pop_one(&self, target_id: Option<&str>) -> QueuePop {
         self.pop_one_filtered(target_id, QueueDrainFilter::Any)
             .await

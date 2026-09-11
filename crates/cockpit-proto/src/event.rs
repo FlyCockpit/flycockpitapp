@@ -1351,6 +1351,15 @@ pub enum Event {
         seq: Option<i64>,
     },
 
+    /// An in-flight interrupt is durably `interrupted`. This is a lifecycle
+    /// state rather than a transcript row: it carries the exact durable
+    /// identity, is emitted live only after the transition commits, and is
+    /// replayed from that committed state when a client attaches later.
+    InterruptInterrupted {
+        session_id: Uuid,
+        interrupt_id: Uuid,
+    },
+
     /// Warm reattach replay of persisted timeline entries. `max_seq` is the
     /// highest session_events seq represented by this batch, including entries
     /// whose display shape does not carry its own seq field. Retracted user
@@ -1812,6 +1821,7 @@ macro_rules! event_variants {
             (Event::InterruptRaised { .. }, "interrupt_raised");
             (Event::InterruptQueueChanged { .. }, "interrupt_queue_changed");
             (Event::InterruptResolved { .. }, "interrupt_resolved");
+            (Event::InterruptInterrupted { .. }, "interrupt_interrupted");
             (Event::HistoryReplay { .. }, "history_replay");
             (Event::AgentIdle { .. }, "agent_idle");
             (Event::GoalSupervisionProgress { .. }, "goal_supervision_progress");

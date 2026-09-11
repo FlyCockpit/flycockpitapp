@@ -4998,7 +4998,7 @@ async fn send_user_message_rejects_client_claimed_internal_origin_before_queuein
 
 #[tokio::test]
 async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
-    let ctx = test_ctx();
+    let ctx = test_ctx_with_fake_secure_key_actor().await;
     let tmp = tempfile::tempdir().unwrap();
     let (state, session_id, mut work_rx) =
         attached_state_with_worker_receiver(&ctx, tmp.path()).await;
@@ -5015,7 +5015,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
         .unwrap();
 
     let first_ctx = ctx.clone();
-    let first = tokio::spawn(async move {
+    let mut first = tokio::spawn(async move {
         let mut state = state;
         let result = handle_request(
             Request::SendUserMessageV2 {
@@ -5045,10 +5045,8 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
         .await;
         (state, result)
     });
-    let first_work = tokio::time::timeout(std::time::Duration::from_secs(2), work_rx.recv())
-        .await
-        .expect("first turn delivered")
-        .expect("first turn work");
+    let first_work =
+        recv_worker_delivery_while_running(&mut work_rx, &mut first, "first turn request").await;
     let SessionWork::UserMessage {
         submission,
         respond_to,
@@ -5111,7 +5109,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
     ));
 
     let second_ctx = ctx.clone();
-    let second = tokio::spawn(async move {
+    let mut second = tokio::spawn(async move {
         let mut state = state;
         handle_request(
             Request::SendUserMessageV2 {
@@ -5140,10 +5138,8 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
         )
         .await
     });
-    let second_work = tokio::time::timeout(std::time::Duration::from_secs(2), work_rx.recv())
-        .await
-        .expect("second turn delivered")
-        .expect("second turn work");
+    let second_work =
+        recv_worker_delivery_while_running(&mut work_rx, &mut second, "second turn request").await;
     let SessionWork::UserMessage {
         submission,
         respond_to,
@@ -7828,6 +7824,16 @@ fn stub_config_source() -> crate::daemon::config_source::ConfigSource {
     )
 }
 
+/// Install the explicit, deterministic authority synthetic server contexts
+/// need to build and resume sessions. Actor lifecycle and consumer recovery
+/// tests attach their own secure-key actor; ordinary request fixtures must not
+/// pay that actor's synchronous bootstrap/reconciliation cost.
+fn install_test_redaction_key_resolver(ctx: &mut DaemonContext) {
+    let resolver = crate::session::test_redaction_key_resolver();
+    ctx.registry.set_redaction_key_resolver(resolver.clone());
+    ctx.redaction_key_resolver = Some(resolver);
+}
+
 /// Like [`stub_config_source`], but with a per-workspace provider layer
 /// (`<cwd>/.cockpit/config.json`) as the write target and watch path.
 /// `GetProviderCatalogSnapshot` can then mint a genuine provider/MCP edit
@@ -7866,6 +7872,7 @@ fn disk_test_ctx(db_path: &Path, spool_path: &Path) -> Arc<DaemonContext> {
         crate::daemon::terminal::test_host_factory(),
         stub_config_source(),
     );
+    install_test_redaction_key_resolver(&mut context);
     context.external_journal = Some(Arc::new(
         crate::external_journal::ExternalJournal::for_test_at(db, spool_path),
     ));
@@ -7877,7 +7884,7 @@ fn disk_test_ctx(db_path: &Path, spool_path: &Path) -> Arc<DaemonContext> {
 /// intentionally leaked (`into_path`) — it lives for the context's lifetime
 /// and is cleaned by the OS.
 fn unique_test_paths(ephemeral: bool) -> DaemonPaths {
-    let dir = tempfile::tempdir().expect("temp dir").into_path();
+    let dir = cockpit_test_support::isolated_tempdir().into_path();
     DaemonPaths {
         socket: dir.join("cockpit.sock"),
         pid_file: dir.join("cockpit.pid"),
@@ -7891,13 +7898,14 @@ fn test_ctx_with_config_source(
     let db = Db::open_in_memory().expect("in-memory db");
     let locks = Arc::new(LockManager::in_memory(db.clone()));
     let paths = unique_test_paths(true);
-    let ctx = DaemonContext::new(
+    let mut ctx = DaemonContext::new(
         db,
         locks,
         paths,
         crate::daemon::terminal::test_host_factory(),
         config_source,
     );
+    install_test_redaction_key_resolver(&mut ctx);
     let generation = ctx.host_capabilities.begin_refresh();
     let mut snapshot = crate::daemon::session_worker::sandbox_capability_snapshot(
         cockpit_proto::FeatureCapabilityState::Available,
@@ -7923,13 +7931,14 @@ fn isolated_test_ctx_with_config_source(
         pid_file: state_root.join("cockpit.pid"),
         ephemeral: true,
     };
-    let ctx = DaemonContext::new(
+    let mut ctx = DaemonContext::new(
         db,
         locks,
         paths,
         crate::daemon::terminal::test_host_factory(),
         config_source,
     );
+    install_test_redaction_key_resolver(&mut ctx);
     let generation = ctx.host_capabilities.begin_refresh();
     let mut snapshot = crate::daemon::session_worker::sandbox_capability_snapshot(
         cockpit_proto::FeatureCapabilityState::Available,
@@ -8101,13 +8110,15 @@ fn persistent_test_ctx_with_config_source(
         pid_file: std::path::PathBuf::from("/tmp/cockpit-persistent-test.pid"),
         ephemeral: false,
     };
-    Arc::new(DaemonContext::new(
+    let mut ctx = DaemonContext::new(
         db,
         locks,
         paths,
         crate::daemon::terminal::test_host_factory(),
         config_source,
-    ))
+    );
+    install_test_redaction_key_resolver(&mut ctx);
+    Arc::new(ctx)
 }
 
 #[test]
@@ -9048,7 +9059,13 @@ async fn run_peer_auth_exchange_test(
     let go_dir = tempfile::tempdir().expect("go-file tempdir");
     let go_file = go_dir.path().join("go");
 
-    let mut command = std::process::Command::new(&child_executable);
+    let server_ctx = ctx.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept peer auth client");
+        handle_client(stream, server_ctx).await
+    });
+
+    let mut command = tokio::process::Command::new(&child_executable);
     command
         .args(child_args)
         .env("COCKPIT_PEER_AUTH_MODE", "exchange")
@@ -9070,13 +9087,7 @@ async fn run_peer_auth_exchange_test(
         std::fs::write(&go_file, b"go").expect("release the child go-file");
     }
 
-    let server_ctx = ctx.clone();
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept peer auth client");
-        handle_client(stream, server_ctx).await
-    });
-
-    let status = child.wait().expect("peer auth child exited");
+    let status = child.wait().await.expect("peer auth child exited");
     assert!(
         status.success(),
         "peer auth child failed for {label} with args {child_args:?} (expected owner: {expect_owner})"
@@ -9097,7 +9108,15 @@ async fn run_legitimate_peer_auth_admission_test(role: &str, child_args: &[&str]
     let go_dir = tempfile::tempdir().expect("go-file tempdir");
     let go_file = go_dir.path().join("go");
 
-    let mut child = std::process::Command::new(&child_executable)
+    // As at daemon publication, make the production accept path runnable
+    // before releasing a client that can observe and connect to the socket.
+    let server_ctx = ctx.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept peer auth client");
+        handle_client(stream, server_ctx).await
+    });
+
+    let mut child = tokio::process::Command::new(&child_executable)
         .args(child_args)
         .env("COCKPIT_PEER_AUTH_MODE", "exchange")
         .env("COCKPIT_PEER_AUTH_SOCKET", &socket_path)
@@ -9109,17 +9128,13 @@ async fn run_legitimate_peer_auth_admission_test(role: &str, child_args: &[&str]
     // The provenance launcher identity must be the live child itself: this
     // is the production contract, the ticket is bound to the exact process
     // that spawned the daemon and will present it.
-    ctx.peer_credential_registry
-        .record_launch_provenance(ticket, Some(child_peer_identity(child.id())));
+    ctx.peer_credential_registry.record_launch_provenance(
+        ticket,
+        Some(child_peer_identity(child.id().expect("child pid"))),
+    );
     std::fs::write(&go_file, b"go").expect("release the child go-file");
 
-    let server_ctx = ctx.clone();
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept peer auth client");
-        handle_client(stream, server_ctx).await
-    });
-
-    let status = child.wait().expect("peer auth child exited");
+    let status = child.wait().await.expect("peer auth child exited");
     assert!(
         status.success(),
         "peer auth child failed for role {role} with args {child_args:?}"
@@ -9190,7 +9205,13 @@ async fn launch_ticket_with_the_wrong_value_is_denied() {
     let go_dir = tempfile::tempdir().expect("go-file tempdir");
     let go_file = go_dir.path().join("go");
 
-    let mut child = std::process::Command::new(&child_executable)
+    let server_ctx = ctx.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept peer auth client");
+        handle_client(stream, server_ctx).await
+    });
+
+    let mut child = tokio::process::Command::new(&child_executable)
         .args(["daemon", "status"])
         .env("COCKPIT_PEER_AUTH_MODE", "exchange")
         .env("COCKPIT_PEER_AUTH_SOCKET", &socket_path)
@@ -9199,17 +9220,13 @@ async fn launch_ticket_with_the_wrong_value_is_denied() {
         .env("COCKPIT_PEER_AUTH_GO_FILE", &go_file)
         .spawn()
         .expect("spawn peer auth child");
-    ctx.peer_credential_registry
-        .record_launch_provenance(bound_ticket, Some(child_peer_identity(child.id())));
+    ctx.peer_credential_registry.record_launch_provenance(
+        bound_ticket,
+        Some(child_peer_identity(child.id().expect("child pid"))),
+    );
     std::fs::write(&go_file, b"go").expect("release the child go-file");
 
-    let server_ctx = ctx.clone();
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept peer auth client");
-        handle_client(stream, server_ctx).await
-    });
-
-    let status = child.wait().expect("peer auth child exited");
+    let status = child.wait().await.expect("peer auth child exited");
     assert!(
         status.success(),
         "peer presenting the wrong token value must be denied owner-class admission"
@@ -9431,10 +9448,7 @@ async fn persistent_daemon_stores_flycockpit_credential_and_wakes_connector() {
     .await
     .expect("credential store succeeds");
     assert!(matches!(response, Response::FlycockpitStored));
-    tokio::time::timeout(Duration::from_millis(100), wake_rx.changed())
-        .await
-        .expect("connector wake delivered")
-        .expect("wake sender alive");
+    wake_rx.changed().await.expect("wake sender alive");
 
     let vault = crate::secure_key::vault_for_db(&ctx.db).expect("ctx vault");
     let stored = crate::credentials::CredentialStore::from_vault(vault)
@@ -9483,10 +9497,7 @@ async fn persistent_daemon_clears_flycockpit_credential_and_wakes_connector() {
         .await
         .expect("credential clear succeeds");
     assert!(matches!(response, Response::FlycockpitCleared { .. }));
-    tokio::time::timeout(Duration::from_millis(100), wake_rx.changed())
-        .await
-        .expect("connector wake delivered")
-        .expect("wake sender alive");
+    wake_rx.changed().await.expect("wake sender alive");
     let vault = crate::secure_key::vault_for_db(&ctx.db).expect("ctx vault");
     assert!(
         crate::credentials::CredentialStore::from_vault(vault)
@@ -14824,6 +14835,151 @@ fn pre_socket_file_recovery_uses_one_bounded_publication_authority() {
     );
 }
 
+#[tokio::test]
+async fn security_subsystem_containment_recovery_failure_aborts_before_publication() {
+    use crate::db::execution_containments::ExecutionContainmentRow;
+    use crate::process_containment::ProcessContainmentActor;
+    use crate::process_containment::fake::FakeProvenAdapter;
+
+    let db = crate::db::Db::open_in_memory().expect("in-memory db");
+    let session_id = db
+        .create_session("proj", "/tmp/security-boot", "orchestrator-build")
+        .await
+        .expect("session")
+        .session_id;
+    db.insert_execution_containment(ExecutionContainmentRow {
+        containment_id: uuid::Uuid::new_v4(),
+        session_id,
+        operation_id: "security-boot-op".into(),
+        generation: 1,
+        platform_kind: "fake".into(),
+        state: "active".into(),
+        guarantee: "proven".into(),
+        platform_locator_json: r#"{"locator_key":"boot-test"}"#.into(),
+        runtime_context_digest: None,
+        unsupported_reason: None,
+        created_at_wall_ms: 1,
+        updated_at_wall_ms: 1,
+        emptied_at_wall_ms: None,
+    })
+    .await
+    .expect("seed containment row");
+
+    let adapter = FakeProvenAdapter::default();
+    adapter.fail_recover_with("injected containment recovery failure");
+    let actor = ProcessContainmentActor::start(db.clone(), Arc::new(adapter));
+    let handle = actor.handle();
+    let registry = SessionRegistry::new(
+        db.clone(),
+        Arc::new(crate::locks::LockManager::in_memory(db.clone())),
+        crate::daemon::shutdown::ShutdownSignal::new(),
+        None,
+        crate::daemon::config_source::ConfigSource::production(),
+    );
+
+    let recover_result = handle.recover().await;
+    assert!(
+        recover_result.is_err(),
+        "containment recovery must fail closed: {recover_result:?}"
+    );
+    assert!(
+        registry.process_containment().is_none(),
+        "failed recovery must not publish containment to the registry"
+    );
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = tmp.path().join("security-boot.sock");
+    let pid_file = tmp.path().join("security-boot.pid");
+    assert!(
+        !socket.exists(),
+        "boot must not bind a socket before security recovery succeeds"
+    );
+    assert!(
+        !pid_file.exists(),
+        "boot must not publish an endpoint record before security recovery succeeds"
+    );
+}
+
+#[tokio::test]
+async fn security_subsystem_write_scope_recovery_failure_aborts_before_publication() {
+    use crate::write_scope::backend::ExecutionMode;
+    use crate::write_scope::containment::ExecutionLaunch;
+    use crate::write_scope::coordinator::TransferRequest;
+    use crate::write_scope::fake::FakeContainmentBarrier;
+    use crate::write_scope::scope::CanonicalScope;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("write_scope_boot.db");
+    let db = crate::db::Db::open(&db_path).expect("open db");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(workspace.join("a/child")).expect("workspace");
+    let session_id = db
+        .create_session(
+            "proj",
+            &workspace.display().to_string(),
+            "orchestrator-build",
+        )
+        .await
+        .expect("session")
+        .session_id;
+    let containment = Arc::new(FakeContainmentBarrier::new());
+    let coordinator = crate::write_scope::WriteScopeCoordinator::new(
+        db.clone(),
+        Arc::new(crate::write_scope::fake::FakeMediatedCowBackend::new()),
+        containment.clone(),
+        Arc::new(crate::write_scope::NullEventSink),
+        crate::write_scope::system_clock(),
+    );
+    let root_scope = CanonicalScope::resolve_under(&workspace, "a").expect("scope");
+    let root = coordinator
+        .open_root_lease(session_id, "parent", root_scope)
+        .await
+        .expect("root lease");
+    coordinator
+        .begin_transfer(TransferRequest {
+            parent_lease_id: root.lease_id(),
+            session_id,
+            sub_scope: CanonicalScope::resolve_under(&workspace, "a/child").expect("child scope"),
+            child_owner_id: "child-a".into(),
+            task_id: Some("task-a".into()),
+            mode: ExecutionMode::Native,
+            launch: ExecutionLaunch::Native {
+                program: "/bin/true".into(),
+                args: Vec::new(),
+                cwd: workspace.clone(),
+            },
+            reachable_ancestor: None,
+        })
+        .await
+        .expect("transfer begins");
+
+    let registry = SessionRegistry::new(
+        db.clone(),
+        Arc::new(crate::locks::LockManager::in_memory(db.clone())),
+        crate::daemon::shutdown::ShutdownSignal::new(),
+        None,
+        crate::daemon::config_source::ConfigSource::production(),
+    );
+
+    db.write(|conn| {
+        conn.execute("DROP TABLE write_scope_transfers", [])
+            .expect("drop write_scope_transfers");
+        Ok(())
+    })
+    .await
+    .expect("corrupt write-scope state");
+    let recover_result = coordinator.recover(None).await;
+    assert!(
+        recover_result.is_err(),
+        "write-scope recovery must fail closed when durable state is unreadable: {recover_result:?}"
+    );
+    let write_scope = registry.write_scope_source();
+    assert!(
+        crate::sync::lock_or_recover(&write_scope).is_none(),
+        "failed recovery must not publish write-scope authority to the registry"
+    );
+}
+
 #[test]
 fn oauth_stored_token_debug_and_drop_are_secret_safe() {
     for source in [
@@ -14870,13 +15026,42 @@ fn authority_recovery_precedes_both_socket_binds() {
         nearest_cfg.is_none_or(|cfg| cfg.contains("windows") || !cfg.contains("unix")),
         "recovery call must not be unix-only inside windows-compiled boot; found {nearest_cfg:?}"
     );
-    let control_bind = boot[recovery..]
-        .find("bind_private_socket(&paths.socket)")
-        .expect("control socket bind must follow recovery");
-    let reveal_bind = boot[recovery..]
-        .find("leak_reveal_socket::bind_reveal_socket(&ctx)")
-        .expect("reveal socket bind must follow recovery");
-    assert!(control_bind < reveal_bind);
+    let pair_publish = boot[recovery..]
+        .find("publish_socket_pair_with(&paths")
+        .expect("Unix socket-pair publication must follow recovery");
+    let windows_pair_publish = boot[recovery..]
+        .find("prepare_and_publish_socket_pair(&paths)")
+        .expect("Windows socket-pair publication must follow recovery");
+    assert!(
+        pair_publish < windows_pair_publish || windows_pair_publish < pair_publish,
+        "both platform publication paths must be present after recovery"
+    );
+
+    let unix_pair = daemon
+        .split("fn publish_socket_pair_with")
+        .nth(1)
+        .and_then(|tail| tail.split("#[cfg(windows)]").next())
+        .expect("Unix socket-pair helper");
+    let reveal = unix_pair.find("bind_reveal_socket(paths)").unwrap();
+    let publish = unix_pair.find("let control = publish_control()?").unwrap();
+    assert!(
+        reveal < publish,
+        "Unix control bind must follow required reveal bind"
+    );
+    let windows_pair = daemon
+        .split("fn prepare_and_publish_socket_pair")
+        .nth(1)
+        .and_then(|tail| tail.split("#[derive(").next())
+        .expect("Windows socket-pair helper");
+    let prepare = windows_pair.find("NamedPipeListener::prepare()").unwrap();
+    let reveal = windows_pair
+        .find("bind_reveal_socket(paths, control.pipe_name())")
+        .unwrap();
+    let publish = windows_pair.find("control.publish(&paths.socket)").unwrap();
+    assert!(
+        prepare < reveal && reveal < publish,
+        "Windows must bind hidden control and reveal identities before publishing control"
+    );
 
     let server = include_str!("mod.rs");
     let recover_prefix = server
@@ -15791,20 +15976,16 @@ async fn set_workspace_trust_does_not_hold_publication_lock_while_worker_refresh
     // `Trust` is a grant here (the fixture attaches under Trust), so Phase 2
     // actually runs the worker refresh this test is about; a narrowing would
     // stop the worker before reaching it.
-    let response = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        handle_request(
-            Request::SetWorkspaceTrust {
-                project_root: tmp.path().display().to_string(),
-                mode: proto::WorkspaceTrustMode::Trust,
-                expected_config_generation,
-            },
-            &mut state,
-            &ctx,
-        ),
+    let response = handle_request(
+        Request::SetWorkspaceTrust {
+            project_root: tmp.path().display().to_string(),
+            mode: proto::WorkspaceTrustMode::Trust,
+            expected_config_generation,
+        },
+        &mut state,
+        &ctx,
     )
     .await
-    .expect("trust transition must not deadlock with a driver publication wait")
     .expect("trust transition succeeds");
     assert!(matches!(response, Response::WorkspaceTrustSet { .. }));
     ctx.registry
@@ -17534,7 +17715,7 @@ async fn large_user_message_ingress_rejects_over_fcm2_before_durable_or_worker_s
 
 #[tokio::test]
 async fn send_user_message_v2_inline_boundary_rejects_over_limit_and_dispatches_at_limit() {
-    let ctx = test_ctx();
+    let ctx = test_ctx_with_fake_secure_key_actor().await;
     let project = tempfile::tempdir().unwrap();
     let (mut state, session_id, mut work_rx) =
         attached_state_with_worker_receiver(&ctx, project.path()).await;
@@ -17579,7 +17760,7 @@ async fn send_user_message_v2_inline_boundary_rejects_over_limit_and_dispatches_
     );
 
     let boundary_ctx = ctx.clone();
-    let boundary = tokio::spawn(async move {
+    let mut boundary = tokio::spawn(async move {
         let result = handle_request(
             Request::SendUserMessageV2 {
                 ingress: MessageIngressV2::local_direct(
@@ -17612,10 +17793,7 @@ async fn send_user_message_v2_inline_boundary_rejects_over_limit_and_dispatches_
         submission,
         respond_to,
         ..
-    } = work_rx
-        .recv()
-        .await
-        .expect("64KiB V2 submission reaches the worker")
+    } = recv_worker_delivery_while_running(&mut work_rx, &mut boundary, "64KiB V2 request").await
     else {
         panic!("expected boundary V2 UserMessage work");
     };
@@ -19622,6 +19800,10 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "clean_managed_workspace_lease"
         | "restart_if_idle"
         | "stop_daemon" => AuthzAllowedOutcome::Response,
+        // The matrix deliberately drops the attached worker after its prelude;
+        // refresh is authorized, then fails closed when fanout observes that
+        // exact worker shutdown.
+        "refresh_host_capabilities" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
         "count_pinned_messages"
         | "list_pinned_message_seqs"
         | "list_pinned_messages_with_text"
@@ -19758,6 +19940,10 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "resume_from_compaction"
         | "pin"
         | "promote_conversation_rule" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
+        // Discard is deliberately idempotent. The owner reaches the handler,
+        // and an unknown/already-removed ephemeral lineage acknowledges
+        // without inventing state.
+        "discard_session" => AuthzAllowedOutcome::Response,
         // `recover_security_blocked_media` validates the owner-principal binding
         // first, then short-circuits on the missing storage authority before the
         // attach check, so a detached owner reaches the `Internal` "media storage
@@ -19774,16 +19960,17 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
         "admit_image_ingress"
-        | "discard_image_ingress_draft"
         | "begin_media_upload"
         | "append_media_upload_chunk"
         | "cancel_media_upload"
         | "finalize_media_upload"
-        | "discard_unreferenced_media_attachment"
-        | "resolve_agent_decision"
-        | "apply_agent_session_override" => {
+        | "discard_unreferenced_media_attachment" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
+        "discard_image_ingress_draft" | "resolve_agent_decision" => {
+            AuthzAllowedOutcome::Error(ErrorCode::Internal)
+        }
+        "apply_agent_session_override" => AuthzAllowedOutcome::Response,
         "list_leak_reports" | "list_secret_inventory" | "get_flycockpit_account" => {
             AuthzAllowedOutcome::Response
         }
@@ -19859,6 +20046,10 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "set_flycockpit_connector_enabled"
         | "sync_flycockpit_org_policy"
         | "enroll_flycockpit_org_sync" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        // The legacy catalog constructor remains on the wire for an explicit,
+        // typed retirement error. Authorization succeeds for the owner before
+        // dispatch directs callers to the owner-declared sink replacement.
+        "create_sealed_action" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         // `import_policy` and `apply_setup_wizard` validate their caller-supplied
         // payload inside the owner handler, which maps every parse /
         // unsupported-descriptor failure through `internal` (not `bad_request`),
@@ -19894,16 +20085,14 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // live session. The session-writer gate passes, then the store lookup
         // maps a missing media-egress verdict to the typed `NotFound`.
         "revoke_media_egress_verdict" => AuthzAllowedOutcome::Error(ErrorCode::NotFound),
-        // Image-sidecar Get is a concurrent handler with its own attach
-        // gate (`BadRequest`). Create/Revoke go through serialized
-        // `require_attached` (`NotAttached`). The default owner matrix
-        // probe is detached, so the owner cell surfaces those attach
-        // errors after the owner-only check.
+        // Image-sidecar Get has its own attach gate. Create/Revoke traverse the
+        // attached owner path, then reject the matrix's deliberately fabricated
+        // candidate/grant identities as typed request errors.
         "get_image_sidecar_authority_snapshot" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
         "create_image_sidecar_grant" | "revoke_image_sidecar_grant" => {
-            AuthzAllowedOutcome::Error(ErrorCode::NotAttached)
+            AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
         // Coordinator failures are carried in a typed redacted DTO, so every
         // owner-authorized installation endpoint reaches a response rather
@@ -19915,29 +20104,34 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // Code-root capability probes deliberately use fresh, unknown opaque
         // authorities. The owner reaches the handler, which rejects the
         // forged authority after the central owner gate.
-        "attach_existing_code_root_v1"
-        | "close_code_root_attachment_v1"
-        | "attach_existing_code_root_with_acp_ingress_v1"
+        "close_code_root_attachment_v1"
         | "close_acp_code_root_attachment_v1"
         | "read_code_root_v1"
         | "read_code_root_deliveries_v1"
         | "ack_code_root_deliveries_v1"
-        | "resolve_code_root_interrupt_v1"
-        | "execute_storage_cleanup"
-        | "set_primary_assistant_soul_edit_mode" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
-        // Root creation requires a configured model; the matrix daemon is
-        // intentionally model-less. Discovery and the owner configuration /
-        // storage read paths remain fully typed on an empty daemon.
+        | "resolve_code_root_interrupt_v1" => {
+            AuthzAllowedOutcome::Error(ErrorCode::Authorization)
+        }
+        "set_primary_assistant_soul_edit_mode" => {
+            AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
+        }
+        "execute_storage_cleanup" => AuthzAllowedOutcome::Error(ErrorCode::Conflict),
+        // The matrix has a configured stub model and a trusted isolated root,
+        // so owner-authorized root creation and attachment return their typed
+        // capabilities. Forged follow-up capabilities fail above with the
+        // authorization error, never a content-dependent lookup error.
         "create_code_root_v1"
-        | "create_code_root_with_acp_ingress_v1" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
+        | "attach_existing_code_root_v1"
+        | "create_code_root_with_acp_ingress_v1"
+        | "attach_existing_code_root_with_acp_ingress_v1" => AuthzAllowedOutcome::Response,
         "discover_code_roots_v1"
         | "set_workspace_history_scope"
         | "get_workspace_history_scope"
         | "get_storage_report"
         | "preview_storage_cleanup"
-        | "cancel_all_session_work"
         | "exit_guard_status"
         | "release_exit_guard" => AuthzAllowedOutcome::Response,
+        "cancel_all_session_work" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
         // The authz probe intentionally uses an unknown inbox item. The
         // human-read acknowledgement is deliberately idempotent (see
         // `assert_assistant_inbox_human_read_happy`): an unknown or pruned id
@@ -20803,54 +20997,85 @@ async fn authz_dispatch_matrix_covers_every_controlled_kind() {
 // invalid-state traversal for every dispatchable command.
 #[tokio::test(flavor = "multi_thread")]
 async fn authz_default_profile_owner_traverses_every_controlled_socket_path() {
-    assert_dispatch_matrix_coverage_complete();
-    for case in authz_dispatch_cases() {
-        let ctx = test_ctx();
-        let tmp = tempfile::tempdir().unwrap();
-        // Stamp a minimal `.cockpit/config.json` so config-bearing requests
-        // (e.g. `set_default_model`) find a retained default target under
-        // the trusted workspace policy.
-        let cockpit_dir = tmp.path().join(".cockpit");
-        std::fs::create_dir_all(&cockpit_dir).unwrap();
-        std::fs::write(cockpit_dir.join("config.json"), "{}").unwrap();
-        let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
-        ctx.db
-            .set_session_shared_with_collaborators(session_id, true)
-            .await
-            .unwrap();
-        ctx.db
-            .insert_session_event(
-                session_id,
-                crate::db::session_log::SessionEventKind::UserMessage,
-                Some("Build"),
-                None,
-                &serde_json::json!({"text": "local owner authz matrix"}),
-            )
-            .await
-            .unwrap();
+    use futures::StreamExt as _;
 
-        let needs_attached = authz_kind_needs_attached_state(case.kind, AuthzLevel::Owner);
-        let prelude = if needs_attached {
-            vec![attach_existing_request(session_id, tmp.path())]
-        } else {
-            Vec::new()
-        };
-        let worker_rx_to_drop_after_prelude = needs_attached.then_some(work_rx);
-        let result = dispatch_authz_request_after(
-            &ctx,
-            ClientPrincipal::owner(),
-            prelude,
-            None,
-            worker_rx_to_drop_after_prelude,
-            authz_matrix_request(case.kind, session_id, tmp.path()),
-        )
+    assert_dispatch_matrix_coverage_complete();
+    // Each matrix row models an independent connection to an independent
+    // daemon home. Exercise a small bounded set concurrently, just as real
+    // local daemons are allowed to boot concurrently, while keeping every
+    // row's storage and worker state isolated by construction.
+    let failures =
+        futures::stream::iter(authz_dispatch_cases().into_iter().map(|case| async move {
+            let ctx = test_ctx();
+            let tmp = cockpit_test_support::isolated_tempdir();
+            // Stamp a minimal `.cockpit/config.json` so config-bearing requests
+            // (e.g. `set_default_model`) find a retained default target under
+            // the trusted workspace policy.
+            let cockpit_dir = tmp.path().join(".cockpit");
+            std::fs::create_dir_all(&cockpit_dir).unwrap();
+            std::fs::write(cockpit_dir.join("config.json"), "{}").unwrap();
+            let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
+            ctx.db
+                .set_session_shared_with_collaborators(session_id, true)
+                .await
+                .unwrap();
+            ctx.db
+                .insert_session_event(
+                    session_id,
+                    crate::db::session_log::SessionEventKind::UserMessage,
+                    Some("Build"),
+                    None,
+                    &serde_json::json!({"text": "local owner authz matrix"}),
+                )
+                .await
+                .unwrap();
+
+            let needs_attached = authz_kind_needs_attached_state(case.kind, AuthzLevel::Owner);
+            let prelude = if needs_attached {
+                vec![attach_existing_request(session_id, tmp.path())]
+            } else {
+                Vec::new()
+            };
+            let worker_rx_to_drop_after_prelude = needs_attached.then_some(work_rx);
+            let result = dispatch_authz_request_after(
+                &ctx,
+                ClientPrincipal::owner(),
+                prelude,
+                None,
+                worker_rx_to_drop_after_prelude,
+                authz_matrix_request(case.kind, session_id, tmp.path()),
+            )
+            .await;
+            #[cfg_attr(not(feature = "remote"), allow(irrefutable_let_patterns))]
+            let AuthzExpectation::Allow(expected) = case.expectation(AuthzLevel::Owner) else {
+                panic!("{} must authorize the local owner", case.kind);
+            };
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_authz_allowed_outcome(case.kind, AuthzLevel::Owner, expected, result);
+            })) {
+                let detail = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| {
+                        payload
+                            .downcast_ref::<&str>()
+                            .map(|value| (*value).to_string())
+                    })
+                    .unwrap_or_else(|| "non-string assertion failure".to_string());
+                Some(format!("{}: {detail}", case.kind))
+            } else {
+                None
+            }
+        }))
+        .buffer_unordered(3)
+        .filter_map(|failure| async move { failure })
+        .collect::<Vec<_>>()
         .await;
-        #[cfg_attr(not(feature = "remote"), allow(irrefutable_let_patterns))]
-        let AuthzExpectation::Allow(expected) = case.expectation(AuthzLevel::Owner) else {
-            panic!("{} must authorize the local owner", case.kind);
-        };
-        assert_authz_allowed_outcome(case.kind, AuthzLevel::Owner, expected, result);
-    }
+    assert!(
+        failures.is_empty(),
+        "owner authz matrix failures:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[cfg(feature = "remote")]
@@ -20973,7 +21198,7 @@ async fn assert_authz_known_hole_socket_case(kind: &'static str, known_hole: Aut
 #[cfg(feature = "remote")]
 async fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSocketScenario {
     let ctx = test_ctx();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = cockpit_test_support::isolated_tempdir();
     // Stamp a minimal `.cockpit/config.json` so config-bearing requests
     // (e.g. `set_default_model`) find a retained default target under
     // the trusted workspace policy.
@@ -21035,7 +21260,7 @@ async fn authz_cross_session_paused_work_scenario(
     level: AuthzLevel,
 ) -> AuthzSocketScenario {
     let ctx = test_ctx();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = cockpit_test_support::isolated_tempdir();
     let accessible_root = tmp.path().join("accessible");
     let target_root = tmp.path().join("target");
     std::fs::create_dir_all(&accessible_root).unwrap();
@@ -24390,7 +24615,7 @@ async fn dispatch_attached_worker_request(
 ) -> std::result::Result<Response, ErrorPayload> {
     let (server_stream, client_stream) = test_stream_pair();
     let mut client = ProtoStream::new(client_stream);
-    let server = tokio::spawn(handle_client_transport(server_stream, ctx.clone()));
+    let mut server = tokio::spawn(handle_client_transport(server_stream, ctx.clone()));
     match recv_body(&mut client).await {
         Body::Response { id, response } => {
             assert_eq!(id, Uuid::nil());
@@ -24421,10 +24646,8 @@ async fn dispatch_attached_worker_request(
     recv_dispatch_matrix_response(&mut client, attach_id)
         .await
         .expect("attach succeeds");
-    let hydration = tokio::time::timeout(std::time::Duration::from_secs(2), work_rx.recv())
-        .await
-        .expect("attach hydration delivered")
-        .expect("attach hydration present");
+    let hydration =
+        recv_worker_delivery_while_running(&mut work_rx, &mut server, "socket attach").await;
     assert!(
         matches!(hydration, SessionWork::RepublishQueue),
         "unexpected attach hydration: {hydration:?}"
@@ -24435,10 +24658,8 @@ async fn dispatch_attached_worker_request(
         .send(&Envelope::request(id, request))
         .await
         .expect("send worker request");
-    let work = tokio::time::timeout(std::time::Duration::from_secs(2), work_rx.recv())
-        .await
-        .expect("worker command delivered")
-        .expect("worker command present");
+    let work =
+        recv_worker_delivery_while_running(&mut work_rx, &mut server, "socket request").await;
     observe(work);
     let result = recv_dispatch_matrix_response(&mut client, id).await;
     drop(client);
@@ -24480,9 +24701,29 @@ fn proto_queue_item(text: &str) -> proto::QueueItem {
     }
 }
 
+async fn recv_worker_delivery_while_running<T>(
+    work_rx: &mut tokio::sync::mpsc::Receiver<SessionWork>,
+    producer: &mut tokio::task::JoinHandle<T>,
+    label: &str,
+) -> SessionWork {
+    tokio::select! {
+        biased;
+        joined = producer => match joined {
+            Ok(_) => panic!("{label} completed before its expected worker delivery"),
+            Err(error) => panic!("{label} task failed before worker delivery: {error}"),
+        },
+        work = work_rx.recv() => work.unwrap_or_else(|| {
+            panic!("{label} worker channel closed before delivery")
+        }),
+    }
+}
+
 async fn assert_worker_delivery_happy(kind: &str) {
     let state_root = tempfile::tempdir().unwrap();
-    let ctx = isolated_test_ctx_with_config_source(state_root.path(), stub_config_source());
+    let mut ctx = isolated_test_ctx_with_config_source(state_root.path(), stub_config_source());
+    if kind == "send_user_message" {
+        attach_fake_secure_key_actor(&mut ctx).await;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
     let bulk_text = "bulk worker payload\n".repeat(4_000);
@@ -24552,6 +24793,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
         "send_now_queued_user_message" => Request::SendNowQueuedUserMessage {
             queue_item_id: Some(Uuid::from_u128(1)),
         },
+        "resume_from_compaction" => Request::ResumeFromCompaction,
         "repair_resume" => Request::RepairResume { session_id },
         "cancel_turn" => Request::CancelTurn,
         "resolve_interrupt" => Request::ResolveInterrupt {
@@ -25031,7 +25273,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
 
 #[tokio::test]
 async fn send_user_message_propagates_exact_pre_acceptance_failure() {
-    let ctx = test_ctx();
+    let ctx = test_ctx_with_fake_secure_key_actor().await;
     let tmp = tempfile::tempdir().unwrap();
     let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
     let client_submission_id = Uuid::now_v7();
@@ -25543,20 +25785,70 @@ async fn assert_knowledge_base_session_mutating_happy(kind: &str) {
 
 async fn assert_assistant_inbox_human_read_happy() {
     let ctx = test_ctx();
-    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+    ctx.db
+        .upsert_assistant("matrix-helper", "/tmp/matrix-helper", "{}", &"0".repeat(64))
+        .await
+        .unwrap();
+    let session = ctx
+        .db
+        .create_assistant_session("p", "/repo", "Build", "matrix-helper")
+        .await
+        .unwrap();
+    let anchor = ctx
+        .db
+        .insert_session_event(
+            session.session_id,
+            crate::db::session_log::SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &serde_json::json!({"text": "anchor"}),
+        )
+        .await
+        .unwrap();
+    let thread = ctx
+        .db
+        .create_thread(session.session_id, anchor.to_string())
+        .await
+        .unwrap();
+    let item = ctx
+        .db
+        .raise_assistant_inbox_item(
+            thread.session_id,
+            "matrix-turn".into(),
+            "matrix-call".into(),
+            "matrix result".into(),
+            crate::db::assistant_inbox::AssistantInboxDelivery::Notify,
+        )
+        .await
+        .unwrap();
     let response = dispatch_matrix_request(
         &ctx,
         Request::AcknowledgeAssistantInboxHumanRead {
             main_session_id: session.session_id,
-            // An already-settled (or unknown) id is intentionally an
-            // idempotent acknowledgement, but still traverses the durable
-            // owner-bound mutation path.
-            inbox_item_ids: vec![Uuid::new_v4()],
+            inbox_item_ids: vec![item.inbox_item_id],
         },
     )
     .await
     .expect("idempotent human-read acknowledgement");
     assert!(matches!(response, Response::Ack));
+    let response = dispatch_matrix_request(
+        &ctx,
+        Request::AcknowledgeAssistantInboxHumanRead {
+            main_session_id: session.session_id,
+            inbox_item_ids: vec![item.inbox_item_id],
+        },
+    )
+    .await
+    .expect("repeated human-read acknowledgement");
+    assert!(matches!(response, Response::Ack));
+    let stored = ctx
+        .db
+        .assistant_inbox_for_main(session.session_id, true, 10)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].inbox_item_id, item.inbox_item_id);
+    assert!(stored[0].human_read_at_unix_ms.is_some());
 }
 
 async fn assert_attachment_mutating_malformed(kind: &str) {
@@ -31155,6 +31447,12 @@ async fn attach_fake_secure_key_actor(ctx: &mut Arc<DaemonContext>) {
         .attach_secure_key_actor(actor);
 }
 
+async fn test_ctx_with_fake_secure_key_actor() -> Arc<DaemonContext> {
+    let mut ctx = test_ctx();
+    attach_fake_secure_key_actor(&mut ctx).await;
+    ctx
+}
+
 fn start_fake_tool_media_actor(
     db: crate::db::Db,
     store: crate::secure_key::fake::FakeNativeStore,
@@ -31617,7 +31915,7 @@ async fn image_submission_exact_retry_case() {
     let mut ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
         providers, extended,
     ));
-    let media_dir = tempfile::tempdir().unwrap();
+    let media_dir = cockpit_test_support::isolated_tempdir();
     let db = ctx.db.clone();
     // V2 attachment acceptance requires durable media storage; provision it
     // so staged identities materialize and remain reusable.
@@ -31629,7 +31927,7 @@ async fn image_submission_exact_retry_case() {
         .unwrap(),
     ));
     attach_fake_secure_key_actor(&mut ctx).await;
-    let project = tempfile::tempdir().unwrap();
+    let project = cockpit_test_support::isolated_tempdir();
     ctx.db
         .set_workspace_trust(
             project.path(),
@@ -31757,29 +32055,26 @@ async fn image_submission_exact_retry_case() {
         .expect("read durable media reference");
     assert_eq!(retained_reference_count, 1);
 
-    let diag_first_started = std::time::Instant::now();
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        loop {
-            if ctx
-                .db
-                .client_submission_receipt(session_id, client_submission_id)
-                .await
-                .expect("durable receipt lookup")
-                .is_some()
-            {
-                break;
-            }
-            // Do not yield_now()-spin: this test pins a 2-thread runtime so a
-            // busy waiter can starve the session driver that persists the event.
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the accepted submission becomes durable");
-    eprintln!(
-        "IMAGE-DIAG first submission became durable in {:?}",
-        diag_first_started.elapsed()
+    // `UserMessageQueued` for an attachment-bearing V2 request is downstream
+    // of the transactional message-operation and attachment receipts above.
+    // Do not wait for the driver's later transcript materialization: a crash
+    // immediately after this acknowledgement must already be replayable from
+    // the acceptance ledger.
+    let accepted_receipt = ctx
+        .db
+        .message_receipt_status(session_id, *operation_id.as_bytes())
+        .await
+        .expect("synchronous durable replay lookup")
+        .expect("queued attachment acknowledgement establishes its durable replay fence");
+    assert_eq!(
+        accepted_receipt.client_submission_id,
+        *client_submission_id.as_bytes()
     );
+    assert!(matches!(
+        accepted_receipt.safe_outcome,
+        crate::db::message_attachments::MessageSafeOutcome::Accepted { .. }
+            | crate::db::message_attachments::MessageSafeOutcome::Materialized { .. }
+    ));
     // Simulate a daemon process restart by dropping the entire per-client
     // attachment state, then reconnecting. Neither the old client nor the
     // daemon replay cache has the bytes now; the durable wire receipt alone
@@ -31862,10 +32157,12 @@ async fn image_submission_exact_retry_case() {
     .expect_err("same UUID with a different fingerprint must conflict");
     assert_eq!(conflict.code, ErrorCode::Conflict);
 
+    let reused_operation_id = Uuid::now_v7();
+    let reused_submission_id = Uuid::now_v7();
     let reused = handle_request(
         request(
-            Uuid::now_v7(),
-            Uuid::now_v7(),
+            reused_operation_id,
+            reused_submission_id,
             "inspect this image",
             image_ref,
         ),
@@ -31876,53 +32173,42 @@ async fn image_submission_exact_retry_case() {
     .expect("one immutable attachment version is reusable by another submission");
     assert!(matches!(reused, Response::UserMessageQueued { .. }));
 
-    // The second durable row can only fold once the first turn terminates:
-    // the stub provider refuses instantly, but the production retry layer
-    // legitimately spends several wall-clock seconds in backoff (plus the
-    // per-attempt request assembly), which saturates well past a tight fuse
-    // under full-suite load. The durable row remains the completion signal.
-    let diag_wait_started = std::time::Instant::now();
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        let mut diag_last_print = std::time::Instant::now();
-        loop {
-            let user_messages = ctx
-                .db
-                .list_session_events(session_id)
-                .await
-                .unwrap()
-                .into_iter()
-                .filter(|event| event.kind == "user_message")
-                .count();
-            if user_messages >= 2 {
-                break;
-            }
-            if diag_last_print.elapsed() >= std::time::Duration::from_secs(1) {
-                eprintln!(
-                    "IMAGE-DIAG still waiting for 2 durable user messages after {:?}: count={}",
-                    diag_wait_started.elapsed(),
-                    user_messages
-                );
-                diag_last_print = std::time::Instant::now();
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("second distinct submission becomes durable");
-    let user_messages = ctx
+    // Dispatch acknowledges only after the operation/submission join commits.
+    // Assert that durable boundary directly: provider scheduling and later
+    // transcript projection are deliberately outside attachment idempotency.
+    let reused_receipt = ctx
         .db
-        .list_session_events(session_id)
+        .message_receipt_status(session_id, *reused_operation_id.as_bytes())
         .await
-        .unwrap()
-        .into_iter()
-        .filter(|event| event.kind == "user_message")
-        .count();
-    assert_eq!(user_messages, 2, "exact retry must not duplicate inference");
+        .expect("read second durable operation receipt")
+        .expect("second distinct submission is durable before acknowledgement");
+    assert_eq!(
+        reused_receipt.client_submission_id,
+        *reused_submission_id.as_bytes()
+    );
+    assert_eq!(reused_receipt.attachments.len(), 1);
+    let durable_operation_count: i64 = ctx
+        .db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM message_operation_receipts WHERE session_id=?1",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .expect("count durable operation identities");
+    assert_eq!(
+        durable_operation_count, 2,
+        "the exact retry reuses its operation while the distinct submission commits once"
+    );
+
     model_server.abort();
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn ambiguous_image_submission_reuses_immutable_v2_identity() {
+#[test]
+fn ambiguous_image_submission_reuses_immutable_v2_identity() {
     let mut ctx = test_ctx();
     let media_dir = tempfile::tempdir().unwrap();
     let db = ctx.db.clone();
@@ -31940,6 +32226,26 @@ async fn ambiguous_image_submission_reuses_immutable_v2_identity() {
             .unwrap(),
         ));
     }
+    let actor = start_fake_tool_media_actor(
+        ctx.db.clone(),
+        crate::secure_key::fake::FakeNativeStore::new(),
+    );
+    Arc::get_mut(&mut ctx)
+        .expect("test context is unique before attach")
+        .attach_secure_key_actor(actor);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(crate::daemon::session_worker::TOKIO_WORKER_STACK_SIZE)
+        .enable_all()
+        .build()
+        .expect("production-equivalent ambiguous image runtime");
+    let ctx = runtime.block_on(Box::pin(ambiguous_image_submission_case(ctx)));
+    drop(runtime);
+    drop(ctx);
+    drop(media_dir);
+}
+
+async fn ambiguous_image_submission_case(ctx: Arc<DaemonContext>) -> Arc<DaemonContext> {
     let project = tempfile::tempdir().unwrap();
     let (mut state, session_id, mut work_rx) =
         attached_state_with_worker_receiver(&ctx, project.path()).await;
@@ -31970,7 +32276,7 @@ async fn ambiguous_image_submission_reuses_immutable_v2_identity() {
 
     let first_ctx = ctx.clone();
     let first_request = request(first_operation_id, first_id);
-    let first = tokio::spawn(async move {
+    let mut first = tokio::spawn(async move {
         let result = handle_request(first_request, &mut state, &first_ctx).await;
         (state, result)
     });
@@ -31978,7 +32284,12 @@ async fn ambiguous_image_submission_reuses_immutable_v2_identity() {
         submission,
         respond_to,
         ..
-    } = work_rx.recv().await.expect("first request reaches worker")
+    } = recv_worker_delivery_while_running(
+        &mut work_rx,
+        &mut first,
+        "first ambiguous image request",
+    )
+    .await
     else {
         panic!("expected first UserMessage work");
     };
@@ -32016,34 +32327,17 @@ async fn ambiguous_image_submission_reuses_immutable_v2_identity() {
     assert_eq!(accepted_queue[0].client_submission_id, *first_id.as_bytes());
     assert_durable_attachment_persists(&ctx, image_ref.attachment_id).await;
 
-    let retry_ctx = ctx.clone();
-    let retry_request = request(first_operation_id, first_id);
-    let retry = tokio::spawn(async move {
-        let result = handle_request(retry_request, &mut state, &retry_ctx).await;
-        (state, result)
-    });
-    let SessionWork::UserMessage {
-        submission,
-        respond_to,
-        ..
-    } = work_rx.recv().await.expect("exact retry reaches worker")
-    else {
-        panic!("expected retry UserMessage work");
-    };
-    assert_eq!(submission.client_submissions[0].id, first_id);
-    assert_same_durable_png_pixels(&submission.media[0], &sample_png());
-    let item = proto::QueueItem {
-        id: first_id,
-        status: proto::QueueItemStatus::Folding,
-        text: submission.text.clone(),
-        display_text: submission.display_text.clone(),
-        target: proto::QueueTarget::default(),
-        delivery_class: Default::default(),
-        send_now: false,
-    };
-    respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
-    let (_state, retry) = retry.await.unwrap();
-    assert!(matches!(retry.unwrap(), Response::UserMessageQueued { .. }));
+    let retry = handle_request(request(first_operation_id, first_id), &mut state, &ctx)
+        .await
+        .expect("an exact retry acknowledges the durable accepted queue item");
+    assert!(matches!(retry, Response::Ack));
+    assert!(
+        matches!(
+            work_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ),
+        "recovery, not a second live dispatch, owns the accepted queue item"
+    );
 
     let accepted = ctx
         .db
@@ -32071,6 +32365,7 @@ async fn ambiguous_image_submission_reuses_immutable_v2_identity() {
     );
     assert_eq!(accepted_queue[0].queue_item_id, *first_id.as_bytes());
     assert_eq!(accepted_queue[0].client_submission_id, *first_id.as_bytes());
+    ctx
 }
 
 #[tokio::test]
@@ -35507,7 +35802,7 @@ fn fs_read_hook_key(project_root: &std::path::Path, path: &str) -> String {
 
 #[tokio::test]
 async fn serialized_requests_apply_in_receipt_order() {
-    let ctx = test_ctx();
+    let ctx = test_ctx_with_fake_secure_key_actor().await;
     let tmp = tempfile::tempdir().unwrap();
     ctx.db
         .set_workspace_trust(
@@ -35542,9 +35837,9 @@ async fn serialized_requests_apply_in_receipt_order() {
     ctx.registry.insert_test_worker(handle, join);
 
     let (executor_tx, executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
-    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, mut event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
-    let executor = tokio::spawn(run_client_executor(
+    let mut executor = tokio::spawn(run_client_executor(
         ctx.clone(),
         ClientPrincipal::owner(),
         Uuid::new_v4(),
@@ -35590,9 +35885,18 @@ async fn serialized_requests_apply_in_receipt_order() {
         other => panic!("expected attach response, got {other:?}"),
     }
     assert!(matches!(
-        work_rx.recv().await.expect("attach queue hydration"),
+        recv_worker_delivery_while_running(&mut work_rx, &mut executor, "serialized attach").await,
         SessionWork::RepublishQueue
     ));
+    match event_cmd_rx.recv().await.expect("attach event command") {
+        ClientEventCommand::Attach {
+            session_id,
+            rx: _,
+            rendered_interrupts: _,
+        } => assert_eq!(session_id, session.session_id),
+        ClientEventCommand::Detach => panic!("expected attach event command"),
+        ClientEventCommand::Barrier(_) => panic!("expected attach event command"),
+    }
 
     let set_id = Uuid::new_v4();
     let message_id = Uuid::now_v7();
@@ -35644,7 +35948,13 @@ async fn serialized_requests_apply_in_receipt_order() {
         .await
         .unwrap();
 
-    match work_rx.recv().await.expect("set-active-model work") {
+    match recv_worker_delivery_while_running(
+        &mut work_rx,
+        &mut executor,
+        "serialized set-active-model request",
+    )
+    .await
+    {
         SessionWork::SetActiveModel {
             selection_id: _,
             selection_deadline: _,
@@ -35668,7 +35978,13 @@ async fn serialized_requests_apply_in_receipt_order() {
         }
         other => panic!("expected SetActiveModel before message, got {other:?}"),
     }
-    match work_rx.recv().await.expect("user-message work") {
+    match recv_worker_delivery_while_running(
+        &mut work_rx,
+        &mut executor,
+        "serialized user-message request",
+    )
+    .await
+    {
         SessionWork::UserMessage {
             submission,
             respond_to,
@@ -36046,13 +36362,7 @@ async fn client_io_split_slow_request_does_not_block_event_forwarding() {
         }))
         .unwrap();
 
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        recv_writer_body(&mut writer_rx, "writer envelope"),
-    )
-    .await
-    .expect("event forwarded")
-    {
+    match recv_writer_body(&mut writer_rx, "writer envelope").await {
         Body::Event {
             event: proto::Event::LspNotice { text },
         } => assert_eq!(text, "forwarded while executor is unavailable"),
@@ -36090,11 +36400,7 @@ async fn client_io_split_reader_eof_tears_down_all_tasks() {
         None,
     ));
     drop(client);
-    tokio::time::timeout(std::time::Duration::from_secs(2), task)
-        .await
-        .expect("client task exits on reader eof")
-        .unwrap()
-        .unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -36117,11 +36423,7 @@ async fn hello_only_probe_does_not_claim_client_lifetime() {
         Some(RecvFrame::Envelope(_))
     ));
     drop(client);
-    tokio::time::timeout(std::time::Duration::from_secs(2), task)
-        .await
-        .expect("hello-only probe transport exits")
-        .unwrap()
-        .unwrap();
+    task.await.unwrap().unwrap();
 
     assert_eq!(*presence.borrow(), ClientPresence::default());
 }
@@ -36487,12 +36789,7 @@ async fn broadcast_lag_emits_typed_event_not_internal_error() {
 
     let mut saw_lag = false;
     for _ in 0..3 {
-        let body = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            recv_writer_body(&mut writer_rx, "writer envelope"),
-        )
-        .await
-        .expect("lag envelope");
+        let body = recv_writer_body(&mut writer_rx, "writer envelope").await;
         match body {
             Body::Event {
                 event:
@@ -36615,6 +36912,8 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         #[cfg(debug_assertions)]
         agent_installation_fixture: base.agent_installation_fixture.clone(),
         secure_key: None,
+        secret_store_path: base.secret_store_path.clone(),
+        container_manager: base.container_manager.clone(),
         _secure_key_actor: None,
         external_journal: None,
         media_storage_recovery: None,
@@ -36632,9 +36931,9 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         cockpit_client::DaemonClient::from_in_process(spawn_in_process_client(ctx.clone()));
 
     assert!(matches!(
-        tokio::time::timeout(std::time::Duration::from_secs(1), client.next_event())
+        client
+            .next_event()
             .await
-            .expect("initial event")
             .expect("in-process client should emit startup state"),
         proto::Event::CaffeinateState { .. }
     ));
@@ -36647,9 +36946,9 @@ async fn in_process_broadcast_lag_emits_typed_event() {
 
     let mut saw_lag = false;
     for _ in 0..4 {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), client.next_event())
+        let event = client
+            .next_event()
             .await
-            .expect("event")
             .expect("in-process client should remain connected");
         if let proto::Event::EventStreamLagged {
             session_id: None,
@@ -36770,10 +37069,7 @@ async fn recv_lsp_notice(
     events: &mut crate::daemon::EventReceiver,
 ) -> crate::daemon::EventEnvelope {
     loop {
-        let envelope = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
-            .await
-            .expect("global event within timeout")
-            .expect("global event bus open");
+        let envelope = events.recv().await.expect("global event bus open");
         if matches!(envelope.event, proto::Event::LspNotice { .. }) {
             return envelope;
         }
@@ -36841,6 +37137,8 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         #[cfg(debug_assertions)]
         agent_installation_fixture: base.agent_installation_fixture.clone(),
         secure_key: None,
+        secret_store_path: base.secret_store_path.clone(),
+        container_manager: base.container_manager.clone(),
         _secure_key_actor: None,
         external_journal: None,
         media_storage_recovery: None,
@@ -37388,10 +37686,7 @@ async fn btw_concurrent_with_parent_turn() {
         submission: btw_submission,
         respond_to: btw_respond,
         ..
-    } = tokio::time::timeout(std::time::Duration::from_millis(250), btw_rx.recv())
-        .await
-        .expect("btw work was not blocked by parent turn")
-        .expect("btw work queued")
+    } = btw_rx.recv().await.expect("btw work queued")
     else {
         panic!("expected btw user message work");
     };
@@ -38234,14 +38529,22 @@ async fn attach_since_seq_replays_retracted_user_row_identity() {
 /// model sends a real reasoning-only SSE delta before stalling, so this also
 /// locks the narrow retraction boundary to actual stream state rather than a
 /// test-only `CancelHandle` call.
-#[tokio::test(flavor = "multi_thread")]
-async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
-    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+#[test]
+fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
+    crate::test_env::run_async_with_large_stack(
+        cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns_inner,
+    );
+}
+
+async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns_inner() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     use crate::config::providers::{
         ActiveModelRef, ModelEntry, ModelTrust, ProviderEntry, ProvidersConfig, ThinkingMode,
+        WireApi,
     };
 
-    let (model_url, captured_requests, model_server) = retraction_acceptance_model_server().await;
+    let mut provider = retraction_acceptance_model_server().await;
+    let model_url = provider.base_url();
     let mut providers = ProvidersConfig::default();
     // The retraction boundary is asserted against LIVE pre-classification
     // stream state, which by the leak-report design only a trusted route
@@ -38253,17 +38556,28 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         "lmstudio".to_string(),
         ProviderEntry {
             url: model_url,
-            trust: Some(ModelTrust::Trusted),
+            wire_api: WireApi::Completions,
+            // The active selection must also exist in the provider catalog.
+            // Otherwise vNext model acquisition can fail before the engine
+            // constructs or streams the chat-completions request.
             models: vec![ModelEntry {
-                id: "retraction-model".to_string(),
+                id: "local".to_string(),
+                thinking_modes: vec![ThinkingMode::High],
+                context_length: Some(128_000),
+                wire_api: WireApi::Completions,
                 ..ModelEntry::default()
             }],
+            // This acceptance test must observe a live reasoning delta before
+            // cancelling the intentionally hanging stream. Untrusted routes
+            // correctly withhold every plaintext delta until classification,
+            // which cannot finish while the stream is open.
+            trust: Some(ModelTrust::Trusted),
             ..ProviderEntry::default()
         },
     );
     providers.active_model = Some(ActiveModelRef {
         provider: "lmstudio".to_string(),
-        model: "retraction-model".to_string(),
+        model: "local".to_string(),
         reasoning_effort: None,
         thinking_mode: Some(ThinkingMode::High),
         prompt_cache_retention: None,
@@ -38280,23 +38594,30 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         );
     let mut extended = crate::config::extended::ExtendedConfig::default();
     extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxIntent::Off;
-    // The scripted retraction model server owns a fixed stream sequence. A
-    // same-model metadata fork after a successful turn would consume the next
-    // stream and desynchronize the visible-text/tool/cancel-all boundaries.
-    extended.auto_title = Some("openai/gpt-4o-mini".to_string());
+    // Keep automatic title work on a distinct, unavailable utility selector.
+    // It then terminates at model resolution without consuming this fixture's
+    // strictly ordered foreground provider responses.
+    extended.auto_title = Some("metadata-fixture:disabled".to_string());
     extended.auto_title_with_session_model = false;
     extended.default_approval_mode = crate::config::extended::ApprovalMode::Yolo;
-    let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+    let mut ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
         providers, extended,
     ));
-    let project = tempfile::tempdir().unwrap();
-    std::fs::write(project.path().join("fixture.txt"), "fixture body").unwrap();
-    trust_workspace_root(&ctx, project.path()).await;
-
+    attach_fake_secure_key_actor(&mut ctx).await;
+    let fixture_root = env.path().expect("owned isolated-home root");
+    let project = fixture_root.join("project");
+    let spool = fixture_root.join("external-journal");
+    assert!(project.starts_with(fixture_root) && spool.starts_with(fixture_root));
+    std::fs::create_dir(&project).unwrap();
+    ctx.registry.set_external_journal(Arc::new(
+        crate::external_journal::ExternalJournal::for_test_at(ctx.db.clone(), &spool),
+    ));
+    std::fs::write(project.join("fixture.txt"), "fixture body").unwrap();
+    trust_workspace_root(&ctx, &project).await;
     let attach_request = |session_id| Request::Attach {
         session_id,
         since_seq: None,
-        project_root: Some(project.path().to_string_lossy().into_owned()),
+        project_root: Some(project.to_string_lossy().into_owned()),
         initial_model: None,
         no_sandbox: false,
         interactive: true,
@@ -38375,6 +38696,7 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         proto::Event::UserMessageRecorded { seq, .. } => seq,
         _ => unreachable!("predicate selected a user row"),
     };
+    wait_for_retraction_provider_request(&mut provider, "initial reasoning turn").await;
     wait_for_retraction_acceptance_event(
         &mut origin_events,
         "real provider reasoning delta",
@@ -38455,6 +38777,7 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
             .expect("resend is accepted after a real CancelTurn"),
         Response::UserMessageQueued { .. }
     ));
+    wait_for_retraction_provider_request(&mut provider, "resent turn").await;
     wait_for_retraction_acceptance_event(
         &mut origin_events,
         "resent visible response",
@@ -38467,19 +38790,10 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         })
         .await;
     }
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        loop {
-            if captured_requests.lock().unwrap().len() >= 2 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("model captured the original and resent provider requests");
-    let requests = captured_requests.lock().unwrap().clone();
+    let requests = provider.captured();
+    assert!(requests.len() >= 2, "model captured both provider requests");
     assert_eq!(
-        requests[0], requests[1],
+        requests[0].body, requests[1].body,
         "retract + resend preserves the exact provider request, including its cacheable prefix"
     );
 
@@ -38496,6 +38810,7 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         .expect("visible-text case is accepted"),
         Response::UserMessageQueued { .. }
     ));
+    wait_for_retraction_provider_request(&mut provider, "visible-text turn").await;
     wait_for_retraction_acceptance_event(
         &mut origin_events,
         "visible text before cancel",
@@ -38555,6 +38870,12 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         .expect("tool case is accepted"),
         Response::UserMessageQueued { .. }
     ));
+    wait_for_retraction_provider_request(&mut provider, "tool turn").await;
+    // The follow-up provider request is a causal barrier: the driver cannot
+    // issue it until the real tool call has returned and published ToolEnd.
+    // Wait on that boundary before applying the short event-delivery budget,
+    // so host I/O pressure cannot turn tool execution time into an event race.
+    wait_for_retraction_provider_request(&mut provider, "tool-result follow-up").await;
     wait_for_retraction_acceptance_event(
         &mut origin_events,
         "completed real read tool before cancel",
@@ -38613,6 +38934,7 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         .expect("cancel-all boundary case is accepted"),
         Response::UserMessageQueued { .. }
     ));
+    wait_for_retraction_provider_request(&mut provider, "cancel-all turn").await;
     wait_for_retraction_acceptance_event(
         &mut origin_events,
         "live reasoning before cancel-all",
@@ -38664,7 +38986,7 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns() {
         })
         .await
         .expect("real worker shuts down after acceptance test");
-    model_server.abort();
+    drop(provider);
 }
 
 async fn wait_for_retraction_acceptance_event(
@@ -38672,10 +38994,6 @@ async fn wait_for_retraction_acceptance_event(
     label: &str,
     matches_event: impl Fn(&proto::Event) -> bool,
 ) -> proto::Event {
-    // Every scripted stream event here is guaranteed to arrive; only its
-    // latency varies with machine load (request assembly between turn start
-    // and the first delta is CPU-heavy under a saturated suite run). The
-    // fuse is a failure bound, never a pacing mechanism.
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             let event = events
@@ -38689,7 +39007,7 @@ async fn wait_for_retraction_acceptance_event(
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
+    .expect(&format!("{label}: timed out waiting for acceptance event"))
 }
 
 async fn collect_retraction_acceptance_events_until(
@@ -38712,7 +39030,7 @@ async fn collect_retraction_acceptance_events_until(
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
+    .expect(&format!("{label}: timed out waiting for acceptance events"))
 }
 
 /// Minimal completions endpoint that finishes every accepted request
@@ -38765,139 +39083,96 @@ data: [DONE]\n\n",
 /// hang, then reasoning/hang for the `CancelAllSessionWork` boundary. Hanging
 /// the socket after a real delta forces production cancellation to abort a
 /// live HTTP stream; it cannot be simulated by a completed turn.
-async fn retraction_acceptance_model_server() -> (
-    String,
-    Arc<StdMutex<Vec<String>>>,
-    tokio::task::JoinHandle<()>,
-) {
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-    };
+async fn retraction_acceptance_model_server() -> cockpit_test_support::provider::ScriptedProvider {
+    use cockpit_test_support::provider::{ScriptedProvider, Turn, WireDialect};
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let captured = Arc::new(StdMutex::new(Vec::new()));
-    let captured_server = captured.clone();
+    let assistant_role = serde_json::json!({
+        "id": "c", "model": "local",
+        "choices": [{
+            "index": 0,
+            "delta": { "role": "assistant", "content": "" },
+            "finish_reason": null
+        }],
+        "usage": null
+    });
     let reasoning = serde_json::json!({
-        "id": "retraction-1", "model": "retraction-model",
-        "choices": [{ "delta": { "reasoning_content": "checking" }, "finish_reason": null }]
+        "id": "c", "model": "local",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "content": null,
+                "reasoning_content": "checking",
+                "tool_calls": []
+            },
+            "finish_reason": null
+        }],
+        "usage": null
     });
     let resent = serde_json::json!({
-        "id": "retraction-2", "model": "retraction-model",
-        "choices": [{ "delta": { "content": "resent answer" }, "finish_reason": null }]
+        "id": "c", "model": "local",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "content": "resent answer",
+                "reasoning_content": null,
+                "tool_calls": []
+            },
+            "finish_reason": null
+        }],
+        "usage": null
     });
     let visible = serde_json::json!({
-        "id": "retraction-3", "model": "retraction-model",
-        "choices": [{ "delta": { "content": "visible answer" }, "finish_reason": null }]
+        "id": "c", "model": "local",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "content": "visible answer",
+                "reasoning_content": null,
+                "tool_calls": []
+            },
+            "finish_reason": null
+        }],
+        "usage": null
     });
-    let tool = serde_json::json!({
-        "id": "retraction-4", "model": "retraction-model",
-        "choices": [{ "delta": { "tool_calls": [{
-            "index": 0, "id": "read-before-cancel", "type": "function",
-            "function": { "name": "read", "arguments": "{\\\"path\\\":\\\"fixture.txt\\\"}" }
-        }] }, "finish_reason": null }]
-    });
-    let tool_finish = serde_json::json!({
-        "id": "retraction-4", "model": "retraction-model",
-        "choices": [{ "delta": {}, "finish_reason": "tool_calls" }]
-    });
-    let streams = vec![
-        (format!("data: {reasoning}\n\n"), true),
-        (format!("data: {resent}\n\ndata: [DONE]\n\n"), false),
-        (format!("data: {visible}\n\n"), true),
-        (
-            format!("data: {tool}\n\ndata: {tool_finish}\n\ndata: [DONE]\n\n"),
-            false,
-        ),
-        (String::new(), true),
-        (format!("data: {reasoning}\n\n"), true),
-    ];
-    let server = tokio::spawn(async move {
-        for (stream_body, hang) in streams {
-            let (mut socket, _) = listener.accept().await.expect("model accepts request");
-            let request = read_retraction_acceptance_http_request(&mut socket).await;
-            if std::env::var("COCKPIT_RETRACT_DBG").is_ok() {
-                eprintln!(
-                    "RETRACT-DBG model server accepted request ({} bytes): {}",
-                    request.len(),
-                    &request[..request.len().min(240)]
-                );
-            }
-            captured_server.lock().unwrap().push(request);
-            socket
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-                )
-                .await
-                .expect("model writes stream headers");
-            socket
-                .write_all(stream_body.as_bytes())
-                .await
-                .expect("model writes stream body");
-            socket.flush().await.expect("model flushes stream body");
-            if hang {
-                let mut eof = [0_u8; 1];
-                let _ = socket.read(&mut eof).await;
-            }
-        }
-        // Absorb any stray utility/metadata requests without shifting the
-        // scripted stream sequence above.
-        loop {
-            let (mut socket, _) = listener.accept().await.expect("model accepts request");
-            let _ = read_retraction_acceptance_http_request(&mut socket).await;
-            socket
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
-data: {\"choices\":[{\"delta\":{\"content\":\"stray\"},\"finish_reason\":null}]}\n\n\
-data: [DONE]\n\n",
-                )
-                .await
-                .expect("model writes stray completion");
-            socket
-                .flush()
-                .await
-                .expect("model flushes stray completion");
-        }
-    });
-    (format!("http://{address}/v1"), captured, server)
+    ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::RawSseThenHang(format!(
+            "data: {assistant_role}\n\ndata: {reasoning}\n\n"
+        )))
+        .turn(Turn::RawSse(format!(
+            "data: {assistant_role}\n\ndata: {resent}\n\ndata: [DONE]\n\n"
+        )))
+        .turn(Turn::RawSseThenHang(format!(
+            "data: {assistant_role}\n\ndata: {visible}\n\n"
+        )))
+        .turn(Turn::ToolCall {
+            id: "read-before-cancel".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({"path": "fixture.txt"}),
+        })
+        .turn(Turn::SseHeadersThenHang)
+        .turn(Turn::RawSseThenHang(format!(
+            "data: {assistant_role}\n\ndata: {reasoning}\n\n"
+        )))
+        .start()
+        .await
 }
 
-async fn read_retraction_acceptance_http_request(socket: &mut tokio::net::TcpStream) -> String {
-    use tokio::io::AsyncReadExt;
-
-    let mut bytes = Vec::new();
-    let mut scratch = [0_u8; 4096];
-    loop {
-        let read = socket
-            .read(&mut scratch)
-            .await
-            .expect("model reads request");
-        assert!(read > 0, "model request ended before its HTTP headers");
-        bytes.extend_from_slice(&scratch[..read]);
-        let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
-            continue;
-        };
-        let headers = std::str::from_utf8(&bytes[..header_end]).expect("ASCII HTTP headers");
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                line.split_once(':').and_then(|(name, value)| {
-                    name.eq_ignore_ascii_case("content-length").then(|| {
-                        value
-                            .trim()
-                            .parse::<usize>()
-                            .expect("numeric content length")
-                    })
-                })
-            })
-            .expect("model request has a content length");
-        let body_start = header_end + 4;
-        if bytes.len() >= body_start + content_length {
-            return String::from_utf8(bytes[body_start..body_start + content_length].to_vec())
-                .expect("UTF-8 JSON request body");
-        }
-    }
+async fn wait_for_retraction_provider_request(
+    provider: &mut cockpit_test_support::provider::ScriptedProvider,
+    label: &str,
+) {
+    let request = provider.next_request().await;
+    assert!(
+        request.request_line.contains("/chat/completions"),
+        "{label} used the wrong provider surface: {}",
+        request.request_line
+    );
+    assert_eq!(
+        request.body.get("stream"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    provider.next_response_started().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -41718,13 +41993,36 @@ async fn daemon_startup_does_not_exec_foreign_owned_command() {
 #[tokio::test]
 async fn boot_with_db_resolves_referenced_command_secret() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    // In-memory DB so the pre-boot seed writes (spec save + ownership) take the
-    // synchronous memory path — safe inside a tokio test — and the shared handle
-    // is read by boot's own vault.
-    let db = crate::db::Db::open_in_memory().expect("temp db");
+    let db = crate::db::Db::open(&tmp.path().join("cockpit.db")).expect("temp db");
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.daemon.boot.secret_store_backend =
+        crate::config::extended::DaemonSecretStoreBackend::Auto;
+    let kek_dir = tmp.path().join("configured-vault");
+    extended.daemon.boot.secret_store_path = Some(kek_dir.clone());
+    let probe_root = tmp.path().join("container-probes");
+    extended.daemon.boot.container_probe_paths =
+        crate::config::extended::DaemonContainerProbePaths {
+            docker_env: probe_root.join("dockerenv"),
+            container_env: probe_root.join("containerenv"),
+            init_cgroup: probe_root.join("cgroup"),
+            self_mountinfo: probe_root.join("mountinfo"),
+        };
     // Seed the vault (via the same opener boot uses), ownership, and trust
     // BEFORE boot, then boot with a fixed config that references the command.
-    let vault = crate::secure_key::open_for_db(&db).expect("boot vault");
+    let file_backend_probe = crate::secure_key::KeyringProbeResult {
+        state: cockpit_proto::FeatureCapabilityState::Missing,
+        reason: "file-backed vault selected by daemon configuration".into(),
+        fix_command: None,
+        remedy_text: None,
+    };
+    let vault = crate::secure_key::ensure_secret_vault(
+        &db,
+        &file_backend_probe,
+        &kek_dir,
+        crate::secure_key::SecretStoreInjected::default(),
+    )
+    .expect("boot vault")
+    .vault;
     let mut store = crate::credentials::CredentialStore::from_vault(vault).unwrap();
     store
         .set_named_secret_command(
@@ -41748,11 +42046,9 @@ async fn boot_with_db_resolves_referenced_command_secret() {
             ..crate::config::providers::ProviderEntry::default()
         },
     );
-    let config_source = crate::daemon::config_source::ConfigSource::fixed(
-        providers,
-        crate::config::extended::ExtendedConfig::default(),
-    );
+    let config_source = crate::daemon::config_source::ConfigSource::fixed(providers, extended);
 
+    crate::secure_key::reset_keyring_probe_cache_for_test();
     let mut timer = crate::startup::PhaseTimer::start("boot_resolves_referenced_command");
     let ctx = boot_with_db(
         DaemonPaths {
@@ -41767,6 +42063,22 @@ async fn boot_with_db_resolves_referenced_command_secret() {
     )
     .await
     .expect("boot_with_db must succeed with startup command resolution wired in");
+
+    assert_eq!(
+        crate::secure_key::kek_dir_for_db(&ctx.db).expect("published vault authority"),
+        kek_dir,
+        "DB-only re-entry must retain the configured boot vault authority"
+    );
+    let reopened = crate::secure_key::open_for_db(&ctx.db).expect("reopen configured boot vault");
+    assert_eq!(
+        reopened.installation_hex(),
+        ctx.secret_vault.installation_hex()
+    );
+    assert_eq!(
+        crate::secure_key::keyring_probe_construct_count(),
+        1,
+        "Auto boot must construct the production keyring probe exactly once"
+    );
 
     assert!(
         ctx.registry
@@ -41825,20 +42137,21 @@ fn interrupt_provenance_requires_successful_event_enqueue() {
 /// the forwarded body must let that ack continuation run before asserting
 /// on the rendered set.
 async fn await_interrupt_marked_rendered(
+    event_cmd_tx: &mpsc::Sender<ClientEventCommand>,
     rendered: &Arc<StdMutex<HashSet<Uuid>>>,
     interrupt_id: Uuid,
-    label: &str,
+    _label: &str,
 ) {
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if crate::sync::lock_or_recover(rendered).contains(&interrupt_id) {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("timed out waiting for {label} interrupt to be marked rendered"));
+    let (done_tx, done_rx) = oneshot::channel();
+    event_cmd_tx
+        .send(ClientEventCommand::Barrier(done_tx))
+        .await
+        .expect("send event-forwarder barrier");
+    done_rx.await.expect("event-forwarder barrier completed");
+    assert!(
+        crate::sync::lock_or_recover(rendered).contains(&interrupt_id),
+        "{_label} interrupt was not marked rendered before the barrier"
+    );
 }
 
 #[tokio::test]
@@ -41907,7 +42220,13 @@ async fn socket_live_interrupt_provenance_tracks_the_attachment_that_received_th
     // Interrupt forwarding marks the rendered set only after the writer's
     // delivery ack resolves, which happens off this task. Wait for the mark
     // instead of racing the forwarder's ack continuation.
-    await_interrupt_marked_rendered(&old_rendered, old_interrupt_id, "old attachment").await;
+    await_interrupt_marked_rendered(
+        &event_cmd_tx,
+        &old_rendered,
+        old_interrupt_id,
+        "old attachment",
+    )
+    .await;
     assert!(crate::sync::lock_or_recover(&old_rendered).contains(&old_interrupt_id));
 
     let new_session_rx = session_tx.subscribe();
@@ -41920,7 +42239,12 @@ async fn socket_live_interrupt_provenance_tracks_the_attachment_that_received_th
         })
         .await
         .unwrap();
-    tokio::task::yield_now().await;
+    let (attached_tx, attached_rx) = oneshot::channel();
+    event_cmd_tx
+        .send(ClientEventCommand::Barrier(attached_tx))
+        .await
+        .unwrap();
+    attached_rx.await.unwrap();
     let new_interrupt_id = Uuid::new_v4();
     session_tx
         .send(test_event_envelope(proto::Event::InterruptRaised {
@@ -41939,7 +42263,13 @@ async fn socket_live_interrupt_provenance_tracks_the_attachment_that_received_th
         Body::Event { event: proto::Event::InterruptRaised { interrupt_id, .. } }
             if interrupt_id == new_interrupt_id
     ));
-    await_interrupt_marked_rendered(&new_rendered, new_interrupt_id, "new attachment").await;
+    await_interrupt_marked_rendered(
+        &event_cmd_tx,
+        &new_rendered,
+        new_interrupt_id,
+        "new attachment",
+    )
+    .await;
     assert!(!crate::sync::lock_or_recover(&new_rendered).contains(&old_interrupt_id));
     assert!(crate::sync::lock_or_recover(&new_rendered).contains(&new_interrupt_id));
 
@@ -41976,7 +42306,12 @@ async fn socket_live_interrupt_provenance_tracks_the_attachment_that_received_th
         })
         .await
         .unwrap();
-    tokio::task::yield_now().await;
+    let (attached_tx, attached_rx) = oneshot::channel();
+    event_cmd_tx
+        .send(ClientEventCommand::Barrier(attached_tx))
+        .await
+        .unwrap();
+    attached_rx.await.unwrap();
     session_tx
         .send(test_event_envelope(proto::Event::InterruptRaised {
             session_id,

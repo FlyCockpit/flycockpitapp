@@ -19,6 +19,7 @@ impl Session {
             title_recovery_nudge_state: row.title_recovery_nudge_state,
             title_failure_noticed: self.title_failure_noticed.load(Ordering::Relaxed),
             last_time_prelude: self.last_time_prelude.lock().unwrap().clone(),
+            replay_time_prelude: self.replay_time_prelude.lock().unwrap().clone(),
         })
     }
 
@@ -63,7 +64,8 @@ impl Session {
             consumed
         };
         if let Some(consumed) = consumed_time_prelude {
-            *self.retracted_time_prelude.lock().unwrap() = Some(consumed);
+            *self.replay_time_prelude.lock().unwrap() =
+                Some(consumed).or(snapshot.replay_time_prelude);
         }
         if outcome.title_restored {
             *self.title.lock().unwrap() = snapshot.title.clone();
@@ -79,6 +81,74 @@ impl Session {
         self.title_failure_noticed
             .store(snapshot.title_failure_noticed, Ordering::Relaxed);
         Ok(true)
+    }
+
+    /// Best-effort rollback for the sole latest-message ledger retraction.
+    /// A concurrent manual rename wins the SQL predicate and is never clobbered.
+    pub(crate) async fn restore_title_progress_after_retract(
+        &self,
+        snapshot: TitleProgressSnapshot,
+        generated_title: Option<&str>,
+    ) -> Result<()> {
+        let consumed_prelude = {
+            let mut last = self.last_time_prelude.lock().unwrap();
+            let consumed = (*last != snapshot.last_time_prelude)
+                .then(|| last.as_ref().cloned())
+                .flatten();
+            *last = snapshot.last_time_prelude.clone();
+            consumed
+        };
+        *self.replay_time_prelude.lock().unwrap() =
+            consumed_prelude.or(snapshot.replay_time_prelude);
+        let session_id = self.live_id();
+        let prior_title = snapshot.title.clone();
+        let generated_title = generated_title.map(str::to_owned);
+        let tokens = snapshot.user_content_tokens as i64;
+        let stage = i64::from(snapshot.title_stage);
+        let expected_user_renamed = snapshot.user_renamed;
+        let nudge_state = snapshot.title_recovery_nudge_state.as_i64();
+        let restoring_generated_title = generated_title.is_some();
+        let restored = self
+            .db
+            .transaction(move |conn| {
+                let restored = conn.execute(
+                    "UPDATE sessions
+                        SET user_content_tokens = ?1,
+                            title_stage = ?2,
+                            title_recovery_nudge_state = ?3,
+                            title = CASE WHEN ?4 IS NULL THEN title ELSE ?5 END
+                      WHERE session_id = ?6
+                        AND user_renamed = ?7
+                        AND (?4 IS NULL OR title = ?4)",
+                    params![
+                        tokens,
+                        stage,
+                        nudge_state,
+                        generated_title,
+                        prior_title,
+                        session_id.to_string(),
+                        expected_user_renamed
+                    ],
+                )?;
+                Ok(restored == 1)
+            })
+            .await?;
+        if restored {
+            if restoring_generated_title {
+                *self.title.lock().unwrap() = snapshot.title;
+            }
+            self.user_content_tokens
+                .store(snapshot.user_content_tokens, Ordering::Relaxed);
+            self.user_content_turns
+                .store(snapshot.user_content_turns, Ordering::Relaxed);
+            self.title_stage
+                .store(snapshot.title_stage, Ordering::Relaxed);
+            self.title_nudge_slot_pending
+                .store(snapshot.title_nudge_slot_pending, Ordering::Relaxed);
+            self.title_failure_noticed
+                .store(snapshot.title_failure_noticed, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Apply the combined output of the cache-reusing self-metadata fork.
@@ -566,9 +636,9 @@ impl Session {
     /// per-session "last prelude" stamp is the side-effect of a
     /// `Some` return — call only when actually about to send.
     pub fn take_time_prelude(&self, interval_minutes: u32) -> Option<String> {
-        if let Some(retracted) = self.retracted_time_prelude.lock().unwrap().take() {
-            *self.last_time_prelude.lock().unwrap() = Some(retracted);
-            return Some(format!("[time: {}]", retracted.to_rfc3339()));
+        if let Some(replay) = self.replay_time_prelude.lock().unwrap().take() {
+            *self.last_time_prelude.lock().unwrap() = Some(replay);
+            return Some(format!("[time: {}]", replay.to_rfc3339()));
         }
         let now = Utc::now();
         let mut last = self.last_time_prelude.lock().unwrap();
@@ -796,7 +866,7 @@ mod metadata_tests {
         )
         .unwrap();
         let pending = Utc::now() - chrono::Duration::minutes(1);
-        *session.retracted_time_prelude.lock().unwrap() = Some(pending);
+        *session.replay_time_prelude.lock().unwrap() = Some(pending);
         let snapshot = session.title_progress_snapshot().await.unwrap();
         let seq = session
             .db
@@ -820,6 +890,39 @@ mod metadata_tests {
             session.take_time_prelude(5),
             Some(format!("[time: {}]", pending.to_rfc3339()))
         );
+    }
+
+    #[tokio::test]
+    async fn retract_replays_the_exact_consumed_time_prelude_across_repeated_cancels() {
+        let session = Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            PathBuf::from("/title-retract-exact-time"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let first_snapshot = session.title_progress_snapshot().await.unwrap();
+        let first = session.take_time_prelude(5).unwrap();
+        session
+            .restore_title_progress_after_retract(first_snapshot, None)
+            .await
+            .unwrap();
+
+        let second_snapshot = session.title_progress_snapshot().await.unwrap();
+        assert_eq!(
+            session.take_time_prelude(5).as_deref(),
+            Some(first.as_str())
+        );
+        session
+            .restore_title_progress_after_retract(second_snapshot, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session.take_time_prelude(5).as_deref(),
+            Some(first.as_str())
+        );
+        assert!(session.take_time_prelude(5).is_none());
     }
 
     #[test]

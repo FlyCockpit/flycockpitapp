@@ -1265,7 +1265,7 @@ fn persistent_user_event_failure_defers_exact_payload_and_services_controls() {
         let run_tx = tx.clone();
         let run =
             tokio::spawn(async move { driver.run_main_loop(run_queue, control_rx, &run_tx).await });
-        let notice = async {
+        let notice = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 if let Some(TurnEvent::Notice { text }) = rx.recv().await
                     && text.contains("exact payload will be retried")
@@ -1273,8 +1273,9 @@ fn persistent_user_event_failure_defers_exact_payload_and_services_controls() {
                     break text;
                 }
             }
-        }
-        .await;
+        })
+        .await
+        .expect("persistent failure emits a bounded retry notice");
         assert!(notice.contains("exact payload will be retried"), "{notice}");
 
         drop(control_tx);
@@ -1305,7 +1306,10 @@ fn persistent_user_event_failure_defers_exact_payload_and_services_controls() {
         let mut expected = submission;
         expected.queue_item_ids = vec![id];
         expected.queue_target = Some(target);
-        let retried = queue.recv().await.expect("exact payload remains queued");
+        let retried = tokio::time::timeout(std::time::Duration::from_secs(2), queue.recv())
+            .await
+            .expect("deferred payload becomes runnable")
+            .expect("exact payload remains queued");
         assert_eq!(
             serde_json::to_value(retried).unwrap(),
             serde_json::to_value(expected).unwrap(),

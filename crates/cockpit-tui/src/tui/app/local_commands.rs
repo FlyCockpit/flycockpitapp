@@ -550,8 +550,12 @@ impl App {
         owns_working_span: bool,
         tag_expansions: &[cockpit_proto::TagExpansionMeta],
     ) -> DispatchOutcome {
+        let client_submission_id = cockpit_client::submission::derive_client_submission_id(
+            uuid::Uuid::now_v7(),
+            &submission.client_fingerprint(),
+        );
         self.dispatch_optimistic_user_submission_with_id(
-            uuid::Uuid::new_v4(),
+            client_submission_id,
             display,
             submission,
             error_prefix,

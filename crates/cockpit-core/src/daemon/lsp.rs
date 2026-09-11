@@ -822,7 +822,7 @@ impl LspClient {
             .kill_on_drop(true);
         #[cfg(unix)]
         cmd.process_group(0);
-        let mut child = cmd.spawn().with_context(|| {
+        let mut child = cockpit_host::process::spawn_pinned(cmd).with_context(|| {
             format!(
                 "spawning LSP server `{}` with `{}`",
                 recipe.id,

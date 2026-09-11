@@ -2382,7 +2382,7 @@ impl super::Db {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
+                        component_decimal(row, 2, "component generation")?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
@@ -2398,11 +2398,10 @@ impl super::Db {
             // shared with every other cleanup digest site.
             hasher.update(generation.to_string().as_bytes());
             hasher.update([0]);
-            let next_component = u64::try_from(*generation)
-                .context("component generation is not a positive integer")?
+            let next_component = generation
                 .checked_add(1)
                 .context("component generation overflow")?;
-            ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='cleanup_pending',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4",params![decimal(next_component)?,now_unix_ms,component_id,*generation])?==1,"discard component lost compare-and-swap");
+            ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='cleanup_pending',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4",params![decimal(next_component)?,now_unix_ms,component_id,decimal(*generation)?])?==1,"discard component lost compare-and-swap");
         }
         let digest = hex_lower(&hasher.finalize());
         conn.execute("INSERT INTO media_attachment_cleanup_intents(intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,'discard',?7)",params![Uuid::now_v7().to_string(),record.attachment_id.to_string(),decimal(record.attachment_version)?,decimal(next)?,decimal(record.reference_generation)?,digest,now_unix_ms])?;

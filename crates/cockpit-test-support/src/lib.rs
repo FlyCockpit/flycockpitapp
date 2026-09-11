@@ -58,6 +58,29 @@ fn test_env_mutex() -> &'static Mutex<()> {
     TEST_ENV_MUTEX.get_or_init(|| Mutex::new(()))
 }
 
+/// Create an isolated Cockpit home without coupling daemon/storage acceptance
+/// tests to unrelated compiler and linker traffic on the workspace disk.
+/// The HOME/XDG production inputs still provide every path consumed by the
+/// code under test; only the backing filesystem differs on Linux.
+pub fn isolated_tempdir() -> tempfile::TempDir {
+    #[cfg(target_os = "linux")]
+    {
+        // Respect the platform-standard override so loaded acceptance runs can
+        // exercise the ordinary disk-backed fallback explicitly. Otherwise
+        // prefer tmpfs, but do not make its presence a correctness condition.
+        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+            return tempfile::tempdir_in(tmpdir).expect("create isolated Cockpit home in TMPDIR");
+        }
+        tempfile::tempdir_in("/dev/shm")
+            .or_else(|_| tempfile::tempdir())
+            .expect("create isolated Cockpit home")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        tempfile::tempdir().expect("create isolated Cockpit home tempdir")
+    }
+}
+
 #[must_use]
 pub struct TestEnvGuard {
     _guard: MutexGuard<'static, ()>,
@@ -86,7 +109,7 @@ impl TestEnvGuard {
     }
 
     pub fn isolated_cockpit_home() -> Self {
-        let tempdir = tempfile::tempdir().expect("create isolated cockpit home tempdir");
+        let tempdir = isolated_tempdir();
         let root = tempdir.path().to_path_buf();
         let mut guard = Self::blocking_lock();
         guard.set_isolated_home(&root);
@@ -95,7 +118,7 @@ impl TestEnvGuard {
     }
 
     pub async fn isolated_cockpit_home_async() -> Self {
-        let tempdir = tempfile::tempdir().expect("create isolated cockpit home tempdir");
+        let tempdir = isolated_tempdir();
         let root = tempdir.path().to_path_buf();
         let mut guard = Self::lock().await;
         guard.set_isolated_home(&root);
@@ -264,7 +287,6 @@ pub fn workspace_root() -> PathBuf {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[derive(Clone, Copy)]
     struct AllowedMutation {
@@ -308,36 +330,38 @@ mod tests {
 
     #[tokio::test]
     async fn guard_serializes_concurrent_async_acquisition() {
-        let first_entered = Arc::new(AtomicBool::new(false));
-        let first_can_finish = Arc::new(AtomicBool::new(false));
-        let second_entered_while_first_held = Arc::new(AtomicBool::new(false));
-
-        let first_entered_for_task = Arc::clone(&first_entered);
-        let first_can_finish_for_task = Arc::clone(&first_can_finish);
+        let (first_entered_tx, first_entered_rx) = tokio::sync::oneshot::channel();
+        let (first_can_finish_tx, first_can_finish_rx) = tokio::sync::oneshot::channel();
+        let (second_entered_tx, mut second_entered_rx) = tokio::sync::oneshot::channel();
         let first = tokio::spawn(async move {
             let _guard = TestEnvGuard::lock().await;
-            first_entered_for_task.store(true, Ordering::SeqCst);
-            while !first_can_finish_for_task.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
+            first_entered_tx
+                .send(())
+                .expect("signal first guard acquisition");
+            first_can_finish_rx.await.expect("release first guard");
         });
 
-        while !first_entered.load(Ordering::SeqCst) {
-            tokio::task::yield_now().await;
-        }
+        first_entered_rx
+            .await
+            .expect("observe first guard acquisition");
 
-        let second_entered_while_first_held_for_task = Arc::clone(&second_entered_while_first_held);
         let second = tokio::spawn(async move {
             let _guard = TestEnvGuard::lock().await;
-            second_entered_while_first_held_for_task.store(true, Ordering::SeqCst);
+            second_entered_tx
+                .send(())
+                .expect("signal second guard acquisition");
         });
 
-        tokio::task::yield_now().await;
-        assert!(!second_entered_while_first_held.load(Ordering::SeqCst));
-        first_can_finish.store(true, Ordering::SeqCst);
+        assert!(
+            second_entered_rx.try_recv().is_err(),
+            "second guard acquired while first was held"
+        );
+        first_can_finish_tx.send(()).expect("release first guard");
         first.await.unwrap();
+        second_entered_rx
+            .await
+            .expect("observe second guard acquisition");
         second.await.unwrap();
-        assert!(second_entered_while_first_held.load(Ordering::SeqCst));
     }
 
     #[test]

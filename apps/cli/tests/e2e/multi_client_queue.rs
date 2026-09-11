@@ -21,8 +21,8 @@ async fn parked_scenario() -> ParkedScenario {
     let provider = queue_provider().await;
     let home = IsolatedHome::new();
     home.write_local_provider_config(&provider.base_url());
-    home.trust_project();
     let daemon = SpawnedDaemon::start_with_home(home).await;
+    daemon.home().trust_project();
     let client_a = daemon.client().await;
     let attached = client_a
         .attach(daemon.project_path(), None, None, true)
@@ -198,8 +198,8 @@ async fn second_window_sees_compact_user_message() {
     let provider = queue_provider().await;
     let home = IsolatedHome::new();
     home.write_local_provider_config(&provider.base_url());
-    home.trust_project();
     let daemon = SpawnedDaemon::start_with_home(home).await;
+    daemon.home().trust_project();
     let client_a = daemon.client().await;
     let attached = client_a
         .attach(daemon.project_path(), None, None, true)

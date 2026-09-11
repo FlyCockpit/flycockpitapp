@@ -3331,6 +3331,7 @@ pub(super) async fn handle_request(
 fn v2_terminal_client_submission_probe(
     request: &crate::proto_crate::send_user_message_v2::SendUserMessageV2,
     origin_principal: Option<String>,
+    run_invocation_options: Option<&proto::RunInvocationOptions>,
 ) -> crate::engine::message::UserSubmission {
     crate::engine::message::UserSubmission {
         origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
@@ -3348,6 +3349,7 @@ fn v2_terminal_client_submission_probe(
         forced_skill: request.forced_skill.clone(),
         delivery_class_override: request.delivery_class_override,
         delivery_class: request.delivery_class_override.unwrap_or_default(),
+        run_invocation_id: run_invocation_options.map(|_| request.client_submission_id),
         origin_principal,
         ..Default::default()
     }
@@ -3506,7 +3508,7 @@ async fn handle_send_user_message_v2(
         .map_err(internal)?,
     )
     .into();
-    let canonical = if let Some(stored) = ctx
+    let (canonical, durable_canonical_replay) = if let Some(stored) = ctx
         .db
         .canonical_message_for_operation(session_id, *validated.operation_id.as_bytes())
         .await
@@ -3521,7 +3523,7 @@ async fn handle_send_user_message_v2(
                 message: "message operation identity conflicts with a durable receipt".into(),
             });
         }
-        stored
+        (stored, true)
     } else {
         let (model_config_generation, canonical_model_digest) = match authoritative_model.as_ref() {
             None => (
@@ -3535,13 +3537,16 @@ async fn handle_send_user_message_v2(
                 (model.generation, Sha256::digest(digest_input).into())
             }
         };
-        crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2 {
-            session_id,
-            canonical_project_digest: project_digest_bytes,
-            model_config_generation,
-            canonical_model_digest,
-            request: request.clone(),
-        }
+        (
+            crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2 {
+                session_id,
+                canonical_project_digest: project_digest_bytes,
+                model_config_generation,
+                canonical_model_digest,
+                request: request.clone(),
+            },
+            false,
+        )
     };
     let canonical_message = canonical.encode().map_err(|error| ErrorPayload {
         code: ErrorCode::BadRequest,
@@ -3577,12 +3582,58 @@ async fn handle_send_user_message_v2(
         .await
         .map_err(internal)?
     {
-        let probe = v2_terminal_client_submission_probe(&request, state.principal.tag());
+        let origin_principal = state.principal.tag();
+        if !durable_canonical_replay
+            && terminal.origin_principal.as_deref() != origin_principal.as_deref()
+        {
+            return Err(ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: format!(
+                    "client_submission_id {} was already used by a different principal",
+                    request.client_submission_id
+                ),
+            });
+        }
+        // The worker fingerprint is deliberately replay-neutral for the
+        // already-validated model fence and contains normalized media bytes
+        // unavailable at this early probe. The durable canonical acceptance
+        // is therefore the authoritative payload identity for every V2 retry.
+        // A terminal worker has already drained the queue item. The durable
+        // operation receipt loaded above is the surviving exact payload
+        // binding, and its decoded request was compared field-for-field.
+        let probe = v2_terminal_client_submission_probe(
+            &request,
+            origin_principal,
+            validated.run_invocation_options.as_ref(),
+        );
         let wire_fingerprint = v2_terminal_client_submission_wire_fingerprint(
             &request,
             validated.run_invocation_options.as_ref(),
         );
-        if terminal.origin_principal.as_deref() != probe.origin_principal.as_deref() {
+        let canonical_wire_fingerprint =
+            format!("fcm2:{}", crate::intel::hex_lower(&message_request_digest));
+        let exact_canonical_replay = durable_canonical_replay
+            || terminal.wire_fingerprint == canonical_wire_fingerprint
+            || terminal.wire_fingerprint == wire_fingerprint
+            || terminal.fingerprint == probe.client_fingerprint();
+        // Run bounds have their own durable, submission-keyed ledger. The
+        // terminal receipt can predate that suffix or be reconstructed from
+        // a canonical FCM2 receipt, so it is not the authority for options.
+        let durable_run = ctx
+            .db
+            .get_run_invocation(request.client_submission_id)
+            .await
+            .map_err(internal)?;
+        let run_identity_matches = match (validated.run_invocation_options.as_ref(), durable_run) {
+            (Some(options), Some(run)) => {
+                run.session_id == session_id
+                    && run.origin_principal_digest == principal_digest(&state.principal)
+                    && run.options_digest == run_invocation::options_digest(options)
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if !exact_canonical_replay || !run_identity_matches {
             return Err(ErrorPayload {
                 code: ErrorCode::BadRequest,
                 message: format!(
@@ -3736,7 +3787,12 @@ async fn handle_send_user_message_v2(
         crate::db::db::message_attachments::AcceptMessageResult::Replayed { safe_outcome } => {
             use crate::db::db::message_attachments::MessageSafeOutcome;
             match safe_outcome {
-                MessageSafeOutcome::Accepted { .. } => {}
+                // Acceptance durably enqueues the canonical message in the
+                // same transaction as its operation and attachment receipts.
+                // An exact retry must therefore acknowledge that committed
+                // intent instead of attempting a second in-memory delivery;
+                // recovery owns draining the durable queue after a crash.
+                MessageSafeOutcome::Accepted { .. } => return Ok(Response::Ack),
                 MessageSafeOutcome::Materialized { .. } => return Ok(Response::Ack),
                 MessageSafeOutcome::TerminalRejected => {
                     if let Err(error) = ctx
@@ -3827,6 +3883,10 @@ async fn handle_send_user_message_v2(
         media,
         true,
         true,
+        Some(format!(
+            "fcm2:{}",
+            crate::intel::hex_lower(&message_request_digest)
+        )),
         request.forced_skill,
         request.delivery_class_override,
         validated.run_invocation_options,
@@ -4057,6 +4117,7 @@ async fn handle_send_user_message(
     media: Vec<crate::engine::message::SubmissionMedia>,
     durable_message_receipt: bool,
     durable_run_invocation_bound: bool,
+    canonical_wire_fingerprint: Option<String>,
     forced_skill: Option<String>,
     delivery_class_override: Option<proto::QueueDeliveryClass>,
     run_invocation_options: Option<proto::RunInvocationOptions>,
@@ -4136,26 +4197,31 @@ async fn handle_send_user_message(
     } else {
         None
     };
-    let mut wire_fingerprint = user_message_wire_fingerprint_bytes(
-        origin,
-        &text,
-        display_text.as_deref(),
-        &tag_expansions,
-        &images,
-        &media,
-        forced_skill.as_deref(),
-    );
-    if let Some(delivery_class) = delivery_class_override {
-        wire_fingerprint.push_str(match delivery_class {
-            proto::QueueDeliveryClass::Steering => "|delivery:steering",
-            proto::QueueDeliveryClass::Held => "|delivery:held",
-        });
-    }
-    if let (Some(generation), Some(model)) =
-        (expected_model_state_generation, expected_model.as_ref())
-    {
-        let model_json = serde_json::to_string(model).map_err(internal)?;
-        wire_fingerprint.push_str(&format!("|model:{generation}:{model_json}"));
+    let canonical_worker_receipt = canonical_wire_fingerprint.is_some();
+    let mut wire_fingerprint = canonical_wire_fingerprint.unwrap_or_else(|| {
+        user_message_wire_fingerprint_bytes(
+            origin,
+            &text,
+            display_text.as_deref(),
+            &tag_expansions,
+            &images,
+            &media,
+            forced_skill.as_deref(),
+        )
+    });
+    if !canonical_worker_receipt {
+        if let Some(delivery_class) = delivery_class_override {
+            wire_fingerprint.push_str(match delivery_class {
+                proto::QueueDeliveryClass::Steering => "|delivery:steering",
+                proto::QueueDeliveryClass::Held => "|delivery:held",
+            });
+        }
+        if let (Some(generation), Some(model)) =
+            (expected_model_state_generation, expected_model.as_ref())
+        {
+            let model_json = serde_json::to_string(model).map_err(internal)?;
+            wire_fingerprint.push_str(&format!("|model:{generation}:{model_json}"));
+        }
     }
     // Include immutable run options in the fingerprint so option drift
     // conflicts. V2 inline/media has already persisted the invocation in its
@@ -4163,7 +4229,9 @@ async fn handle_send_user_message(
     // to the worker, which creates it atomically with phase one.
     if let Some(options) = &run_invocation_options {
         let opts_digest = run_invocation::options_digest(options);
-        wire_fingerprint = format!("{wire_fingerprint}|run:{opts_digest}");
+        if !canonical_worker_receipt {
+            wire_fingerprint = format!("{wire_fingerprint}|run:{opts_digest}");
+        }
         if durable_run_invocation_bound {
             // V2 inline/media admission persisted this exact invocation in the
             // same transaction as the message receipt and attachment refs.
@@ -4255,14 +4323,31 @@ async fn handle_send_user_message(
         delivery_class: delivery_class_override.unwrap_or_default(),
         delivery_class_override,
     };
-    let fingerprint = submission.client_fingerprint();
+    // FCM2's canonical message digest is the durable content identity.  The
+    // startup outbox reconstruction intentionally omits replay-neutral live
+    // fields (model fence and principal tag), so its receipt must not derive
+    // a different legacy client fingerprint from that reduced submission.
+    let fingerprint = if canonical_worker_receipt {
+        wire_fingerprint.clone()
+    } else {
+        submission.client_fingerprint()
+    };
+    let receipt_origin_principal = if canonical_worker_receipt {
+        // Actor ownership was already authenticated and durably bound by the
+        // FCM2 operation receipt. Startup reconstruction deliberately carries
+        // no live connection principal, so the worker-level replay receipt is
+        // principal-neutral on both paths.
+        None
+    } else {
+        origin_principal
+    };
     submission
         .client_submissions
         .push(crate::engine::message::ClientSubmissionReceipt {
             id: client_submission_id,
             fingerprint,
             wire_fingerprint,
-            origin_principal,
+            origin_principal: receipt_origin_principal,
         });
     handle
         .send_work(SessionWork::UserMessage {
@@ -4643,6 +4728,7 @@ async fn handle_send_user_message_bulk(
         Vec::new(),
         false,
         false,
+        None,
         forced_skill,
         delivery_class_override,
         run_invocation_options,
@@ -5210,10 +5296,13 @@ pub(super) async fn execute_remote_staged_rename_with_hook(
     };
     use crate::external_journal::{DirGuard, HeldRenameEffect, RemoteRenameArtifactV1};
 
-    let journal = ctx.external_journal.as_ref().ok_or_else(|| ErrorPayload {
-        code: ErrorCode::Unavailable,
-        message: "remote staged rename recovery authority is unavailable".into(),
-    })?;
+    let journal = ctx
+        .registry
+        .external_journal_handle()
+        .ok_or_else(|| ErrorPayload {
+            code: ErrorCode::Unavailable,
+            message: "remote staged rename recovery authority is unavailable".into(),
+        })?;
     journal
         .ensure_dispatch_allowed()
         .await
@@ -11756,7 +11845,7 @@ async fn handle_serialized_request_impl(
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
-                if ctx.external_journal.is_some() {
+                if ctx.registry.external_journal_handle().is_some() {
                     let request = Request::FsRename {
                         project_root,
                         from_path,
@@ -14114,7 +14203,7 @@ async fn handle_serialized_request_impl(
                 mode: applied.effective,
                 enabled: applied.effective.enabled(),
                 container_network_enabled: att.handle.container_network_enabled(),
-                container_availability: crate::container::availability_snapshot(),
+                container_availability: crate::container::availability_snapshot_for_db(&ctx.db),
                 persisted_intent: Some(applied.persisted_intent.into()),
             };
             finish_nonrepeatable_response!(remote_operation, ctx, "set_sandbox", response)
@@ -20427,6 +20516,7 @@ async fn handle_concurrent_request_impl(
         Request::GetAgentEditSnapshot { project_root, name } => {
             crate::daemon::agent_management::edit_snapshot(&ctx, project_root, name).await
         }
+        Request::GetStorageReport => super::storage::report(&ctx).await,
         // Settlement polling is a pure read over the durable lease registry and
         // must stay reachable while the serialized queue is busy — a client
         // recovering an interrupted `CompleteAgentEditorLease` polls this while
@@ -20704,13 +20794,21 @@ async fn migrate_kek_placement_request(
         None => crate::secure_key::probe_platform_keyring(),
     };
     let db = ctx.db.clone();
-    let snapshot = tokio::task::spawn_blocking(move || {
-        crate::secure_key::migrate_installation_kek(
+    let kek_dir = ctx.secret_store_path.clone();
+    let snapshot = tokio::task::spawn_blocking(move || match kek_dir {
+        Some(kek_dir) => crate::secure_key::migrate_installation_kek_at(
+            &db,
+            dest,
+            &probe,
+            &kek_dir,
+            crate::secure_key::SecretStoreInjected::default(),
+        ),
+        None => crate::secure_key::migrate_installation_kek(
             &db,
             dest,
             &probe,
             crate::secure_key::SecretStoreInjected::default(),
-        )
+        ),
     })
     .await
     .map_err(|e| ErrorPayload {
@@ -29803,6 +29901,10 @@ pub(super) async fn attach(
             .map_err(internal)?;
         att.handle.broadcast_gitignore_allow();
         att.handle.broadcast_active_interrupt().await;
+        att.handle
+            .broadcast_interrupted_interrupts()
+            .await
+            .map_err(internal)?;
         att.handle.broadcast_sandbox_state();
         att.handle.broadcast_sandbox_escalation();
         att.handle.broadcast_sandbox_unavailable_or_probe();
@@ -29832,7 +29934,6 @@ pub(super) async fn attach(
             let (history, replay_max_seq, removed_user_message_seqs) = if let Some(since_seq) = since_seq {
                 let replay_rows =
                     crate::db::Db::list_session_events_since_conn(conn, session_id, since_seq)?;
-                let replay_max_seq = replay_rows.iter().map(|row| row.seq).max();
                 // A retraction deletes its user row, so normal transcript
                 // projection has nothing to render for it. Preserve the
                 // tombstone's target identity as a narrow replay operation:
@@ -29847,6 +29948,11 @@ pub(super) async fn attach(
                             .and_then(serde_json::Value::as_i64)
                     })
                     .collect();
+                let retraction_max_seq = replay_rows
+                    .iter()
+                    .filter(|row| row.kind == "user_message_retracted")
+                    .map(|row| row.seq)
+                    .max();
                 let history = crate::engine::rehydrate::history_snapshot_from_events_conn(
                     conn,
                     session_id,
@@ -29854,6 +29960,19 @@ pub(super) async fn attach(
                     active_subagent_for_attach.as_ref(),
                     replay_rows,
                 )?;
+                // The cursor acknowledges only rows represented in this replay
+                // batch. Internal lifecycle events are deliberately omitted
+                // from `HistoryReplay`; advancing over them would claim the
+                // client received state it never saw. Retraction tombstones are
+                // represented by `removed_user_message_seqs`, so their own
+                // event seq still participates in the high-water mark.
+                let replay_max_seq = history
+                    .iter()
+                    .map(history_entry_seq)
+                    .max()
+                    .into_iter()
+                    .chain(retraction_max_seq)
+                    .max();
                 (history, replay_max_seq, removed_user_message_seqs)
             } else {
                 // A full snapshot is merged with retained paged/live rows by

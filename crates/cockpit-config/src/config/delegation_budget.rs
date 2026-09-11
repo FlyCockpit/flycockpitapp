@@ -153,6 +153,8 @@ impl DelegationBudgetSpec {
             max_output_tokens: overlay_u64(self.max_output_tokens, base.max_output_tokens),
             max_cost_microusd: overlay_u64(self.max_cost_microusd, base.max_cost_microusd),
             max_wall_clock: overlay_duration(self.max_wall_clock_secs, base.max_wall_clock),
+            cost_ceiling_configured: base.cost_ceiling_configured
+                || self.max_cost_microusd.is_some(),
         }
     }
 }
@@ -216,6 +218,9 @@ pub struct ResolvedDelegationBudget {
     pub max_output_tokens: Option<u64>,
     pub max_cost_microusd: Option<u64>,
     pub max_wall_clock: Option<Duration>,
+    /// `true` when any config layer explicitly set `max_cost_microusd` (finite
+    /// or `"unlimited"`). Compiled defaults alone do not count.
+    pub cost_ceiling_configured: bool,
 }
 
 impl ResolvedDelegationBudget {
@@ -227,6 +232,7 @@ impl ResolvedDelegationBudget {
             max_output_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
             max_cost_microusd: Some(DEFAULT_MAX_COST_MICROUSD),
             max_wall_clock: Some(Duration::from_secs(DEFAULT_MAX_WALL_CLOCK_SECS)),
+            cost_ceiling_configured: false,
         }
     }
 
@@ -238,6 +244,7 @@ impl ResolvedDelegationBudget {
             max_output_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
             max_cost_microusd: Some(DEFAULT_MAX_COST_MICROUSD),
             max_wall_clock: Some(Duration::from_secs(DEFAULT_MAX_WALL_CLOCK_SECS)),
+            cost_ceiling_configured: false,
         }
     }
 
@@ -250,6 +257,7 @@ impl ResolvedDelegationBudget {
             max_output_tokens: None,
             max_cost_microusd: None,
             max_wall_clock: None,
+            cost_ceiling_configured: false,
         }
     }
 
@@ -269,6 +277,7 @@ impl ResolvedDelegationBudget {
             max_output_tokens: min_opt(self.max_output_tokens, other.max_output_tokens),
             max_cost_microusd: min_opt(self.max_cost_microusd, other.max_cost_microusd),
             max_wall_clock: min_opt(self.max_wall_clock, other.max_wall_clock),
+            cost_ceiling_configured: self.cost_ceiling_configured || other.cost_ceiling_configured,
         }
     }
 
@@ -281,6 +290,7 @@ impl ResolvedDelegationBudget {
             max_output_tokens: remaining_u64(self.max_output_tokens, spent.output_tokens),
             max_cost_microusd: remaining_u64(self.max_cost_microusd, spent.cost_microusd),
             max_wall_clock: remaining_duration(self.max_wall_clock, spent.elapsed),
+            cost_ceiling_configured: self.cost_ceiling_configured,
         }
     }
 }
@@ -436,6 +446,7 @@ mod tests {
             max_output_tokens: Some(100),
             max_cost_microusd: Some(50),
             max_wall_clock: None,
+            cost_ceiling_configured: false,
         };
         let child = ResolvedDelegationBudget {
             max_rounds: Some(8),
@@ -443,6 +454,7 @@ mod tests {
             max_output_tokens: None,
             max_cost_microusd: Some(80),
             max_wall_clock: Some(Duration::from_secs(5)),
+            cost_ceiling_configured: false,
         };
         let got = parent.intersect(child);
         assert_eq!(got.max_rounds, Some(8));
@@ -503,6 +515,25 @@ mod tests {
         let config = DelegationBudgetConfig::default();
         let resolved = resolve_schedule_run_budget(&config);
         assert_eq!(resolved.max_rounds, Some(DEFAULT_SCHEDULE_RUN_MAX_ROUNDS));
+    }
+
+    #[test]
+    fn compiled_default_cost_ceiling_does_not_count_as_configured() {
+        let resolved =
+            resolve_delegation_budget(&DelegationBudgetConfig::default(), "Build", None, None, 0);
+        assert_eq!(resolved.max_cost_microusd, Some(DEFAULT_MAX_COST_MICROUSD));
+        assert!(!resolved.cost_ceiling_configured);
+    }
+
+    #[test]
+    fn explicit_finite_cost_ceiling_is_configured() {
+        let config = DelegationBudgetConfig {
+            max_cost_microusd: Some(SpendLimit::Finite(42)),
+            ..DelegationBudgetConfig::default()
+        };
+        let resolved = resolve_delegation_budget(&config, "Build", None, None, 0);
+        assert_eq!(resolved.max_cost_microusd, Some(42));
+        assert!(resolved.cost_ceiling_configured);
     }
 
     #[test]

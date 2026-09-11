@@ -194,13 +194,7 @@ async fn replace_socket_fixture(daemon: &SpawnedDaemon, fixture: &serde_json::Va
         serde_json::to_vec(fixture).expect("serialize replacement fixture"),
     )
     .expect("replace non-secret agent fixture");
-    let restart = daemon
-        .command()
-        .args(["daemon", "restart", "--grace", "0"])
-        .output()
-        .expect("restart fixture daemon");
-    assert!(restart.status.success(), "{}", output_text(&restart));
-    daemon.wait_for_handshake().await;
+    daemon.restart_same_home().await;
 }
 
 fn installation_id(output: &str) -> String {

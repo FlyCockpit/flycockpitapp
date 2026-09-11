@@ -1,10 +1,9 @@
-use std::time::Duration;
-
-use crate::support::{SpawnedDaemon, output_text, wait_until};
+use crate::support::{SpawnedDaemon, output_text};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawned_daemon_start_status_stop_round_trip() {
     let daemon = SpawnedDaemon::start().await;
+    let isolated_root = daemon.home().home_dir().to_path_buf();
 
     let output = daemon
         .command()
@@ -13,6 +12,13 @@ async fn spawned_daemon_start_status_stop_round_trip() {
         .expect("daemon status command");
     assert!(output.status.success(), "{}", output_text(&output));
     assert!(output_text(&output).contains("daemon: running"));
+
+    drop(daemon);
+    assert!(
+        !isolated_root.exists(),
+        "exact child reap must finish before isolated-home removal: {}",
+        isolated_root.display()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -32,7 +38,7 @@ async fn typed_client_sends_request_and_receives_event() {
     // that initial state so the assertion below observes this request's
     // transition rather than the connection snapshot.
     let initial = client
-        .next_caffeinate_state(Duration::from_secs(5))
+        .next_caffeinate_state_unbounded()
         .await
         .expect("initial caffeinate state");
     assert!(!initial.active);
@@ -43,7 +49,7 @@ async fn typed_client_sends_request_and_receives_event() {
         .expect("set caffeinate response");
 
     let event = client
-        .next_caffeinate_state(Duration::from_secs(5))
+        .next_caffeinate_state_unbounded()
         .await
         .expect("caffeinate event");
     assert_eq!(event.active, response.active);
@@ -71,40 +77,29 @@ async fn restart_running_daemon_replaces_pid_and_keeps_socket_usable() {
     let daemon = SpawnedDaemon::start().await;
     let old_pid = daemon.pid();
 
-    let output = daemon
-        .command()
-        .args(["daemon", "restart", "--grace", "0"])
-        .output()
-        .expect("daemon restart command");
+    let output = daemon.restart_via_command(0).await;
     assert!(output.status.success(), "{}", output_text(&output));
     assert!(output_text(&output).contains("daemon: restarted"));
 
-    wait_until("replacement daemon pid", Duration::from_secs(5), || async {
-        daemon.try_pid().is_some_and(|pid| pid != old_pid)
-    })
-    .await;
-    daemon.wait_for_handshake().await;
+    assert_ne!(
+        daemon.pid(),
+        old_pid,
+        "restart must publish a new generation"
+    );
+    daemon.status().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_when_not_running_starts_daemon() {
     let daemon = SpawnedDaemon::start().await;
-    let stop = daemon
-        .command()
-        .args(["daemon", "stop", "--grace", "0"])
-        .output()
-        .expect("daemon stop command");
+    let stop = daemon.stop_via_command(0);
     assert!(stop.status.success(), "{}", output_text(&stop));
-    wait_until("daemon pid cleanup", Duration::from_secs(5), || async {
-        daemon.try_pid().is_none()
-    })
-    .await;
+    assert!(
+        daemon.try_pid().is_none(),
+        "stop success must retire pid metadata"
+    );
 
-    let output = daemon
-        .command()
-        .args(["daemon", "restart", "--grace", "0"])
-        .output()
-        .expect("daemon restart command");
+    let output = daemon.restart_via_command(0).await;
     assert!(output.status.success(), "{}", output_text(&output));
     assert!(
         output_text(&output).contains("daemon: was not running; started"),
@@ -112,6 +107,39 @@ async fn restart_when_not_running_starts_daemon() {
         output_text(&output)
     );
 
+    daemon.wait_for_handshake().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_with_unreachable_socket_waits_for_exact_daemon_retirement() {
+    let daemon = SpawnedDaemon::start().await;
+    let output = daemon.stop_via_unreachable_socket();
+
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(
+        output_text(&output).contains("socket unreachable; used SIGTERM"),
+        "{}",
+        output_text(&output)
+    );
+    assert!(
+        daemon.try_pid().is_none(),
+        "stop success must retire pid metadata"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_with_unreachable_socket_retires_then_replaces_exact_daemon() {
+    let daemon = SpawnedDaemon::start().await;
+    let old_pid = daemon.pid();
+
+    let output = daemon.restart_via_unreachable_socket().await;
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(output_text(&output).contains("daemon: restarted"));
+    assert_ne!(
+        daemon.pid(),
+        old_pid,
+        "restart must publish a new generation"
+    );
     daemon.wait_for_handshake().await;
 }
 

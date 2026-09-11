@@ -1236,6 +1236,16 @@ mod tests {
     #[test]
     fn run_wrapper_owns_a_descendant_supervisor_before_launch() {
         let source = include_str!("validation.rs");
+        for required in [
+            "ProcessTreeGuard::prepare",
+            "containment.attach(&child)",
+            "terminate_and_wait_empty",
+        ] {
+            assert!(
+                source.contains(required),
+                "Windows validation containment contract is missing {required}"
+            );
+        }
         #[cfg(not(target_os = "linux"))]
         let process_group = ["process_group", "(0)"].concat();
         #[cfg(not(target_os = "linux"))]

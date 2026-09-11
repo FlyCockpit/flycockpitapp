@@ -681,8 +681,12 @@ mod tests {
         let response = ResolveResponse::Single {
             selected_id: "pg".into(),
         };
+        // Wake the registered continuation before projecting the terminal row.
+        // `register_durable` reconciles a pre-resolved interrupt at `wait()`
+        // time, so resolving the DB first can complete the tool without leaving
+        // a live waiter for `hub.resolve`.
+        assert!(hub.resolve(iid, response.clone()));
         db.resolve_interrupt(iid, &response).await.unwrap();
-        assert!(hub.resolve(iid, response));
 
         let out = call.await.unwrap().unwrap();
         assert!(out.content.contains("DB? → Postgres"));

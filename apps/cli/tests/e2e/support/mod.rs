@@ -192,7 +192,7 @@ impl IsolatedHome {
         // finite cost ceiling (issue #313). Model them with a legitimate $0
         // price row so multi-round scripts charge real (zero-cost) usage
         // instead of tripping `budget exhausted (cost)` after round one.
-        let prices_home = self._root.path().join(".cockpit");
+        let prices_home = self.home_dir().join(".cockpit");
         std::fs::create_dir_all(&prices_home).expect("create isolated prices dir");
         std::fs::write(
             prices_home.join("prices.json"),

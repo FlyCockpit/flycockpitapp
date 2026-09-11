@@ -72,7 +72,8 @@ struct StartingMockSecretService {
     stop: tokio::sync::oneshot::Sender<()>,
     service: JoinHandle<()>,
     address: String,
-    ready: Option<tokio::sync::oneshot::Receiver<()>>,
+    sync_ready: Option<std::sync::mpsc::Receiver<()>>,
+    async_ready: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 impl StartingMockSecretService {
@@ -114,7 +115,8 @@ fn begin_mock_secret_service() -> StartingMockSecretService {
     );
 
     let address_for_thread = address.clone();
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (sync_ready_tx, sync_ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (async_ready_tx, async_ready_rx) = tokio::sync::oneshot::channel();
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let handle = std::thread::Builder::new()
         .name("cockpit-e2e-secret-service".into())
@@ -124,7 +126,7 @@ fn begin_mock_secret_service() -> StartingMockSecretService {
                 .build()
                 .expect("secret-service runtime");
             runtime.block_on(async move {
-                serve(&address_for_thread, ready_tx, stop_rx).await;
+                serve(&address_for_thread, sync_ready_tx, async_ready_tx, stop_rx).await;
             });
         })
         .expect("spawn secret-service thread");
@@ -134,7 +136,8 @@ fn begin_mock_secret_service() -> StartingMockSecretService {
         stop: stop_tx,
         service: handle,
         address,
-        ready: Some(ready_rx),
+        sync_ready: Some(sync_ready_rx),
+        async_ready: Some(async_ready_rx),
     }
 }
 
@@ -142,12 +145,16 @@ fn begin_mock_secret_service() -> StartingMockSecretService {
 /// `start_mock_secret_service_async` so readiness never blocks a runtime
 /// worker.
 pub fn start_mock_secret_service() -> MockSecretService {
+    assert!(
+        tokio::runtime::Handle::try_current().is_err(),
+        "async callers must await start_mock_secret_service_async"
+    );
     let mut starting = begin_mock_secret_service();
     starting
-        .ready
+        .sync_ready
         .take()
         .expect("readiness receiver")
-        .blocking_recv()
+        .recv()
         .expect("mock secret service failed before claiming the bus");
     starting.finish()
 }
@@ -155,7 +162,7 @@ pub fn start_mock_secret_service() -> MockSecretService {
 pub async fn start_mock_secret_service_async() -> MockSecretService {
     let mut starting = begin_mock_secret_service();
     starting
-        .ready
+        .async_ready
         .take()
         .expect("readiness receiver")
         .await
@@ -165,7 +172,8 @@ pub async fn start_mock_secret_service_async() -> MockSecretService {
 
 async fn serve(
     address: &str,
-    ready: tokio::sync::oneshot::Sender<()>,
+    sync_ready: std::sync::mpsc::SyncSender<()>,
+    async_ready: tokio::sync::oneshot::Sender<()>,
     stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
     let state = Arc::new(Mutex::new(ServiceState::new()));
@@ -200,7 +208,12 @@ async fn serve(
             .expect("serve item slot");
     }
     let _conn = builder.build().await.expect("start mock secret service");
-    ready.send(()).expect("signal secret-service readiness");
+    sync_ready
+        .send(())
+        .expect("signal synchronous secret-service readiness");
+    async_ready
+        .send(())
+        .expect("signal asynchronous secret-service readiness");
     let _ = stop_rx.await;
 }
 
@@ -222,6 +235,10 @@ struct StoredItem {
 mod startup_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn mock_secret_service_startup_is_async_runtime_safe() {
+        assert!(
+            std::panic::catch_unwind(super::start_mock_secret_service).is_err(),
+            "sync startup must reject runtime-worker callers before blocking"
+        );
         let service = super::start_mock_secret_service_async().await;
         assert!(!service.address.is_empty());
     }

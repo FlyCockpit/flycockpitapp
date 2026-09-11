@@ -19967,7 +19967,8 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "discard_unreferenced_media_attachment" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
-        "discard_image_ingress_draft" | "resolve_agent_decision" => {
+        "discard_image_ingress_draft" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        "resolve_agent_decision" => {
             AuthzAllowedOutcome::Error(ErrorCode::Internal)
         }
         "apply_agent_session_override" => AuthzAllowedOutcome::Response,
@@ -20085,14 +20086,16 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // live session. The session-writer gate passes, then the store lookup
         // maps a missing media-egress verdict to the typed `NotFound`.
         "revoke_media_egress_verdict" => AuthzAllowedOutcome::Error(ErrorCode::NotFound),
-        // Image-sidecar Get has its own attach gate. Create/Revoke traverse the
-        // attached owner path, then reject the matrix's deliberately fabricated
-        // candidate/grant identities as typed request errors.
+        // Image-sidecar Get is a concurrent handler with its own attach gate
+        // (`BadRequest`). Create/Revoke go through serialized
+        // `require_attached` (`NotAttached`). The default owner matrix probe is
+        // detached, so the owner cell surfaces those attach errors after the
+        // owner-only check.
         "get_image_sidecar_authority_snapshot" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
         "create_image_sidecar_grant" | "revoke_image_sidecar_grant" => {
-            AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
+            AuthzAllowedOutcome::Error(ErrorCode::NotAttached)
         }
         // Coordinator failures are carried in a typed redacted DTO, so every
         // owner-authorized installation endpoint reaches a response rather

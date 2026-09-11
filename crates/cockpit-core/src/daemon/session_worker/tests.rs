@@ -5448,7 +5448,7 @@ async fn malformed_claimed_parked_rows_emit_exact_interrupted_completion_after_c
                 row.questions = None;
             }
         }
-        assert_eq!(claimed_parked_replay_parts(&row), Err(malformed));
+        assert_eq!(claimed_parked_replay_parts(&row).unwrap_err(), malformed);
         assert!(
             mark_client_visible_interrupt_interrupted(
                 &session,

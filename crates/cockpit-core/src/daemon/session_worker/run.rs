@@ -3242,10 +3242,10 @@ pub(super) fn stored_goal_settings_override(
 }
 
 pub(super) struct ParkedReplayCompletion {
-    interrupt_id: uuid::Uuid,
-    decision: Option<proto::InterruptDecision>,
-    was_active: bool,
-    result: std::result::Result<crate::engine::driver::ParkedReplayOutcome, String>,
+    pub(super) interrupt_id: uuid::Uuid,
+    pub(super) decision: Option<proto::InterruptDecision>,
+    pub(super) was_active: bool,
+    pub(super) result: std::result::Result<crate::engine::driver::ParkedReplayOutcome, String>,
 }
 
 /// Persist `Err` after a live replay must retry persist-enter on this

@@ -9,6 +9,117 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
+/// Kernel-backed witness held exclusively by a daemon for its entire
+/// published lifetime. This lock is deliberately separate from the short
+/// lifecycle transaction lock: metadata cleanup may acquire the transaction
+/// lock while this guard remains held without self-deadlocking.
+#[derive(Debug)]
+pub struct DaemonLifetimeGuard {
+    _file: std::fs::File,
+}
+
+#[derive(Debug)]
+pub struct DaemonLifetimeReleaseWitness {
+    file: std::fs::File,
+}
+
+fn lifetime_lock_path(pid_file: &Path) -> PathBuf {
+    pid_file.with_extension("lifetime.lock")
+}
+
+pub fn acquire_daemon_lifetime(pid_file: &Path) -> std::io::Result<DaemonLifetimeGuard> {
+    let file = open_lifetime_lock(&lifetime_lock_path(pid_file))?;
+    lock_lifetime_file(&file)?;
+    Ok(DaemonLifetimeGuard { _file: file })
+}
+
+pub fn capture_daemon_lifetime_release(
+    pid_file: &Path,
+) -> std::io::Result<DaemonLifetimeReleaseWitness> {
+    Ok(DaemonLifetimeReleaseWitness {
+        file: open_lifetime_lock(&lifetime_lock_path(pid_file))?,
+    })
+}
+
+impl DaemonLifetimeReleaseWitness {
+    /// Wait for the kernel to release the daemon's lifetime lock. The helper
+    /// uses one blocking advisory-lock acquisition, never PID polling. On
+    /// timeout the detached helper retains the descriptor and completes only
+    /// when the kernel eventually releases the predecessor lock.
+    pub async fn wait(self, timeout: std::time::Duration) -> std::io::Result<bool> {
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("cockpit-daemon-lifetime-wait".into())
+            .spawn(move || {
+                let _ = finished_tx.send(lock_lifetime_file(&self.file));
+            })?;
+        match tokio::time::timeout(timeout, finished_rx).await {
+            Ok(Ok(result)) => result.map(|()| true),
+            Ok(Err(_)) => Err(std::io::Error::other(
+                "daemon lifetime-lock waiter exited without a result",
+            )),
+            Err(_) => Ok(false),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn open_lifetime_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_lifetime_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)
+}
+
+#[cfg(unix)]
+fn lock_lifetime_file(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: `file` owns a live descriptor and LOCK_EX requests one blocking
+    // kernel advisory-lock acquisition. The descriptor close releases it.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn lock_lifetime_file(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
+    let mut overlapped = unsafe { std::mem::zeroed() };
+    // SAFETY: the file handle remains owned for the blocking call and
+    // OVERLAPPED is initialized for a synchronous whole-file lock. Closing
+    // the process handle releases the lock after daemon death.
+    if unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    } != 0
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonPidReceipt {
     pub pid: u32,
@@ -1352,6 +1463,7 @@ pub struct ForegroundMetadataGuard {
     socket: PathBuf,
     endpoint_record: Option<PathBuf>,
     receipt: DaemonPidReceipt,
+    lifetime: Option<DaemonLifetimeGuard>,
     armed: bool,
 }
 
@@ -1361,14 +1473,22 @@ impl ForegroundMetadataGuard {
         socket: PathBuf,
         endpoint_record: Option<PathBuf>,
         receipt: DaemonPidReceipt,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        // Ordering: the short lifecycle transaction that published the PID
+        // receipt has already ended. Hold the lifetime witness from here
+        // through metadata retirement; cleanup may safely reacquire the
+        // transaction lock because these are distinct files.
+        let lifetime = acquire_daemon_lifetime(&pid_file).with_context(|| {
+            format!("acquiring daemon lifetime lock for {}", pid_file.display())
+        })?;
+        Ok(Self {
             pid_file,
             socket,
             endpoint_record,
             receipt,
+            lifetime: Some(lifetime),
             armed: true,
-        }
+        })
     }
 
     pub fn cleanup(&mut self) -> anyhow::Result<()> {
@@ -1381,6 +1501,7 @@ impl ForegroundMetadataGuard {
             )?;
         }
         self.armed = false;
+        self.lifetime.take();
         Ok(())
     }
 }
@@ -1396,6 +1517,77 @@ impl Drop for ForegroundMetadataGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LIFETIME_CHILD_PATH: &str = "COCKPIT_TEST_DAEMON_LIFETIME_CHILD_PATH";
+
+    #[test]
+    fn daemon_lifetime_witness_observes_real_child_exit() {
+        if let Some(path) = std::env::var_os(LIFETIME_CHILD_PATH) {
+            let _guard = acquire_daemon_lifetime(Path::new(&path)).expect("child lifetime lock");
+            println!("lifetime-lock-held");
+            use std::io::Read as _;
+            let mut byte = [0_u8; 1];
+            let _ = std::io::stdin().read(&mut byte);
+            return;
+        }
+
+        use std::io::BufRead as _;
+        use std::process::Stdio;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("daemon.pid");
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "daemon_lifecycle::tests::daemon_lifetime_witness_observes_real_child_exit",
+                "--nocapture",
+            ])
+            .env(LIFETIME_CHILD_PATH, &pid_file)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn lifetime-lock child");
+        let mut child_stdout = std::io::BufReader::new(child.stdout.take().expect("child stdout"));
+        let mut ready = String::new();
+        while !ready.contains("lifetime-lock-held") {
+            let mut line = String::new();
+            assert_ne!(
+                child_stdout
+                    .read_line(&mut line)
+                    .expect("read child readiness"),
+                0,
+                "child exited before holding lifetime lock: {ready}"
+            );
+            ready.push_str(&line);
+        }
+
+        let timed = capture_daemon_lifetime_release(&pid_file).expect("capture timed witness");
+        let timeout_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("timeout runtime");
+        assert!(
+            !timeout_runtime
+                .block_on(timed.wait(std::time::Duration::ZERO))
+                .expect("deadline result"),
+            "held child lock must honor an expired deadline"
+        );
+
+        let witness = capture_daemon_lifetime_release(&pid_file).expect("capture witness");
+        drop(child.stdin.take());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+        assert!(
+            runtime
+                .block_on(witness.wait(std::time::Duration::from_secs(5)))
+                .expect("wait lifetime release"),
+            "child exit must release the kernel lifetime lock"
+        );
+        assert!(child.wait().expect("reap lifetime child").success());
+        drop(child_stdout);
+    }
 
     fn write_receipt_fixture(path: &Path, receipt: &DaemonPidReceipt) {
         let body = format!(
@@ -1744,7 +1936,8 @@ mod tests {
             socket.clone(),
             Some(endpoint.clone()),
             receipt,
-        );
+        )
+        .expect("lifetime guard");
         guard.cleanup().expect("guard cleanup");
 
         assert!(!pid_file.exists());
@@ -1773,6 +1966,7 @@ mod tests {
             Some(endpoint.clone()),
             receipt,
         )
+        .expect("lifetime guard")
         .cleanup()
         .expect("guard cleanup");
 
@@ -1799,6 +1993,7 @@ mod tests {
             Some(endpoint.clone()),
             receipt,
         )
+        .expect("lifetime guard")
         .cleanup()
         .expect("boot failure cleanup");
 

@@ -1114,6 +1114,7 @@ pub fn daemon_pid(paths: &DaemonPaths) -> Option<u32> {
 /// reusable numeric PID.
 pub struct RestartReleaseWitness {
     expected_pid: Option<u32>,
+    lifetime: Option<cockpit_host::daemon_lifecycle::DaemonLifetimeReleaseWitness>,
     #[cfg(target_os = "linux")]
     process: Option<cockpit_host::daemon_lifecycle::VerifiedDaemonProcess>,
 }
@@ -1122,6 +1123,9 @@ pub fn capture_restart_release(
     paths: &DaemonPaths,
     expected_pid: Option<u32>,
 ) -> RestartReleaseWitness {
+    let lifetime = expected_pid.and_then(|_| {
+        cockpit_host::daemon_lifecycle::capture_daemon_lifetime_release(&paths.pid_file).ok()
+    });
     #[cfg(target_os = "linux")]
     let process = match cockpit_host::daemon_lifecycle::read_daemon_pid_record(&paths.pid_file) {
         Some(cockpit_host::daemon_lifecycle::DaemonPidRecord::Receipt(receipt))
@@ -1138,6 +1142,7 @@ pub fn capture_restart_release(
     };
     RestartReleaseWitness {
         expected_pid,
+        lifetime,
         #[cfg(target_os = "linux")]
         process,
     }
@@ -1153,17 +1158,27 @@ pub fn restart_release_timeout(grace_secs: Option<u64>) -> Duration {
 pub async fn wait_for_restart_release(
     paths: &DaemonPaths,
     witness: RestartReleaseWitness,
-    _timeout: Duration,
+    timeout: Duration,
 ) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
     #[cfg(target_os = "linux")]
     if let Some(process) = witness.process {
-        return process.wait_for_exit().await.is_ok()
-            && restart_paths_released(paths, witness.expected_pid);
+        if !matches!(
+            tokio::time::timeout_at(deadline, process.wait_for_exit()).await,
+            Ok(Ok(()))
+        ) {
+            return false;
+        }
     }
-    // Restart may proceed only from an exact, PID-reuse-safe completion
-    // primitive. Platforms (or stale metadata) that cannot provide one fail
-    // closed instead of polling a numeric PID or guessed deadline.
-    false
+    let Some(lifetime) = witness.lifetime else {
+        return false;
+    };
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    lifetime
+        .wait(remaining)
+        .await
+        .is_ok_and(|released| released)
+        && restart_paths_released(paths, witness.expected_pid)
 }
 
 fn restart_paths_released(paths: &DaemonPaths, expected_pid: Option<u32>) -> bool {
@@ -2184,7 +2199,7 @@ async fn run_foreground_inner_with_boot_db(
         paths.socket.clone(),
         endpoint_record,
         pid_receipt.clone(),
-    );
+    )?;
     match std::fs::remove_file(&paths.socket) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -3085,7 +3100,8 @@ mod tests {
         )
         .expect("noncanonical pid file");
         let mut guard =
-            ForegroundMetadataGuard::new(noncanonical.pid_file, noncanonical.socket, None, receipt);
+            ForegroundMetadataGuard::new(noncanonical.pid_file, noncanonical.socket, None, receipt)
+                .expect("lifetime guard");
         guard.cleanup().expect("guard cleanup");
 
         assert!(

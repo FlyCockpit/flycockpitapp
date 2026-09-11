@@ -2122,6 +2122,40 @@ pub async fn run_foreground_inner(
 }
 
 #[cfg(any(unix, windows))]
+struct ForegroundTask<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+#[cfg(any(unix, windows))]
+impl<T> ForegroundTask<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+        self.handle.take().expect("foreground task handle").await
+    }
+
+    async fn abort_and_join(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl<T> Drop for ForegroundTask<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
 async fn run_foreground_inner_with_boot_db(
     paths: DaemonPaths,
     drain_grace: Duration,
@@ -2190,11 +2224,14 @@ async fn run_foreground_inner_with_boot_db(
     }
     timer.phase("discover");
     let executable = std::env::current_exe().context("resolving daemon executable identity")?;
-    let endpoint_record = if DaemonPaths::resolve_canonical()
+    let endpoint_record = if boot_db.is_some() {
+        paths.pid_file.parent().map(endpoint_file_for_state)
+    } else if DaemonPaths::resolve_canonical()
         .as_ref()
         .is_ok_and(|canonical| {
             paths.pid_file == canonical.pid_file && paths.socket == canonical.socket
-        }) {
+        })
+    {
         paths.pid_file.parent().map(endpoint_file_for_state)
     } else {
         None
@@ -2221,7 +2258,7 @@ async fn run_foreground_inner_with_boot_db(
     let mut metadata_guard = ForegroundMetadataGuard::new_with_lifetime(
         paths.pid_file.clone(),
         paths.socket.clone(),
-        endpoint_record,
+        None,
         pid_receipt.clone(),
         daemon_lifetime,
     );
@@ -2263,12 +2300,23 @@ async fn run_foreground_inner_with_boot_db(
     timer.phase("boot");
     boot_dbg!("after_recover");
 
+    // Complete both fallible publication operations before any owned
+    // background task exists. The metadata guard retracts a published endpoint
+    // if the subsequent control bind fails.
+    if uses_supplied_boot_db {
+        write_endpoint_record_with_receipt_and_canonical(&paths, &paths, &pid_receipt)?;
+    } else {
+        write_endpoint_record(&paths)?;
+    }
+    metadata_guard.track_endpoint_record(endpoint_record);
+    let listener = bind_private_socket(&paths.socket)?;
+
     // Signal task: SIGINT/SIGTERM (or Ctrl-C / console-close on Windows)
     // route into the single graceful-shutdown path. The **first** signal
     // begins the drain; a **second** signal while still draining shortens
     // to an immediate force-exit (`request_shutdown`'s begin → force
     // promotion). The task therefore loops rather than firing once.
-    let signal_task = {
+    let mut signal_task = ForegroundTask::new({
         let ctx = ctx.clone();
         tokio::spawn(async move {
             #[cfg(unix)]
@@ -2304,7 +2352,7 @@ async fn run_foreground_inner_with_boot_db(
                 }
             }
         })
-    };
+    });
 
     // A reference-counted ephemeral owner remains available until at least
     // one client has established a transport connection, then begins the
@@ -2314,12 +2362,12 @@ async fn run_foreground_inner_with_boot_db(
         let ctx = ctx.clone();
         let reaper_ctx = ctx.clone();
         let client_presence = ctx.client_presence();
-        Some(tokio::spawn(async move {
+        Some(ForegroundTask::new(tokio::spawn(async move {
             ephemeral_last_client_reaper(client_presence, move || {
                 reaper_ctx.reap_ephemeral_last_client()
             })
             .await;
-        }))
+        })))
     } else {
         None
     };
@@ -2328,15 +2376,17 @@ async fn run_foreground_inner_with_boot_db(
     // daemon-internal periodic task that reclaims locks whose holder has
     // gone idle past the 5-minute threshold, so a hung/abandoned holder
     // can't block a waiting `read` forever.
-    let lock_sweeper = server::spawn_lock_sweeper(ctx.clone());
+    let mut lock_sweeper = ForegroundTask::new(server::spawn_lock_sweeper(ctx.clone()));
     #[cfg(feature = "remote")]
-    let org_sync_task = org_sync::spawn_background(ctx.clone());
+    let mut org_sync_task = ForegroundTask::new(org_sync::spawn_background(ctx.clone()));
     #[cfg(feature = "remote")]
-    let remote_audit_upload_task = remote_audit_upload::spawn_background(ctx.clone());
+    let mut remote_audit_upload_task =
+        ForegroundTask::new(remote_audit_upload::spawn_background(ctx.clone()));
     #[cfg(feature = "remote")]
-    let connector_task = connector::spawn_background(ctx.clone());
+    let mut connector_task = ForegroundTask::new(connector::spawn_background(ctx.clone()));
     #[cfg(feature = "remote")]
-    let remote_outbox_task = remote_outbox_worker::spawn_background(ctx.clone());
+    let mut remote_outbox_task =
+        ForegroundTask::new(remote_outbox_worker::spawn_background(ctx.clone()));
 
     // Dedicated Unix peer-authenticated leak-reveal socket (sibling of the
     // control socket; path a pure function of it). Carries only the closed
@@ -2347,13 +2397,13 @@ async fn run_foreground_inner_with_boot_db(
     let leak_reveal_task = match leak_reveal_socket::bind_reveal_socket(&ctx) {
         Ok(reveal_listener) => {
             let ctx = ctx.clone();
-            Some(tokio::spawn(async move {
+            Some(ForegroundTask::new(tokio::spawn(async move {
                 if let Err(error) =
                     leak_reveal_socket::run_reveal_accept_loop(ctx, reveal_listener).await
                 {
                     tracing::warn!(%error, "leak-reveal accept loop ended with error");
                 }
-            }))
+            })))
         }
         Err(error) => {
             tracing::warn!(%error, "failed to bind leak-reveal socket; reveal-over-socket unavailable");
@@ -2367,32 +2417,29 @@ async fn run_foreground_inner_with_boot_db(
     // control socket observable. In particular, binding the leak-reveal
     // sibling can block in filesystem I/O under load. A client that observes
     // the control socket expects its hello promptly.
-    if uses_supplied_boot_db {
-        write_endpoint_record_with_receipt_and_canonical(&paths, &paths, &pid_receipt)?;
-    } else {
-        write_endpoint_record(&paths)?;
-    }
-    let listener = bind_private_socket(&paths.socket)?;
     // Schedule the accept loop before startup logging after bind. This keeps
     // a slow log sink from extending the socket-visible/hello-ready interval.
-    let accept = tokio::spawn(server::run_accept_loop(ctx.clone(), listener));
+    let accept = ForegroundTask::new(tokio::spawn(server::run_accept_loop(ctx.clone(), listener)));
     // Retention is ordinary periodic maintenance, not database/config boot or
     // crash-authority reconciliation. Start the initial pass only after the
     // accept loop is runnable so a contended sweep cannot delay the first
     // protocol hello. The pass uses the same transactional implementation as
     // later interval ticks and may safely overlap client reads.
-    let initial_retention = tokio::spawn(server::run_retention_pass(
+    let mut initial_retention = ForegroundTask::new(tokio::spawn(server::run_retention_pass(
         ctx.db.clone(),
         server::retention_config(),
         chrono::Utc::now().timestamp(),
-    ));
+    )));
     timer.phase("socket_bind");
     boot_dbg!("after_bind");
     timer.phase("endpoint_published");
     boot_dbg!("after_endpoint_publish");
     timer.done();
-    let result = accept.await.context("daemon accept loop task stopped")?;
-    let _ = initial_retention.await;
+    let result = match accept.join().await {
+        Ok(result) => result,
+        Err(error) => Err(anyhow::anyhow!(error).context("daemon accept loop task stopped")),
+    };
+    initial_retention.abort_and_join().await;
 
     // The accept loop normally stops because `request_shutdown` already began
     // the drain. Do not call it a second time here: a second request is the
@@ -2422,38 +2469,30 @@ async fn run_foreground_inner_with_boot_db(
         tracing::warn!(%error, "daemon shutdown was not clean");
     }
 
-    signal_task.abort();
-    let _ = signal_task.await;
-    lock_sweeper.abort();
-    let _ = lock_sweeper.await;
-    if let Some(task) = lifecycle_task {
-        task.abort();
-        let _ = task.await;
+    signal_task.abort_and_join().await;
+    lock_sweeper.abort_and_join().await;
+    if let Some(mut task) = lifecycle_task {
+        task.abort_and_join().await;
     }
     #[cfg(feature = "remote")]
     {
-        org_sync_task.abort();
-        let _ = org_sync_task.await;
+        org_sync_task.abort_and_join().await;
     }
     #[cfg(feature = "remote")]
     {
-        remote_audit_upload_task.abort();
-        let _ = remote_audit_upload_task.await;
+        remote_audit_upload_task.abort_and_join().await;
     }
     #[cfg(feature = "remote")]
     {
-        connector_task.abort();
-        let _ = connector_task.await;
+        connector_task.abort_and_join().await;
     }
     #[cfg(feature = "remote")]
     {
-        remote_outbox_task.abort();
-        let _ = remote_outbox_task.await;
+        remote_outbox_task.abort_and_join().await;
     }
     #[cfg(any(unix, windows))]
-    if let Some(task) = leak_reveal_task {
-        task.abort();
-        let _ = task.await;
+    if let Some(mut task) = leak_reveal_task {
+        task.abort_and_join().await;
     }
     #[cfg(any(unix, windows))]
     let _ = std::fs::remove_file(paths.leak_reveal_socket());
@@ -2576,20 +2615,25 @@ async fn ephemeral_last_client_reaper(
 
 /// Kill the running daemon (if any) and clean up its pid + socket files.
 pub fn stop(paths: &DaemonPaths) -> Result<bool> {
+    stop_with_timeout(paths, restart_release_timeout(None))
+}
+
+/// Stop using only the caller's remaining command-level budget.
+pub fn stop_with_timeout(paths: &DaemonPaths, timeout: Duration) -> Result<bool> {
     let Some(record) = read_daemon_pid_record(&paths.pid_file) else {
         return Ok(false);
     };
     #[cfg(target_os = "linux")]
-    return stop_linux(paths, record);
+    return stop_linux(paths, record, timeout);
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-    return stop_kqueue_unix(paths, record);
+    return stop_kqueue_unix(paths, record, timeout);
     #[cfg(all(
         unix,
         not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
     ))]
     return stop_unix_without_stable_handle(paths, record);
     #[cfg(windows)]
-    return stop_windows(paths, record);
+    return stop_windows(paths, record, timeout);
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (paths, record);
@@ -2607,16 +2651,28 @@ pub(crate) fn stop_exact(paths: &DaemonPaths, expected: &DaemonPidReceipt) -> Re
         );
     }
     #[cfg(target_os = "linux")]
-    return stop_linux(paths, DaemonPidRecord::Receipt(expected.clone()));
+    return stop_linux(
+        paths,
+        DaemonPidRecord::Receipt(expected.clone()),
+        restart_release_timeout(None),
+    );
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-    return stop_kqueue_unix(paths, DaemonPidRecord::Receipt(expected.clone()));
+    return stop_kqueue_unix(
+        paths,
+        DaemonPidRecord::Receipt(expected.clone()),
+        restart_release_timeout(None),
+    );
     #[cfg(all(
         unix,
         not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
     ))]
     return stop_unix_without_stable_handle(paths, DaemonPidRecord::Receipt(expected.clone()));
     #[cfg(windows)]
-    return stop_windows(paths, DaemonPidRecord::Receipt(expected.clone()));
+    return stop_windows(
+        paths,
+        DaemonPidRecord::Receipt(expected.clone()),
+        restart_release_timeout(None),
+    );
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (paths, expected);
@@ -2625,7 +2681,7 @@ pub(crate) fn stop_exact(paths: &DaemonPaths, expected: &DaemonPidReceipt) -> Re
 }
 
 #[cfg(target_os = "linux")]
-fn stop_linux(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
+fn stop_linux(paths: &DaemonPaths, record: DaemonPidRecord, timeout: Duration) -> Result<bool> {
     let receipt = match record {
         DaemonPidRecord::LegacyNumeric(pid) => return settle_legacy_stop(paths, pid),
         DaemonPidRecord::Receipt(receipt) => receipt,
@@ -2658,7 +2714,7 @@ fn stop_linux(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
             )
         });
     }
-    let deadline = std::time::Instant::now() + restart_release_timeout(None);
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         if read_daemon_pid_record(&paths.pid_file)
             != Some(DaemonPidRecord::Receipt(receipt.clone()))
@@ -2689,7 +2745,11 @@ fn stop_linux(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-fn stop_kqueue_unix(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
+fn stop_kqueue_unix(
+    paths: &DaemonPaths,
+    record: DaemonPidRecord,
+    timeout: Duration,
+) -> Result<bool> {
     let receipt = match record {
         DaemonPidRecord::LegacyNumeric(pid) => return settle_legacy_stop(paths, pid),
         DaemonPidRecord::Receipt(receipt) => receipt,
@@ -2718,7 +2778,7 @@ fn stop_kqueue_unix(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool
         return Err(error).with_context(|| format!("signaling daemon PID {}", receipt.pid));
     }
     if !process
-        .wait_for_exit_blocking(restart_release_timeout(None))
+        .wait_for_exit_blocking(timeout)
         .with_context(|| format!("waiting for exact daemon PID {} exit", receipt.pid))?
     {
         anyhow::bail!(
@@ -2768,7 +2828,7 @@ fn settle_legacy_stop(paths: &DaemonPaths, pid: u32) -> Result<bool> {
 }
 
 #[cfg(windows)]
-fn stop_windows(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
+fn stop_windows(paths: &DaemonPaths, record: DaemonPidRecord, timeout: Duration) -> Result<bool> {
     match record {
         DaemonPidRecord::LegacyNumeric(pid) => settle_legacy_stop(paths, pid),
         DaemonPidRecord::Receipt(receipt) => {
@@ -2789,7 +2849,7 @@ fn stop_windows(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
                     // Each send re-reads the pid file after connect so a
                     // replacement incarnation that published at `paths.socket`
                     // never receives a shutdown intended for this receipt.
-                    let deadline = std::time::Instant::now() + restart_release_timeout(None);
+                    let deadline = std::time::Instant::now() + timeout;
                     let mut delivered = false;
                     while std::time::Instant::now() < deadline {
                         if read_daemon_pid_record(&paths.pid_file)
@@ -3817,6 +3877,65 @@ mod tests {
             },
             publication_nonce: [0; 32],
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_publication_failure_retires_reserved_metadata_before_any_task_spawn() {
+        let harness = DaemonTestHarness::new();
+        let _env =
+            crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(&harness.state_home).await;
+        let dir = tempfile::tempdir().expect("paths");
+        let paths = test_paths(&dir);
+        let endpoint = endpoint_file_for_state(paths.pid_file.parent().expect("state dir"));
+        std::fs::create_dir(&endpoint).expect("block endpoint file publication");
+
+        let error = run_foreground_inner_with_boot_db(
+            paths.clone(),
+            Duration::from_millis(50),
+            false,
+            crate::daemon::terminal::test_host_factory(),
+            Some(harness.db.clone()),
+        )
+        .await
+        .expect_err("endpoint publication must fail");
+
+        assert!(error.to_string().contains("endpoint"));
+        assert!(!paths.pid_file.exists(), "reserved receipt must be retired");
+        assert!(!paths.socket.exists(), "control socket must never publish");
+        cockpit_host::daemon_lifecycle::acquire_daemon_lifetime(&paths.pid_file)
+            .expect("startup lifetime must be released");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_control_bind_failure_retracts_publication_before_any_task_spawn() {
+        let harness = DaemonTestHarness::new();
+        let _env =
+            crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(&harness.state_home).await;
+        let dir = tempfile::tempdir().expect("paths");
+        let paths = DaemonPaths {
+            socket: dir.path().join("s".repeat(180)),
+            pid_file: dir.path().join("daemon.pid"),
+            ephemeral: false,
+        };
+        let endpoint = endpoint_file_for_state(dir.path());
+
+        let error = run_foreground_inner_with_boot_db(
+            paths.clone(),
+            Duration::from_millis(50),
+            false,
+            crate::daemon::terminal::test_host_factory(),
+            Some(harness.db.clone()),
+        )
+        .await
+        .expect_err("overlong Unix socket bind must fail");
+
+        assert!(error.to_string().contains("binding"));
+        assert!(!paths.pid_file.exists(), "reserved receipt must be retired");
+        assert!(!endpoint.exists(), "published endpoint must be retracted");
+        cockpit_host::daemon_lifecycle::acquire_daemon_lifetime(&paths.pid_file)
+            .expect("startup lifetime must be released");
     }
 
     #[cfg(any(unix, windows))]

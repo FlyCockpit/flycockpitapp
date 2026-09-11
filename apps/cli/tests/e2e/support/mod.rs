@@ -374,6 +374,20 @@ impl SpawnedDaemon {
     /// product replacement is usable, normalize it back to an exactly owned
     /// foreground child for the remainder of the test and unwind cleanup.
     pub async fn restart_via_command(&self, grace_secs: u64) -> Output {
+        self.restart_via_command_with_socket(grace_secs, true).await
+    }
+
+    pub async fn restart_via_unreachable_socket(&self) -> Output {
+        std::fs::remove_file(self.home.socket_path())
+            .expect("remove daemon socket to drive restart signal fallback");
+        self.restart_via_command_with_socket(0, false).await
+    }
+
+    async fn restart_via_command_with_socket(
+        &self,
+        grace_secs: u64,
+        socket_reachable: bool,
+    ) -> Output {
         let had_owned_child = self.process.has_current();
         let grace = grace_secs.to_string();
         let mut command = self.home.cockpit();
@@ -394,7 +408,7 @@ impl SpawnedDaemon {
             .expect("wait for daemon restart command");
         assert!(
             !had_owned_child || owned_child_exited,
-            "daemon restart command exited before its owned daemon; stdout:\n{}\nstderr:\n{}\nlog tail:\n{}",
+            "daemon restart command exited before its owned daemon (socket reachable: {socket_reachable}); stdout:\n{}\nstderr:\n{}\nlog tail:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
             log_tail(&self.home)

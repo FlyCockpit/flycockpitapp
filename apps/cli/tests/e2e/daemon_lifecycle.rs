@@ -129,6 +129,22 @@ async fn stop_with_unreachable_socket_waits_for_exact_daemon_retirement() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_with_unreachable_socket_retires_then_replaces_exact_daemon() {
+    let daemon = SpawnedDaemon::start().await;
+    let old_pid = daemon.pid();
+
+    let output = daemon.restart_via_unreachable_socket().await;
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(output_text(&output).contains("daemon: restarted"));
+    assert_ne!(
+        daemon.pid(),
+        old_pid,
+        "restart must publish a new generation"
+    );
+    daemon.wait_for_handshake().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sigterm_operation_allows_restart_against_same_home() {
     let daemon = SpawnedDaemon::start().await;
     let old_pid = daemon.pid();

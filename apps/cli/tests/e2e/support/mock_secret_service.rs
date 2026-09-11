@@ -29,17 +29,10 @@ impl Drop for MockSecretService {
             let _ = stop.send(());
         }
         if let Some(owner) = self.owner.take() {
-            if tokio::runtime::Handle::try_current().is_ok() {
-                // The owner performs all child teardown before it exits. Do
-                // not synchronously join it from a Tokio runtime worker.
-                let _ = std::thread::Builder::new()
-                    .name("cockpit-e2e-secret-service-reaper".into())
-                    .spawn(move || {
-                        let _ = owner.join();
-                    });
-            } else {
-                let _ = owner.join();
-            }
+            // Explicit async fixture shutdown is the normal path. Drop is the
+            // panic/unwind fallback and must still join: detaching here would
+            // let the isolated home disappear before dbus-daemon kill+wait.
+            let _ = owner.join();
         }
     }
 }

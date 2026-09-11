@@ -553,6 +553,32 @@ impl HermeticCockpit {
     #[cfg(not(target_os = "linux"))]
     pub fn enable_isolated_secret_service(&mut self) {}
 
+    /// Async-runtime-safe counterpart to [`Self::enable_isolated_secret_service`].
+    #[cfg(target_os = "linux")]
+    pub async fn enable_isolated_secret_service_async(&mut self) {
+        let service = super::start_mock_secret_service_async().await;
+        self.spec
+            .extra_env
+            .push(("DBUS_SESSION_BUS_ADDRESS".into(), service.address.clone()));
+        self._secret_service = Some(service);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub async fn enable_isolated_secret_service_async(&mut self) {}
+
+    /// Reap Cockpit-owned processes and await the private Secret Service's
+    /// owner boundary before the isolated home is dropped.
+    pub async fn finish(mut self) {
+        self.reap();
+        #[cfg(target_os = "linux")]
+        if let Some(service) = self._secret_service.take() {
+            assert!(
+                service.shutdown().await,
+                "Secret Service owner must acknowledge shutdown"
+            );
+        }
+    }
+
     pub fn project_path(&self) -> &Path {
         self.home.project_path()
     }

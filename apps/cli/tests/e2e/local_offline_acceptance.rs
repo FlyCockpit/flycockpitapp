@@ -176,7 +176,7 @@ async fn isolated_settings_export_and_restart_resume_paths_execute_without_accou
         "RELEASE_ACCEPTANCE_TOKEN=release-acceptance-secret-7f31\n",
     )
     .unwrap();
-    session.enable_isolated_secret_service();
+    session.enable_isolated_secret_service_async().await;
     let denied_network = install_network_deny_recorder(&mut session);
     // This is the suite's only sandboxed `doctor --offline` invocation.
     // Keep it sandboxed so hermetic PATH + containment stay covered.
@@ -399,4 +399,5 @@ async fn isolated_settings_export_and_restart_resume_paths_execute_without_accou
         !provider.captured().is_empty(),
         "scripted provider saw no successful turn"
     );
+    session.finish().await;
 }

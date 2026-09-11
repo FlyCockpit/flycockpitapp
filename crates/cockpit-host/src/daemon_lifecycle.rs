@@ -23,14 +23,29 @@ pub struct DaemonLifetimeReleaseWitness {
     file: std::fs::File,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum AcquireDaemonLifetimeError {
+    #[error("another daemon already owns the lifetime lock")]
+    Busy,
+    #[error("opening or locking the daemon lifetime file: {0}")]
+    Io(#[from] std::io::Error),
+}
+
 fn lifetime_lock_path(pid_file: &Path) -> PathBuf {
     pid_file.with_extension("lifetime.lock")
 }
 
-pub fn acquire_daemon_lifetime(pid_file: &Path) -> std::io::Result<DaemonLifetimeGuard> {
+/// Attempt startup ownership exactly once. Startup must never wait for an
+/// incumbent generation: observing a live owner is a typed terminal result.
+pub fn acquire_daemon_lifetime(
+    pid_file: &Path,
+) -> Result<DaemonLifetimeGuard, AcquireDaemonLifetimeError> {
     let file = open_lifetime_lock(&lifetime_lock_path(pid_file))?;
-    lock_lifetime_file(&file)?;
-    Ok(DaemonLifetimeGuard { _file: file })
+    if try_lock_lifetime_file(&file)? {
+        Ok(DaemonLifetimeGuard { _file: file })
+    } else {
+        Err(AcquireDaemonLifetimeError::Busy)
+    }
 }
 
 pub fn capture_daemon_lifetime_release(
@@ -72,18 +87,6 @@ fn open_lifetime_lock(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 #[cfg(unix)]
-fn lock_lifetime_file(file: &std::fs::File) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd as _;
-    // SAFETY: `file` owns a live descriptor and LOCK_EX requests one blocking
-    // kernel advisory-lock acquisition. The descriptor close releases it.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(unix)]
 fn try_lock_lifetime_file(file: &std::fs::File) -> std::io::Result<bool> {
     use std::os::fd::AsRawFd as _;
     // SAFETY: `file` owns a live descriptor. This is one nonblocking lock
@@ -97,31 +100,6 @@ fn try_lock_lifetime_file(file: &std::fs::File) -> std::io::Result<bool> {
         } else {
             Err(error)
         }
-    }
-}
-
-#[cfg(windows)]
-fn lock_lifetime_file(file: &std::fs::File) -> std::io::Result<()> {
-    use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
-    let mut overlapped = unsafe { std::mem::zeroed() };
-    // SAFETY: the file handle remains owned for the blocking call and
-    // OVERLAPPED is initialized for a synchronous whole-file lock. Closing
-    // the process handle releases the lock after daemon death.
-    if unsafe {
-        LockFileEx(
-            file.as_raw_handle(),
-            LOCKFILE_EXCLUSIVE_LOCK,
-            0,
-            u32::MAX,
-            u32::MAX,
-            &mut overlapped,
-        )
-    } != 0
-    {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -1794,6 +1772,13 @@ impl ForegroundMetadataGuard {
         }
     }
 
+    /// Arm cleanup for an endpoint only after its publication transaction has
+    /// succeeded. A failed publication must not treat a pre-existing path as
+    /// metadata owned by this generation.
+    pub fn track_endpoint_record(&mut self, endpoint_record: Option<PathBuf>) {
+        self.endpoint_record = endpoint_record;
+    }
+
     pub fn cleanup(&mut self) -> anyhow::Result<()> {
         if self.armed {
             retire_metadata_if_receipt_matches(
@@ -1832,6 +1817,21 @@ mod tests {
     use super::*;
 
     const LIFETIME_CHILD_PATH: &str = "COCKPIT_TEST_DAEMON_LIFETIME_CHILD_PATH";
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn competing_startup_lifetime_acquisition_is_nonblocking_and_typed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("daemon.pid");
+        let owner = acquire_daemon_lifetime(&pid_file).expect("first owner");
+
+        assert!(matches!(
+            acquire_daemon_lifetime(&pid_file),
+            Err(AcquireDaemonLifetimeError::Busy)
+        ));
+
+        drop(owner);
+        acquire_daemon_lifetime(&pid_file).expect("ownership after exact owner release");
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

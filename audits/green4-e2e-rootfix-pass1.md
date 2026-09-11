@@ -2,7 +2,77 @@
 
 Baseline: `0b3ca2a4b`. Review base for the platform-gate inventory:
 `origin/green-the-rust-4`. Scope: STEP0-F1 through STEP0-F4 plus independent
-review findings R1-R6.
+review findings R1-R6. Final-review pass 4 baseline: `4ddf6b6be`.
+
+## Final-review pass 4 invariant coverage
+
+| Site / operation | Result | Evidence |
+| --- | --- | --- |
+| async HermeticCockpit Secret Service entry / shutdown | holds | the sole async consumer awaits `enable_isolated_secret_service_async`, then awaits consuming `finish`; the service owner join acknowledges dbus kill+wait before isolated-home Drop |
+| sync fixture consumer / panic bypass | holds | the sync consumer retains the sync starter; MockSecretService Drop sends stop and joins the owner rather than detaching cleanup |
+| startup lifetime entry / competing owner / re-entry | holds | both foreground and metadata-guard acquisition use one nonblocking advisory-lock attempt; a typed `Busy` result terminates competing startup, while acquisition succeeds after exact owner Drop |
+| foreground publication and bind failures | holds | both fallible operations precede every task spawn; endpoint cleanup is armed only after successful publication, so publication failure retires the PID without claiming a pre-existing path and bind failure retracts the generation's publication |
+| foreground normal exit / task failure / panic | holds | every owned task is abort-on-Drop; accept join errors flow through the one epilogue, which aborts and awaits all remaining tasks before metadata retirement |
+| Stop connected / unreachable fallback / release | holds | one deadline is created before path resolution; connect, request, platform stop, and release observation each consume only its remaining duration |
+| Restart discovery / connected / unreachable fallback / release / re-entry | holds | discovery, connect, request, platform stop, and release observation use the same deadline; replacement spawn happens only after exact release success |
+
+Ownership and order for pass 4: lifetime lock precedes the short lifecycle
+metadata transaction. Foreground task guards are declared after the metadata
+guard, so unwind aborts every task before metadata/lifetime fields drop; the
+ordinary epilogue additionally awaits cancellation acknowledgments before
+retirement. Endpoint ownership is attached to the metadata guard only after
+durable endpoint publication succeeds. The mock service owner thread alone
+owns dbus and its child; async fixture completion consumes and joins that owner
+before the isolated home can drop. Stop/restart own one immutable deadline;
+downstream operations receive durations derived from it and cannot replenish
+the budget.
+
+## Final-review pass 4 class sweeps
+
+### R8 — async fixture startup and teardown
+
+Class sweep: searched `apps/cli/tests/e2e` for
+`enable_isolated_secret_service`, `start_mock_secret_service`, `shutdown`, and
+HermeticCockpit Drop. Affected sites: one sync local-offline case, one Tokio
+local-offline case, the Hermetic fixture, and MockSecretService Drop.
+Enforcement point: mode-specific fixture entry plus consuming awaited `finish`;
+Drop is a deterministic unwind fallback. Verification: exact mock current-thread
+async shutdown and exact requested local-offline test. Remaining exceptions:
+none in the HermeticCockpit consumer set.
+
+### R9 — post-spawn foreground failure
+
+Class sweep: searched the complete `run_foreground_inner_with_boot_db` body for
+task creation, endpoint publication, control/reveal binds, `?`, return, cleanup,
+and every JoinHandle. Affected sites: publication/bind ordering and the accept
+join `?`; all nine feature-inclusive task categories share `ForegroundTask`.
+Enforcement point: pre-spawn publication barrier, abort-on-unwind task owner,
+and one explicit abort-and-await epilogue. Verification: natural endpoint
+publication failure and overlong Unix control-bind failure plus existing clean
+shutdown coverage. Remaining exception: reveal bind remains intentionally
+nonfatal and therefore is not an exit bypass.
+
+### R10 — startup lifetime acquisition
+
+Class sweep: searched the workspace for `acquire_daemon_lifetime`, blocking
+`flock`/`LockFileEx`, lifetime capture, and release acquisition. Affected sites:
+the host primitive and its two production consumers. Enforcement point: one
+`LOCK_NB`/`LOCKFILE_FAIL_IMMEDIATELY` acquisition returning typed `Busy`.
+Verification: live competing owner on a current-thread runtime and successful
+re-entry after exact owner release. Remaining exception: release observation
+retains its specified exact-process-exit then one nonblocking acquisition.
+
+### R11 — one command-level lifecycle deadline
+
+Class sweep: searched CLI Stop/Restart and core Linux, macOS/FreeBSD, and
+Windows platform-stop routes for `restart_release_timeout`, connect, discovery,
+request, platform wait, and release wait. Affected sites: both CLI commands and
+all three stable-handle platform backends. Enforcement point: one entry deadline,
+`remaining_command_budget`, and `stop_with_timeout`. Verification: operation
+budget consumption/expiry unit coverage plus connected Stop/Restart and
+unreachable Stop/Restart e2e. Remaining exceptions: non-command automatic
+promotion/skew workflows own distinct lifecycle transactions and are outside
+the command-level deadline.
 
 ## Invariant coverage
 
@@ -19,7 +89,7 @@ review findings R1-R6.
 | hermetic daemon reap, Windows | holds | a `SYNCHRONIZE` process HANDLE is opened before stop and consumed by `WaitForSingleObject` |
 | mock Secret Service setup, sync | holds | the caller only receives mode-specific readiness; dbus lookup/spawn/stdout read, zbus build, runtime, child, and cleanup are owned by one dedicated thread |
 | mock Secret Service setup, current-thread async | holds | work before the first await is channel creation and thread spawn only; readiness is a Tokio oneshot and no runtime worker blocks |
-| mock Secret Service receiver drop / shutdown | holds | required async ownership awaits `shutdown`, whose join runs off the Tokio worker and returns an asserted termination ack after the owner killed/waited for dbus; the sync test asserts the equivalent blocking ack; async Drop remains a nonblocking cancellation/panic fallback |
+| mock Secret Service receiver drop / shutdown | holds | required async ownership awaits `shutdown`, whose join runs off the Tokio worker and returns an asserted termination ack after the owner killed/waited for dbus; the sync test asserts the equivalent blocking ack; Drop synchronously joins as the deterministic panic fallback |
 | replay launch / durable crash boundary | holds | Unix FIFO and Windows named-pipe barriers remain platform-owned; durable `executing` is asserted before the witness and daemon termination occurs only after the byte |
 | replay/validation descendant cleanup | holds | Linux pidfd/cgroup evidence, non-Linux Unix process-group empty evidence, and Windows Job Object empty evidence remain the relevant platform witnesses |
 
@@ -55,8 +125,8 @@ Class sweep: searched all `MockSecretService`, `start_mock_secret_service`,
 Enforcement is single-thread ownership plus mode-specific readiness and an
 explicit async `shutdown` boundary. The sole async caller awaits stop and owner
 join; exact sync, current-thread async, and local-offline acceptance tests verify
-the consumers. There is no product hook; asynchronous Drop hands finite cleanup
-to a reaper only as cancellation/panic fallback because Rust has no async Drop.
+the consumers. There is no product hook; Drop synchronously joins only as the
+panic/unwind fallback where an async boundary can no longer be awaited.
 
 ### R3 — portable exact completion
 
@@ -117,7 +187,7 @@ installed on this Linux host.
 Command:
 `git diff --unified=0 origin/green-the-rust-4..HEAD -- '*.rs'`, counting each
 added line containing `target_os = "linux"` or `not(target_os = "linux")`.
-At the final working tree the count is **73 additions across 9 files**:
+At the final pass-4 working tree the count is **76 additions across 9 files**:
 
 | File | Added gate lines | Classification |
 | --- | ---: | --- |
@@ -127,7 +197,7 @@ At the final working tree the count is **73 additions across 9 files**:
 | `apps/cli/tests/e2e/support/mod.rs` | 7 | Linux pidfd exact-exit and Linux-only Secret Service fixture; portable exact-exit siblings are separately gated |
 | `crates/cockpit-core/src/daemon/mod.rs` | 8 | stable predecessor selection; Linux pidfd and macOS/FreeBSD kqueue stop routing; unsupported Unix exclusion |
 | `apps/cli/tests/e2e/daemon_lifecycle_replay.rs` | 2 | Linux-only descendant pidfd evidence after shared replay barriers |
-| `apps/cli/tests/e2e/support/hermetic.rs` | 2 | supported-platform exact process witness selection around daemon reap |
+| `apps/cli/tests/e2e/support/hermetic.rs` | 5 | supported-platform exact process witness selection plus Linux-only async Secret Service fixture ownership |
 | `apps/cli/tests/e2e/run_noninteractive.rs` | 2 | expected Linux sandbox-dependent approval result in shared acceptance cases |
 | `crates/cockpit-test-support/src/lib.rs` | 2 | Linux memfd executable fixture versus disk-backed non-Linux fixture |
 

@@ -2309,6 +2309,17 @@ async fn run_foreground_inner_with_boot_db(
         write_endpoint_record(&paths)?;
     }
     metadata_guard.track_endpoint_record(endpoint_record);
+    // Bind the reveal sibling before the control endpoint. A control socket is
+    // an observable readiness promise, so no client may discover it while a
+    // potentially blocking reveal bind is still outstanding.
+    #[cfg(any(unix, windows))]
+    let reveal_listener = match leak_reveal_socket::bind_reveal_socket(&ctx) {
+        Ok(listener) => Some(listener),
+        Err(error) => {
+            tracing::warn!(%error, "failed to bind leak-reveal socket; reveal-over-socket unavailable");
+            None
+        }
+    };
     let listener = bind_private_socket(&paths.socket)?;
 
     // Signal task: SIGINT/SIGTERM (or Ctrl-C / console-close on Windows)
@@ -2394,8 +2405,8 @@ async fn run_foreground_inner_with_boot_db(
     // same-uid peer check the control socket uses. A bind failure is non-fatal
     // for daemon boot: reveal-over-socket is simply unavailable then.
     #[cfg(any(unix, windows))]
-    let leak_reveal_task = match leak_reveal_socket::bind_reveal_socket(&ctx) {
-        Ok(reveal_listener) => {
+    let leak_reveal_task = match reveal_listener {
+        Some(reveal_listener) => {
             let ctx = ctx.clone();
             Some(ForegroundTask::new(tokio::spawn(async move {
                 if let Err(error) =
@@ -2405,10 +2416,7 @@ async fn run_foreground_inner_with_boot_db(
                 }
             })))
         }
-        Err(error) => {
-            tracing::warn!(%error, "failed to bind leak-reveal socket; reveal-over-socket unavailable");
-            None
-        }
+        None => None,
     };
 
     timer.phase("signal_and_lifecycle");

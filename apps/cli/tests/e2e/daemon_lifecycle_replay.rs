@@ -1,24 +1,13 @@
 //! Daemon lifecycle replay e2e (`daemon-lifecycle-replay-e2e.md`).
 //!
-//! Timing-budget policy (`daemon-lifecycle-replay-timing-robustness.md`,
-//! criterion 6): every `wait_until`/`next_event` below is a legitimate
-//! condition-poll for something asynchronous *from the client's point of view*
-//! — an out-of-process daemon the test does not control finishing its boot,
-//! rehydration, crash-reconciliation, or replay — never a "wait long enough"
-//! window, and none of these budgets is widened here. The three former
-//! `sleep(100ms)` negative-assertion windows have been replaced with the
-//! deterministic [`wait_for_duplicate_resolve_processed`] happens-before
-//! barrier. Shutdown ordering is checked at the restart/metadata boundary, and
-//! executing replay is stopped at its real host-operation boundary; the product
-//! has no test-only timing path. Startup attach's exact commit acknowledgment is
-//! covered deterministically in cockpit-core.
+//! Durable observations use the subscribed production event stream. Database
+//! reads occur only after the matching id/sequence event proves its commit.
+//! Process observations use owned-child completion and the replacement status
+//! handshake supplied by the shared harness.
 
 use std::path::Path;
-use std::time::Duration;
 
-use crate::support::{
-    IsolatedHome, ReplayLaunchBarrier, SpawnedDaemon, log_tail, output_text, wait_until,
-};
+use crate::support::{IsolatedHome, ReplayLaunchBarrier, SpawnedDaemon, log_tail, output_text};
 use cockpit_cli::integration::{AttachedSession, DaemonEvent};
 use cockpit_test_support::provider::{ScriptedProvider, Turn};
 use rusqlite::{Connection, params};
@@ -196,21 +185,18 @@ async fn wait_for_interrupt(
     reason: Option<&str>,
 ) -> Uuid {
     loop {
-        match client
-            .next_event(Duration::from_secs(20))
-            .await
-            .unwrap_or_else(|err| {
-                let status = daemon
-                    .command()
-                    .args(["daemon", "status"])
-                    .output()
-                    .map(|output| output_text(&output))
-                    .unwrap_or_else(|status_err| format!("status probe failed: {status_err}"));
-                panic!(
-                    "daemon event while waiting for interrupt: {err}\nstatus:\n{status}\nlog tail:\n{}",
-                    log_tail(daemon.home())
-                )
-            }) {
+        match client.next_event_unbounded().await.unwrap_or_else(|err| {
+            let status = daemon
+                .command()
+                .args(["daemon", "status"])
+                .output()
+                .map(|output| output_text(&output))
+                .unwrap_or_else(|status_err| format!("status probe failed: {status_err}"));
+            panic!(
+                "daemon event while waiting for interrupt: {err}\nstatus:\n{status}\nlog tail:\n{}",
+                log_tail(daemon.home())
+            )
+        }) {
             DaemonEvent::InterruptRaised {
                 session_id: got,
                 interrupt_id,
@@ -223,25 +209,14 @@ async fn wait_for_interrupt(
     }
 }
 
-async fn wait_for_resolved(
-    client: &cockpit_cli::integration::DaemonClient,
-    session_id: Uuid,
-    interrupt_id: Uuid,
-) {
-    let mut seen = Vec::new();
+async fn wait_for_tool_start(client: &cockpit_cli::integration::DaemonClient, session_id: Uuid) {
     loop {
-        let event = client
-            .next_event(Duration::from_secs(20))
-            .await
-            .unwrap_or_else(|err| {
-                panic!("daemon event while waiting for resolution: {err}; seen: {seen:#?}")
-            });
-        seen.push(format!("{event:?}"));
-        match event {
-            DaemonEvent::InterruptResolved {
-                session_id: got_session,
-                interrupt_id: got_interrupt,
-            } if got_session == session_id && got_interrupt == interrupt_id => return,
+        match client.next_event_unbounded().await.expect("daemon event") {
+            DaemonEvent::ToolStart {
+                session_id: got,
+                call_id,
+                ..
+            } if got == session_id && call_id == TOOL_CALL_ID => return,
             _ => {}
         }
     }
@@ -252,11 +227,7 @@ async fn wait_for_replay(
     session_id: Uuid,
 ) -> (i64, Vec<(i64, &'static str)>) {
     loop {
-        match client
-            .next_event(Duration::from_secs(20))
-            .await
-            .expect("daemon event")
-        {
+        match client.next_event_unbounded().await.expect("daemon event") {
             DaemonEvent::HistoryReplay {
                 session_id: got,
                 max_seq,
@@ -282,19 +253,13 @@ async fn drive_auto_replay_to_tool_call(
     session_id: Uuid,
 ) {
     let mut seen = Vec::new();
-    for _ in 0..32 {
-        if tool_call_count(&daemon.db_path(), session_id) == 1 {
-            return;
-        }
-        let event = client
-            .next_event(Duration::from_secs(20))
-            .await
-            .unwrap_or_else(|err| {
-                panic!(
-                    "daemon event while driving auto replay: {err}; seen: {seen:#?}\nlog tail:\n{}",
-                    log_tail(daemon.home())
-                )
-            });
+    loop {
+        let event = client.next_event_unbounded().await.unwrap_or_else(|err| {
+            panic!(
+                "daemon event while driving auto replay: {err}; seen: {seen:#?}\nlog tail:\n{}",
+                log_tail(daemon.home())
+            )
+        });
         seen.push(format!("{event:?}"));
         match event {
             DaemonEvent::Notice { text, .. } if text.contains("safety gate unavailable") => {
@@ -310,10 +275,54 @@ async fn drive_auto_replay_to_tool_call(
                     .await
                     .expect("approve follow-up replay interrupt");
             }
+            DaemonEvent::ToolEnd {
+                session_id: got,
+                call_id,
+                seq: Some(_),
+            }
+            | DaemonEvent::ToolError {
+                session_id: got,
+                call_id,
+                seq: Some(_),
+            } if got == session_id && call_id == TOOL_CALL_ID => return,
             _ => {}
         }
     }
-    panic!("auto replay did not reach tool call; seen: {seen:#?}");
+}
+
+async fn wait_for_tool_terminal_and_resolved(
+    client: &cockpit_cli::integration::DaemonClient,
+    session_id: Uuid,
+    interrupt_id: Uuid,
+) -> i64 {
+    let mut tool_seq = None;
+    let mut resolved = false;
+    loop {
+        match client
+            .next_event_unbounded()
+            .await
+            .expect("daemon event while waiting for tool terminal and interrupt resolution")
+        {
+            DaemonEvent::ToolEnd {
+                session_id: got,
+                call_id,
+                seq: Some(seq),
+            }
+            | DaemonEvent::ToolError {
+                session_id: got,
+                call_id,
+                seq: Some(seq),
+            } if got == session_id && call_id == TOOL_CALL_ID => tool_seq = Some(seq),
+            DaemonEvent::InterruptResolved {
+                session_id: got_session,
+                interrupt_id: got_interrupt,
+            } if got_session == session_id && got_interrupt == interrupt_id => resolved = true,
+            _ => {}
+        }
+        if let (Some(seq), true) = (tool_seq, resolved) {
+            return seq;
+        }
+    }
 }
 
 async fn create_parked_session() -> (ScriptedProvider, SpawnedDaemon, AttachedSession, Uuid) {
@@ -421,11 +430,11 @@ async fn create_auto_gate_parked_session()
 /// Deterministic happens-before for a duplicate-resolve negative assertion
 /// (criterion 6c). A `ResolveInterrupt` request is dispatched to the session
 /// worker via `send_work`, whose `Ack` returns at ENQUEUE time, not after the
-/// worker processes it — so the former `sleep(100ms)` was a wall-clock window
+/// worker processes it — so the former fixed delay was a wall-clock window
 /// hoping a stray second execution would surface. Instead, enqueue a benign
 /// follow-up user-message turn BEHIND the duplicate on the worker's FIFO queue
-/// and condition-poll the DURABLE `session_events` for that turn's persisted
-/// rows. Because the worker drains its queue in order, the new rows prove the
+/// and await its `UserMessageRecorded` commit event. Because the worker drains
+/// its queue in order, the new durable sequence proves the
 /// duplicate was fully processed (and, having no `parked` row to claim, could
 /// not have re-executed the replay). This is a happens-before via durable
 /// observation — not a wall-clock absence window and immune to event-stream
@@ -435,20 +444,26 @@ async fn wait_for_duplicate_resolve_processed(
     daemon: &SpawnedDaemon,
     session_id: Uuid,
 ) {
-    let before = session_event_rows(&daemon.db_path(), session_id).len();
+    let before = session_event_rows(&daemon.db_path(), session_id)
+        .last()
+        .map_or(0, |(seq, _)| *seq);
     client
         .send_user_message("lifecycle duplicate-resolve sync barrier")
         .await
         .expect("send duplicate-resolve sync-barrier user message");
-    wait_until(
-        "duplicate-resolve barrier turn persisted",
-        Duration::from_secs(20),
-        || {
-            let db_path = daemon.db_path();
-            async move { session_event_rows(&db_path, session_id).len() > before }
-        },
-    )
-    .await;
+    loop {
+        match client
+            .next_event_unbounded()
+            .await
+            .expect("barrier commit event")
+        {
+            DaemonEvent::UserMessageRecorded {
+                session_id: got,
+                seq,
+            } if got == session_id && seq > before => break,
+            _ => {}
+        }
+    }
 }
 
 async fn restart_daemon_gracefully(daemon: &SpawnedDaemon) {
@@ -465,16 +480,17 @@ async fn lifecycle_graceful_park_round_trip_replays_once() {
 
     restart_daemon_gracefully(&daemon).await;
 
+    let client = daemon.client().await;
+    let reattached = client
+        .attach(daemon.project_path(), Some(attached.session_id), None, true)
+        .await
+        .expect("reattach session");
+    assert_eq!(reattached.session_id, attached.session_id);
+
+    let raised_after_restart =
+        wait_for_interrupt(&client, &daemon, attached.session_id, Some("rehydration")).await;
+    assert_eq!(raised_after_restart, interrupt_id);
     let db_path = daemon.db_path();
-    wait_until(
-        "graceful restart parked interrupt",
-        Duration::from_secs(5),
-        || {
-            let db_path = db_path.clone();
-            async move { interrupt_row(&db_path, interrupt_id).state == "parked" }
-        },
-    )
-    .await;
     let row = interrupt_row(&db_path, interrupt_id);
     assert_eq!(row.state, "parked");
     assert_replay_payload(&row, &lifecycle_command(daemon.home()));
@@ -486,29 +502,15 @@ async fn lifecycle_graceful_park_round_trip_replays_once() {
         "paused work should remain resumable across restart"
     );
     assert_eq!(tool_call_count(&daemon.db_path(), attached.session_id), 0);
-
-    let client = daemon.client().await;
-    let reattached = client
-        .attach(daemon.project_path(), Some(attached.session_id), None, true)
-        .await
-        .expect("reattach session");
-    assert_eq!(reattached.session_id, attached.session_id);
-
-    let raised_after_restart =
-        wait_for_interrupt(&client, &daemon, attached.session_id, Some("rehydration")).await;
-    assert_eq!(raised_after_restart, interrupt_id);
+    assert_eq!(interrupt_row(&db_path, interrupt_id).state, "parked");
 
     client
         .approve_interrupt_project(interrupt_id)
         .await
         .expect("approve parked interrupt");
-    wait_for_resolved(&client, attached.session_id, interrupt_id).await;
-
-    wait_until("tool call audit row", Duration::from_secs(5), || {
-        let db_path = daemon.db_path();
-        async move { tool_call_count(&db_path, attached.session_id) == 1 }
-    })
-    .await;
+    let tool_seq =
+        wait_for_tool_terminal_and_resolved(&client, attached.session_id, interrupt_id).await;
+    assert!(tool_seq > 0);
     assert_eq!(
         tool_call_command(&daemon.db_path(), attached.session_id),
         lifecycle_command(daemon.home())
@@ -552,24 +554,21 @@ async fn lifecycle_sigkill_open_interrupt_reconciles_and_replays_once() {
         .attach(daemon.project_path(), Some(attached.session_id), None, true)
         .await
         .expect("reattach session");
-    wait_until(
-        "crash-surviving interrupt parked",
-        Duration::from_secs(5),
-        || {
-            let db_path = daemon.db_path();
-            async move { interrupt_row(&db_path, interrupt_id).state == "parked" }
-        },
-    )
-    .await;
     let raised_after_restart =
         wait_for_interrupt(&client, &daemon, attached.session_id, Some("rehydration")).await;
     assert_eq!(raised_after_restart, interrupt_id);
+    assert_eq!(
+        interrupt_row(&daemon.db_path(), interrupt_id).state,
+        "parked"
+    );
 
     client
         .approve_interrupt_project(interrupt_id)
         .await
         .expect("approve parked interrupt");
-    wait_for_resolved(&client, attached.session_id, interrupt_id).await;
+    let tool_seq =
+        wait_for_tool_terminal_and_resolved(&client, attached.session_id, interrupt_id).await;
+    assert!(tool_seq > 0);
 
     assert_eq!(tool_call_count(&daemon.db_path(), attached.session_id), 1);
     assert_eq!(
@@ -595,15 +594,6 @@ async fn lifecycle_auto_gate_unavailable_park_replay_runs_approved_command() {
 
     restart_daemon_gracefully(&daemon).await;
 
-    let row = interrupt_row(&daemon.db_path(), interrupt_id);
-    assert_eq!(row.state, "parked");
-    assert_replay_payload(&row, &lifecycle_command(daemon.home()));
-    assert!(
-        row.parked_gate_json.is_some(),
-        "parked inner prompt must carry the already-approved gate memo"
-    );
-    assert_eq!(tool_call_count(&daemon.db_path(), attached.session_id), 0);
-
     let client = daemon.client().await;
     client
         .attach(daemon.project_path(), Some(attached.session_id), None, true)
@@ -613,6 +603,14 @@ async fn lifecycle_auto_gate_unavailable_park_replay_runs_approved_command() {
         wait_for_interrupt(&client, &daemon, attached.session_id, Some("rehydration")).await,
         interrupt_id
     );
+    let row = interrupt_row(&daemon.db_path(), interrupt_id);
+    assert_eq!(row.state, "parked");
+    assert_replay_payload(&row, &lifecycle_command(daemon.home()));
+    assert!(
+        row.parked_gate_json.is_some(),
+        "parked inner prompt must carry the already-approved gate memo"
+    );
+    assert_eq!(tool_call_count(&daemon.db_path(), attached.session_id), 0);
 
     client
         .approve_interrupt_project(interrupt_id)
@@ -651,18 +649,13 @@ async fn lifecycle_auto_gate_unavailable_sigkill_park_replay_runs_approved_comma
         .attach(daemon.project_path(), Some(attached.session_id), None, true)
         .await
         .expect("reattach session");
-    wait_until(
-        "auto gate crash-surviving interrupt parked",
-        Duration::from_secs(5),
-        || {
-            let db_path = daemon.db_path();
-            async move { interrupt_row(&db_path, interrupt_id).state == "parked" }
-        },
-    )
-    .await;
     assert_eq!(
         wait_for_interrupt(&client, &daemon, attached.session_id, Some("rehydration")).await,
         interrupt_id
+    );
+    assert_eq!(
+        interrupt_row(&daemon.db_path(), interrupt_id).state,
+        "parked"
     );
 
     client
@@ -693,10 +686,6 @@ async fn lifecycle_deny_round_trip_resolves_without_broadened_rerun() {
     // force the excluded interleaving without blocking unrelated SQLite
     // writers in this process-boundary test.
     restart_daemon_gracefully(&daemon).await;
-    assert_eq!(
-        interrupt_row(&daemon.db_path(), interrupt_id).state,
-        "parked"
-    );
 
     let client = daemon.client().await;
     client
@@ -707,12 +696,18 @@ async fn lifecycle_deny_round_trip_resolves_without_broadened_rerun() {
         wait_for_interrupt(&client, &daemon, attached.session_id, Some("rehydration")).await,
         interrupt_id
     );
+    assert_eq!(
+        interrupt_row(&daemon.db_path(), interrupt_id).state,
+        "parked"
+    );
 
     client
         .deny_interrupt(interrupt_id)
         .await
         .expect("deny parked interrupt");
-    wait_for_resolved(&client, attached.session_id, interrupt_id).await;
+    let tool_seq =
+        wait_for_tool_terminal_and_resolved(&client, attached.session_id, interrupt_id).await;
+    assert!(tool_seq > 0);
 
     let row = interrupt_row(&daemon.db_path(), interrupt_id);
     assert_eq!(row.state, "resolved");
@@ -734,10 +729,11 @@ async fn lifecycle_restart_command_preserves_parked_session_and_starts_when_abse
     let old_pid = daemon.pid();
 
     restart_daemon_gracefully(&daemon).await;
-    wait_until("replacement daemon pid", Duration::from_secs(5), || async {
-        daemon.try_pid().is_some_and(|pid| pid != old_pid)
-    })
-    .await;
+    assert_ne!(
+        daemon.pid(),
+        old_pid,
+        "restart must publish a new generation"
+    );
 
     let client = daemon.client().await;
     let reattached = client
@@ -745,24 +741,22 @@ async fn lifecycle_restart_command_preserves_parked_session_and_starts_when_abse
         .await
         .expect("reattach session");
     assert_eq!(reattached.session_id, attached.session_id);
-    let db_path = daemon.db_path();
-    wait_until("restarted interrupt parked", Duration::from_secs(5), || {
-        let db_path = db_path.clone();
-        async move { interrupt_row(&db_path, interrupt_id).state == "parked" }
-    })
-    .await;
     assert_eq!(
         wait_for_interrupt(&client, &daemon, attached.session_id, Some("rehydration")).await,
         interrupt_id
+    );
+    assert_eq!(
+        interrupt_row(&daemon.db_path(), interrupt_id).state,
+        "parked"
     );
     drop(client);
 
     let stop = daemon.stop_via_command(0);
     assert!(stop.status.success(), "{}", output_text(&stop));
-    wait_until("daemon pid cleanup", Duration::from_secs(5), || async {
-        daemon.try_pid().is_none()
-    })
-    .await;
+    assert!(
+        daemon.try_pid().is_none(),
+        "stop success must retire pid metadata"
+    );
 
     let restart = daemon.restart_via_command(0).await;
     assert!(restart.status.success(), "{}", output_text(&restart));
@@ -794,11 +788,7 @@ async fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without
         .answer_interrupt_option(interrupt_id, approve)
         .await
         .expect("approve parked interrupt");
-    wait_until("parked interrupt executing", Duration::from_secs(5), || {
-        let db_path = daemon.db_path();
-        async move { interrupt_row(&db_path, interrupt_id).state == "executing" }
-    })
-    .await;
+    wait_for_tool_start(&client, attached.session_id).await;
     assert_eq!(
         interrupt_row(&daemon.db_path(), interrupt_id).state,
         "executing",
@@ -811,7 +801,7 @@ async fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without
         loop {
             tokio::select! {
                 () = &mut launched => break,
-                event = client.next_event(Duration::from_secs(20)) => {
+                event = client.next_event_unbounded() => {
                     if let DaemonEvent::InterruptRaised {
                         session_id,
                         interrupt_id: launch_interrupt,
@@ -841,15 +831,10 @@ async fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without
         .attach(daemon.project_path(), Some(attached.session_id), None, true)
         .await
         .expect("reattach session");
-    wait_until(
-        "executing interrupt reconciled interrupted",
-        Duration::from_secs(5),
-        || {
-            let db_path = daemon.db_path();
-            async move { interrupt_row(&db_path, interrupt_id).state == "interrupted" }
-        },
-    )
-    .await;
+    assert_eq!(
+        interrupt_row(&daemon.db_path(), interrupt_id).state,
+        "interrupted"
+    );
 
     client
         .approve_interrupt_once(interrupt_id)
@@ -881,12 +866,9 @@ async fn lifecycle_attach_replay_across_restart_delivers_persisted_events_once_i
         .approve_interrupt_project(interrupt_id)
         .await
         .expect("approve parked interrupt");
-    wait_for_resolved(&client, attached.session_id, interrupt_id).await;
-    wait_until("tool call audit row", Duration::from_secs(5), || {
-        let db_path = daemon.db_path();
-        async move { tool_call_count(&db_path, attached.session_id) == 1 }
-    })
-    .await;
+    let tool_seq =
+        wait_for_tool_terminal_and_resolved(&client, attached.session_id, interrupt_id).await;
+    assert!(tool_seq > 0);
 
     assert!(
         session_event_rows(&daemon.db_path(), attached.session_id)

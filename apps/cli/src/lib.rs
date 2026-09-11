@@ -179,6 +179,10 @@ pub mod integration {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum DaemonEvent {
+        UserMessageRecorded {
+            session_id: Uuid,
+            seq: i64,
+        },
         InterruptRaised {
             session_id: Uuid,
             interrupt_id: Uuid,
@@ -209,6 +213,12 @@ pub mod integration {
         ToolEnd {
             session_id: Uuid,
             call_id: String,
+            seq: Option<i64>,
+        },
+        ToolError {
+            session_id: Uuid,
+            call_id: String,
+            seq: Option<i64>,
         },
         AssistantText {
             session_id: Uuid,
@@ -526,12 +536,46 @@ pub mod integration {
             }
         }
 
+        pub async fn next_caffeinate_state_unbounded(&self) -> Result<CaffeinateState> {
+            loop {
+                let event = self
+                    .inner
+                    .next_event()
+                    .await
+                    .ok_or_else(|| anyhow!("daemon event stream closed"))?;
+                if let crate::daemon::proto::Event::CaffeinateState {
+                    active,
+                    lid_close_guaranteed,
+                    message,
+                } = event
+                {
+                    return Ok(CaffeinateState {
+                        active,
+                        lid_close_guaranteed,
+                        message,
+                    });
+                }
+            }
+        }
+
         pub async fn next_event(&self, timeout: Duration) -> Result<DaemonEvent> {
             let event = tokio::time::timeout(timeout, self.inner.next_event())
                 .await
                 .map_err(|_| anyhow!("timed out waiting for daemon event"))?
                 .ok_or_else(|| anyhow!("daemon event stream closed"))?;
             Ok(map_event(event))
+        }
+
+        /// Receive the next daemon event without imposing a second wall-clock
+        /// completion budget. Integration tests that await durable completion
+        /// use nextest's per-test timeout as their hang guard and still fail
+        /// immediately if the socket event stream disconnects.
+        pub async fn next_event_unbounded(&self) -> Result<DaemonEvent> {
+            self.inner
+                .next_event()
+                .await
+                .map(map_event)
+                .ok_or_else(|| anyhow!("daemon event stream closed"))
         }
 
         pub fn is_socket_backed(&self) -> bool {
@@ -541,6 +585,9 @@ pub mod integration {
 
     fn map_event(event: crate::daemon::proto::Event) -> DaemonEvent {
         match event {
+            crate::daemon::proto::Event::UserMessageRecorded {
+                session_id, seq, ..
+            } => DaemonEvent::UserMessageRecorded { session_id, seq },
             crate::daemon::proto::Event::InterruptRaised {
                 session_id,
                 interrupt_id,
@@ -599,10 +646,22 @@ pub mod integration {
             crate::daemon::proto::Event::ToolEnd {
                 session_id,
                 call_id,
+                seq,
                 ..
             } => DaemonEvent::ToolEnd {
                 session_id,
                 call_id,
+                seq,
+            },
+            crate::daemon::proto::Event::ToolError {
+                session_id,
+                call_id,
+                seq,
+                ..
+            } => DaemonEvent::ToolError {
+                session_id,
+                call_id,
+                seq,
             },
             crate::daemon::proto::Event::AssistantText {
                 session_id, text, ..

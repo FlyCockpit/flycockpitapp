@@ -476,6 +476,13 @@ pub struct HermeticCockpit {
     spec: HermeticLaunchSpec,
     inherited: InheritedEnvironmentModel,
     daemon_pid: Option<u32>,
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        windows
+    ))]
+    daemon_exit: Option<super::ExactProcessExit>,
     reaped_pty_pid: Option<u32>,
     reaped_daemon_pid: Option<u32>,
     pty: Option<PtyHandles>,
@@ -501,6 +508,13 @@ impl HermeticCockpit {
             spec,
             inherited,
             daemon_pid: None,
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "freebsd",
+                windows
+            ))]
+            daemon_exit: None,
             reaped_pty_pid: None,
             reaped_daemon_pid: None,
             pty: None,
@@ -614,10 +628,22 @@ impl HermeticCockpit {
             .expect("hermetic cockpit daemon start --detach");
         assert_success("hermetic cockpit daemon start --detach", &start, &self.home);
         self.wait_for_daemon(DEFAULT_DAEMON_TIMEOUT);
-        self.daemon_pid = Some(
-            self.pid_from_file()
-                .expect("daemon pid file after hermetic daemon start"),
-        );
+        let daemon_pid = self
+            .pid_from_file()
+            .expect("daemon pid file after hermetic daemon start");
+        self.daemon_pid = Some(daemon_pid);
+        // Pin the process identity while the successful hello proves this
+        // exact generation is live. Capturing only during cleanup races a
+        // daemon that has already completed its natural shutdown.
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            windows
+        ))]
+        {
+            self.daemon_exit = Some(super::ExactProcessExit::capture(daemon_pid));
+        }
     }
 
     fn wait_for_daemon(&self, timeout: Duration) {
@@ -1014,7 +1040,7 @@ impl HermeticCockpit {
             target_os = "freebsd",
             windows
         ))]
-        let daemon_exit = daemon_pid.map(super::ExactProcessExit::capture);
+        let daemon_exit = self.daemon_exit.take();
         if daemon_pid.is_some() {
             self.reaped_daemon_pid = daemon_pid;
         }

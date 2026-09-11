@@ -401,7 +401,7 @@ impl SpawnedDaemon {
 
         let owned_child_exited = self
             .process
-            .reap_while_command_runs(&mut command_child, DAEMON_RESTART_HANDSHAKE_TIMEOUT)
+            .reap_while_command_runs(&mut command_child)
             .expect("coordinate daemon restart with exact child");
         let output = command_child
             .wait_with_output()
@@ -464,7 +464,7 @@ impl SpawnedDaemon {
             .expect("daemon stop command");
         let owned_child_exited = self
             .process
-            .reap_while_command_runs(&mut command_child, DAEMON_RESTART_HANDSHAKE_TIMEOUT)
+            .reap_while_command_runs(&mut command_child)
             .expect("coordinate daemon stop with exact child");
         command_child
             .wait_with_output()
@@ -878,48 +878,6 @@ pub async fn wait_for_daemon_handshake_on_socket(
     }
 }
 
-pub async fn wait_until<F, Fut>(label: &str, timeout: Duration, mut probe: F)
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let deadline = Instant::now() + timeout;
-    let mut delay = Duration::from_millis(2);
-    loop {
-        if probe().await {
-            return;
-        }
-        assert!(Instant::now() < deadline, "timed out waiting for {label}");
-        tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(Duration::from_millis(50));
-    }
-}
-
-pub async fn wait_until_with_home<F, Fut>(
-    label: &str,
-    timeout: Duration,
-    home: &IsolatedHome,
-    mut probe: F,
-) where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let deadline = Instant::now() + timeout;
-    let mut delay = Duration::from_millis(2);
-    loop {
-        if probe().await {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {label}\nlog tail:\n{}",
-            log_tail(home)
-        );
-        tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(Duration::from_millis(50));
-    }
-}
-
 pub fn log_tail(home: &IsolatedHome) -> String {
     tail_file(home.log_file(), 8192).unwrap_or_else(|| "<no log file>".to_string())
 }
@@ -1176,11 +1134,7 @@ impl EphemeralDaemonGuard {
             .is_some()
     }
 
-    fn reap_while_command_runs(
-        &self,
-        command: &mut std::process::Child,
-        _timeout: Duration,
-    ) -> std::io::Result<bool> {
+    fn reap_while_command_runs(&self, command: &mut std::process::Child) -> std::io::Result<bool> {
         if !command.wait()?.success() {
             self.reap_current();
             return Ok(false);

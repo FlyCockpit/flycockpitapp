@@ -67,7 +67,26 @@ fn hermetic_command(path: &Path) -> Command {
     cmd
 }
 
-pub fn start_mock_secret_service() -> MockSecretService {
+struct StartingMockSecretService {
+    daemon: KillOnDrop,
+    stop: tokio::sync::oneshot::Sender<()>,
+    service: JoinHandle<()>,
+    address: String,
+    ready: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+impl StartingMockSecretService {
+    fn finish(mut self) -> MockSecretService {
+        MockSecretService {
+            daemon: self.daemon.0.take().expect("dbus-daemon child"),
+            stop: Some(self.stop),
+            service: Some(self.service),
+            address: self.address,
+        }
+    }
+}
+
+fn begin_mock_secret_service() -> StartingMockSecretService {
     let dbus = resolve_host_binary("dbus-daemon");
     let daemon = hermetic_command(&dbus)
         .args(["--session", "--nofork", "--print-address=1"])
@@ -110,16 +129,38 @@ pub fn start_mock_secret_service() -> MockSecretService {
         })
         .expect("spawn secret-service thread");
 
-    ready_rx
+    StartingMockSecretService {
+        daemon,
+        stop: stop_tx,
+        service: handle,
+        address,
+        ready: Some(ready_rx),
+    }
+}
+
+/// Start the service from synchronous tests. Async tests must use
+/// `start_mock_secret_service_async` so readiness never blocks a runtime
+/// worker.
+pub fn start_mock_secret_service() -> MockSecretService {
+    let mut starting = begin_mock_secret_service();
+    starting
+        .ready
+        .take()
+        .expect("readiness receiver")
         .blocking_recv()
         .expect("mock secret service failed before claiming the bus");
+    starting.finish()
+}
 
-    MockSecretService {
-        daemon: daemon.0.take().expect("dbus-daemon child"),
-        stop: Some(stop_tx),
-        service: Some(handle),
-        address,
-    }
+pub async fn start_mock_secret_service_async() -> MockSecretService {
+    let mut starting = begin_mock_secret_service();
+    starting
+        .ready
+        .take()
+        .expect("readiness receiver")
+        .await
+        .expect("mock secret service failed before claiming the bus");
+    starting.finish()
 }
 
 async fn serve(
@@ -175,6 +216,15 @@ struct StoredItem {
     secret: Vec<u8>,
     content_type: String,
     path: String,
+}
+
+#[cfg(test)]
+mod startup_tests {
+    #[tokio::test(flavor = "current_thread")]
+    async fn mock_secret_service_startup_is_async_runtime_safe() {
+        let service = super::start_mock_secret_service_async().await;
+        assert!(!service.address.is_empty());
+    }
 }
 
 impl ServiceState {

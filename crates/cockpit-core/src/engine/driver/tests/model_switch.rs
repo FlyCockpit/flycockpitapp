@@ -1230,7 +1230,11 @@ async fn concurrent_plain_enter_switches_write_no_default_at_all() {
     let (tx_b, mut rx_b) = mpsc::channel::<TurnEvent>(64);
     let root = shared.path();
 
-    let a = run_control_with_trusted_project_config(
+    // Keep each full driver future independently owned on the heap. `join!`
+    // otherwise embeds both large `run_control` state machines in this test
+    // future, overflowing an ordinary libtest worker stack before either one
+    // can be polled.
+    let a = Box::pin(run_control_with_trusted_project_config(
         &mut driver_a,
         root,
         DriverControl::SetActiveModel {
@@ -1244,8 +1248,8 @@ async fn concurrent_plain_enter_switches_write_no_default_at_all() {
             prompt_cache_retention: None,
         },
         &tx_a,
-    );
-    let b = run_control_with_trusted_project_config(
+    ));
+    let b = Box::pin(run_control_with_trusted_project_config(
         &mut driver_b,
         root,
         DriverControl::SetActiveModel {
@@ -1259,7 +1263,7 @@ async fn concurrent_plain_enter_switches_write_no_default_at_all() {
             prompt_cache_retention: None,
         },
         &tx_b,
-    );
+    ));
     tokio::join!(a, b);
 
     let outcomes = [
@@ -1303,7 +1307,9 @@ async fn a_concurrent_plain_enter_cannot_disturb_an_explicit_replace() {
     let (session_only_tx, _session_only_rx) = mpsc::channel::<TurnEvent>(64);
     let root = shared.path();
 
-    let explicit = run_control_with_trusted_project_config(
+    // The two independently pinned futures retain genuine interleaving while
+    // bounding the join future's inline state to two owning pointers.
+    let explicit = Box::pin(run_control_with_trusted_project_config(
         &mut explicit_driver,
         root,
         DriverControl::SetActiveModel {
@@ -1317,8 +1323,8 @@ async fn a_concurrent_plain_enter_cannot_disturb_an_explicit_replace() {
             prompt_cache_retention: None,
         },
         &explicit_tx,
-    );
-    let session_only = run_control_with_trusted_project_config(
+    ));
+    let session_only = Box::pin(run_control_with_trusted_project_config(
         &mut session_only_driver,
         root,
         DriverControl::SetActiveModel {
@@ -1332,7 +1338,7 @@ async fn a_concurrent_plain_enter_cannot_disturb_an_explicit_replace() {
             prompt_cache_retention: None,
         },
         &session_only_tx,
-    );
+    ));
     tokio::join!(explicit, session_only);
 
     assert_disk_config_active_model(root, "provider-a", "model-a");

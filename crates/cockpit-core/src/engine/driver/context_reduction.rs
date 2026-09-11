@@ -2519,13 +2519,6 @@ impl Driver {
         // chain (implementation note):
         // `compact_prompt` (the brief-prompt override) and `compact_model`
         // (the dedicated drafting model).
-        #[cfg(test)]
-        let (mut extended, providers) = self.config.configs();
-        #[cfg(test)]
-        if let Some(model_ref) = &self.test_compact_model_ref {
-            extended.compact_model = Some(model_ref.clone());
-        }
-        #[cfg(not(test))]
         let (extended, providers) = self.config.configs();
         // Two-level model precedence: a configured `compact_model` (when it
         // resolves) drafts the brief; otherwise the active agent's own model.
@@ -2865,31 +2858,17 @@ pub(in crate::engine::driver) async fn execute_compact_brief(
         return O::ContextOverflow { diagnostic };
     }
     let source_history = draft.history.clone();
-    #[cfg(test)]
-    let has_scripted_compact = draft
-        .test_script
-        .as_ref()
-        .is_some_and(|script| !crate::sync::lock_or_recover(script).is_empty());
-    #[cfg(not(test))]
-    let has_scripted_compact = false;
-    let (fitted_history, mut fit_rung, mut input_coverage) = if has_scripted_compact {
-        (
-            draft.history.clone(),
-            crate::engine::compact_draft::CompactFitRung::Verbatim,
-            crate::engine::compact_draft::CompactInputCoverage::Full,
-        )
-    } else {
-        let fitted = match crate::engine::compact_draft::fit_compact_request(
-            &draft.history,
-            &draft.system,
-            &prompt_text,
-            draft.context_window,
-        ) {
-            Ok(fitted) => fitted,
-            Err(diagnostic) => return O::ContextOverflow { diagnostic },
-        };
-        (fitted.history, fitted.rung, fitted.coverage)
+    let fitted = match crate::engine::compact_draft::fit_compact_request(
+        &draft.history,
+        &draft.system,
+        &prompt_text,
+        draft.context_window,
+    ) {
+        Ok(fitted) => fitted,
+        Err(diagnostic) => return O::ContextOverflow { diagnostic },
     };
+    let (fitted_history, mut fit_rung, mut input_coverage) =
+        (fitted.history, fitted.rung, fitted.coverage);
     draft.history = fitted_history;
     #[cfg(test)]
     if let Some(calls) = &draft.test_calls {

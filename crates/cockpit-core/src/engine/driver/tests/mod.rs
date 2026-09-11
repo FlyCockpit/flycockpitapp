@@ -2208,6 +2208,17 @@ fn install_test_provider_config(
     driver: &mut Driver,
     providers: crate::config::providers::ProvidersConfig,
 ) {
+    if let Some(active) = providers.active_model.as_ref() {
+        if let Some((override_providers, override_provider, override_model)) =
+            driver.test_providers_override.as_mut()
+        {
+            *override_providers = providers.clone();
+            override_provider.clone_from(&active.provider);
+            override_model.clone_from(&active.model);
+        }
+    } else {
+        driver.test_providers_override = None;
+    }
     driver
         .session
         .set_active_model_selection(providers.active_model.clone())

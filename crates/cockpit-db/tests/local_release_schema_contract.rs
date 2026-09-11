@@ -337,6 +337,122 @@ fn provider_config_journal_actions_have_strict_payload_shapes() {
 }
 
 #[test]
+fn host_authorization_tool_call_identity_is_per_agent_and_indexes_its_owner_fk() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(include_str!("../src/db/migrations/0001_initial.sql"))
+        .unwrap();
+    conn.execute(
+        "INSERT INTO sessions
+         (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms)
+         VALUES (?1, 'project', '/project', 1, 1)",
+        ["00000000-0000-0000-0000-000000000001"],
+    )
+    .unwrap();
+    for agent_id in ["agent-a", "agent-b"] {
+        conn.execute(
+            "INSERT INTO agent_instances
+             (agent_instance_id, session_id, state, revision, created_at_unix_ms, updated_at_unix_ms)
+             VALUES (?1, ?2, 'running', 0, 1, 1)",
+            rusqlite::params![agent_id, "00000000-0000-0000-0000-000000000001"],
+        )
+        .unwrap();
+    }
+
+    let insert_group = |group_id: &str, agent_id: &str| {
+        conn.execute(
+            "INSERT INTO agent_host_authorization_groups
+             (authorization_group_id, tool_call_id, session_id, agent_instance_id,
+              concrete_effect_digest, state, created_at_unix_ms)
+             VALUES (?1, 'shared-tool-call', ?2, ?3, ?4, 'collecting', 1)",
+            rusqlite::params![
+                group_id,
+                "00000000-0000-0000-0000-000000000001",
+                agent_id,
+                "0".repeat(64),
+            ],
+        )
+    };
+    insert_group("group-a", "agent-a").unwrap();
+    insert_group("group-b", "agent-b").unwrap();
+    assert!(
+        insert_group("group-a-duplicate", "agent-a").is_err(),
+        "one agent must not mint two authorization groups for the same session/tool call"
+    );
+    assert!(
+        insert_group("group-orphan", "missing-agent").is_err(),
+        "an authorization group must retain an actual agent owner in its session"
+    );
+
+    let indexed_columns = conn
+        .prepare("PRAGMA index_info(idx_agent_host_authorization_group_tool_call)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(2))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        indexed_columns,
+        ["agent_instance_id", "session_id", "tool_call_id"],
+        "the natural identity must continue to lead the composite owner foreign key"
+    );
+    let owner_fk_columns = conn
+        .prepare(
+            "SELECT \"from\", \"to\" FROM pragma_foreign_key_list('agent_host_authorization_groups')
+              WHERE \"table\" = 'agent_instances' ORDER BY seq",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        owner_fk_columns,
+        [
+            (
+                "agent_instance_id".to_owned(),
+                "agent_instance_id".to_owned()
+            ),
+            ("session_id".to_owned(), "session_id".to_owned()),
+        ],
+        "authorization groups must retain their composite authorized-agent foreign key"
+    );
+
+    let recovery_plan = conn
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             UPDATE agent_host_authorization_groups
+                SET state = 'submission_unknown', resolved_at_unix_ms = ?1
+              WHERE agent_instance_id IN (
+                    SELECT agent_instance_id FROM agent_instances
+                     WHERE session_id = ?2
+                ) AND session_id = ?2
+                AND state IN ('collecting', 'dispatching')
+                AND EXISTS (
+                    SELECT 1 FROM agent_host_approval_operations member
+                     WHERE member.authorization_group_id = agent_host_authorization_groups.authorization_group_id
+                       AND member.state = 'submission_unknown'
+                )",
+        )
+        .unwrap()
+        .query_map(rusqlite::params![2, "00000000-0000-0000-0000-000000000001"], |row| {
+            row.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        recovery_plan.iter().any(|detail| {
+            detail.contains("idx_agent_host_authorization_group_tool_call")
+                && detail.contains("agent_instance_id=?")
+                && detail.contains("session_id=?")
+        }),
+        "production reconciliation must derive actual session agents and use the composite group identity index: {recovery_plan:?}"
+    );
+}
+
+#[test]
 fn authority_journals_bind_exact_fenced_terminal_receipts() {
     let sql = include_str!("../src/db/migrations/0001_initial.sql");
     for table in [

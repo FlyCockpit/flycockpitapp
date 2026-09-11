@@ -1143,13 +1143,24 @@ async fn compact_override_uses_selected_models_context_window() {
         ContextConfig::default(),
         100_000,
     );
-    let (providers, _, _) = driver.test_providers_override.as_mut().unwrap();
+    let mut providers = driver.config.providers();
     let provider = providers.providers.get_mut("lmstudio").unwrap();
     let mut compact = provider.models[0].clone();
     compact.id = "compact".to_string();
     compact.context_length = Some(4_096);
     provider.models.push(compact);
-    driver.test_compact_model_ref = Some("lmstudio:compact".to_string());
+    install_test_provider_config(&mut driver, providers.clone());
+    let mut extended = driver.config.extended().clone();
+    extended.compact_model = Some("lmstudio:compact".to_string());
+    driver.set_config_handle(
+        crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                driver.config.generation(),
+                providers,
+                extended,
+            ),
+        ),
+    );
     let draft = driver
         .compact_brief_draft(
             &tx,
@@ -4713,15 +4724,7 @@ async fn noninteractive_executor_returns_partial_on_compact_guard_trip() {
         },
         10_000,
     );
-    driver
-        .test_providers_override
-        .as_mut()
-        .unwrap()
-        .0
-        .providers
-        .get_mut("lmstudio")
-        .unwrap()
-        .url = provider.base_url();
+    set_test_provider_url(&mut driver, provider.base_url());
     Arc::make_mut(&mut driver.stack[0].agent).context_policy = Some(crate::agents::ContextPolicy {
         auto_compact_pct: Some(50),
         inline_caps: None,
@@ -4842,15 +4845,7 @@ async fn noninteractive_executor_returns_partial_when_compact_charges_exhaust_bu
         },
         10_000,
     );
-    driver
-        .test_providers_override
-        .as_mut()
-        .unwrap()
-        .0
-        .providers
-        .get_mut("lmstudio")
-        .unwrap()
-        .url = provider.base_url();
+    set_test_provider_url(&mut driver, provider.base_url());
     Arc::make_mut(&mut driver.stack[0].agent).context_policy = Some(crate::agents::ContextPolicy {
         auto_compact_pct: Some(50),
         inline_caps: None,
@@ -4952,6 +4947,27 @@ async fn noninteractive_auto_compact_threshold_uses_frame_context_window() {
             ..ContextConfig::default()
         },
         1_000,
+    );
+    // Keep the active frame's deliberately small window as the trigger
+    // authority while giving the production compaction path a real,
+    // separately configured drafting model that can fit the source history.
+    let mut providers = driver.config.providers();
+    let provider = providers.providers.get_mut("lmstudio").unwrap();
+    let mut compact = provider.models[0].clone();
+    compact.id = "compact".to_string();
+    compact.context_length = Some(100_000);
+    provider.models.push(compact);
+    install_test_provider_config(&mut driver, providers.clone());
+    let mut extended = driver.config.extended().clone();
+    extended.compact_model = Some("lmstudio:compact".to_string());
+    driver.set_config_handle(
+        crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                driver.config.generation(),
+                providers,
+                extended,
+            ),
+        ),
     );
     record_test_context_tokens(&driver, 100).await;
     crate::sync::lock_or_recover(driver.test_compact_brief_script.as_ref().unwrap())

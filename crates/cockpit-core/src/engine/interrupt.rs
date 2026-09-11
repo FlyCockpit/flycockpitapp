@@ -1768,7 +1768,7 @@ impl InterruptHub {
         session_id: Uuid,
         interrupt_id: Uuid,
     ) -> PendingInterrupt<'_> {
-        self.register_inner(interrupt_id, Some((db.clone(), session_id)))
+        self.register(interrupt_id).with_durable(db, session_id)
     }
 
     fn register_inner(
@@ -2115,6 +2115,15 @@ pub struct PendingInterrupt<'a> {
 }
 
 impl PendingInterrupt<'_> {
+    /// Attach the durable identity after the in-memory sender is installed.
+    /// Keeping registration as the first operation makes publication ordering
+    /// explicit at call sites while retaining terminal-row reconciliation for
+    /// the unavoidable persist-before-register boundary.
+    fn with_durable(mut self, db: &crate::db::Db, session_id: Uuid) -> Self {
+        self.durable = Some((db.clone(), session_id));
+        self
+    }
+
     /// Issue the host-approval capability from this live waiter.  The opaque
     /// capability therefore cannot be created from a durable operation UUID
     /// alone: the caller must hold the actual registered QuestionTool
@@ -2887,7 +2896,8 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
     // binding exists, so its terminal projection can never beat this waiter
     // and strand the original tool call. Every failure below drops this guard,
     // which removes the registry entry and leaves no synthetic continuation.
-    let pending = interrupts.register_durable(db, interrupt_session_id, interrupt_id);
+    let pending = interrupts.register(interrupt_id);
+    let pending = pending.with_durable(db, interrupt_session_id);
     let host_operation = decision_subject.host_approval_operation().cloned();
     let host_operation_id = host_operation
         .as_ref()

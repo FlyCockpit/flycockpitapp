@@ -5674,7 +5674,11 @@ impl Db {
                      FROM agent_host_approval_operations operation
                      JOIN agent_host_authorization_groups approval_group
                        ON approval_group.authorization_group_id = operation.authorization_group_id
-                    WHERE operation.session_id = ?2 AND operation.state = 'approved'
+                    WHERE operation.agent_instance_id IN (
+                          SELECT agent_instance_id FROM agent_instances
+                           WHERE session_id = ?2
+                      ) AND operation.session_id = ?2
+                      AND operation.state = 'approved'
                       AND operation.selected_response_json IS NOT NULL
                       AND operation.selected_candidate_json IS NOT NULL
                       AND approval_group.state = 'collecting'
@@ -5687,13 +5691,19 @@ impl Db {
             let dispatching_handoffs = conn.execute(
                 "UPDATE agent_host_approval_effect_handoffs
                     SET state = 'submission_unknown', completed_at_unix_ms = ?1
-                  WHERE session_id = ?2 AND state = 'dispatching'",
+                  WHERE agent_instance_id IN (
+                        SELECT agent_instance_id FROM agent_instances
+                         WHERE session_id = ?2
+                    ) AND session_id = ?2 AND state = 'dispatching'",
                 params![now_unix_ms, session_id.to_string()],
             )?;
             let dispatching_operations = conn.execute(
                 "UPDATE agent_host_approval_operations
                     SET state = 'submission_unknown'
-                  WHERE session_id = ?1 AND state = 'dispatching'",
+                  WHERE agent_instance_id IN (
+                        SELECT agent_instance_id FROM agent_instances
+                         WHERE session_id = ?1
+                    ) AND session_id = ?1 AND state = 'dispatching'",
                 params![session_id.to_string()],
             )?;
             ensure!(
@@ -5703,7 +5713,11 @@ impl Db {
             conn.execute(
                 "UPDATE agent_host_authorization_groups
                     SET state = 'submission_unknown', resolved_at_unix_ms = ?1
-                  WHERE session_id = ?2 AND state IN ('collecting', 'dispatching')
+                  WHERE agent_instance_id IN (
+                        SELECT agent_instance_id FROM agent_instances
+                         WHERE session_id = ?2
+                    ) AND session_id = ?2
+                    AND state IN ('collecting', 'dispatching')
                     AND EXISTS (
                         SELECT 1 FROM agent_host_approval_operations member
                          WHERE member.authorization_group_id = agent_host_authorization_groups.authorization_group_id

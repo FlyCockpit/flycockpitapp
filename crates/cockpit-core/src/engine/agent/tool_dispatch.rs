@@ -144,6 +144,8 @@ pub(crate) struct SchedulerDurablePermit {
     order: Arc<SchedulerDurableOrder>,
     ordinal: usize,
     started_released: bool,
+    execution_release: Option<(usize, tokio::sync::mpsc::UnboundedSender<usize>)>,
+    execution_released: bool,
 }
 
 impl SchedulerDurablePermit {
@@ -152,6 +154,25 @@ impl SchedulerDurablePermit {
             order,
             ordinal,
             started_released: false,
+            execution_release: None,
+            execution_released: false,
+        }
+    }
+
+    pub(crate) fn set_execution_release_sender(
+        &mut self,
+        source_index: usize,
+        tx: tokio::sync::mpsc::UnboundedSender<usize>,
+    ) {
+        self.execution_release = Some((source_index, tx));
+    }
+
+    fn release_execution(&mut self) {
+        if !self.execution_released {
+            self.execution_released = true;
+            if let Some((source_index, tx)) = &self.execution_release {
+                let _ = tx.send(*source_index);
+            }
         }
     }
 
@@ -172,6 +193,10 @@ impl SchedulerDurablePermit {
     }
 
     pub(crate) async fn await_commit(&mut self) {
+        // Execution capacity and durable source ordering are distinct. Once
+        // the tool has finished producing its result, release its scheduler
+        // slot before waiting for an earlier source ordinal to commit.
+        self.release_execution();
         SchedulerDurableOrder::wait_for(&self.order.next_commit, self.ordinal, &self.order.notify)
             .await;
     }
@@ -180,6 +205,7 @@ impl SchedulerDurablePermit {
 impl Drop for SchedulerDurablePermit {
     fn drop(&mut self) {
         self.release_started();
+        self.release_execution();
         // An error can leave before the common durable-commit boundary. Mark
         // that ordinal released as well so later completed calls never deadlock
         // behind a cancelled predecessor.
@@ -3457,6 +3483,39 @@ mod tests {
             atomic::{AtomicBool, Ordering},
         },
     };
+
+    #[tokio::test]
+    async fn cancelling_before_commit_releases_execution_slot_and_durable_ordinal() {
+        let order = SchedulerDurableOrder::new();
+        let (slot_tx, mut slot_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut cancelled = SchedulerDurablePermit::new(order.clone(), 0);
+        cancelled.set_execution_release_sender(7, slot_tx);
+
+        let task = tokio::spawn(with_scheduler_durable_order(
+            cancelled,
+            std::future::pending::<()>(),
+        ));
+        tokio::task::yield_now().await;
+        task.abort();
+        let join_error = task
+            .await
+            .expect_err("aborted scheduler member is cancelled");
+        assert!(join_error.is_cancelled());
+        assert_eq!(
+            slot_rx.recv().await,
+            Some(7),
+            "cancellation before commit returns the member's execution slot"
+        );
+
+        let mut successor = SchedulerDurablePermit::new(order, 1);
+        successor.await_started().await;
+        successor.await_commit().await;
+        assert_eq!(
+            slot_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected),
+            "a permit without a driver slot sender emits no synthetic release"
+        );
+    }
 
     #[test]
     fn acquisition_parent_dispatch_has_one_authoritative_effect_seam() {

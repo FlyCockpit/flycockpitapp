@@ -16,12 +16,9 @@
 use std::path::Path;
 use std::time::Duration;
 
-#[cfg(target_os = "linux")]
-use std::os::unix::ffi::OsStrExt as _;
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::OpenOptionsExt as _;
-
-use crate::support::{IsolatedHome, SpawnedDaemon, log_tail, output_text, wait_until};
+use crate::support::{
+    IsolatedHome, ReplayLaunchBarrier, SpawnedDaemon, log_tail, output_text, wait_until,
+};
 use cockpit_cli::integration::{AttachedSession, DaemonEvent};
 use cockpit_test_support::provider::{ScriptedProvider, Turn};
 use rusqlite::{Connection, params};
@@ -351,24 +348,11 @@ async fn create_parked_session_with_blocked_replay() -> (
     SpawnedDaemon,
     AttachedSession,
     Uuid,
-    std::path::PathBuf,
+    ReplayLaunchBarrier,
 ) {
     let home = IsolatedHome::new();
-    let launch_fifo = home.project_path().join("sandbox-launched");
-    // The sandboxed shell writes one byte to the FIFO after launch. The harness
-    // observes that byte through a nonblocking descriptor, which is an exact
-    // launch barrier with no timing window or helper process.
-    #[cfg(target_os = "linux")]
-    let command = {
-        let fifo_c = std::ffi::CString::new(launch_fifo.as_os_str().as_bytes()).unwrap();
-        // SAFETY: `fifo_c` is a valid NUL-terminated path and mode is private.
-        let created = unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) };
-        assert_eq!(created, 0, "create sandbox launch FIFO");
-        format!("dd if=/dev/zero of={} bs=1", launch_fifo.display())
-    };
-    #[cfg(not(target_os = "linux"))]
-    let command = "exec tail -f /dev/null".to_string();
-    let provider = lifecycle_provider_for_command(&command).await;
+    let launch_barrier = ReplayLaunchBarrier::new(home.project_path());
+    let provider = lifecycle_provider_for_command(launch_barrier.command()).await;
     home.write_local_provider_config(&provider.base_url());
     std::fs::write(
         home.config_dir().join("config.json"),
@@ -395,7 +379,7 @@ async fn create_parked_session_with_blocked_replay() -> (
         .expect("approve blocked replay auto gate");
     let interrupt_id =
         wait_for_interrupt(&client, &daemon, attached.session_id, Some("initial")).await;
-    (provider, daemon, attached, interrupt_id, launch_fifo)
+    (provider, daemon, attached, interrupt_id, launch_barrier)
 }
 
 async fn create_auto_gate_parked_session()
@@ -792,25 +776,8 @@ async fn lifecycle_restart_command_preserves_parked_session_and_starts_when_abse
 
 #[tokio::test(flavor = "multi_thread")]
 async fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without_reexecute() {
-    let (_provider, daemon, attached, interrupt_id, launch_fifo) =
+    let (_provider, daemon, attached, interrupt_id, mut launch_barrier) =
         create_parked_session_with_blocked_replay().await;
-    #[cfg(target_os = "linux")]
-    let launch_reader = {
-        let reader = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&launch_fifo)
-            .expect("open sandbox launch-barrier reader");
-        let keep_reader_live = std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&launch_fifo)
-            .expect("keep sandbox launch-barrier reader live");
-        (
-            tokio::io::unix::AsyncFd::new(reader).expect("register sandbox launch-barrier reader"),
-            keep_reader_live,
-        )
-    };
 
     restart_daemon_gracefully(&daemon).await;
     let client = daemon.client().await;
@@ -838,45 +805,30 @@ async fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without
         "host-effect boundary must follow the durable executing claim"
     );
 
-    #[cfg(target_os = "linux")]
-    let _launch_barrier = {
-        let (reader, keep_reader_live) = launch_reader;
+    {
+        let launched = launch_barrier.wait_for_launch();
+        tokio::pin!(launched);
         loop {
             tokio::select! {
-                readiness = reader.readable() => {
-                    let mut readiness = readiness.expect("sandbox launch-barrier readiness");
-                    let mut byte = [0_u8; 1];
-                    match readiness.try_io(|inner| {
-                        std::io::Read::read_exact(&mut inner.get_ref(), &mut byte)
-                    }) {
-                        Ok(Ok(())) => {
-                            assert_eq!(byte, [0], "sandbox launch-barrier byte");
-                            drop(readiness);
-                            break (reader, keep_reader_live);
-                        }
-                        Ok(Err(err)) => panic!("read sandbox launch barrier: {err}"),
-                        Err(_would_block) => {}
-                    }
-                }
+                () = &mut launched => break,
                 event = client.next_event(Duration::from_secs(20)) => {
                     if let DaemonEvent::InterruptRaised {
                         session_id,
                         interrupt_id: launch_interrupt,
                         ..
-                    } = event.expect("daemon event while crossing sandbox launch barrier")
+                    } = event.expect("daemon event while crossing host-operation launch barrier")
                         && session_id == attached.session_id
                     {
-                        let approve =
-                            offered_approval_option(&daemon.db_path(), launch_interrupt);
+                        let approve = offered_approval_option(&daemon.db_path(), launch_interrupt);
                         client
                             .answer_interrupt_option(launch_interrupt, approve)
                             .await
-                            .expect("approve sandbox launch-barrier read");
+                            .expect("approve launch-barrier operation");
                     }
                 }
             }
         }
-    };
+    }
     #[cfg(target_os = "linux")]
     let sandbox_descendants = daemon.capture_owned_sandbox_descendants();
 

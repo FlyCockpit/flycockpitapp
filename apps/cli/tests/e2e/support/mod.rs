@@ -25,6 +25,7 @@ mod hermetic;
 mod mock_secret_service;
 #[cfg(unix)]
 mod osc52_observer;
+mod replay_launch_barrier;
 #[cfg(unix)]
 mod tui_pty;
 
@@ -34,6 +35,7 @@ pub use hermetic::*;
 pub use mock_secret_service::*;
 #[cfg(unix)]
 pub use osc52_observer::*;
+pub use replay_launch_barrier::*;
 #[cfg(unix)]
 pub use tui_pty::*;
 

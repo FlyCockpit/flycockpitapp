@@ -33,6 +33,30 @@ use crate::daemon::server::{DaemonContext, validate_peer_owner};
 use crate::daemon::shutdown::ShutdownPhase;
 use crate::leaks::LEAK_REVEAL_MAX_PLAINTEXT_BYTES;
 
+/// Owns both the bound reveal listener and its discovery path. Dropping this
+/// value closes the listener first and retracts the path on every early return,
+/// including a later control-publication failure.
+pub struct BoundRevealSocket {
+    listener: Option<DaemonListener>,
+    path: std::path::PathBuf,
+}
+
+impl BoundRevealSocket {
+    pub(crate) fn new(listener: DaemonListener, path: std::path::PathBuf) -> Self {
+        Self {
+            listener: Some(listener),
+            path,
+        }
+    }
+}
+
+impl Drop for BoundRevealSocket {
+    fn drop(&mut self) {
+        drop(self.listener.take());
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Bounded wait for the whole reveal exchange (connect + write + read) so a
 /// stalled/misbehaving daemon can never hang the caller. Same-host, same-uid,
 /// sub-millisecond in practice; a generous ceiling fails closed.
@@ -50,7 +74,7 @@ const LEAK_REVEAL_SERVER_READ_TIMEOUT: std::time::Duration = std::time::Duration
 /// mismatch or malformed frame closes with no content (no oracle).
 pub async fn run_reveal_accept_loop(
     ctx: Arc<DaemonContext>,
-    mut listener: DaemonListener,
+    mut reveal: BoundRevealSocket,
 ) -> Result<()> {
     let mut shutdown = ctx.shutdown_signal().subscribe();
     if ctx.shutdown_signal().is_draining() {
@@ -65,7 +89,9 @@ pub async fn run_reveal_accept_loop(
                     break;
                 }
             }
-            accepted = accept_reveal(&mut listener) => {
+            accepted = accept_reveal(
+                reveal.listener.as_mut().expect("bound reveal listener")
+            ) => {
                 match accepted {
                     Ok(stream) => {
                         if validate_peer_owner(&stream).is_err() {
@@ -306,22 +332,26 @@ where
 /// Bind the dedicated 0600 reveal socket at the instance's derived path. Clears
 /// any stale socket file first (a previous crash may have left one). Refuses a
 /// path that is not owner-only (enforced by [`crate::daemon::bind_private_socket`]).
-pub fn bind_reveal_socket(ctx: &DaemonContext) -> Result<DaemonListener> {
-    let path = ctx.paths.leak_reveal_socket();
+pub fn bind_reveal_socket(
+    paths: &crate::daemon::DaemonPaths,
+    #[cfg(windows)] control: &cockpit_host::named_pipe::PipeName,
+) -> Result<BoundRevealSocket> {
+    let path = paths.leak_reveal_socket();
     let _ = std::fs::remove_file(&path);
     #[cfg(unix)]
     {
-        crate::daemon::bind_private_socket(&path)
-            .with_context(|| format!("binding leak-reveal socket {}", path.display()))
+        let listener = crate::daemon::bind_private_socket(&path)
+            .with_context(|| format!("binding leak-reveal socket {}", path.display()))?;
+        Ok(BoundRevealSocket::new(listener, path))
     }
     #[cfg(windows)]
     {
-        let control = cockpit_host::named_pipe::read_pipe_identity(&ctx.paths.socket)
-            .context("reading control pipe identity for leak-reveal sibling")?;
         let reveal = control
             .leak_reveal_sibling()
             .context("deriving leak-reveal pipe name")?;
-        crate::daemon::windows_pipe::NamedPipeListener::bind_named(&path, reveal, true)
-            .with_context(|| format!("binding leak-reveal pipe {}", path.display()))
+        let listener =
+            crate::daemon::windows_pipe::NamedPipeListener::bind_named(&path, reveal, true)
+                .with_context(|| format!("binding leak-reveal pipe {}", path.display()))?;
+        Ok(BoundRevealSocket::new(listener, path))
     }
 }

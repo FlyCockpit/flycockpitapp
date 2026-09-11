@@ -671,6 +671,31 @@ pub(crate) fn bind_private_socket(socket: &std::path::Path) -> Result<DaemonList
     windows_pipe::NamedPipeListener::bind(socket)
 }
 
+#[cfg(unix)]
+fn publish_socket_pair_with(
+    paths: &DaemonPaths,
+    publish_control: impl FnOnce() -> Result<DaemonListener>,
+) -> Result<(DaemonListener, leak_reveal_socket::BoundRevealSocket)> {
+    let reveal = leak_reveal_socket::bind_reveal_socket(paths)?;
+    let control = publish_control()?;
+    Ok((control, reveal))
+}
+
+#[cfg(windows)]
+fn prepare_and_publish_socket_pair(
+    paths: &DaemonPaths,
+) -> Result<(DaemonListener, leak_reveal_socket::BoundRevealSocket)> {
+    // Binding the random control pipe is not publication on Windows. Its
+    // owner-only identity file remains absent while the required sibling is
+    // derived and bound from the immutable prepared name.
+    let control = windows_pipe::NamedPipeListener::prepare()?;
+    let reveal = leak_reveal_socket::bind_reveal_socket(paths, control.pipe_name())?;
+    // The control identity is the final observable readiness boundary. If it
+    // fails, `reveal` drops here and retracts its own identity.
+    control.publish(&paths.socket)?;
+    Ok((control, reveal))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonStatus {
     /// Daemon is running and completed a valid current-protocol hello.
@@ -2309,18 +2334,16 @@ async fn run_foreground_inner_with_boot_db(
         write_endpoint_record(&paths)?;
     }
     metadata_guard.track_endpoint_record(endpoint_record);
-    // Bind the reveal sibling before the control endpoint. A control socket is
-    // an observable readiness promise, so no client may discover it while a
-    // potentially blocking reveal bind is still outstanding.
-    #[cfg(any(unix, windows))]
-    let reveal_listener = match leak_reveal_socket::bind_reveal_socket(&ctx) {
-        Ok(listener) => Some(listener),
-        Err(error) => {
-            tracing::warn!(%error, "failed to bind leak-reveal socket; reveal-over-socket unavailable");
-            None
-        }
-    };
-    let listener = bind_private_socket(&paths.socket)?;
+    // Prepare both required endpoints before publishing control readiness.
+    // Unix reveal binding is observable but harmless until control appears;
+    // Windows binds an undiscoverable random control pipe first, derives the
+    // reveal sibling from that immutable name, and writes control identity
+    // only after the sibling is ready.
+    #[cfg(unix)]
+    let (listener, reveal_listener) =
+        publish_socket_pair_with(&paths, || bind_private_socket(&paths.socket))?;
+    #[cfg(windows)]
+    let (listener, reveal_listener) = prepare_and_publish_socket_pair(&paths)?;
 
     // Signal task: SIGINT/SIGTERM (or Ctrl-C / console-close on Windows)
     // route into the single graceful-shutdown path. The **first** signal
@@ -2402,21 +2425,18 @@ async fn run_foreground_inner_with_boot_db(
     // Dedicated Unix peer-authenticated leak-reveal socket (sibling of the
     // control socket; path a pure function of it). Carries only the closed
     // reveal frame — never ordinary proto — and accepts only after the same
-    // same-uid peer check the control socket uses. A bind failure is non-fatal
-    // for daemon boot: reveal-over-socket is simply unavailable then.
+    // same-uid peer check the control socket uses. Binding this required
+    // sibling completed before control publication above.
     #[cfg(any(unix, windows))]
-    let leak_reveal_task = match reveal_listener {
-        Some(reveal_listener) => {
-            let ctx = ctx.clone();
-            Some(ForegroundTask::new(tokio::spawn(async move {
-                if let Err(error) =
-                    leak_reveal_socket::run_reveal_accept_loop(ctx, reveal_listener).await
-                {
-                    tracing::warn!(%error, "leak-reveal accept loop ended with error");
-                }
-            })))
-        }
-        None => None,
+    let mut leak_reveal_task = {
+        let ctx = ctx.clone();
+        ForegroundTask::new(tokio::spawn(async move {
+            if let Err(error) =
+                leak_reveal_socket::run_reveal_accept_loop(ctx, reveal_listener).await
+            {
+                tracing::warn!(%error, "leak-reveal accept loop ended with error");
+            }
+        }))
     };
 
     timer.phase("signal_and_lifecycle");
@@ -2499,11 +2519,7 @@ async fn run_foreground_inner_with_boot_db(
         remote_outbox_task.abort_and_join().await;
     }
     #[cfg(any(unix, windows))]
-    if let Some(mut task) = leak_reveal_task {
-        task.abort_and_join().await;
-    }
-    #[cfg(any(unix, windows))]
-    let _ = std::fs::remove_file(paths.leak_reveal_socket());
+    leak_reveal_task.abort_and_join().await;
 
     // Retire metadata only after every foreground-owned task has acknowledged
     // cancellation. This never releases the lifetime witness: production
@@ -3917,33 +3933,69 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn foreground_control_bind_failure_retracts_publication_before_any_task_spawn() {
-        let harness = DaemonTestHarness::new();
-        let _env =
-            crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(&harness.state_home).await;
+    async fn foreground_required_reveal_bind_failure_prevents_control_publication() {
         let dir = tempfile::tempdir().expect("paths");
+        use std::os::unix::ffi::OsStrExt as _;
+        let parent_len = dir.path().as_os_str().as_bytes().len();
+        let control_leaf_len = 100_usize
+            .checked_sub(parent_len + 1)
+            .expect("temp path short enough for socket boundary test");
         let paths = DaemonPaths {
-            socket: dir.path().join("s".repeat(180)),
+            socket: dir.path().join("s".repeat(control_leaf_len)),
             pid_file: dir.path().join("daemon.pid"),
             ephemeral: false,
         };
-        let endpoint = endpoint_file_for_state(dir.path());
+        let control_attempted = std::cell::Cell::new(false);
+        let error = match publish_socket_pair_with(&paths, || {
+            control_attempted.set(true);
+            bind_private_socket(&paths.socket)
+        }) {
+            Ok(_) => panic!("overlong reveal socket bind must fail"),
+            Err(error) => error,
+        };
 
-        let error = run_foreground_inner_with_boot_db(
-            paths.clone(),
-            Duration::from_millis(50),
-            false,
-            crate::daemon::terminal::test_host_factory(),
-            Some(harness.db.clone()),
-        )
-        .await
-        .expect_err("overlong Unix socket bind must fail");
+        assert!(
+            format!("{error:#}").contains("leak-reveal"),
+            "required reveal setup must be the failing publication edge: {error:#}"
+        );
+        assert!(
+            !control_attempted.get(),
+            "control publication must not be attempted after reveal failure"
+        );
+        assert!(!paths.socket.exists(), "control readiness must not publish");
+        assert!(
+            !paths.leak_reveal_socket().exists(),
+            "failed reveal bind must leave no sibling endpoint"
+        );
+    }
 
-        assert!(error.to_string().contains("binding"));
-        assert!(!paths.pid_file.exists(), "reserved receipt must be retired");
-        assert!(!endpoint.exists(), "published endpoint must be retracted");
-        cockpit_host::daemon_lifecycle::acquire_daemon_lifetime(&paths.pid_file)
-            .expect("startup lifetime must be released");
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn control_bind_failure_drops_bound_reveal_owner() {
+        let dir = tempfile::tempdir().expect("paths");
+        let paths = test_paths(&dir);
+        let reveal_path = paths.leak_reveal_socket();
+
+        let error = match publish_socket_pair_with(&paths, || {
+            anyhow::bail!("injected control bind failure after real reveal bind")
+        }) {
+            Ok(_) => panic!("control bind must fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("control bind failure"));
+        assert!(!paths.socket.exists(), "control endpoint must stay absent");
+        assert!(
+            !reveal_path.exists(),
+            "reveal owner must retract its path on the control error return"
+        );
+        let rebound = leak_reveal_socket::bind_reveal_socket(&paths)
+            .expect("reveal listener ownership must be released");
+        drop(rebound);
+        assert!(
+            !reveal_path.exists(),
+            "dropping rebound reveal must retract its path"
+        );
     }
 
     #[cfg(any(unix, windows))]
@@ -4453,13 +4505,54 @@ mod windows_pipe_tests {
     async fn leak_reveal_sibling_pipe_is_derived_from_control_identity() {
         let dir = tempfile::tempdir().expect("tempdir");
         let control = dir.path().join("daemon.sock");
-        let listener = bind_private_socket(&control).expect("bind control");
+        let listener = windows_pipe::NamedPipeListener::prepare().expect("prepare control");
+        assert!(
+            !control.exists(),
+            "prepared control pipe must remain undiscoverable"
+        );
         let reveal = listener.pipe_name().leak_reveal_sibling().expect("sibling");
         let reveal_path = DaemonPaths::leak_reveal_socket_path(&control);
         windows_pipe::NamedPipeListener::bind_named(&reveal_path, reveal.clone(), true)
             .expect("bind reveal");
         assert!(cockpit_host::named_pipe::pipe_is_listening(&reveal));
+        assert!(
+            !control.exists(),
+            "reveal preparation must not publish control readiness"
+        );
+        listener.publish(&control).expect("publish control last");
+        assert_eq!(
+            cockpit_host::named_pipe::read_pipe_identity(&control).unwrap(),
+            listener.pipe_name().clone()
+        );
         drop(listener);
+    }
+
+    #[tokio::test]
+    async fn control_publication_failure_retracts_prepared_reveal_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let control = dir.path().join("daemon.sock");
+        std::fs::create_dir(&control).expect("block control identity publication");
+        let paths = DaemonPaths {
+            socket: control.clone(),
+            pid_file: dir.path().join("daemon.pid"),
+            ephemeral: false,
+        };
+        let reveal = paths.leak_reveal_socket();
+
+        let error = match prepare_and_publish_socket_pair(&paths) {
+            Ok(_) => panic!("control identity publication must fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            format!("{error:#}").contains("identity"),
+            "control publication should be the failing edge: {error:#}"
+        );
+        assert!(control.is_dir(), "control readiness was not published");
+        assert!(
+            !reveal.exists(),
+            "prepared reveal identity must be retracted on control publication failure"
+        );
     }
 }
 

@@ -15026,15 +15026,41 @@ fn authority_recovery_precedes_both_socket_binds() {
         nearest_cfg.is_none_or(|cfg| cfg.contains("windows") || !cfg.contains("unix")),
         "recovery call must not be unix-only inside windows-compiled boot; found {nearest_cfg:?}"
     );
-    let control_bind = boot[recovery..]
-        .find("bind_private_socket(&paths.socket)")
-        .expect("control socket bind must follow recovery");
-    let reveal_bind = boot[recovery..]
-        .find("leak_reveal_socket::bind_reveal_socket(&ctx)")
-        .expect("reveal socket bind must follow recovery");
+    let pair_publish = boot[recovery..]
+        .find("publish_socket_pair_with(&paths")
+        .expect("Unix socket-pair publication must follow recovery");
+    let windows_pair_publish = boot[recovery..]
+        .find("prepare_and_publish_socket_pair(&paths)")
+        .expect("Windows socket-pair publication must follow recovery");
     assert!(
-        reveal_bind < control_bind,
-        "control socket must be the final observable bind after reveal setup"
+        pair_publish < windows_pair_publish || windows_pair_publish < pair_publish,
+        "both platform publication paths must be present after recovery"
+    );
+
+    let unix_pair = daemon
+        .split("fn publish_socket_pair_with")
+        .nth(1)
+        .and_then(|tail| tail.split("#[cfg(windows)]").next())
+        .expect("Unix socket-pair helper");
+    let reveal = unix_pair.find("bind_reveal_socket(paths)").unwrap();
+    let publish = unix_pair.find("let control = publish_control()?").unwrap();
+    assert!(
+        reveal < publish,
+        "Unix control bind must follow required reveal bind"
+    );
+    let windows_pair = daemon
+        .split("fn prepare_and_publish_socket_pair")
+        .nth(1)
+        .and_then(|tail| tail.split("#[derive(").next())
+        .expect("Windows socket-pair helper");
+    let prepare = windows_pair.find("NamedPipeListener::prepare()").unwrap();
+    let reveal = windows_pair
+        .find("bind_reveal_socket(paths, control.pipe_name())")
+        .unwrap();
+    let publish = windows_pair.find("control.publish(&paths.socket)").unwrap();
+    assert!(
+        prepare < reveal && reveal < publish,
+        "Windows must bind hidden control and reveal identities before publishing control"
     );
 
     let server = include_str!("mod.rs");

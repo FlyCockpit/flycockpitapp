@@ -2750,6 +2750,7 @@ export const knownEventKindSchema = z.enum([
   "inference_warning",
   "interrupt_queue_changed",
   "interrupt_raised",
+  "interrupt_interrupted",
   "interrupt_resolved",
   "longcache_state",
   "lsp_notice",
@@ -2896,6 +2897,12 @@ const interruptResolvedDataSchema = z
     seq: safeI64NumberSchema.optional(),
   })
   .passthrough();
+const interruptInterruptedDataSchema = z
+  .object({
+    session_id: uuidSchema,
+    interrupt_id: uuidSchema,
+  })
+  .strict();
 const eventStreamLaggedDataSchema = z
   .object({
     session_id: uuidSchema.optional(),
@@ -3085,6 +3092,7 @@ const structuredEventDataSchemas = {
   history_replay: historyReplayDataSchema,
   host_capabilities_changed: hostCapabilitiesChangedDataSchema,
   interrupt_raised: interruptRaisedDataSchema,
+  interrupt_interrupted: interruptInterruptedDataSchema,
   model_selection_result: modelSelectionResultDataSchema,
   interrupt_resolved: interruptResolvedDataSchema,
   preflight_started: correlatedPreflightDataSchema,

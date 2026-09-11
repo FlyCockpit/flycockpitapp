@@ -2023,6 +2023,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | Usage { session_id, .. }
         | InterruptRaised { session_id, .. }
         | InterruptResolved { session_id, .. }
+        | InterruptInterrupted { session_id, .. }
         | HistoryReplay { session_id, .. }
         | InterruptQueueChanged { session_id, .. }
         | AgentIdle { session_id, .. }

@@ -1064,6 +1064,10 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             decision: _,
             seq: _,
         }
+        | proto::Event::InterruptInterrupted {
+            session_id: _,
+            interrupt_id: _,
+        }
         | proto::Event::AgentIdle {
             session_id: _,
             turn_id: _,

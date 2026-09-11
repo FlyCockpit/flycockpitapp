@@ -29890,6 +29890,10 @@ pub(super) async fn attach(
             .map_err(internal)?;
         att.handle.broadcast_gitignore_allow();
         att.handle.broadcast_active_interrupt().await;
+        att.handle
+            .broadcast_interrupted_interrupts()
+            .await
+            .map_err(internal)?;
         att.handle.broadcast_sandbox_state();
         att.handle.broadcast_sandbox_escalation();
         att.handle.broadcast_sandbox_unavailable_or_probe();

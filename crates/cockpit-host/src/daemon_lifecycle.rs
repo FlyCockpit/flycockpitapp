@@ -265,6 +265,33 @@ impl VerifiedDaemonProcess {
         }
     }
 
+    /// One nonblocking observation of this receipt-bound pidfd. Unlike a PID
+    /// probe, readiness cannot be transferred to a recycled process.
+    pub fn has_exited(&self) -> std::io::Result<bool> {
+        use std::os::fd::AsRawFd as _;
+        let mut pollfd = libc::pollfd {
+            fd: self.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pollfd names the live pidfd owned by self; timeout zero is a
+        // single observation and never waits or polls in a loop.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        if ready < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if ready == 0 {
+            return Ok(false);
+        }
+        if pollfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(std::io::Error::other(format!(
+                "pidfd returned invalid readiness {:#x}",
+                pollfd.revents
+            )));
+        }
+        Ok(pollfd.revents & (libc::POLLIN | libc::POLLHUP) != 0)
+    }
+
     /// Await the kernel's exit notification for this exact process.
     ///
     /// A pidfd becomes readable when the process exits even if its parent has
@@ -369,6 +396,38 @@ impl VerifiedDaemonProcess {
         } else {
             Err(std::io::Error::last_os_error())
         }
+    }
+
+    /// One nonblocking read of the receipt-bound process-exit filter.
+    pub fn has_exited(&self) -> std::io::Result<bool> {
+        use std::os::fd::AsRawFd as _;
+        let mut event = std::mem::MaybeUninit::<libc::kevent>::uninit();
+        let zero = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: event has room for one result, kqueue remains owned by self,
+        // and the zero timespec makes this a single nonblocking observation.
+        let count = unsafe {
+            libc::kevent(
+                self.kqueue.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                event.as_mut_ptr(),
+                1,
+                &zero,
+            )
+        };
+        if count < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if count == 0 {
+            return Ok(false);
+        }
+        let event = unsafe { event.assume_init() };
+        Ok(event.ident == self.receipt.pid as libc::uintptr_t
+            && event.filter == libc::EVFILT_PROC
+            && event.fflags & libc::NOTE_EXIT != 0)
     }
 
     /// Consume the exact kqueue witness in a single deadline-bounded wait.
@@ -535,6 +594,27 @@ pub fn acquire_verified_daemon_process(receipt: &DaemonPidReceipt) -> VerifiedPr
         receipt: receipt.clone(),
         handle,
     })
+}
+
+#[cfg(windows)]
+impl VerifiedDaemonProcess {
+    /// One nonblocking observation of the receipt-bound process handle.
+    pub fn has_exited(&self) -> std::io::Result<bool> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::{
+            WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        };
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        // SAFETY: self retains the verified process handle for this call.
+        match unsafe { WaitForSingleObject(self.handle.as_raw_handle(), 0) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED | WAIT_ABANDONED => Err(std::io::Error::last_os_error()),
+            other => Err(std::io::Error::other(format!(
+                "unexpected process wait result {other:#x}"
+            ))),
+        }
+    }
 }
 
 #[cfg(windows)]

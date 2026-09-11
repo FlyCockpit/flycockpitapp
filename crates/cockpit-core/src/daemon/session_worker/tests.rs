@@ -5245,6 +5245,84 @@ async fn active_interrupt_hydration_rebroadcasts_with_rehydration_reason() {
 }
 
 #[tokio::test]
+async fn interrupted_interrupt_hydration_requires_and_replays_committed_state() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_for_test(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let session_id = session.id;
+    let set = proto::InterruptQuestionSet {
+        questions: vec![proto::InterruptQuestion::Freetext {
+            prompt: "Why?".to_string(),
+            masked: false,
+        }],
+    };
+    let interrupt_id = db
+        .raise_interrupt_questions(session_id, "Build", "context", &set)
+        .await
+        .unwrap();
+    let locks = Arc::new(LockManager::in_memory(db.clone()));
+    let handle = SessionWorkerHandle::test_handle(Arc::new(session), locks);
+    let mut rx = handle.subscribe();
+
+    handle.broadcast_interrupted_interrupts().await.unwrap();
+    assert!(
+        rx.try_recv().is_err(),
+        "an open row must not emit interrupted state"
+    );
+
+    assert!(db.mark_interrupt_interrupted(interrupt_id).await.unwrap());
+    handle.broadcast_interrupted_interrupts().await.unwrap();
+    assert!(matches!(
+        rx.try_recv().expect("durable interrupted-state replay").event,
+        proto::Event::InterruptInterrupted {
+            session_id: got_session_id,
+            interrupt_id: got_interrupt_id,
+        } if got_session_id == session_id && got_interrupt_id == interrupt_id
+    ));
+    assert!(rx.try_recv().is_err(), "exactly one committed row replayed");
+}
+
+#[tokio::test]
+async fn failed_interrupt_settlement_does_not_emit_interrupted_event() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_for_test(
+        db,
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(8);
+    let redaction: SharedRedactionTable = Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
+
+    assert!(
+        !settle_unrecoverable_interrupt(
+            &session,
+            &event_tx,
+            &redaction,
+            session.id,
+            Uuid::new_v4(),
+            false,
+            "failed settlement".to_string(),
+        )
+        .await
+    );
+    while let Ok(envelope) = event_rx.try_recv() {
+        assert!(
+            !matches!(envelope.event, proto::Event::InterruptInterrupted { .. }),
+            "a failed durable transition must not emit interrupted state"
+        );
+    }
+}
+
+#[tokio::test]
 async fn shutdown_durability_commit_parks_interrupt_and_writes_paused_work_atomically() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open_in_memory().unwrap();

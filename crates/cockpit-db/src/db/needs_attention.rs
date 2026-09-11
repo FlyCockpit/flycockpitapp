@@ -443,6 +443,41 @@ impl Db {
         .await
     }
 
+    /// Durable interrupted-state snapshot used to hydrate clients that attach
+    /// after crash reconciliation committed and its live broadcast had no
+    /// subscribers. Unlike reconcilable rows, these entries are terminal for
+    /// replay and must never be executed again.
+    pub async fn list_interrupted_interrupts(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<NeedsAttentionRow>> {
+        self.read(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT interrupt_id, session_id, agent_id, agent_instance_id, description,
+                            question_json, questions_json, raised_at, resolved_at, response_json,
+                            state, parked_tool, parked_args_json, parked_call_id,
+                            parked_resume_json, parked_gate_json, parked_verification_json
+                       FROM needs_attention
+                      WHERE session_id = ?1
+                        AND (decision_request_id IS NULL
+                             OR question_json IS NOT NULL OR questions_json IS NOT NULL)
+                        AND state = 'interrupted'
+                      ORDER BY raised_at ASC, rowid ASC",
+                )
+                .context("preparing list_interrupted_interrupts")?;
+            let rows = stmt
+                .query_map([session_id.to_string()], decode_row)
+                .context("querying interrupted needs_attention")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding interrupted needs_attention row")?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     pub async fn list_reconcilable_interrupts(
         &self,
         session_id: Uuid,
@@ -1488,6 +1523,16 @@ mod tests {
         assert!(db.mark_interrupt_interrupted(iid).await.unwrap());
         let row = db.get_interrupt(iid).await.unwrap().unwrap();
         assert_eq!(row.state, InterruptState::Interrupted);
+        let interrupted = db.list_interrupted_interrupts(s.session_id).await.unwrap();
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0].interrupt_id, iid);
+        assert_eq!(interrupted[0].state, InterruptState::Interrupted);
+        assert!(
+            db.list_reconcilable_interrupts(s.session_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(!db.complete_executing_interrupt(iid).await.unwrap());
     }
 

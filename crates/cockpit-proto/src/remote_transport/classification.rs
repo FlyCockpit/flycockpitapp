@@ -2999,6 +2999,11 @@ pub const EVENT_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "interrupt_interrupted",
+        RemoteMessageClass::Approval,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "interrupt_resolved",
         RemoteMessageClass::Approval,
         RemoteInlinePayloadBound::Bounded,
@@ -3495,9 +3500,9 @@ mod tests {
         #[cfg(not(feature = "extended"))]
         assert_eq!(RESPONSE_CLASSIFICATION.len(), 194);
         #[cfg(feature = "extended")]
-        assert_eq!(EVENT_CLASSIFICATION.len(), 87);
+        assert_eq!(EVENT_CLASSIFICATION.len(), 88);
         #[cfg(not(feature = "extended"))]
-        assert_eq!(EVENT_CLASSIFICATION.len(), 86);
+        assert_eq!(EVENT_CLASSIFICATION.len(), 87);
     }
 
     #[test]

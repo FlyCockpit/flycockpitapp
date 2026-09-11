@@ -192,6 +192,10 @@ pub mod integration {
             session_id: Uuid,
             interrupt_id: Uuid,
         },
+        InterruptInterrupted {
+            session_id: Uuid,
+            interrupt_id: Uuid,
+        },
         AgentIdle {
             session_id: Uuid,
             reason: String,
@@ -607,6 +611,13 @@ pub mod integration {
                 interrupt_id,
                 ..
             } => DaemonEvent::InterruptResolved {
+                session_id,
+                interrupt_id,
+            },
+            crate::daemon::proto::Event::InterruptInterrupted {
+                session_id,
+                interrupt_id,
+            } => DaemonEvent::InterruptInterrupted {
                 session_id,
                 interrupt_id,
             },

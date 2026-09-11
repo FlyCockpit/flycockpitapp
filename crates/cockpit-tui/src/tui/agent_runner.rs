@@ -2330,6 +2330,7 @@ fn is_global_event(event: &proto::Event) -> bool {
             | proto::Event::EnvDriftWarning { .. }
             | proto::Event::InterruptRaised { .. }
             | proto::Event::InterruptResolved { .. }
+            | proto::Event::InterruptInterrupted { .. }
             | proto::Event::InterruptQueueChanged { .. }
             | proto::Event::HostCapabilitiesChanged { .. }
     ) || {
@@ -4038,6 +4039,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | Usage { session_id, .. }
         | InterruptRaised { session_id, .. }
         | InterruptResolved { session_id, .. }
+        | InterruptInterrupted { session_id, .. }
         | HistoryReplay { session_id, .. }
         | InterruptQueueChanged { session_id, .. }
         | AgentIdle { session_id, .. }
@@ -5131,6 +5133,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             session_id,
             interrupt_id,
         },
+        InterruptInterrupted { .. } => return None,
         ConfigSnapshot { snapshot } => TurnEvent::ConfigSnapshot { snapshot },
         HostCapabilitiesChanged { snapshot } => TurnEvent::HostCapabilitiesChanged {
             snapshot: Box::new(snapshot),

@@ -2187,6 +2187,30 @@ impl SessionWorkerHandle {
         );
     }
 
+    /// Replay every exact durable `interrupted` identity after an attach has
+    /// subscribed. Startup crash reconciliation can commit before any client
+    /// exists, so its live edge alone cannot hydrate a reconnecting client.
+    /// Reading the committed rows here also makes a failed transition
+    /// ineligible for publication.
+    pub async fn broadcast_interrupted_interrupts(&self) -> Result<()> {
+        let interrupted = self
+            .session
+            .db
+            .list_interrupted_interrupts(self.session.live_id())
+            .await?;
+        for row in interrupted {
+            send_current_event(
+                &self.event_tx,
+                &self.redaction,
+                proto::Event::InterruptInterrupted {
+                    session_id: row.session_id,
+                    interrupt_id: row.interrupt_id,
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// Broadcast intent vs effective sandbox mode so attach/reconnect can
     /// show "intent Sandbox, effective Refuse (missing bwrap)".
     pub fn broadcast_sandbox_state(&self) {

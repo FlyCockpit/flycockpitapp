@@ -4455,7 +4455,7 @@ fn interrupt_restart_notice_text(interrupt_id: Uuid, payload: Result<(), &'stati
     }
 }
 
-async fn settle_unrecoverable_interrupt(
+pub(super) async fn settle_unrecoverable_interrupt(
     session: &crate::session::Session,
     event_tx: &EventSender,
     redaction: &SharedRedactionTable,
@@ -4492,6 +4492,16 @@ async fn settle_unrecoverable_interrupt(
             false
         }
     };
+    if committed {
+        send_current_event(
+            event_tx,
+            redaction,
+            proto::Event::InterruptInterrupted {
+                session_id,
+                interrupt_id,
+            },
+        );
+    }
     send_current_session_event(
         session,
         event_tx,

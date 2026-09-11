@@ -40,7 +40,7 @@ pub use replay_launch_barrier::*;
 pub use tui_pty::*;
 
 pub struct IsolatedHome {
-    _root: tempfile::TempDir,
+    _root: Option<tempfile::TempDir>,
     config_home: PathBuf,
     data_home: PathBuf,
     state_home: PathBuf,
@@ -85,7 +85,7 @@ impl IsolatedHome {
                 .expect("restrict isolated temp root");
         }
         Self {
-            _root: root,
+            _root: Some(root),
             config_home,
             data_home,
             state_home,
@@ -128,7 +128,17 @@ impl IsolatedHome {
     }
 
     pub fn home_dir(&self) -> &std::path::Path {
-        self._root.path()
+        self._root.as_ref().expect("isolated home root").path()
+    }
+
+    /// Keep the isolated tree when process cleanup cannot prove completion.
+    /// Removing its receipt/socket while the owned daemon may still be alive
+    /// would hide an escaped generation from the test runner.
+    pub fn preserve_after_cleanup_failure(&mut self) -> PathBuf {
+        self._root
+            .take()
+            .expect("isolated home root already preserved")
+            .keep()
     }
 
     pub fn xdg_config_home(&self) -> &std::path::Path {
@@ -246,7 +256,7 @@ impl IsolatedHome {
             .env("XDG_STATE_HOME", &self.state_home)
             .env("XDG_RUNTIME_DIR", &self.runtime_dir)
             .env("XDG_CACHE_HOME", &self.cache_home)
-            .env("HOME", self._root.path())
+            .env("HOME", self.home_dir())
             .env_remove("COCKPIT_CONFIG")
             .env_remove("COCKPIT_LOG")
             .env_remove("DBUS_SESSION_BUS_ADDRESS");
@@ -765,6 +775,50 @@ fn socket_answers_hello(socket: &Path, pid_file: &Path) -> bool {
     BufReader::new(stream).read_line(&mut line).is_ok() && !line.trim().is_empty()
 }
 
+fn hello_line_matches_receipt(
+    line: &str,
+    receipt: &cockpit_host::daemon_lifecycle::DaemonPidReceipt,
+) -> bool {
+    let Ok(envelope) = serde_json::from_str::<cockpit_proto::Envelope>(line) else {
+        return false;
+    };
+    matches!(
+        envelope.body,
+        cockpit_proto::Body::Response { id, response }
+            if id.is_nil()
+                && matches!(
+                    *response,
+                    cockpit_proto::Response::DaemonStatus {
+                        pid,
+                        protocol_version: cockpit_proto::PROTOCOL_VERSION,
+                        ..
+                    } if pid == receipt.pid
+                )
+    )
+}
+
+/// One exact hello observation bound to the immutable receipt captured for the
+/// same generation. Callers compare the receipt file both before and after.
+#[cfg(unix)]
+pub(crate) fn socket_answers_receipt_hello(
+    socket: &Path,
+    pid_file: &Path,
+    receipt: &cockpit_host::daemon_lifecycle::DaemonPidReceipt,
+) -> bool {
+    use std::os::unix::net::UnixStream;
+
+    if !daemon_transport_ready_for_paths(socket, pid_file) {
+        return false;
+    }
+    let Ok(stream) = UnixStream::connect(socket) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).is_ok()
+        && hello_line_matches_receipt(&line, receipt)
+}
+
 #[cfg(windows)]
 fn socket_answers_hello(socket: &Path, pid_file: &Path) -> bool {
     if !daemon_transport_ready_for_paths(socket, pid_file) {
@@ -785,9 +839,39 @@ fn socket_answers_hello(socket: &Path, pid_file: &Path) -> bool {
     )
 }
 
+#[cfg(windows)]
+pub(crate) fn socket_answers_receipt_hello(
+    socket: &Path,
+    pid_file: &Path,
+    receipt: &cockpit_host::daemon_lifecycle::DaemonPidReceipt,
+) -> bool {
+    if !daemon_transport_ready_for_paths(socket, pid_file) {
+        return false;
+    }
+    let Ok(Some(pipe)) = cockpit_host::named_pipe::read_pipe_identity_if_present(socket) else {
+        return false;
+    };
+    let Ok(stream) = cockpit_host::named_pipe::open_client_pipe_blocking(&pipe) else {
+        return false;
+    };
+    matches!(
+        cockpit_host::named_pipe::read_line_bounded(&stream, Duration::from_millis(200)),
+        Ok(line) if hello_line_matches_receipt(&line, receipt)
+    )
+}
+
 #[cfg(not(any(unix, windows)))]
 fn socket_answers_hello(socket: &Path, pid_file: &Path) -> bool {
     daemon_transport_ready_for_paths(socket, pid_file)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn socket_answers_receipt_hello(
+    _socket: &Path,
+    _pid_file: &Path,
+    _receipt: &cockpit_host::daemon_lifecycle::DaemonPidReceipt,
+) -> bool {
+    false
 }
 
 fn handshake_debug(home: &IsolatedHome) -> String {
@@ -891,174 +975,6 @@ fn tail_file(path: PathBuf, max_bytes: usize) -> Option<String> {
 #[cfg(unix)]
 pub(crate) fn pid_is_live(pid: u32) -> bool {
     cockpit_host::daemon_lifecycle::process_exists(pid)
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) struct ExactProcessExit {
-    pid: u32,
-    pidfd: std::os::fd::OwnedFd,
-}
-
-#[cfg(target_os = "linux")]
-impl ExactProcessExit {
-    pub(crate) fn capture(pid: u32) -> Self {
-        use std::os::fd::{FromRawFd as _, OwnedFd};
-        // SAFETY: pidfd_open has no pointer arguments. The returned descriptor
-        // is newly owned on success and pins the process identity against PID
-        // reuse before the lifecycle command is allowed to stop it.
-        let raw_fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        assert!(
-            raw_fd >= 0,
-            "capture exact daemon pid {pid}: {}",
-            std::io::Error::last_os_error()
-        );
-        // SAFETY: successful pidfd_open returns a fresh owned descriptor.
-        let pidfd = unsafe { OwnedFd::from_raw_fd(raw_fd as std::os::fd::RawFd) };
-        Self { pid, pidfd }
-    }
-
-    pub(crate) fn wait(self) {
-        use std::os::fd::AsRawFd as _;
-        let mut pollfd = libc::pollfd {
-            fd: self.pidfd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        loop {
-            // SAFETY: pollfd is initialized and pidfd remains owned here.
-            let ready = unsafe { libc::poll(&mut pollfd, 1, -1) };
-            if ready > 0 && pollfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
-                panic!(
-                    "waiting for daemon pid {} returned invalid pidfd readiness {:#x}",
-                    self.pid, pollfd.revents
-                );
-            }
-            if ready > 0 && pollfd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-                return;
-            }
-            let error = std::io::Error::last_os_error();
-            if ready < 0 && error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            panic!("waiting for daemon pid {} exit failed: {error}", self.pid);
-        }
-    }
-}
-
-#[cfg(windows)]
-pub(crate) struct ExactProcessExit {
-    pid: u32,
-    process: std::os::windows::io::OwnedHandle,
-}
-
-#[cfg(windows)]
-impl ExactProcessExit {
-    pub(crate) fn capture(pid: u32) -> Self {
-        use std::os::windows::io::FromRawHandle as _;
-        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-        use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
-        use windows_sys::Win32::System::Threading::OpenProcess;
-        // SAFETY: SYNCHRONIZE opens a wait-only stable process handle.
-        let raw = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
-        assert!(
-            !raw.is_null() && raw != INVALID_HANDLE_VALUE,
-            "open exact daemon pid {pid}: {}",
-            std::io::Error::last_os_error()
-        );
-        Self {
-            pid,
-            process: unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw) },
-        }
-    }
-
-    pub(crate) fn wait(self) {
-        use std::os::windows::io::AsRawHandle as _;
-        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
-        use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
-        // SAFETY: the stable process handle remains owned for the wait.
-        assert_eq!(
-            unsafe { WaitForSingleObject(self.process.as_raw_handle(), INFINITE) },
-            WAIT_OBJECT_0,
-            "wait for exact daemon pid {}: {}",
-            self.pid,
-            std::io::Error::last_os_error()
-        );
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub(crate) struct ExactProcessExit {
-    pid: u32,
-    kqueue: std::os::fd::OwnedFd,
-}
-
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
-impl ExactProcessExit {
-    pub(crate) fn capture(pid: u32) -> Self {
-        use std::os::fd::FromRawFd as _;
-        // SAFETY: kqueue returns a fresh owned descriptor on success.
-        let raw = unsafe { libc::kqueue() };
-        assert!(
-            raw >= 0,
-            "create kqueue: {}",
-            std::io::Error::last_os_error()
-        );
-        let kqueue = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-        let change = libc::kevent {
-            ident: pid as libc::uintptr_t,
-            filter: libc::EVFILT_PROC,
-            flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
-            fflags: libc::NOTE_EXIT,
-            data: 0,
-            udata: std::ptr::null_mut(),
-        };
-        // SAFETY: change is initialized and kqueue remains owned by Self.
-        let registered = unsafe {
-            libc::kevent(
-                std::os::fd::AsRawFd::as_raw_fd(&kqueue),
-                &change,
-                1,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null(),
-            )
-        };
-        assert_eq!(
-            registered,
-            0,
-            "register exact pid {pid}: {}",
-            std::io::Error::last_os_error()
-        );
-        Self { pid, kqueue }
-    }
-
-    pub(crate) fn wait(self) {
-        use std::os::fd::AsRawFd as _;
-        let mut event = std::mem::MaybeUninit::<libc::kevent>::uninit();
-        // SAFETY: event has space for one result; null timeout is a blocking
-        // kernel wait on the registered process identity, not PID polling.
-        let count = unsafe {
-            libc::kevent(
-                self.kqueue.as_raw_fd(),
-                std::ptr::null(),
-                0,
-                event.as_mut_ptr(),
-                1,
-                std::ptr::null(),
-            )
-        };
-        assert_eq!(
-            count,
-            1,
-            "wait for exact pid {}: {}",
-            self.pid,
-            std::io::Error::last_os_error()
-        );
-        let event = unsafe { event.assume_init() };
-        assert_eq!(event.ident, self.pid as libc::uintptr_t);
-        assert_eq!(event.filter, libc::EVFILT_PROC);
-        assert_ne!(event.fflags & libc::NOTE_EXIT, 0);
-    }
 }
 
 /// Panic/unwind guard for foreground test daemons. Ensures the exact child is

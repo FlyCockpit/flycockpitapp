@@ -831,6 +831,21 @@ async fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without
         .attach(daemon.project_path(), Some(attached.session_id), None, true)
         .await
         .expect("reattach session");
+    loop {
+        match client
+            .next_event_unbounded()
+            .await
+            .expect("daemon event while awaiting interrupted reconciliation")
+        {
+            DaemonEvent::InterruptInterrupted {
+                session_id,
+                interrupt_id: reconciled_interrupt_id,
+            } if session_id == attached.session_id && reconciled_interrupt_id == interrupt_id => {
+                break;
+            }
+            _ => {}
+        }
+    }
     assert_eq!(
         interrupt_row(&daemon.db_path(), interrupt_id).state,
         "interrupted"

@@ -115,7 +115,7 @@ fn production_paths_keep_agent_tree_authoritative() {
         .expect("durable QuestionTool bridge must exist");
     assert!(
         durable_question_bridge
-            .find("let pending = interrupts.register(interrupt_id)")
+            .find("let pending = interrupts.register_durable")
             .expect("durable QuestionTool bridge must register its waiter")
             < durable_question_bridge
                 .find(".request_decision_for_interrupt")

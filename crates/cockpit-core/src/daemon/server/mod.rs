@@ -5154,6 +5154,7 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, mut listener: DaemonListen
     #[cfg(feature = "remote")]
     dispatch::debug_assert_ledger_site_registry_consistent();
     let mut shutdown = ctx.shutdown.subscribe();
+    let mut clients = tokio::task::JoinSet::new();
     let retention_cfg = retention_config();
     let mut retention_interval = tokio::time::interval(std::time::Duration::from_secs(
         (retention_cfg.sweep_interval_hours.max(1) as u64) * 60 * 60,
@@ -5215,7 +5216,7 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, mut listener: DaemonListen
                             continue;
                         }
                         let ctx = ctx.clone();
-                        tokio::spawn(async move {
+                        clients.spawn(async move {
                             if let Err(e) = handle_client(stream, ctx).await {
                                 tracing::warn!(error = ?e, "client task ended with error");
                             }
@@ -5229,6 +5230,14 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, mut listener: DaemonListen
             }
         }
     }
+
+    // Client handlers retain the central context, database handles, and their
+    // reader/writer/executor children.  Keep them under the accept loop's
+    // ownership so foreground shutdown has an explicit cancellation
+    // completion boundary instead of leaving process teardown to Tokio's
+    // runtime-drop scheduling.
+    clients.abort_all();
+    while clients.join_next().await.is_some() {}
 
     Ok(())
 }

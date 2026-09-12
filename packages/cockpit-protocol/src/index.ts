@@ -2,6 +2,7 @@ import { z } from "zod";
 import { canonicalU64DecimalStringSchema, decodeProtocolIdBase64Url } from "./remote-protocol-id";
 
 export * from "./dependency-health";
+export * from "./onboarding";
 export * from "./remote-attempt-grants";
 export * from "./remote-connection-metadata";
 export * from "./remote-device-identity-enrollment";
@@ -15,7 +16,7 @@ export * from "./remote-websocket-fallback";
 export * from "./remote-wire-magic-registry";
 export * from "./send-user-message-v2";
 
-export const PROTOCOL_VERSION = 22 as const;
+export const PROTOCOL_VERSION = 23 as const;
 
 /** Immutable daemon-owned session setup metadata; never an authority grant. */
 export const sessionEntryModeSchema = z.enum(["code", "assistant", "computer"]);

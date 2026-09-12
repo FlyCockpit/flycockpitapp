@@ -7358,6 +7358,54 @@ CREATE INDEX idx_protected_leak_records_history
 -- plaintext never live in SQLite. First-run defaults to keyring when the OS
 -- keyring probe is available, but can explicitly choose the file vault.
 
+-- ---- daemon-authoritative onboarding --------------------------------------
+--
+-- The onboarding authority is deliberately separate from the vault tables:
+-- it is readable before a vault exists and contains only opaque identifiers
+-- and redacted, non-secret state.  The active run is a singleton because
+-- onboarding is user-global, not workspace-global.
+CREATE TABLE onboarding_runs (
+    id                  INTEGER PRIMARY KEY CHECK (id = 1),
+    run_id              TEXT NOT NULL UNIQUE CHECK (length(run_id) = 36),
+    active_attempt_id   TEXT NOT NULL UNIQUE CHECK (length(active_attempt_id) = 36),
+    revision            INTEGER NOT NULL CHECK (revision >= 0),
+    stage               TEXT NOT NULL CHECK (stage IN (
+        'welcome', 'profile', 'secure_store', 'provider', 'model', 'agent', 'lifetime', 'complete'
+    )),
+    bootstrap_state     TEXT NOT NULL CHECK (bootstrap_state IN (
+        'awaiting_choice', 'awaiting_passphrase', 'materializing', 'ready', 'failed'
+    )),
+    limited_mode        INTEGER NOT NULL DEFAULT 0 CHECK (limited_mode IN (0, 1)),
+    lifetime_selection  TEXT,
+    created_at_unix_ms  INTEGER NOT NULL,
+    updated_at_unix_ms  INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms)
+);
+
+CREATE TABLE onboarding_attempts (
+    attempt_id          TEXT PRIMARY KEY CHECK (length(attempt_id) = 36),
+    run_id              TEXT NOT NULL REFERENCES onboarding_runs(run_id) ON DELETE CASCADE,
+    opened_revision     INTEGER NOT NULL CHECK (opened_revision >= 0),
+    closed_revision     INTEGER,
+    status              TEXT NOT NULL CHECK (status IN ('active', 'superseded', 'completed')),
+    created_at_unix_ms  INTEGER NOT NULL,
+    CHECK ((status = 'active' AND closed_revision IS NULL) OR (status <> 'active' AND closed_revision IS NOT NULL))
+);
+CREATE UNIQUE INDEX onboarding_attempts_one_active
+    ON onboarding_attempts(run_id) WHERE status = 'active';
+
+-- Receipt payloads are intentionally an enum/status plus opaque ids.  Do not
+-- put provider config, credentials, OAuth material, or passphrases here.
+CREATE TABLE onboarding_receipts (
+    receipt_id          TEXT PRIMARY KEY CHECK (length(receipt_id) = 36),
+    run_id              TEXT NOT NULL REFERENCES onboarding_runs(run_id) ON DELETE CASCADE,
+    attempt_id          TEXT NOT NULL REFERENCES onboarding_attempts(attempt_id) ON DELETE CASCADE,
+    client_operation_id TEXT NOT NULL CHECK (length(client_operation_id) BETWEEN 1 AND 128),
+    consumed_revision   INTEGER NOT NULL CHECK (consumed_revision >= 0),
+    status              TEXT NOT NULL CHECK (status IN ('pending', 'committed', 'rejected', 'unknown')),
+    created_at_unix_ms  INTEGER NOT NULL,
+    UNIQUE (run_id, attempt_id, client_operation_id)
+);
+
 -- Installation-scoped authority singleton. No secret bytes.
 CREATE TABLE secret_vault_authority (
     id                    INTEGER PRIMARY KEY CHECK (id = 1),

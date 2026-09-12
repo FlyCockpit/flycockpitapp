@@ -76,6 +76,7 @@ pub use config_management::{
 };
 pub mod bulk_transfer;
 pub mod host_capabilities;
+pub mod onboarding;
 #[cfg(feature = "extended")]
 pub mod image_control;
 pub mod image_sidecar_authority;
@@ -92,6 +93,12 @@ pub use host_capabilities::{
     CatalogDependencyImportance, CatalogDependencyRow, CatalogDependencyState,
     CatalogExecutionTarget, FeatureCapabilityRow, FeatureCapabilityState, HostCapabilitySnapshot,
     SecretStoreIntent, SecretStorePlacement, SecretStoreSnapshot,
+};
+pub use onboarding::{
+    ApplyOnboardingSecureIntent, BeginOrReopenOnboarding, OnboardingBootstrapEvent,
+    OnboardingBootstrapSnapshot, OnboardingBootstrapState, OnboardingReceiptStatus,
+    OnboardingSecurePlacement, OnboardingStage, OnboardingTransitionReceipt,
+    SensitiveOnboardingPassphrase,
 };
 pub use launch::{LaunchBundle, LaunchInfo, RepoStatus};
 pub use provider_management::{
@@ -1327,7 +1334,7 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// daemon-owned setup inventory, bounded base64 media previews, the
 /// rolling-precompaction resume choice, and knowledge-dream completion
 /// receipts including ordered all-KB runs.
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -7477,7 +7484,7 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 22);
+        assert_eq!(PROTOCOL_VERSION, 23);
         let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
@@ -7497,7 +7504,7 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 22);
+        assert_eq!(PROTOCOL_VERSION, 23);
         let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {

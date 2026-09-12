@@ -1339,6 +1339,7 @@ dependencies = [
  "cockpit-proto",
  "cockpit-test-support",
  "cockpit-tokenizer",
+ "cockpit-updater-evidence",
  "croner",
  "cryptoki",
  "csv",
@@ -1543,6 +1544,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cockpit-tuf-release"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cockpit-updater-evidence",
+ "serde_json",
+]
+
+[[package]]
 name = "cockpit-tui"
 version = "0.1.0"
 dependencies = [
@@ -1601,6 +1611,14 @@ dependencies = [
  "vt100",
  "windows-sys 0.61.2",
  "zeroize",
+]
+
+[[package]]
+name = "cockpit-updater-evidence"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

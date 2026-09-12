@@ -285,7 +285,9 @@ fn call_is_update_check_gated(source: &str, line_idx: usize) -> bool {
     if call_line.contains("update_checks_enabled") {
         return true;
     }
-    let block_opener = find_enclosing_block_opener(source, call_offset)?;
+    let Some(block_opener) = find_enclosing_block_opener(source, call_offset) else {
+        return false;
+    };
     let controller = controlling_statement_for_block(source, block_opener);
     controller.contains("update_checks_enabled")
 }
@@ -311,7 +313,7 @@ fn assert_update_checks_suppressed_when_off() {
         server.contains("update_checks_enabled(update_channel)"),
         "daemon boot must gate startup update checks behind update_checks_enabled"
     );
-    assert_run_startup_check_gated(&server, server_path.display().to_string());
+    assert_run_startup_check_gated(&server, &server_path.display().to_string());
 
     let daemon = fs::read_to_string(workspace_root().join("crates/cockpit-core/src/daemon/mod.rs"))
         .expect("read daemon source");
@@ -331,7 +333,7 @@ fn assert_update_checks_suppressed_when_off() {
         background.contains("update_checks_enabled(channel)"),
         "background update loop must skip checks when the effective channel is off"
     );
-    assert_run_startup_check_gated(&background, background_path.display().to_string());
+    assert_run_startup_check_gated(&background, &background_path.display().to_string());
 }
 
 #[test]

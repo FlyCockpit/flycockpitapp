@@ -2151,8 +2151,10 @@ pub fn load_for_cwd(cwd: &Path) -> ExtendedConfig {
 pub fn load_installation_update_channel() -> Result<crate::config::update_channel::UpdateChannel> {
     let path = crate::config::dirs::global_config_dir()?.join(crate::config::dirs::CONFIG_FILE);
     if !path.exists() {
-        return crate::config::update_channel::UpdateChannel::resolve_effective(
-            crate::config::update_channel::UpdateChannel::default(),
+        return Ok(
+            crate::config::update_channel::UpdateChannel::resolve_effective(
+                crate::config::update_channel::UpdateChannel::default(),
+            )?,
         );
     }
     let doc = ExtendedConfigDoc::load(&path)?;
@@ -2161,7 +2163,7 @@ pub fn load_installation_update_channel() -> Result<crate::config::update_channe
             .with_context(|| format!("invalid update channel in {}", path.display()))?,
         None => crate::config::update_channel::UpdateChannel::default(),
     };
-    crate::config::update_channel::UpdateChannel::resolve_effective(configured)
+    Ok(crate::config::update_channel::UpdateChannel::resolve_effective(configured)?)
 }
 
 fn parse_installation_update_channel_value(

@@ -4391,20 +4391,10 @@ pub(crate) fn locked_in_process_endpoint(
                     Ok(frame) => {
                         match locked.apply_secure_intent(frame.request).await {
                             Ok(result) => match locked.finish_ready_transition().await {
-                                Ok(ready) => {
-                                    let ctx = Arc::new(ready.context);
-                                    if recover_before_socket_publish(&ctx).await.is_err() {
-                                        let _ = locked.rollback_failed_ready_handoff().await;
-                                        cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
-                                            cockpit_proto::SensitiveOnboardingIntentError::ReadyConstructionFailed,
-                                        )
-                                    } else {
-                                        let _ = ready_tx.send(Some(ctx));
-                                        locked.ready.store(true, Ordering::Release);
-                                        cockpit_proto::SensitiveOnboardingIntentResponse::Applied(
-                                            result,
-                                        )
-                                    }
+                                Ok(constructed) => {
+                                    constructed
+                                        .finalize_sensitive_in_process(&ready_tx, result)
+                                        .await
                                 }
                                 Err(_) => {
                                     cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
@@ -4445,25 +4435,18 @@ fn spawn_locked_in_process_client(
                 request.request,
                 cockpit_proto::Request::RetryOnboardingReadyConstruction
             ) {
-                let handoff = async {
-                    let ready = locked.finish_ready_transition().await?;
-                    let snapshot = locked.onboarding_snapshot_present().await?;
-                    Ok((Response::OnboardingBootstrapSnapshot(snapshot), ready))
-                }
-                .await;
-                let (response, ready) = match handoff {
-                    Ok((response, ready)) => (Ok(response), Some(ready)),
-                    Err(error) => (
-                        Err(ErrorPayload {
+                match locked.prepare_retry_ready_handoff().await {
+                    Ok((response, constructed)) => {
+                        if request.reply.send(Ok(response)).is_ok() {
+                            constructed.publish_stored();
+                        }
+                    }
+                    Err(error) => {
+                        let _ = request.reply.send(Err(ErrorPayload {
                             code: ErrorCode::BootstrapLocked,
                             message: error.to_string(),
-                        }),
-                        None,
-                    ),
-                };
-                let _ = request.reply.send(response);
-                if let Some(ready) = ready {
-                    locked.store_achieved_ready(ready);
+                        }));
+                    }
                 }
                 continue;
             }
@@ -4709,6 +4692,122 @@ pub(crate) enum BootServices {
     Ready(ReadyServices),
 }
 
+struct ReadyTransitionPermit {
+    locked: Arc<LockedServices>,
+    released: bool,
+}
+
+impl ReadyTransitionPermit {
+    fn new(locked: Arc<LockedServices>) -> Self {
+        Self {
+            locked,
+            released: false,
+        }
+    }
+
+    fn release(&mut self) {
+        if !self.released {
+            self.released = true;
+            self.locked.release_ready_transition();
+        }
+    }
+}
+
+impl Drop for ReadyTransitionPermit {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        self.locked.release_ready_transition();
+        if self.locked.closing.load(Ordering::Acquire) && !self.locked.ready.load(Ordering::Acquire)
+        {
+            let locked = self.locked.clone();
+            tokio::spawn(async move {
+                let _ = locked.rollback_failed_ready_handoff().await;
+            });
+        }
+    }
+}
+
+struct ConstructedReady {
+    locked: Arc<LockedServices>,
+    ready: ReadyServices,
+    permit: ReadyTransitionPermit,
+    published: bool,
+}
+
+impl ConstructedReady {
+    fn new(locked: Arc<LockedServices>, ready: ReadyServices) -> Self {
+        Self {
+            permit: ReadyTransitionPermit::new(locked.clone()),
+            locked,
+            ready,
+            published: false,
+        }
+    }
+
+    fn publish_stored(mut self) {
+        self.published = true;
+        self.permit.release();
+        self.locked.store_achieved_ready(self.ready);
+    }
+
+    fn publish_returned(mut self) -> ReadyServices {
+        self.published = true;
+        self.permit.release();
+        self.ready
+    }
+
+    async fn finalize_sensitive_in_process(
+        mut self,
+        ready_tx: &watch::Sender<Option<Arc<DaemonContext>>>,
+        result: cockpit_proto::OnboardingTransitionResult,
+    ) -> cockpit_proto::SensitiveOnboardingIntentResponse {
+        let ctx = Arc::new(self.ready.context);
+        if recover_before_socket_publish(&ctx).await.is_err() {
+            return cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
+                cockpit_proto::SensitiveOnboardingIntentError::ReadyConstructionFailed,
+            );
+        }
+        self.published = true;
+        self.permit.release();
+        let _ = ready_tx.send(Some(ctx));
+        self.locked.ready.store(true, Ordering::Release);
+        cockpit_proto::SensitiveOnboardingIntentResponse::Applied(result)
+    }
+
+    async fn finalize_sensitive_wire(
+        mut self,
+        stream: &mut (impl tokio::io::AsyncWriteExt + Unpin),
+        result: cockpit_proto::OnboardingTransitionResult,
+    ) -> Result<ReadyServices> {
+        let response = cockpit_proto::SensitiveOnboardingIntentResponse::Applied(result);
+        let bytes = cockpit_proto::encode_sensitive_onboarding_response(&response)
+            .map_err(anyhow::Error::msg)?;
+        stream.write_all(&bytes).await?;
+        stream.flush().await?;
+        stream.shutdown().await?;
+        Ok(self.publish_returned())
+    }
+}
+
+impl Drop for ConstructedReady {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        self.permit.release();
+        if self.locked.closing.load(Ordering::Acquire) && !self.locked.ready.load(Ordering::Acquire)
+        {
+            let locked = self.locked.clone();
+            tokio::spawn(async move {
+                let _ = locked.rollback_failed_ready_handoff().await;
+            });
+        }
+    }
+}
+
 impl LockedServices {
     async fn prepare(
         paths: DaemonPaths,
@@ -4876,7 +4975,7 @@ impl LockedServices {
             .context("onboarding run is absent")
     }
 
-    async fn finish_ready_transition(&self) -> Result<ReadyServices> {
+    async fn finish_ready_transition(self: &Arc<Self>) -> Result<ConstructedReady> {
         anyhow::ensure!(
             self.ready_construction_pending(),
             "onboarding ready construction is not pending"
@@ -4885,22 +4984,32 @@ impl LockedServices {
             self.try_acquire_ready_transition(),
             "onboarding ready construction is already in progress"
         );
+        let mut permit = ReadyTransitionPermit::new(self.clone());
         self.begin_locked_to_ready_transition().await;
         let outcome = match self.into_ready().await {
             Ok(ready) => match self.mark_ready_construction_recovered().await {
                 Ok(()) => Ok(ready),
-                Err(error) => {
-                    let _ = self.rollback_failed_ready_handoff().await;
-                    Err(error)
-                }
+                Err(error) => Err(error),
             },
+            Err(error) => Err(error),
+        };
+        match outcome {
+            Ok(ready) => Ok(ConstructedReady::new(self.clone(), ready)),
             Err(error) => {
                 let _ = self.rollback_failed_ready_handoff().await;
+                permit.release();
                 Err(error)
             }
-        };
-        self.release_ready_transition();
-        outcome
+        }
+    }
+
+    async fn prepare_retry_ready_handoff(self: &Arc<Self>) -> Result<(Response, ConstructedReady)> {
+        let constructed = self.finish_ready_transition().await?;
+        let snapshot = self.onboarding_snapshot_present().await.map_err(|error| {
+            drop(constructed);
+            error
+        })?;
+        Ok((Response::OnboardingBootstrapSnapshot(snapshot), constructed))
     }
 
     fn store_achieved_ready(&self, ready: ReadyServices) {
@@ -5996,16 +6105,27 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
             authenticated_owner = true;
         }
         if matches!(request, Request::RetryOnboardingReadyConstruction) {
-            let handoff = async {
-                let ready = locked.finish_ready_transition().await?;
-                let snapshot = locked.onboarding_snapshot_present().await?;
-                Ok((Response::OnboardingBootstrapSnapshot(snapshot), ready))
+            if !authenticated_owner {
+                proto_stream
+                    .send(&Envelope::error(
+                        Some(id),
+                        ErrorPayload {
+                            code: ErrorCode::Authorization,
+                            message: "bootstrap peer is not authenticated".into(),
+                        },
+                    ))
+                    .await?;
+                continue;
             }
-            .await;
-            match handoff {
-                Ok((response, ready)) => {
-                    proto_stream.send(&Envelope::response(id, response)).await?;
-                    locked.store_achieved_ready(ready);
+            match locked.prepare_retry_ready_handoff().await {
+                Ok((response, constructed)) => {
+                    if proto_stream
+                        .send(&Envelope::response(id, response))
+                        .await
+                        .is_ok()
+                    {
+                        constructed.publish_stored();
+                    }
                 }
                 Err(_) => {
                     proto_stream
@@ -6227,14 +6347,16 @@ pub(crate) async fn run_locked_until_ready(
                         locked_clients.abort_all();
                         while locked_clients.join_next().await.is_some() {}
                         match locked.finish_ready_transition().await {
-                            Ok(ready) => {
-                                let response = cockpit_proto::SensitiveOnboardingIntentResponse::Applied(result);
-                                let bytes = cockpit_proto::encode_sensitive_onboarding_response(&response)
-                                    .map_err(anyhow::Error::msg)?;
-                                stream.write_all(&bytes).await?;
-                                stream.flush().await?;
-                                stream.shutdown().await?;
-                                return Ok((ready, listener, sensitive));
+                            Ok(constructed) => {
+                                match constructed
+                                    .finalize_sensitive_wire(&mut stream, result)
+                                    .await
+                                {
+                                    Ok(ready) => {
+                                        return Ok((ready, listener, sensitive));
+                                    }
+                                    Err(_) => {}
+                                }
                             }
                             Err(_) => {
                                 let response = cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(

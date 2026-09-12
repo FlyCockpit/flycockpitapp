@@ -80,6 +80,7 @@ pub mod host_capabilities;
 pub mod image_control;
 pub mod image_sidecar_authority;
 pub mod media_egress_authority;
+pub mod onboarding;
 pub use image_sidecar_authority::{
     ImageSidecarApprovalModeV1, ImageSidecarAuthoritySnapshotV1, ImageSidecarGrantMutationV1,
     ImageSidecarGrantScopeV1, ImageSidecarGrantV1, ImageSidecarInvocationCapSourceV1,
@@ -94,6 +95,17 @@ pub use host_capabilities::{
     SecretStoreIntent, SecretStorePlacement, SecretStoreSnapshot,
 };
 pub use launch::{LaunchBundle, LaunchInfo, RepoStatus};
+pub use onboarding::{
+    ApplyOnboardingSecureIntent, ApplyOnboardingTransition, BeginOrReopenOnboarding,
+    LockedBootstrapHello, OnboardingBootstrapEvent, OnboardingBootstrapSnapshot,
+    OnboardingBootstrapState, OnboardingReceiptQuery, OnboardingReceiptStatus,
+    OnboardingSecurePlacement, OnboardingStage, OnboardingStageSettlement,
+    OnboardingTransitionKind, OnboardingTransitionReceipt, OnboardingTransitionResult,
+    SensitiveOnboardingIntentError, SensitiveOnboardingIntentFrame,
+    SensitiveOnboardingIntentResponse, SensitiveOnboardingPassphrase,
+    decode_sensitive_onboarding_intent, decode_sensitive_onboarding_response,
+    encode_sensitive_onboarding_intent, encode_sensitive_onboarding_response,
+};
 pub use provider_management::{
     ProviderLayerMetadataPatch, ProviderMutationBatch, ProviderMutationDelete,
     ProviderMutationUpsert, ProviderSecretValue,
@@ -155,7 +167,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1322,11 +1334,13 @@ impl fmt::Debug for StoredFlycockpitCredential {
 
 /// Current wire schema version. v23 adds durable logical-conversation
 /// favorites (`SetSessionFavorite` / `SessionFavoriteApplied` and the
-/// resolved-root `SessionSummary.favorite` bit) on top of v22's first-class
-/// assistant-thread creation and durable lineage projections, the V2 tagged
-/// ingress envelope, queued-message delivery classes, local queue controls,
-/// MCP credential profiles, agent-dimensioned MCP scopes on the attached-session
-/// and daemon-owned setup inventory, bounded base64 media previews, the
+/// resolved-root `SessionSummary.favorite` bit) and daemon-authoritative
+/// onboarding (`BeginOrReopenOnboarding` / `ApplyOnboardingTransition` and
+/// bootstrap snapshots) on top of v22's first-class assistant-thread
+/// creation and durable lineage projections, the V2 tagged ingress envelope,
+/// queued-message delivery classes, local queue controls, MCP credential
+/// profiles, agent-dimensioned MCP scopes on the attached-session and
+/// daemon-owned setup inventory, bounded base64 media previews, the
 /// rolling-precompaction resume choice, and knowledge-dream completion
 /// receipts including ordered all-KB runs.
 pub const PROTOCOL_VERSION: u32 = 23;
@@ -1475,18 +1489,21 @@ pub fn daemon_hello_from_envelope(env: &Envelope) -> Option<DaemonHello> {
     if !id.is_nil() {
         return None;
     }
-    let Response::DaemonStatus {
-        daemon_version,
-        protocol_version,
-        ..
-    } = response.as_ref()
-    else {
-        return None;
-    };
-    Some(DaemonHello {
-        daemon_version: daemon_version.clone(),
-        protocol_version: *protocol_version,
-    })
+    match response.as_ref() {
+        Response::DaemonStatus {
+            daemon_version,
+            protocol_version,
+            ..
+        } => Some(DaemonHello {
+            daemon_version: daemon_version.clone(),
+            protocol_version: *protocol_version,
+        }),
+        Response::LockedBootstrapHello(hello) => Some(DaemonHello {
+            daemon_version: DAEMON_VERSION.to_string(),
+            protocol_version: hello.protocol_version,
+        }),
+        _ => None,
+    }
 }
 
 pub fn parse_daemon_hello_line(line: &str) -> Result<Option<DaemonHello>> {
@@ -2250,6 +2267,9 @@ pub enum ErrorCode {
     NotFound,
     /// Daemon is shutting down.
     Shutdown,
+    /// The authenticated daemon is in locked first-run mode; only the named
+    /// bootstrap RPC allowlist is available.
+    BootstrapLocked,
     /// Principal is not authorized for the requested operation.
     Authorization,
     /// Principal has read-only access to this session.
@@ -2360,6 +2380,7 @@ impl<'de> Deserialize<'de> for ErrorCode {
             "unknown_interrupt" => Self::UnknownInterrupt,
             "not_found" => Self::NotFound,
             "shutdown" => Self::Shutdown,
+            "bootstrap_locked" => Self::BootstrapLocked,
             "authorization" => Self::Authorization,
             "read_only" => Self::ReadOnly,
             "root_missing" => Self::RootMissing,
@@ -2409,6 +2430,7 @@ impl std::fmt::Display for ErrorCode {
             Self::UnknownInterrupt => "unknown_interrupt",
             Self::NotFound => "not_found",
             Self::Shutdown => "shutdown",
+            Self::BootstrapLocked => "bootstrap_locked",
             Self::Authorization => "authorization",
             Self::ReadOnly => "read_only",
             Self::RootMissing => "root_missing",

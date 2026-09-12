@@ -30,6 +30,7 @@ use crate::tools::shell_sandbox::{SandboxAvailability, probe_host_sandbox};
 
 /// Feature capability IDs consulted by settings/spawn/vault.
 pub const FEATURE_SECRET_STORE_KEYRING: &str = "secret_store.keyring";
+pub const FEATURE_SECRET_STORE_FILE: &str = "secret_store.file";
 pub const FEATURE_SANDBOX_HOST: &str = "sandbox.host";
 pub const FEATURE_SANDBOX_CONTAINER: &str = "sandbox.container";
 pub const FEATURE_MEDIA_DECODE: &str = "media.decode";
@@ -792,8 +793,23 @@ pub fn build_host_capability_snapshot(
         .collect();
     dependencies.sort_by(|left, right| left.id.cmp(&right.id));
 
+    let file_vault = crate::secure_key::first_run_secret_store_capabilities(&probes.keyring);
     let features = vec![
         feature_from_keyring(&probes.keyring),
+        FeatureCapabilityRow {
+            id: FEATURE_SECRET_STORE_FILE.to_string(),
+            state: if file_vault.file_vault_available {
+                FeatureCapabilityState::Available
+            } else {
+                FeatureCapabilityState::Missing
+            },
+            reason: file_vault
+                .file_vault_reason
+                .unwrap_or_else(|| "encrypted file-backed secret storage is available".to_string()),
+            fix_command: file_vault.file_vault_fix_command,
+            remedy_text: Some(file_vault.machine_bound_warning.to_string()),
+            dependency_ids: Vec::new(),
+        },
         feature_sandbox_host(probes.platform, &probes.sandbox, &dependencies),
         feature_sandbox_container(&probes.container),
         feature_media_decode(

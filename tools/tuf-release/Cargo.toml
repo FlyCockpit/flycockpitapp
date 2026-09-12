@@ -1,0 +1,14 @@
+[package]
+name = "cockpit-tuf-release"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+cockpit-updater-evidence = { path = "../../crates/cockpit-updater-evidence" }
+serde_json = { workspace = true }

@@ -473,6 +473,28 @@ impl PeerCredentialRegistry {
         Some((record.role, record.grants.clone()))
     }
 
+    /// Verify a credential on the authenticated sibling sensitive transport.
+    /// The token remains bound to the exact OS peer that obtained it; the
+    /// sibling connection has no control-connection id of its own.
+    pub fn verify_sensitive_peer(
+        &self,
+        peer: PeerIdentity,
+        presented: &str,
+    ) -> Option<(LocalClientRole, Vec<PrincipalGrant>)> {
+        if !peer_identity_matches_live_process(peer) {
+            return None;
+        }
+        let records = self
+            .records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let record = records.get(presented)?;
+        if record.expires_at_unix_ms <= now_unix_ms() || record.peer != peer {
+            return None;
+        }
+        Some((record.role, record.grants.clone()))
+    }
+
     pub fn expires_at_unix_ms(&self, connection_id: Uuid, presented: &str) -> Option<i64> {
         let records = self
             .records

@@ -432,68 +432,54 @@ async fn request_durable_local_mutation(
     operation_kind: &str,
     request: Request,
 ) -> Result<Response> {
-    let mut initial_rejection = match client.request(request.clone()).await {
+    let initial_rejection = match client.request(request).await {
         Ok(Ok(response)) => return Ok(response),
         Ok(Err(error)) => Some(error.to_string()),
         Err(_) => None,
     };
-    let mut attempts = 0_u32;
-    loop {
-        let settlement = client
-            .request(Request::GetLocalOperationSettlement {
-                client_operation_id: client_operation_id.to_string(),
-            })
-            .await;
-        match settlement {
-            Ok(Ok(Response::LocalOperationSettlement {
-                client_operation_id: returned_operation_id,
-                operation_kind: returned_kind,
-                pending,
-                response,
-                terminal_error,
-                terminal_cancelled,
-                ..
-            })) if returned_operation_id == client_operation_id
-                && returned_kind == operation_kind =>
-            {
-                if let Some(error) = terminal_error {
-                    bail!("daemon rejected {operation_kind}: {error}");
-                }
-                if terminal_cancelled {
-                    bail!("daemon cancelled {operation_kind}");
-                }
-                if let Some(response) = response {
-                    return Ok(*response);
-                }
-                if !pending {
-                    bail!("daemon returned an incomplete terminal settlement for {operation_kind}");
-                }
+    let settlement = client
+        .request(Request::GetLocalOperationSettlement {
+            client_operation_id: client_operation_id.to_string(),
+        })
+        .await;
+    match settlement {
+        Ok(Ok(Response::LocalOperationSettlement {
+            client_operation_id: returned_operation_id,
+            operation_kind: returned_kind,
+            pending,
+            response,
+            terminal_error,
+            terminal_cancelled,
+            ..
+        })) if returned_operation_id == client_operation_id && returned_kind == operation_kind => {
+            if let Some(error) = terminal_error {
+                bail!("daemon rejected {operation_kind}: {error}");
             }
-            Ok(Ok(other)) => {
-                bail!("daemon returned an unbound settlement for {operation_kind}: {other:?}")
+            if terminal_cancelled {
+                bail!("daemon cancelled {operation_kind}");
             }
-            Ok(Err(error)) => {
-                if let Some(rejection) = initial_rejection.as_deref() {
-                    bail!("daemon rejected {operation_kind}: {rejection}");
-                }
-                // A response can be lost after the daemon accepted the
-                // mutation but before its receipt became queryable. Re-submit
-                // the exact same operation id/body periodically; daemon-side
-                // fencing makes this an idempotent reconciliation, never a
-                // second mutation.
-                if attempts.is_multiple_of(40) {
-                    match client.request(request.clone()).await {
-                        Ok(Ok(response)) => return Ok(response),
-                        Ok(Err(rejection)) => initial_rejection = Some(rejection.to_string()),
-                        Err(_) => {}
-                    }
-                }
-                let _ = error;
+            if let Some(response) = response {
+                return Ok(*response);
             }
-            Err(_) => {}
+            let state = if pending { "pending" } else { "unknown" };
+            bail!(
+                "{operation_kind} settlement is {state}; query operation `{client_operation_id}` before submitting another write"
+            );
         }
-        attempts = attempts.wrapping_add(1);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        Ok(Ok(other)) => {
+            bail!("daemon returned an unbound settlement for {operation_kind}: {other:?}")
+        }
+        Ok(Err(error)) => {
+            if let Some(rejection) = initial_rejection {
+                bail!("daemon rejected {operation_kind}: {rejection}");
+            }
+            bail!(
+                "{operation_kind} commit is unknown ({error}); query operation `{client_operation_id}` before submitting another write"
+            );
+        }
+        Err(error) => bail!(
+            "{operation_kind} commit is unknown ({error}); query operation `{client_operation_id}` before submitting another write"
+        ),
     }
 }
 

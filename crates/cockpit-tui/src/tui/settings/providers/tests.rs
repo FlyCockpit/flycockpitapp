@@ -1,4 +1,4 @@
-use super::oauth_flow::{OAuthOption, oauth_options};
+use super::oauth_flow::{OAuthEffects, OAuthOption, oauth_options};
 use super::row_editor::RowListEditor;
 use super::*;
 use crate::tui::settings::pointer_actions::ProviderRowEditorAction;

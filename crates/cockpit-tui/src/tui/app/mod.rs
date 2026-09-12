@@ -67,6 +67,7 @@ mod terminal_display;
 mod terminal_suspend;
 mod toggles;
 mod transcript_toggles;
+mod update_notice;
 
 use events::{
     GIT_AGENT_TOKEN_CAP, WORKING_MESSAGES, cache_config_caches, cap_display_lines, cap_tokens,
@@ -471,19 +472,6 @@ pub(crate) enum ControlApplied {
 pub enum StartupWorkspaceTrust {
     Decided,
     Pending(cockpit_config::trust::TrustRoot),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FirstRunFlow {
-    None,
-    AwaitWelcome,
-    AwaitProfile,
-    AwaitProvider,
-    AwaitProviderValidation,
-    AwaitModel,
-    AwaitAgent,
-    AwaitLifetime,
-    AwaitFinish,
 }
 
 /// Required launch modals share one precedence order for drawing and input.
@@ -2673,6 +2661,7 @@ pub struct App {
     /// enters history or any inference request — purely client-side chrome.
     pub(super) sandbox_down_notice: Option<SandboxDownNotice>,
     pub(super) command_capability_notice: Option<CommandCapabilityNotice>,
+    pub(super) update_disabled_notice: Option<String>,
     pub(super) sandbox_notice_copy_rect: Option<Rect>,
     /// Process-local, event-earned per-model auth failures. These deliberately
     /// have no persistence path and start empty for every TUI process.
@@ -2744,7 +2733,12 @@ pub struct App {
     #[cfg(feature = "remote")]
     pub(super) connector_disclosure: Option<cockpit_proto::ConnectorDisclosure>,
     has_no_providers_at_startup: bool,
-    first_run_flow: FirstRunFlow,
+    onboarding_snapshot: Option<cockpit_proto::OnboardingBootstrapSnapshot>,
+    /// Presentation-only completion choice. Durable stage ownership remains
+    /// exclusively in `onboarding_snapshot`; this flag never acts as a reducer.
+    onboarding_completion_visible: bool,
+    onboarding_skip: bool,
+    onboarding_force: bool,
     /// An open `/side` side conversation, or `None` in the main session. While
     /// `Some`, the TUI is bound to an ephemeral throwaway fork: the chrome
     /// shows the side indicator with `/side end` guidance, and the fork is
@@ -3596,7 +3590,6 @@ impl App {
         let preflight_enabled = extended.preflight.enabled;
         let sandbox_escalation_enabled = extended.sandbox_escalation_enabled;
         let has_no_providers_at_startup = providers.providers.is_empty();
-        let onboarding_stage = cockpit_core::welcome::onboarding_stage();
         let startup_dependency_notice =
             cockpit_core::external_runtime::current_startup_dependency_policy()
                 .and_then(|policy| policy.summary)
@@ -3960,6 +3953,7 @@ impl App {
             waiting_for_lock: None,
             sandbox_down_notice: None,
             command_capability_notice: None,
+            update_disabled_notice: None,
             sandbox_notice_copy_rect: None,
             auth_failure_annotations: Default::default(),
             auth_failure_notice: None,
@@ -3984,21 +3978,10 @@ impl App {
             #[cfg(feature = "remote")]
             connector_disclosure,
             has_no_providers_at_startup,
-            first_run_flow: match onboarding_stage {
-                cockpit_core::welcome::OnboardingStage::Welcome => FirstRunFlow::AwaitWelcome,
-                cockpit_core::welcome::OnboardingStage::Profile => FirstRunFlow::AwaitProfile,
-                cockpit_core::welcome::OnboardingStage::Provider => {
-                    if cockpit_core::welcome::onboarding_provider_pending_validation().is_some() {
-                        FirstRunFlow::AwaitProviderValidation
-                    } else {
-                        FirstRunFlow::AwaitProvider
-                    }
-                }
-                cockpit_core::welcome::OnboardingStage::Model => FirstRunFlow::AwaitModel,
-                cockpit_core::welcome::OnboardingStage::Agent => FirstRunFlow::AwaitAgent,
-                cockpit_core::welcome::OnboardingStage::Lifetime => FirstRunFlow::AwaitLifetime,
-                cockpit_core::welcome::OnboardingStage::Complete => FirstRunFlow::None,
-            },
+            onboarding_snapshot: None,
+            onboarding_completion_visible: false,
+            onboarding_skip: false,
+            onboarding_force: false,
             side_conversation: None,
             daemon_draining: false,
             predict_setting,
@@ -4385,6 +4368,7 @@ impl App {
         self.sync_active_agent();
         self.sync_pin_count();
         self.sync_mouse_capture_from_dialog();
+        changed |= self.sync_update_notice();
         changed |= self.tick_toast();
         changed |= self.tick_ctrl_c_window();
         changed |= self.check_pending_link_activation();

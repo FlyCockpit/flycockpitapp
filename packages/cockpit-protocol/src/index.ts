@@ -1,7 +1,18 @@
 import { z } from "zod";
+import {
+  applyOnboardingTransitionSchema,
+  beginOrReopenOnboardingSchema,
+  lockedBootstrapHelloSchema,
+  onboardingBootstrapEventSchema,
+  onboardingBootstrapSnapshotSchema,
+  onboardingReceiptQuerySchema,
+  onboardingTransitionReceiptSchema,
+  onboardingTransitionResultSchema,
+} from "./onboarding";
 import { canonicalU64DecimalStringSchema, decodeProtocolIdBase64Url } from "./remote-protocol-id";
 
 export * from "./dependency-health";
+export * from "./onboarding";
 export * from "./remote-attempt-grants";
 export * from "./remote-connection-metadata";
 export * from "./remote-device-identity-enrollment";
@@ -911,6 +922,10 @@ export const localClientRoleSchema = z.enum(["tui", "cli", "acp", "agent_child"]
 export type LocalClientRole = z.infer<typeof localClientRoleSchema>;
 
 const requestParamSchemas = {
+  get_onboarding_bootstrap_snapshot: z.undefined(),
+  begin_or_reopen_onboarding: beginOrReopenOnboardingSchema,
+  apply_onboarding_transition: applyOnboardingTransitionSchema,
+  get_onboarding_transition_receipt: onboardingReceiptQuerySchema,
   get_storage_report: z.undefined(),
   get_app_flag: z
     .object({ key: z.enum(["daemon_autostart_notice", "storage_management_hint"]) })
@@ -1424,6 +1439,13 @@ function requestVariantNoParams<Name extends RequestName>(request: Name) {
 // array directly so it stays in sync with `clientRequestSchema` by
 // construction.
 const clientRequestVariants = [
+  requestVariantNoParams("get_onboarding_bootstrap_snapshot"),
+  requestVariant("begin_or_reopen_onboarding", requestParamSchemas.begin_or_reopen_onboarding),
+  requestVariant("apply_onboarding_transition", requestParamSchemas.apply_onboarding_transition),
+  requestVariant(
+    "get_onboarding_transition_receipt",
+    requestParamSchemas.get_onboarding_transition_receipt,
+  ),
   requestVariant("create_code_root_v1", requestParamSchemas.create_code_root_v1),
   requestVariant("attach_existing_code_root_v1", requestParamSchemas.attach_existing_code_root_v1),
   requestVariant(
@@ -1627,6 +1649,10 @@ export type RunInvocationCancelResultV1 = z.infer<typeof runInvocationCancelResu
 
 export const responseNameSchema = z.enum([
   "ack",
+  "onboarding_bootstrap_snapshot",
+  "locked_bootstrap_hello",
+  "onboarding_transition",
+  "onboarding_transition_receipt",
   "app_flag",
   "app_flag_seen",
   "assistant_session_resolved",
@@ -2150,6 +2176,10 @@ const responseVariant = <Name extends ResponseName, Schema extends z.ZodTypeAny>
 
 export const responseEnvelopeSchema = z.discriminatedUnion("response", [
   z.object({ ...responseBaseSchema, response: z.literal("ack") }).passthrough(),
+  responseVariant("onboarding_bootstrap_snapshot", onboardingBootstrapSnapshotSchema.nullable()),
+  responseVariant("locked_bootstrap_hello", lockedBootstrapHelloSchema),
+  responseVariant("onboarding_transition", onboardingTransitionResultSchema),
+  responseVariant("onboarding_transition_receipt", onboardingTransitionReceiptSchema.nullable()),
   responseVariant(
     "app_flag",
     z
@@ -2736,6 +2766,7 @@ export type ErrorEnvelope = z.infer<typeof errorEnvelopeSchema>;
 
 export const knownEventKindSchema = z.enum([
   "active_model_state",
+  "onboarding_bootstrap",
   "agent_idle",
   "agent_tree_changed",
   "approval_mode_state",
@@ -3104,6 +3135,7 @@ const workspaceTrustReconciliationDataSchema = z
 const daemonLifetimeChangedDataSchema = z.object({ ephemeral_owner: z.boolean() }).strict();
 
 const structuredEventDataSchemas = {
+  onboarding_bootstrap: onboardingBootstrapEventSchema,
   active_model_state: activeModelStateSchema.extend({ session_id: uuidSchema }),
   agent_tree_changed: agentTreeChangedDataSchema,
   default_model_update_result: defaultModelUpdateResultDataSchema,

@@ -899,6 +899,7 @@ fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
                     | crate::cli::DaemonCommand::DiagnosticFailedCalls { .. }
             ))
             | Some(Command::Trust(_))
+            | Some(Command::Update(_))
             | Some(Command::Jq(_))
             | Some(Command::Completion { .. })
             | Some(Command::BashHints(_))
@@ -947,21 +948,6 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
             Ok(cwd) => engine::model::enable_debug_last_message(cwd.join(".lastmessage")),
             Err(e) => tracing::warn!(error = %e, "--debug-last-message: cwd unavailable"),
         }
-    }
-
-    // A persistent daemon creates the global config directory. Record a truly
-    // fresh interactive launch before trust setup can start that daemon, while
-    // leaving every non-TUI and non-interactive trust path unchanged.
-    if (tui_mode_for_command(cli.command.as_ref()).is_some()
-        || matches!(
-            cli.command.as_ref(),
-            Some(Command::Setup(crate::cli::SetupArgs { wizard: None }))
-        ))
-        && std::io::IsTerminal::is_terminal(&std::io::stdin())
-        && std::io::IsTerminal::is_terminal(&std::io::stdout())
-    {
-        cockpit_core::welcome::initialize_onboarding_if_first_run()
-            .context("initializing first-run onboarding state")?;
     }
 
     if command_requires_workspace_trust(cli.command.as_ref()) {
@@ -1022,6 +1008,7 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         Some(Command::Jq(args)) => commands::jq::run(args).await,
         Some(Command::Daemon(sub)) => commands::daemon::run(sub).await,
         Some(Command::Doctor(args)) => commands::doctor::run(args, cli.no_sandbox).await,
+        Some(Command::Update(args)) => commands::update::run(args).await,
         Some(Command::Session(sub)) => commands::session::run(sub).await,
         Some(Command::Knowledge(sub)) => commands::knowledge::run(sub).await,
         Some(Command::Dream(args)) => {
@@ -1584,6 +1571,14 @@ mod tests {
                 path: None,
                 offline: false,
                 dependencies_json: false,
+            }
+        ))));
+        assert!(!command_requires_workspace_trust(Some(&Command::Update(
+            crate::cli::UpdateArgs {
+                check: true,
+                status: false,
+                version: None,
+                channel: None,
             }
         ))));
         assert!(!command_requires_workspace_trust(Some(&Command::Init(

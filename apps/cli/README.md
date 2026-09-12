@@ -250,6 +250,7 @@ cockpit packages prune --dry-run
 | `cockpit schedule list` | List durable scheduler jobs. Compiled only into opt-in `extended`-feature builds; absent from the public local binary. |
 | `cockpit skill curator status` | Show skill curation and snapshot state. |
 | `cockpit trust status [path]` | Show workspace trust state. |
+| `cockpit update [--check] [--status]` | Check or apply installed-binary updates (disabled until production updater activation). |
 | `cockpit export <session>` | Export a session/fork tree debug bundle, redacted by default; `--include-sensitive` writes an unredacted archive (local-only opt-in, mandatory stderr warning). |
 | `cockpit import <file>` | Import a session export (never restores approval grants or other authorization state). Refuses an unredacted `--include-sensitive` export unless `--include-sensitive` is passed again, and prints the fresh destination session ids. |
 | `cockpit stats` | Show token and cost statistics. |

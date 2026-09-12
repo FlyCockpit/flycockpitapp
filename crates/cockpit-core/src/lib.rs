@@ -69,6 +69,7 @@ mod media_image;
 pub mod media_reservation;
 mod media_storage;
 pub mod model_system_prompt;
+pub mod onboarding;
 pub mod onboarding_agent;
 #[cfg(feature = "extended")]
 pub mod openai_images_adapter;
@@ -110,6 +111,7 @@ pub mod tokens;
 pub mod tool_media_authority;
 pub mod tools;
 pub mod typed_media_result;
+pub mod updater;
 pub mod user_agent;
 pub mod welcome;
 pub mod wizard;

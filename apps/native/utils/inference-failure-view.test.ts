@@ -101,9 +101,7 @@ describe("active model state", () => {
       diverged: true,
       generation: 1,
     };
-    expect(activeModelView(diverged).divergence).toBe(
-      "Configured openai/gpt-5 is not active",
-    );
+    expect(activeModelView(diverged).divergence).toBe("Configured openai/gpt-5 is not active");
     expect(activeModelView({ ...diverged, diverged: false }).divergence).toBeNull();
   });
 });

@@ -1028,6 +1028,13 @@ pub enum Request {
     GetStartupDisclosures {
         project_root: String,
     },
+    GetOnboardingBootstrapSnapshot,
+    BeginOrReopenOnboarding(crate::BeginOrReopenOnboarding),
+    ApplyOnboardingTransition(crate::ApplyOnboardingTransition),
+    GetOnboardingTransitionReceipt(crate::OnboardingReceiptQuery),
+    /// Retry ready-service construction after vault authority exists but the
+    /// first locked-to-ready transition failed.
+    RetryOnboardingReadyConstruction,
     GetAppFlag {
         key: AppFlagKey,
     },
@@ -2196,6 +2203,8 @@ pub enum Request {
     /// Answers are validated against the daemon's current descriptor; the
     /// descriptor itself never crosses the wire.
     ApplySetupWizard {
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
+        client_operation_id: String,
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
         #[serde(deserialize_with = "deserialize_owner_provider_id")]
@@ -3642,10 +3651,12 @@ impl Request {
                 validate_owner_identifier("provider id", provider_id, MAX_OWNER_PROVIDER_ID_BYTES)?;
             }
             Self::ApplySetupWizard {
+                client_operation_id,
                 project_root,
                 wizard_id,
                 answers_json,
             } => {
+                validate_owner_identifier("client operation", client_operation_id, 128)?;
                 validate_owner_project_root(project_root)?;
                 if !matches!(
                     wizard_id.as_str(),
@@ -4507,6 +4518,11 @@ macro_rules! request_variants {
             (Request::SetWorkspaceHistoryScope { .. }, "set_workspace_history_scope");
             (Request::GetWorkspaceHistoryScope { .. }, "get_workspace_history_scope");
             (Request::GetStartupDisclosures { .. }, "get_startup_disclosures");
+            (Request::GetOnboardingBootstrapSnapshot, "get_onboarding_bootstrap_snapshot");
+            (Request::BeginOrReopenOnboarding(..), "begin_or_reopen_onboarding");
+            (Request::ApplyOnboardingTransition(..), "apply_onboarding_transition");
+            (Request::GetOnboardingTransitionReceipt(..), "get_onboarding_transition_receipt");
+            (Request::RetryOnboardingReadyConstruction, "retry_onboarding_ready_construction");
             (Request::GetAppFlag { .. }, "get_app_flag");
             (Request::MarkAppFlagSeen { .. }, "mark_app_flag_seen");
             (Request::GetStorageReport, "get_storage_report");
@@ -4874,6 +4890,11 @@ macro_rules! command {
             (Request::SetWorkspaceHistoryScope { project_root, outbound, inbound }, "set_workspace_history_scope", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|outbound:bool|inbound:bool", [project_root: String => project_root, outbound: bool => param, inbound: bool => param]);
             (Request::GetWorkspaceHistoryScope { project_root }, "get_workspace_history_scope", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::GetStartupDisclosures { project_root }, "get_startup_disclosures", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
+            (Request::GetOnboardingBootstrapSnapshot, "get_onboarding_bootstrap_snapshot", owner_only, none, false, read_only, none, serialized, none, "-", []);
+            (Request::BeginOrReopenOnboarding(request), "begin_or_reopen_onboarding", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "request:BeginOrReopenOnboarding", [request: $crate::BeginOrReopenOnboarding => param]);
+            (Request::ApplyOnboardingTransition(request), "apply_onboarding_transition", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "request:ApplyOnboardingTransition", [request: $crate::ApplyOnboardingTransition => param]);
+            (Request::GetOnboardingTransitionReceipt(request), "get_onboarding_transition_receipt", owner_only, none, false, read_only, none, serialized, none, "request:OnboardingReceiptQuery", [request: $crate::OnboardingReceiptQuery => param]);
+            (Request::RetryOnboardingReadyConstruction, "retry_onboarding_ready_construction", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::GetAppFlag { key }, "get_app_flag", owner_only, none, false, local_only, none, serialized, none, "key:AppFlagKey", [key: AppFlagKey => param]);
             (Request::MarkAppFlagSeen { key, expected_version }, "mark_app_flag_seen", owner_only, none, true, local_only, none, serialized, none, "key:AppFlagKey|expected_version:u64", [key: AppFlagKey => param, expected_version: u64 => param]);
             (Request::GetStorageReport, "get_storage_report", owner_only, none, false, read_only, none, concurrent, none, "-", []);
@@ -5020,7 +5041,7 @@ macro_rules! command {
             #[cfg(feature = "remote")]
             (Request::SaveProviderConfig { project_root, provider_id, entry, header_secrets }, "save_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|entry:cockpit_config::config::providers::ProviderEntry|header_secrets:Vec<Option<crate::ProviderSecretValue>>", [project_root: String => project_root, provider_id: String => param, entry: cockpit_config::config::providers::ProviderEntry => param, header_secrets: Vec<Option<cockpit_proto::ProviderSecretValue>> => param]);
             (Request::SetupCopilotAuth { client_operation_id, project_root, provider_id }, "setup_copilot_auth", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "client_operation_id:String|project_root:String|provider_id:String", [client_operation_id: String => param, project_root: String => project_root, provider_id: String => param]);
-            (Request::ApplySetupWizard { project_root, wizard_id, answers_json }, "apply_setup_wizard", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|wizard_id:String|answers_json:String", [project_root: String => project_root, wizard_id: String => param, answers_json: String => param]);
+            (Request::ApplySetupWizard { client_operation_id, project_root, wizard_id, answers_json }, "apply_setup_wizard", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|wizard_id:String|answers_json:String", [client_operation_id: String => param, project_root: String => project_root, wizard_id: String => param, answers_json: String => param]);
             // Composite MCP publication is reserved in the remote ledger
             // before dispatch. The daemon's journal + staged vault commit
             // makes the nonrepeatable outcome replay-safe.

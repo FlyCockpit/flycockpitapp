@@ -1,0 +1,17 @@
+[package]
+name = "cockpit-updater-evidence"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Canonical fake-fixture evidence schema for private updater release tooling"
+license = "Apache-2.0"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

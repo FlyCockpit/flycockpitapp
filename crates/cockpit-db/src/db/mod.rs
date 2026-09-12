@@ -79,6 +79,7 @@ pub mod media_attachments;
 pub mod message_attachments;
 pub mod monty_network;
 pub mod needs_attention;
+pub mod onboarding;
 #[cfg(feature = "remote")]
 pub mod org_sync;
 pub mod packages;

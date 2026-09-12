@@ -43,7 +43,14 @@ impl App {
     }
 
     fn start_named_assistant_resolution(&mut self, assistant_id: String) {
-        let lifecycle = self.lifecycle.clone();
+        let generation = self.startup_background.generation;
+        let Some(endpoint) = self
+            .startup_lifecycle
+            .as_ref()
+            .map(|selected| selected.endpoint.clone())
+        else {
+            return;
+        };
         let project_root = self.launch.cwd.to_string_lossy().into_owned();
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("assistant.resolve"),
@@ -54,18 +61,14 @@ impl App {
                     project_root,
                     mode: cockpit_proto::AssistantSessionResolutionMode::MostRecentOrCreate,
                 };
-                let resolution =
-                    agent_runner::resolve_assistant_session_blocking(lifecycle, request)?;
-                let cockpit_proto::Response::AssistantSessionResolved { session, .. } =
-                    resolution.response
+                let response = agent_runner::daemon_request_at_blocking(&endpoint, request)?;
+                let cockpit_proto::Response::AssistantSessionResolved { session, .. } = response
                 else {
                     return Err("unexpected assistant session response".to_string());
                 };
-                Ok(AsyncActionPayload::AssistantSessionResolved {
+                Ok(AsyncActionPayload::StartupAssistantSessionResolved {
+                    generation,
                     session_id: session.session_id,
-                    source_session_id: None,
-                    startup_notice: resolution.startup_notice,
-                    promoted_from_ephemeral: resolution.promoted_from_ephemeral,
                 })
             },
         );
@@ -191,45 +194,66 @@ impl App {
         let no_sandbox = self.no_sandbox;
         let intent = self.lifecycle_intent();
         let lifecycle = self.lifecycle.clone();
+        let selected = self.startup_lifecycle.clone();
         let worker_cwd = cwd.clone();
         // Route selection is structural: Code uses the closed Code-root API,
         // while generic attach can represent only Assistant/Computer.
-        let requested_session_entry_mode = Some(self.session_mode.unwrap_or(SessionMode::Code));
+        let requested_session_entry_mode = requested_session_id
+            .is_none()
+            .then_some(self.session_mode.unwrap_or(SessionMode::Code));
         let action_id = self
             .async_actions
             .start(
                 AsyncActionKind::Internal("runner.attach"),
                 AsyncActionPolicy::Replace(AsyncActionKey::new("runner.attach")),
                 async move {
-                    let runner = match initial_model {
-                        Some(model) => {
-                            agent_runner::try_spawn_with_model_and_entry_mode(
-                                &worker_cwd,
-                                requested_session_id,
-                                model,
-                                no_sandbox,
-                                lifecycle,
-                                intent,
-                                requested_session_entry_mode,
-                            )
-                            .await
-                        }
-                        None => match requested_session_id {
-                            Some(session_id) => {
-                                agent_runner::attach_to_session(
+                    let runner = if let Some(selected) = selected {
+                        agent_runner::attach_to_selected_lifecycle(
+                            &worker_cwd,
+                            requested_session_id,
+                            initial_model,
+                            requested_session_entry_mode,
+                            no_sandbox,
+                            lifecycle,
+                            selected,
+                        )
+                        .await
+                    } else {
+                        match initial_model {
+                            Some(model) => {
+                                agent_runner::try_spawn_with_model_and_entry_mode(
                                     &worker_cwd,
-                                    session_id,
+                                    requested_session_id,
+                                    model,
                                     no_sandbox,
                                     lifecycle,
                                     intent,
+                                    requested_session_entry_mode,
                                 )
                                 .await
                             }
-                            None => {
-                                agent_runner::try_spawn(&worker_cwd, no_sandbox, lifecycle, intent)
+                            None => match requested_session_id {
+                                Some(session_id) => {
+                                    agent_runner::attach_to_session(
+                                        &worker_cwd,
+                                        session_id,
+                                        no_sandbox,
+                                        lifecycle,
+                                        intent,
+                                    )
                                     .await
-                            }
-                        },
+                                }
+                                None => {
+                                    agent_runner::try_spawn(
+                                        &worker_cwd,
+                                        no_sandbox,
+                                        lifecycle,
+                                        intent,
+                                    )
+                                    .await
+                                }
+                            },
+                        }
                     }?;
                     Ok(AsyncActionPayload::AgentRunnerAttached(Box::new(runner)))
                 },
@@ -365,7 +389,7 @@ impl App {
     pub(super) fn adopt_runner(&mut self, runner: Result<AgentRunner, String>) {
         let mut runner = runner;
         if let Ok(r) = &mut runner {
-            tracing::info!("startup session-ready");
+            tracing::info!(target: cockpit_core::startup::TARGET, event = "session-ready", "startup");
             // The daemon, not the CLI parser, is authoritative after Attach.
             self.session_mode = Some(r.session_entry_mode);
             self.start_model_state_epoch(Some(r.session_id()), r.active_model_state.as_ref());
@@ -424,7 +448,7 @@ impl App {
             }
         }
         if runner.is_err() {
-            tracing::warn!("startup session-error");
+            tracing::warn!(target: cockpit_core::startup::TARGET, event = "session-error", "startup");
         }
         let refresh_skills = runner.is_ok();
         let attach_ids = runner.as_ref().ok().map(|r| {
@@ -435,6 +459,16 @@ impl App {
             (session_id, connection_epoch)
         });
         self.agent_runner = Some(runner);
+        if self
+            .startup_retained_submission_id
+            .is_some_and(|(generation, _)| generation == self.startup_background.generation)
+            && self
+                .agent_runner
+                .as_ref()
+                .is_some_and(|runner| runner.is_ok())
+        {
+            let _ = self.submit_input();
+        }
         if let Some((session_id, connection_epoch)) = attach_ids {
             self.bootstrap_inventory_after_attach(
                 uuid::Uuid::nil(), // single TUI instance

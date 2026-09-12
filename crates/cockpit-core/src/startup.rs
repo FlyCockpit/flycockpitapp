@@ -17,11 +17,29 @@
 //! own phases, including launch-to-first-paint, print to its interactive
 //! log file unless `--print-logs`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 /// `tracing` target every startup-timing line uses. Filter on this to
 /// capture (only) the cold-start breakdown.
 pub const TARGET: &str = "cockpit::startup";
+
+static INTERACTIVE_FIRST_PAINT: AtomicBool = AtomicBool::new(false);
+
+/// Reset by the CLI before installing an interactive trace sink.
+pub fn reset_interactive_first_paint() {
+    INTERACTIVE_FIRST_PAINT.store(false, Ordering::Release);
+}
+
+/// Publish the completed-draw fence to the interactive trace writer.
+pub fn mark_interactive_first_paint() {
+    INTERACTIVE_FIRST_PAINT.store(true, Ordering::Release);
+}
+
+/// Whether the public interactive composition has completed its first draw.
+pub fn interactive_first_paint_completed() -> bool {
+    INTERACTIVE_FIRST_PAINT.load(Ordering::Acquire)
+}
 
 /// Sequential phase timer. Each [`PhaseTimer::phase`] call logs the
 /// elapsed time since the previous mark (or since construction for the

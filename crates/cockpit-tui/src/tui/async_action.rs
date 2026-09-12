@@ -161,14 +161,6 @@ impl AsyncActionKind {
                 // remains fenced, exactly like a newly added production label.
                 _ => Unclassified,
             },
-            Self::Internal(label) => match *label {
-                // Startup recovery is explicitly cancellable.  If a blocking
-                // worker has already crossed into the secure unlink it may
-                // finish, but process exit must not wait for or resurrect its
-                // completion.
-                "startup.clipboard_reconcile" | "startup.export_recovery" => ReadOnly,
-                _ => Unclassified,
-            },
             Self::DaemonRpc(label) => match *label {
                 "guidance.estimate"
                 | "git.diff"
@@ -176,6 +168,7 @@ impl AsyncActionKind {
                 | "history.page"
                 | "inventory.bundle"
                 | "leaks-list"
+                | "onboarding.bootstrap"
                 | "resources.snapshot"
                 | "sessions.list"
                 | "sessions.live"
@@ -228,6 +221,10 @@ impl AsyncActionKind {
                 | "pending"
                 | "pins.review"
                 | "shutdown"
+                // Startup cleanup is cancellable. If a blocking worker has
+                // crossed into a secure unlink it may finish, but exit never
+                // waits for or applies its presentation completion.
+                | "startup.clipboard_reconcile"
                 | "startup.dependencies"
                 | "startup.export_recovery"
                 | "startup.guidance.estimate"
@@ -549,19 +546,34 @@ pub enum AsyncActionPayload {
     Tools(crate::tui::tools_pane::ToolsCompletion),
     WorkspaceTrust(crate::tui::app::WorkspaceTrustCompletion),
     OnboardingBootstrap(Option<cockpit_proto::OnboardingBootstrapSnapshot>),
+    StartupOnboardingTransition(crate::tui::app::StartupOnboardingCompletion),
     /// The initial post-paint bootstrap carries the already-selected daemon
     /// endpoint forward to the trust reducer.  Reusing it is what keeps
     /// startup to one lifecycle request rather than accidentally resolving a
     /// second owner while asking for workspace trust.
     StartupOnboardingBootstrap {
+        generation: u64,
         snapshot: Option<cockpit_proto::OnboardingBootstrapSnapshot>,
-        endpoint: cockpit_client::ClientEndpoint,
+        lifecycle: crate::tui::agent_runner::SelectedLifecycle,
     },
     StartupLifetimePolicy {
         generation: u64,
         background_agents: bool,
     },
     StartupWorkspace(crate::tui::app::StartupWorkspaceCompletion),
+    StartupAssistantSessionResolved {
+        generation: u64,
+        session_id: uuid::Uuid,
+    },
+    StartupClipboardReconciled {
+        generation: u64,
+        removed: usize,
+        unsafe_entries: usize,
+        failed: bool,
+    },
+    StartupExportRecovery {
+        generation: u64,
+    },
     Sealed(crate::tui::app::slash::SealedCompletion),
     SettingsDaemon(crate::tui::settings::SettingsDaemonEffectCompletion),
     SettingsBlocking(crate::tui::settings::SettingsBlockingEffectCompletion),

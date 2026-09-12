@@ -2203,12 +2203,21 @@ pub fn load_installation_daemon_boot() -> Result<DaemonBootConfig> {
 /// than an implicit request for an ephemeral owner.
 pub fn load_global_daemon_lifetime_policy() -> Result<bool> {
     let path = crate::config::dirs::global_config_file()?;
+    load_daemon_lifetime_policy_at(&path)
+}
+
+fn load_daemon_lifetime_policy_at(path: &Path) -> Result<bool> {
     if !path.exists() {
         return Ok(DaemonConfig::default().background_agents);
     }
     let doc = ExtendedConfigDoc::load(&path)?;
     match doc.raw_field("daemon") {
-        Some(raw) => Ok(serde_json::from_value::<DaemonConfig>(raw.clone())?.background_agents),
+        Some(Value::Object(daemon)) => match daemon.get("background_agents") {
+            Some(Value::Bool(value)) => Ok(*value),
+            Some(_) => anyhow::bail!("daemon.background_agents must be a boolean"),
+            None => Ok(DaemonConfig::default().background_agents),
+        },
+        Some(_) => anyhow::bail!("daemon must be an object"),
         None => Ok(DaemonConfig::default().background_agents),
     }
 }

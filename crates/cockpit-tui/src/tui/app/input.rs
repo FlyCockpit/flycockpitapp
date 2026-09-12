@@ -2619,6 +2619,23 @@ impl App {
             }
             return false;
         }
+        if (self.first_paint_completed || self.startup_background.started)
+            && (!self.startup_background.workspace_ready
+                || !matches!(self.agent_runner, Some(Ok(_))))
+        {
+            if self
+                .startup_retained_submission_id
+                .is_none_or(|(generation, _)| generation != self.startup_background.generation)
+            {
+                self.startup_retained_submission_id =
+                    Some((self.startup_background.generation, uuid::Uuid::now_v7()));
+            }
+            self.show_toast(
+                "Message retained until startup attaches the session",
+                super::ToastKind::Info,
+            );
+            return false;
+        }
         // A selection in flight is deliberately *not* a missing-model state.
         // Build the exact submission below and hold it behind that correlated
         // transaction instead of opening configuration or losing paste/tag
@@ -2678,7 +2695,12 @@ impl App {
         // v7 nonce is only the provisional fence key; once the complete
         // submission exists below, the reservation is atomically re-keyed to
         // the payload-derived durable identity without changing its order.
-        let invocation_nonce = uuid::Uuid::now_v7();
+        let invocation_nonce = self
+            .startup_retained_submission_id
+            .take()
+            .filter(|(generation, _)| *generation == self.startup_background.generation)
+            .map(|(_, id)| id)
+            .unwrap_or_else(uuid::Uuid::now_v7);
         let mut client_submission_id = invocation_nonce;
         let Ok(fence_sequence) =
             self.submission_order

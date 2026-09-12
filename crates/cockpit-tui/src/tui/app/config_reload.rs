@@ -179,6 +179,17 @@ impl App {
     /// with the built-in `Off` default, so neither construction nor first
     /// paint can inspect or create the recovery directory.
     fn schedule_startup_clipboard_reconciliation(&mut self) {
+        self.schedule_startup_clipboard_reconciliation_with(|| {
+            let dir = crate::clipboard::recovery::recovery_dir_path()
+                .map_err(|error| error.to_string())?;
+            crate::clipboard::recovery::reconcile_startup(&dir).map_err(|error| error.to_string())
+        });
+    }
+
+    pub(super) fn schedule_startup_clipboard_reconciliation_with<F>(&mut self, work: F)
+    where
+        F: FnOnce() -> Result<crate::clipboard::recovery::ReconcileReport, String> + Send + 'static,
+    {
         if !self.first_paint_completed
             || self.exit_requested
             || self.clipboard_recovery != cockpit_config::extended::ClipboardRecovery::PrivateFile
@@ -193,11 +204,19 @@ impl App {
                 crate::tui::async_action::AsyncActionKey::new("startup.clipboard_reconcile"),
             ),
             move || {
-                let dir = crate::clipboard::recovery::recovery_dir_path()
-                    .map_err(|error| error.to_string())?;
-                crate::clipboard::recovery::reconcile_startup(&dir)
-                    .map(|_| crate::tui::async_action::AsyncActionPayload::Unit)
-                    .map_err(|error| error.to_string())
+                let outcome = work();
+                let (removed, unsafe_entries, failed) = match outcome {
+                    Ok(report) => (report.removed, report.unsafe_entries_reported, false),
+                    Err(_) => (0, 0, true),
+                };
+                Ok(
+                    crate::tui::async_action::AsyncActionPayload::StartupClipboardReconciled {
+                        generation,
+                        removed,
+                        unsafe_entries,
+                        failed,
+                    },
+                )
             },
         );
         tracing::info!(

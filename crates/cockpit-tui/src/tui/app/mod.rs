@@ -58,6 +58,7 @@ mod side_conversation;
 mod skills_pane_actions;
 pub(super) mod slash;
 mod startup_layout;
+pub(crate) use startup_layout::{StartupOnboardingCompletion, StartupWorkspaceCompletion};
 mod sticky_header;
 #[cfg(test)]
 mod sticky_header_tests;
@@ -1829,10 +1830,9 @@ pub struct App {
     /// Parsed launch intent only. Its file path is activated after the
     /// accepted workspace phase, never by the safe shell constructor.
     startup_debug_last_message: bool,
-    /// Endpoint returned by the one selected lifecycle request.  It is used
-    /// for the initial trust RPC so startup never issues a second lifecycle
-    /// request merely to reconnect to the same owner.
-    startup_lifecycle_endpoint: Option<cockpit_client::ClientEndpoint>,
+    /// Result returned by the one selected lifecycle request. Every startup
+    /// RPC and the initial runner attach reuses this exact owner.
+    startup_lifecycle: Option<crate::tui::agent_runner::SelectedLifecycle>,
     /// Daemon-pushed config the TUI renders from; see [`HeldConfig`].
     pub(super) config_snapshot: HeldConfig,
     pending_workspace_trust: Option<PendingWorkspaceTrust>,
@@ -1932,6 +1932,9 @@ pub struct App {
     /// Exact payloads rejected before the runner dispatcher accepted
     /// ownership. These are safe to retry only on their original session.
     pub(super) retained_pre_dispatch_submissions: Vec<RetainedPreDispatchSubmission>,
+    /// Stable identity reserved when input is submitted before this startup
+    /// generation has an attached session.
+    pub(super) startup_retained_submission_id: Option<(u64, uuid::Uuid)>,
     /// Current queue-routing foreground target. Seeded from the daemon attach
     /// snapshot and kept current by `ForegroundInputTarget` events. `None`
     /// means the client cannot identify an active target; existing per-item
@@ -3356,8 +3359,9 @@ impl StartupFirstPaintTiming {
         let launch_to_first_paint_ms = launch_start.elapsed().as_secs_f64() * 1000.0;
         tracing::info!(
             target: cockpit_core::startup::TARGET,
+            event = "first-paint",
             launch_to_first_paint_ms = format_args!("{launch_to_first_paint_ms:.1}"),
-            "startup first paint"
+            "startup"
         );
         #[cfg(test)]
         STARTUP_FIRST_PAINT_LOG_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -3496,7 +3500,7 @@ impl App {
         Self::new_composed_with_session_mode(
             project,
             no_sandbox,
-            SessionMode::Code,
+            session_mode,
             trust,
             launch_start,
             lifecycle,
@@ -3535,7 +3539,7 @@ impl App {
         let mut app = Self::new_inner(
             project,
             no_sandbox,
-            Some(SessionMode::Code),
+            None,
             trust,
             launch_start,
             Some(lifecycle),
@@ -3684,7 +3688,10 @@ impl App {
         let copy_on_release = tui_cfg.copy_on_release;
         let clipboard_recovery = tui_cfg.clipboard_recovery;
         let use_emojis = tui_cfg.use_emojis;
-        let file_icons = crate::tui::file_icons::file_icons_resolved(tui_cfg.file_icons);
+        // Auto-detection consults terminal environment. The safe shell uses a
+        // built-in presentation default and applies the configured setting
+        // only after the daemon-backed snapshot is accepted.
+        let file_icons = false;
         let attention = tui_cfg.attention;
         let longcache_supported = launch
             .active_model
@@ -3701,7 +3708,7 @@ impl App {
         let initial_agent_path = vec![launch.agent_name.clone()];
         let terminal_title_pushed_for_cleanup = Arc::new(AtomicBool::new(false));
         let active_model_selection = config_snapshot.providers.active_model.clone();
-        let mut app = Self {
+        let app = Self {
             session_mode,
             lifecycle: lifecycle
                 .map(|lifecycle| {
@@ -3718,7 +3725,7 @@ impl App {
             launch,
             startup_assistant_name: None,
             startup_debug_last_message: false,
-            startup_lifecycle_endpoint: None,
+            startup_lifecycle: None,
             config_snapshot,
             pending_workspace_trust: None,
             pending_sealed_operations: HashMap::new(),
@@ -3761,6 +3768,7 @@ impl App {
             pending_ephemeral_session_switch_intent: None,
             retained_session_switch_submissions: Vec::new(),
             retained_pre_dispatch_submissions: Vec::new(),
+            startup_retained_submission_id: None,
             foreground_input_target: None,
             fresh_queue_ack: FreshQueueAck::None,
             folded_queue_item_ids: HashSet::new(),
@@ -4056,7 +4064,7 @@ impl App {
         // Resolving/opening workspace trust belongs to the post-paint
         // startup reducer. The safe shell may not inspect its root.
         let _ = startup_trust;
-        tracing::info!(target: cockpit_core::startup::TARGET, "startup shell-constructed");
+        tracing::info!(target: cockpit_core::startup::TARGET, event = "shell-constructed", "startup");
         app
     }
 
@@ -4225,9 +4233,7 @@ impl App {
                 EVENT_LOOP_DRAW_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
                 self.link_registry.begin_frame();
                 terminal.draw(|frame| self.render(frame))?;
-                self.startup_first_paint_timing.log_after_draw();
-                self.first_paint_completed = true;
-                tracing::info!(target: cockpit_core::startup::TARGET, "startup input-ready");
+                self.after_completed_draw();
                 crate::tui::links::emit_osc8(&self.link_registry, self.hyperlinks)?;
                 self.sync_cursor_shape();
             }
@@ -4368,6 +4374,27 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn after_completed_draw(&mut self) {
+        self.after_completed_draw_with_policy(async {
+            cockpit_config::extended::load_global_daemon_lifetime_policy()
+                .map_err(|error| error.to_string())
+        });
+    }
+
+    fn after_completed_draw_with_policy<F>(&mut self, policy: F)
+    where
+        F: std::future::Future<Output = Result<bool, String>> + Send + 'static,
+    {
+        cockpit_core::startup::mark_interactive_first_paint();
+        let first_paint = !self.first_paint_completed;
+        self.startup_first_paint_timing.log_after_draw();
+        self.first_paint_completed = true;
+        if first_paint {
+            tracing::info!(target: cockpit_core::startup::TARGET, event = "input-ready", "startup");
+            self.start_startup_background_tasks_with_policy(policy);
+        }
     }
 
     async fn service_event_loop_wake(

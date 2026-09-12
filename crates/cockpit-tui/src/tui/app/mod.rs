@@ -67,6 +67,7 @@ mod terminal_display;
 mod terminal_suspend;
 mod toggles;
 mod transcript_toggles;
+mod update_notice;
 
 use events::{
     GIT_AGENT_TOKEN_CAP, WORKING_MESSAGES, cache_config_caches, cap_display_lines, cap_tokens,
@@ -2673,6 +2674,7 @@ pub struct App {
     /// enters history or any inference request — purely client-side chrome.
     pub(super) sandbox_down_notice: Option<SandboxDownNotice>,
     pub(super) command_capability_notice: Option<CommandCapabilityNotice>,
+    pub(super) update_disabled_notice: Option<String>,
     pub(super) sandbox_notice_copy_rect: Option<Rect>,
     /// Process-local, event-earned per-model auth failures. These deliberately
     /// have no persistence path and start empty for every TUI process.
@@ -3960,6 +3962,7 @@ impl App {
             waiting_for_lock: None,
             sandbox_down_notice: None,
             command_capability_notice: None,
+            update_disabled_notice: None,
             sandbox_notice_copy_rect: None,
             auth_failure_annotations: Default::default(),
             auth_failure_notice: None,
@@ -4385,6 +4388,7 @@ impl App {
         self.sync_active_agent();
         self.sync_pin_count();
         self.sync_mouse_capture_from_dialog();
+        changed |= self.sync_update_notice();
         changed |= self.tick_toast();
         changed |= self.tick_ctrl_c_window();
         changed |= self.check_pending_link_activation();

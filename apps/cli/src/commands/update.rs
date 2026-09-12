@@ -9,17 +9,25 @@ use cockpit_core::updater::{
 use crate::cli::UpdateArgs;
 
 pub async fn run(args: UpdateArgs) -> Result<()> {
-    let configured = effective_update_channel();
+    let configured = effective_update_channel().context("invalid update channel configuration")?;
     let channel = if let Some(raw) = args.channel.as_deref() {
         UpdateChannel::resolve_effective(
             UpdateChannel::from_label(raw).context("invalid --channel value")?,
-        )
+        )?
     } else {
         configured
     };
 
     if args.status {
         print_status(installed_updater().status(channel));
+        return Ok(());
+    }
+
+    if args.version.is_some() {
+        installed_updater()
+            .apply_manual(channel, args.version.as_deref())
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         return Ok(());
     }
 
@@ -30,9 +38,9 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
         return Ok(());
     }
 
-    if args.version.is_some() || !args.check {
+    if !args.check {
         installed_updater()
-            .apply_manual(channel, args.version.as_deref())
+            .apply_manual(channel, None)
             .await
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         return Ok(());

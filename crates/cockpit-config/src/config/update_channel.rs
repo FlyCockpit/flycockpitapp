@@ -64,10 +64,16 @@ impl UpdateChannel {
     }
 
     /// Apply the installation config channel after the process-wide override.
-    pub fn resolve_effective(configured: Self) -> Self {
+    ///
+    /// `COCKPIT_UPDATES` accepts only the closed channel labels. Unknown or
+    /// malformed values are rejected instead of silently retaining the
+    /// configured channel.
+    pub fn resolve_effective(configured: Self) -> Result<Self, UpdateChannelParseError> {
         match std::env::var(COCKPIT_UPDATES_ENV) {
-            Ok(value) if value.eq_ignore_ascii_case("off") => Self::Off,
-            _ => configured,
+            Ok(value) if value.trim().is_empty() => Ok(configured),
+            Ok(value) => Self::from_label(&value),
+            Err(std::env::VarError::NotPresent) => Ok(configured),
+            Err(_) => Ok(configured),
         }
     }
 }

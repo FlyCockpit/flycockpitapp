@@ -2151,14 +2151,33 @@ pub fn load_for_cwd(cwd: &Path) -> ExtendedConfig {
 pub fn load_installation_update_channel() -> Result<crate::config::update_channel::UpdateChannel> {
     let path = crate::config::dirs::global_config_dir()?.join(crate::config::dirs::CONFIG_FILE);
     if !path.exists() {
-        return Ok(
-            crate::config::update_channel::UpdateChannel::resolve_effective(
-                crate::config::update_channel::UpdateChannel::default(),
-            ),
+        return crate::config::update_channel::UpdateChannel::resolve_effective(
+            crate::config::update_channel::UpdateChannel::default(),
         );
     }
     let doc = ExtendedConfigDoc::load(&path)?;
-    Ok(crate::config::update_channel::UpdateChannel::resolve_effective(doc.config().updates))
+    if let Some(raw) = doc.raw_field("updates") {
+        parse_installation_update_channel_value(raw)
+            .with_context(|| format!("invalid update channel in {}", path.display()))?;
+    }
+    let (cfg, warnings) = doc.config_with_warnings();
+    if warnings
+        .iter()
+        .any(|warning| warning.contains("update channel"))
+    {
+        anyhow::bail!("invalid update channel in {}", path.display());
+    }
+    crate::config::update_channel::UpdateChannel::resolve_effective(cfg.updates)
+}
+
+fn parse_installation_update_channel_value(
+    raw: &Value,
+) -> Result<crate::config::update_channel::UpdateChannel> {
+    match raw {
+        Value::String(label) => crate::config::update_channel::UpdateChannel::from_label(label)
+            .map_err(|error| anyhow::anyhow!("{error}")),
+        _ => serde_json::from_value(raw.clone()).context("invalid update channel value"),
+    }
 }
 
 pub fn load_installation_daemon_boot() -> Result<DaemonBootConfig> {
@@ -3219,6 +3238,10 @@ impl ExtendedConfigDoc {
             "knowledgeBases" => {
                 tracing::warn!("ignored invalid `knowledgeBases` policy");
                 warnings.push("ignored invalid `knowledgeBases` policy".to_string());
+            }
+            "updates" => {
+                tracing::warn!("ignored invalid update channel configuration");
+                warnings.push("ignored invalid update channel configuration".to_string());
             }
             _ => {
                 tracing::warn!(

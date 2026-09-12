@@ -31,12 +31,22 @@ fn closed_channel_parse() {
     let guard = cockpit_test_support::TestEnvGuard::blocking_lock();
     guard.set_var(COCKPIT_UPDATES_ENV, "off");
     assert_eq!(
-        UpdateChannel::resolve_effective(UpdateChannel::Auto),
+        UpdateChannel::resolve_effective(UpdateChannel::Auto).unwrap(),
         UpdateChannel::Off
+    );
+    guard.set_var(COCKPIT_UPDATES_ENV, "notify");
+    assert_eq!(
+        UpdateChannel::resolve_effective(UpdateChannel::Auto).unwrap(),
+        UpdateChannel::Notify
+    );
+    guard.set_var(COCKPIT_UPDATES_ENV, "disabled");
+    assert!(
+        UpdateChannel::resolve_effective(UpdateChannel::Auto).is_err(),
+        "unsupported COCKPIT_UPDATES values must fail closed"
     );
     guard.remove_var(COCKPIT_UPDATES_ENV);
     assert_eq!(
-        UpdateChannel::resolve_effective(UpdateChannel::Auto),
+        UpdateChannel::resolve_effective(UpdateChannel::Auto).unwrap(),
         UpdateChannel::Auto
     );
 }

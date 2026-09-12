@@ -3,6 +3,7 @@
 //! This binary never loads production roots, signing keys, HTTP clients, or
 //! publication paths. Activation issues own the real ceremony tooling.
 
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -49,6 +50,20 @@ fn validate(evidence: &FakeFixtureEvidence) -> Result<()> {
     if evidence.targets.is_empty() {
         bail!("targets must not be empty");
     }
+
+    let mut identities = HashSet::new();
+    let mut paths = HashSet::new();
+    let mut canonical = evidence.targets.clone();
+    canonical.sort_by(|left, right| {
+        left.version
+            .cmp(&right.version)
+            .then_with(|| left.platform.cmp(&right.platform))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    if canonical != evidence.targets {
+        bail!("targets must be listed in canonical version/platform/path order");
+    }
+
     for target in &evidence.targets {
         if target.version.trim().is_empty()
             || target.platform.trim().is_empty()
@@ -62,6 +77,35 @@ fn validate(evidence: &FakeFixtureEvidence) -> Result<()> {
         if target.sha256.len() != 64 || !target.sha256.chars().all(|ch| ch.is_ascii_hexdigit()) {
             bail!("target sha256 must be a 64-character hex digest");
         }
+        if target.sha256.chars().any(|ch| ch.is_ascii_uppercase()) {
+            bail!("target sha256 must use lowercase hex digits");
+        }
+        if !identities.insert((target.version.clone(), target.platform.clone())) {
+            bail!(
+                "duplicate target identity for version `{}` on platform `{}`",
+                target.version,
+                target.platform
+            );
+        }
+        if !paths.insert(target.path.clone()) {
+            bail!("duplicate target path `{}`", target.path);
+        }
     }
+
+    let inventory: BTreeSet<(String, String, String)> = evidence
+        .targets
+        .iter()
+        .map(|target| {
+            (
+                target.version.clone(),
+                target.platform.clone(),
+                target.path.clone(),
+            )
+        })
+        .collect();
+    if inventory.len() != evidence.targets.len() {
+        bail!("target inventory must contain unique version/platform/path tuples");
+    }
+
     Ok(())
 }

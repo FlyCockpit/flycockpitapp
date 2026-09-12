@@ -4,6 +4,7 @@
 //! Fixture adapters live behind `cfg(test)` / `test-support` and must never
 //! link into the shipped binary.
 
+mod background;
 mod composition;
 mod disabled;
 #[cfg(any(test, feature = "test-support"))]
@@ -11,6 +12,7 @@ pub mod fake;
 mod traits;
 mod types;
 
+pub use background::spawn_background;
 pub use composition::{InstalledUpdaterComposition, installed_composition, installed_updater};
 pub use disabled::DisabledUpdater;
 pub use traits::{
@@ -27,9 +29,9 @@ pub use types::{
 use cockpit_config::config::update_channel::UpdateChannel;
 
 /// Resolve the effective update channel for the current installation.
-pub fn effective_update_channel() -> UpdateChannel {
-    cockpit_config::extended::load_installation_update_channel()
-        .unwrap_or_else(|_| UpdateChannel::resolve_effective(UpdateChannel::default()))
+pub fn effective_update_channel() -> anyhow::Result<UpdateChannel> {
+    let configured = cockpit_config::extended::load_installation_update_channel()?;
+    UpdateChannel::resolve_effective(configured).map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 /// Startup and background check entrypoint. Never performs network, filesystem

@@ -1,7 +1,7 @@
 //! Disabled updater boundary tests for issue #402.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -14,27 +14,56 @@ use cockpit_core::updater::{
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn production_updater_sources() -> Vec<PathBuf> {
-    use std::path::PathBuf;
     let root =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../crates/cockpit-core/src/updater");
-    let mut files = Vec::new();
-    for name in ["disabled.rs", "composition.rs"] {
-        files.push(root.join(name));
-    }
-    files
+    fs::read_dir(&root)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to read updater sources at {}: {error}",
+                root.display()
+            )
+        })
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "rs")
+                && path.file_name().is_some_and(|name| name != "fake.rs")
+        })
+        .collect()
 }
 
-use std::path::PathBuf;
+fn implementation_updater_sources() -> Vec<PathBuf> {
+    production_updater_sources()
+        .into_iter()
+        .filter(|path| {
+            path.file_name().is_some_and(|name| {
+                name == "disabled.rs" || name == "composition.rs" || name == "background.rs"
+            })
+        })
+        .collect()
+}
 
 #[test]
 fn installed_composition_has_no_trust_or_transport() {
-    let forbidden = [
-        "reqwest::",
-        "tough::",
-        "self_replace::",
+    let transport_forbidden = [
+        "reqwest",
+        "tough",
+        "self_replace",
+        "ureq",
+        "minisign",
         "https://",
         "http://",
         "FakeFixture",
+    ];
+    let capability_forbidden = [
+        "download_verified_target",
+        "stage_and_swap",
+        "request_maintenance",
+        "refresh_trusted_metadata",
+        "acquire_exclusive",
+        "std::process::Command",
+        "Command::new",
+        "tokio::process",
     ];
     for path in production_updater_sources() {
         let source = fs::read_to_string(&path).unwrap_or_else(|error| {
@@ -44,22 +73,61 @@ fn installed_composition_has_no_trust_or_transport() {
             )
         });
         let production = strip_test_modules(&source);
-        for needle in forbidden {
-            assert!(
-                !production.contains(needle),
-                "{} must not reference `{needle}` in production code",
-                path.display()
-            );
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let scan_transport = file_name != "traits.rs" && file_name != "types.rs";
+        if scan_transport {
+            for needle in transport_forbidden {
+                assert!(
+                    !production.contains(needle),
+                    "{} must not reference `{needle}` in production code",
+                    path.display()
+                );
+            }
+        }
+        if file_name == "disabled.rs"
+            || file_name == "composition.rs"
+            || file_name == "background.rs"
+        {
+            for needle in capability_forbidden {
+                assert!(
+                    !production.contains(needle),
+                    "{} must not invoke `{needle}` in production updater code",
+                    path.display()
+                );
+            }
         }
     }
+
+    let composition_source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/cockpit-core/src/updater/composition.rs"),
+    )
+    .expect("read composition source");
+    assert!(
+        composition_source.contains("DisabledUpdater"),
+        "installed composition must wire only DisabledUpdater"
+    );
+    assert!(
+        !composition_source.contains("FakeFixture"),
+        "installed composition must not reference fake adapters"
+    );
     let _composition = installed_composition();
 }
 
 #[tokio::test]
 async fn all_check_entrypoints_return_disabled_without_side_effect() {
     let _guard = cockpit_test_support::TestEnvGuard::lock().await;
-    let channel = effective_update_channel();
-    let before = snapshot_state_tree();
+    let state_dir = isolated_state_dir();
+    fs::create_dir_all(&state_dir).expect("create isolated state dir");
+    _guard.set_var(
+        "COCKPIT_STATE_DIR",
+        state_dir.to_str().expect("utf8 state dir"),
+    );
+    let channel = effective_update_channel().expect("effective update channel");
+    let before = snapshot_state_tree(&state_dir);
 
     let startup = run_startup_check(channel).await;
     let manual = installed_updater().check(channel).await;
@@ -87,7 +155,7 @@ async fn all_check_entrypoints_return_disabled_without_side_effect() {
         }
     }
 
-    let after = snapshot_state_tree();
+    let after = snapshot_state_tree(&state_dir);
     assert_eq!(before, after, "update checks must not touch the state tree");
 
     let bin = cargo_bin("cockpit");
@@ -113,6 +181,22 @@ async fn all_check_entrypoints_return_disabled_without_side_effect() {
             "expected disabled updater output, got: {combined}"
         );
     }
+
+    for path in implementation_updater_sources() {
+        let source = fs::read_to_string(&path).expect("read updater implementation source");
+        assert!(
+            !source.contains("reqwest::")
+                && !source.contains("tough::")
+                && !source.contains("self_replace::")
+                && !source.contains("MetadataRepository")
+                && !source.contains("TargetFetcher")
+                && !source.contains("BinaryReplacer")
+                && !source.contains("SupervisorMaintenanceClient")
+                && !source.contains("UpdateLockStore"),
+            "{} must not delegate to transport/trust/maintenance seams",
+            path.display()
+        );
+    }
 }
 
 #[test]
@@ -125,11 +209,30 @@ fn fixture_adapter_cannot_link_to_installed_binary() {
         "fake fixture adapters must be cfg-gated in updater/mod.rs"
     );
 
-    let cli_lib = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
-    let cli_source = fs::read_to_string(cli_lib).expect("read cli lib");
+    let cli_manifest =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+            .expect("read cli manifest");
+    let production_dep = cli_manifest
+        .split("[dependencies]")
+        .nth(1)
+        .and_then(|section| section.split("[dev-dependencies]").next())
+        .unwrap_or("");
     assert!(
-        !cli_source.contains("updater::fake"),
-        "installed CLI must not import fake updater adapters"
+        !production_dep.contains("test-support"),
+        "installed CLI production dependency must not enable cockpit-core test-support"
+    );
+
+    let core_manifest = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../crates/cockpit-core/Cargo.toml"),
+    )
+    .expect("read cockpit-core manifest");
+    assert!(
+        core_manifest.contains("[features]"),
+        "cockpit-core manifest must declare explicit features"
+    );
+    assert!(
+        !core_manifest.contains("default = [\"test-support\"]"),
+        "cockpit-core default features must not expose fake updater adapters"
     );
 
     let composition_source = fs::read_to_string(
@@ -163,18 +266,15 @@ fn cargo_dist_and_docs_remain_disabled() {
     );
 }
 
-fn snapshot_state_tree() -> Vec<String> {
-    let root = std::env::var("COCKPIT_STATE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(format!(
-                    "cockpit-updater-disabled-{}",
-                    COUNTER.fetch_add(1, Ordering::Relaxed)
-                ))
-        });
-    walk_tree(&root)
+fn isolated_state_dir() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "cockpit-updater-disabled-{}",
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+fn snapshot_state_tree(root: &Path) -> Vec<String> {
+    walk_tree(root)
 }
 
 fn walk_tree(root: &Path) -> Vec<String> {

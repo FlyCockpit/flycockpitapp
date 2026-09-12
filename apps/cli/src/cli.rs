@@ -1712,7 +1712,11 @@ pub struct UpdateArgs {
     #[arg(long, conflicts_with = "check")]
     pub status: bool,
     /// Explicit authorized target version to apply.
-    #[arg(long = "target-version", value_name = "VERSION")]
+    #[arg(
+        long = "target-version",
+        value_name = "VERSION",
+        conflicts_with = "check"
+    )]
     pub version: Option<String>,
     /// Override the configured update channel for this invocation.
     #[arg(long, value_name = "CHANNEL")]

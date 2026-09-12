@@ -75,6 +75,25 @@ export const beginOrReopenOnboardingSchema = z
   .strict();
 export type BeginOrReopenOnboarding = z.infer<typeof beginOrReopenOnboardingSchema>;
 
+export const onboardingTransitionKindSchema = z.enum([
+  "advance",
+  "defer_provider",
+  "back",
+  "complete",
+]);
+export type OnboardingTransitionKind = z.infer<typeof onboardingTransitionKindSchema>;
+
+export const applyOnboardingTransitionSchema = z
+  .object({
+    run_id: z.string().uuid(),
+    attempt_id: z.string().uuid(),
+    expected_revision: z.number().int().nonnegative(),
+    client_operation_id: z.string().min(1).max(128),
+    transition: onboardingTransitionKindSchema,
+  })
+  .strict();
+export type ApplyOnboardingTransition = z.infer<typeof applyOnboardingTransitionSchema>;
+
 /** A passphrase is intentionally absent: it is Rust-only sensitive ingress. */
 export const onboardingBootstrapEventSchema = z
   .object({

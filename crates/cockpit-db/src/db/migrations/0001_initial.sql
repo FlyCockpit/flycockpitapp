@@ -7375,6 +7375,9 @@ CREATE TABLE onboarding_runs (
     bootstrap_state     TEXT NOT NULL CHECK (bootstrap_state IN (
         'awaiting_choice', 'awaiting_passphrase', 'materializing', 'ready', 'failed'
     )),
+    selected_secure_placement TEXT CHECK (selected_secure_placement IN (
+        'automatic', 'keyring', 'passphrase_file', 'machine_bound_file'
+    )),
     limited_mode        INTEGER NOT NULL DEFAULT 0 CHECK (limited_mode IN (0, 1)),
     lifetime_selection  TEXT,
     created_at_unix_ms  INTEGER NOT NULL,
@@ -7401,6 +7404,8 @@ CREATE TABLE onboarding_receipts (
     attempt_id          TEXT NOT NULL REFERENCES onboarding_attempts(attempt_id) ON DELETE CASCADE,
     client_operation_id TEXT NOT NULL CHECK (length(client_operation_id) BETWEEN 1 AND 128),
     consumed_revision   INTEGER NOT NULL CHECK (consumed_revision >= 0),
+    operation_kind      TEXT NOT NULL CHECK (length(operation_kind) BETWEEN 1 AND 64),
+    operation_digest    TEXT NOT NULL CHECK (length(operation_digest) = 64),
     status              TEXT NOT NULL CHECK (status IN ('pending', 'committed', 'rejected', 'unknown')),
     created_at_unix_ms  INTEGER NOT NULL,
     UNIQUE (run_id, attempt_id, client_operation_id)

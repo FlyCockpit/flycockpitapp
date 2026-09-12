@@ -96,10 +96,10 @@ pub use host_capabilities::{
 };
 pub use launch::{LaunchBundle, LaunchInfo, RepoStatus};
 pub use onboarding::{
-    ApplyOnboardingSecureIntent, BeginOrReopenOnboarding, OnboardingBootstrapEvent,
-    OnboardingBootstrapSnapshot, OnboardingBootstrapState, OnboardingReceiptStatus,
-    OnboardingSecurePlacement, OnboardingStage, OnboardingTransitionReceipt,
-    SensitiveOnboardingPassphrase,
+    ApplyOnboardingSecureIntent, ApplyOnboardingTransition, BeginOrReopenOnboarding,
+    OnboardingBootstrapEvent, OnboardingBootstrapSnapshot, OnboardingBootstrapState,
+    OnboardingReceiptStatus, OnboardingSecurePlacement, OnboardingStage, OnboardingTransitionKind,
+    OnboardingTransitionReceipt, SensitiveOnboardingPassphrase,
 };
 pub use provider_management::{
     ProviderLayerMetadataPatch, ProviderMutationBatch, ProviderMutationDelete,

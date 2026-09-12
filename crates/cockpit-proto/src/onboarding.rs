@@ -83,6 +83,28 @@ pub struct BeginOrReopenOnboarding {
     pub reentry: bool,
 }
 
+/// A redacted ordinary onboarding transition.  Provider/OAuth/validation and
+/// installation effects are settled by their own daemon authorities; this
+/// command records only the stage decision after the exact external receipt
+/// has been correlated by the daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnboardingTransitionKind {
+    Advance,
+    DeferProvider,
+    Back,
+    Complete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyOnboardingTransition {
+    pub run_id: Uuid,
+    pub attempt_id: Uuid,
+    pub expected_revision: u64,
+    pub client_operation_id: String,
+    pub transition: OnboardingTransitionKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OnboardingBootstrapEvent {
     pub run_id: Uuid,
@@ -148,5 +170,29 @@ mod tests {
     fn sensitive_passphrase_never_has_a_json_or_debug_representation() {
         let value = SensitiveOnboardingPassphrase::new("onboarding-canary".into());
         assert!(!format!("{value:?}").contains("onboarding-canary"));
+    }
+
+    #[test]
+    fn bootstrap_projection_has_no_secret_bearing_field_names() {
+        let encoded = serde_json::to_string(&ApplyOnboardingTransition {
+            run_id: Uuid::nil(),
+            attempt_id: Uuid::nil(),
+            expected_revision: 0,
+            client_operation_id: "operation".into(),
+            transition: OnboardingTransitionKind::DeferProvider,
+        })
+        .unwrap();
+        for forbidden in [
+            "passphrase",
+            "credential",
+            "oauth",
+            "provider_config",
+            "path",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "projection leaked {forbidden}"
+            );
+        }
     }
 }

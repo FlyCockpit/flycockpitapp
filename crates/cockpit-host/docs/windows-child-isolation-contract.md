@@ -313,7 +313,12 @@ The temporary-object runner records each of:
 4. zero-handle and exact standard-I/O inheritance modes, with a deliberately
    inheritable known Cockpit marker handle absent from both children. The stdio
    child reads fixture bytes from stdin and writes fixture bytes to stdout, so
-   a non-null standard handle or reversed pipe endpoint is not evidence.
+   a non-null standard handle or reversed pipe endpoint is not evidence. The
+   test-only stdio bridge uses three local one-way named-pipe pairs rather than
+   `CreatePipe`: its retained parent endpoints are opened with
+   `FILE_FLAG_OVERLAPPED` for bounded, documented completion and byte counts,
+   while the three inherited child endpoints remain synchronous standard-I/O
+   handles in the exact list.
 
 All fixture pipe accepts, pipe reads/writes, and child observations have a
 finite timeout. On timeout the launcher terminates and reaps the affected

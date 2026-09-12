@@ -67,8 +67,8 @@ mod windows_fixture {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_OVERLAPPED, FILE_READ_DATA, FILE_WRITE_DATA, OPEN_EXISTING,
-        PIPE_ACCESS_DUPLEX, ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, SYNCHRONIZE,
-        WriteFile,
+        PIPE_ACCESS_DUPLEX, PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND, ReadFile,
+        SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, SYNCHRONIZE, WriteFile,
     };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
@@ -76,8 +76,8 @@ mod windows_fixture {
         JobObjectExtendedLimitInformation, SetInformationJobObject,
     };
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, CreatePipe, DisconnectNamedPipe,
-        PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, WaitNamedPipeW,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_REJECT_REMOTE_CLIENTS,
+        PIPE_TYPE_BYTE, WaitNamedPipeW,
     };
     use windows_sys::Win32::System::StationsAndDesktops::{
         CloseDesktop, CloseWindowStation, CreateDesktopW, CreateWindowStationW,
@@ -263,7 +263,11 @@ mod windows_fixture {
         }
 
         fn wait_for_completion(&mut self, handle: HANDLE) -> io::Result<u32> {
-            let waited = unsafe { WaitForSingleObject(self.as_ref().hEvent, FIXTURE_TIMEOUT_MS) };
+            self.wait_for_completion_for(handle, FIXTURE_TIMEOUT_MS)
+        }
+
+        fn wait_for_completion_for(&mut self, handle: HANDLE, timeout_ms: u32) -> io::Result<u32> {
+            let waited = unsafe { WaitForSingleObject(self.as_ref().hEvent, timeout_ms) };
             if waited == WAIT_TIMEOUT {
                 let timeout = io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -1105,32 +1109,49 @@ mod windows_fixture {
 
     impl FixtureStdio {
         fn create() -> io::Result<Self> {
-            let attributes = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
-                nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>()
-                    as u32,
-                lpSecurityDescriptor: std::ptr::null_mut(),
-                bInheritHandle: 1,
-            };
-            // CreatePipe returns (read, write): the child reads stdin while
-            // the parent writes it; stdout/stderr reverse that direction.
-            let (child_stdin, parent_stdin) = anonymous_pipe(&attributes)?;
-            // CreatePipe returns (read, write). The child reads stdin and
-            // writes stdout/stderr; the parent keeps the opposing endpoints.
-            let (parent_stdout, child_stdout) = anonymous_pipe(&attributes)?;
-            let (parent_stderr, child_stderr) = anonymous_pipe(&attributes)?;
-            for parent in [parent_stdin, parent_stdout, parent_stderr] {
-                if unsafe { SetHandleInformation(parent, HANDLE_FLAG_INHERIT, 0) } == 0 {
-                    unsafe {
-                        let _ = CloseHandle(parent_stdin);
-                        let _ = CloseHandle(child_stdin);
-                        let _ = CloseHandle(child_stdout);
-                        let _ = CloseHandle(parent_stdout);
-                        let _ = CloseHandle(child_stderr);
-                        let _ = CloseHandle(parent_stderr);
-                    }
-                    return Err(io::Error::last_os_error());
+            let (stdin_name, stdout_name, stderr_name) = temporary_stdio_pipe_names();
+            let mut stdin_security =
+                OwnerOnlyPipeSecurity::for_current_user().map_err(io::Error::other)?;
+            let mut stdout_security =
+                OwnerOnlyPipeSecurity::for_current_user().map_err(io::Error::other)?;
+            let mut stderr_security =
+                OwnerOnlyPipeSecurity::for_current_user().map_err(io::Error::other)?;
+
+            // Anonymous pipes ignore `lpOverlapped`, so their synchronous
+            // ReadFile/WriteFile calls cannot supply the fixture's bounded
+            // completion proof. These are local, one-way named-pipe pairs:
+            // only the retained parent server endpoints are overlapped, while
+            // the inherited child clients remain ordinary synchronous stdio.
+            let (parent_stdin, child_stdin) = connected_stdio_pipe(
+                &stdin_name,
+                PIPE_ACCESS_OUTBOUND,
+                FILE_READ_DATA,
+                &mut stdin_security,
+            )?;
+            let (parent_stdout, child_stdout) = match connected_stdio_pipe(
+                &stdout_name,
+                PIPE_ACCESS_INBOUND,
+                FILE_WRITE_DATA,
+                &mut stdout_security,
+            ) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    close_fixture_handles([parent_stdin, child_stdin]);
+                    return Err(error);
                 }
-            }
+            };
+            let (parent_stderr, child_stderr) = match connected_stdio_pipe(
+                &stderr_name,
+                PIPE_ACCESS_INBOUND,
+                FILE_WRITE_DATA,
+                &mut stderr_security,
+            ) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    close_fixture_handles([parent_stdin, child_stdin, parent_stdout, child_stdout]);
+                    return Err(error);
+                }
+            };
             Ok(Self {
                 child_stdin,
                 child_stdout,
@@ -1161,6 +1182,7 @@ mod windows_fixture {
         }
 
         fn prove_child_stdio(&self) -> io::Result<()> {
+            let deadline = Instant::now() + FIXTURE_TIMEOUT;
             write_all(self.parent_stdin, b"fixture-stdin\n")?;
             let mut transcript = Vec::new();
             while !transcript
@@ -1168,7 +1190,14 @@ mod windows_fixture {
                 .any(|line| line == b"fixture-stdout\n")
             {
                 let mut chunk = [0_u8; 256];
-                let read = read_with_timeout(self.parent_stdout, &mut chunk)? as usize;
+                let read =
+                    read_with_timeout_until(self.parent_stdout, &mut chunk, deadline)? as usize;
+                if read == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "exact handle-list child stdout closed before its expected bytes",
+                    ));
+                }
                 transcript.extend_from_slice(&chunk[..read]);
                 if transcript.len() > 8 * 1024 {
                     return Err(io::Error::new(
@@ -1204,15 +1233,89 @@ mod windows_fixture {
         }
     }
 
-    fn anonymous_pipe(
-        attributes: &windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+    fn connected_stdio_pipe(
+        name: &str,
+        parent_access: u32,
+        child_access: u32,
+        security: &mut OwnerOnlyPipeSecurity,
     ) -> io::Result<(HANDLE, HANDLE)> {
-        let mut read = std::ptr::null_mut();
-        let mut write = std::ptr::null_mut();
-        if unsafe { CreatePipe(&mut read, &mut write, attributes, 65_536) } == 0 {
+        let wide_name = wide(name);
+        // The parent end owns the only asynchronous handle. The child endpoint
+        // deliberately omits FILE_FLAG_OVERLAPPED because Rust's standard-I/O
+        // implementation performs synchronous ReadFile/WriteFile calls.
+        let parent = unsafe {
+            CreateNamedPipeW(
+                wide_name.as_ptr(),
+                parent_access | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                65_536,
+                65_536,
+                TEMPORARY_PIPE_DEFAULT_TIMEOUT,
+                security.as_mut_ptr().cast(),
+            )
+        };
+        if parent == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
         }
-        Ok((read, write))
+
+        let child = unsafe {
+            CreateFileW(
+                wide_name.as_ptr(),
+                child_access,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                SECURITY_IDENTIFICATION | SECURITY_SQOS_PRESENT,
+                std::ptr::null_mut(),
+            )
+        };
+        if child == INVALID_HANDLE_VALUE {
+            let error = io::Error::last_os_error();
+            unsafe { CloseHandle(parent) };
+            return Err(error);
+        }
+
+        // The local CreateFileW connected before this server-side call, so the
+        // documented ERROR_PIPE_CONNECTED result is success. No remote or
+        // third-party client can consume this one-instance endpoint.
+        let mut connect = match StableOverlapped::new(()) {
+            Ok(connect) => connect,
+            Err(error) => {
+                close_fixture_handles([parent, child]);
+                return Err(error);
+            }
+        };
+        let connected = unsafe { ConnectNamedPipe(parent, connect.as_mut()) };
+        let connection = if connected != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED {
+            connect.discard_not_pending();
+            Ok(())
+        } else if unsafe { GetLastError() } == ERROR_IO_PENDING {
+            connect.wait_for_completion(parent).map(|_| ())
+        } else {
+            connect.discard_not_pending();
+            Err(io::Error::last_os_error())
+        };
+        if let Err(error) = connection {
+            close_fixture_handles([parent, child]);
+            return Err(error);
+        }
+        if unsafe { SetHandleInformation(child, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
+            let error = io::Error::last_os_error();
+            close_fixture_handles([parent, child]);
+            return Err(error);
+        }
+        Ok((parent, child))
+    }
+
+    fn close_fixture_handles(handles: impl IntoIterator<Item = HANDLE>) {
+        unsafe {
+            for handle in handles {
+                if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                    let _ = CloseHandle(handle);
+                }
+            }
+        }
     }
 
     fn launch_restricted_suspended(
@@ -1385,10 +1488,17 @@ mod windows_fixture {
             protect_process_dacl(process.hProcess)?;
             assign_and_check_job(process.hProcess)
         })();
-        if prepared.is_err() {
-            terminate_and_close(process);
+        match prepared {
+            Ok(job) => Ok(job),
+            Err(error) => {
+                terminate_reap(process).map_err(|cleanup_error| {
+                    io::Error::other(format!(
+                        "restricted fixture setup failed ({error}); its child could not be reaped: {cleanup_error}"
+                    ))
+                })?;
+                Err(error)
+            }
         }
-        prepared
     }
 
     fn protect_process_dacl(process: HANDLE) -> io::Result<()> {
@@ -1465,47 +1575,32 @@ mod windows_fixture {
         // SAFETY: the initial thread is still suspended; all token, image,
         // protected-DACL, and job assertions ran before this resume.
         if unsafe { ResumeThread(process.hThread) } == u32::MAX {
-            terminate_and_close(process);
-            unsafe { CloseHandle(job) };
-            return Err(io::Error::last_os_error());
+            let resume_error = io::Error::last_os_error();
+            return terminate_reap_and_close(process, job).and(Err(resume_error));
         }
         if let Some(stdio) = stdio {
             if let Err(error) = stdio.prove_child_stdio() {
-                terminate_and_close(process);
-                unsafe { CloseHandle(job) };
-                return Err(error);
+                return terminate_reap_and_close(process, job).and(Err(error));
             }
         }
         let waited = unsafe { WaitForSingleObject(process.hProcess, FIXTURE_TIMEOUT_MS) };
         if waited == WAIT_TIMEOUT {
-            // Reap before dropping the kill-on-close Job or any process handle:
-            // a timed-out restricted child must never outlive this fixture.
-            unsafe {
-                let _ = TerminateProcess(process.hProcess, 1);
-                let _ = WaitForSingleObject(process.hProcess, FIXTURE_TIMEOUT_MS);
-                let _ = CloseHandle(process.hThread);
-                let _ = CloseHandle(process.hProcess);
-                let _ = CloseHandle(job);
-            }
-            process.hThread = std::ptr::null_mut();
-            process.hProcess = std::ptr::null_mut();
-            return Err(io::Error::new(
+            let timeout = io::Error::new(
                 io::ErrorKind::TimedOut,
                 "restricted fixture child observation timed out",
-            ));
+            );
+            return terminate_reap_and_close(process, job).and(Err(timeout));
+        }
+        if waited != WAIT_OBJECT_0 {
+            let wait_error = io::Error::last_os_error();
+            return terminate_reap_and_close(process, job).and(Err(wait_error));
         }
         let mut exit = 1_u32;
         let got_exit = unsafe {
             windows_sys::Win32::System::Threading::GetExitCodeProcess(process.hProcess, &mut exit)
         };
-        unsafe {
-            let _ = CloseHandle(process.hThread);
-            let _ = CloseHandle(process.hProcess);
-            let _ = CloseHandle(job);
-        }
-        process.hThread = std::ptr::null_mut();
-        process.hProcess = std::ptr::null_mut();
-        if waited != windows_sys::Win32::Foundation::WAIT_OBJECT_0 || got_exit == 0 || exit != 0 {
+        close_reaped_process_and_job(process, job);
+        if got_exit == 0 || exit != 0 {
             return Err(io::Error::other(
                 "restricted fixture child did not report every denial",
             ));
@@ -1513,10 +1608,44 @@ mod windows_fixture {
         Ok(())
     }
 
-    fn terminate_and_close(process: &mut PROCESS_INFORMATION) {
+    fn terminate_reap_and_close(process: &mut PROCESS_INFORMATION, job: HANDLE) -> io::Result<()> {
+        terminate_reap(process)?;
+        unsafe { CloseHandle(job) };
+        Ok(())
+    }
+
+    fn terminate_reap(process: &mut PROCESS_INFORMATION) -> io::Result<()> {
+        // Every failure path reaches a signaled process handle before it closes
+        // that handle or its kill-on-close Job. This keeps a slow stdio child
+        // from escaping the fixture after a bounded I/O observation fails.
         unsafe {
-            let _ = TerminateProcess(process.hProcess, 1);
-            let _ = WaitForSingleObject(process.hProcess, FIXTURE_TIMEOUT_MS);
+            if !process.hProcess.is_null() && TerminateProcess(process.hProcess, 1) == 0 {
+                let termination_error = io::Error::last_os_error();
+                if WaitForSingleObject(process.hProcess, FIXTURE_TIMEOUT_MS) != WAIT_OBJECT_0 {
+                    return Err(io::Error::other(format!(
+                        "could not terminate restricted fixture child: {termination_error}"
+                    )));
+                }
+            } else if !process.hProcess.is_null()
+                && WaitForSingleObject(process.hProcess, FIXTURE_TIMEOUT_MS) != WAIT_OBJECT_0
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "terminated restricted fixture child did not exit before the reap deadline",
+                ));
+            }
+        }
+        close_reaped_process(process);
+        Ok(())
+    }
+
+    fn close_reaped_process_and_job(process: &mut PROCESS_INFORMATION, job: HANDLE) {
+        close_reaped_process(process);
+        unsafe { CloseHandle(job) };
+    }
+
+    fn close_reaped_process(process: &mut PROCESS_INFORMATION) {
+        unsafe {
             let _ = CloseHandle(process.hThread);
             let _ = CloseHandle(process.hProcess);
         }
@@ -1954,24 +2083,32 @@ mod windows_fixture {
     }
 
     fn write_all(handle: HANDLE, bytes: &[u8]) -> io::Result<()> {
-        let written = write_with_timeout(handle, bytes)?;
-        if written as usize != bytes.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "temporary pipe wrote only part of the test exchange",
-            ));
+        let mut written = 0;
+        while written < bytes.len() {
+            let count = write_with_timeout(handle, &bytes[written..])? as usize;
+            if count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "temporary pipe wrote zero bytes during the test exchange",
+                ));
+            }
+            written += count;
         }
         Ok(())
     }
 
     fn read_exact(handle: HANDLE, length: usize) -> io::Result<Vec<u8>> {
         let mut bytes = vec![0_u8; length];
-        let read = read_with_timeout(handle, &mut bytes)?;
-        if read as usize != length {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "temporary pipe read only part of the test exchange",
-            ));
+        let mut read = 0;
+        while read < length {
+            let count = read_with_timeout(handle, &mut bytes[read..])? as usize;
+            if count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "temporary pipe closed during the test exchange",
+                ));
+            }
+            read += count;
         }
         Ok(bytes)
     }
@@ -2001,6 +2138,18 @@ mod windows_fixture {
     }
 
     fn read_with_timeout(handle: HANDLE, bytes: &mut [u8]) -> io::Result<u32> {
+        read_with_timeout_for(handle, bytes, FIXTURE_TIMEOUT_MS)
+    }
+
+    fn read_with_timeout_until(
+        handle: HANDLE,
+        bytes: &mut [u8],
+        deadline: Instant,
+    ) -> io::Result<u32> {
+        read_with_timeout_for(handle, bytes, remaining_timeout_ms(deadline)?)
+    }
+
+    fn read_with_timeout_for(handle: HANDLE, bytes: &mut [u8], timeout_ms: u32) -> io::Result<u32> {
         let mut overlapped = StableOverlapped::new(vec![0_u8; bytes.len()])?;
         let length = overlapped.keepalive().len() as u32;
         let read_buffer = overlapped.keepalive_mut().as_mut_ptr();
@@ -2016,7 +2165,7 @@ mod windows_fixture {
         let result = if issued != 0 {
             overlapped.complete_without_wait(handle)
         } else if unsafe { GetLastError() } == ERROR_IO_PENDING {
-            overlapped.wait_for_completion(handle)
+            overlapped.wait_for_completion_for(handle, timeout_ms)
         } else {
             overlapped.discard_not_pending();
             Err(io::Error::last_os_error())
@@ -2029,6 +2178,18 @@ mod windows_fixture {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn remaining_timeout_ms(deadline: Instant) -> io::Result<u32> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "exact handle-list stdio proof exceeded its fixture deadline",
+                )
+            })?;
+        Ok(u32::try_from(remaining.as_millis().max(1)).unwrap_or(FIXTURE_TIMEOUT_MS))
     }
 
     fn new_overlapped_event() -> io::Result<windows_sys::Win32::System::IO::OVERLAPPED> {
@@ -2078,6 +2239,20 @@ mod windows_fixture {
     }
 
     fn temporary_pipe_names() -> (String, String) {
+        let prefix = temporary_pipe_prefix();
+        (format!("{prefix}-supervisor"), format!("{prefix}-worker"))
+    }
+
+    fn temporary_stdio_pipe_names() -> (String, String, String) {
+        let prefix = temporary_pipe_prefix();
+        (
+            format!("{prefix}-stdio-stdin"),
+            format!("{prefix}-stdio-stdout"),
+            format!("{prefix}-stdio-stderr"),
+        )
+    }
+
+    fn temporary_pipe_prefix() -> String {
         // SAFETY: returns the current test-runner process ID without borrowing
         // or owning a Windows handle.
         let pid = unsafe { GetCurrentProcessId() };
@@ -2085,8 +2260,7 @@ mod windows_fixture {
             .duration_since(UNIX_EPOCH)
             .expect("system clock precedes the Unix epoch")
             .as_nanos();
-        let prefix = format!(r"\\.\pipe\cockpit-host-398-{pid}-{nonce}");
-        (format!("{prefix}-supervisor"), format!("{prefix}-worker"))
+        format!(r"\\.\pipe\cockpit-host-398-{pid}-{nonce}")
     }
 
     fn wide(value: &str) -> Vec<u16> {

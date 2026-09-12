@@ -1,8 +1,8 @@
 //! Peer-authenticated leak-reveal transport: the production reveal path for a
 //! socket-attached TUI. A dedicated owner-only endpoint (path a pure function of
 //! the control socket, [`crate::daemon::DaemonPaths::leak_reveal_socket`]) that
-//! carries **only** the closed reveal frame ([`crate::daemon::leak_reveal_frame`]),
-//! never ordinary proto. On accept it runs the **same** owner peer check the
+//! carries only bounded one-shot sensitive frames: leak reveal and onboarding
+//! passphrase ingress, never ordinary proto. On accept it runs the **same** owner peer check the
 //! control socket uses ([`crate::daemon::server::validate_peer_owner`]) — no
 //! second hand-rolled `SO_PEERCRED`/`getpeereid`/SID path — then hands the
 //! presented capability to the channel-agnostic consumption core.
@@ -29,7 +29,7 @@ use crate::daemon::leak_reveal_frame::{
     LEAK_REVEAL_REQUEST_FRAME_LEN, LeakRevealSocketRequest, LeakRevealSocketResponse,
     encode_response,
 };
-use crate::daemon::server::{DaemonContext, validate_peer_owner};
+use crate::daemon::server::{DaemonContext, socket_peer_identity, validate_peer_owner};
 use crate::daemon::shutdown::ShutdownPhase;
 use crate::leaks::LEAK_REVEAL_MAX_PLAINTEXT_BYTES;
 
@@ -37,7 +37,7 @@ use crate::leaks::LEAK_REVEAL_MAX_PLAINTEXT_BYTES;
 /// value closes the listener first and retracts the path on every early return,
 /// including a later control-publication failure.
 pub struct BoundRevealSocket {
-    listener: Option<DaemonListener>,
+    pub(crate) listener: Option<DaemonListener>,
     path: std::path::PathBuf,
 }
 
@@ -103,9 +103,7 @@ pub async fn run_reveal_accept_loop(
                             handle_reveal_connection(stream, ctx).await;
                         });
                     }
-                    Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
+                    Err(error) => return Err(error),
                 }
             }
         }
@@ -133,7 +131,7 @@ async fn handle_reveal_connection(mut stream: DaemonStream, ctx: Arc<DaemonConte
     // spawned handler forever.
     let request = match tokio::time::timeout(
         LEAK_REVEAL_SERVER_READ_TIMEOUT,
-        read_request_frame(&mut stream),
+        read_sensitive_request_frame(&mut stream),
     )
     .await
     {
@@ -141,22 +139,47 @@ async fn handle_reveal_connection(mut stream: DaemonStream, ctx: Arc<DaemonConte
         // Timeout, malformed, short, or trailing frame: close, no content.
         _ => return,
     };
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let response = match consume_leak_reveal(&ctx, request.capability_hex.as_str(), now_ms).await {
-        Ok(RevealedLeakSecret {
-            report_id,
-            plaintext,
-            generation,
-        }) => LeakRevealSocketResponse::Ok {
-            report_id,
-            generation,
-            plaintext,
-        },
-        Err(denied) => LeakRevealSocketResponse::Denied(denied),
+    let mut bytes = match request {
+        SensitiveRequestFrame::Leak(request) => {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let response =
+                match consume_leak_reveal(&ctx, request.capability_hex.as_str(), now_ms).await {
+                    Ok(RevealedLeakSecret {
+                        report_id,
+                        plaintext,
+                        generation,
+                    }) => LeakRevealSocketResponse::Ok {
+                        report_id,
+                        generation,
+                        plaintext,
+                    },
+                    Err(denied) => LeakRevealSocketResponse::Denied(denied),
+                };
+            let bytes = zeroize::Zeroizing::new(encode_response(&response));
+            drop(response);
+            bytes
+        }
+        SensitiveRequestFrame::Onboarding(payload) => {
+            let authorized = cockpit_proto::decode_sensitive_onboarding_intent(&payload)
+                .ok()
+                .and_then(|frame| {
+                    let token = frame.owner_capability?;
+                    let peer = socket_peer_identity(&stream).ok()?;
+                    ctx.peer_credential_registry
+                        .verify_sensitive_peer(peer, token.as_str())
+                })
+                .is_some_and(|(role, _)| role.is_owner_class());
+            let response = if authorized {
+                crate::daemon::server::handle_ready_onboarding_secure_intent(&ctx, &payload).await
+            } else {
+                cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
+                    cockpit_proto::SensitiveOnboardingIntentError::Unauthorized,
+                )
+            };
+            cockpit_proto::encode_sensitive_onboarding_response(&response)
+                .unwrap_or_else(|_| zeroize::Zeroizing::new(b"COBSR001\x05".to_vec()))
+        }
     };
-    let mut bytes = encode_response(&response);
-    // `response` (and its Zeroizing plaintext) drops here after the encode.
-    drop(response);
     let _ = stream.write_all(&bytes).await;
     let _ = stream.flush().await;
     // Shut down the write half so the client observes a clean end-of-response
@@ -164,6 +187,75 @@ async fn handle_reveal_connection(mut stream: DaemonStream, ctx: Arc<DaemonConte
     let _ = stream.shutdown().await;
     // Zeroize the serialized buffer — it held the plaintext bytes.
     bytes.zeroize();
+}
+
+pub(crate) enum SensitiveRequestFrame {
+    Leak(LeakRevealSocketRequest),
+    Onboarding(zeroize::Zeroizing<Vec<u8>>),
+}
+
+const MAX_ONBOARDING_SENSITIVE_FRAME_BYTES: usize = 128 * 1024;
+
+pub(crate) async fn read_sensitive_request_frame<S>(stream: &mut S) -> Option<SensitiveRequestFrame>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut first = [0_u8; 1];
+    stream.read_exact(&mut first).await.ok()?;
+    if first[0] == LEAK_REVEAL_FRAME_VERSION {
+        let mut bytes = [0_u8; LEAK_REVEAL_REQUEST_FRAME_LEN];
+        bytes[0] = first[0];
+        stream.read_exact(&mut bytes[1..]).await.ok()?;
+        return crate::daemon::leak_reveal_frame::decode_request(&bytes)
+            .ok()
+            .map(SensitiveRequestFrame::Leak);
+    }
+    if first[0] != b'C' {
+        return None;
+    }
+    let mut encoded = zeroize::Zeroizing::new(Vec::with_capacity(256));
+    encoded.push(first[0]);
+    let mut magic_tail = [0_u8; 7];
+    stream.read_exact(&mut magic_tail).await.ok()?;
+    encoded.extend_from_slice(&magic_tail);
+    if encoded.as_slice() != b"COBSI001" {
+        return None;
+    }
+    // connection/run/attempt UUIDs + revision + placement
+    let mut fixed = [0_u8; 57];
+    stream.read_exact(&mut fixed).await.ok()?;
+    encoded.extend_from_slice(&fixed);
+    read_bounded_len_prefixed(stream, &mut encoded, 2, 512).await?;
+    read_bounded_len_prefixed(stream, &mut encoded, 2, 128).await?;
+    read_bounded_len_prefixed(stream, &mut encoded, 4, 64 * 1024).await?;
+    if encoded.len() > MAX_ONBOARDING_SENSITIVE_FRAME_BYTES
+        || cockpit_proto::decode_sensitive_onboarding_intent(&encoded).is_err()
+    {
+        return None;
+    }
+    Some(SensitiveRequestFrame::Onboarding(encoded))
+}
+
+async fn read_bounded_len_prefixed<S>(
+    stream: &mut S,
+    target: &mut Vec<u8>,
+    width: usize,
+    max: usize,
+) -> Option<()>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut length = [0_u8; 4];
+    stream.read_exact(&mut length[4 - width..]).await.ok()?;
+    target.extend_from_slice(&length[4 - width..]);
+    let len = usize::try_from(u32::from_be_bytes(length)).ok()?;
+    if len > max || target.len().checked_add(len)? > MAX_ONBOARDING_SENSITIVE_FRAME_BYTES {
+        return None;
+    }
+    let start = target.len();
+    target.resize(start + len, 0);
+    stream.read_exact(&mut target[start..]).await.ok()?;
+    Some(())
 }
 
 /// Read exactly one fixed-length (67-byte) request frame. The request is a

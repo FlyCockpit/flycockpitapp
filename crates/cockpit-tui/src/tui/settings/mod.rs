@@ -2546,6 +2546,7 @@ pub enum Dialog {
         frame: usize,
         reduced_motion: bool,
     },
+    OnboardingSecureStore(Box<OnboardingSecureStoreDialog>),
     WorkspaceTrust {
         root: cockpit_config::trust::TrustRoot,
         cursor: usize,
@@ -2751,6 +2752,28 @@ pub struct SetupWizardDialog {
     dialog_id: uuid::Uuid,
     queued_daemon_effect: Option<SettingsDaemonEffectRequest>,
     pending_operation_id: Option<uuid::Uuid>,
+}
+
+pub struct OnboardingSecureStoreDialog {
+    capabilities: cockpit_proto::HostCapabilitySnapshot,
+    cursor: usize,
+    phase: SecureStoreInputPhase,
+    passphrase: zeroize::Zeroizing<String>,
+    confirmation: zeroize::Zeroizing<String>,
+    submitted: Option<SecureStoreSubmission>,
+    status: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecureStoreInputPhase {
+    Choice,
+    Passphrase,
+    Confirmation,
+}
+
+pub struct SecureStoreSubmission {
+    pub placement: cockpit_proto::OnboardingSecurePlacement,
+    pub passphrase: Option<cockpit_proto::SensitiveOnboardingPassphrase>,
 }
 
 pub struct SettingsDialog {
@@ -5953,16 +5976,25 @@ impl Dialog {
         }
     }
 
-    pub fn open_onboarding_secure_store(cwd: &std::path::Path) -> Self {
-        let root = global_config_dir().unwrap_or_else(|_| cwd.to_path_buf());
-        let mut settings = SettingsDialog::open_from_picker(root.join(CONFIG_FILE), root);
-        let mut page = CategoryPage::new(Category::Privacy);
-        page.cursor = 2;
-        page.status = Some(
-            "Choose and confirm secure storage before provider credentials are accepted.".into(),
-        );
-        settings.page = category_page(page);
-        Dialog::Settings(Box::new(settings))
+    pub fn open_onboarding_secure_store(
+        capabilities: cockpit_proto::HostCapabilitySnapshot,
+    ) -> Self {
+        Dialog::OnboardingSecureStore(Box::new(OnboardingSecureStoreDialog {
+            capabilities,
+            cursor: 0,
+            phase: SecureStoreInputPhase::Choice,
+            passphrase: zeroize::Zeroizing::new(String::new()),
+            confirmation: zeroize::Zeroizing::new(String::new()),
+            submitted: None,
+            status: None,
+        }))
+    }
+
+    pub fn take_onboarding_secure_store_submission(&mut self) -> Option<SecureStoreSubmission> {
+        match self {
+            Dialog::OnboardingSecureStore(dialog) => dialog.submitted.take(),
+            _ => None,
+        }
     }
 
     pub fn open_providers_add_with_status(cwd: &std::path::Path, status: Option<String>) -> Self {
@@ -6327,6 +6359,7 @@ impl Dialog {
                 }
                 false
             }
+            Dialog::OnboardingSecureStore(dialog) => handle_secure_store_key(dialog, key),
             Dialog::FirstRunComplete { cursor, choice, .. } => {
                 match list_key_action(key, cursor, 2) {
                     ListAction::Stay => {}
@@ -6481,8 +6514,14 @@ impl Dialog {
     /// pages own text fields; the config pickers are pure list nav, so a
     /// paste there is dropped.
     pub fn paste(&mut self, text: &str) {
-        if let Dialog::Settings(s) = self {
-            s.paste(text);
+        match self {
+            Dialog::Settings(s) => s.paste(text),
+            Dialog::OnboardingSecureStore(dialog) => match dialog.phase {
+                SecureStoreInputPhase::Passphrase => dialog.passphrase.push_str(text),
+                SecureStoreInputPhase::Confirmation => dialog.confirmation.push_str(text),
+                SecureStoreInputPhase::Choice => {}
+            },
+            _ => {}
         }
     }
 
@@ -6726,6 +6765,9 @@ impl Dialog {
                 reduced_motion,
                 ..
             } => render_onboarding_welcome(frame, area, *animation_frame, *reduced_motion),
+            Dialog::OnboardingSecureStore(dialog) => {
+                render_onboarding_secure_store(frame, area, dialog)
+            }
             Dialog::WorkspaceTrust { root, cursor, .. } => {
                 render_workspace_trust(frame, area, root, *cursor)
             }
@@ -9789,6 +9831,114 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
     false
 }
 
+fn handle_secure_store_key(dialog: &mut OnboardingSecureStoreDialog, key: KeyEvent) -> bool {
+    match dialog.phase {
+        SecureStoreInputPhase::Choice => match key.code {
+            KeyCode::Up => {
+                dialog.cursor = dialog.cursor.saturating_sub(1);
+                dialog.status = None;
+            }
+            KeyCode::Down => {
+                dialog.cursor = (dialog.cursor + 1).min(2);
+                dialog.status = None;
+            }
+            KeyCode::Esc => return true,
+            KeyCode::Enter => {
+                let (placement, capability_id) = match dialog.cursor {
+                    0 => (
+                        cockpit_proto::OnboardingSecurePlacement::Automatic,
+                        "secret_store.keyring",
+                    ),
+                    1 => (
+                        cockpit_proto::OnboardingSecurePlacement::PassphraseFile,
+                        "secret_store.file",
+                    ),
+                    _ => (
+                        cockpit_proto::OnboardingSecurePlacement::MachineBoundFile,
+                        "secret_store.file",
+                    ),
+                };
+                let Some(capability) = dialog.capabilities.feature(capability_id) else {
+                    dialog.status = Some("Secure-store capability is not ready; retry after the host check completes.".into());
+                    return false;
+                };
+                if !capability.state.is_available() {
+                    dialog.status = Some(
+                        capability
+                            .fix_command
+                            .as_deref()
+                            .or(capability.remedy_text.as_deref())
+                            .unwrap_or(capability.reason.as_str())
+                            .to_string(),
+                    );
+                    return false;
+                }
+                if placement == cockpit_proto::OnboardingSecurePlacement::PassphraseFile {
+                    dialog.phase = SecureStoreInputPhase::Passphrase;
+                } else {
+                    dialog.submitted = Some(SecureStoreSubmission {
+                        placement,
+                        passphrase: None,
+                    });
+                }
+            }
+            _ => {}
+        },
+        SecureStoreInputPhase::Passphrase | SecureStoreInputPhase::Confirmation => match key.code {
+            KeyCode::Esc => {
+                dialog.passphrase.clear();
+                dialog.confirmation.clear();
+                dialog.phase = SecureStoreInputPhase::Choice;
+                dialog.status = None;
+            }
+            KeyCode::Backspace => {
+                let target = if dialog.phase == SecureStoreInputPhase::Passphrase {
+                    &mut dialog.passphrase
+                } else {
+                    &mut dialog.confirmation
+                };
+                target.pop();
+            }
+            KeyCode::Char(ch) => {
+                let ch = crate::tui::textfield::normalize_shift_char(&key, ch);
+                let target = if dialog.phase == SecureStoreInputPhase::Passphrase {
+                    &mut dialog.passphrase
+                } else {
+                    &mut dialog.confirmation
+                };
+                target.push(ch);
+            }
+            KeyCode::Enter if dialog.phase == SecureStoreInputPhase::Passphrase => {
+                if dialog.passphrase.is_empty() {
+                    dialog.status = Some("Passphrase must not be empty.".into());
+                } else {
+                    dialog.phase = SecureStoreInputPhase::Confirmation;
+                    dialog.status = None;
+                }
+            }
+            KeyCode::Enter => {
+                let value = std::mem::take(&mut *dialog.passphrase);
+                let confirmation = std::mem::take(&mut *dialog.confirmation);
+                match cockpit_proto::SensitiveOnboardingPassphrase::confirmed(value, confirmation) {
+                    Ok(passphrase) => {
+                        dialog.submitted = Some(SecureStoreSubmission {
+                            placement: cockpit_proto::OnboardingSecurePlacement::PassphraseFile,
+                            passphrase: Some(passphrase),
+                        });
+                        dialog.status = None;
+                    }
+                    Err(error) => {
+                        dialog.status = Some(error.into());
+                        dialog.phase = SecureStoreInputPhase::Passphrase;
+                    }
+                }
+            }
+            _ => {}
+        },
+    }
+    false
+}
+
 fn apply_setup_wizard_daemon_completion(
     wizard: &mut SetupWizardDialog,
     completion: SettingsDaemonEffectCompletion,
@@ -10430,6 +10580,81 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
         help_line("↑/↓  space: toggle  t: tier  enter: select/continue  y/n: confirm  esc: close"),
         layout[1],
     );
+}
+
+fn render_onboarding_secure_store(
+    frame: &mut Frame,
+    area: Rect,
+    dialog: &OnboardingSecureStoreDialog,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Secure secret store ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let selected = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let mut lines = vec![
+        Line::from("Choose where Cockpit encrypts credentials before adding a provider."),
+        Line::from(Span::styled(
+            "Automatic means the platform keyring only; a failure requires a new explicit choice.",
+            muted,
+        )),
+        Line::default(),
+    ];
+    match dialog.phase {
+        SecureStoreInputPhase::Choice => {
+            let choices = [
+                ("Platform keyring (recommended)", "No silent file fallback."),
+                (
+                    "Passphrase-protected file",
+                    "You must enter it again after a pre-commit crash.",
+                ),
+                (
+                    "Machine-bound encrypted file",
+                    "Explicit fallback tied to this machine.",
+                ),
+            ];
+            for (index, (label, description)) in choices.into_iter().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::raw(if dialog.cursor == index { "▸ " } else { "  " }),
+                    Span::styled(
+                        label,
+                        if dialog.cursor == index {
+                            selected
+                        } else {
+                            Style::default()
+                        },
+                    ),
+                    Span::raw("  "),
+                    Span::styled(description, muted),
+                ]));
+            }
+        }
+        SecureStoreInputPhase::Passphrase => {
+            lines.push(Line::from("Enter a vault passphrase:"));
+            lines.push(Line::from("•".repeat(dialog.passphrase.chars().count())));
+        }
+        SecureStoreInputPhase::Confirmation => {
+            lines.push(Line::from("Confirm the vault passphrase:"));
+            lines.push(Line::from("•".repeat(dialog.confirmation.chars().count())));
+        }
+    }
+    if let Some(status) = dialog.status.as_deref() {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(status.to_string(), Color::Red)));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
+    let help = match dialog.phase {
+        SecureStoreInputPhase::Choice => "↑/↓  enter: select  esc: cancel",
+        SecureStoreInputPhase::Passphrase | SecureStoreInputPhase::Confirmation => {
+            "enter: continue  esc: choose again"
+        }
+    };
+    frame.render_widget(help_line(help), layout[1]);
 }
 
 fn render_first_run_complete(frame: &mut Frame, area: Rect, summary: &str, cursor: usize) {

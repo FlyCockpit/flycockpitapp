@@ -1843,7 +1843,7 @@ fn spawn_owned_in_process_daemon(
     std::thread::JoinHandle<()>,
 )> {
     let (booted, boot) = tokio::sync::oneshot::channel();
-    let (shutdown, shutdown_request) = tokio::sync::oneshot::channel();
+    let (shutdown, mut shutdown_request) = tokio::sync::oneshot::channel();
     let (completion, completed) = tokio::sync::oneshot::channel();
     let supervisor = std::thread::Builder::new()
         .name("cockpit-in-process-daemon".to_string())
@@ -1854,11 +1854,50 @@ fn spawn_owned_in_process_daemon(
                 .context("building in-process daemon runtime")
                 .and_then(|runtime| {
                     runtime.block_on(async move {
-                        let ctx = match server::boot(paths, terminal_factory).await {
-                            Ok(ctx) => std::sync::Arc::new(ctx),
+                        let services = match server::boot(paths, terminal_factory).await {
+                            Ok(services) => services,
                             Err(error) => {
                                 let _ = booted.send(Err(error));
                                 return Ok(());
+                            }
+                        };
+                        let ctx = match services {
+                            server::BootServices::Ready(ready) => {
+                                let ctx = std::sync::Arc::new(ready.context);
+                                let endpoint = server::register_in_process_context(ctx.clone());
+                                let force = ctx.shutdown_signal().clone();
+                                if booted
+                                    .send(Ok(InProcessBootReady { endpoint, force }))
+                                    .is_err()
+                                {
+                                    return shutdown_in_process_context(ctx, Vec::new()).await;
+                                }
+                                ctx
+                            }
+                            server::BootServices::Locked(locked) => {
+                                let (endpoint, mut ready) =
+                                    server::locked_in_process_endpoint(std::sync::Arc::new(locked));
+                                let force = shutdown::ShutdownSignal::new();
+                                if booted
+                                    .send(Ok(InProcessBootReady {
+                                        endpoint,
+                                        force: force.clone(),
+                                    }))
+                                    .is_err()
+                                {
+                                    return Ok(());
+                                }
+                                loop {
+                                    tokio::select! {
+                                        _ = &mut shutdown_request => return Ok(()),
+                                        changed = ready.changed() => {
+                                            changed.context("locked in-process ready authority stopped")?;
+                                            if let Some(ctx) = ready.borrow().clone() {
+                                                break ctx;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         };
                         #[cfg(not(test))]
@@ -1877,14 +1916,6 @@ fn spawn_owned_in_process_daemon(
                         };
                         #[cfg(test)]
                         let tasks = Vec::new();
-                        let endpoint = server::register_in_process_context(ctx.clone());
-                        let force = ctx.shutdown_signal().clone();
-                        if booted
-                            .send(Ok(InProcessBootReady { endpoint, force }))
-                            .is_err()
-                        {
-                            return shutdown_in_process_context(ctx, tasks).await;
-                        }
                         let _ = shutdown_request.await;
                         shutdown_in_process_context(ctx, tasks).await
                     })
@@ -2318,7 +2349,7 @@ async fn run_foreground_inner_with_boot_db(
     }
 
     let uses_supplied_boot_db = boot_db.is_some();
-    let ctx = std::sync::Arc::new(match boot_db {
+    let services = match boot_db {
         Some(db) => {
             server::boot_with_db(
                 paths.clone(),
@@ -2330,7 +2361,40 @@ async fn run_foreground_inner_with_boot_db(
             .await?
         }
         None => server::boot(paths.clone(), terminal_factory).await?,
-    });
+    };
+    let mut published_listeners = None;
+    let ctx = match services {
+        server::BootServices::Ready(ready) => std::sync::Arc::new(ready.context),
+        server::BootServices::Locked(locked) => {
+            // Locked bootstrap is itself a fully booted, authenticated local
+            // service. Publish only after DB/non-secret construction, then
+            // keep ordinary recovery and dispatch unreachable until the
+            // selected vault opens and ReadyServices finishes construction.
+            if uses_supplied_boot_db {
+                write_endpoint_record_with_receipt_and_canonical(&paths, &paths, &pid_receipt)?;
+            } else {
+                write_endpoint_record(&paths)?;
+            }
+            metadata_guard.track_endpoint_record(endpoint_record.clone());
+            #[cfg(unix)]
+            let (listener, reveal_listener) =
+                publish_socket_pair_with(&paths, || bind_private_socket(&paths.socket))?;
+            #[cfg(windows)]
+            let (listener, reveal_listener) = prepare_and_publish_socket_pair(&paths)?;
+            let (ready, listener, reveal_listener) = tokio::select! {
+                result = server::run_locked_until_ready(
+                    std::sync::Arc::new(locked),
+                    listener,
+                    reveal_listener,
+                ) => result?,
+                () = wait_for_bootstrap_shutdown_signal() => {
+                    anyhow::bail!("daemon bootstrap interrupted by shutdown signal")
+                }
+            };
+            published_listeners = Some((listener, reveal_listener));
+            std::sync::Arc::new(ready.context)
+        }
+    };
     boot_dbg!("after_ctx_boot");
     // Recovery is part of the socket-publication barrier. Neither the control
     // socket nor its reveal sibling may be observable while durable authority
@@ -2345,22 +2409,28 @@ async fn run_foreground_inner_with_boot_db(
     // Complete both fallible publication operations before any owned
     // background task exists. The metadata guard retracts a published endpoint
     // if the subsequent control bind fails.
-    if uses_supplied_boot_db {
-        write_endpoint_record_with_receipt_and_canonical(&paths, &paths, &pid_receipt)?;
-    } else {
-        write_endpoint_record(&paths)?;
-    }
-    metadata_guard.track_endpoint_record(endpoint_record);
-    // Prepare both required endpoints before publishing control readiness.
-    // Unix reveal binding is observable but harmless until control appears;
-    // Windows binds an undiscoverable random control pipe first, derives the
-    // reveal sibling from that immutable name, and writes control identity
-    // only after the sibling is ready.
-    #[cfg(unix)]
-    let (listener, reveal_listener) =
-        publish_socket_pair_with(&paths, || bind_private_socket(&paths.socket))?;
-    #[cfg(windows)]
-    let (listener, reveal_listener) = prepare_and_publish_socket_pair(&paths)?;
+    let (listener, reveal_listener) = match published_listeners {
+        Some(listeners) => listeners,
+        None => {
+            if uses_supplied_boot_db {
+                write_endpoint_record_with_receipt_and_canonical(&paths, &paths, &pid_receipt)?;
+            } else {
+                write_endpoint_record(&paths)?;
+            }
+            metadata_guard.track_endpoint_record(endpoint_record);
+            // Prepare both required endpoints before publishing control readiness.
+            // Unix reveal binding is observable but harmless until control appears;
+            // Windows binds an undiscoverable random control pipe first, derives the
+            // reveal sibling from that immutable name, and writes control identity
+            // only after the sibling is ready.
+            #[cfg(unix)]
+            let listeners =
+                publish_socket_pair_with(&paths, || bind_private_socket(&paths.socket))?;
+            #[cfg(windows)]
+            let listeners = prepare_and_publish_socket_pair(&paths)?;
+            listeners
+        }
+    };
 
     // Signal task: SIGINT/SIGTERM (or Ctrl-C / console-close on Windows)
     // route into the single graceful-shutdown path. The **first** signal
@@ -2556,6 +2626,26 @@ async fn run_foreground_inner_with_boot_db(
         Ok(())
     } else {
         anyhow::bail!(failures.join("; "))
+    }
+}
+
+/// Locked bootstrap exists before `DaemonContext` and therefore before its
+/// shutdown actor. Still honor the platform shutdown signal while waiting for
+/// vault intent so a first-run daemon can never become an unkillable owner.
+async fn wait_for_bootstrap_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut int = signal(SignalKind::interrupt()).ok();
+        let mut term = signal(SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = async { if let Some(signal) = int.as_mut() { signal.recv().await; } else { std::future::pending::<()>().await } } => {}
+            _ = async { if let Some(signal) = term.as_mut() { signal.recv().await; } else { std::future::pending::<()>().await } } => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

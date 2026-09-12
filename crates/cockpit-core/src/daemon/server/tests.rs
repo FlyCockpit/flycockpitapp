@@ -11709,6 +11709,40 @@ async fn ephemeral_daemon_onboarding_first_write_succeeds_without_promotion() {
         "first write must not promote the owner"
     );
     assert!(global_provider_path("onboard").is_file());
+
+    let second = take_onboarding_catalog(
+        &ctx,
+        &mut state,
+        &workspace,
+        "ephemeral-onboarding-second-edit",
+    )
+    .await;
+    let error = handle_request(
+        Request::ApplyProviderMutation {
+            snapshot_session_id: second.snapshot_session_id,
+            layer_id: second.layer_id,
+            expected_revision: second.base_revision,
+            client_operation_id: "ephemeral-onboarding-second-edit".into(),
+            mutation_intent_hash: cockpit_proto::ProviderMutationBatch {
+                upserts: Vec::new(),
+                deletes: Vec::new(),
+                metadata: None,
+            }
+            .sanitized_intent_hash()
+            .unwrap(),
+            mutation: cockpit_proto::ProviderMutationBatch {
+                upserts: Vec::new(),
+                deletes: Vec::new(),
+                metadata: None,
+            },
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("an ephemeral first-write capability must be single-use");
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(error.message.contains("create-on-first-write"));
 }
 
 /// Durable journal replay of a validated first-write into the missing global
@@ -42095,7 +42129,7 @@ async fn boot_with_db_resolves_referenced_command_secret() {
 
     crate::secure_key::reset_keyring_probe_cache_for_test();
     let mut timer = crate::startup::PhaseTimer::start("boot_resolves_referenced_command");
-    let ctx = boot_with_db(
+    let ctx = boot_ready_with_db(
         DaemonPaths {
             socket: tmp.path().join("cockpit-cmd-boot.sock"),
             pid_file: tmp.path().join("cockpit-cmd-boot.pid"),

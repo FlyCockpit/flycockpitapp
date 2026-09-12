@@ -11,9 +11,9 @@ use crate::tui::history::HistoryEntry;
 use crate::tui::textfield::normalize_shift_char;
 
 use super::{
-    App, ControlApplied, DispatchOutcome, FirstRunFlow, LocalChoiceSelection,
-    MouseGestureInvalidation, OptimisticSubmissionState, Overlay, PendingSessionSwitchSubmission,
-    StartupModal, TranscriptFind,
+    App, ControlApplied, DispatchOutcome, LocalChoiceSelection, MouseGestureInvalidation,
+    OptimisticSubmissionState, Overlay, PendingSessionSwitchSubmission, StartupModal,
+    TranscriptFind,
 };
 use crate::tui::agent_runner;
 use crate::tui::async_action::{AsyncActionKey, AsyncActionPayload, AsyncActionPolicy};
@@ -3245,8 +3245,10 @@ impl App {
         let cfg = self.config_snapshot.providers.clone();
         self.submit_after_model_selection = true;
         if cfg.providers.is_empty() {
-            let onboarding = self.first_run_flow != FirstRunFlow::None;
-            self.first_run_flow = FirstRunFlow::AwaitProvider;
+            let onboarding = self
+                .onboarding_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.stage != cockpit_proto::OnboardingStage::Complete);
             self.dialog = if onboarding {
                 Dialog::open_onboarding_provider_add(&self.launch.cwd, Some(status))
             } else {

@@ -96,6 +96,7 @@ pub enum Response {
     /// `CancelTurn`, `ResolveInterrupt`, …).
     Ack,
     OnboardingBootstrapSnapshot(Option<crate::OnboardingBootstrapSnapshot>),
+    LockedBootstrapHello(crate::LockedBootstrapHello),
     OnboardingTransition(crate::OnboardingTransitionResult),
     OnboardingTransitionReceipt(Option<crate::OnboardingTransitionReceipt>),
 
@@ -1646,6 +1647,7 @@ macro_rules! response_variants {
         $with_variants! { ($($context),*) [
             (Response::Ack, "ack");
             (Response::OnboardingBootstrapSnapshot(..), "onboarding_bootstrap_snapshot");
+            (Response::LockedBootstrapHello(..), "locked_bootstrap_hello");
             (Response::OnboardingTransition(..), "onboarding_transition");
             (Response::OnboardingTransitionReceipt(..), "onboarding_transition_receipt");
             (Response::KnowledgeDreamStatus { .. }, "knowledge_dream_status");

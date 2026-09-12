@@ -666,7 +666,7 @@ async fn host_capabilities_boot_with_db_populates_snapshot_when_keyring_missing(
             self_mountinfo: probe_root.join("mountinfo"),
         };
     let mut timer = crate::startup::PhaseTimer::start("host_capabilities_boot_with_db");
-    let ctx = boot_with_db(
+    let ctx = boot_ready_with_db(
         DaemonPaths {
             socket: tmp.path().join("cockpit-hostcap-boot.sock"),
             pid_file: tmp.path().join("cockpit-hostcap-boot.pid"),

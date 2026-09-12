@@ -9780,3 +9780,79 @@ fn oauth_and_project_receipts_are_bound_to_exact_authority_targets() {
     assert!(mcp.contains("expected_request_intent_hash"));
     assert!(source.contains("provider_view_matches_mutation"));
 }
+
+fn onboarding_secure_store_capabilities(
+    keyring_state: cockpit_proto::FeatureCapabilityState,
+) -> cockpit_proto::HostCapabilitySnapshot {
+    let mut snapshot = cockpit_proto::HostCapabilitySnapshot::unpublished();
+    snapshot.features = vec![
+        cockpit_proto::FeatureCapabilityRow {
+            id: "secret_store.keyring".into(),
+            state: keyring_state,
+            reason: "keyring is locked".into(),
+            fix_command: Some("unlock-keyring".into()),
+            remedy_text: Some("Unlock the platform keyring".into()),
+            dependency_ids: Vec::new(),
+        },
+        cockpit_proto::FeatureCapabilityRow {
+            id: "secret_store.file".into(),
+            state: cockpit_proto::FeatureCapabilityState::Available,
+            reason: "encrypted file vault is available".into(),
+            fix_command: None,
+            remedy_text: None,
+            dependency_ids: Vec::new(),
+        },
+    ];
+    snapshot
+}
+
+#[test]
+fn unavailable_automatic_secure_store_never_silently_falls_back_to_file() {
+    let mut dialog = Dialog::open_onboarding_secure_store(onboarding_secure_store_capabilities(
+        cockpit_proto::FeatureCapabilityState::Missing,
+    ));
+    assert!(!dialog.handle_key(press(KeyCode::Enter)));
+    assert!(dialog.take_onboarding_secure_store_submission().is_none());
+    let Dialog::OnboardingSecureStore(state) = &dialog else {
+        panic!("secure-store dialog must remain open");
+    };
+    assert_eq!(state.cursor, 0);
+    assert_eq!(state.status.as_deref(), Some("unlock-keyring"));
+
+    dialog.handle_key(press(KeyCode::Down));
+    dialog.handle_key(press(KeyCode::Down));
+    dialog.handle_key(press(KeyCode::Enter));
+    let explicit = dialog
+        .take_onboarding_secure_store_submission()
+        .expect("explicit machine-bound selection");
+    assert_eq!(
+        explicit.placement,
+        cockpit_proto::OnboardingSecurePlacement::MachineBoundFile
+    );
+    assert!(explicit.passphrase.is_none());
+}
+
+#[test]
+fn passphrase_secure_store_requires_matching_confirmation() {
+    let mut dialog = Dialog::open_onboarding_secure_store(onboarding_secure_store_capabilities(
+        cockpit_proto::FeatureCapabilityState::Available,
+    ));
+    dialog.handle_key(press(KeyCode::Down));
+    dialog.handle_key(press(KeyCode::Enter));
+    let Dialog::OnboardingSecureStore(state) = &mut dialog else {
+        panic!("secure-store dialog must remain open");
+    };
+    state.passphrase.push_str("first-canary");
+    state.phase = SecureStoreInputPhase::Confirmation;
+    state.confirmation.push_str("second-canary");
+    dialog.handle_key(press(KeyCode::Enter));
+    assert!(dialog.take_onboarding_secure_store_submission().is_none());
+    let Dialog::OnboardingSecureStore(state) = &dialog else {
+        panic!("secure-store dialog must remain open");
+    };
+    assert_eq!(state.phase, SecureStoreInputPhase::Passphrase);
+    assert_eq!(
+        state.status.as_deref(),
+        Some("onboarding passphrase confirmation does not match")
+    );
+}

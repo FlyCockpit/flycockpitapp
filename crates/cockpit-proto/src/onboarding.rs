@@ -6,9 +6,9 @@
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
-use crate::HostCapabilitySnapshot;
+use crate::{HostCapabilitySnapshot, OwnerCapabilityToken};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -146,17 +146,26 @@ impl SensitiveOnboardingPassphrase {
     /// Construct the one-shot ingress only after the caller has collected a
     /// matching confirmation.  Neither input is retained on mismatch.
     pub fn confirmed(value: String, confirmation: String) -> Result<Self, &'static str> {
+        let value = Zeroizing::new(value);
+        let confirmation = Zeroizing::new(confirmation);
         if value != confirmation {
             return Err("onboarding passphrase confirmation does not match");
         }
         if value.is_empty() {
             return Err("onboarding passphrase must not be empty");
         }
-        Ok(Self(Zeroizing::new(value)))
+        Ok(Self(value))
     }
 
     pub fn into_zeroizing(self) -> Zeroizing<String> {
         self.0
+    }
+
+    fn from_confirmed_local_frame(value: Zeroizing<String>) -> Result<Self, &'static str> {
+        if value.is_empty() {
+            return Err("onboarding passphrase must not be empty");
+        }
+        Ok(Self(value))
     }
 }
 
@@ -167,7 +176,7 @@ impl std::fmt::Debug for SensitiveOnboardingPassphrase {
 }
 
 /// Local secure-intent command.  It binds sensitive ingress to the current
-/// durable attempt and revision without giving that secret a wire shape.
+/// durable attempt and revision without giving that secret a serde/JSON shape.
 pub struct ApplyOnboardingSecureIntent {
     pub run_id: Uuid,
     pub attempt_id: Uuid,
@@ -191,6 +200,328 @@ impl std::fmt::Debug for ApplyOnboardingSecureIntent {
                 &self.passphrase.as_ref().map(|_| "[REDACTED]"),
             )
             .finish()
+    }
+}
+
+const SENSITIVE_ONBOARDING_INTENT_MAGIC: &[u8; 8] = b"COBSI001";
+const SENSITIVE_ONBOARDING_RESPONSE_MAGIC: &[u8; 8] = b"COBSR001";
+const MAX_SENSITIVE_ONBOARDING_OPERATION_ID_BYTES: usize = 128;
+const MAX_SENSITIVE_ONBOARDING_CAPABILITY_BYTES: usize = 512;
+const MAX_SENSITIVE_ONBOARDING_PASSPHRASE_BYTES: usize = 64 * 1024;
+
+/// Decoded local-only secure-intent frame. The owner capability remains bound
+/// to the authenticated same-owner OS peer that obtained it; possession of the
+/// sibling socket alone never authorizes vault materialization.
+pub struct SensitiveOnboardingIntentFrame {
+    pub connection_id: Uuid,
+    pub owner_capability: Option<OwnerCapabilityToken>,
+    pub request: ApplyOnboardingSecureIntent,
+}
+
+impl std::fmt::Debug for SensitiveOnboardingIntentFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SensitiveOnboardingIntentFrame")
+            .field("connection_id", &self.connection_id)
+            .field(
+                "owner_capability",
+                &self.owner_capability.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("request", &self.request)
+            .finish()
+    }
+}
+
+/// Fixed, schema-bounded failures permitted while the ready redactor does not
+/// yet exist. No dynamic error, path, environment value, or secret crosses
+/// this preparation-time boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SensitiveOnboardingIntentError {
+    Unauthorized,
+    InvalidRequest,
+    RevisionConflict,
+    PlacementUnavailable,
+    MaterializationFailed,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SensitiveOnboardingIntentResponse {
+    Applied(OnboardingTransitionResult),
+    Rejected(SensitiveOnboardingIntentError),
+}
+
+/// Encode the Rust-only ingress without giving it a serde/JSON shape. The
+/// returned allocation is zeroized, including the passphrase bytes, on drop.
+pub fn encode_sensitive_onboarding_intent(
+    frame: SensitiveOnboardingIntentFrame,
+) -> Result<Zeroizing<Vec<u8>>, &'static str> {
+    let SensitiveOnboardingIntentFrame {
+        connection_id,
+        owner_capability,
+        request,
+    } = frame;
+    let ApplyOnboardingSecureIntent {
+        run_id,
+        attempt_id,
+        expected_revision,
+        client_operation_id,
+        placement,
+        passphrase,
+    } = request;
+    let capability = owner_capability
+        .as_ref()
+        .map(OwnerCapabilityToken::as_str)
+        .unwrap_or_default()
+        .as_bytes();
+    let operation = client_operation_id.as_bytes();
+    let passphrase = passphrase.map(SensitiveOnboardingPassphrase::into_zeroizing);
+    let passphrase_bytes = passphrase
+        .as_deref()
+        .map_or(&[][..], |value| value.as_bytes());
+    if operation.is_empty() || operation.len() > MAX_SENSITIVE_ONBOARDING_OPERATION_ID_BYTES {
+        return Err("invalid onboarding client operation id");
+    }
+    if capability.len() > MAX_SENSITIVE_ONBOARDING_CAPABILITY_BYTES
+        || passphrase_bytes.len() > MAX_SENSITIVE_ONBOARDING_PASSPHRASE_BYTES
+    {
+        return Err("sensitive onboarding frame exceeds its field limit");
+    }
+    let mut encoded = Zeroizing::new(Vec::with_capacity(
+        8 + 16 * 3
+            + 8
+            + 1
+            + 2
+            + capability.len()
+            + 2
+            + operation.len()
+            + 4
+            + passphrase_bytes.len(),
+    ));
+    encoded.extend_from_slice(SENSITIVE_ONBOARDING_INTENT_MAGIC);
+    encoded.extend_from_slice(connection_id.as_bytes());
+    encoded.extend_from_slice(run_id.as_bytes());
+    encoded.extend_from_slice(attempt_id.as_bytes());
+    encoded.extend_from_slice(&expected_revision.to_be_bytes());
+    encoded.push(match placement {
+        OnboardingSecurePlacement::Automatic => 0,
+        OnboardingSecurePlacement::Keyring => 1,
+        OnboardingSecurePlacement::PassphraseFile => 2,
+        OnboardingSecurePlacement::MachineBoundFile => 3,
+    });
+    push_u16_bytes(&mut encoded, capability)?;
+    push_u16_bytes(&mut encoded, operation)?;
+    encoded.extend_from_slice(
+        &u32::try_from(passphrase_bytes.len())
+            .map_err(|_| "sensitive onboarding passphrase is too long")?
+            .to_be_bytes(),
+    );
+    encoded.extend_from_slice(passphrase_bytes);
+    Ok(encoded)
+}
+
+pub fn decode_sensitive_onboarding_intent(
+    encoded: &[u8],
+) -> Result<SensitiveOnboardingIntentFrame, &'static str> {
+    let mut cursor = FrameCursor::new(encoded);
+    if cursor.take(8)? != SENSITIVE_ONBOARDING_INTENT_MAGIC {
+        return Err("invalid sensitive onboarding frame magic");
+    }
+    let connection_id = uuid_from_frame(cursor.take(16)?)?;
+    let run_id = uuid_from_frame(cursor.take(16)?)?;
+    let attempt_id = uuid_from_frame(cursor.take(16)?)?;
+    let expected_revision = u64::from_be_bytes(
+        cursor
+            .take(8)?
+            .try_into()
+            .map_err(|_| "invalid onboarding revision")?,
+    );
+    let placement = match cursor.take(1)?[0] {
+        0 => OnboardingSecurePlacement::Automatic,
+        1 => OnboardingSecurePlacement::Keyring,
+        2 => OnboardingSecurePlacement::PassphraseFile,
+        3 => OnboardingSecurePlacement::MachineBoundFile,
+        _ => return Err("invalid onboarding secure placement"),
+    };
+    let capability = cursor.take_u16_bytes(MAX_SENSITIVE_ONBOARDING_CAPABILITY_BYTES)?;
+    let operation = cursor.take_u16_bytes(MAX_SENSITIVE_ONBOARDING_OPERATION_ID_BYTES)?;
+    if operation.is_empty() {
+        return Err("invalid onboarding client operation id");
+    }
+    let passphrase_len = usize::try_from(u32::from_be_bytes(
+        cursor
+            .take(4)?
+            .try_into()
+            .map_err(|_| "invalid onboarding passphrase length")?,
+    ))
+    .map_err(|_| "invalid onboarding passphrase length")?;
+    if passphrase_len > MAX_SENSITIVE_ONBOARDING_PASSPHRASE_BYTES {
+        return Err("sensitive onboarding passphrase is too long");
+    }
+    let passphrase = cursor.take(passphrase_len)?;
+    if !cursor.is_empty() {
+        return Err("sensitive onboarding frame has trailing bytes");
+    }
+    let passphrase = if passphrase.is_empty() {
+        None
+    } else {
+        Some(SensitiveOnboardingPassphrase::from_confirmed_local_frame(
+            zeroizing_utf8(passphrase, "onboarding passphrase is not UTF-8")?,
+        )?)
+    };
+    Ok(SensitiveOnboardingIntentFrame {
+        connection_id,
+        owner_capability: if capability.is_empty() {
+            None
+        } else {
+            Some(OwnerCapabilityToken::new(
+                String::from_utf8(capability.to_vec())
+                    .map_err(|_| "invalid onboarding owner capability")?,
+            ))
+        },
+        request: ApplyOnboardingSecureIntent {
+            run_id,
+            attempt_id,
+            expected_revision,
+            client_operation_id: String::from_utf8(operation.to_vec())
+                .map_err(|_| "onboarding operation id is not UTF-8")?,
+            placement,
+            passphrase,
+        },
+    })
+}
+
+fn zeroizing_utf8(value: &[u8], error: &'static str) -> Result<Zeroizing<String>, &'static str> {
+    let mut bytes = Zeroizing::new(value.to_vec());
+    match String::from_utf8(std::mem::take(&mut *bytes)) {
+        Ok(value) => Ok(Zeroizing::new(value)),
+        Err(invalid) => {
+            let mut bytes = invalid.into_bytes();
+            bytes.zeroize();
+            Err(error)
+        }
+    }
+}
+
+pub fn encode_sensitive_onboarding_response(
+    response: &SensitiveOnboardingIntentResponse,
+) -> Result<Zeroizing<Vec<u8>>, &'static str> {
+    let mut encoded = Zeroizing::new(Vec::new());
+    encoded.extend_from_slice(SENSITIVE_ONBOARDING_RESPONSE_MAGIC);
+    match response {
+        SensitiveOnboardingIntentResponse::Applied(result) => {
+            encoded.push(0);
+            let json =
+                serde_json::to_vec(result).map_err(|_| "could not encode onboarding response")?;
+            encoded.extend_from_slice(
+                &u32::try_from(json.len())
+                    .map_err(|_| "onboarding response is too large")?
+                    .to_be_bytes(),
+            );
+            encoded.extend_from_slice(&json);
+        }
+        SensitiveOnboardingIntentResponse::Rejected(error) => {
+            encoded.push(match error {
+                SensitiveOnboardingIntentError::Unauthorized => 1,
+                SensitiveOnboardingIntentError::InvalidRequest => 2,
+                SensitiveOnboardingIntentError::RevisionConflict => 3,
+                SensitiveOnboardingIntentError::PlacementUnavailable => 4,
+                SensitiveOnboardingIntentError::MaterializationFailed => 5,
+            });
+        }
+    }
+    Ok(encoded)
+}
+
+pub fn decode_sensitive_onboarding_response(
+    encoded: &[u8],
+) -> Result<SensitiveOnboardingIntentResponse, &'static str> {
+    let mut cursor = FrameCursor::new(encoded);
+    if cursor.take(8)? != SENSITIVE_ONBOARDING_RESPONSE_MAGIC {
+        return Err("invalid sensitive onboarding response magic");
+    }
+    let status = cursor.take(1)?[0];
+    let response = match status {
+        0 => {
+            let len = usize::try_from(u32::from_be_bytes(
+                cursor
+                    .take(4)?
+                    .try_into()
+                    .map_err(|_| "invalid onboarding response length")?,
+            ))
+            .map_err(|_| "invalid onboarding response length")?;
+            let result = serde_json::from_slice(cursor.take(len)?)
+                .map_err(|_| "invalid onboarding response payload")?;
+            SensitiveOnboardingIntentResponse::Applied(result)
+        }
+        1 => SensitiveOnboardingIntentResponse::Rejected(
+            SensitiveOnboardingIntentError::Unauthorized,
+        ),
+        2 => SensitiveOnboardingIntentResponse::Rejected(
+            SensitiveOnboardingIntentError::InvalidRequest,
+        ),
+        3 => SensitiveOnboardingIntentResponse::Rejected(
+            SensitiveOnboardingIntentError::RevisionConflict,
+        ),
+        4 => SensitiveOnboardingIntentResponse::Rejected(
+            SensitiveOnboardingIntentError::PlacementUnavailable,
+        ),
+        5 => SensitiveOnboardingIntentResponse::Rejected(
+            SensitiveOnboardingIntentError::MaterializationFailed,
+        ),
+        _ => return Err("invalid sensitive onboarding response status"),
+    };
+    if !cursor.is_empty() {
+        return Err("sensitive onboarding response has trailing bytes");
+    }
+    Ok(response)
+}
+
+fn push_u16_bytes(target: &mut Vec<u8>, value: &[u8]) -> Result<(), &'static str> {
+    target.extend_from_slice(
+        &u16::try_from(value.len())
+            .map_err(|_| "sensitive onboarding field is too long")?
+            .to_be_bytes(),
+    );
+    target.extend_from_slice(value);
+    Ok(())
+}
+
+fn uuid_from_frame(value: &[u8]) -> Result<Uuid, &'static str> {
+    Uuid::from_slice(value).map_err(|_| "invalid onboarding UUID")
+}
+
+struct FrameCursor<'a> {
+    remaining: &'a [u8],
+}
+
+impl<'a> FrameCursor<'a> {
+    fn new(remaining: &'a [u8]) -> Self {
+        Self { remaining }
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8], &'static str> {
+        if self.remaining.len() < len {
+            return Err("truncated sensitive onboarding frame");
+        }
+        let (value, remaining) = self.remaining.split_at(len);
+        self.remaining = remaining;
+        Ok(value)
+    }
+
+    fn take_u16_bytes(&mut self, max: usize) -> Result<&'a [u8], &'static str> {
+        let len = usize::from(u16::from_be_bytes(
+            self.take(2)?
+                .try_into()
+                .map_err(|_| "invalid sensitive onboarding field length")?,
+        ));
+        if len > max {
+            return Err("sensitive onboarding field exceeds its limit");
+        }
+        self.take(len)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.remaining.is_empty()
     }
 }
 
@@ -237,5 +568,39 @@ mod tests {
                 "projection leaked {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn sensitive_intent_binary_frame_round_trips_and_debug_redacts() {
+        let canary = "frame-passphrase-canary";
+        let frame = SensitiveOnboardingIntentFrame {
+            connection_id: Uuid::from_u128(7),
+            owner_capability: Some(OwnerCapabilityToken::new("owner-token")),
+            request: ApplyOnboardingSecureIntent {
+                run_id: Uuid::from_u128(8),
+                attempt_id: Uuid::from_u128(9),
+                expected_revision: 4,
+                client_operation_id: "secure-intent".into(),
+                placement: OnboardingSecurePlacement::PassphraseFile,
+                passphrase: Some(
+                    SensitiveOnboardingPassphrase::confirmed(canary.into(), canary.into()).unwrap(),
+                ),
+            },
+        };
+        let encoded = encode_sensitive_onboarding_intent(frame).unwrap();
+        assert!(
+            encoded
+                .windows(canary.len())
+                .any(|window| window == canary.as_bytes())
+        );
+        let decoded = decode_sensitive_onboarding_intent(&encoded).unwrap();
+        let debug = format!("{decoded:?}");
+        assert!(!debug.contains(canary));
+        assert_eq!(decoded.connection_id, Uuid::from_u128(7));
+        assert_eq!(decoded.request.expected_revision, 4);
+        assert_eq!(
+            decoded.request.placement,
+            OnboardingSecurePlacement::PassphraseFile
+        );
     }
 }

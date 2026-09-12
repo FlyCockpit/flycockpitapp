@@ -2,6 +2,7 @@ import { z } from "zod";
 import {
   applyOnboardingTransitionSchema,
   beginOrReopenOnboardingSchema,
+  lockedBootstrapHelloSchema,
   onboardingBootstrapEventSchema,
   onboardingBootstrapSnapshotSchema,
   onboardingReceiptQuerySchema,
@@ -1641,6 +1642,7 @@ export type RunInvocationCancelResultV1 = z.infer<typeof runInvocationCancelResu
 export const responseNameSchema = z.enum([
   "ack",
   "onboarding_bootstrap_snapshot",
+  "locked_bootstrap_hello",
   "onboarding_transition",
   "onboarding_transition_receipt",
   "app_flag",
@@ -2165,6 +2167,7 @@ const responseVariant = <Name extends ResponseName, Schema extends z.ZodTypeAny>
 export const responseEnvelopeSchema = z.discriminatedUnion("response", [
   z.object({ ...responseBaseSchema, response: z.literal("ack") }).passthrough(),
   responseVariant("onboarding_bootstrap_snapshot", onboardingBootstrapSnapshotSchema.nullable()),
+  responseVariant("locked_bootstrap_hello", lockedBootstrapHelloSchema),
   responseVariant("onboarding_transition", onboardingTransitionResultSchema),
   responseVariant("onboarding_transition_receipt", onboardingTransitionReceiptSchema.nullable()),
   responseVariant(

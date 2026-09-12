@@ -498,6 +498,10 @@ struct ProviderEditCapability {
     layer_id: String,
     revision: String,
     config_generation: u64,
+    /// Minted while the global configuration directory did not exist. This
+    /// exact capability is the sole provider-write exception for an already
+    /// selected ephemeral owner.
+    create_on_first_write: bool,
     mcp_target_path: std::path::PathBuf,
     mcp_revision: String,
     mcp_scope_targets: std::collections::BTreeMap<String, (std::path::PathBuf, String)>,
@@ -17586,11 +17590,6 @@ async fn handle_serialized_request_impl(
             mutation_intent_hash,
             mutation,
         } => {
-            if ctx.is_ephemeral_lifetime() {
-                return Err(bad_request(
-                    "ephemeral daemons do not accept provider config writes",
-                ));
-            }
             apply_provider_mutation(
                 ctx,
                 snapshot_session_id,
@@ -18253,11 +18252,6 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Execute(generation) => generation,
             };
             let operation = async {
-                if ctx.is_ephemeral_lifetime() {
-                    return Err(bad_request(
-                        "ephemeral daemons do not accept MCP config writes",
-                    ));
-                }
                 #[cfg(feature = "remote")]
                 let request = Request::SaveMcpConfig {
                     client_operation_id: client_operation_id.clone(),
@@ -21157,6 +21151,11 @@ fn prepare_user_level_write_target(
     Ok(path)
 }
 
+fn is_missing_global_layer_target(path: &std::path::Path) -> bool {
+    cockpit_config::config::dirs::global_config_dir()
+        .is_ok_and(|global| path.starts_with(&global) && !global.exists())
+}
+
 /// Journal replay of a durable user-level target. Creates a missing global
 /// layer only after the journal's capability-bound target has been validated;
 /// owner lifetime is intentionally unchanged. Does not re-canonicalize a
@@ -21290,6 +21289,7 @@ async fn provider_catalog_snapshot(
     }
     let mut mcp_scope_revisions = std::collections::BTreeMap::new();
     let minted_edit_capability = if let Some(target_path) = target_path {
+        let create_on_first_write = is_missing_global_layer_target(&target_path);
         let mut capabilities = PROVIDER_EDIT_CAPABILITIES
             .lock()
             .map_err(|_| internal(anyhow::anyhow!("provider capability registry poisoned")))?;
@@ -21315,6 +21315,7 @@ async fn provider_catalog_snapshot(
                 layer_id: layer_id.clone(),
                 revision: revision.clone(),
                 config_generation,
+                create_on_first_write,
                 // An absent MCP layer leaves empty bindings; `save_mcp_config`
                 // then fails its path/revision equality checks, so the
                 // capability cannot be replayed against an MCP target.
@@ -21464,6 +21465,11 @@ async fn apply_provider_mutation(
             inventory::current_config_generation(),
             &observed_revision,
         )?;
+        if ctx.is_ephemeral_lifetime() && !capability.create_on_first_write {
+            return Err(bad_request(
+                "ephemeral daemons accept only a capability-bound global create-on-first-write",
+            ));
+        }
 
         // Validate the entire intent before the first durable side effect. This is
         // also defense in depth for typed in-process callers that bypass decoding.
@@ -21517,6 +21523,7 @@ async fn apply_provider_mutation(
                     layer_id: layer_id.clone(),
                     revision: commit.result_revision.clone(),
                     config_generation: commit.config_generation,
+                    create_on_first_write: false,
                     mcp_target_path: capability.mcp_target_path,
                     mcp_revision: capability.mcp_revision,
                     mcp_scope_targets: capability.mcp_scope_targets,
@@ -21630,6 +21637,9 @@ pub(super) fn register_mcp_edit_capability_for_test(
             layer_id: String::new(),
             revision: String::new(),
             config_generation: 0,
+            create_on_first_write: is_missing_global_layer_target(std::path::Path::new(
+                config_path,
+            )),
             mcp_target_path: std::path::PathBuf::from(config_path),
             mcp_revision: revision.to_string(),
             mcp_scope_targets: std::collections::BTreeMap::new(),
@@ -24071,6 +24081,7 @@ mod provider_atomic_authority_tests {
             layer_id: "layer".into(),
             revision: "revision".into(),
             config_generation: 7,
+            create_on_first_write: false,
             mcp_target_path: "/project/.cockpit/mcp.json".into(),
             mcp_revision: "mcp-revision".into(),
             mcp_scope_targets: std::collections::BTreeMap::new(),
@@ -25851,6 +25862,11 @@ async fn save_mcp_config(
                 "MCP edit authority does not match the daemon snapshot; reload before retrying"
                     .into(),
         });
+    }
+    if ctx.is_ephemeral_lifetime() && !capability.create_on_first_write {
+        return Err(bad_request(
+            "ephemeral daemons accept only a capability-bound global create-on-first-write",
+        ));
     }
     recover_mcp_config_journals(ctx, project_root).await?;
     let patch: cockpit_proto::McpConfigPatch = serde_json::from_str(patch_json)

@@ -62,17 +62,56 @@ fn config_with_provider(provider_id: &str, model_id: &str) -> ProvidersConfig {
     cfg
 }
 
+fn onboarding_snapshot(
+    stage: cockpit_proto::OnboardingStage,
+) -> cockpit_proto::OnboardingBootstrapSnapshot {
+    cockpit_proto::OnboardingBootstrapSnapshot {
+        run_id: uuid::Uuid::from_u128(1),
+        attempt_id: uuid::Uuid::from_u128(2),
+        revision: stage as u64,
+        stage,
+        bootstrap_state: if matches!(
+            stage,
+            cockpit_proto::OnboardingStage::Welcome
+                | cockpit_proto::OnboardingStage::Profile
+                | cockpit_proto::OnboardingStage::SecureStore
+        ) {
+            cockpit_proto::OnboardingBootstrapState::AwaitingChoice
+        } else {
+            cockpit_proto::OnboardingBootstrapState::Ready
+        },
+        limited_mode: false,
+        lifetime_selection: None,
+        host_capabilities: cockpit_proto::HostCapabilitySnapshot::unpublished(),
+        last_receipt: None,
+    }
+}
+
+fn set_onboarding_stage(app: &mut App, stage: cockpit_proto::OnboardingStage) {
+    app.onboarding_snapshot = Some(onboarding_snapshot(stage));
+}
+
 fn advance_welcome_and_profile(app: &mut App, cwd: &std::path::Path) {
-    app.first_run_flow = FirstRunFlow::AwaitWelcome;
+    set_onboarding_stage(app, cockpit_proto::OnboardingStage::Welcome);
     app.dialog = crate::tui::settings::Dialog::open_setup_wizard(
         cwd,
         cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
     )
     .unwrap();
     assert!(with_trusted_workspace(cwd, || app.service_first_run_flow()));
-    assert_eq!(app.first_run_flow, FirstRunFlow::AwaitProfile);
+    set_onboarding_stage(app, cockpit_proto::OnboardingStage::Profile);
     app.dialog.test_mark_setup_complete("profile-save");
     assert!(with_trusted_workspace(cwd, || app.service_first_run_flow()));
+    set_onboarding_stage(app, cockpit_proto::OnboardingStage::SecureStore);
+    assert_eq!(
+        app.onboarding_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.stage),
+        Some(cockpit_proto::OnboardingStage::SecureStore)
+    );
+    set_onboarding_stage(app, cockpit_proto::OnboardingStage::Provider);
+    app.dialog = crate::tui::settings::Dialog::None;
+    app.maybe_open_add_provider_wizard();
     assert!(app.dialog.test_provider_is_add());
 }
 
@@ -87,6 +126,7 @@ fn first_run_chains_provider_then_model() {
     app.dialog.test_mark_provider_add_done("p");
 
     assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
+    set_onboarding_stage(&mut app, cockpit_proto::OnboardingStage::Model);
 
     assert_eq!(
         app.dialog.test_page_name(),
@@ -119,18 +159,21 @@ fn first_run_flow_completes_end_to_end() {
     app.dialog.test_mark_provider_add_done("p");
 
     assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
+    set_onboarding_stage(&mut app, cockpit_proto::OnboardingStage::Model);
     assert_eq!(
         app.dialog.test_page_name(),
         Some(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID)
     );
     app.dialog.test_mark_setup_complete("model-save");
     assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
+    set_onboarding_stage(&mut app, cockpit_proto::OnboardingStage::Agent);
     assert_eq!(
         app.dialog.test_page_name(),
         Some(cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID)
     );
     app.dialog.test_mark_setup_complete("agent-install");
     assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
+    set_onboarding_stage(&mut app, cockpit_proto::OnboardingStage::Lifetime);
     assert_eq!(
         app.dialog.test_page_name(),
         Some(cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID)
@@ -163,11 +206,14 @@ fn first_run_configuration_queues_held_draft_behind_selected_model() {
     write_config(tmp.path(), &cfg);
     app.dialog.test_mark_provider_add_done("p");
     assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
+    set_onboarding_stage(&mut app, cockpit_proto::OnboardingStage::Model);
     app.dialog.test_mark_setup_complete("model-save");
 
     assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
+    set_onboarding_stage(&mut app, cockpit_proto::OnboardingStage::Agent);
     app.dialog.test_mark_setup_complete("agent-install");
     assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
+    set_onboarding_stage(&mut app, cockpit_proto::OnboardingStage::Lifetime);
     app.dialog.test_mark_setup_complete("lifetime-save");
 
     let (control_tx, mut control_rx) = mpsc::channel(4);

@@ -49,11 +49,61 @@ export const onboardingTransitionReceiptSchema = z
   .strict();
 export type OnboardingTransitionReceipt = z.infer<typeof onboardingTransitionReceiptSchema>;
 
-/**
- * The host-capability projection is defined by the daemon capability protocol.
- * It is an opaque redacted projection here so this mirror cannot accidentally
- * add credential or path fields to the bootstrap surface.
- */
+const featureCapabilitySchema = z
+  .object({
+    id: z.string(),
+    state: z.enum(["available", "missing", "unsupported", "failed"]),
+    reason: z.string(),
+    fix_command: z.string().optional(),
+    remedy_text: z.string().optional(),
+    dependency_ids: z.array(z.string()).optional(),
+  })
+  .strict();
+
+const catalogDependencySchema = z
+  .object({
+    id: z.string(),
+    state: z.enum([
+      "pending",
+      "available",
+      "missing",
+      "incompatible",
+      "timed_out",
+      "failed",
+      "unknown",
+      "not_applicable",
+    ]),
+    importance: z.enum([
+      "required_for_default_safety",
+      "required_when_feature_selected",
+      "optional_integration",
+      "optional_accelerator",
+    ]),
+    target: z.enum(["host", "container"]),
+    required_version: z.string().optional(),
+    discovered_version: z.string().optional(),
+    cause: z.unknown().optional(),
+    remedy: z.unknown().optional(),
+    reason: z.string(),
+  })
+  .strict();
+
+export const onboardingHostCapabilitiesSchema = z
+  .object({
+    generation: z.number().int().nonnegative(),
+    features: z.array(featureCapabilitySchema),
+    dependencies: z.array(catalogDependencySchema),
+    secretStore: z
+      .object({
+        intent: z.enum(["unconfigured", "database", "keyring"]),
+        effective_placement: z.enum(["unavailable", "database", "keyring"]),
+        fail_closed_reason: z.string().nullable().optional(),
+        fix_command: z.string().nullable().optional(),
+      })
+      .strict(),
+  })
+  .strict();
+
 export const onboardingBootstrapSnapshotSchema = z
   .object({
     run_id: z.string().uuid(),
@@ -63,7 +113,7 @@ export const onboardingBootstrapSnapshotSchema = z
     bootstrap_state: onboardingBootstrapStateSchema,
     limited_mode: z.boolean(),
     lifetime_selection: z.string().optional(),
-    host_capabilities: z.object({}).passthrough(),
+    host_capabilities: onboardingHostCapabilitiesSchema,
     last_receipt: onboardingTransitionReceiptSchema.optional(),
   })
   .strict();
@@ -114,12 +164,15 @@ export const onboardingTransitionResultSchema = z
   .strict();
 export type OnboardingTransitionResult = z.infer<typeof onboardingTransitionResultSchema>;
 
-export interface LockedBootstrapHello {
-  protocol_version: number;
-  bootstrap_available: boolean;
-  host_capabilities: object;
-  snapshot?: OnboardingBootstrapSnapshot;
-}
+export const lockedBootstrapHelloSchema = z
+  .object({
+    protocol_version: z.number().int().nonnegative(),
+    bootstrap_available: z.boolean(),
+    host_capabilities: onboardingHostCapabilitiesSchema,
+    snapshot: onboardingBootstrapSnapshotSchema.optional(),
+  })
+  .strict();
+export type LockedBootstrapHello = z.infer<typeof lockedBootstrapHelloSchema>;
 
 /** A passphrase is intentionally absent: it is Rust-only sensitive ingress. */
 export const onboardingBootstrapEventSchema = z

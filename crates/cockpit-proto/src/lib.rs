@@ -100,7 +100,11 @@ pub use onboarding::{
     LockedBootstrapHello, OnboardingBootstrapEvent, OnboardingBootstrapSnapshot,
     OnboardingBootstrapState, OnboardingReceiptQuery, OnboardingReceiptStatus,
     OnboardingSecurePlacement, OnboardingStage, OnboardingTransitionKind,
-    OnboardingTransitionReceipt, OnboardingTransitionResult, SensitiveOnboardingPassphrase,
+    OnboardingTransitionReceipt, OnboardingTransitionResult, SensitiveOnboardingIntentError,
+    SensitiveOnboardingIntentFrame, SensitiveOnboardingIntentResponse,
+    SensitiveOnboardingPassphrase, decode_sensitive_onboarding_intent,
+    decode_sensitive_onboarding_response, encode_sensitive_onboarding_intent,
+    encode_sensitive_onboarding_response,
 };
 pub use provider_management::{
     ProviderLayerMetadataPatch, ProviderMutationBatch, ProviderMutationDelete,
@@ -163,7 +167,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1481,18 +1485,21 @@ pub fn daemon_hello_from_envelope(env: &Envelope) -> Option<DaemonHello> {
     if !id.is_nil() {
         return None;
     }
-    let Response::DaemonStatus {
-        daemon_version,
-        protocol_version,
-        ..
-    } = response.as_ref()
-    else {
-        return None;
-    };
-    Some(DaemonHello {
-        daemon_version: daemon_version.clone(),
-        protocol_version: *protocol_version,
-    })
+    match response.as_ref() {
+        Response::DaemonStatus {
+            daemon_version,
+            protocol_version,
+            ..
+        } => Some(DaemonHello {
+            daemon_version: daemon_version.clone(),
+            protocol_version: *protocol_version,
+        }),
+        Response::LockedBootstrapHello(hello) => Some(DaemonHello {
+            daemon_version: DAEMON_VERSION.to_string(),
+            protocol_version: hello.protocol_version,
+        }),
+        _ => None,
+    }
 }
 
 pub fn parse_daemon_hello_line(line: &str) -> Result<Option<DaemonHello>> {

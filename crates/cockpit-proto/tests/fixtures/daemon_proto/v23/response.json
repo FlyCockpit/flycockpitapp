@@ -1,4 +1,39 @@
 {
+  "locked_bootstrap_hello": {
+    "bootstrap_available": true,
+    "host_capabilities": {
+      "dependencies": [],
+      "features": [],
+      "generation": 0,
+      "secretStore": {
+        "effective_placement": "unavailable",
+        "fail_closed_reason": null,
+        "fix_command": null,
+        "intent": "unconfigured"
+      }
+    },
+    "protocol_version": 23,
+    "response": "locked_bootstrap_hello",
+    "snapshot": {
+      "attempt_id": "22222222-2222-4222-8222-222222222222",
+      "bootstrap_state": "awaiting_choice",
+      "host_capabilities": {
+        "dependencies": [],
+        "features": [],
+        "generation": 0,
+        "secretStore": {
+          "effective_placement": "unavailable",
+          "fail_closed_reason": null,
+          "fix_command": null,
+          "intent": "unconfigured"
+        }
+      },
+      "limited_mode": false,
+      "revision": 1,
+      "run_id": "11111111-1111-4111-8111-111111111111",
+      "stage": "secure_store"
+    }
+  },
   "onboarding_bootstrap_snapshot": {
     "data": {
       "attempt_id": "22222222-2222-4222-8222-222222222222",

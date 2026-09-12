@@ -14,7 +14,17 @@ const snapshot = {
   stage: "secure_store",
   bootstrap_state: "awaiting_passphrase",
   limited_mode: false,
-  host_capabilities: {},
+  host_capabilities: {
+    generation: 0,
+    features: [],
+    dependencies: [],
+    secretStore: {
+      intent: "unconfigured",
+      effective_placement: "unavailable",
+      fail_closed_reason: null,
+      fix_command: null,
+    },
+  },
 };
 
 describe("daemon onboarding wire projection", () => {

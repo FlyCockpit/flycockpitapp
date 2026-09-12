@@ -5,7 +5,8 @@ impl App {
         self.onboarding_skip = skip;
         self.onboarding_force = force;
         if skip {
-            self.first_run_flow = FirstRunFlow::None;
+            self.onboarding_snapshot = None;
+            self.onboarding_completion_visible = false;
             self.dialog = crate::tui::settings::Dialog::None;
         }
     }
@@ -67,17 +68,8 @@ impl App {
         &mut self,
         snapshot: Option<cockpit_proto::OnboardingBootstrapSnapshot>,
     ) {
-        self.onboarding_snapshot = snapshot.clone();
-        self.first_run_flow = match snapshot.as_ref().map(|value| value.stage) {
-            None | Some(cockpit_proto::OnboardingStage::Complete) => FirstRunFlow::None,
-            Some(cockpit_proto::OnboardingStage::Welcome) => FirstRunFlow::AwaitWelcome,
-            Some(cockpit_proto::OnboardingStage::Profile) => FirstRunFlow::AwaitProfile,
-            Some(cockpit_proto::OnboardingStage::SecureStore) => FirstRunFlow::AwaitSecureStore,
-            Some(cockpit_proto::OnboardingStage::Provider) => FirstRunFlow::AwaitProvider,
-            Some(cockpit_proto::OnboardingStage::Model) => FirstRunFlow::AwaitModel,
-            Some(cockpit_proto::OnboardingStage::Agent) => FirstRunFlow::AwaitAgent,
-            Some(cockpit_proto::OnboardingStage::Lifetime) => FirstRunFlow::AwaitLifetime,
-        };
+        self.onboarding_completion_visible = false;
+        self.onboarding_snapshot = snapshot;
         self.maybe_open_add_provider_wizard();
     }
 
@@ -143,14 +135,21 @@ impl App {
             // reconnect is not a provider-less launch.
             return;
         }
-        if self.first_run_flow == FirstRunFlow::None {
+        let Some(stage) = self
+            .onboarding_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.stage)
+        else {
+            return;
+        };
+        if stage == cockpit_proto::OnboardingStage::Complete {
             return;
         }
-        self.dialog = match self.first_run_flow {
-            FirstRunFlow::AwaitWelcome => {
+        self.dialog = match stage {
+            cockpit_proto::OnboardingStage::Welcome => {
                 crate::tui::settings::Dialog::open_onboarding_welcome(&self.launch.cwd)
             }
-            FirstRunFlow::AwaitProfile => match crate::tui::settings::Dialog::open_setup_wizard(
+            cockpit_proto::OnboardingStage::Profile => match crate::tui::settings::Dialog::open_setup_wizard(
                 &self.launch.cwd,
                 cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
             ) {
@@ -160,16 +159,20 @@ impl App {
                     return;
                 }
             },
-            FirstRunFlow::AwaitSecureStore => {
-                crate::tui::settings::Dialog::open_onboarding_secure_store(&self.launch.cwd)
-            }
-            FirstRunFlow::AwaitProvider => {
+            cockpit_proto::OnboardingStage::SecureStore => crate::tui::settings::Dialog::open_onboarding_secure_store(
+                self.onboarding_snapshot
+                    .as_ref()
+                    .expect("secure-store stage has a snapshot")
+                    .host_capabilities
+                    .clone(),
+            ),
+            cockpit_proto::OnboardingStage::Provider => {
                 crate::tui::settings::Dialog::open_onboarding_provider_add(
                     &self.launch.cwd,
                     Some("Resume setup: add and validate a provider credential.".to_string()),
                 )
             }
-            FirstRunFlow::AwaitModel => {
+            cockpit_proto::OnboardingStage::Model => {
                 match crate::tui::settings::Dialog::open_onboarding_model_setup(Some(
                     "Resume setup: enter a model ID and its context settings.".to_string(),
                 )) {
@@ -180,7 +183,7 @@ impl App {
                     }
                 }
             }
-            FirstRunFlow::AwaitAgent => {
+            cockpit_proto::OnboardingStage::Agent => {
                 match crate::tui::settings::Dialog::open_onboarding_agent_setup(Some(
                     "Resume setup: install an agent and confirm its model, tools, trust, and sidecar."
                         .to_string(),
@@ -192,7 +195,7 @@ impl App {
                     }
                 }
             }
-            FirstRunFlow::AwaitLifetime => {
+            cockpit_proto::OnboardingStage::Lifetime => {
                 match crate::tui::settings::Dialog::open_onboarding_lifetime_setup(Some(
                     "Resume setup: choose what happens when the last Cockpit window closes."
                         .to_string(),
@@ -204,18 +207,43 @@ impl App {
                     }
                 }
             }
-            FirstRunFlow::AwaitFinish => crate::tui::settings::Dialog::open_first_run_complete(
-                "Setup is ready. Suggested first prompt: ‘Help me understand this codebase.’"
-                    .to_string(),
-            ),
-            FirstRunFlow::None => return,
+            cockpit_proto::OnboardingStage::Complete => return,
         };
     }
 
     pub(super) fn service_first_run_flow(&mut self) -> bool {
-        match self.first_run_flow {
-            FirstRunFlow::None => false,
-            FirstRunFlow::AwaitWelcome => {
+        if self.onboarding_completion_visible {
+            let Some(choice) = self.dialog.take_first_run_choice() else {
+                return false;
+            };
+            match choice {
+                crate::tui::settings::FirstRunChoice::AddAnotherProvider => {
+                    self.dialog = crate::tui::settings::Dialog::open_onboarding_provider_add(
+                        &self.launch.cwd,
+                        Some("Add another provider; live validation is required.".to_string()),
+                    );
+                    self.onboarding_completion_visible = false;
+                }
+                crate::tui::settings::FirstRunChoice::StartCoding => {
+                    self.dialog = crate::tui::settings::Dialog::None;
+                    self.onboarding_completion_visible = false;
+                    self.request_onboarding_transition(
+                        cockpit_proto::OnboardingTransitionKind::Complete,
+                    );
+                }
+            }
+            return true;
+        }
+        let Some(stage) = self
+            .onboarding_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.stage)
+        else {
+            return false;
+        };
+        match stage {
+            cockpit_proto::OnboardingStage::Complete => false,
+            cockpit_proto::OnboardingStage::Welcome => {
                 if !self
                     .dialog
                     .setup_wizard_is_active(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID)
@@ -227,7 +255,7 @@ impl App {
                 );
                 true
             }
-            FirstRunFlow::AwaitProfile => {
+            cockpit_proto::OnboardingStage::Profile => {
                 if !self
                     .dialog
                     .setup_wizard_is_complete(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID)
@@ -240,8 +268,52 @@ impl App {
                 );
                 true
             }
-            FirstRunFlow::AwaitSecureStore => true,
-            FirstRunFlow::AwaitProvider => {
+            cockpit_proto::OnboardingStage::SecureStore => {
+                let Some(submission) = self.dialog.take_onboarding_secure_store_submission() else {
+                    return false;
+                };
+                let Some(snapshot) = self.onboarding_snapshot.as_ref() else {
+                    return false;
+                };
+                let request = cockpit_proto::ApplyOnboardingSecureIntent {
+                    run_id: snapshot.run_id,
+                    attempt_id: snapshot.attempt_id,
+                    expected_revision: snapshot.revision,
+                    client_operation_id: uuid::Uuid::new_v4().to_string(),
+                    placement: submission.placement,
+                    passphrase: submission.passphrase,
+                };
+                let lifecycle = self.lifecycle.clone();
+                self.async_actions.start(
+                    crate::tui::async_action::AsyncActionKind::DaemonRpc(
+                        "onboarding.secure_intent",
+                    ),
+                    crate::tui::async_action::AsyncActionPolicy::Dedupe(
+                        crate::tui::async_action::AsyncActionKey::new("onboarding.secure_intent"),
+                    ),
+                    async move {
+                        let resolved = lifecycle.resolve_default().await?;
+                        let client =
+                            cockpit_client::DaemonClient::connect_endpoint(&resolved.endpoint)
+                                .await
+                                .map_err(|error| error.to_string())?;
+                        match client
+                            .apply_onboarding_secure_intent(&resolved.endpoint, request)
+                            .await
+                            .map_err(|error| error.to_string())?
+                        {
+                            Ok(result) => Ok(
+                                crate::tui::async_action::AsyncActionPayload::OnboardingBootstrap(
+                                    Some(result.snapshot),
+                                ),
+                            ),
+                            Err(error) => Err(error.to_string()),
+                        }
+                    },
+                );
+                true
+            }
+            cockpit_proto::OnboardingStage::Provider => {
                 let Some(provider_id) = self.dialog.take_completed_provider_id() else {
                     return false;
                 };
@@ -273,7 +345,7 @@ impl App {
                 }
                 true
             }
-            FirstRunFlow::AwaitModel => {
+            cockpit_proto::OnboardingStage::Model => {
                 if !self.dialog.setup_wizard_is_complete_any(&[
                     cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID,
                 ]) {
@@ -285,7 +357,7 @@ impl App {
                 );
                 true
             }
-            FirstRunFlow::AwaitAgent => {
+            cockpit_proto::OnboardingStage::Agent => {
                 if !self
                     .dialog
                     .setup_wizard_is_complete(cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID)
@@ -298,7 +370,7 @@ impl App {
                 );
                 true
             }
-            FirstRunFlow::AwaitLifetime => {
+            cockpit_proto::OnboardingStage::Lifetime => {
                 if !self
                     .dialog
                     .setup_wizard_is_complete(cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID)
@@ -348,7 +420,7 @@ impl App {
                 self.dialog = crate::tui::settings::Dialog::open_first_run_complete(format!(
                     "{summary} {sandbox}. {dependencies}.{platform_warning} Add another provider any time with /provider add. Suggested first prompt: ‘Help me understand this codebase.’"
                 ));
-                self.first_run_flow = FirstRunFlow::AwaitFinish;
+                self.onboarding_completion_visible = true;
                 if self.submit_after_model_selection {
                     match configured_model {
                         Some(active) => {
@@ -368,27 +440,6 @@ impl App {
                                     .to_string(),
                             );
                         }
-                    }
-                }
-                true
-            }
-            FirstRunFlow::AwaitFinish => {
-                let Some(choice) = self.dialog.take_first_run_choice() else {
-                    return false;
-                };
-                match choice {
-                    crate::tui::settings::FirstRunChoice::AddAnotherProvider => {
-                        self.dialog = crate::tui::settings::Dialog::open_onboarding_provider_add(
-                            &self.launch.cwd,
-                            Some("Add another provider; live validation is required.".to_string()),
-                        );
-                        self.first_run_flow = FirstRunFlow::AwaitProvider;
-                    }
-                    crate::tui::settings::FirstRunChoice::StartCoding => {
-                        self.dialog = crate::tui::settings::Dialog::None;
-                        self.request_onboarding_transition(
-                            cockpit_proto::OnboardingTransitionKind::Complete,
-                        );
                     }
                 }
                 true

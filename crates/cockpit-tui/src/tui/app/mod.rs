@@ -473,19 +473,6 @@ pub enum StartupWorkspaceTrust {
     Pending(cockpit_config::trust::TrustRoot),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FirstRunFlow {
-    None,
-    AwaitWelcome,
-    AwaitProfile,
-    AwaitSecureStore,
-    AwaitProvider,
-    AwaitModel,
-    AwaitAgent,
-    AwaitLifetime,
-    AwaitFinish,
-}
-
 /// Required launch modals share one precedence order for drawing and input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StartupModal {
@@ -2744,8 +2731,10 @@ pub struct App {
     #[cfg(feature = "remote")]
     pub(super) connector_disclosure: Option<cockpit_proto::ConnectorDisclosure>,
     has_no_providers_at_startup: bool,
-    first_run_flow: FirstRunFlow,
     onboarding_snapshot: Option<cockpit_proto::OnboardingBootstrapSnapshot>,
+    /// Presentation-only completion choice. Durable stage ownership remains
+    /// exclusively in `onboarding_snapshot`; this flag never acts as a reducer.
+    onboarding_completion_visible: bool,
     onboarding_skip: bool,
     onboarding_force: bool,
     /// An open `/side` side conversation, or `None` in the main session. While
@@ -3986,8 +3975,8 @@ impl App {
             #[cfg(feature = "remote")]
             connector_disclosure,
             has_no_providers_at_startup,
-            first_run_flow: FirstRunFlow::None,
             onboarding_snapshot: None,
+            onboarding_completion_visible: false,
             onboarding_skip: false,
             onboarding_force: false,
             side_conversation: None,

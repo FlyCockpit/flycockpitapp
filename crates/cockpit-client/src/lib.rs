@@ -701,6 +701,64 @@ impl DaemonClient {
         }
     }
 
+    /// Apply the one Rust-only onboarding secure intent through the dedicated
+    /// zeroizing local channel. The passphrase never enters the ordinary
+    /// request queue, serde, logs, or a clonable client command.
+    pub async fn apply_onboarding_secure_intent(
+        &self,
+        endpoint: &ClientEndpoint,
+        request: proto::ApplyOnboardingSecureIntent,
+    ) -> Result<std::result::Result<proto::OnboardingTransitionResult, ErrorPayload>> {
+        if !self.has_owner_capability() {
+            return Ok(Err(ErrorPayload {
+                code: proto::ErrorCode::Authorization,
+                message: "onboarding secure intent requires the authenticated local owner".into(),
+            }));
+        }
+        let payload =
+            proto::encode_sensitive_onboarding_intent(proto::SensitiveOnboardingIntentFrame {
+                // The peer credential token is already bound to its minting
+                // control connection in the daemon registry. The sensitive
+                // sibling verifies that token against the same OS peer.
+                connection_id: Uuid::nil(),
+                owner_capability: self.owner_capability.clone(),
+                request,
+            })
+            .map_err(anyhow::Error::msg)?;
+        let response = endpoint.sensitive_request(payload).await?;
+        match proto::decode_sensitive_onboarding_response(&response).map_err(anyhow::Error::msg)? {
+            proto::SensitiveOnboardingIntentResponse::Applied(result) => Ok(Ok(result)),
+            proto::SensitiveOnboardingIntentResponse::Rejected(reason) => {
+                let (code, message) = match reason {
+                    proto::SensitiveOnboardingIntentError::Unauthorized => (
+                        proto::ErrorCode::Authorization,
+                        "onboarding secure intent was not authorized",
+                    ),
+                    proto::SensitiveOnboardingIntentError::InvalidRequest => (
+                        proto::ErrorCode::BadRequest,
+                        "onboarding secure intent was invalid",
+                    ),
+                    proto::SensitiveOnboardingIntentError::RevisionConflict => (
+                        proto::ErrorCode::Conflict,
+                        "onboarding secure intent revision conflicted",
+                    ),
+                    proto::SensitiveOnboardingIntentError::PlacementUnavailable => (
+                        proto::ErrorCode::BadRequest,
+                        "selected onboarding secure placement is unavailable",
+                    ),
+                    proto::SensitiveOnboardingIntentError::MaterializationFailed => (
+                        proto::ErrorCode::Internal,
+                        "selected onboarding secure placement could not be materialized",
+                    ),
+                };
+                Ok(Err(ErrorPayload {
+                    code,
+                    message: message.into(),
+                }))
+            }
+        }
+    }
+
     #[cfg(any(unix, windows))]
     #[cfg(test)]
     fn from_proto<S>(proto: ProtoStream<S>) -> Self
@@ -1099,7 +1157,10 @@ where
                         id: response_id,
                         response,
                     } if response_id == id
-                        && matches!(*response, Response::DaemonStatus { .. }) =>
+                        && matches!(
+                            *response,
+                            Response::DaemonStatus { .. } | Response::LockedBootstrapHello(..)
+                        ) =>
                     {
                         return Ok(initial_events);
                     }

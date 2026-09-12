@@ -864,7 +864,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let handle = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS as i32)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(temp.path())
             .unwrap();
         (temp, handle)

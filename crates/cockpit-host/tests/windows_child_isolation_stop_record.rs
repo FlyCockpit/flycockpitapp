@@ -62,13 +62,13 @@ mod windows_fixture {
         CreateRestrictedToken, CreateWellKnownSid, DACL_SECURITY_INFORMATION,
         DISABLE_MAX_PRIVILEGE, EqualSid, GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION,
         SID_AND_ATTRIBUTES, SetKernelObjectSecurity, SetUserObjectSecurity, TOKEN_ASSIGN_PRIMARY,
-        TOKEN_DUPLICATE, TOKEN_QUERY, TokenRestrictedSids, WRITE_DAC, WRITE_OWNER,
-        WinRestrictedCodeSid,
+        TOKEN_DUPLICATE, TOKEN_QUERY, TokenRestrictedSids, WinRestrictedCodeSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_OVERLAPPED, FILE_READ_DATA, FILE_WRITE_DATA, OPEN_EXISTING,
         PIPE_ACCESS_DUPLEX, PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND, ReadFile,
-        SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, SYNCHRONIZE, WriteFile,
+        SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+        WriteFile,
     };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
@@ -781,7 +781,7 @@ mod windows_fixture {
         let token = FixtureHandle(restricted_code_token()?);
         let executable = env::current_exe()?;
         let command = format!(
-            "\"{}\" --exact windows_fixture::restricted_child_denials --ignored --nocapture",
+            "\"{}\" --exact windows_fixture::restricted_child_denials_fixture_child --ignored --nocapture",
             executable.display()
         );
         // Mark the real temporary supervisor control-pipe server handle
@@ -1402,10 +1402,9 @@ mod windows_fixture {
         }
         let words = bytes.div_ceil(std::mem::size_of::<usize>());
         let mut storage = vec![0_usize; words];
-        let attributes = storage
-            .as_mut_ptr()
-            .cast::<windows_sys::Win32::System::Threading::PROC_THREAD_ATTRIBUTE_LIST>(
-        );
+        // `windows-sys` represents the native attribute-list structure as an
+        // opaque pointer, matching the Windows API's allocation contract.
+        let attributes = storage.as_mut_ptr().cast();
         // SAFETY: storage uses the exact size returned by the probe and remains
         // live until DeleteProcThreadAttributeList below.
         if unsafe { InitializeProcThreadAttributeList(attributes, 1, 0, &mut bytes) } == 0 {
@@ -1732,7 +1731,7 @@ mod windows_fixture {
 
     #[test]
     #[ignore = "runs only as the suspended restricted-token fixture child"]
-    fn restricted_child_denials() {
+    fn restricted_child_denials_fixture_child() {
         let supervisor = env::var(SUPERVISOR_PIPE_ENV).expect("fixture supervisor pipe name");
         let worker = env::var(WORKER_PIPE_ENV).expect("fixture worker pipe name");
         let supervisor_pid = env::var(SUPERVISOR_PID_ENV)

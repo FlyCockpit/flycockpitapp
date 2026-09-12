@@ -191,8 +191,9 @@ fn is_lower_hex(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-/// Owner-only DACL for a local named pipe: current-user Generic All, protected
-/// (no inherited Everyone/Users ACEs), no remote clients at the SDDL layer.
+/// Owner-only DACL for a local named pipe: exact ordinary-client data rights,
+/// protected (no inherited Everyone/Users ACEs). The server separately rejects
+/// remote clients when it creates an instance.
 #[cfg(windows)]
 pub struct OwnerOnlyPipeSecurity {
     descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
@@ -203,7 +204,11 @@ pub struct OwnerOnlyPipeSecurity {
 impl OwnerOnlyPipeSecurity {
     pub fn for_current_user() -> Result<Self> {
         let sid = current_user_sid()?;
-        Self::from_sddl(&format!("D:P(A;;GA;;;{sid})"))
+        // A duplex named-pipe client needs only read, write, and synchronize.
+        // Do not use Generic Write here: named-pipe generic-write expansion
+        // includes FILE_APPEND_DATA, which is FILE_CREATE_PIPE_INSTANCE for a
+        // pipe and would let an ordinary client create a server instance.
+        Self::from_sddl(&format!("D:P(A;;0x00100003;;;{sid})"))
     }
 
     fn from_sddl(sddl: &str) -> Result<Self> {
@@ -527,14 +532,13 @@ fn token_user_bytes(token: windows_sys::Win32::Foundation::HANDLE) -> Result<Vec
 /// `CreateFileW` converts live-owner contention into a false "unreachable".
 #[cfg(windows)]
 pub fn open_client_pipe_blocking(pipe: &PipeName) -> std::io::Result<std::fs::File> {
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
 
-    let file = retry_busy_open_blocking(pipe, CLIENT_PIPE_CONNECT_TIMEOUT, || {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(pipe.as_str())
+    let handle = retry_busy_open_blocking(pipe, CLIENT_PIPE_CONNECT_TIMEOUT, || {
+        open_pipe_client_handle(pipe, 0)
     })?;
+    // SAFETY: `open_pipe_client_handle` returns a unique, owned HANDLE.
+    let file = unsafe { std::fs::File::from_raw_handle(handle.cast()) };
     named_pipe_server_is_current_user(file.as_raw_handle())
         .map_err(impersonating_server_io_error)?;
     Ok(file)
@@ -546,16 +550,62 @@ pub fn open_client_pipe_blocking(pipe: &PipeName) -> std::io::Result<std::fs::Fi
 pub async fn connect_client_pipe(
     pipe: &PipeName,
 ) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
-    use std::os::windows::io::AsRawHandle;
-    use tokio::net::windows::named_pipe::ClientOptions;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use tokio::net::windows::named_pipe::NamedPipeClient;
 
-    let client = retry_busy_open_async(pipe, CLIENT_PIPE_CONNECT_TIMEOUT, || {
-        ClientOptions::new().open(pipe.as_str())
+    let handle = retry_busy_open_async(pipe, CLIENT_PIPE_CONNECT_TIMEOUT, || {
+        open_pipe_client_handle(
+            pipe,
+            windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED,
+        )
     })
     .await?;
+    // SAFETY: `open_pipe_client_handle` returns a unique, owned overlapped
+    // pipe handle. Tokio takes ownership on success and closes it on error.
+    let client = unsafe { NamedPipeClient::from_raw_handle(handle.cast()) }?;
     named_pipe_server_is_current_user(client.as_raw_handle())
         .map_err(impersonating_server_io_error)?;
     Ok(client)
+}
+
+/// Open the ordinary client side with exactly the DACL rights in
+/// [`OwnerOnlyPipeSecurity`]. Tokio's `ClientOptions` requests generic read
+/// and generic write, and generic write would not match this deliberately
+/// narrow DACL (nor should it, because it carries pipe-instance creation).
+#[cfg(windows)]
+fn open_pipe_client_handle(
+    pipe: &PipeName,
+    flags_and_attributes: windows_sys::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES,
+) -> std::io::Result<windows_sys::Win32::Foundation::HANDLE> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_READ_DATA, FILE_WRITE_DATA, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+        SECURITY_SQOS_PRESENT, SYNCHRONIZE,
+    };
+
+    let wide: Vec<u16> = pipe
+        .as_str()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `wide` is a live NUL-terminated pipe path. The returned handle
+    // is checked before it leaves this helper and ownership transfers to the
+    // caller on success.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_DATA | FILE_WRITE_DATA | SYNCHRONIZE,
+            0,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            flags_and_attributes | SECURITY_IDENTIFICATION | SECURITY_SQOS_PRESENT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(handle)
 }
 
 /// Read one NDJSON hello line without blocking past `timeout`. `std::fs::File`

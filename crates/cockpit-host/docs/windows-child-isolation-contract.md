@@ -90,8 +90,8 @@ may be added merely to make a test pass. `0x00100003` is exactly
 
 | Object | Protected SDDL template | Rule |
 | --- | --- | --- |
-| Supervisor control pipe | `D:P(A;;0x00100003;;;{USER_SID})(A;;0x00100003;;;SY)` | `{USER_SID}` and SYSTEM may open a client endpoint only to read/write/synchronize an admission exchange. The supervisor owns its already-created server handle. |
-| Admitted worker pipe | `D:P(A;;0x00100003;;;{USER_SID})(A;;0x00100003;;;SY)` | The same principal receives the post-admission direct-worker exchange; there is no generic write ACE. |
+| Supervisor control pipe | `D:P(A;;0x00100003;;;{USER_SID})(A;;0x00100003;;;SY)` | `{USER_SID}` and SYSTEM may open a client endpoint only with `FILE_READ_DATA | FILE_WRITE_DATA | SYNCHRONIZE` for an admission exchange. The supervisor owns its already-created server handle. |
+| Admitted worker pipe | `D:P(A;;0x00100003;;;{USER_SID})(A;;0x00100003;;;SY)` | The same principal receives the post-admission direct-worker exchange with exactly `FILE_READ_DATA | FILE_WRITE_DATA | SYNCHRONIZE`; there is no generic write ACE. |
 | Supervisor process object | `D:P(A;;0x00100000;;;{USER_SID})(A;;0x00100000;;;SY)` | Only `SYNCHRONIZE` is permitted. It grants none of `PROCESS_DUP_HANDLE`, `PROCESS_CREATE_PROCESS`, VM access, `WRITE_DAC`, or `WRITE_OWNER`. The trusted supervisor retains its lifecycle handle. |
 | Worker process object | `D:P(A;;0x00100000;;;{USER_SID})(A;;0x00100000;;;SY)` | Same denial rule; the trusted worker/supervisor retains needed lifecycle/private-control handles. |
 
@@ -104,48 +104,72 @@ ACE. [Process security and access
 rights](https://learn.microsoft.com/en-us/windows/win32/procthread/process-security-and-access-rights)
 defines the process-object rights that the templates intentionally omit.
 
+The existing `OwnerOnlyPipeSecurity` and both ordinary Cockpit named-pipe
+client open helpers use this same `0x00100003` contract. They call
+`CreateFileW` with `FILE_READ_DATA | FILE_WRITE_DATA | SYNCHRONIZE`, rather
+than `OpenOptions` or Tokio `ClientOptions`, because those helpers request
+generic read/write and generic write would not match (or be safe under) this
+template. This is a correction to the current ordinary-client control-pipe
+contract, not supervisor activation.
+
 For a restricted-token policy, neither protected pipe nor protected process
 template contains an RC ACE. The ordinary user SID would pass the first token
 check, but RC would fail the second. A later, non-token policy must provide an
 equivalent protected-object denial rule and prove it in the fixture; it may not
 reuse these templates by assertion alone.
 
-## Exact inheritance, containment, and release sequence for a future candidate
+## Exact inheritance, containment, and release sequence in the test-only fixture
 
-The following is the only acceptable sequence for a candidate fixture or later
-implementation. It is deliberately not wired to a production launch path.
+The test-only temporary-object fixture below follows this sequence. It is not
+wired to a production launch path.
 
-1. Create the security descriptors, pipes, Job, token, and any temporary
+1. Create and ACL a unique alternate window station and desktop before process
+   creation. The window-station DACL and desktop DACL must admit only the
+   trusted launcher identities plus the selected child principal's documented
+   minimum window-station/desktop rights; for an RC-token experiment that
+   means the separate RC access check must also be represented. The fixture
+   must treat inability to construct those temporary objects under the current
+   test-runner account as typed `Unavailable`, never fall back to `WinSta0` or
+   `Default`. Form the `window-station\\desktop` string while it is live and set
+   `STARTUPINFOW.lpDesktop` to its mutable, NUL-terminated buffer.
+2. Create the security descriptors, pipes, Job, token, and any temporary
    child-side stdio/PTY duplicates before process creation. The launcher keeps
-   the supervisor, worker, control-pipe, worker-pipe, token, Job, and parent
-   I/O ends. All have non-inheritable handles.
-2. With no child-visible handles, call `CreateProcessAsUserW` with
+   the supervisor, worker, control-pipe, worker-pipe, token, Job, window
+   station, desktop, and parent I/O ends. Retained launcher handles are
+   non-inheritable; step 4 creates only the listed child duplicates as
+   inheritable.
+3. With no child-visible handles, call `CreateProcessAsUserW` with
    `bInheritHandles = FALSE`, no `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, and
-   `CREATE_SUSPENDED`. This is the required zero-handle mode.
-3. For a supported stdio/PTY route, first duplicate only the child endpoints
+   `CREATE_SUSPENDED`, passing the `STARTUPINFOW` whose `lpDesktop` identifies
+   the alternate desktop. This is the required zero-handle mode.
+4. For a supported stdio/PTY route, first duplicate only the child endpoints
    as inheritable. Build `STARTUPINFOEXW` and set
    `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` to exactly those endpoints; call
    `CreateProcessAsUserW` with `bInheritHandles = TRUE`,
    `EXTENDED_STARTUPINFO_PRESENT`, and `CREATE_SUSPENDED`. The documented
    handle-list attribute is valid only with `TRUE`, and every listed handle
-   must already be inheritable. No Cockpit, token, process, Job, control-pipe,
-   or worker-pipe handle is listed. Close temporary launcher duplicates before
-   target resume; retain only trusted parent I/O ends.
-4. While the initial thread is suspended, verify that `GetProcessId(hProcess)`
+   must already be inheritable. The `STARTUPINFOEXW.StartupInfo.lpDesktop` is
+   the same alternate desktop. No Cockpit, token, process, Job, control-pipe,
+   worker-pipe, window-station, or desktop handle is listed. Close temporary
+   launcher duplicates before target resume; retain only trusted parent I/O
+   ends.
+5. While the initial thread is suspended, verify that `GetProcessId(hProcess)`
    equals `PROCESS_INFORMATION.dwProcessId`, verify the canonical image with
-   `QueryFullProcessImageNameW`, and verify the restricted token's exact
-   restricting-SID state with `GetTokenInformation(TokenRestrictedSids)` before
-   associating the process with the pre-created Job. Then call
+   `QueryFullProcessImageNameW`, then open **the child process token** with
+   `TOKEN_QUERY` and inspect `GetTokenInformation(TokenRestrictedSids)` for the
+   exact restricted-SID state expected of that child. Do not infer child token
+   identity from the source or pre-launch token handle. Only then associate the
+   process with the pre-created Job by calling
    `AssignProcessToJobObject` and prove membership with `IsProcessInJob`. A Job
    is a lifecycle fence only; it is not evidence of IPC or handle denial. Hold
    the Job/process/thread handles in the trusted launcher until the target has
    either been resumed and reaped or terminated on failure.
-5. Configure the separate restricted desktop/window station and its DACL
-   before creation; do not inherit an arbitrary desktop handle. Then call
+6. Then call
    `ResumeThread` on the returned primary-thread handle only after the
    descriptor, Job, identity, registration, and handle-closure checks have
    succeeded. Close the initial thread handle after resume; close the token
-   after creation; keep the Job and lifecycle process handles until quiescence.
+   after child-token inspection; keep the Job, lifecycle process,
+   window-station, and desktop handles until quiescence.
 
 Microsoft documents that `CREATE_SUSPENDED` prevents the initial thread from
 running until `ResumeThread`, that `AssignProcessToJobObject` associates a
@@ -220,10 +244,11 @@ decision supplies a finite model.
 | Native computer helpers | `crates/cockpit-core/src/computer/mod.rs`; `crates/cockpit-core/src/computer/macos_backend.rs` |
 | Git/GitHub/worktree helpers | `crates/cockpit-core/src/git/mod.rs`; `crates/cockpit-core/src/tools/intel/change_impact.rs`; `crates/cockpit-core/src/tools/worktree_orchestrate.rs` |
 
-## Test-only stop recorder and evidence rule
+## Test-only temporary-object runner and evidence rule
 
 `crates/cockpit-host/tests/windows_child_isolation_stop_record.rs` is a
-test-only typed stop recorder, not a conformance fixture. Run it on any host
+test-only temporary-object fixture runner and evidence fixture. It does not
+activate a production launch path. Run it on any host
 with:
 
 ```text
@@ -231,32 +256,60 @@ cargo test -p cockpit-host --test windows_child_isolation_stop_record -- --nocap
 ```
 
 On a non-Windows host it reports the typed `Unavailable { WindowsHost }`
-state. On Windows it reports the typed `Blocked` state with the unbounded
-resource classes above. It deliberately does not create a Job, token, pipe, or
-process: an endpoint-only RC experiment cannot be called a conformance fixture
-while executable/runtime, workspace, temp, PTY, configured-network, and
-native-approval behavior have no finite allow rule. It checks the status record
-and route-inventory parity only; it is not a capable-Windows fixture and its
-result is never pass evidence.
+state. On Windows it first provisions and ACLs a unique alternate window
+station and desktop. A real OS/API failure in required temporary-object, token,
+launch, attribute-list, inspection, or Job setup is a typed `Unavailable`;
+denial, DACL, identity, image, and inheritance assertion mismatches fail the
+fixture. It then creates two unique temporary named pipes under the
+existing test-runner account with the ordinary-client descriptor above, spawns
+a second test-runner process, and measures its control admission and
+direct-worker exchanges using exactly `FILE_READ_DATA | FILE_WRITE_DATA |
+SYNCHRONIZE`. A successful temporary ordinary-client exchange is only an
+endpoint observation. The runner then records `Blocked` with the unbounded
+resource classes above, because endpoint evidence alone cannot activate a
+production policy while executable/runtime, workspace, temp, PTY,
+configured-network, and native-approval behavior have no finite allow rule.
+It then creates two disposable ordinary test-runner holder processes as the
+actual supervisor and worker process objects, and applies the protected
+current-user-only `SYNCHRONIZE` DACL to those holders. It never changes the
+test runner's process DACL. A separate disposable duplication-source holder
+opens a worker handle before that worker DACL is tightened; its own protected
+DACL grants the restricted child only `SYNCHRONIZE`. This gives the child a
+real, non-null source-process handle and a known valid worker-handle value,
+while `DuplicateHandle` is denied because that source handle lacks
+`PROCESS_DUP_HANDLE`. The fixture also verifies a direct denied `OpenProcess`
+for every forbidden supervisor/worker right: `PROCESS_DUP_HANDLE`,
+`PROCESS_CREATE_PROCESS`, `PROCESS_VM_OPERATION`, `PROCESS_VM_READ`,
+`PROCESS_VM_WRITE`, `WRITE_DAC`, and `WRITE_OWNER`.
 
-When and only when a later prompt supplies a finite product resource model, the
-stop recorder must be replaced with a real temporary-object fixture under the
-existing test-runner account. That fixture must create temporary
-pipes/directories, launch a restricted child through the sequence above, and
-record each of:
+It then creates two restricted-token children through the suspended test-only
+launch path: one with `bInheritHandles = FALSE` and no handle list, and one
+with `bInheritHandles = TRUE` and an exact three-endpoint standard-I/O handle
+list. Both receive the alternate desktop through `lpDesktop`; before either
+resume, the fixture verifies its token and image, protects its process DACL,
+and assigns/checks Job membership. A denial or inheritance mismatch is a
+fixture failure. Neither result activates a supervisor.
+
+The temporary-object runner records each of:
 
 1. ordinary-current-user supervisor admission and admitted direct-worker
    exchange with exactly the client pipe rights;
 2. child denial for both pipe opens and pipe-instance creation;
-3. child denial for `PROCESS_DUP_HANDLE`, forbidden process rights, and
-   duplication of known protected handles;
-4. permitted stdio/PTY only through the exact handle list, with no Cockpit
-   handle inherited; and
-5. each finite resource class succeeding only under its documented allow rule
-   (an RC ACE for an RC policy).
+3. child denial for `PROCESS_DUP_HANDLE`, `PROCESS_CREATE_PROCESS`,
+   `PROCESS_VM_OPERATION`, `PROCESS_VM_READ`, `PROCESS_VM_WRITE`, `WRITE_DAC`,
+   `WRITE_OWNER`, and an actual `DuplicateHandle` call using a non-null,
+   deliberately under-righted source-process handle that owns a known protected
+   worker handle;
+4. zero-handle and exact standard-I/O inheritance modes, with no Cockpit
+   handle inherited.
 
-It must report typed `Unavailable` for a missing documented capability, use no
+All fixture pipe accepts, pipe reads/writes, and child observations have a
+finite timeout. On timeout the launcher terminates and reaps the affected
+child before closing its kill-on-close Job or remaining handles.
+
+It reports typed `Unavailable` only for a real required Windows setup API
+failure, uses no
 daemon, credentials, OS-user creation, privileged installation, persistent ACL
 change, or production launch path, and preserve a typed pass/denied/unavailable
-observation for every assertion. A Job-assignment success or a unit fake is not
-conformance evidence.
+observation for every assertion. A Job-assignment success or a unit fake does
+not activate the production policy.

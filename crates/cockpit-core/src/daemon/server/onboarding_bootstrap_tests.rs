@@ -4,7 +4,7 @@ use cockpit_proto::{
     OnboardingSecurePlacement, OnboardingStage, OnboardingTransitionKind, Request, Response,
 };
 
-use super::{BootServices, boot_with_db, handle_locked_in_process_request};
+use super::{BootServices, LockedServices, boot_with_db, handle_locked_in_process_request};
 
 async fn fresh_locked_services() -> (tempfile::TempDir, super::LockedServices) {
     let tmp = tempfile::tempdir().expect("temporary daemon installation");
@@ -84,6 +84,28 @@ async fn advance_to_secure_store(
         .0
 }
 
+async fn ready_construction() -> (
+    tempfile::TempDir,
+    std::sync::Arc<LockedServices>,
+    cockpit_proto::OnboardingTransitionResult,
+) {
+    let (tmp, locked) = fresh_locked_services().await;
+    let locked = std::sync::Arc::new(locked);
+    let secure = advance_to_secure_store(&locked).await;
+    let result = locked
+        .apply_secure_intent(ApplyOnboardingSecureIntent {
+            run_id: secure.run_id,
+            attempt_id: secure.attempt_id,
+            expected_revision: secure.revision,
+            client_operation_id: "construct-ready".into(),
+            placement: OnboardingSecurePlacement::MachineBoundFile,
+            passphrase: None,
+        })
+        .await
+        .expect("apply secure-store intent");
+    (tmp, locked, result)
+}
+
 #[tokio::test]
 async fn fresh_boot_is_locked_and_materializes_only_the_explicit_machine_bound_choice() {
     let (_tmp, locked) = fresh_locked_services().await;
@@ -142,4 +164,177 @@ async fn locked_dispatch_denies_ordinary_reads_with_the_typed_error() {
         .expect_err("ordinary read must stay unavailable before vault intent");
     assert_eq!(denied.code, ErrorCode::BootstrapLocked);
     assert_eq!(denied.message, "daemon bootstrap is locked");
+}
+
+#[tokio::test]
+async fn ready_transition_keeps_the_acquired_permit_until_return_publication() {
+    let (_tmp, locked, _) = ready_construction().await;
+    let constructed = locked
+        .finish_ready_transition()
+        .await
+        .expect("construct ready services");
+
+    assert!(
+        locked
+            .ready_transition_inflight
+            .load(std::sync::atomic::Ordering::Acquire),
+        "the exact acquired permit must survive ready construction"
+    );
+    assert!(locked.closing.load(std::sync::atomic::Ordering::Acquire));
+
+    let ready = constructed.publish_returned();
+    assert!(locked.ready.load(std::sync::atomic::Ordering::Acquire));
+    assert!(
+        !locked
+            .ready_transition_inflight
+            .load(std::sync::atomic::Ordering::Acquire),
+        "publication releases the transition permit"
+    );
+    drop(ready);
+}
+
+#[tokio::test]
+async fn dropped_ready_construction_retains_permit_through_rollback() {
+    let (_tmp, locked, _) = ready_construction().await;
+    let constructed = locked
+        .finish_ready_transition()
+        .await
+        .expect("construct ready services");
+
+    drop(constructed);
+    assert!(
+        locked
+            .ready_transition_inflight
+            .load(std::sync::atomic::Ordering::Acquire),
+        "a detached rollback must retain exclusive transition ownership"
+    );
+    assert!(locked.closing.load(std::sync::atomic::Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn stored_ready_handoff_without_lifecycle_receiver_rolls_back_under_permit() {
+    let (_tmp, locked, _) = ready_construction().await;
+    let constructed = locked
+        .finish_ready_transition()
+        .await
+        .expect("construct ready services");
+
+    constructed.publish_stored();
+    assert!(
+        locked
+            .ready_transition_inflight
+            .load(std::sync::atomic::Ordering::Acquire),
+        "failed lifecycle delivery must retain exclusive transition ownership"
+    );
+    assert!(locked.closing.load(std::sync::atomic::Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn stored_ready_handoff_rolls_back_when_notified_lifecycle_consumer_is_cancelled() {
+    let (_tmp, locked, _) = ready_construction().await;
+    let mut lifecycle = locked.subscribe_ready_handoff();
+    let mut sibling_lifecycle = locked.subscribe_ready_handoff();
+    let constructed = locked
+        .finish_ready_transition()
+        .await
+        .expect("construct ready services");
+
+    constructed.publish_stored();
+    tokio::time::timeout(std::time::Duration::from_secs(1), lifecycle.changed())
+        .await
+        .expect("ready notification must be accepted")
+        .expect("ready notification sender must remain open");
+    assert!(*lifecycle.borrow_and_update());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        sibling_lifecycle.changed(),
+    )
+    .await
+    .expect("sibling ready notification must be accepted")
+    .expect("ready notification sender must remain open");
+
+    drop(lifecycle);
+    {
+        let handoff = locked.ready_handoff.lock().unwrap();
+        assert_eq!(handoff.consumers, 1);
+        assert!(
+            handoff.achieved.is_some(),
+            "one cancelled subscriber must not steal from a surviving lifecycle consumer"
+        );
+    }
+    drop(sibling_lifecycle);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while locked
+            .ready_transition_inflight
+            .load(std::sync::atomic::Ordering::Acquire)
+            || locked.closing.load(std::sync::atomic::Ordering::Acquire)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled lifecycle consumer must complete rollback");
+
+    assert!(!locked.ready.load(std::sync::atomic::Ordering::Acquire));
+    assert!(locked.take_achieved_ready().is_none());
+    let weak = std::sync::Arc::downgrade(&locked);
+    drop(locked);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while weak.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled handoff must release ready resources and locked services");
+}
+
+#[tokio::test]
+async fn retry_snapshot_failure_retains_permit_for_detached_rollback() {
+    let (_tmp, locked, _) = ready_construction().await;
+    locked
+        .fail_next_onboarding_snapshot
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    let error = match locked.prepare_retry_ready_handoff().await {
+        Ok(_) => panic!("injected snapshot failure must reject retry publication"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("injected onboarding snapshot failure")
+    );
+    assert!(
+        locked
+            .ready_transition_inflight
+            .load(std::sync::atomic::Ordering::Acquire),
+        "snapshot-failure rollback must retain exclusive transition ownership"
+    );
+    assert!(locked.closing.load(std::sync::atomic::Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn sensitive_wire_disconnect_retains_permit_through_rollback() {
+    let (_tmp, locked, result) = ready_construction().await;
+    let constructed = locked
+        .finish_ready_transition()
+        .await
+        .expect("construct ready services");
+    let (mut writer, reader) = tokio::io::duplex(64);
+    drop(reader);
+
+    assert!(
+        constructed
+            .finalize_sensitive_wire(&mut writer, result)
+            .await
+            .is_err(),
+        "disconnected sensitive peer must prevent publication"
+    );
+    assert!(
+        locked
+            .ready_transition_inflight
+            .load(std::sync::atomic::Ordering::Acquire),
+        "wire-delivery rollback must retain exclusive transition ownership"
+    );
+    assert!(locked.closing.load(std::sync::atomic::Ordering::Acquire));
 }

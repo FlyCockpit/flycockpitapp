@@ -4349,20 +4349,21 @@ pub(crate) fn locked_in_process_endpoint(
     let locked_for_client_connections = locked_for_connections.clone();
     let ready_tx_for_watch = ready_tx.clone();
     tokio::spawn(async move {
-        let mut ready_signal = locked_for_connections.ready_signal.subscribe();
+        let mut ready_signal = locked_for_connections.subscribe_ready_handoff();
         while ready_signal.changed().await.is_ok() {
             if !*ready_signal.borrow_and_update() {
                 continue;
             }
-            let Some(ready) = locked_for_connections.take_achieved_ready() else {
+            let Some(constructed) = locked_for_connections.take_achieved_ready() else {
                 continue;
             };
-            let ctx = Arc::new(ready.context);
-            if recover_before_socket_publish(&ctx).await.is_ok() {
-                let _ = ready_tx_for_watch.send(Some(ctx));
+            if constructed
+                .publish_context_to_watch(&ready_tx_for_watch)
+                .await
+                .is_ok()
+            {
                 break;
             }
-            let _ = locked_for_connections.rollback_failed_ready_handoff().await;
         }
     });
     tokio::spawn(async move {
@@ -4678,8 +4679,10 @@ pub(crate) struct LockedServices {
     closing: AtomicBool,
     inflight_mutations: AtomicUsize,
     ready_transition_inflight: AtomicBool,
-    achieved_ready: StdMutex<Option<ReadyServices>>,
+    ready_handoff: StdMutex<ReadyHandoffState>,
     ready_signal: watch::Sender<bool>,
+    #[cfg(test)]
+    fail_next_onboarding_snapshot: AtomicBool,
 }
 
 /// Vault-bearing daemon composition. Ordinary dispatch and recovery accept
@@ -4691,6 +4694,36 @@ pub(crate) struct ReadyServices {
 pub(crate) enum BootServices {
     Locked(LockedServices),
     Ready(ReadyServices),
+}
+
+#[derive(Default)]
+struct ReadyHandoffState {
+    // Registration and the mailbox share one lock so the last consumer's
+    // cancellation is linearized with publication and can break the
+    // LockedServices -> ConstructedReady -> LockedServices ownership cycle.
+    achieved: Option<ConstructedReady>,
+    consumers: usize,
+}
+
+struct ReadyHandoffReceiver {
+    locked: Arc<LockedServices>,
+    receiver: watch::Receiver<bool>,
+}
+
+impl ReadyHandoffReceiver {
+    async fn changed(&mut self) -> std::result::Result<(), watch::error::RecvError> {
+        self.receiver.changed().await
+    }
+
+    fn borrow_and_update(&mut self) -> watch::Ref<'_, bool> {
+        self.receiver.borrow_and_update()
+    }
+}
+
+impl Drop for ReadyHandoffReceiver {
+    fn drop(&mut self) {
+        self.locked.unregister_ready_handoff_consumer();
+    }
 }
 
 struct ReadyTransitionPermit {
@@ -4712,6 +4745,17 @@ impl ReadyTransitionPermit {
             self.locked.release_ready_transition();
         }
     }
+
+    async fn rollback(mut self) -> Result<()> {
+        let result = self.locked.rollback_failed_ready_handoff().await;
+        self.released = true;
+        if result.is_ok() {
+            self.locked.release_ready_transition();
+        } else {
+            tokio::spawn(rollback_and_release_ready_transition(self.locked.clone()));
+        }
+        result
+    }
 }
 
 impl Drop for ReadyTransitionPermit {
@@ -4720,13 +4764,30 @@ impl Drop for ReadyTransitionPermit {
             return;
         }
         self.released = true;
-        self.locked.release_ready_transition();
         if self.locked.closing.load(Ordering::Acquire) && !self.locked.ready.load(Ordering::Acquire)
         {
             let locked = self.locked.clone();
-            tokio::spawn(async move {
-                let _ = locked.rollback_failed_ready_handoff().await;
-            });
+            tokio::spawn(rollback_and_release_ready_transition(locked));
+        } else {
+            self.locked.release_ready_transition();
+        }
+    }
+}
+
+async fn rollback_and_release_ready_transition(locked: Arc<LockedServices>) {
+    loop {
+        match locked.rollback_failed_ready_handoff().await {
+            Ok(()) => {
+                locked.release_ready_transition();
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "ready-transition rollback failed; retaining ownership"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
         }
     }
 }
@@ -4735,16 +4796,18 @@ struct ConstructedReady {
     locked: Arc<LockedServices>,
     ready: Option<ReadyServices>,
     permit: ReadyTransitionPermit,
-    published: bool,
 }
 
 impl ConstructedReady {
-    fn new(locked: Arc<LockedServices>, ready: ReadyServices) -> Self {
+    fn new(
+        locked: Arc<LockedServices>,
+        ready: ReadyServices,
+        permit: ReadyTransitionPermit,
+    ) -> Self {
         Self {
-            permit: ReadyTransitionPermit::new(locked.clone()),
             locked,
             ready: Some(ready),
-            published: false,
+            permit,
         }
     }
 
@@ -4752,40 +4815,50 @@ impl ConstructedReady {
         self.ready.take().expect("ready services already consumed")
     }
 
-    fn publish_stored(mut self) {
-        self.published = true;
-        self.permit.release();
-        let ready = self.take_ready();
-        self.locked.store_achieved_ready(ready);
+    fn publish_stored(self) {
+        let locked = self.locked.clone();
+        locked.store_achieved_ready(self);
     }
 
     fn publish_returned(mut self) -> ReadyServices {
-        self.published = true;
+        let ready = self.take_ready();
+        self.locked.ready.store(true, Ordering::Release);
         self.permit.release();
-        self.take_ready()
+        ready
+    }
+
+    async fn publish_context_to_watch(
+        mut self,
+        ready_tx: &watch::Sender<Option<Arc<DaemonContext>>>,
+    ) -> Result<()> {
+        let ready = self.take_ready();
+        let ctx = Arc::new(ready.context);
+        if let Err(error) = recover_before_socket_publish(&ctx).await {
+            return Err(error);
+        }
+        if ready_tx.send(Some(ctx)).is_err() {
+            anyhow::bail!("ready context receiver closed before publication");
+        }
+        self.locked.ready.store(true, Ordering::Release);
+        self.permit.release();
+        Ok(())
     }
 
     async fn finalize_sensitive_in_process(
-        mut self,
+        self,
         ready_tx: &watch::Sender<Option<Arc<DaemonContext>>>,
         result: cockpit_proto::OnboardingTransitionResult,
     ) -> cockpit_proto::SensitiveOnboardingIntentResponse {
-        let ready = self.take_ready();
-        let ctx = Arc::new(ready.context);
-        if recover_before_socket_publish(&ctx).await.is_err() {
+        if self.publish_context_to_watch(ready_tx).await.is_err() {
             return cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
                 cockpit_proto::SensitiveOnboardingIntentError::ReadyConstructionFailed,
             );
         }
-        self.published = true;
-        self.permit.release();
-        let _ = ready_tx.send(Some(ctx));
-        self.locked.ready.store(true, Ordering::Release);
         cockpit_proto::SensitiveOnboardingIntentResponse::Applied(result)
     }
 
     async fn finalize_sensitive_wire(
-        mut self,
+        self,
         stream: &mut (impl tokio::io::AsyncWriteExt + Unpin),
         result: cockpit_proto::OnboardingTransitionResult,
     ) -> Result<ReadyServices> {
@@ -4796,22 +4869,6 @@ impl ConstructedReady {
         stream.flush().await?;
         stream.shutdown().await?;
         Ok(self.publish_returned())
-    }
-}
-
-impl Drop for ConstructedReady {
-    fn drop(&mut self) {
-        if self.published {
-            return;
-        }
-        self.permit.release();
-        if self.locked.closing.load(Ordering::Acquire) && !self.locked.ready.load(Ordering::Acquire)
-        {
-            let locked = self.locked.clone();
-            tokio::spawn(async move {
-                let _ = locked.rollback_failed_ready_handoff().await;
-            });
-        }
     }
 }
 
@@ -4900,8 +4957,10 @@ impl LockedServices {
             closing: AtomicBool::new(false),
             inflight_mutations: AtomicUsize::new(0),
             ready_transition_inflight: AtomicBool::new(false),
-            achieved_ready: StdMutex::new(None),
+            ready_handoff: StdMutex::new(ReadyHandoffState::default()),
             ready_signal,
+            #[cfg(test)]
+            fail_next_onboarding_snapshot: AtomicBool::new(false),
         })
     }
 
@@ -4967,16 +5026,23 @@ impl LockedServices {
     }
 
     async fn rollback_failed_ready_handoff(&self) -> Result<()> {
-        self.closing.store(false, Ordering::Release);
         self.ready.store(false, Ordering::Release);
         let _ = self.ready_signal.send(false);
         self.mark_ready_construction_failed().await?;
+        self.closing.store(false, Ordering::Release);
         Ok(())
     }
 
     async fn onboarding_snapshot_present(
         &self,
     ) -> Result<cockpit_proto::OnboardingBootstrapSnapshot> {
+        #[cfg(test)]
+        if self
+            .fail_next_onboarding_snapshot
+            .swap(false, Ordering::AcqRel)
+        {
+            anyhow::bail!("injected onboarding snapshot failure");
+        }
         self.onboarding
             .snapshot(self.host_capabilities.clone())
             .await?
@@ -4992,7 +5058,7 @@ impl LockedServices {
             self.try_acquire_ready_transition(),
             "onboarding ready construction is already in progress"
         );
-        let mut permit = ReadyTransitionPermit::new(self.clone());
+        let permit = ReadyTransitionPermit::new(self.clone());
         self.begin_locked_to_ready_transition().await;
         let outcome = match self.into_ready().await {
             Ok(ready) => match self.mark_ready_construction_recovered().await {
@@ -5002,10 +5068,9 @@ impl LockedServices {
             Err(error) => Err(error),
         };
         match outcome {
-            Ok(ready) => Ok(ConstructedReady::new(self.clone(), ready)),
+            Ok(ready) => Ok(ConstructedReady::new(self.clone(), ready, permit)),
             Err(error) => {
-                let _ = self.rollback_failed_ready_handoff().await;
-                permit.release();
+                let _ = permit.rollback().await;
                 Err(error)
             }
         }
@@ -5026,14 +5091,53 @@ impl LockedServices {
         ))
     }
 
-    fn store_achieved_ready(&self, ready: ReadyServices) {
-        *self.achieved_ready.lock().unwrap() = Some(ready);
-        self.ready.store(true, Ordering::Release);
-        let _ = self.ready_signal.send(true);
+    fn subscribe_ready_handoff(self: &Arc<Self>) -> ReadyHandoffReceiver {
+        let mut handoff = self.ready_handoff.lock().unwrap();
+        let receiver = self.ready_signal.subscribe();
+        handoff.consumers += 1;
+        drop(handoff);
+        ReadyHandoffReceiver {
+            locked: self.clone(),
+            receiver,
+        }
     }
 
-    fn take_achieved_ready(&self) -> Option<ReadyServices> {
-        self.achieved_ready.lock().unwrap().take()
+    fn unregister_ready_handoff_consumer(&self) {
+        let abandoned = {
+            let mut handoff = self.ready_handoff.lock().unwrap();
+            handoff.consumers = handoff
+                .consumers
+                .checked_sub(1)
+                .expect("ready handoff consumer count underflow");
+            (handoff.consumers == 0)
+                .then(|| handoff.achieved.take())
+                .flatten()
+        };
+        drop(abandoned);
+    }
+
+    fn store_achieved_ready(&self, ready: ConstructedReady) {
+        let rejected = {
+            let mut handoff = self.ready_handoff.lock().unwrap();
+            if handoff.consumers == 0 || handoff.achieved.is_some() {
+                Some(ready)
+            } else {
+                handoff.achieved = Some(ready);
+                None
+            }
+        };
+        if rejected.is_some() {
+            drop(rejected);
+            return;
+        }
+        if self.ready_signal.send(true).is_err() {
+            let abandoned = self.ready_handoff.lock().unwrap().achieved.take();
+            drop(abandoned);
+        }
+    }
+
+    fn take_achieved_ready(&self) -> Option<ConstructedReady> {
+        self.ready_handoff.lock().unwrap().achieved.take()
     }
 
     pub(crate) fn vault_authority_exists(&self) -> Result<bool> {
@@ -6306,7 +6410,7 @@ pub(crate) async fn run_locked_until_ready(
     crate::daemon::leak_reveal_socket::BoundRevealSocket,
 )> {
     let mut locked_clients = tokio::task::JoinSet::new();
-    let mut ready_signal = locked.ready_signal.subscribe();
+    let mut ready_signal = locked.subscribe_ready_handoff();
     loop {
         tokio::select! {
             changed = ready_signal.changed() => {
@@ -6314,11 +6418,11 @@ pub(crate) async fn run_locked_until_ready(
                     continue;
                 }
                 if *ready_signal.borrow_and_update()
-                    && let Some(ready) = locked.take_achieved_ready()
+                    && let Some(constructed) = locked.take_achieved_ready()
                 {
                     locked_clients.abort_all();
                     while locked_clients.join_next().await.is_some() {}
-                    return Ok((ready, listener, sensitive));
+                    return Ok((constructed.publish_returned(), listener, sensitive));
                 }
             }
             accepted = accept_daemon_stream(&mut listener) => {

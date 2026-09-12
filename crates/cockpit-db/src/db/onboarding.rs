@@ -161,6 +161,9 @@ pub struct OnboardingReceiptRow {
     pub client_operation_id: String,
     pub consumed_revision: u64,
     pub status: OnboardingReceiptStatus,
+    /// True only when this call returned a previously durable operation.
+    /// This is storage-local metadata and is never projected onto the wire.
+    pub replayed: bool,
 }
 
 fn uuid(value: String, field: &str) -> Result<Uuid> {
@@ -231,6 +234,52 @@ impl Db {
         limited_mode: bool,
         selected_secure_placement: Option<OnboardingSecurePlacement>,
     ) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
+        self.onboarding_transition_with_receipt_status(
+            snapshot,
+            client_operation_id,
+            next_stage,
+            bootstrap_state,
+            limited_mode,
+            selected_secure_placement,
+            OnboardingReceiptStatus::Committed,
+        )
+        .await
+    }
+
+    /// The secure-vault hand-off reserves its revision before performing an
+    /// external effect.  Its receipt stays pending until that effect reports
+    /// success, so a crash can be reconciled without pretending it committed.
+    pub async fn onboarding_transition_pending(
+        &self,
+        snapshot: OnboardingSnapshotRow,
+        client_operation_id: String,
+        next_stage: OnboardingStage,
+        bootstrap_state: OnboardingBootstrapState,
+        limited_mode: bool,
+        selected_secure_placement: Option<OnboardingSecurePlacement>,
+    ) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
+        self.onboarding_transition_with_receipt_status(
+            snapshot,
+            client_operation_id,
+            next_stage,
+            bootstrap_state,
+            limited_mode,
+            selected_secure_placement,
+            OnboardingReceiptStatus::Pending,
+        )
+        .await
+    }
+
+    async fn onboarding_transition_with_receipt_status(
+        &self,
+        snapshot: OnboardingSnapshotRow,
+        client_operation_id: String,
+        next_stage: OnboardingStage,
+        bootstrap_state: OnboardingBootstrapState,
+        limited_mode: bool,
+        selected_secure_placement: Option<OnboardingSecurePlacement>,
+        receipt_status: OnboardingReceiptStatus,
+    ) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
         self.write(move |conn| {
             transition_conn(
                 conn,
@@ -240,7 +289,59 @@ impl Db {
                 bootstrap_state,
                 limited_mode,
                 selected_secure_placement,
+                receipt_status,
             )
+        })
+        .await
+    }
+
+    /// Return an exact transition receipt, validating its immutable operation
+    /// fingerprint.  This is the only safe replay lookup: callers cannot use
+    /// an operation id from a different transition as a generic status key.
+    pub async fn onboarding_transition_receipt(
+        &self,
+        run_id: Uuid,
+        attempt_id: Uuid,
+        client_operation_id: String,
+        next_stage: OnboardingStage,
+        bootstrap_state: OnboardingBootstrapState,
+        limited_mode: bool,
+        selected_secure_placement: Option<OnboardingSecurePlacement>,
+    ) -> Result<Option<(OnboardingSnapshotRow, OnboardingReceiptRow)>> {
+        self.read(move |conn| {
+            transition_receipt_conn(
+                conn,
+                run_id,
+                attempt_id,
+                &client_operation_id,
+                next_stage,
+                bootstrap_state,
+                limited_mode,
+                selected_secure_placement,
+            )
+        })
+        .await
+    }
+
+    /// Move only a pending receipt to a terminal state.  The guarded update
+    /// prevents a late callback from rewriting an already-settled receipt.
+    pub async fn onboarding_set_pending_receipt_status(
+        &self,
+        receipt_id: Uuid,
+        status: OnboardingReceiptStatus,
+    ) -> Result<()> {
+        if status == OnboardingReceiptStatus::Pending {
+            bail!("onboarding receipt must settle to a terminal status");
+        }
+        self.write(move |conn| {
+            let changed = conn.execute(
+                "UPDATE onboarding_receipts SET status = ?1 WHERE receipt_id = ?2 AND status = 'pending'",
+                params![status.as_str(), receipt_id.to_string()],
+            )?;
+            if changed != 1 {
+                bail!("onboarding receipt is not pending");
+            }
+            Ok(())
         })
         .await
     }
@@ -296,6 +397,7 @@ fn begin_or_reopen_conn(
             client_operation_id: client_operation_id.into(),
             consumed_revision: 0,
             status: OnboardingReceiptStatus::Committed,
+            replayed: false,
         },
     ))
 }
@@ -308,6 +410,7 @@ fn transition_conn(
     bootstrap_state: OnboardingBootstrapState,
     limited_mode: bool,
     selected_secure_placement: Option<OnboardingSecurePlacement>,
+    receipt_status: OnboardingReceiptStatus,
 ) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
     if client_operation_id.is_empty() || client_operation_id.len() > 128 {
         bail!("invalid onboarding client operation id");
@@ -350,6 +453,7 @@ fn transition_conn(
                 client_operation_id: client_operation_id.into(),
                 consumed_revision: u64::try_from(consumed_revision)?,
                 status: OnboardingReceiptStatus::parse(&status)?,
+                replayed: true,
             },
         ));
     }
@@ -370,8 +474,8 @@ fn transition_conn(
     conn.execute(
         "INSERT INTO onboarding_receipts
          (receipt_id, run_id, attempt_id, client_operation_id, consumed_revision, operation_kind, operation_digest, status, created_at_unix_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'committed', ?8)",
-        params![receipt_id.to_string(), current.run_id.to_string(), current.attempt_id.to_string(), client_operation_id, i64::try_from(current.revision)?, operation_kind, operation_digest, now],
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![receipt_id.to_string(), current.run_id.to_string(), current.attempt_id.to_string(), client_operation_id, i64::try_from(current.revision)?, operation_kind, operation_digest, receipt_status.as_str(), now],
     )?;
     let snapshot = snapshot_conn(conn)?.context("onboarding transition did not persist")?;
     Ok((
@@ -382,9 +486,68 @@ fn transition_conn(
             attempt_id: current.attempt_id,
             client_operation_id: client_operation_id.into(),
             consumed_revision: current.revision,
-            status: OnboardingReceiptStatus::Committed,
+            status: receipt_status,
+            replayed: false,
         },
     ))
+}
+
+fn transition_receipt_conn(
+    conn: &rusqlite::Connection,
+    run_id: Uuid,
+    attempt_id: Uuid,
+    client_operation_id: &str,
+    next_stage: OnboardingStage,
+    bootstrap_state: OnboardingBootstrapState,
+    limited_mode: bool,
+    selected_secure_placement: Option<OnboardingSecurePlacement>,
+) -> Result<Option<(OnboardingSnapshotRow, OnboardingReceiptRow)>> {
+    let (operation_kind, operation_digest) = transition_fingerprint(
+        next_stage,
+        bootstrap_state,
+        limited_mode,
+        selected_secure_placement,
+    );
+    let receipt = conn
+        .query_row(
+            "SELECT receipt_id, consumed_revision, operation_kind, operation_digest, status
+             FROM onboarding_receipts
+             WHERE run_id = ?1 AND attempt_id = ?2 AND client_operation_id = ?3",
+            params![
+                run_id.to_string(),
+                attempt_id.to_string(),
+                client_operation_id
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((receipt_id, consumed_revision, stored_kind, stored_digest, status)) = receipt else {
+        return Ok(None);
+    };
+    if stored_kind != operation_kind || stored_digest != operation_digest {
+        bail!("onboarding client operation id was reused for a different transition");
+    }
+    let snapshot = snapshot_conn(conn)?.context("onboarding run did not persist")?;
+    Ok(Some((
+        snapshot,
+        OnboardingReceiptRow {
+            receipt_id: uuid(receipt_id, "receipt id")?,
+            run_id,
+            attempt_id,
+            client_operation_id: client_operation_id.into(),
+            consumed_revision: u64::try_from(consumed_revision)?,
+            status: OnboardingReceiptStatus::parse(&status)?,
+            replayed: true,
+        },
+    )))
 }
 
 fn reopen_conn(
@@ -416,6 +579,7 @@ fn reopen_conn(
                 client_operation_id: client_operation_id.into(),
                 consumed_revision: u64::try_from(consumed_revision)?,
                 status: OnboardingReceiptStatus::parse(&status)?,
+                replayed: true,
             },
         ));
     }
@@ -436,6 +600,7 @@ fn reopen_conn(
                 client_operation_id: client_operation_id.into(),
                 consumed_revision: current.revision,
                 status: OnboardingReceiptStatus::Committed,
+                replayed: false,
             },
         ));
     }
@@ -478,6 +643,7 @@ fn reopen_conn(
             client_operation_id: client_operation_id.into(),
             consumed_revision: current.revision,
             status: OnboardingReceiptStatus::Committed,
+            replayed: false,
         },
     ))
 }
@@ -508,7 +674,13 @@ fn transition_fingerprint(
 
 fn transition_digest(value: &str) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(value.as_bytes()))
+    let digest = Sha256::digest(value.as_bytes());
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
 }
 
 #[cfg(test)]

@@ -80,7 +80,26 @@ impl OnboardingAuthority {
         let client_operation_id = request.client_operation_id.clone();
         let placement = request.placement;
         let passphrase = request.passphrase.map(|value| value.into_zeroizing());
-        let (pending, _) = self
+        if let Some((snapshot, prior_receipt)) = self
+            .db
+            .onboarding_transition_receipt(
+                request.run_id,
+                request.attempt_id,
+                client_operation_id.clone(),
+                DbStage::SecureStore,
+                DbBootstrapState::Materializing,
+                false,
+                Some(placement(placement)),
+            )
+            .await?
+        {
+            let receipt = receipt(prior_receipt);
+            return Ok((
+                project(snapshot, host_capabilities, Some(receipt.clone()))?,
+                receipt,
+            ));
+        }
+        let (pending, pending_receipt) = self
             .record_secure_intent(
                 request.run_id,
                 request.attempt_id,
@@ -92,12 +111,24 @@ impl OnboardingAuthority {
             )
             .await?;
         materialize(placement, passphrase)?;
-        self.mark_secure_store_ready(
-            &pending,
-            format!("{client_operation_id}:ready"),
-            host_capabilities,
-        )
-        .await
+        self.db
+            .onboarding_set_pending_receipt_status(
+                pending_receipt.receipt_id,
+                DbReceiptStatus::Committed,
+            )
+            .await?;
+        let (ready, _) = self
+            .mark_secure_store_ready(
+                &pending,
+                format!("{client_operation_id}:ready"),
+                host_capabilities.clone(),
+            )
+            .await?;
+        let terminal = OnboardingTransitionReceipt {
+            status: OnboardingReceiptStatus::Committed,
+            ..receipt(pending_receipt)
+        };
+        Ok((ready, terminal))
     }
 
     async fn record_secure_intent(
@@ -134,7 +165,7 @@ impl OnboardingAuthority {
         }
         let (row, receipt_row) = self
             .db
-            .onboarding_transition(
+            .onboarding_transition_pending(
                 current,
                 client_operation_id,
                 DbStage::SecureStore,
@@ -146,6 +177,48 @@ impl OnboardingAuthority {
         let receipt = receipt(receipt_row);
         let snapshot = project(row, host_capabilities, Some(receipt.clone()))?;
         Ok((snapshot, receipt))
+    }
+
+    /// Reconcile the only crash-sensitive bootstrap checkpoint before ready
+    /// services are built.  A durable vault authority is proof that the
+    /// selected placement can be opened normally.  Without one, a passphrase
+    /// choice cannot be replayed because its bytes were intentionally never
+    /// persisted; the user must submit it again.  Other interrupted choices
+    /// return to an explicit choice state rather than silently falling back.
+    pub async fn reconcile_materializing_secure_intent(
+        &self,
+        vault_authority_exists: bool,
+        host_capabilities: HostCapabilitySnapshot,
+    ) -> Result<Option<OnboardingBootstrapSnapshot>> {
+        let Some(current) = self.db.onboarding_snapshot().await? else {
+            return Ok(None);
+        };
+        if current.bootstrap_state != DbBootstrapState::Materializing {
+            return Ok(Some(project(current, host_capabilities, None)?));
+        }
+        let (stage, state, placement) = if vault_authority_exists {
+            (
+                DbStage::Provider,
+                DbBootstrapState::Ready,
+                current.selected_secure_placement,
+            )
+        } else if current.selected_secure_placement
+            == Some(crate::db::onboarding::OnboardingSecurePlacement::PassphraseFile)
+        {
+            (
+                DbStage::SecureStore,
+                DbBootstrapState::AwaitingPassphrase,
+                current.selected_secure_placement,
+            )
+        } else {
+            (DbStage::SecureStore, DbBootstrapState::AwaitingChoice, None)
+        };
+        let operation_id = format!("bootstrap-reconcile-{}", current.revision);
+        let (snapshot, _) = self
+            .db
+            .onboarding_transition(current, operation_id, stage, state, false, placement)
+            .await?;
+        Ok(Some(project(snapshot, host_capabilities, None)?))
     }
 
     pub async fn mark_secure_store_ready(
@@ -335,6 +408,10 @@ fn receipt(value: OnboardingReceiptRow) -> OnboardingTransitionReceipt {
 mod tests {
     use super::*;
     use cockpit_proto::SensitiveOnboardingPassphrase;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     fn capabilities() -> HostCapabilitySnapshot {
         HostCapabilitySnapshot::unpublished()
@@ -394,9 +471,13 @@ mod tests {
                     expected_revision: secure.revision,
                     client_operation_id: "passphrase-intent".into(),
                     placement: OnboardingSecurePlacement::PassphraseFile,
-                    passphrase: Some(SensitiveOnboardingPassphrase::new(
-                        "passphrase-canary".into(),
-                    )),
+                    passphrase: Some(
+                        SensitiveOnboardingPassphrase::confirmed(
+                            "passphrase-canary".into(),
+                            "passphrase-canary".into(),
+                        )
+                        .unwrap(),
+                    ),
                 },
                 capabilities(),
                 |placement, passphrase| {
@@ -465,5 +546,94 @@ mod tests {
             .unwrap();
         assert_eq!(deferred.stage, OnboardingStage::Provider);
         assert!(deferred.limited_mode);
+    }
+
+    #[tokio::test]
+    async fn secure_intent_replay_never_materializes_the_vault_twice() {
+        let db = Db::open_in_memory_async().await.unwrap();
+        let authority = OnboardingAuthority::new(db);
+        let secure = secure_stage(&authority).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first_calls = calls.clone();
+        let request = |revision| ApplyOnboardingSecureIntent {
+            run_id: secure.run_id,
+            attempt_id: secure.attempt_id,
+            expected_revision: revision,
+            client_operation_id: "one-keyring-intent".into(),
+            placement: OnboardingSecurePlacement::Keyring,
+            passphrase: None,
+        };
+        let (ready, first) = authority
+            .apply_secure_intent_with(request(secure.revision), capabilities(), move |_, _| {
+                first_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (replayed, replay_receipt) = authority
+            .apply_secure_intent_with(request(secure.revision), capabilities(), |_, _| {
+                panic!("an exact onboarding replay must not re-materialize the vault")
+            })
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(replay_receipt.receipt_id, first.receipt_id);
+        assert_eq!(replayed.revision, ready.revision);
+        assert_eq!(replayed.stage, OnboardingStage::Provider);
+    }
+
+    #[tokio::test]
+    async fn interrupted_passphrase_materialization_requires_a_new_sensitive_submission() {
+        let db = Db::open_in_memory_async().await.unwrap();
+        let authority = OnboardingAuthority::new(db.clone());
+        let secure = secure_stage(&authority).await;
+        let request = ApplyOnboardingSecureIntent {
+            run_id: secure.run_id,
+            attempt_id: secure.attempt_id,
+            expected_revision: secure.revision,
+            client_operation_id: "interrupted-passphrase-intent".into(),
+            placement: OnboardingSecurePlacement::PassphraseFile,
+            passphrase: Some(
+                SensitiveOnboardingPassphrase::confirmed(
+                    "crash-canary".into(),
+                    "crash-canary".into(),
+                )
+                .unwrap(),
+            ),
+        };
+        let error = authority
+            .apply_secure_intent_with(request, capabilities(), |_, _| {
+                anyhow::bail!("materializer interrupted")
+            })
+            .await
+            .expect_err("failed materialization must leave an uncertain checkpoint");
+        assert!(error.to_string().contains("materializer interrupted"));
+        let resumed = authority
+            .reconcile_materializing_secure_intent(false, capabilities())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.stage, OnboardingStage::SecureStore);
+        assert_eq!(
+            resumed.bootstrap_state,
+            OnboardingBootstrapState::AwaitingPassphrase
+        );
+        let serialized_rows = db
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT group_concat(run_id || active_attempt_id || coalesce(selected_secure_placement, ''), '|') FROM onboarding_runs",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        assert!(!serialized_rows.contains("crash-canary"));
+        assert!(
+            !serde_json::to_string(&resumed)
+                .unwrap()
+                .contains("crash-canary")
+        );
     }
 }

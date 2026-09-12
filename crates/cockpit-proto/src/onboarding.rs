@@ -119,8 +119,16 @@ pub struct OnboardingBootstrapEvent {
 pub struct SensitiveOnboardingPassphrase(Zeroizing<String>);
 
 impl SensitiveOnboardingPassphrase {
-    pub fn new(value: String) -> Self {
-        Self(Zeroizing::new(value))
+    /// Construct the one-shot ingress only after the caller has collected a
+    /// matching confirmation.  Neither input is retained on mismatch.
+    pub fn confirmed(value: String, confirmation: String) -> Result<Self, &'static str> {
+        if value != confirmation {
+            return Err("onboarding passphrase confirmation does not match");
+        }
+        if value.is_empty() {
+            return Err("onboarding passphrase must not be empty");
+        }
+        Ok(Self(Zeroizing::new(value)))
     }
 
     pub fn into_zeroizing(self) -> Zeroizing<String> {
@@ -168,8 +176,19 @@ mod tests {
 
     #[test]
     fn sensitive_passphrase_never_has_a_json_or_debug_representation() {
-        let value = SensitiveOnboardingPassphrase::new("onboarding-canary".into());
+        let value = SensitiveOnboardingPassphrase::confirmed(
+            "onboarding-canary".into(),
+            "onboarding-canary".into(),
+        )
+        .unwrap();
         assert!(!format!("{value:?}").contains("onboarding-canary"));
+    }
+
+    #[test]
+    fn passphrase_confirmation_is_required_before_sensitive_ingress_exists() {
+        let error = SensitiveOnboardingPassphrase::confirmed("first".into(), "second".into())
+            .expect_err("mismatched confirmation must not create sensitive ingress");
+        assert_eq!(error, "onboarding passphrase confirmation does not match");
     }
 
     #[test]

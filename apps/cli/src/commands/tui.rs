@@ -68,6 +68,7 @@ pub async fn run(
         launch_start,
         false,
         false,
+        false,
     )
     .await
 }
@@ -83,6 +84,7 @@ pub async fn run_mode(
     launch_start: Option<Instant>,
     skip_setup: bool,
     force_setup: bool,
+    debug_last_message: bool,
 ) -> Result<()> {
     if !stdin().is_terminal() || !stdout().is_terminal() {
         welcome::print(project, !no_sandbox);
@@ -98,6 +100,7 @@ pub async fn run_mode(
         launch_start,
         lifecycle,
     );
+    app.set_startup_debug_last_message(debug_last_message);
     app.configure_onboarding_launch(skip_setup, force_setup);
     let result = app.run().await;
     drop(app);
@@ -146,6 +149,7 @@ pub async fn run_named_assistant(
     no_sandbox: bool,
     assistant_name: String,
     launch_start: Option<Instant>,
+    debug_last_message: bool,
 ) -> Result<()> {
     if !stdin().is_terminal() || !stdout().is_terminal() {
         welcome::print(project, !no_sandbox);
@@ -160,6 +164,7 @@ pub async fn run_named_assistant(
         launch_start,
         lifecycle,
     );
+    app.set_startup_debug_last_message(debug_last_message);
     app.configure_onboarding_launch(false, false);
     let result = app.run().await;
     drop(app);

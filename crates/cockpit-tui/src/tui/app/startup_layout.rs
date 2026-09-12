@@ -57,11 +57,9 @@ impl App {
     }
 
     pub(super) fn start_onboarding_bootstrap_fetch(&mut self) {
-        if self.onboarding_skip {
-            return;
-        }
         let lifecycle = self.lifecycle.clone();
         let force = self.onboarding_force;
+        let skip = self.onboarding_skip;
         self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.bootstrap"),
             crate::tui::async_action::AsyncActionPolicy::Dedupe(
@@ -89,7 +87,8 @@ impl App {
                 }
                 if current.as_ref().is_some_and(|snapshot| {
                     !force && snapshot.stage == cockpit_proto::OnboardingStage::Complete
-                }) {
+                }) || skip
+                {
                     return Ok(
                         crate::tui::async_action::AsyncActionPayload::OnboardingBootstrap(current),
                     );
@@ -120,6 +119,15 @@ impl App {
         &mut self,
         snapshot: Option<cockpit_proto::OnboardingBootstrapSnapshot>,
     ) {
+        // A bootstrap projection is global authority only.  The workspace is
+        // intentionally still unresolved at this point.  Resolve its root
+        // and its daemon-owned trust decision before exposing the projection
+        // to the session-attach reducer; otherwise an eager attach can read a
+        // project config under the safe shell's `.` placeholder.
+        if !self.startup_background.workspace_ready {
+            self.start_workspace_resolution(snapshot);
+            return;
+        }
         if snapshot.as_ref().is_some_and(|current| {
             current.bootstrap_state == cockpit_proto::OnboardingBootstrapState::Failed
         }) {
@@ -139,9 +147,175 @@ impl App {
         }
         self.onboarding_completion_visible = false;
         self.onboarding_snapshot = snapshot;
-        self.maybe_open_add_provider_wizard();
+        if !self.onboarding_skip {
+            self.maybe_open_add_provider_wizard();
+        }
     }
 
+    fn start_workspace_resolution(
+        &mut self,
+        snapshot: Option<cockpit_proto::OnboardingBootstrapSnapshot>,
+    ) {
+        let generation = self.startup_background.generation;
+        let requested_project = self.launch.cwd.clone();
+        let lifecycle = self.lifecycle.clone();
+        self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::DaemonRpc("startup.workspace"),
+            crate::tui::async_action::AsyncActionPolicy::Dedupe(
+                crate::tui::async_action::AsyncActionKey::new("startup.workspace"),
+            ),
+            async move {
+                let opened = if requested_project == std::path::Path::new(".") {
+                    std::env::current_dir()
+                        .map_err(|error| format!("resolving workspace: {error}"))?
+                } else {
+                    requested_project
+                };
+                let root = cockpit_config::trust::resolve_trust_root(&opened)
+                    .map_err(|error| format!("resolving workspace trust root: {error}"))?;
+                let project_root = root.root.to_string_lossy().into_owned();
+                let client = crate::tui::settings::settings_daemon_client(&lifecycle)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let response = client
+                    .request(cockpit_proto::Request::GetWorkspaceTrust { project_root })
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let mode = match response {
+                    Ok(cockpit_proto::Response::WorkspaceTrust { mode, .. }) => mode,
+                    Ok(other) => {
+                        return Err(format!("unexpected workspace trust response: {other:?}"));
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
+                Ok(
+                    crate::tui::async_action::AsyncActionPayload::StartupWorkspace(
+                        StartupWorkspaceCompletion {
+                            generation,
+                            opened,
+                            root,
+                            mode,
+                            snapshot,
+                        },
+                    ),
+                )
+            },
+        );
+    }
+
+    pub(super) fn apply_startup_workspace_completion(
+        &mut self,
+        completion: StartupWorkspaceCompletion,
+    ) {
+        if completion.generation != self.startup_background.generation || self.exit_requested {
+            return;
+        }
+        let mode = match completion.mode {
+            Some(cockpit_proto::WorkspaceTrustMode::Trust) => {
+                cockpit_config::WorkspaceTrustMode::Trust
+            }
+            Some(cockpit_proto::WorkspaceTrustMode::IgnoreConfig) | None => {
+                cockpit_config::WorkspaceTrustMode::IgnoreConfig
+            }
+            Some(cockpit_proto::WorkspaceTrustMode::Untrusted) => {
+                self.push_plain("workspace is untrusted and cannot be opened".to_string());
+                self.exit_requested = true;
+                return;
+            }
+        };
+        cockpit_config::trust::set_runtime_policy(completion.root, mode);
+        self.launch.cwd = completion.opened;
+        if self.startup_debug_last_message {
+            cockpit_core::engine::model::enable_debug_last_message(
+                self.launch.cwd.join(".lastmessage"),
+            );
+        }
+        self.startup_background.workspace_ready = true;
+        tracing::info!("startup trust-ready");
+        self.apply_onboarding_bootstrap_snapshot(completion.snapshot);
+        self.start_post_trust_cleanup();
+    }
+
+    fn start_post_trust_cleanup(&mut self) {
+        let exports_dir = self.launch.cwd.join(".cockpit").join("exports");
+        self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::Internal("startup.export_recovery"),
+            crate::tui::async_action::AsyncActionPolicy::Dedupe(
+                crate::tui::async_action::AsyncActionKey::new("startup.export_recovery"),
+            ),
+            async move {
+                crate::tui::app::export_actions::recover_deferred_export_cleanup(&exports_dir)
+                    .await;
+                Ok(crate::tui::async_action::AsyncActionPayload::Unit)
+            },
+        );
+
+        // These projections used to be queued with startup construction. They
+        // are retained, but are intentionally downstream of the accepted
+        // workspace trust fence because they inspect the opened project.
+        tokio::task::spawn_blocking(cockpit_core::tokens::warm_cl100k);
+
+        let cwd = self.launch.cwd.clone();
+        let active_model = self.launch.active_model.clone();
+        let endpoint = self.attached_daemon_endpoint();
+        let providers = self.config_snapshot.providers.clone();
+        self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::Internal("startup.guidance.estimate"),
+            crate::tui::async_action::AsyncActionPolicy::Dedupe(
+                crate::tui::async_action::AsyncActionKey::new("startup.guidance.estimate"),
+            ),
+            async move {
+                let (provider, model) = match &active_model {
+                    Some((provider, model)) => (Some(provider.clone()), Some(model.clone())),
+                    None => (None, None),
+                };
+                let estimate = agent_runner::fetch_guidance_estimate_with_endpoint(
+                    &cwd, providers, provider, model, endpoint,
+                )
+                .await;
+                Ok(
+                    crate::tui::async_action::AsyncActionPayload::StartupGuidanceEstimate {
+                        cwd,
+                        active_model,
+                        estimate,
+                    },
+                )
+            },
+        );
+
+        let dependency_cwd = self.launch.cwd.clone();
+        let sandbox_enabled = !self.no_sandbox;
+        self.async_actions.start_blocking(
+            crate::tui::async_action::AsyncActionKind::Internal("startup.dependencies"),
+            crate::tui::async_action::AsyncActionPolicy::Dedupe(
+                crate::tui::async_action::AsyncActionKey::new("startup.dependencies"),
+            ),
+            move || {
+                cockpit_core::diagnostics::dependency_projection_with_deadline_and_publish_for_run(
+                    dependency_cwd,
+                    std::time::Duration::from_secs(2),
+                    sandbox_enabled,
+                )
+                .map(crate::tui::async_action::AsyncActionPayload::StartupDependencyProjection)
+                .map_err(|error| error.to_string())
+            },
+        );
+
+        #[cfg(feature = "remote")]
+        self.start_startup_disclosures_fetch();
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct StartupWorkspaceCompletion {
+    pub(crate) generation: u64,
+    pub(crate) opened: std::path::PathBuf,
+    pub(crate) root: cockpit_config::trust::TrustRoot,
+    pub(crate) mode: Option<cockpit_proto::WorkspaceTrustMode>,
+    pub(crate) snapshot: Option<cockpit_proto::OnboardingBootstrapSnapshot>,
+}
+
+impl App {
     fn start_onboarding_ready_construction_retry(&mut self) {
         let lifecycle = self.lifecycle.clone();
         self.async_actions.start(
@@ -571,96 +745,27 @@ impl App {
             return;
         }
         self.startup_background.started = true;
-
-        // This is deliberately the first startup authority operation after
-        // paint. It reads only the user-global daemon lifetime preference;
-        // project/layered configuration remains unavailable here.
-        match cockpit_config::extended::load_global_daemon_lifetime_policy() {
-            Ok(background_agents) => {
-                self.ephemeral_preference = !background_agents;
-                self.lifecycle.set_default_intent(self.lifecycle_intent());
-                tracing::info!(background_agents, "startup lifetime-policy-ready");
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "startup lifetime-policy-error");
-                self.show_toast(
-                    "Could not read daemon lifetime policy; retry startup",
-                    super::ToastKind::Error,
-                );
-                self.startup_background.started = false;
-                return;
-            }
-        }
-
-        // First paint has already occurred before this entry point. Acquire
-        // the lifecycle-selected owner now and ask its global authority for
-        // the resumable checkpoint; this never pre-promotes an ephemeral owner.
-        self.start_onboarding_bootstrap_fetch();
-
-        // Recovery is security cleanup, not a startup gate.  It is owned by
-        // the cancellable async-action registry so closing the shell before
-        // the worker starts performs no recovery I/O.
-        let exports_dir = self.launch.cwd.join(".cockpit").join("exports");
+        let generation = self.startup_background.generation;
+        // The first authority operation is isolated in the action runner so
+        // an exit before the worker begins has no configuration I/O.  It
+        // reads only `daemon.background_agents`; project configuration is not
+        // available until the daemon has returned onboarding and trust.
         self.async_actions.start(
-            crate::tui::async_action::AsyncActionKind::Internal("startup.export_recovery"),
+            crate::tui::async_action::AsyncActionKind::Blocking("startup.lifetime-policy"),
             crate::tui::async_action::AsyncActionPolicy::Dedupe(
-                crate::tui::async_action::AsyncActionKey::new("startup.export_recovery"),
+                crate::tui::async_action::AsyncActionKey::new("startup.lifetime-policy"),
             ),
             async move {
-                crate::tui::app::export_actions::recover_deferred_export_cleanup(&exports_dir)
-                    .await;
-                Ok(crate::tui::async_action::AsyncActionPayload::Unit)
+                cockpit_config::extended::load_global_daemon_lifetime_policy()
+                    .map(|background_agents| {
+                        crate::tui::async_action::AsyncActionPayload::StartupLifetimePolicy {
+                            generation,
+                            background_agents,
+                        }
+                    })
+                    .map_err(|error| error.to_string())
             },
         );
-
-        tokio::task::spawn_blocking(cockpit_core::tokens::warm_cl100k);
-
-        let cwd = self.launch.cwd.clone();
-        let active_model = self.launch.active_model.clone();
-        let endpoint = self.attached_daemon_endpoint();
-        let providers = self.config_snapshot.providers.clone();
-        self.async_actions.start(
-            AsyncActionKind::Internal("startup.guidance.estimate"),
-            AsyncActionPolicy::Dedupe(AsyncActionKey::new("startup.guidance.estimate")),
-            async move {
-                let (provider, model) = match &active_model {
-                    Some((p, m)) => (Some(p.clone()), Some(m.clone())),
-                    None => (None, None),
-                };
-                let estimate = agent_runner::fetch_guidance_estimate_with_endpoint(
-                    &cwd, providers, provider, model, endpoint,
-                )
-                .await;
-                Ok(AsyncActionPayload::StartupGuidanceEstimate {
-                    cwd,
-                    active_model,
-                    estimate,
-                })
-            },
-        );
-
-        // Pre-daemon / in-process doctor snapshot for Settings before attach.
-        // This is not the daemon capability authority. After the daemon is
-        // up, clients must consult `GetHostCapabilities` /
-        // `HostCapabilitySnapshot` instead of this TUI-process compose.
-        let dependency_cwd = self.launch.cwd.clone();
-        let sandbox_enabled = !self.no_sandbox;
-        self.async_actions.start_blocking(
-            AsyncActionKind::Internal("startup.dependencies"),
-            AsyncActionPolicy::Dedupe(AsyncActionKey::new("startup.dependencies")),
-            move || {
-                cockpit_core::diagnostics::dependency_projection_with_deadline_and_publish_for_run(
-                    dependency_cwd,
-                    std::time::Duration::from_secs(2),
-                    sandbox_enabled,
-                )
-                .map(AsyncActionPayload::StartupDependencyProjection)
-                .map_err(|error| error.to_string())
-            },
-        );
-
-        #[cfg(feature = "remote")]
-        self.start_startup_disclosures_fetch();
     }
 
     #[cfg(feature = "remote")]

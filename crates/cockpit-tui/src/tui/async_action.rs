@@ -144,7 +144,13 @@ impl AsyncActionKind {
                 "autocomplete.files"
                 | "doctor.snapshot"
                 | "settings.path-suggest"
-                | "thread-check" => ReadOnly,
+                | "thread-check"
+                // The interactive startup reducer reads this one global
+                // field before it asks the lifecycle host for an owner.  It
+                // is deliberately read-only and cancellable: it must never
+                // become an exit fence merely because a terminal was closed
+                // between the first frame and the policy read.
+                | "startup.lifetime-policy" => ReadOnly,
                 "btw.teardown"
                 | "paste.delivery_receipt"
                 | "queue.edit"
@@ -168,6 +174,7 @@ impl AsyncActionKind {
                 | "sessions.preview"
                 | "sessions.inbox"
                 | "skills.list"
+                | "startup.workspace"
                 | "subagent.history.page"
                 | "session_setup.snapshot" => ReadOnly,
                 "assistant.resolve"
@@ -214,6 +221,7 @@ impl AsyncActionKind {
                 | "pins.review"
                 | "shutdown"
                 | "startup.dependencies"
+                | "startup.export_recovery"
                 | "startup.guidance.estimate"
                 | "startup.remote_disclosures"
                 | "subagent.history" => ReadOnly,
@@ -533,6 +541,11 @@ pub enum AsyncActionPayload {
     Tools(crate::tui::tools_pane::ToolsCompletion),
     WorkspaceTrust(crate::tui::app::WorkspaceTrustCompletion),
     OnboardingBootstrap(Option<cockpit_proto::OnboardingBootstrapSnapshot>),
+    StartupLifetimePolicy {
+        generation: u64,
+        background_agents: bool,
+    },
+    StartupWorkspace(crate::tui::app::StartupWorkspaceCompletion),
     Sealed(crate::tui::app::slash::SealedCompletion),
     SettingsDaemon(crate::tui::settings::SettingsDaemonEffectCompletion),
     SettingsBlocking(crate::tui::settings::SettingsBlockingEffectCompletion),

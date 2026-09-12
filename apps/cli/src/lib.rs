@@ -964,6 +964,7 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
             Some(launch_start),
             cli.skip_setup,
             false,
+            cli.debug_last_message,
         )
         .await;
     }
@@ -979,11 +980,12 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
             Some(launch_start),
             false,
             true,
+            cli.debug_last_message,
         )
         .await;
     }
 
-    if cli.debug_last_message {
+    if cli.debug_last_message && !interactive_shell {
         match std::env::current_dir() {
             Ok(cwd) => engine::model::enable_debug_last_message(cwd.join(".lastmessage")),
             Err(e) => tracing::warn!(error = %e, "--debug-last-message: cwd unavailable"),
@@ -1003,7 +1005,13 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         Some(Command::Invocation(sub)) => commands::invocation::run(sub).await,
         Some(Command::Agent(sub)) => commands::agent::run(sub).await,
         Some(Command::Assistants(sub)) => {
-            commands::assistant::run(sub, cli.no_sandbox, Some(launch_start)).await
+            commands::assistant::run(
+                sub,
+                cli.no_sandbox,
+                Some(launch_start),
+                cli.debug_last_message,
+            )
+            .await
         }
         #[cfg(feature = "remote")]
         Some(Command::Account(sub)) => match sub {

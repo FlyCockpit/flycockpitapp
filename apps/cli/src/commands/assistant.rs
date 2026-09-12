@@ -27,13 +27,16 @@ pub async fn run(
     cmd: AssistantCommand,
     no_sandbox: bool,
     launch_start: Option<Instant>,
+    debug_last_message: bool,
 ) -> Result<()> {
     match cmd {
         AssistantCommand::New(args) => new(args).await,
         AssistantCommand::List => list().await,
         AssistantCommand::Show { name } => show(&name).await,
         AssistantCommand::Delete(args) => delete(args).await,
-        AssistantCommand::Chat { name } => chat(&name, no_sandbox, launch_start).await,
+        AssistantCommand::Chat { name } => {
+            chat(&name, no_sandbox, launch_start, debug_last_message).await
+        }
         AssistantCommand::SoulEditMode { mode } => set_primary_soul_edit_mode(mode).await,
         AssistantCommand::Learn(args) => crate::commands::learn::run(args, no_sandbox).await,
         AssistantCommand::Media { command } => media(command).await,
@@ -497,12 +500,23 @@ async fn fetch_assistant(
     Ok(assistant)
 }
 
-async fn chat(name: &str, no_sandbox: bool, launch_start: Option<Instant>) -> Result<()> {
+async fn chat(
+    name: &str,
+    no_sandbox: bool,
+    launch_start: Option<Instant>,
+    debug_last_message: bool,
+) -> Result<()> {
     crate::assistants::validate_named_assistant_name(name)?;
     // Named-session resolution is presentation work and therefore belongs
     // behind the shell's first-paint lifecycle gate.
-    crate::commands::tui::run_named_assistant(None, no_sandbox, name.to_string(), launch_start)
-        .await
+    crate::commands::tui::run_named_assistant(
+        None,
+        no_sandbox,
+        name.to_string(),
+        launch_start,
+        debug_last_message,
+    )
+    .await
 }
 
 struct StdTerminalIo;

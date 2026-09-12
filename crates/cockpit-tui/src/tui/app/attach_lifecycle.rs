@@ -16,7 +16,11 @@ impl App {
     ///   owner's socket may not be bound for a beat, so probing in the
     ///   background lets us wait quietly and attach without blocking a tick.
     pub(super) fn ensure_session_for_display(&mut self) {
-        if !self.first_paint_completed || self.onboarding_snapshot.is_none() {
+        // `None` is a valid daemon bootstrap projection (for example when
+        // setup is explicitly skipped).  The ordering fence is the accepted
+        // startup workspace/trust result, not the presence of an onboarding
+        // card in the renderer.
+        if !self.first_paint_completed || !self.startup_background.workspace_ready {
             return;
         }
         if let Some(name) = self.startup_assistant_name.clone()

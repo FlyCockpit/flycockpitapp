@@ -1733,6 +1733,10 @@ struct StartupBackground {
     daemon_socket: Option<PathBuf>,
     daemon_endpoint: Option<cockpit_client::ClientEndpoint>,
     started: bool,
+    /// Monotonically fences the post-paint startup reducer.  A completion
+    /// from a shell that has exited or been replaced is presentation-inert.
+    generation: u64,
+    workspace_ready: bool,
 }
 
 /// Daemon-resolved config the TUI renders from (`tui-config-single-source`).
@@ -1822,6 +1826,9 @@ pub struct App {
     /// A named Assistant resume request. It is consumed only by the
     /// post-onboarding attach reducer.
     startup_assistant_name: Option<String>,
+    /// Parsed launch intent only. Its file path is activated after the
+    /// accepted workspace phase, never by the safe shell constructor.
+    startup_debug_last_message: bool,
     /// Daemon-pushed config the TUI renders from; see [`HeldConfig`].
     pub(super) config_snapshot: HeldConfig,
     pending_workspace_trust: Option<PendingWorkspaceTrust>,
@@ -3590,6 +3597,10 @@ impl App {
         }
     }
 
+    pub fn set_startup_debug_last_message(&mut self, enabled: bool) {
+        self.startup_debug_last_message = enabled;
+    }
+
     fn new_inner(
         project: Option<&Path>,
         no_sandbox: bool,
@@ -3702,6 +3713,7 @@ impl App {
             paste_client_instance_id: uuid::Uuid::new_v4(),
             launch,
             startup_assistant_name: None,
+            startup_debug_last_message: false,
             config_snapshot,
             pending_workspace_trust: None,
             pending_sealed_operations: HashMap::new(),
@@ -3805,6 +3817,8 @@ impl App {
                 daemon_socket: None,
                 daemon_endpoint: None,
                 started: false,
+                generation: 1,
+                workspace_ready: false,
             },
             startup_dependency_notice,
             chat_area: None,

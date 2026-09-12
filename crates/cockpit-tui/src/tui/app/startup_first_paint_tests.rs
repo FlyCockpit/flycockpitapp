@@ -66,6 +66,7 @@ fn startup_guidance_backfill_discards_stale_session_or_model() {
 #[tokio::test]
 async fn startup_background_tasks_are_explicitly_started_after_construction() {
     let tmp = tempfile::tempdir().unwrap();
+    let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let mut app = App::new(Some(tmp.path()), false);
     assert!(!app.startup_background.started);
     assert_eq!(app.async_actions.pending_count(), 0);
@@ -74,5 +75,5 @@ async fn startup_background_tasks_are_explicitly_started_after_construction() {
     app.start_startup_background_tasks();
 
     assert!(app.startup_background.started);
-    assert!(app.async_actions.pending_count() >= 2);
+    assert_eq!(app.async_actions.pending_count(), 1);
 }

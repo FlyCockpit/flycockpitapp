@@ -914,6 +914,29 @@ impl App {
             return;
         }
         match result.kind {
+            AsyncActionKind::Blocking("startup.lifetime-policy") => match result.payload {
+                Ok(AsyncActionPayload::StartupLifetimePolicy {
+                    generation,
+                    background_agents,
+                }) if generation == self.startup_background.generation && !self.exit_requested => {
+                    self.ephemeral_preference = !background_agents;
+                    self.lifecycle.set_default_intent(self.lifecycle_intent());
+                    tracing::info!(background_agents, "startup lifetime-policy-ready");
+                    // Lifecycle acquisition is deliberately downstream of the
+                    // policy receipt.  The bootstrap action resolves exactly
+                    // this selected lifecycle capability after first paint.
+                    self.start_onboarding_bootstrap_fetch();
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(error = %error, "startup lifetime-policy-error");
+                    self.startup_background.started = false;
+                    self.show_toast(
+                        "Could not read daemon lifetime policy; retry startup",
+                        crate::tui::app::ToastKind::Error,
+                    );
+                }
+            },
             AsyncActionKind::Internal("runner.attach") => {
                 self.apply_runner_attach_result(result.id, result.payload);
             }
@@ -1005,6 +1028,22 @@ impl App {
                 ),
                 Ok(_) => self.show_toast(
                     "Onboarding authority returned an invalid projection",
+                    crate::tui::app::ToastKind::Error,
+                ),
+            },
+            AsyncActionKind::DaemonRpc("startup.workspace") => match result.payload {
+                Ok(AsyncActionPayload::StartupWorkspace(completion)) => {
+                    self.apply_startup_workspace_completion(completion);
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "startup trust-error");
+                    self.show_toast(
+                        format!("Workspace trust could not be resolved: {error}"),
+                        crate::tui::app::ToastKind::Error,
+                    );
+                }
+                Ok(_) => self.show_toast(
+                    "Workspace trust returned an invalid projection",
                     crate::tui::app::ToastKind::Error,
                 ),
             },

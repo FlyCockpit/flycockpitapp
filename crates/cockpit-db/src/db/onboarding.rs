@@ -178,7 +178,8 @@ impl Db {
         expected_revision: Option<u64>,
         client_operation_id: String,
     ) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
-        self.write(move |conn| begin_or_reopen_conn(conn, expected_revision, &client_operation_id)).await
+        self.write(move |conn| begin_or_reopen_conn(conn, expected_revision, &client_operation_id))
+            .await
     }
 
     /// Consume one revision and persist an idempotent receipt.  This is the
@@ -192,9 +193,17 @@ impl Db {
         bootstrap_state: OnboardingBootstrapState,
         limited_mode: bool,
     ) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
-        self.write(move |conn| transition_conn(
-            conn, &snapshot, &client_operation_id, next_stage, bootstrap_state, limited_mode,
-        )).await
+        self.write(move |conn| {
+            transition_conn(
+                conn,
+                &snapshot,
+                &client_operation_id,
+                next_stage,
+                bootstrap_state,
+                limited_mode,
+            )
+        })
+        .await
     }
 }
 
@@ -209,7 +218,12 @@ fn begin_or_reopen_conn(
             bail!("onboarding revision conflict");
         }
         return transition_conn(
-            conn, &existing, client_operation_id, existing.stage, existing.bootstrap_state, existing.limited_mode,
+            conn,
+            &existing,
+            client_operation_id,
+            existing.stage,
+            existing.bootstrap_state,
+            existing.limited_mode,
         );
     }
     if expected_revision.is_some() {
@@ -240,7 +254,17 @@ fn begin_or_reopen_conn(
         params![receipt_id.to_string(), run_id.to_string(), attempt_id.to_string(), client_operation_id, now],
     )?;
     let snapshot = snapshot_conn(conn)?.context("onboarding run did not persist")?;
-    Ok((snapshot, OnboardingReceiptRow { receipt_id, run_id, attempt_id, client_operation_id: client_operation_id.into(), consumed_revision: 0, status: OnboardingReceiptStatus::Committed }))
+    Ok((
+        snapshot,
+        OnboardingReceiptRow {
+            receipt_id,
+            run_id,
+            attempt_id,
+            client_operation_id: client_operation_id.into(),
+            consumed_revision: 0,
+            status: OnboardingReceiptStatus::Committed,
+        },
+    ))
 }
 
 fn transition_conn(
@@ -254,27 +278,51 @@ fn transition_conn(
     if client_operation_id.is_empty() || client_operation_id.len() > 128 {
         bail!("invalid onboarding client operation id");
     }
-    let replay = conn.query_row(
-        "SELECT receipt_id, consumed_revision, status FROM onboarding_receipts
+    let replay = conn
+        .query_row(
+            "SELECT receipt_id, consumed_revision, status FROM onboarding_receipts
          WHERE run_id = ?1 AND attempt_id = ?2 AND client_operation_id = ?3",
-        params![current.run_id.to_string(), current.attempt_id.to_string(), client_operation_id],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
-    ).optional()?;
+            params![
+                current.run_id.to_string(),
+                current.attempt_id.to_string(),
+                client_operation_id
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
     if let Some((receipt_id, consumed_revision, status)) = replay {
-        return Ok((current.clone(), OnboardingReceiptRow {
-            receipt_id: uuid(receipt_id, "receipt id")?, run_id: current.run_id, attempt_id: current.attempt_id,
-            client_operation_id: client_operation_id.into(), consumed_revision: u64::try_from(consumed_revision)?,
-            status: OnboardingReceiptStatus::parse(&status)?,
-        }));
+        let refreshed = snapshot_conn(conn)?.context("onboarding run did not persist")?;
+        return Ok((
+            refreshed,
+            OnboardingReceiptRow {
+                receipt_id: uuid(receipt_id, "receipt id")?,
+                run_id: current.run_id,
+                attempt_id: current.attempt_id,
+                client_operation_id: client_operation_id.into(),
+                consumed_revision: u64::try_from(consumed_revision)?,
+                status: OnboardingReceiptStatus::parse(&status)?,
+            },
+        ));
     }
-    let next_revision = current.revision.checked_add(1).context("onboarding revision overflow")?;
+    let next_revision = current
+        .revision
+        .checked_add(1)
+        .context("onboarding revision overflow")?;
     let now = Utc::now().timestamp_millis();
     let changed = conn.execute(
         "UPDATE onboarding_runs SET revision = ?1, stage = ?2, bootstrap_state = ?3, limited_mode = ?4, updated_at_unix_ms = ?5
          WHERE id = 1 AND run_id = ?6 AND active_attempt_id = ?7 AND revision = ?8",
         params![i64::try_from(next_revision)?, next_stage.as_str(), bootstrap_state.as_str(), if limited_mode { 1_i64 } else { 0_i64 }, now, current.run_id.to_string(), current.attempt_id.to_string(), i64::try_from(current.revision)?],
     )?;
-    if changed != 1 { bail!("onboarding revision conflict"); }
+    if changed != 1 {
+        bail!("onboarding revision conflict");
+    }
     let receipt_id = Uuid::new_v4();
     conn.execute(
         "INSERT INTO onboarding_receipts
@@ -283,7 +331,17 @@ fn transition_conn(
         params![receipt_id.to_string(), current.run_id.to_string(), current.attempt_id.to_string(), client_operation_id, i64::try_from(current.revision)?, now],
     )?;
     let snapshot = snapshot_conn(conn)?.context("onboarding transition did not persist")?;
-    Ok((snapshot, OnboardingReceiptRow { receipt_id, run_id: current.run_id, attempt_id: current.attempt_id, client_operation_id: client_operation_id.into(), consumed_revision: current.revision, status: OnboardingReceiptStatus::Committed }))
+    Ok((
+        snapshot,
+        OnboardingReceiptRow {
+            receipt_id,
+            run_id: current.run_id,
+            attempt_id: current.attempt_id,
+            client_operation_id: client_operation_id.into(),
+            consumed_revision: current.revision,
+            status: OnboardingReceiptStatus::Committed,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -299,7 +357,10 @@ mod tests {
             .unwrap();
         assert_eq!(initial.revision, 0);
         assert_eq!(initial.stage, OnboardingStage::Welcome);
-        assert_eq!(initial.bootstrap_state, OnboardingBootstrapState::AwaitingChoice);
+        assert_eq!(
+            initial.bootstrap_state,
+            OnboardingBootstrapState::AwaitingChoice
+        );
 
         let (after, first) = db
             .onboarding_transition(
@@ -324,7 +385,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(replayed, initial);
+        assert_eq!(replayed, after);
         assert_eq!(replay_receipt.receipt_id, first.receipt_id);
 
         let error = db

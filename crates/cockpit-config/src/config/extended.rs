@@ -522,6 +522,12 @@ pub struct ExtendedConfig {
     #[serde(default)]
     pub daemon: DaemonConfig,
 
+    /// Installed-binary update policy (`auto`, `notify`, or `off`). Production
+    /// TUF activation is deferred; the installed updater remains disabled until
+    /// ceremony evidence is accepted.
+    #[serde(default)]
+    pub updates: crate::config::update_channel::UpdateChannel,
+
     /// Authoritative evaluated-plan source for every media reservation.
     #[serde(rename = "mediaResources", default)]
     pub media_resources: Box<crate::config::media_budget::MediaResourcePolicy>,
@@ -1927,6 +1933,7 @@ impl Default for ExtendedConfig {
             resource_scheduler: ResourceSchedulerConfig::default(),
             sandbox: SandboxConfig::default(),
             daemon: DaemonConfig::default(),
+            updates: crate::config::update_channel::UpdateChannel::default(),
             media_resources: Box::new(crate::config::media_budget::MediaResourcePolicy::default()),
             retention: RetentionConfig::default(),
             delegation: DelegationConfig::default(),
@@ -2139,6 +2146,21 @@ pub fn load_for_cwd(cwd: &Path) -> ExtendedConfig {
 /// global layer only. Project, machine-local-per-project, explicit override,
 /// retained workspace, and remote layers are intentionally outside this
 /// authority boundary.
+/// Load the installation-level update channel from the canonical user-owned
+/// global layer only. Project and remote layers are outside this authority.
+pub fn load_installation_update_channel() -> Result<crate::config::update_channel::UpdateChannel> {
+    let path = crate::config::dirs::global_config_dir()?.join(crate::config::dirs::CONFIG_FILE);
+    if !path.exists() {
+        return Ok(
+            crate::config::update_channel::UpdateChannel::resolve_effective(
+                crate::config::update_channel::UpdateChannel::default(),
+            ),
+        );
+    }
+    let doc = ExtendedConfigDoc::load(&path)?;
+    Ok(crate::config::update_channel::UpdateChannel::resolve_effective(doc.config().updates))
+}
+
 pub fn load_installation_daemon_boot() -> Result<DaemonBootConfig> {
     let path = crate::config::dirs::global_config_dir()?.join(crate::config::dirs::CONFIG_FILE);
     if !path.exists() {

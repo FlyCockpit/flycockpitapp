@@ -25,6 +25,12 @@ The only valid outcome for #398 is therefore **Blocked**. #399 remains deferred.
 An unavailable Windows fixture is also a blocked result, never supervisor
 activation evidence.
 
+This stop result is based on the documented access-check semantics and the
+current route inventory below. It is not a claim that a Windows machine ran a
+restricted child. In particular, a test that proves only that RC cannot open
+the two protected endpoints would leave every unrestricted resource class
+untested and must not be reported as conformance.
+
 ## Native facts and rejected restricted-token candidate
 
 Microsoft documents that a restricted token can delete privileges, make SIDs
@@ -125,11 +131,15 @@ implementation. It is deliberately not wired to a production launch path.
    must already be inheritable. No Cockpit, token, process, Job, control-pipe,
    or worker-pipe handle is listed. Close temporary launcher duplicates before
    target resume; retain only trusted parent I/O ends.
-4. Verify the returned process identity while suspended, then assign the
-   returned process handle to the pre-created Job and verify membership. A Job
-   is a lifecycle fence only; it is not evidence of IPC or handle denial.
-   Hold the Job/process/thread handles in the trusted launcher until the target
-   has either been resumed and reaped or terminated on failure.
+4. While the initial thread is suspended, verify that `GetProcessId(hProcess)`
+   equals `PROCESS_INFORMATION.dwProcessId`, verify the canonical image with
+   `QueryFullProcessImageNameW`, and verify the restricted token's exact
+   restricting-SID state with `GetTokenInformation(TokenRestrictedSids)` before
+   associating the process with the pre-created Job. Then call
+   `AssignProcessToJobObject` and prove membership with `IsProcessInJob`. A Job
+   is a lifecycle fence only; it is not evidence of IPC or handle denial. Hold
+   the Job/process/thread handles in the trusted launcher until the target has
+   either been resumed and reaped or terminated on failure.
 5. Configure the separate restricted desktop/window station and its DACL
    before creation; do not inherit an arbitrary desktop handle. Then call
    `ResumeThread` on the returned primary-thread handle only after the
@@ -149,6 +159,12 @@ only when `bInheritHandles` is true:
 The existing `ProcessTreeGuard` follows only the Job/suspended ordering. Its
 Job neither blocks a named-pipe open nor process-handle access nor inherited
 handles, so it cannot be cited as isolation conformance.
+
+The process identity calls above are the required fixture evidence, rather
+than an assertion inferred from a successful Job assignment. Their documented
+access requirements are part of [Process security and access
+rights](https://learn.microsoft.com/en-us/windows/win32/procthread/process-security-and-access-rights)
+and [IsProcessInJob](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-isprocessinjob).
 
 ## Current Windows subprocess capability matrix
 
@@ -182,13 +198,36 @@ network behavior, and native resource approval across all rows. A later product
 prompt may deliberately narrow a route and then define its resources; this
 prerequisite may not narrow it silently.
 
+### Source evidence for the route inventory
+
+The matrix is intentionally a route inventory rather than a claim of a
+filesystem sandbox. These are the production seams reviewed in this checkout;
+the static contract ratchet keeps every row represented until a later product
+decision supplies a finite model.
+
+| Matrix row | Production source evidence |
+| --- | --- |
+| Foreground and background shells | `crates/cockpit-core/src/tools/bash/mod.rs`; `crates/cockpit-core/src/engine/schedule/background.rs` |
+| Custom tools and skill interpolation | `crates/cockpit-core/src/tools/custom.rs`; `crates/cockpit-core/src/skills/mod.rs` |
+| Worker-owned terminal | `apps/cli/src/terminal_host.rs` |
+| Agent hooks | `crates/cockpit-core/src/engine/agent/hooks.rs` |
+| Harness invocation and probes | `crates/cockpit-core/src/harness/spawn.rs`; `crates/cockpit-core/src/harness/preflight.rs`; `crates/cockpit-core/src/harness/models.rs` |
+| MCP stdio | `crates/cockpit-core/src/mcp/transport/stdio.rs` |
+| LSP and command actions | `crates/cockpit-core/src/daemon/lsp.rs`; `crates/cockpit-core/src/tools/lsp.rs` |
+| Command-resource introspection | `crates/cockpit-core/src/tools/command_resource_profiles/mod.rs` |
+| Container runtime client | `crates/cockpit-core/src/container/mod.rs` |
+| Media runners | `crates/cockpit-core/src/tools/audio_video/runner.rs`; `crates/cockpit-core/src/media_storage.rs` |
+| Native computer helpers | `crates/cockpit-core/src/computer/mod.rs`; `crates/cockpit-core/src/computer/macos_backend.rs` |
+| Git/GitHub/worktree helpers | `crates/cockpit-core/src/git/mod.rs`; `crates/cockpit-core/src/tools/intel/change_impact.rs`; `crates/cockpit-core/src/tools/worktree_orchestrate.rs` |
+
 ## Test-only stop recorder and evidence rule
 
-`crates/cockpit-host/tests/windows_child_isolation_fixture.rs` is a test-only
-typed stop recorder, not a conformance fixture. Run it on any host with:
+`crates/cockpit-host/tests/windows_child_isolation_stop_record.rs` is a
+test-only typed stop recorder, not a conformance fixture. Run it on any host
+with:
 
 ```text
-cargo test -p cockpit-host --test windows_child_isolation_fixture -- --nocapture
+cargo test -p cockpit-host --test windows_child_isolation_stop_record -- --nocapture
 ```
 
 On a non-Windows host it reports the typed `Unavailable { WindowsHost }`
@@ -196,8 +235,9 @@ state. On Windows it reports the typed `Blocked` state with the unbounded
 resource classes above. It deliberately does not create a Job, token, pipe, or
 process: an endpoint-only RC experiment cannot be called a conformance fixture
 while executable/runtime, workspace, temp, PTY, configured-network, and
-native-approval behavior have no finite allow rule. Its result is a stop
-record, never pass evidence.
+native-approval behavior have no finite allow rule. It checks the status record
+and route-inventory parity only; it is not a capable-Windows fixture and its
+result is never pass evidence.
 
 When and only when a later prompt supplies a finite product resource model, the
 stop recorder must be replaced with a real temporary-object fixture under the

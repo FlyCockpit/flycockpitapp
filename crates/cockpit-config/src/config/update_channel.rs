@@ -70,10 +70,11 @@ impl UpdateChannel {
     /// configured channel.
     pub fn resolve_effective(configured: Self) -> Result<Self, UpdateChannelParseError> {
         match std::env::var(COCKPIT_UPDATES_ENV) {
-            Ok(value) if value.trim().is_empty() => Ok(configured),
             Ok(value) => Self::from_label(&value),
             Err(std::env::VarError::NotPresent) => Ok(configured),
-            Err(_) => Ok(configured),
+            Err(std::env::VarError::NotUnicode(_)) => Err(UpdateChannelParseError {
+                value: format!("non-unicode {COCKPIT_UPDATES_ENV} value"),
+            }),
         }
     }
 }

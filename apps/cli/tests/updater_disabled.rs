@@ -13,9 +13,12 @@ use cockpit_core::updater::{
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-fn production_updater_sources() -> Vec<PathBuf> {
-    let root =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../crates/cockpit-core/src/updater");
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn production_updater_implementation_sources() -> Vec<PathBuf> {
+    let root = workspace_root().join("crates/cockpit-core/src/updater");
     fs::read_dir(&root)
         .unwrap_or_else(|error| {
             panic!(
@@ -32,8 +35,26 @@ fn production_updater_sources() -> Vec<PathBuf> {
         .collect()
 }
 
+fn production_updater_consumer_sources() -> Vec<PathBuf> {
+    [
+        "apps/cli/src/commands/update.rs",
+        "crates/cockpit-core/src/daemon/server/mod.rs",
+        "crates/cockpit-core/src/daemon/mod.rs",
+        "crates/cockpit-tui/src/tui/app/update_notice.rs",
+    ]
+    .into_iter()
+    .map(|relative| workspace_root().join(relative))
+    .collect()
+}
+
+fn production_updater_boundary_sources() -> Vec<PathBuf> {
+    let mut sources = production_updater_implementation_sources();
+    sources.extend(production_updater_consumer_sources());
+    sources
+}
+
 fn implementation_updater_sources() -> Vec<PathBuf> {
-    production_updater_sources()
+    production_updater_implementation_sources()
         .into_iter()
         .filter(|path| {
             path.file_name().is_some_and(|name| {
@@ -41,6 +62,55 @@ fn implementation_updater_sources() -> Vec<PathBuf> {
             })
         })
         .collect()
+}
+
+fn boundary_side_effect_sources() -> Vec<PathBuf> {
+    let mut sources = implementation_updater_sources();
+    sources.extend(production_updater_consumer_sources());
+    sources
+}
+
+const UPDATER_ENTRYPOINT_WINDOW: usize = 25;
+
+fn embedded_updater_consumer(path: &Path) -> bool {
+    path.ends_with("crates/cockpit-core/src/daemon/mod.rs")
+}
+
+fn extract_updater_entrypoint_regions(source: &str, window: usize) -> Vec<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut regions = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if line.contains("crate::updater::") {
+            let start = idx.saturating_sub(window);
+            let end = (idx + window + 1).min(lines.len());
+            regions.push(lines[start..end].join("\n"));
+        }
+    }
+    assert!(
+        !regions.is_empty(),
+        "embedded updater consumer must declare crate::updater:: entrypoints"
+    );
+    regions
+}
+
+fn side_effect_scan_segments(path: &Path, source: &str) -> Vec<String> {
+    if embedded_updater_consumer(path) {
+        extract_updater_entrypoint_regions(source, UPDATER_ENTRYPOINT_WINDOW)
+    } else {
+        vec![strip_test_modules(source)]
+    }
+}
+
+fn scan_segments_for_forbidden(segments: &[String], needles: &[&str], path: &Path, label: &str) {
+    for segment in segments {
+        for needle in needles {
+            assert!(
+                !segment.contains(needle),
+                "{} must not {label} `{needle}` in production updater code",
+                path.display()
+            );
+        }
+    }
 }
 
 #[test]
@@ -65,39 +135,32 @@ fn installed_composition_has_no_trust_or_transport() {
         "Command::new",
         "tokio::process",
     ];
-    for path in production_updater_sources() {
+    for path in production_updater_boundary_sources() {
+        assert!(
+            path.is_file(),
+            "updater boundary source must exist: {}",
+            path.display()
+        );
         let source = fs::read_to_string(&path).unwrap_or_else(|error| {
             panic!(
                 "failed to read production updater source {}: {error}",
                 path.display()
             )
         });
-        let production = strip_test_modules(&source);
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("");
         let scan_transport = file_name != "traits.rs" && file_name != "types.rs";
+        let segments = side_effect_scan_segments(&path, &source);
         if scan_transport {
-            for needle in transport_forbidden {
-                assert!(
-                    !production.contains(needle),
-                    "{} must not reference `{needle}` in production code",
-                    path.display()
-                );
-            }
+            scan_segments_for_forbidden(&segments, &transport_forbidden, &path, "reference");
         }
-        if file_name == "disabled.rs"
-            || file_name == "composition.rs"
-            || file_name == "background.rs"
+        if boundary_side_effect_sources()
+            .iter()
+            .any(|candidate| candidate == &path)
         {
-            for needle in capability_forbidden {
-                assert!(
-                    !production.contains(needle),
-                    "{} must not invoke `{needle}` in production updater code",
-                    path.display()
-                );
-            }
+            scan_segments_for_forbidden(&segments, &capability_forbidden, &path, "invoke");
         }
     }
 
@@ -182,20 +245,22 @@ async fn all_check_entrypoints_return_disabled_without_side_effect() {
         );
     }
 
-    for path in implementation_updater_sources() {
-        let source = fs::read_to_string(&path).expect("read updater implementation source");
-        assert!(
-            !source.contains("reqwest::")
-                && !source.contains("tough::")
-                && !source.contains("self_replace::")
-                && !source.contains("MetadataRepository")
-                && !source.contains("TargetFetcher")
-                && !source.contains("BinaryReplacer")
-                && !source.contains("SupervisorMaintenanceClient")
-                && !source.contains("UpdateLockStore"),
-            "{} must not delegate to transport/trust/maintenance seams",
-            path.display()
-        );
+    for path in boundary_side_effect_sources() {
+        let source = fs::read_to_string(&path).expect("read updater boundary source");
+        for segment in side_effect_scan_segments(&path, &source) {
+            assert!(
+                !segment.contains("reqwest::")
+                    && !segment.contains("tough::")
+                    && !segment.contains("self_replace::")
+                    && !segment.contains("MetadataRepository")
+                    && !segment.contains("TargetFetcher")
+                    && !segment.contains("BinaryReplacer")
+                    && !segment.contains("SupervisorMaintenanceClient")
+                    && !segment.contains("UpdateLockStore"),
+                "{} must not delegate to transport/trust/maintenance seams",
+                path.display()
+            );
+        }
     }
 }
 

@@ -44,6 +44,16 @@ fn closed_channel_parse() {
         UpdateChannel::resolve_effective(UpdateChannel::Auto).is_err(),
         "unsupported COCKPIT_UPDATES values must fail closed"
     );
+    guard.set_var(COCKPIT_UPDATES_ENV, "");
+    assert!(
+        UpdateChannel::resolve_effective(UpdateChannel::Auto).is_err(),
+        "empty COCKPIT_UPDATES values must fail closed"
+    );
+    guard.set_var(COCKPIT_UPDATES_ENV, "   ");
+    assert!(
+        UpdateChannel::resolve_effective(UpdateChannel::Auto).is_err(),
+        "whitespace-only COCKPIT_UPDATES values must fail closed"
+    );
     guard.remove_var(COCKPIT_UPDATES_ENV);
     assert_eq!(
         UpdateChannel::resolve_effective(UpdateChannel::Auto).unwrap(),

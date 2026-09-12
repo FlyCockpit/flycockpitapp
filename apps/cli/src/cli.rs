@@ -1706,16 +1706,16 @@ pub struct FailedCallsArgs {
 #[command(disable_version_flag = true)]
 pub struct UpdateArgs {
     /// Check for updates without applying them.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["status", "version"])]
     pub check: bool,
     /// Print updater status for the effective channel.
-    #[arg(long, conflicts_with = "check")]
+    #[arg(long, conflicts_with_all = ["check", "version"])]
     pub status: bool,
     /// Explicit authorized target version to apply.
     #[arg(
         long = "target-version",
         value_name = "VERSION",
-        conflicts_with = "check"
+        conflicts_with_all = ["check", "status"]
     )]
     pub version: Option<String>,
     /// Override the configured update channel for this invocation.

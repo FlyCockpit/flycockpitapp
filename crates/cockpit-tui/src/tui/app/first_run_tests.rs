@@ -1,6 +1,15 @@
+//! Full-screen onboarding shell integration tests.
+//!
+//! These drive the real `App` surface: shell keys route through
+//! `handle_onboarding_shell_key`, stage engines are the embedded settings
+//! dialogs, and stage changes are simulated by applying the authoritative
+//! daemon snapshot (the transition RPC itself is a background async action,
+//! exactly as in production).
+
 use super::*;
 use crate::tui::agent_runner::AgentRunner;
 use cockpit_config::providers::{ConfigDoc, ModelEntry, ProviderEntry, ProvidersConfig};
+use cockpit_proto::OnboardingStage;
 use cockpit_test_support::TestEnvGuard;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
@@ -48,6 +57,14 @@ fn with_trusted_workspace<T>(cwd: &std::path::Path, f: impl FnOnce() -> T) -> T 
     cockpit_config::trust::with_workspace_trust_policy(policy, f)
 }
 
+fn with_untrusted_workspace<T>(cwd: &std::path::Path, f: impl FnOnce() -> T) -> T {
+    let policy = cockpit_config::trust::WorkspaceTrustPolicy {
+        root: cockpit_config::trust::resolve_trust_root(cwd).unwrap(),
+        mode: cockpit_config::WorkspaceTrustMode::IgnoreConfig,
+    };
+    cockpit_config::trust::with_workspace_trust_policy(policy, f)
+}
+
 fn config_with_provider(provider_id: &str, model_id: &str) -> ProvidersConfig {
     let mut cfg = ProvidersConfig::default();
     let mut provider = ProviderEntry {
@@ -62,9 +79,7 @@ fn config_with_provider(provider_id: &str, model_id: &str) -> ProvidersConfig {
     cfg
 }
 
-fn onboarding_snapshot(
-    stage: cockpit_proto::OnboardingStage,
-) -> cockpit_proto::OnboardingBootstrapSnapshot {
+fn onboarding_snapshot(stage: OnboardingStage) -> cockpit_proto::OnboardingBootstrapSnapshot {
     cockpit_proto::OnboardingBootstrapSnapshot {
         run_id: uuid::Uuid::from_u128(1),
         attempt_id: uuid::Uuid::from_u128(2),
@@ -72,9 +87,7 @@ fn onboarding_snapshot(
         stage,
         bootstrap_state: if matches!(
             stage,
-            cockpit_proto::OnboardingStage::Welcome
-                | cockpit_proto::OnboardingStage::Profile
-                | cockpit_proto::OnboardingStage::SecureStore
+            OnboardingStage::Welcome | OnboardingStage::Profile | OnboardingStage::SecureStore
         ) {
             cockpit_proto::OnboardingBootstrapState::AwaitingChoice
         } else {
@@ -82,20 +95,41 @@ fn onboarding_snapshot(
         },
         limited_mode: false,
         lifetime_selection: None,
-        host_capabilities: cockpit_proto::HostCapabilitySnapshot::unpublished(),
+        host_capabilities: secure_store_ready_capabilities(),
         last_receipt: None,
     }
 }
 
-fn set_onboarding_stage(app: &mut App, stage: cockpit_proto::OnboardingStage) {
+fn secure_store_ready_capabilities() -> cockpit_proto::HostCapabilitySnapshot {
+    let mut capabilities = cockpit_proto::HostCapabilitySnapshot::unpublished();
+    capabilities.features = vec![
+        cockpit_proto::FeatureCapabilityRow {
+            id: "secret_store.keyring".into(),
+            state: cockpit_proto::FeatureCapabilityState::Available,
+            reason: "platform keyring is available".into(),
+            fix_command: None,
+            remedy_text: None,
+            dependency_ids: Vec::new(),
+        },
+        cockpit_proto::FeatureCapabilityRow {
+            id: "secret_store.file".into(),
+            state: cockpit_proto::FeatureCapabilityState::Available,
+            reason: "encrypted file vault is available".into(),
+            fix_command: None,
+            remedy_text: None,
+            dependency_ids: Vec::new(),
+        },
+    ];
+    capabilities
+}
+
+fn set_onboarding_stage(app: &mut App, stage: OnboardingStage) {
     // Every post-secure-store checkpoint is reached through a committed
     // config mutation. Preserve that daemon settlement evidence when these
     // focused UI tests synthesize the authoritative checkpoint directly.
     if !matches!(
         stage,
-        cockpit_proto::OnboardingStage::Welcome
-            | cockpit_proto::OnboardingStage::Profile
-            | cockpit_proto::OnboardingStage::SecureStore
+        OnboardingStage::Welcome | OnboardingStage::Profile | OnboardingStage::SecureStore
     ) {
         app.config_snapshot.generation = 1;
         app.config_snapshot.providers.set_resolution_generation(1);
@@ -103,28 +137,63 @@ fn set_onboarding_stage(app: &mut App, stage: cockpit_proto::OnboardingStage) {
     app.apply_onboarding_bootstrap_snapshot(Some(onboarding_snapshot(stage)));
 }
 
-fn advance_welcome_and_profile(app: &mut App, cwd: &std::path::Path) {
-    set_onboarding_stage(app, cockpit_proto::OnboardingStage::Welcome);
-    app.dialog = crate::tui::settings::Dialog::open_setup_wizard(
-        cwd,
-        cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
-    )
-    .unwrap();
-    assert!(with_trusted_workspace(cwd, || app.service_first_run_flow()));
-    set_onboarding_stage(app, cockpit_proto::OnboardingStage::Profile);
-    app.dialog.test_mark_setup_complete("profile-save");
-    assert!(with_trusted_workspace(cwd, || app.service_first_run_flow()));
-    set_onboarding_stage(app, cockpit_proto::OnboardingStage::SecureStore);
+fn shell_key(app: &mut App, code: KeyCode) -> bool {
+    app.handle_onboarding_shell_key(KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+fn shell_screen_kind(app: &App) -> Option<crate::tui::onboarding::OnboardingScreenKind> {
+    app.onboarding_shell
+        .as_ref()
+        .map(|shell| shell.screen_kind())
+}
+
+fn type_into_search(app: &mut App, text: &str) {
+    for ch in text.chars() {
+        shell_key(app, KeyCode::Char(ch));
+    }
+}
+
+/// Walk Welcome → Profile → SecureStore → (Provider handled by the caller).
+fn advance_through_secure_store(app: &mut App, cwd: &std::path::Path) {
+    set_onboarding_stage(app, OnboardingStage::Welcome);
     assert_eq!(
-        app.onboarding_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.stage),
-        Some(cockpit_proto::OnboardingStage::SecureStore)
+        shell_screen_kind(app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::Welcome)
     );
-    set_onboarding_stage(app, cockpit_proto::OnboardingStage::Provider);
-    app.dialog = crate::tui::settings::Dialog::None;
-    app.maybe_open_add_provider_wizard();
-    assert!(app.dialog.test_provider_is_add());
+    shell_key(app, KeyCode::Char(' '));
+
+    set_onboarding_stage(app, OnboardingStage::Profile);
+    assert_eq!(
+        app.dialog.test_page_name(),
+        Some(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID)
+    );
+    app.dialog.test_mark_setup_complete("profile-save");
+    assert!(with_trusted_workspace(cwd, || app.service_onboarding_shell()));
+
+    set_onboarding_stage(app, OnboardingStage::SecureStore);
+    assert_eq!(
+        shell_screen_kind(app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::SecureStore)
+    );
+    // Cursor 0 is the platform keyring; Enter submits the placement.
+    shell_key(app, KeyCode::Enter);
+
+    set_onboarding_stage(app, OnboardingStage::Provider);
+    assert_eq!(
+        shell_screen_kind(app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::ProviderSearch)
+    );
+}
+
+/// Select a template from the searchable catalog, which mounts and seeds
+/// the provider engine.
+fn select_provider_template(app: &mut App, query: &str) {
+    type_into_search(app, query);
+    shell_key(app, KeyCode::Enter);
+    assert!(
+        app.dialog.is_provider_add(),
+        "selecting a search row must mount the provider add engine"
+    );
 }
 
 #[test]
@@ -133,12 +202,13 @@ fn first_run_chains_provider_then_model() {
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
     let mut app = App::new(Some(tmp.path()), false);
-    advance_welcome_and_profile(&mut app, tmp.path());
+    advance_through_secure_store(&mut app, tmp.path());
+    select_provider_template(&mut app, "openai");
     write_global_config(&config_with_provider("p", "m"));
     app.dialog.test_mark_provider_add_done("p");
 
-    assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
-    set_onboarding_stage(&mut app, cockpit_proto::OnboardingStage::Model);
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    set_onboarding_stage(&mut app, OnboardingStage::Model);
 
     assert_eq!(
         app.dialog.test_page_name(),
@@ -161,38 +231,93 @@ fn first_run_chains_provider_then_model() {
 }
 
 #[test]
+fn first_run_provider_without_catalog_offers_manual_model_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    write_config(tmp.path(), &ProvidersConfig::default());
+    let mut app = App::new(Some(tmp.path()), false);
+    advance_through_secure_store(&mut app, tmp.path());
+    select_provider_template(&mut app, "openai");
+    // No catalog: the provider was saved without a validated model list.
+    write_global_config(&config_with_provider("p", ""));
+    let mut empty_catalog = config_with_provider("p", "");
+    empty_catalog.providers.get_mut("p").unwrap().models.clear();
+    write_global_config(&empty_catalog);
+    app.dialog.test_mark_provider_add_done("p");
+
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    set_onboarding_stage(&mut app, OnboardingStage::Model);
+    assert_eq!(
+        app.dialog.test_page_name(),
+        Some(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID)
+    );
+}
+
+#[test]
 fn first_run_flow_completes_end_to_end() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
     let mut app = App::new(Some(tmp.path()), false);
-    advance_welcome_and_profile(&mut app, tmp.path());
+    advance_through_secure_store(&mut app, tmp.path());
+    select_provider_template(&mut app, "openai");
     write_global_config(&config_with_provider("p", "m"));
     app.dialog.test_mark_provider_add_done("p");
 
-    assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
-    set_onboarding_stage(&mut app, cockpit_proto::OnboardingStage::Model);
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    set_onboarding_stage(&mut app, OnboardingStage::Model);
     assert_eq!(
         app.dialog.test_page_name(),
         Some(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID)
     );
     app.dialog.test_mark_setup_complete("model-save");
-    assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
-    set_onboarding_stage(&mut app, cockpit_proto::OnboardingStage::Agent);
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    set_onboarding_stage(&mut app, OnboardingStage::Agent);
     assert_eq!(
         app.dialog.test_page_name(),
         Some(cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID)
     );
     app.dialog.test_mark_setup_complete("agent-install");
-    assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
-    set_onboarding_stage(&mut app, cockpit_proto::OnboardingStage::Lifetime);
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    set_onboarding_stage(&mut app, OnboardingStage::Lifetime);
     assert_eq!(
         app.dialog.test_page_name(),
         Some(cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID)
     );
     app.dialog.test_mark_setup_complete("lifetime-save");
-    assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
-    assert_eq!(app.dialog.test_page_name(), Some("first_run_complete"));
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    assert_eq!(
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::Complete)
+    );
+
+    // Start coding commits the terminal transition; the arriving
+    // authoritative snapshot closes the shell.
+    shell_key(&mut app, KeyCode::Enter);
+    set_onboarding_stage(&mut app, OnboardingStage::Complete);
+    assert!(app.onboarding_shell.is_none());
+    assert!(!app.dialog.is_active());
+}
+
+#[test]
+fn first_run_completes_under_an_untrusted_workspace() {
+    // Provider saves are global and trust-independent: the whole
+    // provider→model chain must settle with IgnoreConfig in force.
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    write_config(tmp.path(), &ProvidersConfig::default());
+    let mut app = App::new(Some(tmp.path()), false);
+    advance_through_secure_store(&mut app, tmp.path());
+    select_provider_template(&mut app, "openai");
+    write_global_config(&config_with_provider("p", "m"));
+    app.dialog.test_mark_provider_add_done("p");
+
+    assert!(with_untrusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    set_onboarding_stage(&mut app, OnboardingStage::Model);
+    assert_eq!(
+        app.dialog.test_page_name(),
+        Some(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID)
+    );
 }
 
 #[test]
@@ -201,13 +326,13 @@ fn first_run_configuration_queues_held_draft_behind_selected_model() {
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
     let mut app = App::new(Some(tmp.path()), false);
-    app.dialog = crate::tui::settings::Dialog::None;
     app.composer.set("draft from first run".to_string());
 
     assert!(!app.submit_input());
-    assert!(app.dialog.test_provider_is_add());
-
-    set_onboarding_stage(&mut app, cockpit_proto::OnboardingStage::Provider);
+    assert_eq!(
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::ProviderSearch)
+    );
 
     let mut cfg = config_with_provider("p", "m");
     cfg.active_model = Some(cockpit_config::providers::ActiveModelRef {
@@ -218,21 +343,22 @@ fn first_run_configuration_queues_held_draft_behind_selected_model() {
         prompt_cache_retention: None,
     });
     write_config(tmp.path(), &cfg);
+    select_provider_template(&mut app, "openai");
     app.dialog.test_mark_provider_add_done("p");
-    assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
-    set_onboarding_stage(&mut app, cockpit_proto::OnboardingStage::Model);
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    set_onboarding_stage(&mut app, OnboardingStage::Model);
     app.dialog.test_mark_setup_complete("model-save");
 
-    assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
-    set_onboarding_stage(&mut app, cockpit_proto::OnboardingStage::Agent);
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    set_onboarding_stage(&mut app, OnboardingStage::Agent);
     app.dialog.test_mark_setup_complete("agent-install");
-    assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
-    set_onboarding_stage(&mut app, cockpit_proto::OnboardingStage::Lifetime);
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    set_onboarding_stage(&mut app, OnboardingStage::Lifetime);
     app.dialog.test_mark_setup_complete("lifetime-save");
 
     let (control_tx, mut control_rx) = mpsc::channel(4);
     app.agent_runner = Some(Ok(AgentRunner::stub_with_control_tx(control_tx)));
-    assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
 
     let request = control_rx.try_recv().expect("model request queued").request;
     let selection_id = match request {
@@ -255,7 +381,6 @@ fn no_provider_status_is_surfaced_and_draft_preserved() {
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
     let mut app = App::new(Some(tmp.path()), false);
-    app.dialog = crate::tui::settings::Dialog::None;
     app.composer.set("draft message".to_string());
 
     assert!(!app.submit_input());
@@ -263,31 +388,199 @@ fn no_provider_status_is_surfaced_and_draft_preserved() {
     assert!(app.queue.is_empty());
     assert!(app.history.is_empty());
     assert!(app.submit_after_model_selection);
-    assert!(app.dialog.test_provider_is_add());
     assert_eq!(
-        app.dialog.test_provider_add_status(),
-        Some(
-            "No provider is configured yet. Add one before sending; your message is still in the composer."
-        )
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::ProviderSearch)
+    );
+    // The full-screen shell renders the provider catalog; the composer
+    // draft survives underneath it.
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let rendered: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(rendered.contains("Cockpit setup"), "{rendered}");
+    assert!(rendered.contains("Search providers:"), "{rendered}");
+    assert!(
+        !rendered.contains("draft message"),
+        "the shell replaces the chat surface; the draft lives on in state"
     );
 }
 
 #[test]
-fn no_provider_send_opens_provider_setup_preserves_input() {
+fn defer_provider_closes_shell_and_limited_resume_reopens_it() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
     let mut app = App::new(Some(tmp.path()), false);
-    app.dialog = crate::tui::settings::Dialog::None;
-    app.composer.set("draft message".to_string());
+    advance_through_secure_store(&mut app, tmp.path());
 
-    assert!(!app.submit_input());
+    // Escape → Defer: an explicit, visible choice — never a silent
+    // key-to-defer mapping.
+    shell_key(&mut app, KeyCode::Esc);
+    shell_key(&mut app, KeyCode::Down);
+    shell_key(&mut app, KeyCode::Down);
+    shell_key(&mut app, KeyCode::Enter);
 
-    assert_eq!(app.composer.text(), "draft message");
-    assert!(app.queue.is_empty());
-    assert!(app.history.is_empty());
-    assert!(app.submit_after_model_selection);
-    assert!(app.dialog.test_provider_is_add());
+    // The DeferProvider transition commits limited mode; the authoritative
+    // deferred snapshot it produces closes the shell (limited-mode chat is
+    // now the surface).
+    let mut deferred = onboarding_snapshot(OnboardingStage::Provider);
+    deferred.limited_mode = true;
+    deferred.revision += 10;
+    app.apply_onboarding_bootstrap_snapshot(Some(deferred.clone()));
+    assert!(
+        app.onboarding_shell.is_none(),
+        "a committed deferral hands the surface to limited mode"
+    );
+
+    // A later launch applying the same deferred snapshot does not auto-open
+    // the shell either; the no-provider send guard reopens it explicitly.
+    let mut resumed = App::new(Some(tmp.path()), false);
+    resumed.apply_onboarding_bootstrap_snapshot(Some(deferred));
+    assert!(resumed.onboarding_shell.is_none());
+    resumed.composer.set("deferred, still typing".to_string());
+    assert!(!resumed.submit_input());
+    assert_eq!(resumed.composer.text(), "deferred, still typing");
+    assert!(resumed.onboarding_shell.is_some());
+    assert_eq!(
+        resumed
+            .onboarding_shell
+            .as_ref()
+            .map(|shell| shell.screen_kind()),
+        Some(crate::tui::onboarding::OnboardingScreenKind::ProviderSearch)
+    );
+
+    // The limited-mode badge is visible on the reopened shell.
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    terminal.draw(|frame| resumed.render(frame)).unwrap();
+    let rendered: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(rendered.contains("limited mode"), "{rendered}");
+}
+
+#[test]
+fn cancel_preserves_progress_and_reopen_uses_authoritative_stage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    write_config(tmp.path(), &ProvidersConfig::default());
+    let mut app = App::new(Some(tmp.path()), false);
+    advance_through_secure_store(&mut app, tmp.path());
+
+    // Escape → Cancel: closes the shell; committed daemon progress (the
+    // snapshot) is untouched.
+    shell_key(&mut app, KeyCode::Esc);
+    shell_key(&mut app, KeyCode::Down);
+    shell_key(&mut app, KeyCode::Down);
+    shell_key(&mut app, KeyCode::Enter);
+    assert!(app.onboarding_shell.is_none());
+    assert!(!app.dialog.is_active());
+    assert_eq!(
+        app.onboarding_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.stage),
+        Some(OnboardingStage::Provider),
+        "cancel must not erase the committed stage"
+    );
+
+    // A later authoritative snapshot reopens at the current stage — the
+    // provider catalog, not a stale settings page.
+    set_onboarding_stage(&mut app, OnboardingStage::Provider);
+    assert!(app.onboarding_shell.is_some());
+    assert_eq!(
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::ProviderSearch)
+    );
+}
+
+#[test]
+fn duplicate_engine_completion_advances_exactly_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    write_config(tmp.path(), &ProvidersConfig::default());
+    let mut app = App::new(Some(tmp.path()), false);
+    advance_through_secure_store(&mut app, tmp.path());
+    select_provider_template(&mut app, "openai");
+    write_global_config(&config_with_provider("p", "m"));
+    app.dialog.test_mark_provider_add_done("p");
+
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    // The latch holds until the authoritative revision lands: repeated
+    // wakes must not request a second advance for the same completion.
+    assert!(!with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    assert!(!with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+
+    // The advanced snapshot clears the latch and mounts the model engine.
+    set_onboarding_stage(&mut app, OnboardingStage::Model);
+    assert_eq!(
+        app.dialog.test_page_name(),
+        Some(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID)
+    );
+}
+
+#[test]
+fn late_engine_completion_after_close_is_inert() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    write_config(tmp.path(), &ProvidersConfig::default());
+    let mut app = App::new(Some(tmp.path()), false);
+    advance_through_secure_store(&mut app, tmp.path());
+    select_provider_template(&mut app, "openai");
+
+    // Cancel mid-flight, then deliver a settlement for the dropped engine.
+    shell_key(&mut app, KeyCode::Esc);
+    shell_key(&mut app, KeyCode::Down);
+    shell_key(&mut app, KeyCode::Down);
+    shell_key(&mut app, KeyCode::Enter);
+    assert!(app.onboarding_shell.is_none());
+
+    let completion = crate::tui::settings::SettingsDaemonEffectCompletion {
+        dialog_id: uuid::Uuid::new_v4(),
+        operation_id: uuid::Uuid::new_v4(),
+        target: crate::tui::settings::SettingsEffectTarget {
+            surface: "settings.providers".into(),
+            owner: "provider-add".into(),
+            revision: None,
+        },
+        response: Err("daemon gone".to_string()),
+        authoritative_rejection: false,
+        committed_refresh_needed: None,
+    };
+    app.dialog.apply_settings_daemon_completion(completion);
+    assert!(app.onboarding_shell.is_none());
+    assert!(!app.dialog.is_active());
+}
+
+#[test]
+fn provider_engine_abandoned_returns_to_search_not_settings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    write_config(tmp.path(), &ProvidersConfig::default());
+    let mut app = App::new(Some(tmp.path()), false);
+    advance_through_secure_store(&mut app, tmp.path());
+    select_provider_template(&mut app, "openai");
+    assert!(app.dialog.is_provider_add());
+
+    // The engine's own Escape is intercepted by the shell; the visible
+    // menu's Cancel is the only way out. Choose Back instead: the daemon
+    // Back transition returns to the prior committed stage, and the next
+    // snapshot remounts the secure-store screen.
+    shell_key(&mut app, KeyCode::Esc);
+    shell_key(&mut app, KeyCode::Enter);
+    set_onboarding_stage(&mut app, OnboardingStage::SecureStore);
+    assert_eq!(
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::SecureStore)
+    );
 }
 
 #[test]
@@ -348,7 +641,7 @@ async fn onboarding_never_auto_trusts() {
         StartupWorkspaceTrust::Pending(root.clone()),
     );
 
-    app.service_first_run_flow();
+    app.service_onboarding_shell();
     assert_eq!(app.dialog.test_page_name(), Some("workspace_trust"));
     cockpit_config::trust::clear_runtime_policy_for_tests();
 }

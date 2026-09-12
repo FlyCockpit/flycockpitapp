@@ -51,7 +51,7 @@ impl App {
         self.onboarding_force = force;
         if skip {
             self.onboarding_snapshot = None;
-            self.onboarding_completion_visible = false;
+            self.onboarding_shell = None;
             self.dialog = crate::tui::settings::Dialog::None;
         }
     }
@@ -126,20 +126,195 @@ impl App {
             self.start_onboarding_ready_construction_retry();
             return;
         }
-        let stage_changed = self
-            .onboarding_snapshot
-            .as_ref()
-            .map(|current| current.stage)
-            != snapshot.as_ref().map(|current| current.stage);
-        if stage_changed {
-            // The daemon snapshot is the stage authority. A completed dialog
-            // from the preceding stage must not block construction of the
-            // newly authoritative stage's UI.
-            self.dialog = crate::tui::settings::Dialog::None;
-        }
-        self.onboarding_completion_visible = false;
         self.onboarding_snapshot = snapshot;
-        self.maybe_open_add_provider_wizard();
+        if let Some(snapshot) = self.onboarding_snapshot.clone() {
+            self.sync_onboarding_shell(&snapshot);
+        } else {
+            self.onboarding_shell = None;
+        }
+    }
+
+    /// Activate, update, or retire the full-screen onboarding shell so it
+    /// always mirrors the authoritative daemon snapshot. This is the single
+    /// onboarding entry/exit point: fresh launch, resume, deferred resume,
+    /// and post-transition refreshes all flow through here.
+    ///
+    /// A deferred run (`limited_mode`) does not auto-open the shell: defer
+    /// means "limited mode now"; the shell reopens through the no-provider
+    /// send guard or an explicit re-entry. A snapshot that commits the
+    /// deferral closes a currently open shell.
+    pub(super) fn sync_onboarding_shell(
+        &mut self,
+        snapshot: &cockpit_proto::OnboardingBootstrapSnapshot,
+    ) {
+        if self.onboarding_skip {
+            self.onboarding_shell = None;
+            return;
+        }
+        if snapshot.stage == cockpit_proto::OnboardingStage::Complete {
+            // A completed run presents no onboarding surface. When the shell
+            // is showing its completion screen, the Start Coding action
+            // requested exactly this transition; closing here is the
+            // committed end. "Add another provider" keeps the daemon stage
+            // on Lifetime, so it never reaches this branch.
+            self.onboarding_shell = None;
+            self.dialog = crate::tui::settings::Dialog::None;
+            return;
+        }
+        if snapshot.limited_mode {
+            // Deferred limited mode: the ordinary composer is the surface,
+            // guarded by the existing no-provider send rule.
+            self.onboarding_shell = None;
+            self.dialog = crate::tui::settings::Dialog::None;
+            return;
+        }
+        let stage_changed =
+            self.onboarding_shell.as_ref().map(|shell| shell.stage()) != Some(snapshot.stage);
+        if let Some(shell) = self.onboarding_shell.as_mut() {
+            shell.sync_snapshot(snapshot);
+        } else {
+            self.onboarding_shell = Some(Box::new(crate::tui::onboarding::OnboardingShell::new(
+                snapshot,
+                crate::tui::onboarding::reduced_motion_enabled(),
+            )));
+        }
+        if stage_changed {
+            self.mount_onboarding_engine(snapshot.stage);
+        }
+    }
+
+    /// User-initiated reopen (the no-provider send guard): present the
+    /// authoritative stage through the shell even in deferred limited mode.
+    pub(super) fn reopen_onboarding_shell(
+        &mut self,
+        snapshot: &cockpit_proto::OnboardingBootstrapSnapshot,
+    ) {
+        if self.onboarding_skip || snapshot.stage == cockpit_proto::OnboardingStage::Complete {
+            return;
+        }
+        if self.onboarding_shell.is_none() {
+            self.onboarding_shell = Some(Box::new(crate::tui::onboarding::OnboardingShell::new(
+                snapshot,
+                crate::tui::onboarding::reduced_motion_enabled(),
+            )));
+            self.mount_onboarding_engine(snapshot.stage);
+        }
+    }
+
+    /// Mount the settings-dialog engine for wizard stages. The engine stays
+    /// in `App.dialog` so every daemon-effect, OAuth, paste, and pointer
+    /// accessor keeps flowing through the ordinary `Dialog` dispatch; the
+    /// shell only records the pairing via `present_engine`.
+    fn mount_onboarding_engine(&mut self, stage: cockpit_proto::OnboardingStage) {
+        use cockpit_proto::OnboardingStage;
+        match stage {
+            OnboardingStage::Welcome | OnboardingStage::SecureStore => {
+                self.dialog = crate::tui::settings::Dialog::None;
+            }
+            OnboardingStage::Profile => {
+                self.mount_onboarding_wizard(
+                    cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+                    None,
+                    None,
+                );
+            }
+            OnboardingStage::Provider => {
+                if self.dialog.is_provider_add() {
+                    if let Some(shell) = self.onboarding_shell.as_mut() {
+                        shell.present_engine(crate::tui::onboarding::EngineStage::Provider);
+                    }
+                } else {
+                    self.dialog = crate::tui::settings::Dialog::None;
+                    if let Some(shell) = self.onboarding_shell.as_mut() {
+                        shell.present_provider_search(Some(
+                            "Pick a provider and sign in; setup resumes here.".to_string(),
+                        ));
+                    }
+                }
+            }
+            OnboardingStage::Model => {
+                // Seed the model wizard with the committed provider's first
+                // catalog model when one exists; manual entry stays available
+                // when it does not.
+                let preselected = self
+                    .config_snapshot
+                    .providers
+                    .providers
+                    .iter()
+                    .next()
+                    .and_then(|(provider_id, entry)| {
+                        entry
+                            .models
+                            .first()
+                            .map(|model| (provider_id.clone(), model.id.clone()))
+                    });
+                let preselected = preselected.as_ref().map(|(p, m)| (p.as_str(), m.as_str()));
+                self.mount_onboarding_wizard(
+                    cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID,
+                    preselected,
+                    if preselected.is_some() {
+                        Some("Choose the model Cockpit should use by default.".to_string())
+                    } else {
+                        Some("No model catalog is available. Enter the exact model ID and context settings manually.".to_string())
+                    },
+                );
+            }
+            OnboardingStage::Agent => {
+                self.mount_onboarding_wizard(
+                    cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID,
+                    None,
+                    Some(
+                        "Install an agent and confirm its model, tools, trust, and sidecar."
+                            .to_string(),
+                    ),
+                );
+            }
+            OnboardingStage::Lifetime => {
+                self.mount_onboarding_wizard(
+                    cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
+                    None,
+                    Some("Choose what happens when the last Cockpit window closes.".to_string()),
+                );
+            }
+            OnboardingStage::Complete => {}
+        }
+    }
+
+    fn mount_onboarding_wizard(
+        &mut self,
+        wizard_id: &str,
+        preselected_model: Option<(&str, &str)>,
+        status: Option<String>,
+    ) {
+        match crate::tui::settings::Dialog::onboarding_wizard_engine(
+            wizard_id,
+            preselected_model,
+            status,
+        ) {
+            Ok(dialog) => {
+                self.dialog = dialog;
+                if let Some(shell) = self.onboarding_shell.as_mut() {
+                    shell.present_engine(match wizard_id {
+                        cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID => {
+                            crate::tui::onboarding::EngineStage::Profile
+                        }
+                        cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID => {
+                            crate::tui::onboarding::EngineStage::Agent
+                        }
+                        cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID => {
+                            crate::tui::onboarding::EngineStage::Lifetime
+                        }
+                        _ => crate::tui::onboarding::EngineStage::Model,
+                    });
+                }
+            }
+            Err(error) => {
+                // Fail visibly: the stage has no native screen, so surface
+                // the construction failure and drop the engine.
+                self.dialog = crate::tui::settings::Dialog::None;
+                self.show_toast(error, super::ToastKind::Error);
+            }
+        }
     }
 
     fn start_onboarding_ready_construction_retry(&mut self) {
@@ -169,6 +344,12 @@ impl App {
             );
             return;
         };
+        // Latch the in-flight transition on the shell so a duplicate stage
+        // completion cannot request a second advance before the
+        // authoritative revision lands.
+        if let Some(shell) = self.onboarding_shell.as_mut() {
+            shell.latch_transition(snapshot.revision, transition);
+        }
         let lifecycle = self.lifecycle.clone();
         self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.transition"),
@@ -204,145 +385,100 @@ impl App {
         );
     }
 
-    /// If the user has no providers configured in the active config
-    /// layer, open onboarding directly. No-op when
-    /// providers already exist or when the settings dialog is already
-    /// open. Evaluated each launch so emptying the providers list
-    /// re-triggers the wizard on the next start.
-    pub(super) fn maybe_open_add_provider_wizard(&mut self) {
-        if self.dialog.is_active() {
-            return;
-        }
-        if self.config_snapshot.providers.providers.is_empty()
-            && !self.has_no_providers_at_startup
-            && !self.config_snapshot.from_daemon
-        {
-            // A generation-zero empty seed during runner replacement or
-            // reconnect is not a provider-less launch.
-            return;
-        }
-        let Some(stage) = self
-            .onboarding_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.stage)
-        else {
-            return;
-        };
-        if stage == cockpit_proto::OnboardingStage::Complete {
-            return;
-        }
-        self.dialog = match stage {
-            cockpit_proto::OnboardingStage::Welcome => {
-                crate::tui::settings::Dialog::open_onboarding_welcome(&self.launch.cwd)
+    /// Map a shell intent onto its daemon operation. The shell never writes
+    /// config, credential, or onboarding state itself.
+    pub(super) fn apply_onboarding_shell_action(
+        &mut self,
+        action: Option<crate::tui::onboarding::OnboardingShellAction>,
+    ) {
+        use crate::tui::onboarding::OnboardingShellAction;
+        match action {
+            None => {}
+            Some(OnboardingShellAction::Transition(kind, settlement)) => {
+                self.request_onboarding_transition(kind, settlement);
             }
-            cockpit_proto::OnboardingStage::Profile => match crate::tui::settings::Dialog::open_setup_wizard(
-                &self.launch.cwd,
-                cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
-            ) {
-                Ok(dialog) => dialog,
-                Err(error) => {
-                    self.show_toast(error, super::ToastKind::Error);
-                    return;
-                }
-            },
-            cockpit_proto::OnboardingStage::SecureStore => crate::tui::settings::Dialog::open_onboarding_secure_store(
-                self.onboarding_snapshot
-                    .as_ref()
-                    .expect("secure-store stage has a snapshot")
-                    .host_capabilities
-                    .clone(),
-            ),
-            cockpit_proto::OnboardingStage::Provider => {
-                crate::tui::settings::Dialog::open_onboarding_provider_add(
+            Some(OnboardingShellAction::SecureIntent(submission)) => {
+                self.apply_onboarding_secure_intent(submission);
+            }
+            Some(OnboardingShellAction::SelectTemplate(template)) => {
+                // Mount the provider engine seeded with the canonical
+                // template chosen from the searchable catalog.
+                self.dialog = crate::tui::settings::Dialog::onboarding_provider_engine(
                     &self.launch.cwd,
-                    Some("Resume setup: add and validate a provider credential.".to_string()),
-                )
-            }
-            cockpit_proto::OnboardingStage::Model => {
-                match crate::tui::settings::Dialog::open_onboarding_model_setup(Some(
-                    "Resume setup: enter a model ID and its context settings.".to_string(),
-                )) {
-                    Ok(dialog) => dialog,
-                    Err(error) => {
-                        self.show_toast(error, super::ToastKind::Error);
-                        return;
-                    }
+                    None,
+                );
+                self.dialog.seed_provider_template(template);
+                if let Some(shell) = self.onboarding_shell.as_mut() {
+                    shell.present_engine(crate::tui::onboarding::EngineStage::Provider);
                 }
             }
-            cockpit_proto::OnboardingStage::Agent => {
-                match crate::tui::settings::Dialog::open_onboarding_agent_setup(Some(
-                    "Resume setup: install an agent and confirm its model, tools, trust, and sidecar."
-                        .to_string(),
-                )) {
-                    Ok(dialog) => dialog,
-                    Err(error) => {
-                        self.show_toast(error, super::ToastKind::Error);
-                        return;
-                    }
-                }
+            Some(OnboardingShellAction::Close) => {
+                // Cancel/exit preserves committed daemon progress and drops
+                // only the local engine state; a later reopen resumes from
+                // the authoritative snapshot.
+                self.onboarding_shell = None;
+                self.dialog = crate::tui::settings::Dialog::None;
             }
-            cockpit_proto::OnboardingStage::Lifetime => {
-                match crate::tui::settings::Dialog::open_onboarding_lifetime_setup(Some(
-                    "Resume setup: choose what happens when the last Cockpit window closes."
-                        .to_string(),
-                )) {
-                    Ok(dialog) => dialog,
-                    Err(error) => {
-                        self.show_toast(error, super::ToastKind::Error);
-                        return;
-                    }
-                }
-            }
-            cockpit_proto::OnboardingStage::Complete => return,
-        };
+        }
     }
 
-    pub(super) fn service_first_run_flow(&mut self) -> bool {
-        if self.onboarding_completion_visible {
-            let Some(choice) = self.dialog.take_first_run_choice() else {
-                return false;
-            };
-            match choice {
-                crate::tui::settings::FirstRunChoice::AddAnotherProvider => {
-                    self.dialog = crate::tui::settings::Dialog::open_onboarding_provider_add(
-                        &self.launch.cwd,
-                        Some("Add another provider; live validation is required.".to_string()),
-                    );
-                    self.onboarding_completion_visible = false;
-                }
-                crate::tui::settings::FirstRunChoice::StartCoding => {
-                    self.dialog = crate::tui::settings::Dialog::None;
-                    self.onboarding_completion_visible = false;
-                    self.request_onboarding_transition(
-                        cockpit_proto::OnboardingTransitionKind::Complete,
-                        None,
-                    );
-                }
-            }
-            return true;
-        }
+    fn apply_onboarding_secure_intent(
+        &mut self,
+        submission: crate::tui::onboarding::SecureStoreSubmission,
+    ) {
+        let Some(snapshot) = self.onboarding_snapshot.clone() else {
+            self.show_toast(
+                "Onboarding checkpoint is unavailable",
+                super::ToastKind::Error,
+            );
+            return;
+        };
+        let request = cockpit_proto::ApplyOnboardingSecureIntent {
+            run_id: snapshot.run_id,
+            attempt_id: snapshot.attempt_id,
+            expected_revision: snapshot.revision,
+            client_operation_id: uuid::Uuid::new_v4().to_string(),
+            placement: submission.placement,
+            passphrase: submission.passphrase,
+        };
+        let lifecycle = self.lifecycle.clone();
+        self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.secure_intent"),
+            crate::tui::async_action::AsyncActionPolicy::Dedupe(
+                crate::tui::async_action::AsyncActionKey::new("onboarding.secure_intent"),
+            ),
+            async move {
+                onboarding_snapshot_after_secure_intent(&lifecycle, request)
+                    .await
+                    .map(crate::tui::async_action::AsyncActionPayload::OnboardingBootstrap)
+            },
+        );
+    }
+
+    /// Service the full-screen onboarding shell each wake: advance stages
+    /// whose engine settled, present completion, and keep the shell paired
+    /// with a live engine. Key-driven intents are applied inline in
+    /// `handle_onboarding_shell_key`; this poll covers completions that the
+    /// engine reaches asynchronously.
+    pub(super) fn service_onboarding_shell(&mut self) -> bool {
         let Some(snapshot) = self.onboarding_snapshot.clone() else {
             return false;
         };
-        match snapshot.stage {
+        let Some(shell) = self.onboarding_shell.as_ref() else {
+            return false;
+        };
+        if shell.transition_pending() {
+            return false;
+        }
+        match shell.stage() {
             cockpit_proto::OnboardingStage::Complete => false,
-            cockpit_proto::OnboardingStage::Welcome => {
-                if !self
-                    .dialog
-                    .setup_wizard_is_active(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID)
-                {
-                    return false;
-                }
-                self.request_onboarding_transition(
-                    cockpit_proto::OnboardingTransitionKind::Advance,
-                    None,
-                );
-                true
-            }
+            cockpit_proto::OnboardingStage::Welcome
+            | cockpit_proto::OnboardingStage::SecureStore => false,
             cockpit_proto::OnboardingStage::Profile => {
-                if !self
-                    .dialog
-                    .setup_wizard_is_complete(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID)
+                if !shell.screen_is_engine(crate::tui::onboarding::EngineStage::Profile)
+                    || !self.dialog.setup_wizard_is_complete(
+                        cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+                    )
                 {
                     return false;
                 }
@@ -353,38 +489,10 @@ impl App {
                 );
                 true
             }
-            cockpit_proto::OnboardingStage::SecureStore => {
-                let Some(submission) = self.dialog.take_onboarding_secure_store_submission() else {
-                    return false;
-                };
-                let Some(snapshot) = self.onboarding_snapshot.as_ref() else {
-                    return false;
-                };
-                let request = cockpit_proto::ApplyOnboardingSecureIntent {
-                    run_id: snapshot.run_id,
-                    attempt_id: snapshot.attempt_id,
-                    expected_revision: snapshot.revision,
-                    client_operation_id: uuid::Uuid::new_v4().to_string(),
-                    placement: submission.placement,
-                    passphrase: submission.passphrase,
-                };
-                let lifecycle = self.lifecycle.clone();
-                self.async_actions.start(
-                    crate::tui::async_action::AsyncActionKind::DaemonRpc(
-                        "onboarding.secure_intent",
-                    ),
-                    crate::tui::async_action::AsyncActionPolicy::Dedupe(
-                        crate::tui::async_action::AsyncActionKey::new("onboarding.secure_intent"),
-                    ),
-                    async move {
-                        onboarding_snapshot_after_secure_intent(&lifecycle, request)
-                            .await
-                            .map(crate::tui::async_action::AsyncActionPayload::OnboardingBootstrap)
-                    },
-                );
-                true
-            }
             cockpit_proto::OnboardingStage::Provider => {
+                if !shell.screen_is_engine(crate::tui::onboarding::EngineStage::Provider) {
+                    return false;
+                }
                 let settlement = self.dialog.onboarding_provider_settlement(
                     snapshot.run_id,
                     snapshot.attempt_id,
@@ -393,43 +501,19 @@ impl App {
                 let Some(settlement) = settlement else {
                     return false;
                 };
-                let provider_id = settlement
-                    .provider_id
-                    .clone()
-                    .expect("provider settlement always carries provider identity");
                 self.refresh_bootstrap_config_snapshot();
-                let model_id =
-                    first_provider_model_id(&self.config_snapshot.providers, &provider_id);
-                let dialog = match model_id.as_deref() {
-                    Some(model_id) => {
-                        crate::tui::settings::Dialog::open_onboarding_model_setup_preselected(
-                            &provider_id,
-                            model_id,
-                            Some("Choose the model Cockpit should use by default.".to_string()),
-                        )
-                    }
-                    None => crate::tui::settings::Dialog::open_onboarding_model_setup(Some(
-                        "No model catalog is available. Enter the exact model ID and context settings manually."
-                            .to_string(),
-                    )),
-                };
-                match dialog {
-                    Ok(_dialog) => {
-                        self.request_onboarding_transition(
-                            cockpit_proto::OnboardingTransitionKind::Advance,
-                            Some(settlement),
-                        );
-                    }
-                    Err(error) => {
-                        self.show_toast(error, super::ToastKind::Error);
-                    }
-                }
+                self.request_onboarding_transition(
+                    cockpit_proto::OnboardingTransitionKind::Advance,
+                    Some(settlement),
+                );
                 true
             }
             cockpit_proto::OnboardingStage::Model => {
-                if !self.dialog.setup_wizard_is_complete_any(&[
-                    cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID,
-                ]) {
+                if !shell.screen_is_engine(crate::tui::onboarding::EngineStage::Model)
+                    || !self
+                        .dialog
+                        .setup_wizard_is_complete(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID)
+                {
                     return false;
                 }
                 self.refresh_bootstrap_config_snapshot();
@@ -451,9 +535,10 @@ impl App {
                 true
             }
             cockpit_proto::OnboardingStage::Agent => {
-                if !self
-                    .dialog
-                    .setup_wizard_is_complete(cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID)
+                if !shell.screen_is_engine(crate::tui::onboarding::EngineStage::Agent)
+                    || !self
+                        .dialog
+                        .setup_wizard_is_complete(cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID)
                 {
                     return false;
                 }
@@ -476,56 +561,22 @@ impl App {
                 true
             }
             cockpit_proto::OnboardingStage::Lifetime => {
-                if !self
-                    .dialog
-                    .setup_wizard_is_complete(cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID)
+                if shell.screen_is_complete() {
+                    return false;
+                }
+                if !shell.screen_is_engine(crate::tui::onboarding::EngineStage::Lifetime)
+                    || !self.dialog.setup_wizard_is_complete(
+                        cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
+                    )
                 {
                     return false;
                 }
                 self.refresh_bootstrap_config_snapshot();
                 let configured_model = self.config_snapshot.providers.active_model.clone();
-                let summary = configured_model
-                    .as_ref()
-                    .map(|active| {
-                        format!(
-                            "Configured {}/{} as the default model for future sessions.",
-                            active.provider, active.model
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        "Model configuration finished; no default model was selected.".to_string()
-                    });
-                let sandbox = self
-                    .host_capabilities
-                    .feature("sandbox.host")
-                    .map(|row| format!("Sandbox: {:?} ({})", row.state, row.reason))
-                    .unwrap_or_else(|| "Sandbox: capability check pending".to_string());
-                let missing_dependencies = self
-                    .host_capabilities
-                    .dependencies
-                    .iter()
-                    .filter(|row| {
-                        !matches!(
-                            row.state,
-                            cockpit_proto::CatalogDependencyState::Available
-                                | cockpit_proto::CatalogDependencyState::NotApplicable
-                        )
-                    })
-                    .map(|row| row.id.as_str())
-                    .collect::<Vec<_>>();
-                let dependencies = if missing_dependencies.is_empty() {
-                    "Dependencies: ready".to_string()
-                } else {
-                    format!(
-                        "Dependencies needing attention: {}",
-                        missing_dependencies.join(", ")
-                    )
-                };
-                let platform_warning = onboarding_platform_warning();
-                self.dialog = crate::tui::settings::Dialog::open_first_run_complete(format!(
-                    "{summary} {sandbox}. {dependencies}.{platform_warning} Add another provider any time with /provider add. Suggested first prompt: ‘Help me understand this codebase.’"
-                ));
-                self.onboarding_completion_visible = true;
+                let summary = self.onboarding_completion_summary();
+                if let Some(shell) = self.onboarding_shell.as_mut() {
+                    shell.present_completion(summary);
+                }
                 if self.submit_after_model_selection {
                     match configured_model {
                         Some(active) => {
@@ -550,6 +601,65 @@ impl App {
                 true
             }
         }
+    }
+
+    /// Route a key through the full-screen onboarding shell. Returns
+    /// `false` (consume): while onboarding, no other surface sees keys.
+    pub(super) fn handle_onboarding_shell_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        self.dialog.bind_lifecycle(self.lifecycle.clone());
+        let action = match self.onboarding_shell.as_mut() {
+            Some(shell) => shell.handle_key(key, &mut self.dialog),
+            None => None,
+        };
+        // The engine may have queued OAuth or effect requests with the key.
+        self.drain_oauth_actions();
+        self.apply_onboarding_shell_action(action);
+        false
+    }
+
+    fn onboarding_completion_summary(&self) -> String {
+        let configured_model = &self.config_snapshot.providers.active_model;
+        let summary = configured_model
+            .as_ref()
+            .map(|active| {
+                format!(
+                    "Configured {}/{} as the default model for future sessions.",
+                    active.provider, active.model
+                )
+            })
+            .unwrap_or_else(|| {
+                "Model configuration finished; no default model was selected.".to_string()
+            });
+        let sandbox = self
+            .host_capabilities
+            .feature("sandbox.host")
+            .map(|row| format!("Sandbox: {:?} ({})", row.state, row.reason))
+            .unwrap_or_else(|| "Sandbox: capability check pending".to_string());
+        let missing_dependencies = self
+            .host_capabilities
+            .dependencies
+            .iter()
+            .filter(|row| {
+                !matches!(
+                    row.state,
+                    cockpit_proto::CatalogDependencyState::Available
+                        | cockpit_proto::CatalogDependencyState::NotApplicable
+                )
+            })
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>();
+        let dependencies = if missing_dependencies.is_empty() {
+            "Dependencies: ready".to_string()
+        } else {
+            format!(
+                "Dependencies needing attention: {}",
+                missing_dependencies.join(", ")
+            )
+        };
+        let platform_warning = onboarding_platform_warning();
+        format!(
+            "{summary} {sandbox}. {dependencies}.{platform_warning} Add another provider any time with /provider add. Suggested first prompt: ‘Help me understand this codebase.’"
+        )
     }
 
     pub(super) fn apply_startup_guidance_estimate(
@@ -792,16 +902,4 @@ fn onboarding_platform_warning() -> &'static str {
 #[cfg(not(windows))]
 fn onboarding_platform_warning() -> &'static str {
     ""
-}
-
-fn first_provider_model_id(
-    providers: &cockpit_config::providers::ProvidersConfig,
-    provider_id: &str,
-) -> Option<String> {
-    providers
-        .providers
-        .get(provider_id)?
-        .models
-        .first()
-        .map(|model| model.id.clone())
 }

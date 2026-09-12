@@ -2541,12 +2541,6 @@ pub const DIALOG_HEIGHT: u16 = 20;
 
 pub enum Dialog {
     None,
-    OnboardingWelcome {
-        cwd: PathBuf,
-        frame: usize,
-        reduced_motion: bool,
-    },
-    OnboardingSecureStore(Box<OnboardingSecureStoreDialog>),
     WorkspaceTrust {
         root: cockpit_config::trust::TrustRoot,
         cursor: usize,
@@ -2594,21 +2588,10 @@ pub enum Dialog {
         cursor: usize,
     },
     SetupWizard(Box<SetupWizardDialog>),
-    FirstRunComplete {
-        summary: String,
-        cursor: usize,
-        choice: Option<FirstRunChoice>,
-    },
     /// Boxed because [`SettingsDialog`] dwarfs the other variants
     /// (~1.1KB vs <100 bytes), which would otherwise bloat every
     /// [`Dialog`] on the stack.
     Settings(Box<SettingsDialog>),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FirstRunChoice {
-    AddAnotherProvider,
-    StartCoding,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2753,28 +2736,6 @@ pub struct SetupWizardDialog {
     queued_daemon_effect: Option<SettingsDaemonEffectRequest>,
     pending_operation_id: Option<uuid::Uuid>,
     settled_operation_id: Option<uuid::Uuid>,
-}
-
-pub struct OnboardingSecureStoreDialog {
-    capabilities: cockpit_proto::HostCapabilitySnapshot,
-    cursor: usize,
-    phase: SecureStoreInputPhase,
-    passphrase: zeroize::Zeroizing<String>,
-    confirmation: zeroize::Zeroizing<String>,
-    submitted: Option<SecureStoreSubmission>,
-    status: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SecureStoreInputPhase {
-    Choice,
-    Passphrase,
-    Confirmation,
-}
-
-pub struct SecureStoreSubmission {
-    pub placement: cockpit_proto::OnboardingSecurePlacement,
-    pub passphrase: Option<cockpit_proto::SensitiveOnboardingPassphrase>,
 }
 
 pub struct SettingsDialog {
@@ -5736,7 +5697,6 @@ impl Dialog {
             Dialog::WorkspaceTrust { .. } => Some("workspace_trust"),
             Dialog::WizardMenu { .. } => Some("wizard_menu"),
             Dialog::SetupWizard(wizard) => Some(wizard.run.descriptor().id),
-            Dialog::FirstRunComplete { .. } => Some("first_run_complete"),
             _ => None,
         }
     }
@@ -5946,77 +5906,45 @@ impl Dialog {
         Self::open_providers_add_with_status(cwd, None)
     }
 
-    pub fn open_onboarding_provider_add(cwd: &std::path::Path, status: Option<String>) -> Self {
+    pub fn open_providers_add_with_status(cwd: &std::path::Path, status: Option<String>) -> Self {
+        Self::open_providers_add_mode(cwd, status, false)
+    }
+
+    /// Provider-add engine for the onboarding shell: the same daemon-backed
+    /// add wizard the providers page hosts, presented inside the full-screen
+    /// shell instead of the settings modal. The onboarding flag keeps its
+    /// resume/validation semantics.
+    pub fn onboarding_provider_engine(cwd: &std::path::Path, status: Option<String>) -> Self {
         Self::open_providers_add_mode(cwd, status, true)
     }
 
-    /// Resume validation of a provider whose daemon-owned save committed
-    /// after the add wizard was cancelled.
-    pub fn open_onboarding_provider_validation(cwd: &std::path::Path, provider_id: &str) -> Self {
-        let path = global_config_dir().map(|root| (root.join(CONFIG_FILE), root));
-        match path {
-            Ok((path, global_root)) => {
-                let mut s = SettingsDialog::open_from_picker(path, global_root);
-                if s.config.providers.contains_key(provider_id) {
-                    let mut add = AddState::new_with_onboarding(true);
-                    s.resume_onboarding_provider_validation(&mut add, provider_id);
-                    s.page = providers_page(ProvidersPage::Add(add));
-                } else {
-                    let mut add = AddState::new_with_onboarding(true);
-                    add.error = Some(format!(
-                        "The saved provider `{provider_id}` is no longer configured. Add and validate a provider to resume setup."
-                    ));
-                    s.page = providers_page(ProvidersPage::Add(add));
-                }
-                Dialog::Settings(Box::new(s))
-            }
-            Err(error) => Dialog::CreateConfig {
-                choices: Vec::new(),
-                cursor: 0,
-                cwd: cwd.to_path_buf(),
-                status: Some(format!(
-                    "could not resolve the global Cockpit config: {error}"
-                )),
-            },
-        }
-    }
-
-    pub fn open_onboarding_welcome(cwd: &std::path::Path) -> Self {
-        let reduced_motion = std::env::var_os("NO_COLOR").is_some()
-            || std::env::var("TERM").is_ok_and(|term| term == "dumb")
-            || ["COCKPIT_REDUCE_MOTION", "REDUCE_MOTION"]
-                .into_iter()
-                .any(|name| std::env::var(name).is_ok_and(|value| value != "0"));
-        Self::OnboardingWelcome {
-            cwd: cwd.to_path_buf(),
-            frame: 0,
-            reduced_motion,
-        }
-    }
-
-    pub fn open_onboarding_secure_store(
-        capabilities: cockpit_proto::HostCapabilitySnapshot,
-    ) -> Self {
-        Dialog::OnboardingSecureStore(Box::new(OnboardingSecureStoreDialog {
-            capabilities,
-            cursor: 0,
-            phase: SecureStoreInputPhase::Choice,
-            passphrase: zeroize::Zeroizing::new(String::new()),
-            confirmation: zeroize::Zeroizing::new(String::new()),
-            submitted: None,
-            status: None,
-        }))
-    }
-
-    pub fn take_onboarding_secure_store_submission(&mut self) -> Option<SecureStoreSubmission> {
+    /// True while this dialog is the onboarding provider engine sitting on
+    /// its Add page. The shell uses this to detect the wizard abandoning
+    /// provider setup (its own back semantics) so it can return to the
+    /// searchable catalog instead of a settings list.
+    pub fn is_provider_add(&self) -> bool {
         match self {
-            Dialog::OnboardingSecureStore(dialog) => dialog.submitted.take(),
-            _ => None,
+            Dialog::Settings(settings) => matches!(
+                settings.page.as_any().downcast_ref::<ProvidersPage>(),
+                Some(ProvidersPage::Add(_))
+            ),
+            _ => false,
         }
     }
 
-    pub fn open_providers_add_with_status(cwd: &std::path::Path, status: Option<String>) -> Self {
-        Self::open_providers_add_mode(cwd, status, false)
+    /// Seed the provider-add engine with a template chosen from the shell's
+    /// searchable catalog. Applies the same prefill the wizard's template
+    /// step performs (id/url/headers/env-var defaults) and advances past
+    /// the template step; the canonical `'static` template identity is
+    /// preserved unchanged.
+    pub fn seed_provider_template(
+        &mut self,
+        template: &'static cockpit_core::providers::ProviderTemplate,
+    ) {
+        let Dialog::Settings(settings) = self else {
+            return;
+        };
+        settings.seed_onboarding_template(template);
     }
 
     fn open_providers_add_mode(
@@ -6062,18 +5990,47 @@ impl Dialog {
         let global_root = global_config_dir().map_err(|error| error.to_string())?;
         match wizard_id {
             cockpit_core::wizard::PROVIDER_WIZARD_ID => Ok(Self::open_providers_add(cwd)),
-            cockpit_core::wizard::SECURITY_WIZARD_ID
-            | cockpit_core::wizard::MODEL_WIZARD_ID
-            | cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID
-            | cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID
-            | cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID
-            | cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID => {
+            cockpit_core::wizard::SECURITY_WIZARD_ID | cockpit_core::wizard::MODEL_WIZARD_ID => {
                 let descriptor = cockpit_core::wizard::descriptor_for_cwd(wizard_id, &global_root)
                     .ok_or_else(|| format!("unknown setup wizard `{wizard_id}`"))?;
                 setup_wizard_dialog(&global_root, descriptor, None)
             }
             other => Err(format!("unknown setup wizard `{other}`")),
         }
+    }
+
+    /// Wizard engine for the onboarding shell's profile/model/agent/lifetime
+    /// stages. The same wizard machinery (and daemon-effect settlement) as
+    /// the non-onboarding setup wizards, presented inside the full-screen
+    /// shell instead of the settings modal. `preselected_model` seeds the
+    /// model wizard's provider/model pair when the committed provider
+    /// catalog already offers one.
+    pub fn onboarding_wizard_engine(
+        wizard_id: &str,
+        preselected_model: Option<(&str, &str)>,
+        status: Option<String>,
+    ) -> Result<Self, String> {
+        let global_root = global_config_dir().map_err(|error| error.to_string())?;
+        let descriptor = match wizard_id {
+            cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID => {
+                cockpit_core::wizard::descriptor_for_cwd(wizard_id, &global_root)
+            }
+            cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID => {
+                Some(cockpit_core::wizard::onboarding_model_descriptor_for_cwd(
+                    &global_root,
+                    preselected_model,
+                ))
+            }
+            cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID => {
+                cockpit_core::wizard::descriptor_for_cwd(wizard_id, &global_root)
+            }
+            cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID => {
+                Some(cockpit_core::wizard::onboarding_lifetime_descriptor())
+            }
+            other => return Err(format!("unknown onboarding wizard `{other}`")),
+        }
+        .ok_or_else(|| format!("could not build onboarding wizard `{wizard_id}`"))?;
+        setup_wizard_dialog(&global_root, descriptor, status)
     }
 
     pub fn open_model_setup_preselected(
@@ -6090,42 +6047,6 @@ impl Dialog {
         setup_wizard_dialog(&global_root, descriptor, status)
     }
 
-    pub fn open_onboarding_model_setup_preselected(
-        provider_id: &str,
-        model_id: &str,
-        status: Option<String>,
-    ) -> Result<Self, String> {
-        let global_root = global_config_dir().map_err(|error| error.to_string())?;
-        let descriptor = cockpit_core::wizard::onboarding_model_descriptor_for_cwd(
-            &global_root,
-            Some((provider_id, model_id)),
-        );
-        setup_wizard_dialog(&global_root, descriptor, status)
-    }
-
-    pub fn open_onboarding_model_setup(status: Option<String>) -> Result<Self, String> {
-        let global_root = global_config_dir().map_err(|error| error.to_string())?;
-        let descriptor =
-            cockpit_core::wizard::onboarding_model_descriptor_for_cwd(&global_root, None);
-        setup_wizard_dialog(&global_root, descriptor, status)
-    }
-
-    pub fn open_onboarding_lifetime_setup(status: Option<String>) -> Result<Self, String> {
-        let global_root = global_config_dir().map_err(|error| error.to_string())?;
-        let descriptor = cockpit_core::wizard::onboarding_lifetime_descriptor();
-        setup_wizard_dialog(&global_root, descriptor, status)
-    }
-
-    pub fn open_onboarding_agent_setup(status: Option<String>) -> Result<Self, String> {
-        let global_root = global_config_dir().map_err(|error| error.to_string())?;
-        let descriptor = cockpit_core::wizard::descriptor_for_cwd(
-            cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID,
-            &global_root,
-        )
-        .ok_or_else(|| "could not build onboarding agent catalog".to_string())?;
-        setup_wizard_dialog(&global_root, descriptor, status)
-    }
-
     pub fn open_model_setup_choice(
         cwd: &std::path::Path,
         confirmed: Option<(String, String)>,
@@ -6137,21 +6058,6 @@ impl Dialog {
             pending,
             cursor: 0,
         }
-    }
-
-    pub fn open_first_run_complete(summary: String) -> Self {
-        Dialog::FirstRunComplete {
-            summary,
-            cursor: 1,
-            choice: None,
-        }
-    }
-
-    pub fn take_first_run_choice(&mut self) -> Option<FirstRunChoice> {
-        let Dialog::FirstRunComplete { choice, .. } = self else {
-            return None;
-        };
-        choice.take()
     }
 
     pub fn take_completed_provider_id(&mut self) -> Option<String> {
@@ -6410,14 +6316,6 @@ impl Dialog {
                 s.tick();
                 false
             }
-            Dialog::OnboardingWelcome {
-                frame,
-                reduced_motion,
-                ..
-            } if !*reduced_motion => {
-                *frame = frame.wrapping_add(1);
-                true
-            }
             _ => false,
         }
     }
@@ -6425,33 +6323,6 @@ impl Dialog {
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         match self {
             Dialog::None => false,
-            Dialog::OnboardingWelcome { cwd, .. } => {
-                match Self::open_setup_wizard(
-                    cwd,
-                    cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
-                ) {
-                    Ok(next) => *self = next,
-                    Err(error) => {
-                        *self = Dialog::CreateConfig {
-                            choices: Vec::new(),
-                            cursor: 0,
-                            cwd: cwd.clone(),
-                            status: Some(format!("Could not open profile setup: {error}")),
-                        };
-                    }
-                }
-                false
-            }
-            Dialog::OnboardingSecureStore(dialog) => handle_secure_store_key(dialog, key),
-            Dialog::FirstRunComplete { cursor, choice, .. } => {
-                match list_key_action(key, cursor, 2) {
-                    ListAction::Stay => {}
-                    ListAction::Close => *choice = Some(FirstRunChoice::StartCoding),
-                    ListAction::Select(0) => *choice = Some(FirstRunChoice::AddAnotherProvider),
-                    ListAction::Select(_) => *choice = Some(FirstRunChoice::StartCoding),
-                }
-                false
-            }
             Dialog::WorkspaceTrust { cursor, chosen, .. } => {
                 match workspace_trust_key_action(key, cursor) {
                     WorkspaceTrustAction::Stay => false,
@@ -6599,11 +6470,6 @@ impl Dialog {
     pub fn paste(&mut self, text: &str) {
         match self {
             Dialog::Settings(s) => s.paste(text),
-            Dialog::OnboardingSecureStore(dialog) => match dialog.phase {
-                SecureStoreInputPhase::Passphrase => dialog.passphrase.push_str(text),
-                SecureStoreInputPhase::Confirmation => dialog.confirmation.push_str(text),
-                SecureStoreInputPhase::Choice => {}
-            },
             _ => {}
         }
     }
@@ -6843,14 +6709,6 @@ impl Dialog {
     ) {
         match self {
             Dialog::None => {}
-            Dialog::OnboardingWelcome {
-                frame: animation_frame,
-                reduced_motion,
-                ..
-            } => render_onboarding_welcome(frame, area, *animation_frame, *reduced_motion),
-            Dialog::OnboardingSecureStore(dialog) => {
-                render_onboarding_secure_store(frame, area, dialog)
-            }
             Dialog::WorkspaceTrust { root, cursor, .. } => {
                 render_workspace_trust(frame, area, root, *cursor)
             }
@@ -6909,9 +6767,6 @@ impl Dialog {
                 *cursor,
             ),
             Dialog::SetupWizard(wizard) => render_setup_wizard(frame, area, wizard),
-            Dialog::FirstRunComplete {
-                summary, cursor, ..
-            } => render_first_run_complete(frame, area, summary, *cursor),
             Dialog::Settings(s) => s.render(frame, area, links),
         }
     }
@@ -9918,114 +9773,6 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
     false
 }
 
-fn handle_secure_store_key(dialog: &mut OnboardingSecureStoreDialog, key: KeyEvent) -> bool {
-    match dialog.phase {
-        SecureStoreInputPhase::Choice => match key.code {
-            KeyCode::Up => {
-                dialog.cursor = dialog.cursor.saturating_sub(1);
-                dialog.status = None;
-            }
-            KeyCode::Down => {
-                dialog.cursor = (dialog.cursor + 1).min(2);
-                dialog.status = None;
-            }
-            KeyCode::Esc => return true,
-            KeyCode::Enter => {
-                let (placement, capability_id) = match dialog.cursor {
-                    0 => (
-                        cockpit_proto::OnboardingSecurePlacement::Automatic,
-                        "secret_store.keyring",
-                    ),
-                    1 => (
-                        cockpit_proto::OnboardingSecurePlacement::PassphraseFile,
-                        "secret_store.file",
-                    ),
-                    _ => (
-                        cockpit_proto::OnboardingSecurePlacement::MachineBoundFile,
-                        "secret_store.file",
-                    ),
-                };
-                let Some(capability) = dialog.capabilities.feature(capability_id) else {
-                    dialog.status = Some("Secure-store capability is not ready; retry after the host check completes.".into());
-                    return false;
-                };
-                if !capability.state.is_available() {
-                    dialog.status = Some(
-                        capability
-                            .fix_command
-                            .as_deref()
-                            .or(capability.remedy_text.as_deref())
-                            .unwrap_or(capability.reason.as_str())
-                            .to_string(),
-                    );
-                    return false;
-                }
-                if placement == cockpit_proto::OnboardingSecurePlacement::PassphraseFile {
-                    dialog.phase = SecureStoreInputPhase::Passphrase;
-                } else {
-                    dialog.submitted = Some(SecureStoreSubmission {
-                        placement,
-                        passphrase: None,
-                    });
-                }
-            }
-            _ => {}
-        },
-        SecureStoreInputPhase::Passphrase | SecureStoreInputPhase::Confirmation => match key.code {
-            KeyCode::Esc => {
-                dialog.passphrase.clear();
-                dialog.confirmation.clear();
-                dialog.phase = SecureStoreInputPhase::Choice;
-                dialog.status = None;
-            }
-            KeyCode::Backspace => {
-                let target = if dialog.phase == SecureStoreInputPhase::Passphrase {
-                    &mut dialog.passphrase
-                } else {
-                    &mut dialog.confirmation
-                };
-                target.pop();
-            }
-            KeyCode::Char(ch) => {
-                let ch = crate::tui::textfield::normalize_shift_char(&key, ch);
-                let target = if dialog.phase == SecureStoreInputPhase::Passphrase {
-                    &mut dialog.passphrase
-                } else {
-                    &mut dialog.confirmation
-                };
-                target.push(ch);
-            }
-            KeyCode::Enter if dialog.phase == SecureStoreInputPhase::Passphrase => {
-                if dialog.passphrase.is_empty() {
-                    dialog.status = Some("Passphrase must not be empty.".into());
-                } else {
-                    dialog.phase = SecureStoreInputPhase::Confirmation;
-                    dialog.status = None;
-                }
-            }
-            KeyCode::Enter => {
-                let value = std::mem::take(&mut *dialog.passphrase);
-                let confirmation = std::mem::take(&mut *dialog.confirmation);
-                match cockpit_proto::SensitiveOnboardingPassphrase::confirmed(value, confirmation) {
-                    Ok(passphrase) => {
-                        dialog.submitted = Some(SecureStoreSubmission {
-                            placement: cockpit_proto::OnboardingSecurePlacement::PassphraseFile,
-                            passphrase: Some(passphrase),
-                        });
-                        dialog.status = None;
-                    }
-                    Err(error) => {
-                        dialog.status = Some(error.into());
-                        dialog.phase = SecureStoreInputPhase::Passphrase;
-                    }
-                }
-            }
-            _ => {}
-        },
-    }
-    false
-}
-
 fn apply_setup_wizard_daemon_completion(
     wizard: &mut SetupWizardDialog,
     completion: SettingsDaemonEffectCompletion,
@@ -10668,159 +10415,6 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
     frame.render_widget(
         help_line("↑/↓  space: toggle  t: tier  enter: select/continue  y/n: confirm  esc: close"),
         layout[1],
-    );
-}
-
-fn render_onboarding_secure_store(
-    frame: &mut Frame,
-    area: Rect,
-    dialog: &OnboardingSecureStoreDialog,
-) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Secure secret store ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let selected = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
-    let mut lines = vec![
-        Line::from("Choose where Cockpit encrypts credentials before adding a provider."),
-        Line::from(Span::styled(
-            "Automatic means the platform keyring only; a failure requires a new explicit choice.",
-            muted,
-        )),
-        Line::default(),
-    ];
-    match dialog.phase {
-        SecureStoreInputPhase::Choice => {
-            let choices = [
-                ("Platform keyring (recommended)", "No silent file fallback."),
-                (
-                    "Passphrase-protected file",
-                    "You must enter it again after a pre-commit crash.",
-                ),
-                (
-                    "Machine-bound encrypted file",
-                    "Explicit fallback tied to this machine.",
-                ),
-            ];
-            for (index, (label, description)) in choices.into_iter().enumerate() {
-                lines.push(Line::from(vec![
-                    Span::raw(if dialog.cursor == index { "▸ " } else { "  " }),
-                    Span::styled(
-                        label,
-                        if dialog.cursor == index {
-                            selected
-                        } else {
-                            Style::default()
-                        },
-                    ),
-                    Span::raw("  "),
-                    Span::styled(description, muted),
-                ]));
-            }
-        }
-        SecureStoreInputPhase::Passphrase => {
-            lines.push(Line::from("Enter a vault passphrase:"));
-            lines.push(Line::from("•".repeat(dialog.passphrase.chars().count())));
-        }
-        SecureStoreInputPhase::Confirmation => {
-            lines.push(Line::from("Confirm the vault passphrase:"));
-            lines.push(Line::from("•".repeat(dialog.confirmation.chars().count())));
-        }
-    }
-    if let Some(status) = dialog.status.as_deref() {
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(status.to_string(), Color::Red)));
-    }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
-    let help = match dialog.phase {
-        SecureStoreInputPhase::Choice => "↑/↓  enter: select  esc: cancel",
-        SecureStoreInputPhase::Passphrase | SecureStoreInputPhase::Confirmation => {
-            "enter: continue  esc: choose again"
-        }
-    };
-    frame.render_widget(help_line(help), layout[1]);
-}
-
-fn render_first_run_complete(frame: &mut Frame, area: Rect, summary: &str, cursor: usize) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Setup complete ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let mut lines = vec![
-        Line::from("Cockpit is ready."),
-        Line::from(summary.to_string()),
-        Line::default(),
-        Line::from("Next: run /setup security to choose project trust and approval defaults."),
-        Line::from("Use /help any time to see available commands."),
-        Line::default(),
-    ];
-    for (index, label) in ["Add another provider", "Start coding"].iter().enumerate() {
-        lines.push(Line::from(Span::styled(
-            format!("{} {label}", if index == cursor { "›" } else { " " }),
-            if index == cursor {
-                Style::default().fg(Color::Yellow)
-            } else {
-                muted
-            },
-        )));
-    }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
-}
-
-fn render_onboarding_welcome(
-    frame: &mut Frame,
-    area: Rect,
-    animation_frame: usize,
-    reduced_motion: bool,
-) {
-    let block = Block::default().borders(Borders::ALL).title(" Welcome ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let stages = ["·", "✦", "✈", "✦"];
-    let mark = if reduced_motion {
-        "✈"
-    } else {
-        stages[(animation_frame / 3) % stages.len()]
-    };
-    let description = if inner.width < 54 {
-        "Your coding cockpit."
-    } else {
-        "A focused cockpit for coding with the models you choose."
-    };
-    let mut lines = vec![
-        Line::from(Span::styled(
-            format!("{mark}  FlyCockpit"),
-            if reduced_motion {
-                Style::default()
-            } else {
-                Style::default().fg(Color::Yellow)
-            },
-        )),
-        Line::default(),
-        Line::from(description),
-        Line::default(),
-        Line::from("No Cockpit telemetry is collected."),
-        Line::from("Inference providers may have their own telemetry policies."),
-        Line::default(),
-        Line::from(Span::styled(
-            "Press any key to begin setup.",
-            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
-        )),
-    ];
-    lines.truncate(lines.len().min(inner.height as usize));
-    frame.render_widget(
-        Paragraph::new(lines)
-            .alignment(ratatui::layout::Alignment::Center)
-            .wrap(Wrap { trim: false }),
-        inner,
     );
 }
 

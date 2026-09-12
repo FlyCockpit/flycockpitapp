@@ -442,10 +442,9 @@ fn assert_config_epoch_reset_accepts_authoritative_zero(path: ConfigEpochPath) {
         !app.has_no_providers_at_startup,
         "an empty epoch seed must not masquerade as a provider-less process launch"
     );
-    app.maybe_open_add_provider_wizard();
     assert!(
-        !app.dialog.is_active(),
-        "the temporary seed must not open first-run provider setup"
+        app.onboarding_shell.is_none(),
+        "the temporary seed must not activate first-run onboarding; only the authoritative daemon snapshot may"
     );
     assert_eq!(app.config_snapshot.extended.dialog.lockout_ms, 9009);
     app.last_composer_edit_at = Some(Instant::now() - Duration::from_secs(2));

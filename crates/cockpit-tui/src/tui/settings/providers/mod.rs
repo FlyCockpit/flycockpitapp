@@ -1040,14 +1040,6 @@ impl AddState {
         self.template_cursor = cursor;
     }
 
-    pub(super) fn resume_onboarding_validation(&mut self, provider_id: &str) {
-        self.run
-            .return_to("test-key")
-            .expect("provider validation step exists");
-        self.saved_provider_id = Some(provider_id.to_string());
-        self.error = Some("Resume setup: test the saved credential with the daemon.".into());
-    }
-
     fn restore_non_secret_inputs(&mut self) {
         let Some(WizardAnswer::Select(template_id)) = self.run.answer("template") else {
             return;
@@ -1155,27 +1147,49 @@ impl EditState {
 // ── Handlers ─────────────────────────────────────────────────────────────
 
 impl SettingsDialog {
-    /// Resume a saved onboarding provider by immediately repeating the required
-    /// daemon-owned live validation. The only continuation without a successful
-    /// result remains the explicit offline fallback after this fetch fails.
-    pub(super) fn resume_onboarding_provider_validation(
-        &mut self,
-        state: &mut AddState,
-        provider_id: &str,
-    ) {
-        state.resume_onboarding_validation(provider_id);
-        let entry = self
-            .config
-            .providers
-            .get(provider_id)
-            .expect("caller verified saved provider exists")
-            .clone();
-        state.fetch = Some(FetchHandle::spawn(
-            self.lifecycle.clone(),
-            provider_id.to_string(),
-            entry,
-            self.provider_fetch_root(),
-        ));
+    /// Seed the add wizard with a template selected from the onboarding
+    /// shell's searchable catalog. Mirrors the template step's Enter
+    /// prefill exactly so the engine behaves identically whether the
+    /// template was picked from the cursor list or the search screen.
+    pub(super) fn seed_onboarding_template(&mut self, template: &'static ProviderTemplate) {
+        let Some(page) = self.page.downcast_mut::<ProvidersPage>() else {
+            return;
+        };
+        let ProvidersPage::Add(s) = page else {
+            return;
+        };
+        if s.run.current_step_id() != Some("template") {
+            return;
+        }
+        s.template = Some(template);
+        // Pre-fill id only for templates that map 1:1 to a single vendor;
+        // `openai-compatible` keeps its empty id for the user to name.
+        if template.use_id_as_default {
+            s.id_field.set(template.id);
+        } else {
+            s.id_field.set("");
+        }
+        s.url_field.set(template.url);
+        *s.headers = HeaderEditor::new_for_provider(
+            s.id_field.text(),
+            templates::default_headers_for(template),
+            /* show_continue */ true,
+        );
+        s.env_var_field.set(
+            cockpit_core::providers::detected_env_var(template)
+                .or(template.default_env_var)
+                .or_else(|| template.env_var_candidates.first().copied())
+                .unwrap_or("API_KEY"),
+        );
+        if let Some(detected) = cockpit_core::providers::detected_env_var(template) {
+            s.auth_method_cursor = 1;
+            s.detected_env_offer = Some(detected.to_string());
+        }
+        s.wire_api_cursor = 0;
+        s.error = None;
+        s.run
+            .submit(WizardAnswer::Select(template.id.to_string()))
+            .expect("provider template is a valid select answer");
     }
 
     pub(super) fn apply_fetch_result(
@@ -6473,7 +6487,7 @@ impl SettingsPage for ProvidersPage {
         "Providers"
     }
 }
-fn onboarding_ordered_templates() -> Vec<&'static ProviderTemplate> {
+pub(crate) fn onboarding_ordered_templates() -> Vec<&'static ProviderTemplate> {
     let mut ordered = templates::TEMPLATES.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|template| match template.id {
         "codex-oauth" | "copilot" | "grok-oauth" => 0,

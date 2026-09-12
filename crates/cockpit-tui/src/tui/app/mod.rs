@@ -663,7 +663,6 @@ impl App {
             self.resync_config_after_local_write();
         }
         self.dialog = Dialog::None;
-        self.maybe_open_add_provider_wizard();
     }
 }
 
@@ -2734,9 +2733,10 @@ pub struct App {
     pub(super) connector_disclosure: Option<cockpit_proto::ConnectorDisclosure>,
     has_no_providers_at_startup: bool,
     onboarding_snapshot: Option<cockpit_proto::OnboardingBootstrapSnapshot>,
-    /// Presentation-only completion choice. Durable stage ownership remains
-    /// exclusively in `onboarding_snapshot`; this flag never acts as a reducer.
-    onboarding_completion_visible: bool,
+    /// Full-screen onboarding shell. `None` unless the daemon snapshot says
+    /// an onboarding run is in flight; the shell is the only onboarding
+    /// renderer and the snapshot is its exclusive stage authority.
+    pub(super) onboarding_shell: Option<Box<crate::tui::onboarding::OnboardingShell>>,
     onboarding_skip: bool,
     onboarding_force: bool,
     /// An open `/side` side conversation, or `None` in the main session. While
@@ -3979,7 +3979,7 @@ impl App {
             connector_disclosure,
             has_no_providers_at_startup,
             onboarding_snapshot: None,
-            onboarding_completion_visible: false,
+            onboarding_shell: None,
             onboarding_skip: false,
             onboarding_force: false,
             side_conversation: None,
@@ -4003,18 +4003,15 @@ impl App {
             keys_overlay: None,
             keyboard_enhancement_active: false,
         };
-        // First-run convenience: if the daemon prompt doesn't gate
-        // startup, open the Add-Provider wizard immediately when no
-        // providers are configured. The prompt-resolution branches
-        // call this same helper after the user dismisses the daemon
-        // prompt.
+        // Workspace trust is the only pre-snapshot startup modal. The
+        // onboarding shell activates later, strictly after first paint,
+        // when the post-paint bootstrap fetch applies the authoritative
+        // snapshot (see `start_startup_background_tasks`).
         match startup_trust {
             StartupWorkspaceTrust::Pending(root) => {
                 app.dialog = Dialog::open_workspace_trust(root);
             }
-            StartupWorkspaceTrust::Decided => {
-                app.maybe_open_add_provider_wizard();
-            }
+            StartupWorkspaceTrust::Decided => {}
         }
         app
     }
@@ -4373,7 +4370,11 @@ impl App {
         changed |= self.tick_ctrl_c_window();
         changed |= self.check_pending_link_activation();
         changed |= self.dialog.tick();
-        changed |= self.service_first_run_flow();
+        changed |= self
+            .onboarding_shell
+            .as_mut()
+            .is_some_and(|shell| shell.tick());
+        changed |= self.service_onboarding_shell();
         // Auto-close the embedded pane when its child has exited
         // (GOALS §1i — e.g. `:q`).
         self.service_pane();

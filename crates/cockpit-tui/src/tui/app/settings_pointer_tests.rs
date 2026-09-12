@@ -453,10 +453,6 @@ pub(crate) fn run_tui_button_pointer_dispatch_matrix() {
                 .unwrap_or_else(|_| Dialog::open_setup(tmp.path())),
         ),
         (
-            "FirstRunComplete",
-            Dialog::open_first_run_complete("ready".into()),
-        ),
-        (
             "Settings",
             Dialog::Settings(Box::new(crate::tui::settings::SettingsDialog::open(
                 tmp.path().join("config.json"),

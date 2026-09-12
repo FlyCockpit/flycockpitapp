@@ -440,7 +440,7 @@ async fn one_shot_daemon_uses_the_ephemeral_socket_owner_and_reaps_metadata() {
     })
     .await
     .expect("one-shot daemon status");
-    assert!(matches!(response, Response::DaemonStatus { .. }));
+    assert!(matches!(response, Response::LockedBootstrapHello(_)));
 
     let paths = crate::daemon::DaemonPaths::resolve_canonical().expect("canonical paths");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {

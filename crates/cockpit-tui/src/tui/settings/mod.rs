@@ -5793,6 +5793,14 @@ impl Dialog {
         add.run
             .return_to("done")
             .expect("provider done step exists");
+        // A completed provider stage is backed by a committed daemon mutation
+        // receipt. Populate that authority evidence along with the visual
+        // completion state so onboarding tests cannot bypass the settlement
+        // contract introduced by the daemon-owned flow.
+        settings.cx.last_provider_mutation_operation_id =
+            Some("test-provider-mutation".to_string());
+        settings.cx.last_provider_mutation_intent_hash = Some("00".repeat(32));
+        settings.cx.config.set_resolution_generation(1);
     }
 
     #[cfg(test)]
@@ -5808,6 +5816,7 @@ impl Dialog {
             .run
             .submit(cockpit_core::wizard::WizardAnswer::Acknowledged)
             .expect("setup completion step accepts acknowledgement");
+        wizard.settled_operation_id = Some(uuid::Uuid::now_v7());
     }
 
     #[cfg(test)]

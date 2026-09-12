@@ -206,6 +206,9 @@ where
         let mut bytes = [0_u8; LEAK_REVEAL_REQUEST_FRAME_LEN];
         bytes[0] = first[0];
         stream.read_exact(&mut bytes[1..]).await.ok()?;
+        if consume_buffered_trailing_byte(stream).await {
+            return None;
+        }
         return crate::daemon::leak_reveal_frame::decode_request(&bytes)
             .ok()
             .map(SensitiveRequestFrame::Leak);
@@ -230,10 +233,27 @@ where
     read_bounded_len_prefixed(stream, &mut encoded, 4, 64 * 1024).await?;
     if encoded.len() > MAX_ONBOARDING_SENSITIVE_FRAME_BYTES
         || cockpit_proto::decode_sensitive_onboarding_intent(&encoded).is_err()
+        || consume_buffered_trailing_byte(stream).await
     {
         return None;
     }
     Some(SensitiveRequestFrame::Onboarding(encoded))
+}
+
+/// Consume and report one already-buffered byte beyond a closed sensitive
+/// frame. Consuming the violating byte lets Unix close with a clean FIN for
+/// the common single-byte violation while preserving the no-EOF-wait contract
+/// required by duplex named pipes.
+async fn consume_buffered_trailing_byte<S>(stream: &mut S) -> bool
+where
+    S: AsyncRead + Unpin,
+{
+    let mut extra = [0_u8; 1];
+    tokio::select! {
+        biased;
+        result = stream.read(&mut extra) => !matches!(result, Ok(0)),
+        _ = std::future::ready(()) => false,
+    }
 }
 
 async fn read_bounded_len_prefixed<S>(
@@ -274,16 +294,8 @@ where
     // Reject extra bytes that are already readable. Do not wait for EOF or for
     // a later byte: Unix half-close is not expressible on named pipes, and the
     // client must keep the duplex handle open to read the response.
-    let mut extra = [0u8; 1];
-    tokio::select! {
-        biased;
-        result = stream.read(&mut extra) => {
-            match result {
-                Ok(0) => {}
-                _ => return None,
-            }
-        }
-        _ = std::future::ready(()) => {}
+    if consume_buffered_trailing_byte(stream).await {
+        return None;
     }
     crate::daemon::leak_reveal_frame::decode_request(&buf).ok()
 }

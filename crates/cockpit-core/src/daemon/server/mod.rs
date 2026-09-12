@@ -4681,6 +4681,10 @@ pub(crate) struct LockedServices {
     ready_transition_inflight: AtomicBool,
     ready_handoff: StdMutex<ReadyHandoffState>,
     ready_signal: watch::Sender<bool>,
+    /// Locked bootstrap owns the same transport-lifetime invariant as the
+    /// ready daemon. An ephemeral owner must retire after its final confirmed
+    /// client disconnects even when no vault authority has been selected yet.
+    client_presence: watch::Sender<ClientPresence>,
     #[cfg(test)]
     fail_next_onboarding_snapshot: AtomicBool,
 }
@@ -4941,6 +4945,7 @@ impl LockedServices {
                 .context("persisting locked-bootstrap launch ticket")?;
         }
         let (ready_signal, _) = watch::channel(false);
+        let (client_presence, _) = watch::channel(ClientPresence::default());
         Ok(Self {
             onboarding: crate::onboarding::OnboardingAuthority::new(db.clone()),
             db,
@@ -4959,6 +4964,7 @@ impl LockedServices {
             ready_transition_inflight: AtomicBool::new(false),
             ready_handoff: StdMutex::new(ReadyHandoffState::default()),
             ready_signal,
+            client_presence,
             #[cfg(test)]
             fail_next_onboarding_snapshot: AtomicBool::new(false),
         })
@@ -4966,6 +4972,20 @@ impl LockedServices {
 
     fn locked_admission_denied(&self) -> bool {
         self.closing.load(Ordering::Acquire) || self.ready.load(Ordering::Acquire)
+    }
+
+    fn track_client(self: &Arc<Self>) -> LockedClientGuard {
+        self.client_presence.send_modify(|presence| {
+            presence.count += 1;
+            presence.has_lifetime_client = true;
+        });
+        LockedClientGuard {
+            locked: self.clone(),
+        }
+    }
+
+    fn client_presence(&self) -> watch::Receiver<ClientPresence> {
+        self.client_presence.subscribe()
     }
 
     fn ready_construction_pending(&self) -> bool {
@@ -5218,6 +5238,18 @@ impl LockedServices {
         .await?;
         timer.done();
         Ok(ReadyServices { context })
+    }
+}
+
+struct LockedClientGuard {
+    locked: Arc<LockedServices>,
+}
+
+impl Drop for LockedClientGuard {
+    fn drop(&mut self) {
+        self.locked
+            .client_presence
+            .send_modify(|presence| presence.count = presence.count.saturating_sub(1));
     }
 }
 
@@ -6188,6 +6220,7 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
     let peer = socket_peer_identity(&stream)?;
     let connection_id = Uuid::new_v4();
     let mut authenticated_owner = false;
+    let mut lifetime_guard = None;
     let mut proto_stream = ProtoStream::new(stream);
     proto_stream
         .send(&Envelope::response(
@@ -6221,6 +6254,9 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
                 .is_some_and(|(role, _)| role.is_owner_class())
         {
             authenticated_owner = true;
+        }
+        if matches!(&request, Request::DaemonStatus) && lifetime_guard.is_none() {
+            lifetime_guard = Some(locked.track_client());
         }
         if matches!(request, Request::RetryOnboardingReadyConstruction) {
             if !authenticated_owner {
@@ -6399,19 +6435,37 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
     Ok(())
 }
 
+pub(crate) enum LockedRunOutcome {
+    Ready(
+        ReadyServices,
+        DaemonListener,
+        crate::daemon::leak_reveal_socket::BoundRevealSocket,
+    ),
+    Shutdown,
+}
+
 #[cfg(any(unix, windows))]
 pub(crate) async fn run_locked_until_ready(
     locked: Arc<LockedServices>,
     mut listener: DaemonListener,
     mut sensitive: crate::daemon::leak_reveal_socket::BoundRevealSocket,
-) -> Result<(
-    ReadyServices,
-    DaemonListener,
-    crate::daemon::leak_reveal_socket::BoundRevealSocket,
-)> {
+) -> Result<LockedRunOutcome> {
     let mut locked_clients = tokio::task::JoinSet::new();
     let mut ready_signal = locked.subscribe_ready_handoff();
+    let mut client_presence = locked.client_presence();
     loop {
+        let observed = *client_presence.borrow_and_update();
+        if locked.paths.ephemeral
+            && observed.has_lifetime_client
+            && observed.count == 0
+            && !locked.ready_transition_inflight.load(Ordering::Acquire)
+        {
+            locked.closing.store(true, Ordering::Release);
+            locked.drain_inflight_mutations().await;
+            locked_clients.abort_all();
+            while locked_clients.join_next().await.is_some() {}
+            return Ok(LockedRunOutcome::Shutdown);
+        }
         tokio::select! {
             changed = ready_signal.changed() => {
                 if changed.is_err() {
@@ -6422,7 +6476,16 @@ pub(crate) async fn run_locked_until_ready(
                 {
                     locked_clients.abort_all();
                     while locked_clients.join_next().await.is_some() {}
-                    return Ok((constructed.publish_returned(), listener, sensitive));
+                    return Ok(LockedRunOutcome::Ready(
+                        constructed.publish_returned(),
+                        listener,
+                        sensitive,
+                    ));
+                }
+            }
+            changed = client_presence.changed(), if locked.paths.ephemeral => {
+                if changed.is_err() {
+                    anyhow::bail!("locked client lifetime publisher closed");
                 }
             }
             accepted = accept_daemon_stream(&mut listener) => {
@@ -6471,7 +6534,11 @@ pub(crate) async fn run_locked_until_ready(
                                     .await
                                 {
                                     Ok(ready) => {
-                                        return Ok((ready, listener, sensitive));
+                                        return Ok(LockedRunOutcome::Ready(
+                                            ready,
+                                            listener,
+                                            sensitive,
+                                        ));
                                     }
                                     Err(_) => {}
                                 }

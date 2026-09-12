@@ -52,6 +52,33 @@ impl DaemonTestHarness {
         }
     }
 
+    /// Mark a scenario as an already-configured installation. Fresh harnesses
+    /// intentionally remain authority-free so locked-bootstrap tests exercise
+    /// the real first-run boundary.
+    pub(crate) fn initialize_vault_authority(&self) {
+        let kek_dir = crate::secure_key::kek_dir_for_db(&self.db)
+            .expect("resolve daemon harness vault directory");
+        self.db
+            .configure_secret_vault_dir(kek_dir.clone())
+            .expect("configure daemon harness vault directory");
+        crate::secure_key::ensure_secret_vault_with_options(
+            &self.db,
+            &crate::secure_key::KeyringProbeResult {
+                state: cockpit_proto::FeatureCapabilityState::Missing,
+                reason: "daemon harness selects a file-backed vault".into(),
+                fix_command: None,
+                remedy_text: None,
+            },
+            &kek_dir,
+            crate::secure_key::SecretStoreInjected::default(),
+            crate::secure_key::SecretVaultOpenOptions {
+                first_run_intent: crate::secure_key::FirstRunSecretStoreIntent::FileMachineBound,
+                passphrase: None,
+            },
+        )
+        .expect("initialize daemon harness vault authority");
+    }
+
     pub(crate) fn manifest_path(&self, name: &str) -> PathBuf {
         manifest_dir().join(format!("{}-{name}.json", self.owner))
     }

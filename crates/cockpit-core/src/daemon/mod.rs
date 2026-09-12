@@ -2381,7 +2381,7 @@ async fn run_foreground_inner_with_boot_db(
                 publish_socket_pair_with(&paths, || bind_private_socket(&paths.socket))?;
             #[cfg(windows)]
             let (listener, reveal_listener) = prepare_and_publish_socket_pair(&paths)?;
-            let (ready, listener, reveal_listener) = tokio::select! {
+            let locked_outcome = tokio::select! {
                 result = server::run_locked_until_ready(
                     std::sync::Arc::new(locked),
                     listener,
@@ -2389,6 +2389,17 @@ async fn run_foreground_inner_with_boot_db(
                 ) => result?,
                 () = wait_for_bootstrap_shutdown_signal() => {
                     anyhow::bail!("daemon bootstrap interrupted by shutdown signal")
+                }
+            };
+            let (ready, listener, reveal_listener) = match locked_outcome {
+                server::LockedRunOutcome::Ready(ready, listener, reveal_listener) => {
+                    (ready, listener, reveal_listener)
+                }
+                server::LockedRunOutcome::Shutdown => {
+                    metadata_guard
+                        .cleanup()
+                        .context("retiring locked ephemeral daemon metadata")?;
+                    return Ok(());
                 }
             };
             published_listeners = Some((listener, reveal_listener));
@@ -3792,6 +3803,7 @@ mod tests {
     #[tokio::test]
     async fn ephemeral_socket_owner_waits_for_its_last_connected_client() {
         let harness = DaemonTestHarness::new();
+        harness.initialize_vault_authority();
         let _env =
             crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(&harness.state_home).await;
         let project = tempfile::tempdir().expect("project directory");
@@ -3934,6 +3946,7 @@ mod tests {
         use crate::session::Session;
 
         let harness = DaemonTestHarness::new();
+        harness.initialize_vault_authority();
         let _env =
             crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(&harness.state_home).await;
         let drain_grace = Duration::from_millis(300);

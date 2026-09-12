@@ -7388,7 +7388,7 @@ CREATE TABLE onboarding_runs (
 
 CREATE TABLE onboarding_attempts (
     attempt_id          TEXT PRIMARY KEY CHECK (length(attempt_id) = 36),
-    run_id              TEXT NOT NULL REFERENCES onboarding_runs(run_id) ON DELETE CASCADE,
+    run_id              TEXT NOT NULL REFERENCES onboarding_runs(run_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     opened_revision     INTEGER NOT NULL CHECK (opened_revision >= 0),
     closed_revision     INTEGER,
     status              TEXT NOT NULL CHECK (status IN ('active', 'superseded', 'completed')),
@@ -7397,13 +7397,15 @@ CREATE TABLE onboarding_attempts (
 );
 CREATE UNIQUE INDEX onboarding_attempts_one_active
     ON onboarding_attempts(run_id) WHERE status = 'active';
+CREATE INDEX onboarding_attempts_run_id_idx
+    ON onboarding_attempts(run_id);
 
 -- Receipt payloads are intentionally an enum/status plus opaque ids.  Do not
 -- put provider config, credentials, OAuth material, or passphrases here.
 CREATE TABLE onboarding_receipts (
     receipt_id          TEXT PRIMARY KEY CHECK (length(receipt_id) = 36),
-    run_id              TEXT NOT NULL REFERENCES onboarding_runs(run_id) ON DELETE CASCADE,
-    attempt_id          TEXT NOT NULL REFERENCES onboarding_attempts(attempt_id) ON DELETE CASCADE,
+    run_id              TEXT NOT NULL REFERENCES onboarding_runs(run_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    attempt_id          TEXT NOT NULL REFERENCES onboarding_attempts(attempt_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     client_operation_id TEXT NOT NULL CHECK (length(client_operation_id) BETWEEN 1 AND 128),
     consumed_revision   INTEGER NOT NULL CHECK (consumed_revision >= 0),
     operation_kind      TEXT NOT NULL CHECK (length(operation_kind) BETWEEN 1 AND 64),
@@ -7412,6 +7414,8 @@ CREATE TABLE onboarding_receipts (
     created_at_unix_ms  INTEGER NOT NULL,
     UNIQUE (run_id, attempt_id, client_operation_id)
 );
+CREATE INDEX onboarding_receipts_attempt_id_idx
+    ON onboarding_receipts(attempt_id);
 
 -- Installation-scoped authority singleton. No secret bytes.
 CREATE TABLE secret_vault_authority (

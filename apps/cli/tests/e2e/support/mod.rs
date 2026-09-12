@@ -84,7 +84,7 @@ impl IsolatedHome {
             std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
                 .expect("restrict isolated temp root");
         }
-        Self {
+        let home = Self {
             _root: Some(root),
             config_home,
             data_home,
@@ -93,6 +93,73 @@ impl IsolatedHome {
             cache_home,
             project,
             extra_env: Vec::new(),
+        };
+        home.initialize_configured_installation();
+        home
+    }
+
+    /// Seed the explicit authority owned by legacy E2E profiles that model an
+    /// installation which completed first run before the scenario begins.
+    pub fn initialize_configured_installation(&self) {
+        let cockpit_data_dir = self.data_home.join("cockpit");
+        std::fs::create_dir_all(&cockpit_data_dir).expect("create isolated cockpit data dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&cockpit_data_dir, std::fs::Permissions::from_mode(0o700))
+                .expect("restrict isolated cockpit data dir");
+        }
+        let db = cockpit_core::secure_key::test_open_db(&cockpit_data_dir.join("cockpit.db"));
+        let kek_dir = cockpit_core::secure_key::kek_dir_for_db(&db)
+            .expect("resolve isolated vault directory");
+        db.configure_secret_vault_dir(kek_dir.clone())
+            .expect("configure isolated vault directory");
+        cockpit_core::secure_key::ensure_secret_vault_with_options(
+            &db,
+            &cockpit_core::secure_key::test_missing_keyring_probe(),
+            &kek_dir,
+            cockpit_core::secure_key::SecretStoreInjected::default(),
+            cockpit_core::secure_key::SecretVaultOpenOptions {
+                first_run_intent:
+                    cockpit_core::secure_key::FirstRunSecretStoreIntent::FileMachineBound,
+                passphrase: None,
+            },
+        )
+        .expect("initialize isolated machine-bound vault authority");
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build onboarding fixture runtime");
+            runtime.block_on(async move {
+                let (snapshot, _) = db
+                    .onboarding_begin_or_reopen(None, "fixture-begin".into(), false)
+                    .await
+                    .expect("begin configured-installation onboarding fixture");
+                db.onboarding_transition(
+                    snapshot,
+                    "fixture-complete".into(),
+                    cockpit_db::db::onboarding::OnboardingStage::Complete,
+                    cockpit_db::db::onboarding::OnboardingBootstrapState::Ready,
+                    false,
+                    Some(cockpit_db::db::onboarding::OnboardingSecurePlacement::MachineBoundFile),
+                    1,
+                )
+                .await
+                .expect("complete configured-installation onboarding fixture");
+            });
+        })
+        .join()
+        .expect("configured-installation fixture thread panicked");
+    }
+
+    /// Restore the genuinely fresh pre-ledger state needed by the one
+    /// sandboxed-doctor acceptance path; that path re-seeds before daemon use.
+    pub fn clear_configured_installation(&self) {
+        let cockpit_data_dir = self.data_home.join("cockpit");
+        if cockpit_data_dir.exists() {
+            std::fs::remove_dir_all(&cockpit_data_dir)
+                .expect("clear isolated configured-installation fixture");
         }
     }
 

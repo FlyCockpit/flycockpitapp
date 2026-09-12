@@ -126,6 +126,17 @@ impl App {
             self.start_onboarding_ready_construction_retry();
             return;
         }
+        let stage_changed = self
+            .onboarding_snapshot
+            .as_ref()
+            .map(|current| current.stage)
+            != snapshot.as_ref().map(|current| current.stage);
+        if stage_changed {
+            // The daemon snapshot is the stage authority. A completed dialog
+            // from the preceding stage must not block construction of the
+            // newly authoritative stage's UI.
+            self.dialog = crate::tui::settings::Dialog::None;
+        }
         self.onboarding_completion_visible = false;
         self.onboarding_snapshot = snapshot;
         self.maybe_open_add_provider_wizard();

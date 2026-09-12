@@ -11725,14 +11725,20 @@ async fn ephemeral_daemon_onboarding_first_write_succeeds_without_promotion() {
             client_operation_id: "ephemeral-onboarding-second-edit".into(),
             mutation_intent_hash: cockpit_proto::ProviderMutationBatch {
                 upserts: Vec::new(),
-                deletes: Vec::new(),
+                deletes: vec![cockpit_proto::ProviderMutationDelete {
+                    provider_id: "onboard".into(),
+                    delete_stored_secrets: false,
+                }],
                 metadata: None,
             }
             .sanitized_intent_hash()
             .unwrap(),
             mutation: cockpit_proto::ProviderMutationBatch {
                 upserts: Vec::new(),
-                deletes: Vec::new(),
+                deletes: vec![cockpit_proto::ProviderMutationDelete {
+                    provider_id: "onboard".into(),
+                    delete_stored_secrets: false,
+                }],
                 metadata: None,
             },
         },
@@ -11742,7 +11748,10 @@ async fn ephemeral_daemon_onboarding_first_write_succeeds_without_promotion() {
     .await
     .expect_err("an ephemeral first-write capability must be single-use");
     assert_eq!(error.code, ErrorCode::BadRequest);
-    assert!(error.message.contains("create-on-first-write"));
+    assert!(
+        error.message.contains("create-on-first-write"),
+        "unexpected error: {error:?}"
+    );
 }
 
 /// Durable journal replay of a validated first-write into the missing global
@@ -19842,7 +19851,9 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "clean_managed_workspace_lease"
         | "restart_if_idle"
         | "stop_daemon" => AuthzAllowedOutcome::Response,
-        "apply_onboarding_transition" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        "apply_onboarding_transition" | "retry_onboarding_ready_construction" => {
+            AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
+        }
         // The matrix deliberately drops the attached worker after its prelude;
         // refresh is authorized, then fails closed when fanout observes that
         // exact worker shutdown.
@@ -20498,6 +20509,11 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("stats_rollup"),
         authz_owner_only("get_workspace_trust"),
         authz_owner_only("get_startup_disclosures"),
+        authz_owner_only("get_onboarding_bootstrap_snapshot"),
+        authz_owner_only("begin_or_reopen_onboarding"),
+        authz_owner_only("apply_onboarding_transition"),
+        authz_owner_only("get_onboarding_transition_receipt"),
+        authz_owner_only("retry_onboarding_ready_construction"),
         authz_owner_only("get_app_flag"),
         authz_owner_only("mark_app_flag_seen"),
         authz_owner_only("set_workspace_trust"),
@@ -22497,6 +22513,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 client_operation_id: "authz-onboarding-receipt".into(),
             })
         }
+        "retry_onboarding_ready_construction" => Request::RetryOnboardingReadyConstruction,
         "get_app_flag" => Request::GetAppFlag {
             key: proto::AppFlagKey::DaemonAutostartNotice,
         },

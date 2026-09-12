@@ -88,7 +88,19 @@ fn onboarding_snapshot(
 }
 
 fn set_onboarding_stage(app: &mut App, stage: cockpit_proto::OnboardingStage) {
-    app.onboarding_snapshot = Some(onboarding_snapshot(stage));
+    // Every post-secure-store checkpoint is reached through a committed
+    // config mutation. Preserve that daemon settlement evidence when these
+    // focused UI tests synthesize the authoritative checkpoint directly.
+    if !matches!(
+        stage,
+        cockpit_proto::OnboardingStage::Welcome
+            | cockpit_proto::OnboardingStage::Profile
+            | cockpit_proto::OnboardingStage::SecureStore
+    ) {
+        app.config_snapshot.generation = 1;
+        app.config_snapshot.providers.set_resolution_generation(1);
+    }
+    app.apply_onboarding_bootstrap_snapshot(Some(onboarding_snapshot(stage)));
 }
 
 fn advance_welcome_and_profile(app: &mut App, cwd: &std::path::Path) {
@@ -194,6 +206,8 @@ fn first_run_configuration_queues_held_draft_behind_selected_model() {
 
     assert!(!app.submit_input());
     assert!(app.dialog.test_provider_is_add());
+
+    set_onboarding_stage(&mut app, cockpit_proto::OnboardingStage::Provider);
 
     let mut cfg = config_with_provider("p", "m");
     cfg.active_model = Some(cockpit_config::providers::ActiveModelRef {

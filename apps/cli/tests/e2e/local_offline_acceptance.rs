@@ -180,12 +180,18 @@ async fn isolated_settings_export_and_restart_resume_paths_execute_without_accou
     let denied_network = install_network_deny_recorder(&mut session);
     // This is the suite's only sandboxed `doctor --offline` invocation.
     // Keep it sandboxed so hermetic PATH + containment stay covered.
+    // Doctor's fresh-ledger branch intentionally does not expose the private
+    // data directory to its sandbox. Temporarily restore that exact state,
+    // then re-establish this profile's completed-installation prerequisite
+    // before daemon-backed acceptance continues.
+    session.home().clear_configured_installation();
     let clean_doctor = run(&session, &["doctor", "--offline"]);
     assert!(
         clean_doctor.status.success(),
         "{}",
         output_text(&clean_doctor)
     );
+    session.home().initialize_configured_installation();
     session.start_trusted_daemon();
     session.spawn_pty(100, 30).unwrap();
     session.wait_until_ready(Duration::from_secs(30)).unwrap();

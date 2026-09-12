@@ -246,6 +246,17 @@ impl HostApprovalEffectHandoff {
         self.terminalized = true;
     }
 
+    /// Transfer an unclaimed capability back to its durable parked
+    /// continuation without changing the database row. A parked tool result
+    /// is not an abandoned effect scope: the daemon has committed the exact
+    /// replay payload and the ready handoff must remain available to that
+    /// replay. The in-memory owner is terminalized only to disarm `Drop`;
+    /// startup reconciliation remains the authority for the durable row.
+    fn retain_ready_for_park(mut self) {
+        debug_assert!(!self.claimed);
+        self.terminalized = true;
+    }
+
     async fn complete_at_effect_boundary(
         mut self,
         boundary: &'static str,
@@ -479,6 +490,7 @@ where
             }),
             async move {
                 let result = future.await;
+                let parked = result.as_ref().err().is_some_and(is_parked);
                 let scope = CURRENT_HOST_APPROVAL_HANDOFFS.with(|slot| {
                     let mut scope = slot.borrow_mut();
                     HostApprovalEffectScope {
@@ -502,7 +514,14 @@ where
                         .or_else(|| result.as_ref().ok().and_then(|output| is_success(output)))
                 };
                 for handoff in scope.handoffs {
-                    if !handoff.claimed {
+                    if parked && !handoff.claimed {
+                        // `InterruptOutcome::Parked` committed the replay
+                        // payload before unwinding this tool future. Preserve
+                        // the still-unsubmitted capability for that exact
+                        // continuation instead of misclassifying the scope
+                        // unwind as an abandoned approval.
+                        handoff.retain_ready_for_park();
+                    } else if !handoff.claimed {
                         // The enclosing dispatcher returned before any exact
                         // host boundary claimed this ready capability. No
                         // effect was submitted, so this is a known rejection,

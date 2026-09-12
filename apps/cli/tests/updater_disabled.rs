@@ -13,12 +13,7 @@ use cockpit_core::updater::{
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-const UPDATER_CONSUMER_SCAN_ROOTS: &[&str] = &[
-    "apps/cli/src",
-    "apps/cli/tests",
-    "crates/cockpit-core/src",
-    "crates/cockpit-tui/src",
-];
+const WORKSPACE_SCAN_ROOTS: &[&str] = &["apps", "crates"];
 
 const EXPECTED_UPDATER_CONSUMERS: &[&str] = &[
     "apps/cli/src/commands/update.rs",
@@ -58,8 +53,37 @@ fn is_updater_implementation_source(path: &Path) -> bool {
             .any(|component| component.as_os_str() == "cockpit-core")
 }
 
+fn strip_rust_comments(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'/' && i + 1 < bytes.len() {
+            if bytes[i + 1] == b'/' {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if bytes[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 fn references_installed_updater_module(source: &str) -> bool {
-    source.contains("cockpit_core::updater") || source.contains("crate::updater::")
+    let production = strip_rust_comments(&strip_test_modules(source));
+    production.contains("cockpit_core::updater") || production.contains("crate::updater")
 }
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -85,7 +109,7 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 fn discover_updater_consumer_sources() -> Vec<PathBuf> {
     let root = workspace_root();
     let mut sources = Vec::new();
-    for relative in UPDATER_CONSUMER_SCAN_ROOTS {
+    for relative in WORKSPACE_SCAN_ROOTS {
         collect_rs_files(&root.join(relative), &mut sources);
     }
 
@@ -164,20 +188,44 @@ fn scan_segments_for_forbidden(segments: &[String], needles: &[&str], path: &Pat
     }
 }
 
+fn assert_run_startup_check_gated(source: &str, path_label: &str) {
+    let production = strip_rust_comments(&strip_test_modules(source));
+    for (line_idx, line) in production.lines().enumerate() {
+        if !line.contains("run_startup_check") {
+            continue;
+        }
+        if line.contains("pub async fn run_startup_check")
+            || line.contains("pub fn run_startup_check")
+            || line.trim_start().starts_with("use ")
+        {
+            continue;
+        }
+        let context = production
+            .lines()
+            .take(line_idx)
+            .rev()
+            .take(6)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            context.contains("update_checks_enabled") || line.contains("update_checks_enabled"),
+            "{}: run_startup_check must be gated by update_checks_enabled",
+            path_label
+        );
+    }
+}
+
 fn assert_update_checks_suppressed_when_off() {
-    let server =
-        fs::read_to_string(workspace_root().join("crates/cockpit-core/src/daemon/server/mod.rs"))
-            .expect("read daemon server source");
+    let server_path = workspace_root().join("crates/cockpit-core/src/daemon/server/mod.rs");
+    let server = fs::read_to_string(&server_path).expect("read daemon server source");
     assert!(
         server.contains("update_checks_enabled(update_channel)"),
         "daemon boot must gate startup update checks behind update_checks_enabled"
     );
-    assert!(
-        !server.contains(
-            "let _update_check = crate::updater::run_startup_check(update_channel).await;"
-        ),
-        "daemon boot must not unconditionally invoke run_startup_check"
-    );
+    assert_run_startup_check_gated(&server, server_path.display().to_string());
 
     let daemon = fs::read_to_string(workspace_root().join("crates/cockpit-core/src/daemon/mod.rs"))
         .expect("read daemon source");
@@ -186,17 +234,18 @@ fn assert_update_checks_suppressed_when_off() {
         "daemon must spawn background update checks only through maybe_spawn_background"
     );
     assert!(
-        !daemon.contains("crate::updater::spawn_background(ctx.clone())"),
-        "daemon must not unconditionally spawn background update checks"
+        !strip_rust_comments(&strip_test_modules(&daemon))
+            .contains("crate::updater::spawn_background"),
+        "daemon must not invoke updater::spawn_background directly"
     );
 
-    let background =
-        fs::read_to_string(workspace_root().join("crates/cockpit-core/src/updater/background.rs"))
-            .expect("read updater background source");
+    let background_path = workspace_root().join("crates/cockpit-core/src/updater/background.rs");
+    let background = fs::read_to_string(&background_path).expect("read updater background source");
     assert!(
         background.contains("update_checks_enabled(channel)"),
         "background update loop must skip checks when the effective channel is off"
     );
+    assert_run_startup_check_gated(&background, background_path.display().to_string());
 }
 
 #[test]
@@ -350,6 +399,24 @@ async fn all_check_entrypoints_return_disabled_without_side_effect() {
             );
         }
     }
+}
+
+#[test]
+fn tuf_release_uses_canonical_fake_fixture_schema() {
+    let main_rs = fs::read_to_string(workspace_root().join("tools/tuf-release/src/main.rs"))
+        .expect("read tuf-release main source");
+    assert!(
+        main_rs.contains("cockpit_core::updater::FakeFixtureEvidence"),
+        "tuf-release must deserialize canonical FakeFixtureEvidence from cockpit-core"
+    );
+    assert!(
+        main_rs.contains("validate_fake_fixture_evidence"),
+        "tuf-release must validate evidence through the shared cockpit-core validator"
+    );
+    assert!(
+        !main_rs.contains("struct FakeFixtureTarget"),
+        "tuf-release must not declare a parallel fake-fixture schema"
+    );
 }
 
 #[test]

@@ -2,7 +2,6 @@
 #![cfg(any(test, feature = "test-support"))]
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 
 use super::traits::{
     BinaryReplacer, MetadataRepository, SupervisorMaintenanceClient, TargetFetcher, UpdateLockStore,
@@ -12,13 +11,7 @@ use super::types::{
     UpdateApplyReceipt, UpdateLockRecord, UpdateTargetDescriptor,
 };
 
-/// Canonical fake-fixture evidence validated by private release tooling.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FakeFixtureEvidence {
-    pub release_tag: String,
-    pub commit: String,
-    pub targets: Vec<UpdateTargetDescriptor>,
-}
+pub use super::types::FakeFixtureEvidence;
 
 /// Injectable metadata repository for error-path tests only.
 #[derive(Debug, Default, Clone)]

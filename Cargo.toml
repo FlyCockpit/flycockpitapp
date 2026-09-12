@@ -13,6 +13,7 @@ members = [
     "crates/cockpit-tokenizer",
     "crates/cockpit-tui",
     "crates/relay-protocol",
+    "tools/tuf-release",
 ]
 resolver = "3"
 

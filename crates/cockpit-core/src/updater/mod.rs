@@ -20,10 +20,10 @@ pub use traits::{
     UpdateLockStore, Updater,
 };
 pub use types::{
-    DisabledNoProductionRoot, InstallChannel, SupervisorMaintenanceRequest,
+    DisabledNoProductionRoot, FakeFixtureEvidence, InstallChannel, SupervisorMaintenanceRequest,
     TrustedMetadataVersions, UpdateApplyReceipt, UpdateApplyReceiptState, UpdateCheckResult,
     UpdateLockRecord, UpdateLockState, UpdateNotice, UpdateStatusSnapshot, UpdateTargetDescriptor,
-    UpdaterApplyError,
+    UpdaterApplyError, validate_fake_fixture_evidence,
 };
 
 use std::sync::Arc;

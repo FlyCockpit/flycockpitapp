@@ -108,6 +108,13 @@ mod windows_fixture {
     const EXPECTED_DESKTOP_ENV: &str = "COCKPIT_HOST_398_EXPECTED_DESKTOP";
     const KNOWN_COCKPIT_HANDLE_ENV: &str = "COCKPIT_HOST_398_KNOWN_COCKPIT_HANDLE";
     const CLIENT_PIPE_ACCESS: u32 = FILE_READ_DATA | FILE_WRITE_DATA | SYNCHRONIZE;
+    const TEMPORARY_PIPE_OPEN_MODE: u32 = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
+    const TEMPORARY_PIPE_MODE: u32 = PIPE_TYPE_BYTE | PIPE_REJECT_REMOTE_CLIENTS;
+    const TEMPORARY_PIPE_MAX_INSTANCES: u32 =
+        windows_sys::Win32::System::Pipes::PIPE_UNLIMITED_INSTANCES;
+    const TEMPORARY_PIPE_OUTPUT_BUFFER_SIZE: u32 = 1024;
+    const TEMPORARY_PIPE_INPUT_BUFFER_SIZE: u32 = 1024;
+    const TEMPORARY_PIPE_DEFAULT_TIMEOUT: u32 = 0;
     const FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
     const FIXTURE_TIMEOUT_MS: u32 = 10_000;
     const RESTRICTED_CODE_SID: &str = "S-1-5-12";
@@ -139,13 +146,168 @@ mod windows_fixture {
 
     struct TemporaryPipe(HANDLE);
 
+    /// Heap-backed `OVERLAPPED` storage for one fixture operation.
+    ///
+    /// Windows identifies an overlapped I/O request by the address passed to
+    /// the issuing call. Keep that allocation stable until completion has
+    /// been observed; on an unconfirmed cancellation failure, intentionally
+    /// leak it rather than let the kernel write through a freed pointer.
+    struct StableOverlapped<T> {
+        overlapped: Option<Box<windows_sys::Win32::System::IO::OVERLAPPED>>,
+        keepalive: Option<T>,
+    }
+
+    impl<T> StableOverlapped<T> {
+        fn new(keepalive: T) -> io::Result<Self> {
+            Ok(Self {
+                overlapped: Some(Box::new(new_overlapped_event()?)),
+                keepalive: Some(keepalive),
+            })
+        }
+
+        fn as_mut(&mut self) -> &mut windows_sys::Win32::System::IO::OVERLAPPED {
+            self.overlapped
+                .as_deref_mut()
+                .expect("an overlapped operation is available until completion")
+        }
+
+        fn as_ref(&self) -> &windows_sys::Win32::System::IO::OVERLAPPED {
+            self.overlapped
+                .as_deref()
+                .expect("an overlapped operation is available until completion")
+        }
+
+        fn is_pending(&self) -> bool {
+            self.overlapped.is_some()
+        }
+
+        fn keepalive(&self) -> &T {
+            self.keepalive
+                .as_ref()
+                .expect("operation keepalive is available until ownership is returned")
+        }
+
+        fn keepalive_mut(&mut self) -> &mut T {
+            self.keepalive
+                .as_mut()
+                .expect("operation keepalive is available until ownership is returned")
+        }
+
+        fn into_keepalive(mut self) -> T {
+            assert!(
+                !self.is_pending(),
+                "a pending overlapped operation cannot return its keepalive"
+            );
+            self.keepalive
+                .take()
+                .expect("operation keepalive is returned exactly once")
+        }
+
+        /// Releases the event and allocation only after an operation that did
+        /// not become pending, or after the caller has otherwise established
+        /// that no kernel I/O can still reference this `OVERLAPPED`.
+        fn discard_not_pending(&mut self) {
+            if let Some(overlapped) = self.overlapped.take() {
+                unsafe { CloseHandle(overlapped.hEvent) };
+            }
+        }
+
+        fn complete_after_signal(&mut self, handle: HANDLE) -> io::Result<u32> {
+            self.complete(handle)
+        }
+
+        fn complete_without_wait(&mut self, handle: HANDLE) -> io::Result<u32> {
+            self.complete(handle)
+        }
+
+        fn complete(&mut self, handle: HANDLE) -> io::Result<u32> {
+            let mut transferred = 0_u32;
+            let completed = unsafe {
+                windows_sys::Win32::System::IO::GetOverlappedResult(
+                    handle,
+                    self.as_ref(),
+                    &mut transferred,
+                    0,
+                )
+            };
+            let result = if completed != 0 {
+                Ok(transferred)
+            } else {
+                Err(io::Error::last_os_error())
+            };
+            // The completed operation can no longer reference either its
+            // address or its caller-owned keepalive data. Its I/O result does
+            // not change that lifetime conclusion.
+            self.discard_not_pending();
+            result
+        }
+
+        fn cancel_and_drain(&mut self, handle: HANDLE) -> io::Result<u32> {
+            if unsafe { windows_sys::Win32::System::IO::CancelIoEx(handle, self.as_ref()) } == 0
+                && unsafe { GetLastError() } != ERROR_NOT_FOUND
+            {
+                return Err(io::Error::last_os_error());
+            }
+
+            let waited = unsafe { WaitForSingleObject(self.as_ref().hEvent, FIXTURE_TIMEOUT_MS) };
+            if waited == WAIT_TIMEOUT {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "cancelling temporary overlapped operation timed out",
+                ));
+            }
+            if waited != WAIT_OBJECT_0 {
+                return Err(io::Error::last_os_error());
+            }
+            self.complete_after_signal(handle)
+        }
+
+        fn wait_for_completion(&mut self, handle: HANDLE) -> io::Result<u32> {
+            let waited = unsafe { WaitForSingleObject(self.as_ref().hEvent, FIXTURE_TIMEOUT_MS) };
+            if waited == WAIT_TIMEOUT {
+                let timeout = io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "temporary named-pipe operation timed out",
+                );
+                // Drain before returning the deadline error. If this cannot
+                // establish completion, Drop retains the allocation so an
+                // in-flight kernel request never observes freed storage.
+                match self.cancel_and_drain(handle) {
+                    Ok(_) => Err(timeout),
+                    Err(error) if error.raw_os_error() == Some(ERROR_OPERATION_ABORTED as i32) => {
+                        Err(timeout)
+                    }
+                    Err(error) => Err(error),
+                }
+            } else if waited != WAIT_OBJECT_0 {
+                Err(io::Error::last_os_error())
+            } else {
+                self.complete_after_signal(handle)
+            }
+        }
+    }
+
+    impl<T> Drop for StableOverlapped<T> {
+        fn drop(&mut self) {
+            // Completion was not established. Keep both the event and the
+            // submitted address plus any I/O buffer alive for the kernel
+            // rather than freeing still-referenced operation storage.
+            if let Some(overlapped) = self.overlapped.take() {
+                let _ = Box::into_raw(overlapped);
+                if let Some(keepalive) = self.keepalive.take() {
+                    std::mem::forget(keepalive);
+                }
+            }
+        }
+    }
+
     /// A pending `ConnectNamedPipeW` keeps one protected server instance
     /// listening while the restricted fixture attempts its client open.  The
     /// guard owns the event and cancels/drains its one overlapped operation
     /// before the pipe can be disconnected or closed.
     struct PendingPipeConnection<'pipe> {
         pipe: &'pipe TemporaryPipe,
-        overlapped: windows_sys::Win32::System::IO::OVERLAPPED,
+        overlapped: StableOverlapped<()>,
     }
 
     impl TemporaryPipe {
@@ -157,12 +319,12 @@ mod windows_fixture {
             let handle = unsafe {
                 CreateNamedPipeW(
                     wide.as_ptr(),
-                    PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-                    PIPE_TYPE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
-                    windows_sys::Win32::System::Pipes::PIPE_UNLIMITED_INSTANCES,
-                    1024,
-                    1024,
-                    0,
+                    TEMPORARY_PIPE_OPEN_MODE,
+                    TEMPORARY_PIPE_MODE,
+                    TEMPORARY_PIPE_MAX_INSTANCES,
+                    TEMPORARY_PIPE_OUTPUT_BUFFER_SIZE,
+                    TEMPORARY_PIPE_INPUT_BUFFER_SIZE,
+                    TEMPORARY_PIPE_DEFAULT_TIMEOUT,
                     security.as_mut_ptr().cast(),
                 )
             };
@@ -200,27 +362,23 @@ mod windows_fixture {
         }
 
         fn connect_with_timeout(&self) -> io::Result<()> {
-            let mut overlapped = windows_sys::Win32::System::IO::OVERLAPPED::default();
-            let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
-            if event.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            overlapped.hEvent = event;
-            let connected = unsafe { ConnectNamedPipe(self.0, &mut overlapped) };
+            let mut overlapped = StableOverlapped::new(())?;
+            let connected = unsafe { ConnectNamedPipe(self.0, overlapped.as_mut()) };
             let result = if connected != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED {
+                overlapped.discard_not_pending();
                 Ok(())
             } else if unsafe { GetLastError() } == ERROR_IO_PENDING {
-                wait_for_overlapped(self.0, &mut overlapped).map(|_| ())
+                overlapped.wait_for_completion(self.0).map(|_| ())
             } else {
+                overlapped.discard_not_pending();
                 Err(io::Error::last_os_error())
             };
-            unsafe { CloseHandle(event) };
             result
         }
 
         fn begin_pending_connection(&self) -> io::Result<PendingPipeConnection<'_>> {
-            let mut overlapped = new_overlapped_event()?;
-            let connected = unsafe { ConnectNamedPipe(self.0, &mut overlapped) };
+            let mut overlapped = StableOverlapped::new(())?;
+            let connected = unsafe { ConnectNamedPipe(self.0, overlapped.as_mut()) };
             if connected == 0 && unsafe { GetLastError() } == ERROR_IO_PENDING {
                 return Ok(PendingPipeConnection {
                     pipe: self,
@@ -234,75 +392,41 @@ mod windows_fixture {
             // leaving it available for the restricted-child DACL proof.
             if connected != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED {
                 unsafe { DisconnectNamedPipe(self.0) };
-                unsafe { CloseHandle(overlapped.hEvent) };
+                overlapped.discard_not_pending();
                 return Err(io::Error::other(
                     "protected pipe listener accepted an unexpected client while arming denial proof",
                 ));
             }
 
             let error = io::Error::last_os_error();
-            unsafe { CloseHandle(overlapped.hEvent) };
+            overlapped.discard_not_pending();
             Err(error)
         }
     }
 
     impl PendingPipeConnection<'_> {
         fn cancel_and_drain(&mut self) -> io::Result<()> {
-            if self.overlapped.hEvent.is_null() {
+            if !self.overlapped.is_pending() {
                 return Ok(());
             }
-
-            if unsafe { windows_sys::Win32::System::IO::CancelIoEx(self.pipe.0, &self.overlapped) }
-                == 0
-                && unsafe { GetLastError() } != ERROR_NOT_FOUND
-            {
-                return Err(io::Error::last_os_error());
-            }
-
-            let waited = unsafe { WaitForSingleObject(self.overlapped.hEvent, FIXTURE_TIMEOUT_MS) };
-            if waited == WAIT_TIMEOUT {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "cancelling protected pipe listener timed out",
-                ));
-            }
-            if waited != WAIT_OBJECT_0 {
-                return Err(io::Error::last_os_error());
-            }
-
-            let mut transferred = 0_u32;
-            let completed = unsafe {
-                windows_sys::Win32::System::IO::GetOverlappedResult(
-                    self.pipe.0,
-                    &self.overlapped,
-                    &mut transferred,
-                    0,
-                )
-            };
-            let result = if completed != 0 {
-                Err(io::Error::other(
+            match self.overlapped.cancel_and_drain(self.pipe.0) {
+                Ok(_) => Err(io::Error::other(
                     "protected pipe listener accepted a client during denial proof",
-                ))
-            } else if unsafe { GetLastError() } == ERROR_OPERATION_ABORTED {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            };
-            unsafe { CloseHandle(self.overlapped.hEvent) };
-            self.overlapped.hEvent = std::ptr::null_mut();
-            result
+                )),
+                Err(error) if error.raw_os_error() == Some(ERROR_OPERATION_ABORTED as i32) => {
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
         }
     }
 
     impl Drop for PendingPipeConnection<'_> {
         fn drop(&mut self) {
-            // Every expected path explicitly drains the listener.  Preserve
-            // that invariant on fixture setup/launch failures too; if Windows
-            // cannot acknowledge cancellation, retain the OVERLAPPED storage
-            // rather than freeing memory that the kernel could still complete.
-            if self.cancel_and_drain().is_err() {
-                let _ = Box::into_raw(Box::new(std::mem::take(&mut self.overlapped)));
-            }
+            // Every expected path explicitly drains the listener. On setup or
+            // launch failures `StableOverlapped::Drop` retains storage if a
+            // retry cannot establish completion.
+            let _ = self.cancel_and_drain();
         }
     }
 
@@ -1706,15 +1830,20 @@ mod windows_fixture {
 
     fn create_second_pipe_instance(name: &str) -> io::Result<HANDLE> {
         let wide = wide(name);
+        // Keep every documented instance-compatibility parameter identical to
+        // the live listener. The null security attributes avoid granting the
+        // restricted child a replacement descriptor if this call unexpectedly
+        // succeeds; the existing listener DACL must be the only reason this
+        // construction is denied.
         let handle = unsafe {
             CreateNamedPipeW(
                 wide.as_ptr(),
-                PIPE_ACCESS_DUPLEX,
-                PIPE_TYPE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
-                1,
-                64,
-                64,
-                0,
+                TEMPORARY_PIPE_OPEN_MODE,
+                TEMPORARY_PIPE_MODE,
+                TEMPORARY_PIPE_MAX_INSTANCES,
+                TEMPORARY_PIPE_OUTPUT_BUFFER_SIZE,
+                TEMPORARY_PIPE_INPUT_BUFFER_SIZE,
+                TEMPORARY_PIPE_DEFAULT_TIMEOUT,
                 std::ptr::null(),
             )
         };
@@ -1848,47 +1977,58 @@ mod windows_fixture {
     }
 
     fn write_with_timeout(handle: HANDLE, bytes: &[u8]) -> io::Result<u32> {
-        let mut overlapped = new_overlapped_event()?;
+        let mut overlapped = StableOverlapped::new(bytes.to_vec())?;
+        let length = overlapped.keepalive().len() as u32;
+        let payload = overlapped.keepalive().as_ptr();
         let issued = unsafe {
             WriteFile(
                 handle,
-                bytes.as_ptr(),
-                bytes.len() as u32,
+                payload,
+                length,
                 std::ptr::null_mut(),
-                &mut overlapped,
+                overlapped.as_mut(),
             )
         };
         let result = if issued != 0 {
-            wait_for_overlapped(handle, &mut overlapped)
+            overlapped.complete_without_wait(handle)
         } else if unsafe { GetLastError() } == ERROR_IO_PENDING {
-            wait_for_overlapped(handle, &mut overlapped)
+            overlapped.wait_for_completion(handle)
         } else {
+            overlapped.discard_not_pending();
             Err(io::Error::last_os_error())
         };
-        unsafe { CloseHandle(overlapped.hEvent) };
         result
     }
 
     fn read_with_timeout(handle: HANDLE, bytes: &mut [u8]) -> io::Result<u32> {
-        let mut overlapped = new_overlapped_event()?;
+        let mut overlapped = StableOverlapped::new(vec![0_u8; bytes.len()])?;
+        let length = overlapped.keepalive().len() as u32;
+        let read_buffer = overlapped.keepalive_mut().as_mut_ptr();
         let issued = unsafe {
             ReadFile(
                 handle,
-                bytes.as_mut_ptr(),
-                bytes.len() as u32,
+                read_buffer,
+                length,
                 std::ptr::null_mut(),
-                &mut overlapped,
+                overlapped.as_mut(),
             )
         };
         let result = if issued != 0 {
-            wait_for_overlapped(handle, &mut overlapped)
+            overlapped.complete_without_wait(handle)
         } else if unsafe { GetLastError() } == ERROR_IO_PENDING {
-            wait_for_overlapped(handle, &mut overlapped)
+            overlapped.wait_for_completion(handle)
         } else {
+            overlapped.discard_not_pending();
             Err(io::Error::last_os_error())
         };
-        unsafe { CloseHandle(overlapped.hEvent) };
-        result
+        match result {
+            Ok(read) => {
+                let read_buffer = overlapped.into_keepalive();
+                bytes.copy_from_slice(&read_buffer);
+                Ok(read)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn new_overlapped_event() -> io::Result<windows_sys::Win32::System::IO::OVERLAPPED> {
@@ -1900,39 +2040,6 @@ mod windows_fixture {
             hEvent: event,
             ..Default::default()
         })
-    }
-
-    fn wait_for_overlapped(
-        handle: HANDLE,
-        overlapped: &mut windows_sys::Win32::System::IO::OVERLAPPED,
-    ) -> io::Result<u32> {
-        let waited = unsafe { WaitForSingleObject(overlapped.hEvent, FIXTURE_TIMEOUT_MS) };
-        if waited == WAIT_TIMEOUT {
-            unsafe {
-                let _ = windows_sys::Win32::System::IO::CancelIoEx(handle, overlapped);
-                let _ = WaitForSingleObject(overlapped.hEvent, FIXTURE_TIMEOUT_MS);
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "temporary named-pipe operation timed out",
-            ));
-        }
-        if waited != WAIT_OBJECT_0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut transferred = 0_u32;
-        if unsafe {
-            windows_sys::Win32::System::IO::GetOverlappedResult(
-                handle,
-                overlapped,
-                &mut transferred,
-                0,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(transferred)
     }
 
     fn wait_for_child_or_terminate(child: &mut Child, role: &str) -> io::Result<()> {

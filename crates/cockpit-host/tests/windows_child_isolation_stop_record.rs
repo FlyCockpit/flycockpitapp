@@ -51,8 +51,9 @@ mod windows_fixture {
     use cockpit_host::named_pipe::OwnerOnlyPipeSecurity;
     use windows_sys::Win32::Foundation::{
         CloseHandle, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE, ERROR_IO_PENDING,
-        ERROR_PIPE_CONNECTED, GetHandleInformation, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
-        INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED, ERROR_PIPE_CONNECTED, GetHandleInformation,
+        GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -138,6 +139,15 @@ mod windows_fixture {
 
     struct TemporaryPipe(HANDLE);
 
+    /// A pending `ConnectNamedPipeW` keeps one protected server instance
+    /// listening while the restricted fixture attempts its client open.  The
+    /// guard owns the event and cancels/drains its one overlapped operation
+    /// before the pipe can be disconnected or closed.
+    struct PendingPipeConnection<'pipe> {
+        pipe: &'pipe TemporaryPipe,
+        overlapped: windows_sys::Win32::System::IO::OVERLAPPED,
+    }
+
     impl TemporaryPipe {
         fn create(name: &str, security: &mut OwnerOnlyPipeSecurity) -> io::Result<Self> {
             let wide = wide(name);
@@ -207,6 +217,93 @@ mod windows_fixture {
             unsafe { CloseHandle(event) };
             result
         }
+
+        fn begin_pending_connection(&self) -> io::Result<PendingPipeConnection<'_>> {
+            let mut overlapped = new_overlapped_event()?;
+            let connected = unsafe { ConnectNamedPipe(self.0, &mut overlapped) };
+            if connected == 0 && unsafe { GetLastError() } == ERROR_IO_PENDING {
+                return Ok(PendingPipeConnection {
+                    pipe: self,
+                    overlapped,
+                });
+            }
+
+            // There is no ordinary client after `ordinary_current_user_exchange`
+            // has reaped it.  A synchronous completion would therefore mean an
+            // unexpected client consumed the protected listener rather than
+            // leaving it available for the restricted-child DACL proof.
+            if connected != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED {
+                unsafe { DisconnectNamedPipe(self.0) };
+                unsafe { CloseHandle(overlapped.hEvent) };
+                return Err(io::Error::other(
+                    "protected pipe listener accepted an unexpected client while arming denial proof",
+                ));
+            }
+
+            let error = io::Error::last_os_error();
+            unsafe { CloseHandle(overlapped.hEvent) };
+            Err(error)
+        }
+    }
+
+    impl PendingPipeConnection<'_> {
+        fn cancel_and_drain(&mut self) -> io::Result<()> {
+            if self.overlapped.hEvent.is_null() {
+                return Ok(());
+            }
+
+            if unsafe { windows_sys::Win32::System::IO::CancelIoEx(self.pipe.0, &self.overlapped) }
+                == 0
+                && unsafe { GetLastError() } != ERROR_NOT_FOUND
+            {
+                return Err(io::Error::last_os_error());
+            }
+
+            let waited = unsafe { WaitForSingleObject(self.overlapped.hEvent, FIXTURE_TIMEOUT_MS) };
+            if waited == WAIT_TIMEOUT {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "cancelling protected pipe listener timed out",
+                ));
+            }
+            if waited != WAIT_OBJECT_0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            let mut transferred = 0_u32;
+            let completed = unsafe {
+                windows_sys::Win32::System::IO::GetOverlappedResult(
+                    self.pipe.0,
+                    &self.overlapped,
+                    &mut transferred,
+                    0,
+                )
+            };
+            let result = if completed != 0 {
+                Err(io::Error::other(
+                    "protected pipe listener accepted a client during denial proof",
+                ))
+            } else if unsafe { GetLastError() } == ERROR_OPERATION_ABORTED {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            };
+            unsafe { CloseHandle(self.overlapped.hEvent) };
+            self.overlapped.hEvent = std::ptr::null_mut();
+            result
+        }
+    }
+
+    impl Drop for PendingPipeConnection<'_> {
+        fn drop(&mut self) {
+            // Every expected path explicitly drains the listener.  Preserve
+            // that invariant on fixture setup/launch failures too; if Windows
+            // cannot acknowledge cancellation, retain the OVERLAPPED storage
+            // rather than freeing memory that the kernel could still complete.
+            if self.cancel_and_drain().is_err() {
+                let _ = Box::into_raw(Box::new(std::mem::take(&mut self.overlapped)));
+            }
+        }
     }
 
     impl Drop for TemporaryPipe {
@@ -233,7 +330,10 @@ mod windows_fixture {
         let fixture = match ordinary_current_user_exchange() {
             Ok(fixture) => fixture,
             Err(error) => {
-                return report_missing_capability_or_fail("TemporaryNamedPipesAndTestRunner", error);
+                return report_missing_capability_or_fail(
+                    "TemporaryNamedPipesAndTestRunner",
+                    error,
+                );
             }
         };
         match restricted_child_denials(&fixture, &desktop) {
@@ -543,6 +643,13 @@ mod windows_fixture {
         desktop: &AlternateDesktop,
     ) -> io::Result<()> {
         let targets = ProcessTargets::spawn()?;
+        // The ordinary exchange disconnected both server instances.  Re-arm
+        // each protected endpoint before any restricted child can run, and
+        // retain its pending `ConnectNamedPipeW` through both inheritance
+        // variants.  That makes `WaitNamedPipeW` a readiness check and leaves
+        // `CreateFileW` as the operation that must observe the DACL denial.
+        let mut supervisor_listener = fixture.supervisor.begin_pending_connection()?;
+        let mut worker_listener = fixture.worker.begin_pending_connection()?;
         let token = FixtureHandle(restricted_code_token()?);
         let executable = env::current_exe()?;
         let command = format!(
@@ -565,59 +672,73 @@ mod windows_fixture {
         {
             return Err(io::Error::last_os_error());
         }
-        let mut environment = FixtureEnvironment::default();
-        environment.set(SUPERVISOR_PIPE_ENV, &fixture.supervisor_name);
-        environment.set(WORKER_PIPE_ENV, &fixture.worker_name);
-        environment.set(SUPERVISOR_PID_ENV, targets.supervisor.pid().to_string());
-        environment.set(WORKER_PID_ENV, targets.worker.pid().to_string());
-        environment.set(
-            DUPLICATION_SOURCE_PID_ENV,
-            targets.duplication_source.pid().to_string(),
-        );
-        environment.set(
-            DUPLICATION_SOURCE_HANDLE_ENV,
-            targets.known_worker_handle.to_string(),
-        );
-        environment.set(EXPECTED_DESKTOP_ENV, &desktop.full_name);
-        environment.set(
-            KNOWN_COCKPIT_HANDLE_ENV,
-            (known_cockpit_handle as usize).to_string(),
-        );
-        // The empty variant is a separate process creation: no inherited
-        // handles and no attribute list are permitted in that proof.
-        environment.set(INHERITANCE_MODE_ENV, "none");
-        let empty =
-            launch_restricted_suspended(token.0, &executable, &command, desktop, Inheritance::None);
-        let mut empty = empty?;
-        let empty_job = prepare_restricted_child(&mut empty, &executable)?;
-        resume_and_require_success(&mut empty, empty_job, None)?;
+        let restricted_result = (|| {
+            let mut environment = FixtureEnvironment::default();
+            environment.set(SUPERVISOR_PIPE_ENV, &fixture.supervisor_name);
+            environment.set(WORKER_PIPE_ENV, &fixture.worker_name);
+            environment.set(SUPERVISOR_PID_ENV, targets.supervisor.pid().to_string());
+            environment.set(WORKER_PID_ENV, targets.worker.pid().to_string());
+            environment.set(
+                DUPLICATION_SOURCE_PID_ENV,
+                targets.duplication_source.pid().to_string(),
+            );
+            environment.set(
+                DUPLICATION_SOURCE_HANDLE_ENV,
+                targets.known_worker_handle.to_string(),
+            );
+            environment.set(EXPECTED_DESKTOP_ENV, &desktop.full_name);
+            environment.set(
+                KNOWN_COCKPIT_HANDLE_ENV,
+                (known_cockpit_handle as usize).to_string(),
+            );
+            // The empty variant is a separate process creation: no inherited
+            // handles and no attribute list are permitted in that proof.
+            environment.set(INHERITANCE_MODE_ENV, "none");
+            let empty = launch_restricted_suspended(
+                token.0,
+                &executable,
+                &command,
+                desktop,
+                Inheritance::None,
+            );
+            let mut empty = empty?;
+            let empty_job = prepare_restricted_child(&mut empty, &executable)?;
+            resume_and_require_success(&mut empty, empty_job, None)?;
 
-        let mut stdio = FixtureStdio::create()?;
-        // This variant has precisely the three standard-I/O endpoints in its
-        // explicit handle list; the protected Cockpit pipe is deliberately not
-        // inheritable and not listed.
-        environment.set(INHERITANCE_MODE_ENV, "stdio");
-        let listed = launch_restricted_suspended(
-            token.0,
-            &executable,
-            &command,
-            desktop,
-            Inheritance::ExactStdio(&stdio),
-        );
-        // Creation has copied the three explicit child endpoints. The parent
-        // closes its duplicate endpoints before the target is allowed to run.
-        stdio.close_child_ends();
-        drop(environment);
-        // SAFETY: restore the fixture pipe's non-inheritable state before
-        // releasing it back to EndpointFixture's Drop implementation.
-        let cleared = unsafe { SetHandleInformation(known_cockpit_handle, HANDLE_FLAG_INHERIT, 0) };
-        drop(token);
-        if cleared == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut listed = listed?;
-        let listed_job = prepare_restricted_child(&mut listed, &executable)?;
-        resume_and_require_success(&mut listed, listed_job, Some(&stdio))
+            let mut stdio = FixtureStdio::create()?;
+            // This variant has precisely the three standard-I/O endpoints in
+            // its explicit handle list. The protected Cockpit pipe remains
+            // inheritable only as the known unlisted-leak marker; it is never
+            // included in the attribute allowlist.
+            environment.set(INHERITANCE_MODE_ENV, "stdio");
+            let listed = launch_restricted_suspended(
+                token.0,
+                &executable,
+                &command,
+                desktop,
+                Inheritance::ExactStdio(&stdio),
+            );
+            // Creation has copied the three explicit child endpoints. The parent
+            // closes its duplicate endpoints before the target is allowed to run.
+            stdio.close_child_ends();
+            drop(environment);
+            // SAFETY: restore the fixture pipe's non-inheritable state before
+            // releasing it back to EndpointFixture's Drop implementation.
+            let cleared =
+                unsafe { SetHandleInformation(known_cockpit_handle, HANDLE_FLAG_INHERIT, 0) };
+            drop(token);
+            if cleared == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut listed = listed?;
+            let listed_job = prepare_restricted_child(&mut listed, &executable)?;
+            resume_and_require_success(&mut listed, listed_job, Some(&stdio))
+        })();
+        let listener_result = supervisor_listener
+            .cancel_and_drain()
+            .and_then(|()| worker_listener.cancel_and_drain());
+        restricted_result?;
+        listener_result
     }
 
     fn restricted_code_token() -> io::Result<HANDLE> {
@@ -1382,8 +1503,8 @@ mod windows_fixture {
 
         assert_child_desktop_identity();
 
-        assert_access_denied(open_client_with_exact_rights(&supervisor));
-        assert_access_denied(open_client_with_exact_rights(&worker));
+        assert_client_open_denied(&supervisor);
+        assert_client_open_denied(&worker);
         assert_access_denied(create_second_pipe_instance(&supervisor));
         assert_access_denied(create_second_pipe_instance(&worker));
         for (role, pid) in [("supervisor", supervisor_pid), ("worker", worker_pid)] {
@@ -1577,6 +1698,12 @@ mod windows_fixture {
         }
     }
 
+    fn assert_client_open_denied(name: &str) {
+        wait_for_pipe_listener(name)
+            .expect("protected pipe must be listening before the DACL open-denial assertion");
+        assert_access_denied(open_listening_client_with_exact_rights(name));
+    }
+
     fn create_second_pipe_instance(name: &str) -> io::Result<HANDLE> {
         let wide = wide(name);
         let handle = unsafe {
@@ -1660,6 +1787,11 @@ mod windows_fixture {
     }
 
     fn open_client_with_exact_rights(name: &str) -> io::Result<HANDLE> {
+        wait_for_pipe_listener(name)?;
+        open_listening_client_with_exact_rights(name)
+    }
+
+    fn wait_for_pipe_listener(name: &str) -> io::Result<()> {
         let wide = wide(name);
         // Bound the race with server creation/acceptance. A timed-out ordinary
         // fixture exchange is an assertion failure rather than an indefinite
@@ -1667,6 +1799,11 @@ mod windows_fixture {
         if unsafe { WaitNamedPipeW(wide.as_ptr(), FIXTURE_TIMEOUT_MS) } == 0 {
             return Err(io::Error::last_os_error());
         }
+        Ok(())
+    }
+
+    fn open_listening_client_with_exact_rights(name: &str) -> io::Result<HANDLE> {
+        let wide = wide(name);
         // SAFETY: `wide` is a NUL-terminated temporary pipe name. The desired
         // access is exactly the ordinary-client DACL contract, not generic
         // read/write, so it cannot request FILE_CREATE_PIPE_INSTANCE.

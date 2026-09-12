@@ -79,6 +79,7 @@ pub mod media_attachments;
 pub mod message_attachments;
 pub mod monty_network;
 pub mod needs_attention;
+pub mod onboarding;
 #[cfg(feature = "remote")]
 pub mod org_sync;
 pub mod packages;
@@ -101,7 +102,6 @@ pub mod sealed_actions;
 pub mod sealed_scope;
 pub mod sealed_values;
 pub mod secret_vault;
-pub mod onboarding;
 pub mod secure_key;
 pub mod session_goals;
 pub mod session_log;

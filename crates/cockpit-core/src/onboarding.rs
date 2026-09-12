@@ -11,12 +11,11 @@ use cockpit_proto::{
     OnboardingSecurePlacement, OnboardingStage, OnboardingTransitionReceipt,
 };
 
+use crate::db::Db;
 use crate::db::onboarding::{
     OnboardingBootstrapState as DbBootstrapState, OnboardingReceiptRow,
-    OnboardingReceiptStatus as DbReceiptStatus, OnboardingSnapshotRow,
-    OnboardingStage as DbStage,
+    OnboardingReceiptStatus as DbReceiptStatus, OnboardingSnapshotRow, OnboardingStage as DbStage,
 };
-use crate::db::Db;
 
 #[derive(Clone)]
 pub struct OnboardingAuthority {
@@ -86,11 +85,12 @@ impl OnboardingAuthority {
         {
             bail!("onboarding revision conflict");
         }
-        let bootstrap_state = if matches!(request.placement, OnboardingSecurePlacement::PassphraseFile) {
-            DbBootstrapState::AwaitingPassphrase
-        } else {
-            DbBootstrapState::Materializing
-        };
+        let bootstrap_state =
+            if matches!(request.placement, OnboardingSecurePlacement::PassphraseFile) {
+                DbBootstrapState::AwaitingPassphrase
+            } else {
+                DbBootstrapState::Materializing
+            };
         let (row, receipt_row) = self
             .db
             .onboarding_transition(
@@ -112,7 +112,11 @@ impl OnboardingAuthority {
         client_operation_id: String,
         host_capabilities: HostCapabilitySnapshot,
     ) -> Result<(OnboardingBootstrapSnapshot, OnboardingTransitionReceipt)> {
-        let current = self.db.onboarding_snapshot().await?.context("no onboarding run exists")?;
+        let current = self
+            .db
+            .onboarding_snapshot()
+            .await?
+            .context("no onboarding run exists")?;
         if current.run_id != expected.run_id
             || current.attempt_id != expected.attempt_id
             || current.revision != expected.revision

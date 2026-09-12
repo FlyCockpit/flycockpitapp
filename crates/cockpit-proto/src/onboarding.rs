@@ -132,7 +132,10 @@ impl std::fmt::Debug for ApplyOnboardingSecureIntent {
             .field("expected_revision", &self.expected_revision)
             .field("client_operation_id", &self.client_operation_id)
             .field("placement", &self.placement)
-            .field("passphrase", &self.passphrase.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "passphrase",
+                &self.passphrase.as_ref().map(|_| "[REDACTED]"),
+            )
             .finish()
     }
 }

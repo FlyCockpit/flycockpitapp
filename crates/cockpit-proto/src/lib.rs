@@ -76,11 +76,11 @@ pub use config_management::{
 };
 pub mod bulk_transfer;
 pub mod host_capabilities;
-pub mod onboarding;
 #[cfg(feature = "extended")]
 pub mod image_control;
 pub mod image_sidecar_authority;
 pub mod media_egress_authority;
+pub mod onboarding;
 pub use image_sidecar_authority::{
     ImageSidecarApprovalModeV1, ImageSidecarAuthoritySnapshotV1, ImageSidecarGrantMutationV1,
     ImageSidecarGrantScopeV1, ImageSidecarGrantV1, ImageSidecarInvocationCapSourceV1,
@@ -94,13 +94,13 @@ pub use host_capabilities::{
     CatalogExecutionTarget, FeatureCapabilityRow, FeatureCapabilityState, HostCapabilitySnapshot,
     SecretStoreIntent, SecretStorePlacement, SecretStoreSnapshot,
 };
+pub use launch::{LaunchBundle, LaunchInfo, RepoStatus};
 pub use onboarding::{
     ApplyOnboardingSecureIntent, BeginOrReopenOnboarding, OnboardingBootstrapEvent,
     OnboardingBootstrapSnapshot, OnboardingBootstrapState, OnboardingReceiptStatus,
     OnboardingSecurePlacement, OnboardingStage, OnboardingTransitionReceipt,
     SensitiveOnboardingPassphrase,
 };
-pub use launch::{LaunchBundle, LaunchInfo, RepoStatus};
 pub use provider_management::{
     ProviderLayerMetadataPatch, ProviderMutationBatch, ProviderMutationDelete,
     ProviderMutationUpsert, ProviderSecretValue,

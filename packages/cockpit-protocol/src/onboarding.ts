@@ -143,6 +143,8 @@ export const onboardingStageSettlementSchema = z
     stage_revision: z.number().int().nonnegative(),
     settlement_operation_id: z.string().min(1).max(128),
     provider_id: z.string().optional(),
+    mutation_intent_hash: z.string().optional(),
+    wizard_id: z.string().optional(),
     config_generation: z.number().int().nonnegative(),
   })
   .strict();

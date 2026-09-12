@@ -10020,6 +10020,7 @@ fn apply_setup_wizard_daemon_completion(
     wizard.pending_operation_id = None;
     let status = match completion.response {
         Ok(Response::SetupWizardApplied {
+            wizard_id: _,
             changed,
             model_file_written,
             default_scope,

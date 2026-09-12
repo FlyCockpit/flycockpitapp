@@ -252,6 +252,7 @@
       "consumed_revision": "provider-revision-fixture",
       "layer_id": "provider-layer-fixture",
       "mutation_intent_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+      "upserted_provider_ids": ["example"],
       "owner_root": "/tmp/project",
       "publication": "published",
       "result_revision": "provider-result-fixture",
@@ -2229,6 +2230,7 @@
   },
   "setup_wizard_applied": {
     "data": {
+      "wizard_id": "model",
       "changed": true,
       "model_file_written": false,
       "default_scope": null

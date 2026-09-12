@@ -750,6 +750,10 @@ impl DaemonClient {
                         proto::ErrorCode::Internal,
                         "selected onboarding secure placement could not be materialized",
                     ),
+                    proto::SensitiveOnboardingIntentError::ReadyConstructionFailed => (
+                        proto::ErrorCode::Internal,
+                        "onboarding vault materialized but ready construction failed; retry ready construction",
+                    ),
                 };
                 Ok(Err(ErrorPayload {
                     code,

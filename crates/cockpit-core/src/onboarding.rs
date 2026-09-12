@@ -307,6 +307,59 @@ impl OnboardingAuthority {
         Ok(Some(project(snapshot, host_capabilities, None)?))
     }
 
+    pub async fn mark_ready_construction_failed(
+        &self,
+        host_capabilities: HostCapabilitySnapshot,
+    ) -> Result<OnboardingBootstrapSnapshot> {
+        let current = self
+            .db
+            .onboarding_snapshot()
+            .await?
+            .context("no onboarding run exists")?;
+        if current.bootstrap_state == DbBootstrapState::Failed {
+            return project(current, host_capabilities, None);
+        }
+        let (row, _) = self
+            .db
+            .onboarding_transition(
+                current,
+                format!("ready-construction-failed-{}", current.revision),
+                current.stage,
+                DbBootstrapState::Failed,
+                current.limited_mode,
+                current.selected_secure_placement,
+                stage_entry_config_generation(),
+            )
+            .await?;
+        project(row, host_capabilities, None)
+    }
+
+    pub async fn mark_ready_construction_recovered(
+        &self,
+        host_capabilities: HostCapabilitySnapshot,
+    ) -> Result<()> {
+        let current = self
+            .db
+            .onboarding_snapshot()
+            .await?
+            .context("no onboarding run exists")?;
+        if current.bootstrap_state != DbBootstrapState::Failed {
+            return Ok(());
+        }
+        self.db
+            .onboarding_transition(
+                current,
+                format!("ready-construction-recovered-{}", current.revision),
+                current.stage,
+                DbBootstrapState::Ready,
+                current.limited_mode,
+                current.selected_secure_placement,
+                stage_entry_config_generation(),
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn mark_secure_store_ready(
         &self,
         expected: &OnboardingBootstrapSnapshot,

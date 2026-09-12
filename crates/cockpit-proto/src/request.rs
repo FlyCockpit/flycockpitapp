@@ -1032,6 +1032,9 @@ pub enum Request {
     BeginOrReopenOnboarding(crate::BeginOrReopenOnboarding),
     ApplyOnboardingTransition(crate::ApplyOnboardingTransition),
     GetOnboardingTransitionReceipt(crate::OnboardingReceiptQuery),
+    /// Retry ready-service construction after vault authority exists but the
+    /// first locked-to-ready transition failed.
+    RetryOnboardingReadyConstruction,
     GetAppFlag {
         key: AppFlagKey,
     },
@@ -4506,6 +4509,7 @@ macro_rules! request_variants {
             (Request::BeginOrReopenOnboarding(..), "begin_or_reopen_onboarding");
             (Request::ApplyOnboardingTransition(..), "apply_onboarding_transition");
             (Request::GetOnboardingTransitionReceipt(..), "get_onboarding_transition_receipt");
+            (Request::RetryOnboardingReadyConstruction, "retry_onboarding_ready_construction");
             (Request::GetAppFlag { .. }, "get_app_flag");
             (Request::MarkAppFlagSeen { .. }, "mark_app_flag_seen");
             (Request::GetStorageReport, "get_storage_report");
@@ -4876,6 +4880,7 @@ macro_rules! command {
             (Request::BeginOrReopenOnboarding(request), "begin_or_reopen_onboarding", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "request:BeginOrReopenOnboarding", [request: $crate::BeginOrReopenOnboarding => param]);
             (Request::ApplyOnboardingTransition(request), "apply_onboarding_transition", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "request:ApplyOnboardingTransition", [request: $crate::ApplyOnboardingTransition => param]);
             (Request::GetOnboardingTransitionReceipt(request), "get_onboarding_transition_receipt", owner_only, none, false, read_only, none, serialized, none, "request:OnboardingReceiptQuery", [request: $crate::OnboardingReceiptQuery => param]);
+            (Request::RetryOnboardingReadyConstruction, "retry_onboarding_ready_construction", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::GetAppFlag { key }, "get_app_flag", owner_only, none, false, local_only, none, serialized, none, "key:AppFlagKey", [key: AppFlagKey => param]);
             (Request::MarkAppFlagSeen { key, expected_version }, "mark_app_flag_seen", owner_only, none, true, local_only, none, serialized, none, "key:AppFlagKey|expected_version:u64", [key: AppFlagKey => param, expected_version: u64 => param]);
             (Request::GetStorageReport, "get_storage_report", owner_only, none, false, read_only, none, concurrent, none, "-", []);

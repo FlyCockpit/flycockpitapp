@@ -7087,6 +7087,7 @@ fn onboarding_profile_save_completes_after_daemon_apply() {
         operation_id: effect.operation_id,
         target: effect.target,
         response: Ok(Response::SetupWizardApplied {
+            wizard_id: "model".into(),
             changed,
             model_file_written,
             default_scope,

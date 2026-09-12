@@ -1280,6 +1280,11 @@ fn apply_provider_mutation(
         layer_id,
         owner_root: capability.owner_root,
         mutation_intent_hash,
+        upserted_provider_ids: mutation
+            .upserts
+            .iter()
+            .map(|upsert| upsert.provider_id.clone())
+            .collect(),
         consumed_revision: expected_revision,
         result_revision,
         config_generation,

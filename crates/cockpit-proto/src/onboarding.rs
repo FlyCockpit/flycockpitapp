@@ -107,6 +107,13 @@ pub struct OnboardingStageSettlement {
     pub settlement_operation_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
+    /// Sanitized digest of the exact provider mutation batch that must match
+    /// the terminal `ProviderMutationCommitted` receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_intent_hash: Option<String>,
+    /// Setup-wizard identity for model or agent settlement correlation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wizard_id: Option<String>,
     pub config_generation: u64,
 }
 
@@ -258,6 +265,7 @@ pub enum SensitiveOnboardingIntentError {
     RevisionConflict,
     PlacementUnavailable,
     MaterializationFailed,
+    ReadyConstructionFailed,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -442,6 +450,7 @@ pub fn encode_sensitive_onboarding_response(
                 SensitiveOnboardingIntentError::RevisionConflict => 3,
                 SensitiveOnboardingIntentError::PlacementUnavailable => 4,
                 SensitiveOnboardingIntentError::MaterializationFailed => 5,
+                SensitiveOnboardingIntentError::ReadyConstructionFailed => 6,
             });
         }
     }
@@ -483,6 +492,9 @@ pub fn decode_sensitive_onboarding_response(
         ),
         5 => SensitiveOnboardingIntentResponse::Rejected(
             SensitiveOnboardingIntentError::MaterializationFailed,
+        ),
+        6 => SensitiveOnboardingIntentResponse::Rejected(
+            SensitiveOnboardingIntentError::ReadyConstructionFailed,
         ),
         _ => return Err("invalid sensitive onboarding response status"),
     };

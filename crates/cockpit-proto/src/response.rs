@@ -684,6 +684,8 @@ pub enum Response {
         owner_root: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         mutation_intent_hash: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        upserted_provider_ids: Vec<String>,
         consumed_revision: String,
         result_revision: String,
         config_generation: u64,
@@ -1044,6 +1046,7 @@ pub enum Response {
 
     /// Safe outcome of a daemon-owned setup wizard mutation.
     SetupWizardApplied {
+        wizard_id: String,
         changed: bool,
         model_file_written: bool,
         default_scope: Option<String>,

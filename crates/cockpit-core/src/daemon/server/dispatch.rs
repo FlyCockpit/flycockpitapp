@@ -191,7 +191,13 @@ async fn validate_terminal_local_operation_settlement(
     owner: &str,
     operation_id: &str,
     expected_kind: &str,
-) -> std::result::Result<String, ErrorPayload> {
+) -> std::result::Result<
+    (
+        crate::db::local_operation_receipts::LocalOperationIdentity,
+        String,
+    ),
+    ErrorPayload,
+> {
     let durable = ctx
         .db
         .local_operation_settlement(owner.to_owned(), operation_id.to_owned())
@@ -204,11 +210,27 @@ async fn validate_terminal_local_operation_settlement(
         crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(
             identity,
             json,
-        ) if identity.operation_kind == expected_kind => Ok(json),
+        ) if identity.operation_kind == expected_kind => Ok((identity, json)),
         _ => Err(bad_request(
             "onboarding settlement operation is not terminal; query exact status",
         )),
     }
+}
+
+fn onboarding_model_wizard_id(wizard_id: &str) -> bool {
+    wizard_id == crate::wizard::MODEL_WIZARD_ID
+        || wizard_id == crate::wizard::ONBOARDING_MODEL_WIZARD_ID
+}
+
+fn validate_settlement_request_hash(
+    identity: &crate::db::local_operation_receipts::LocalOperationIdentity,
+) -> std::result::Result<(), ErrorPayload> {
+    if identity.request_hash.len() != 32 {
+        return Err(bad_request(
+            "onboarding settlement operation has an invalid request hash",
+        ));
+    }
+    Ok(())
 }
 
 async fn validate_onboarding_stage_settlement(
@@ -242,24 +264,34 @@ async fn validate_onboarding_stage_settlement(
                 .ok_or_else(|| {
                     bad_request("provider advance requires a settled provider identity")
                 })?;
-            let response_json = validate_terminal_local_operation_settlement(
+            let mutation_intent_hash = settlement
+                .mutation_intent_hash
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    bad_request("provider advance requires a settled mutation intent hash")
+                })?;
+            let (identity, response_json) = validate_terminal_local_operation_settlement(
                 ctx,
                 owner,
                 &operation_id,
                 "apply_provider_mutation",
             )
             .await?;
+            validate_settlement_request_hash(&identity)?;
             let response: Response = serde_json::from_str(&response_json).map_err(internal)?;
             match response {
                 Response::ProviderMutationCommitted {
                     client_operation_id,
                     config_generation,
-                    config,
+                    mutation_intent_hash: committed_intent_hash,
+                    upserted_provider_ids,
                     status: proto::ConfigCommitStatus::Committed,
                     ..
                 } if client_operation_id == operation_id
                     && config_generation == settlement.config_generation
-                    && config.providers.contains_key(provider_id) =>
+                    && committed_intent_hash == mutation_intent_hash
+                    && upserted_provider_ids.iter().any(|id| id == provider_id) =>
                 {
                     Ok(())
                 }
@@ -269,20 +301,34 @@ async fn validate_onboarding_stage_settlement(
             }
         }
         proto::OnboardingStage::Model => {
-            let response_json = validate_terminal_local_operation_settlement(
+            let wizard_id = settlement
+                .wizard_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    bad_request("model advance requires a settled setup wizard identity")
+                })?;
+            if !onboarding_model_wizard_id(wizard_id) {
+                return Err(bad_request(
+                    "model onboarding settlement references an invalid setup wizard",
+                ));
+            }
+            let (identity, response_json) = validate_terminal_local_operation_settlement(
                 ctx,
                 owner,
                 &operation_id,
                 "apply_setup_wizard",
             )
             .await?;
+            validate_settlement_request_hash(&identity)?;
             let response: Response = serde_json::from_str(&response_json).map_err(internal)?;
             match response {
                 Response::SetupWizardApplied {
+                    wizard_id: committed_wizard_id,
                     changed,
                     model_file_written,
                     ..
-                } if changed || model_file_written => {
+                } if committed_wizard_id == wizard_id && (changed || model_file_written) => {
                     let global =
                         cockpit_config::config::dirs::global_config_file().map_err(internal)?;
                     let providers = crate::config::providers::ConfigDoc::load(&global)
@@ -302,16 +348,33 @@ async fn validate_onboarding_stage_settlement(
             }
         }
         proto::OnboardingStage::Agent => {
-            let response_json = validate_terminal_local_operation_settlement(
+            let wizard_id = settlement
+                .wizard_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    bad_request("agent advance requires a settled setup wizard identity")
+                })?;
+            if wizard_id != crate::wizard::ONBOARDING_AGENT_WIZARD_ID {
+                return Err(bad_request(
+                    "agent onboarding settlement references an invalid setup wizard",
+                ));
+            }
+            let (identity, response_json) = validate_terminal_local_operation_settlement(
                 ctx,
                 owner,
                 &operation_id,
                 "apply_setup_wizard",
             )
             .await?;
+            validate_settlement_request_hash(&identity)?;
             let response: Response = serde_json::from_str(&response_json).map_err(internal)?;
             match response {
-                Response::SetupWizardApplied { changed, .. } if changed => {
+                Response::SetupWizardApplied {
+                    wizard_id: committed_wizard_id,
+                    changed,
+                    ..
+                } if committed_wizard_id == wizard_id && changed => {
                     if ctx
                         .db
                         .default_agent_installation()
@@ -6383,6 +6446,9 @@ async fn handle_serialized_request_impl(
                 .map_err(onboarding_error)?;
             Ok(Response::OnboardingTransitionReceipt(receipt))
         }
+        Request::RetryOnboardingReadyConstruction => Err(bad_request(
+            "onboarding ready construction is only valid while bootstrap is locked",
+        )),
         Request::AttachKnowledgeBaseSession {
             knowledge_base_id,
             session_id,
@@ -18464,6 +18530,7 @@ async fn handle_serialized_request_impl(
                     .await
                     .map_err(internal)?;
                     return Ok(Response::SetupWizardApplied {
+                        wizard_id: wizard_id.clone(),
                         changed: true,
                         model_file_written: true,
                         default_scope: Some("global".into()),
@@ -18477,6 +18544,7 @@ async fn handle_serialized_request_impl(
                 .await
                 .map_err(internal)?;
                 Ok(Response::SetupWizardApplied {
+                    wizard_id: wizard_id.clone(),
                     changed: result.0,
                     model_file_written: result.1,
                     default_scope: result.2,
@@ -22979,6 +23047,11 @@ async fn stage_and_recover_provider_batch(
         std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
     let mut credential_claims = Vec::<(String, String)>::new();
     let batch_id = Uuid::now_v7().to_string();
+    let upserted_provider_ids = mutation
+        .upserts
+        .iter()
+        .map(|upsert| upsert.provider_id.clone())
+        .collect::<Vec<_>>();
 
     for mut upsert in mutation.upserts {
         // Secret resolution validates a header against the complete provider
@@ -23112,6 +23185,7 @@ async fn stage_and_recover_provider_batch(
         layer_id: layer_id.to_owned(),
         owner_root: project_root.to_owned(),
         mutation_intent_hash: mutation_intent_hash.to_owned(),
+        upserted_provider_ids,
         consumed_revision: consumed_revision.to_owned(),
         result_revision: result_revision.clone(),
         config_generation,

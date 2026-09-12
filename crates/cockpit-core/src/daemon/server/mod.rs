@@ -4346,6 +4346,26 @@ pub(crate) fn locked_in_process_endpoint(
         mpsc::channel::<cockpit_client::InProcessSensitiveRequest>(4);
     let ready_for_connections = ready_rx.clone();
     let locked_for_connections = locked.clone();
+    let ready_tx_for_watch = ready_tx.clone();
+    tokio::spawn(async move {
+        let mut ready_signal = locked_for_connections.ready_signal.subscribe();
+        while ready_signal.changed().await.is_ok() {
+            if *ready_signal.borrow_and_update() {
+                if let Some(ready) = locked_for_connections.take_achieved_ready() {
+                    let ctx = Arc::new(ready.context);
+                    if recover_before_socket_publish(&ctx).await.is_ok() {
+                        let _ = ready_tx_for_watch.send(Some(ctx));
+                    } else {
+                        locked_for_connections.ready.store(false, Ordering::Release);
+                        let _ = locked_for_connections
+                            .mark_ready_construction_failed()
+                            .await;
+                    }
+                }
+                break;
+            }
+        }
+    });
     tokio::spawn(async move {
         while let Some(reply) = connection_requests.recv().await {
             if reply.is_closed() {
@@ -4372,28 +4392,28 @@ pub(crate) fn locked_in_process_endpoint(
                 match cockpit_proto::decode_sensitive_onboarding_intent(&request.payload) {
                     Ok(frame) => {
                         match locked.apply_secure_intent(frame.request).await {
-                            Ok(result) => {
-                                locked.begin_locked_to_ready_transition().await;
-                                match locked.into_ready().await {
-                                    Ok(ready) => {
-                                        let ctx = Arc::new(ready.context);
-                                        if recover_before_socket_publish(&ctx).await.is_err() {
-                                            locked.closing.store(false, Ordering::Release);
-                                            cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
-                                            cockpit_proto::SensitiveOnboardingIntentError::MaterializationFailed,
-                                        )
-                                        } else {
-                                            let _ = ready_tx.send(Some(ctx));
-                                            locked.ready.store(true, Ordering::Release);
-                                            cockpit_proto::SensitiveOnboardingIntentResponse::Applied(result)
-                                        }
-                                    }
-                                    Err(_) => {
+                            Ok(result) => match locked.finish_ready_transition().await {
+                                Ok(ready) => {
+                                    let ctx = Arc::new(ready.context);
+                                    if recover_before_socket_publish(&ctx).await.is_err() {
                                         locked.closing.store(false, Ordering::Release);
+                                        locked.ready.store(false, Ordering::Release);
+                                        let _ = locked.mark_ready_construction_failed().await;
                                         cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
-                                        cockpit_proto::SensitiveOnboardingIntentError::MaterializationFailed,
-                                    )
+                                            cockpit_proto::SensitiveOnboardingIntentError::ReadyConstructionFailed,
+                                        )
+                                    } else {
+                                        let _ = ready_tx.send(Some(ctx));
+                                        locked.ready.store(true, Ordering::Release);
+                                        cockpit_proto::SensitiveOnboardingIntentResponse::Applied(
+                                            result,
+                                        )
                                     }
+                                }
+                                Err(_) => {
+                                    cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
+                                        cockpit_proto::SensitiveOnboardingIntentError::ReadyConstructionFailed,
+                                    )
                                 }
                             }
                             Err(error) => {
@@ -4503,6 +4523,17 @@ async fn handle_locked_in_process_request(
                 .await;
                 locked.end_locked_mutation();
                 outcome
+            }
+            Request::RetryOnboardingReadyConstruction => {
+                let ready = locked.finish_ready_transition().await?;
+                locked.store_achieved_ready(ready);
+                Ok(Response::OnboardingBootstrapSnapshot(
+                    locked
+                        .onboarding
+                        .snapshot(locked.host_capabilities.clone())
+                        .await?
+                        .context("onboarding run is absent")?,
+                ))
             }
             _ => Err(anyhow::anyhow!("bootstrap is locked")),
         }
@@ -4651,6 +4682,8 @@ pub(crate) struct LockedServices {
     ready: AtomicBool,
     closing: AtomicBool,
     inflight_mutations: AtomicUsize,
+    achieved_ready: StdMutex<Option<ReadyServices>>,
+    ready_signal: watch::Sender<bool>,
 }
 
 /// Vault-bearing daemon composition. Ordinary dispatch and recovery accept
@@ -4732,6 +4765,7 @@ impl LockedServices {
             crate::daemon::peer_authority::persist_launch_ticket(&paths.socket, &ticket)
                 .context("persisting locked-bootstrap launch ticket")?;
         }
+        let (ready_signal, _) = watch::channel(false);
         Ok(Self {
             onboarding: crate::onboarding::OnboardingAuthority::new(db.clone()),
             db,
@@ -4747,6 +4781,8 @@ impl LockedServices {
             ready: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             inflight_mutations: AtomicUsize::new(0),
+            achieved_ready: StdMutex::new(None),
+            ready_signal,
         })
     }
 
@@ -4754,11 +4790,19 @@ impl LockedServices {
         self.closing.load(Ordering::Acquire) || self.ready.load(Ordering::Acquire)
     }
 
+    fn ready_construction_pending(&self) -> bool {
+        !self.ready.load(Ordering::Acquire) && self.vault_authority_exists().unwrap_or(false)
+    }
+
     fn begin_locked_mutation(&self) -> bool {
-        if self.locked_admission_denied() {
+        if self.ready.load(Ordering::Acquire) {
             return false;
         }
         self.inflight_mutations.fetch_add(1, Ordering::AcqRel);
+        if self.closing.load(Ordering::Acquire) {
+            self.inflight_mutations.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
         true
     }
 
@@ -4775,6 +4819,49 @@ impl LockedServices {
     async fn begin_locked_to_ready_transition(&self) {
         self.closing.store(true, Ordering::Release);
         self.drain_inflight_mutations().await;
+    }
+
+    async fn mark_ready_construction_failed(&self) -> Result<()> {
+        self.onboarding
+            .mark_ready_construction_failed(self.host_capabilities.clone())
+            .await
+            .context("recording ready-construction failure")
+    }
+
+    async fn mark_ready_construction_recovered(&self) -> Result<()> {
+        self.onboarding
+            .mark_ready_construction_recovered(self.host_capabilities.clone())
+            .await
+            .context("recording ready-construction recovery")
+    }
+
+    async fn finish_ready_transition(&self) -> Result<ReadyServices> {
+        anyhow::ensure!(
+            self.ready_construction_pending(),
+            "onboarding ready construction is not pending"
+        );
+        self.begin_locked_to_ready_transition().await;
+        match self.into_ready().await {
+            Ok(ready) => {
+                self.mark_ready_construction_recovered().await?;
+                Ok(ready)
+            }
+            Err(error) => {
+                self.closing.store(false, Ordering::Release);
+                self.mark_ready_construction_failed().await?;
+                Err(error)
+            }
+        }
+    }
+
+    fn store_achieved_ready(&self, ready: ReadyServices) {
+        *self.achieved_ready.lock().unwrap() = Some(ready);
+        self.ready.store(true, Ordering::Release);
+        let _ = self.ready_signal.send(true);
+    }
+
+    fn take_achieved_ready(&self) -> Option<ReadyServices> {
+        self.achieved_ready.lock().unwrap().take()
     }
 
     pub(crate) fn vault_authority_exists(&self) -> Result<bool> {
@@ -5979,6 +6066,17 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
                 locked.end_locked_mutation();
                 outcome
             }
+            Request::RetryOnboardingReadyConstruction => {
+                let ready = locked.finish_ready_transition().await?;
+                locked.store_achieved_ready(ready);
+                Ok(Response::OnboardingBootstrapSnapshot(
+                    locked
+                        .onboarding
+                        .snapshot(locked.host_capabilities.clone())
+                        .await?
+                        .context("onboarding run is absent")?,
+                ))
+            }
             _ => Err(anyhow::anyhow!("bootstrap is locked")),
         };
         let response = match result {
@@ -6010,8 +6108,21 @@ pub(crate) async fn run_locked_until_ready(
     crate::daemon::leak_reveal_socket::BoundRevealSocket,
 )> {
     let mut locked_clients = tokio::task::JoinSet::new();
+    let mut ready_signal = locked.ready_signal.subscribe();
     loop {
         tokio::select! {
+            changed = ready_signal.changed() => {
+                if changed.is_err() {
+                    continue;
+                }
+                if *ready_signal.borrow_and_update()
+                    && let Some(ready) = locked.take_achieved_ready()
+                {
+                    locked_clients.abort_all();
+                    while locked_clients.join_next().await.is_some() {}
+                    return Ok((ready, listener, sensitive));
+                }
+            }
             accepted = accept_daemon_stream(&mut listener) => {
                 let stream = accepted?;
                 if validate_peer_owner(&stream).is_err() {
@@ -6049,10 +6160,9 @@ pub(crate) async fn run_locked_until_ready(
                 };
                 match outcome {
                     Ok(result) => {
-                        locked.begin_locked_to_ready_transition().await;
                         locked_clients.abort_all();
                         while locked_clients.join_next().await.is_some() {}
-                        match locked.into_ready().await {
+                        match locked.finish_ready_transition().await {
                             Ok(ready) => {
                                 let response = cockpit_proto::SensitiveOnboardingIntentResponse::Applied(result);
                                 let bytes = cockpit_proto::encode_sensitive_onboarding_response(&response)
@@ -6063,9 +6173,8 @@ pub(crate) async fn run_locked_until_ready(
                                 return Ok((ready, listener, sensitive));
                             }
                             Err(_) => {
-                                locked.closing.store(false, Ordering::Release);
                                 let response = cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
-                                    cockpit_proto::SensitiveOnboardingIntentError::MaterializationFailed,
+                                    cockpit_proto::SensitiveOnboardingIntentError::ReadyConstructionFailed,
                                 );
                                 let bytes = cockpit_proto::encode_sensitive_onboarding_response(&response)
                                     .map_err(anyhow::Error::msg)?;

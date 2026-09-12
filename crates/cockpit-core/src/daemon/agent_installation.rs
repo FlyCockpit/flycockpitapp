@@ -474,6 +474,35 @@ struct RetainedHookExecutionBundle {
     byte_len: usize,
 }
 
+/// Core-owned adapter from the host's Windows no-delete directory lease to
+/// config's runtime-private hook launch contract. Keeping this adapter here
+/// avoids making the dependency-minimal host crate depend upward on config.
+#[cfg(windows)]
+struct RetainedWindowsHookWorkingDirectory {
+    lease: cockpit_host::private_fs::held_directory::WindowsWorkspaceExecutionLease,
+}
+
+#[cfg(windows)]
+impl cockpit_config::config::extended::hooks::HookExecutionLease
+    for RetainedWindowsHookWorkingDirectory
+{
+}
+
+#[cfg(windows)]
+impl cockpit_config::config::extended::hooks::RetainedWindowsHookWorkingDirectory
+    for RetainedWindowsHookWorkingDirectory
+{
+    fn canonical_path(&self) -> &Path {
+        self.lease.canonical_path()
+    }
+
+    fn revalidate_before_spawn(&self) -> std::result::Result<(), String> {
+        self.lease.revalidate_before_spawn().map_err(|error| {
+            format!("Windows retained hook cwd lease verification failed: {error:#}")
+        })
+    }
+}
+
 #[cfg(any(unix, windows))]
 impl Drop for RetainedHookExecutionBundle {
     fn drop(&mut self) {
@@ -1049,13 +1078,14 @@ impl cockpit_config::config::extended::hooks::RetainedHookExecutionAuthority
             // chain and is revalidated immediately before spawn. The bundle is
             // already immutable, so a source replacement can never alter the
             // program this launch executes.
-            let cwd = Arc::new(
-                self.working_directory
+            let cwd = Arc::new(RetainedWindowsHookWorkingDirectory {
+                lease: self
+                    .working_directory
                     .acquire_windows_execution_lease()
                     .map_err(|error| {
                         format!("acquiring retained Windows hook cwd lease failed: {error:#}")
                     })?,
-            );
+            });
             return Ok(
                 cockpit_config::config::extended::hooks::HookExecutionLaunch::retained(
                     bundle.executable.clone(),

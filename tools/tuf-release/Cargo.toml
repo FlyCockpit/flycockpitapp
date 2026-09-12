@@ -10,5 +10,5 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-cockpit-core = { path = "../../crates/cockpit-core" }
+cockpit-updater-evidence = { path = "../../crates/cockpit-updater-evidence" }
 serde_json = { workspace = true }

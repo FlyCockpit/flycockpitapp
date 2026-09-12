@@ -11,28 +11,30 @@ Flycockpit is a pnpm/Turborepo monorepo with a React web app, Hono API server, B
 
 Apps under `apps/`: `apps/cli` (Rust Cockpit CLI), `apps/docs` (documentation site), `apps/native` (Expo app), `apps/relay` (temporary TypeScript standalone relay bridge still deployed until WebSocket ownership moves into `apps/server`), `apps/server` (Hono API; destination owner of public WebSocket signaling/gateway work), `apps/tenant-authority` (Rust tenant-authority reference service), `apps/web` (React app), and `apps/worker` (BullMQ worker). There is no Rust WebSocket relay app: the former `apps/relay-rs` experiment was deleted.
 
-Rust code lives in the Cargo workspace rooted at this repo's `Cargo.toml`. Current members are `apps/cli` (Cockpit CLI binary, commands, and terminal host), `apps/tenant-authority` (customer-operated tenant-authority reference service), `crates/cockpit-tui` (ratatui terminal interface), `crates/cockpit-core` (UI-free Cockpit application layer), `crates/cockpit-client` (dependency-minimal local daemon client transport), `crates/cockpit-host` (dependency-minimal private filesystem, path, process, PID, lifecycle-guard, and named-pipe identity/connect primitives), `crates/cockpit-config` (config types/loading), `crates/cockpit-tokenizer` (strict shared tiktoken contract), `crates/cockpit-db` (SQLite layer and migrations), `crates/cockpit-proto` (daemon wire protocol), `crates/cockpit-noise` (Noise protocol bindings), `crates/cockpit-test-support` (shared test-only helpers; not a production API), and `crates/relay-protocol` (legacy relay wire types still used by the daemon client). pnpm/turbo commands do not build or test Rust. Run cargo checks serially from the primary repo root with its singular target: `CARGO_TARGET_DIR=target cargo fmt --check`, `CARGO_TARGET_DIR=target cargo nextest run --locked --workspace`, and `CARGO_TARGET_DIR=target cargo clippy --locked --tests -- -D warnings` (test targets are lint-clean and must stay that way). `cargo nextest run --locked --workspace --profile quick` may be used only while fixing a failure in the final serialized validation loop — it skips only apps/cli's e2e integration binary — and the full default-profile run is required after the last change. Worker worktrees never build or test, and build artifacts or dependency caches never go under `/tmp`. CLI CI is `.github/workflows/cli-ci.yml` and releases go through `.github/workflows/release.yml` (cargo-dist + Homebrew tap).
+Rust code lives in the Cargo workspace rooted at this repo's `Cargo.toml`. Current members are `apps/cli` (Cockpit CLI binary, commands, and terminal host), `apps/tenant-authority` (customer-operated tenant-authority reference service), `crates/cockpit-tui` (ratatui terminal interface), `crates/cockpit-core` (UI-free Cockpit application layer), `crates/cockpit-client` (dependency-minimal local daemon client transport), `crates/cockpit-host` (dependency-minimal private filesystem, path, process, PID, lifecycle-guard, and named-pipe identity/connect primitives), `crates/cockpit-config` (config types/loading), `crates/cockpit-tokenizer` (strict shared tiktoken contract), `crates/cockpit-db` (SQLite layer and migrations), `crates/cockpit-proto` (daemon wire protocol), `crates/cockpit-noise` (Noise protocol bindings), `crates/cockpit-test-support` (shared test-only helpers; not a production API), `crates/cockpit-updater-evidence` (canonical fake-fixture evidence schema for private release tooling), `crates/relay-protocol` (legacy relay wire types still used by the daemon client), and `tools/tuf-release` (private updater release-tooling binary; evidence validation only in disabled preparation). pnpm/turbo commands do not build or test Rust. Run cargo checks serially from the primary repo root with its singular target: `CARGO_TARGET_DIR=target cargo fmt --check`, `CARGO_TARGET_DIR=target cargo nextest run --locked --workspace`, and `CARGO_TARGET_DIR=target cargo clippy --locked --tests -- -D warnings` (test targets are lint-clean and must stay that way). `cargo nextest run --locked --workspace --profile quick` may be used only while fixing a failure in the final serialized validation loop — it skips only apps/cli's e2e integration binary — and the full default-profile run is required after the last change. Worker worktrees never build or test, and build artifacts or dependency caches never go under `/tmp`. CLI CI is `.github/workflows/cli-ci.yml` and releases go through `.github/workflows/release.yml` (cargo-dist + Homebrew tap).
 
 ### Rust crate graph
 
 Dependencies run strictly downward; there are no upward or circular edges. This graph is authoritative — do not duplicate it elsewhere.
 
 ```
-apps/cli                 -> cockpit-tui, cockpit-core, cockpit-client, cockpit-host, cockpit-proto,
-                            cockpit-config, cockpit-db, relay-protocol
-apps/tenant-authority    -> cockpit-proto
-crates/cockpit-tui       -> cockpit-core, cockpit-client, cockpit-host, cockpit-proto, cockpit-config
-crates/cockpit-core      -> cockpit-client, cockpit-host, cockpit-proto, cockpit-config,
-                            cockpit-tokenizer, cockpit-db, relay-protocol
-crates/cockpit-proto     -> cockpit-config, cockpit-db
-crates/cockpit-config    -> cockpit-host, cockpit-tokenizer, cockpit-db
-crates/cockpit-tokenizer -> (none)
-crates/cockpit-db        -> (none)
-crates/cockpit-client    -> cockpit-proto, cockpit-host
-crates/cockpit-host      -> (none)
-crates/cockpit-noise     -> (none)
-crates/cockpit-test-support -> (none)
-crates/relay-protocol    -> (none)
+apps/cli                      -> cockpit-tui, cockpit-core, cockpit-client, cockpit-host, cockpit-proto,
+                                 cockpit-config, cockpit-db, relay-protocol
+apps/tenant-authority         -> cockpit-proto
+crates/cockpit-tui            -> cockpit-core, cockpit-client, cockpit-host, cockpit-proto, cockpit-config
+crates/cockpit-core           -> cockpit-client, cockpit-host, cockpit-proto, cockpit-config,
+                                 cockpit-tokenizer, cockpit-db, cockpit-updater-evidence, relay-protocol
+crates/cockpit-proto          -> cockpit-config, cockpit-db
+crates/cockpit-config         -> cockpit-host, cockpit-tokenizer, cockpit-db
+crates/cockpit-tokenizer      -> (none)
+crates/cockpit-db             -> (none)
+crates/cockpit-client         -> cockpit-proto, cockpit-host
+crates/cockpit-host           -> (none)
+crates/cockpit-noise          -> (none)
+crates/cockpit-test-support   -> (none)
+crates/cockpit-updater-evidence -> (none)
+crates/relay-protocol         -> (none)
+tools/tuf-release             -> cockpit-updater-evidence
 ```
 
 Layered, the application chain is `apps/cli -> cockpit-tui -> cockpit-core -> cockpit-client -> cockpit-proto -> cockpit-config -> cockpit-db`, with upper crates also depending directly on lower ones. `cockpit-client` is the authority-free local daemon transport shared by core, CLI, and TUI. `cockpit-host` is an independent production leaf shared by CLI, TUI, core, config, and the local daemon client; it must not depend on application, protocol, config, or storage crates. Config loaders use `cockpit_host::bounded` with an explicit domain cap because they sit below `cockpit-core` and cannot import `resource_limits`. `apps/tenant-authority` sits beside `apps/cli` and depends only on `cockpit-proto`. `cockpit-noise` is a leaf. `cockpit-test-support` is a test-only leaf: upper crates may take it as a dev-dependency or via an explicit `test-support` feature; that is not a production edge and must not become one.

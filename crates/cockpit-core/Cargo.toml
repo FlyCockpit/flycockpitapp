@@ -134,6 +134,7 @@ cockpit-db = { path = "../cockpit-db", features = ["host-approval-composition", 
 cockpit-host = { path = "../cockpit-host" }
 cockpit-proto = { path = "../cockpit-proto" }
 cockpit-tokenizer = { path = "../cockpit-tokenizer" }
+cockpit-updater-evidence = { path = "../cockpit-updater-evidence" }
 cockpit-test-support = { path = "../cockpit-test-support", optional = true }
 rusqlite = { workspace = true }
 sqlite-vec = { workspace = true }

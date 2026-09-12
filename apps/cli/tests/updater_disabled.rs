@@ -81,9 +81,43 @@ fn strip_rust_comments(source: &str) -> String {
     out
 }
 
+fn parse_use_as_alias(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim().trim_end_matches(';').trim();
+    let rest = trimmed.strip_prefix("use ")?.trim();
+    let (path, alias) = rest.split_once(" as ")?;
+    Some((path.trim().to_string(), alias.trim().to_string()))
+}
+
+fn updater_module_prefixes(source: &str) -> Vec<String> {
+    let mut prefixes = vec!["cockpit_core".to_string(), "crate".to_string()];
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("use ") {
+            continue;
+        }
+        if let Some((path, alias)) = parse_use_as_alias(trimmed) {
+            if path == "cockpit_core"
+                || path == "crate"
+                || path.starts_with("cockpit_core::")
+                || path.starts_with("crate::")
+            {
+                prefixes.push(alias);
+            }
+        }
+    }
+    prefixes.sort();
+    prefixes.dedup();
+    prefixes
+}
+
 fn references_installed_updater_module(source: &str) -> bool {
     let production = strip_rust_comments(&strip_test_modules(source));
-    production.contains("cockpit_core::updater") || production.contains("crate::updater")
+    for prefix in updater_module_prefixes(&production) {
+        if production.contains(&format!("{prefix}::updater")) {
+            return true;
+        }
+    }
+    production.contains("::updater::")
 }
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -188,31 +222,83 @@ fn scan_segments_for_forbidden(segments: &[String], needles: &[&str], path: &Pat
     }
 }
 
+fn is_run_startup_check_call_site(line: &str) -> bool {
+    if !line.contains("run_startup_check(") {
+        return false;
+    }
+    let trimmed = line.trim_start();
+    !(trimmed.starts_with("use ")
+        || line.contains("pub async fn run_startup_check")
+        || line.contains("pub fn run_startup_check"))
+}
+
+fn byte_offset_for_line(source: &str, line_idx: usize) -> usize {
+    source
+        .lines()
+        .take(line_idx)
+        .map(|line| line.len() + 1)
+        .sum()
+}
+
+fn find_enclosing_block_opener(source: &str, call_offset: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut depth = 0usize;
+    let mut index = call_offset;
+    while index > 0 {
+        index -= 1;
+        match bytes[index] {
+            b'}' => depth += 1,
+            b'{' => {
+                if depth == 0 {
+                    return Some(index);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn controlling_statement_for_block(source: &str, block_opener: usize) -> String {
+    let prefix = source[..block_opener].trim_end();
+    if let Some(arm_start) = prefix.rfind("=>") {
+        let before_arm = prefix[..arm_start].trim_end();
+        let line_start = before_arm.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        return prefix[line_start..arm_start].trim().to_string();
+    }
+    if let Some(if_start) = prefix.rfind("\nif ") {
+        return prefix[if_start + 1..].trim().to_string();
+    }
+    if let Some(if_start) = prefix.rfind(" if ") {
+        return prefix[if_start + 1..].trim().to_string();
+    }
+    if prefix.trim_start().starts_with("if ") {
+        return prefix.trim().to_string();
+    }
+    String::new()
+}
+
+fn call_is_update_check_gated(source: &str, line_idx: usize) -> bool {
+    let call_offset = byte_offset_for_line(source, line_idx);
+    let call_line = source.lines().nth(line_idx).unwrap_or("");
+    if call_line.contains("update_checks_enabled") {
+        return true;
+    }
+    let block_opener = find_enclosing_block_opener(source, call_offset)?;
+    let controller = controlling_statement_for_block(source, block_opener);
+    controller.contains("update_checks_enabled")
+}
+
 fn assert_run_startup_check_gated(source: &str, path_label: &str) {
     let production = strip_rust_comments(&strip_test_modules(source));
     for (line_idx, line) in production.lines().enumerate() {
-        if !line.contains("run_startup_check") {
+        if !is_run_startup_check_call_site(line) {
             continue;
         }
-        if line.contains("pub async fn run_startup_check")
-            || line.contains("pub fn run_startup_check")
-            || line.trim_start().starts_with("use ")
-        {
-            continue;
-        }
-        let context = production
-            .lines()
-            .take(line_idx)
-            .rev()
-            .take(6)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n");
         assert!(
-            context.contains("update_checks_enabled") || line.contains("update_checks_enabled"),
-            "{}: run_startup_check must be gated by update_checks_enabled",
+            call_is_update_check_gated(&production, line_idx),
+            "{}: run_startup_check must be enclosed by an update_checks_enabled guard",
             path_label
         );
     }
@@ -406,8 +492,19 @@ fn tuf_release_uses_canonical_fake_fixture_schema() {
     let main_rs = fs::read_to_string(workspace_root().join("tools/tuf-release/src/main.rs"))
         .expect("read tuf-release main source");
     assert!(
-        main_rs.contains("cockpit_core::updater::FakeFixtureEvidence"),
-        "tuf-release must deserialize canonical FakeFixtureEvidence from cockpit-core"
+        main_rs.contains("cockpit_updater_evidence::FakeFixtureEvidence")
+            || main_rs.contains("cockpit_updater_evidence::{FakeFixtureEvidence"),
+        "tuf-release must deserialize canonical FakeFixtureEvidence from cockpit-updater-evidence"
+    );
+    let tuf_manifest = fs::read_to_string(workspace_root().join("tools/tuf-release/Cargo.toml"))
+        .expect("read tuf-release manifest");
+    assert!(
+        !tuf_manifest.contains("cockpit-core"),
+        "tuf-release must not depend on the request-capable cockpit-core crate"
+    );
+    assert!(
+        tuf_manifest.contains("cockpit-updater-evidence"),
+        "tuf-release must depend only on the evidence schema crate"
     );
     assert!(
         main_rs.contains("validate_fake_fixture_evidence"),

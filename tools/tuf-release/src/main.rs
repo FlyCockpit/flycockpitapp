@@ -7,7 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use cockpit_core::updater::{FakeFixtureEvidence, validate_fake_fixture_evidence};
+use cockpit_updater_evidence::{FakeFixtureEvidence, validate_fake_fixture_evidence};
 
 fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();

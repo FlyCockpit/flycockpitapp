@@ -7222,6 +7222,7 @@ fn model_wizard_tui_advances_through_multitoggle_steps() {
         dialog_id: uuid::Uuid::new_v4(),
         queued_daemon_effect: None,
         pending_operation_id: None,
+        settled_operation_id: None,
     }));
     for expected in [
         "provider",

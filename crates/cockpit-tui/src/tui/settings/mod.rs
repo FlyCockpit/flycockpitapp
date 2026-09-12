@@ -4198,6 +4198,7 @@ impl SettingsCx {
                         layer_id: returned_layer_id,
                         owner_root: returned_owner_root,
                         mutation_intent_hash: returned_intent_hash,
+                        upserted_provider_ids: _,
                         consumed_revision,
                         result_revision,
                         config_generation,
@@ -6164,10 +6165,10 @@ impl Dialog {
         attempt_id: uuid::Uuid,
         stage_revision: u64,
     ) -> Option<cockpit_proto::OnboardingStageSettlement> {
+        let provider_id = self.take_completed_provider_id()?;
         let Dialog::Settings(settings) = self else {
             return None;
         };
-        let provider_id = self.take_completed_provider_id()?;
         let operation_id = settings
             .cx
             .last_provider_mutation_operation_id
@@ -9677,6 +9678,7 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
         dialog_id,
         queued_daemon_effect,
         pending_operation_id,
+        settled_operation_id: _,
     } = wizard;
     if pending_operation_id.is_some() {
         return false;

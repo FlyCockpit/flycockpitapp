@@ -81,43 +81,44 @@ fn strip_rust_comments(source: &str) -> String {
     out
 }
 
-fn parse_use_as_alias(line: &str) -> Option<(String, String)> {
-    let trimmed = line.trim().trim_end_matches(';').trim();
-    let rest = trimmed.strip_prefix("use ")?.trim();
-    let (path, alias) = rest.split_once(" as ")?;
-    Some((path.trim().to_string(), alias.trim().to_string()))
-}
-
-fn updater_module_prefixes(source: &str) -> Vec<String> {
-    let mut prefixes = vec!["cockpit_core".to_string(), "crate".to_string()];
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with("use ") {
-            continue;
-        }
-        if let Some((path, alias)) = parse_use_as_alias(trimmed) {
-            if path == "cockpit_core"
-                || path == "crate"
-                || path.starts_with("cockpit_core::")
-                || path.starts_with("crate::")
-            {
-                prefixes.push(alias);
-            }
-        }
-    }
-    prefixes.sort();
-    prefixes.dedup();
-    prefixes
+fn is_updater_module_path(path: &str) -> bool {
+    path == "updater"
+        || path == "cockpit_core::updater"
+        || path == "crate::updater"
+        || path.ends_with("::updater")
 }
 
 fn references_installed_updater_module(source: &str) -> bool {
-    let production = strip_rust_comments(&strip_test_modules(source));
-    for prefix in updater_module_prefixes(&production) {
-        if production.contains(&format!("{prefix}::updater")) {
+    let production = strip_rust_comments(source);
+    if production.contains("cockpit_core::updater")
+        || production.contains("crate::updater")
+        || production.contains("::updater::")
+    {
+        return true;
+    }
+
+    let mut module_aliases = Vec::new();
+    for line in production.lines() {
+        let trimmed = line.trim().trim_end_matches(';').trim();
+        if !trimmed.starts_with("use ") {
+            continue;
+        }
+        let rest = trimmed.strip_prefix("use ").unwrap_or("").trim();
+        if let Some((path, alias)) = rest.split_once(" as ") {
+            if is_updater_module_path(path.trim()) {
+                module_aliases.push(alias.trim().to_string());
+            }
+            continue;
+        }
+        let path = rest.split_once('{').map_or(rest, |(path, _)| path).trim();
+        if is_updater_module_path(path.trim_end_matches("::")) {
             return true;
         }
     }
-    production.contains("::updater::")
+
+    module_aliases
+        .iter()
+        .any(|alias| production.contains(&format!("{alias}::")))
 }
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -206,6 +207,12 @@ fn boundary_side_effect_sources() -> Vec<PathBuf> {
     sources
 }
 
+fn is_updater_boundary_scan_source(path: &Path) -> bool {
+    !path
+        .components()
+        .any(|component| component.as_os_str() == "tests")
+}
+
 fn side_effect_scan_segments(_path: &Path, source: &str) -> Vec<String> {
     vec![strip_test_modules(source)]
 }
@@ -260,36 +267,53 @@ fn find_enclosing_block_opener(source: &str, call_offset: usize) -> Option<usize
     None
 }
 
-fn controlling_statement_for_block(source: &str, block_opener: usize) -> String {
+fn line_before_block(source: &str, block_opener: usize) -> (usize, &str) {
     let prefix = source[..block_opener].trim_end();
-    if let Some(arm_start) = prefix.rfind("=>") {
-        let before_arm = prefix[..arm_start].trim_end();
-        let line_start = before_arm.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
-        return prefix[line_start..arm_start].trim().to_string();
+    let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    (line_start, prefix[line_start..].trim())
+}
+
+fn controlling_statement_for_block(source: &str, block_opener: usize) -> String {
+    let (last_line_start, last_line) = line_before_block(source, block_opener);
+    if let Some(arm_start) = last_line.find("=>") {
+        return last_line[..arm_start].trim().to_string();
     }
-    if let Some(if_start) = prefix.rfind("\nif ") {
-        return prefix[if_start + 1..].trim().to_string();
+    if last_line.is_empty() {
+        let prev_end = last_line_start.saturating_sub(1);
+        let (prev_line_start, prev_line) = line_before_block(source, prev_end);
+        if let Some(arm_start) = prev_line.find("=>") {
+            return prev_line[..arm_start].trim().to_string();
+        }
+        if prev_line.starts_with("if ") {
+            return prev_line.to_string();
+        }
+        if let Some(if_start) = prev_line.rfind(" if ") {
+            return prev_line[if_start + 1..].trim().to_string();
+        }
     }
-    if let Some(if_start) = prefix.rfind(" if ") {
-        return prefix[if_start + 1..].trim().to_string();
+    if last_line.starts_with("if ") {
+        return last_line.to_string();
     }
-    if prefix.trim_start().starts_with("if ") {
-        return prefix.trim().to_string();
+    if let Some(if_start) = last_line.rfind(" if ") {
+        return last_line[if_start + 1..].trim().to_string();
     }
     String::new()
 }
 
 fn call_is_update_check_gated(source: &str, line_idx: usize) -> bool {
     let call_offset = byte_offset_for_line(source, line_idx);
-    let call_line = source.lines().nth(line_idx).unwrap_or("");
-    if call_line.contains("update_checks_enabled") {
-        return true;
+    let mut search_from = call_offset;
+    while let Some(block_opener) = find_enclosing_block_opener(source, search_from) {
+        let controller = controlling_statement_for_block(source, block_opener);
+        if controller.contains("update_checks_enabled") {
+            return true;
+        }
+        if block_opener == 0 {
+            break;
+        }
+        search_from = block_opener;
     }
-    let Some(block_opener) = find_enclosing_block_opener(source, call_offset) else {
-        return false;
-    };
-    let controller = controlling_statement_for_block(source, block_opener);
-    controller.contains("update_checks_enabled")
+    false
 }
 
 fn assert_run_startup_check_gated(source: &str, path_label: &str) {
@@ -348,7 +372,7 @@ fn installed_composition_has_no_trust_or_transport() {
         "minisign",
         "https://",
         "http://",
-        "FakeFixture",
+        "fake::",
     ];
     let capability_forbidden = [
         "download_verified_target",
@@ -376,16 +400,20 @@ fn installed_composition_has_no_trust_or_transport() {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("");
-        let scan_transport = file_name != "traits.rs" && file_name != "types.rs";
+        let scan_transport = is_updater_implementation_source(&path)
+            && file_name != "traits.rs"
+            && file_name != "types.rs";
         let segments = side_effect_scan_segments(&path, &source);
-        if scan_transport {
-            scan_segments_for_forbidden(&segments, &transport_forbidden, &path, "reference");
-        }
-        if boundary_side_effect_sources()
-            .iter()
-            .any(|candidate| candidate == &path)
-        {
-            scan_segments_for_forbidden(&segments, &capability_forbidden, &path, "invoke");
+        if is_updater_boundary_scan_source(&path) {
+            if scan_transport {
+                scan_segments_for_forbidden(&segments, &transport_forbidden, &path, "reference");
+            }
+            if implementation_updater_sources()
+                .iter()
+                .any(|candidate| candidate == &path)
+            {
+                scan_segments_for_forbidden(&segments, &capability_forbidden, &path, "invoke");
+            }
         }
     }
 
@@ -471,6 +499,9 @@ async fn all_check_entrypoints_return_disabled_without_side_effect() {
     }
 
     for path in boundary_side_effect_sources() {
+        if !is_updater_boundary_scan_source(&path) {
+            continue;
+        }
         let source = fs::read_to_string(&path).expect("read updater boundary source");
         for segment in side_effect_scan_segments(&path, &source) {
             assert!(

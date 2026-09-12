@@ -95,6 +95,10 @@ pub enum Response {
     /// whose effects flow back as events (`SendUserMessage`,
     /// `CancelTurn`, `ResolveInterrupt`, …).
     Ack,
+    OnboardingBootstrapSnapshot(Option<crate::OnboardingBootstrapSnapshot>),
+    LockedBootstrapHello(crate::LockedBootstrapHello),
+    OnboardingTransition(crate::OnboardingTransitionResult),
+    OnboardingTransitionReceipt(Option<crate::OnboardingTransitionReceipt>),
 
     /// Authoritative pre/post-run receipt for CLI dream orchestration. The
     /// source IDs are consent-bound ledger candidates, never transcript data.
@@ -680,6 +684,8 @@ pub enum Response {
         owner_root: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         mutation_intent_hash: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        upserted_provider_ids: Vec<String>,
         consumed_revision: String,
         result_revision: String,
         config_generation: u64,
@@ -1040,6 +1046,7 @@ pub enum Response {
 
     /// Safe outcome of a daemon-owned setup wizard mutation.
     SetupWizardApplied {
+        wizard_id: String,
         changed: bool,
         model_file_written: bool,
         default_scope: Option<String>,
@@ -1642,6 +1649,10 @@ macro_rules! response_variants {
     ($with_variants:ident $(, $context:ident)*) => {
         $with_variants! { ($($context),*) [
             (Response::Ack, "ack");
+            (Response::OnboardingBootstrapSnapshot(..), "onboarding_bootstrap_snapshot");
+            (Response::LockedBootstrapHello(..), "locked_bootstrap_hello");
+            (Response::OnboardingTransition(..), "onboarding_transition");
+            (Response::OnboardingTransitionReceipt(..), "onboarding_transition_receipt");
             (Response::KnowledgeDreamStatus { .. }, "knowledge_dream_status");
             (Response::KnowledgeDreamRuns { .. }, "knowledge_dream_runs");
             (Response::CodeRootCreated(..), "code_root_created");

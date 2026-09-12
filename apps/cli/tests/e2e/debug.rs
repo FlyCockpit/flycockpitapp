@@ -2,7 +2,7 @@ use crate::support::{IsolatedHome, output_text};
 
 #[test]
 fn paths_reports_locations() {
-    let home = IsolatedHome::new();
+    let home = IsolatedHome::new_fresh();
     let home_config = home.config_dir();
     let project_config = home.project_path().join(".cockpit");
     std::fs::create_dir_all(&home_config).unwrap();

@@ -2546,6 +2546,7 @@ pub enum Dialog {
         frame: usize,
         reduced_motion: bool,
     },
+    OnboardingSecureStore(Box<OnboardingSecureStoreDialog>),
     WorkspaceTrust {
         root: cockpit_config::trust::TrustRoot,
         cursor: usize,
@@ -2751,6 +2752,29 @@ pub struct SetupWizardDialog {
     dialog_id: uuid::Uuid,
     queued_daemon_effect: Option<SettingsDaemonEffectRequest>,
     pending_operation_id: Option<uuid::Uuid>,
+    settled_operation_id: Option<uuid::Uuid>,
+}
+
+pub struct OnboardingSecureStoreDialog {
+    capabilities: cockpit_proto::HostCapabilitySnapshot,
+    cursor: usize,
+    phase: SecureStoreInputPhase,
+    passphrase: zeroize::Zeroizing<String>,
+    confirmation: zeroize::Zeroizing<String>,
+    submitted: Option<SecureStoreSubmission>,
+    status: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecureStoreInputPhase {
+    Choice,
+    Passphrase,
+    Confirmation,
+}
+
+pub struct SecureStoreSubmission {
+    pub placement: cockpit_proto::OnboardingSecurePlacement,
+    pub passphrase: Option<cockpit_proto::SensitiveOnboardingPassphrase>,
 }
 
 pub struct SettingsDialog {
@@ -2766,19 +2790,7 @@ fn setup_wizard_dialog(
     descriptor: cockpit_core::wizard::WizardDescriptor,
     status: Option<String>,
 ) -> Result<Dialog, String> {
-    let progress = cockpit_core::welcome::onboarding_wizard_progress(descriptor.id);
-    let run = match progress {
-        Some(progress) => cockpit_core::wizard::WizardRun::resume_from_answers_json(
-            descriptor.clone(),
-            &progress,
-        )
-        .unwrap_or_else(|error| {
-            tracing::warn!(wizard = descriptor.id, %error, "discarding invalid onboarding progress");
-            cockpit_core::wizard::WizardRun::new(descriptor)
-                .expect("validated setup descriptor remains valid")
-        }),
-        None => cockpit_core::wizard::WizardRun::new(descriptor).map_err(|e| e.to_string())?,
-    };
+    let run = cockpit_core::wizard::WizardRun::new(descriptor).map_err(|e| e.to_string())?;
     let mut cursor = 0;
     let mut text = TextField::new("");
     let mut multi = std::collections::BTreeSet::new();
@@ -2809,6 +2821,7 @@ fn setup_wizard_dialog(
         dialog_id: uuid::Uuid::new_v4(),
         queued_daemon_effect: None,
         pending_operation_id: None,
+        settled_operation_id: None,
     })))
 }
 
@@ -3203,6 +3216,8 @@ pub struct SettingsCx {
     /// sidecar editor records it so a terminal rejection can release only its
     /// own busy state.
     last_extended_save_operation_id: Option<String>,
+    last_provider_mutation_operation_id: Option<String>,
+    last_provider_mutation_intent_hash: Option<String>,
     completed_extended_save_rejections: BTreeMap<String, String>,
     completed_extended_save_commits: BTreeSet<String>,
     /// Malformed known extended-config fields reported by the daemon during
@@ -3494,33 +3509,20 @@ impl SettingsCx {
 
     /// Resolve an add-wizard save that the daemon proved did not commit.
     ///
-    /// A first-run add persists a validation continuation before dispatch so
-    /// cancellation cannot lose a committed provider. The opposite is also
-    /// required: once authority rejects the mutation, remove that
-    /// continuation and return the wizard to an editable state rather than
-    /// resuming validation for a provider that does not exist.
+    /// Once authority rejects the mutation, return the wizard to an editable
+    /// state rather than presenting validation for a provider that does not
+    /// exist. Onboarding continuation is settled separately by its daemon
+    /// receipt correlation.
     fn reject_pending_provider_add(&mut self, error: String) {
-        let Some(pending) = self.pending_provider_add.take() else {
+        if self.pending_provider_add.take().is_none() {
             return;
-        };
+        }
 
         // The staged entry was never daemon-owned. Restore the last
         // authoritative snapshot so retrying the add does not see a phantom
         // duplicate provider.
         self.config = self.original_config.clone();
 
-        let error = if pending.onboarding {
-            match cockpit_core::welcome::persist_onboarding_stage(
-                cockpit_core::welcome::OnboardingStage::Provider,
-            ) {
-                Ok(()) => error,
-                Err(clear_error) => format!(
-                    "{error}; could not clear the setup validation continuation: {clear_error}"
-                ),
-            }
-        } else {
-            error
-        };
         self.completed_provider_add = Some(Err(error));
     }
 
@@ -4196,6 +4198,7 @@ impl SettingsCx {
                         layer_id: returned_layer_id,
                         owner_root: returned_owner_root,
                         mutation_intent_hash: returned_intent_hash,
+                        upserted_provider_ids: _,
                         consumed_revision,
                         result_revision,
                         config_generation,
@@ -4225,6 +4228,10 @@ impl SettingsCx {
                             base_revision: result_revision,
                             config_generation,
                         });
+                        self.last_provider_mutation_operation_id =
+                            Some(client_operation_id.clone());
+                        self.last_provider_mutation_intent_hash =
+                            Some(mutation_intent_hash.clone());
                         self.last_secret_notice = notice;
                         self.extended_warnings = vec![if publication
                             == cockpit_proto::ConfigPublicationStatus::Published
@@ -5786,6 +5793,14 @@ impl Dialog {
         add.run
             .return_to("done")
             .expect("provider done step exists");
+        // A completed provider stage is backed by a committed daemon mutation
+        // receipt. Populate that authority evidence along with the visual
+        // completion state so onboarding tests cannot bypass the settlement
+        // contract introduced by the daemon-owned flow.
+        settings.cx.last_provider_mutation_operation_id =
+            Some("test-provider-mutation".to_string());
+        settings.cx.last_provider_mutation_intent_hash = Some("00".repeat(32));
+        settings.cx.config.set_resolution_generation(1);
     }
 
     #[cfg(test)]
@@ -5801,6 +5816,7 @@ impl Dialog {
             .run
             .submit(cockpit_core::wizard::WizardAnswer::Acknowledged)
             .expect("setup completion step accepts acknowledgement");
+        wizard.settled_operation_id = Some(uuid::Uuid::now_v7());
     }
 
     #[cfg(test)]
@@ -5978,6 +5994,27 @@ impl Dialog {
         }
     }
 
+    pub fn open_onboarding_secure_store(
+        capabilities: cockpit_proto::HostCapabilitySnapshot,
+    ) -> Self {
+        Dialog::OnboardingSecureStore(Box::new(OnboardingSecureStoreDialog {
+            capabilities,
+            cursor: 0,
+            phase: SecureStoreInputPhase::Choice,
+            passphrase: zeroize::Zeroizing::new(String::new()),
+            confirmation: zeroize::Zeroizing::new(String::new()),
+            submitted: None,
+            status: None,
+        }))
+    }
+
+    pub fn take_onboarding_secure_store_submission(&mut self) -> Option<SecureStoreSubmission> {
+        match self {
+            Dialog::OnboardingSecureStore(dialog) => dialog.submitted.take(),
+            _ => None,
+        }
+    }
+
     pub fn open_providers_add_with_status(cwd: &std::path::Path, status: Option<String>) -> Self {
         Self::open_providers_add_mode(cwd, status, false)
     }
@@ -6129,6 +6166,71 @@ impl Dialog {
             return add.saved_provider_id.clone();
         }
         None
+    }
+
+    pub fn onboarding_provider_settlement(
+        &mut self,
+        run_id: uuid::Uuid,
+        attempt_id: uuid::Uuid,
+        stage_revision: u64,
+    ) -> Option<cockpit_proto::OnboardingStageSettlement> {
+        let provider_id = self.take_completed_provider_id()?;
+        let Dialog::Settings(settings) = self else {
+            return None;
+        };
+        let operation_id = settings
+            .cx
+            .last_provider_mutation_operation_id
+            .clone()
+            .or_else(|| settings.cx.last_extended_save_operation_id.clone())?;
+        let mutation_intent_hash = settings.cx.last_provider_mutation_intent_hash.clone()?;
+        let config_generation = settings
+            .cx
+            .provider_edit_authority
+            .as_ref()
+            .map(|authority| authority.config_generation)
+            .filter(|generation| *generation > 0)
+            .or_else(|| {
+                (settings.cx.config.resolution_generation > 0)
+                    .then_some(settings.cx.config.resolution_generation)
+            })?;
+        Some(cockpit_proto::OnboardingStageSettlement {
+            run_id,
+            attempt_id,
+            stage_revision,
+            settlement_operation_id: operation_id,
+            provider_id: Some(provider_id),
+            mutation_intent_hash: Some(mutation_intent_hash),
+            wizard_id: None,
+            config_generation,
+        })
+    }
+
+    pub fn onboarding_wizard_settlement(
+        &self,
+        wizard_id: &str,
+        config_generation: u64,
+        run_id: uuid::Uuid,
+        attempt_id: uuid::Uuid,
+        stage_revision: u64,
+    ) -> Option<cockpit_proto::OnboardingStageSettlement> {
+        let Dialog::SetupWizard(wizard) = self else {
+            return None;
+        };
+        if wizard.run.descriptor().id != wizard_id || config_generation == 0 {
+            return None;
+        }
+        let operation_id = wizard.settled_operation_id?.to_string();
+        Some(cockpit_proto::OnboardingStageSettlement {
+            run_id,
+            attempt_id,
+            stage_revision,
+            settlement_operation_id: operation_id,
+            provider_id: None,
+            mutation_intent_hash: None,
+            wizard_id: Some(wizard_id.to_string()),
+            config_generation,
+        })
     }
 
     pub fn setup_wizard_is_complete(&self, wizard_id: &str) -> bool {
@@ -6340,6 +6442,7 @@ impl Dialog {
                 }
                 false
             }
+            Dialog::OnboardingSecureStore(dialog) => handle_secure_store_key(dialog, key),
             Dialog::FirstRunComplete { cursor, choice, .. } => {
                 match list_key_action(key, cursor, 2) {
                     ListAction::Stay => {}
@@ -6494,8 +6597,14 @@ impl Dialog {
     /// pages own text fields; the config pickers are pure list nav, so a
     /// paste there is dropped.
     pub fn paste(&mut self, text: &str) {
-        if let Dialog::Settings(s) = self {
-            s.paste(text);
+        match self {
+            Dialog::Settings(s) => s.paste(text),
+            Dialog::OnboardingSecureStore(dialog) => match dialog.phase {
+                SecureStoreInputPhase::Passphrase => dialog.passphrase.push_str(text),
+                SecureStoreInputPhase::Confirmation => dialog.confirmation.push_str(text),
+                SecureStoreInputPhase::Choice => {}
+            },
+            _ => {}
         }
     }
 
@@ -6739,6 +6848,9 @@ impl Dialog {
                 reduced_motion,
                 ..
             } => render_onboarding_welcome(frame, area, *animation_frame, *reduced_motion),
+            Dialog::OnboardingSecureStore(dialog) => {
+                render_onboarding_secure_store(frame, area, dialog)
+            }
             Dialog::WorkspaceTrust { root, cursor, .. } => {
                 render_workspace_trust(frame, area, root, *cursor)
             }
@@ -7553,6 +7665,8 @@ impl SettingsDialog {
                 extended_base,
                 extended_revision,
                 last_extended_save_operation_id: None,
+                last_provider_mutation_operation_id: None,
+                last_provider_mutation_intent_hash: None,
                 completed_extended_save_rejections: BTreeMap::new(),
                 completed_extended_save_commits: BTreeSet::new(),
                 extended_warnings,
@@ -9573,6 +9687,7 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
         dialog_id,
         queued_daemon_effect,
         pending_operation_id,
+        settled_operation_id: _,
     } = wizard;
     if pending_operation_id.is_some() {
         return false;
@@ -9680,6 +9795,7 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
                     operation_id,
                     target,
                     work: SettingsDaemonEffectWork::Request(Request::ApplySetupWizard {
+                        client_operation_id: operation_id.to_string(),
                         project_root,
                         wizard_id: run.descriptor().id.to_string(),
                         answers_json,
@@ -9802,6 +9918,114 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
     false
 }
 
+fn handle_secure_store_key(dialog: &mut OnboardingSecureStoreDialog, key: KeyEvent) -> bool {
+    match dialog.phase {
+        SecureStoreInputPhase::Choice => match key.code {
+            KeyCode::Up => {
+                dialog.cursor = dialog.cursor.saturating_sub(1);
+                dialog.status = None;
+            }
+            KeyCode::Down => {
+                dialog.cursor = (dialog.cursor + 1).min(2);
+                dialog.status = None;
+            }
+            KeyCode::Esc => return true,
+            KeyCode::Enter => {
+                let (placement, capability_id) = match dialog.cursor {
+                    0 => (
+                        cockpit_proto::OnboardingSecurePlacement::Automatic,
+                        "secret_store.keyring",
+                    ),
+                    1 => (
+                        cockpit_proto::OnboardingSecurePlacement::PassphraseFile,
+                        "secret_store.file",
+                    ),
+                    _ => (
+                        cockpit_proto::OnboardingSecurePlacement::MachineBoundFile,
+                        "secret_store.file",
+                    ),
+                };
+                let Some(capability) = dialog.capabilities.feature(capability_id) else {
+                    dialog.status = Some("Secure-store capability is not ready; retry after the host check completes.".into());
+                    return false;
+                };
+                if !capability.state.is_available() {
+                    dialog.status = Some(
+                        capability
+                            .fix_command
+                            .as_deref()
+                            .or(capability.remedy_text.as_deref())
+                            .unwrap_or(capability.reason.as_str())
+                            .to_string(),
+                    );
+                    return false;
+                }
+                if placement == cockpit_proto::OnboardingSecurePlacement::PassphraseFile {
+                    dialog.phase = SecureStoreInputPhase::Passphrase;
+                } else {
+                    dialog.submitted = Some(SecureStoreSubmission {
+                        placement,
+                        passphrase: None,
+                    });
+                }
+            }
+            _ => {}
+        },
+        SecureStoreInputPhase::Passphrase | SecureStoreInputPhase::Confirmation => match key.code {
+            KeyCode::Esc => {
+                dialog.passphrase.clear();
+                dialog.confirmation.clear();
+                dialog.phase = SecureStoreInputPhase::Choice;
+                dialog.status = None;
+            }
+            KeyCode::Backspace => {
+                let target = if dialog.phase == SecureStoreInputPhase::Passphrase {
+                    &mut dialog.passphrase
+                } else {
+                    &mut dialog.confirmation
+                };
+                target.pop();
+            }
+            KeyCode::Char(ch) => {
+                let ch = crate::tui::textfield::normalize_shift_char(&key, ch);
+                let target = if dialog.phase == SecureStoreInputPhase::Passphrase {
+                    &mut dialog.passphrase
+                } else {
+                    &mut dialog.confirmation
+                };
+                target.push(ch);
+            }
+            KeyCode::Enter if dialog.phase == SecureStoreInputPhase::Passphrase => {
+                if dialog.passphrase.is_empty() {
+                    dialog.status = Some("Passphrase must not be empty.".into());
+                } else {
+                    dialog.phase = SecureStoreInputPhase::Confirmation;
+                    dialog.status = None;
+                }
+            }
+            KeyCode::Enter => {
+                let value = std::mem::take(&mut *dialog.passphrase);
+                let confirmation = std::mem::take(&mut *dialog.confirmation);
+                match cockpit_proto::SensitiveOnboardingPassphrase::confirmed(value, confirmation) {
+                    Ok(passphrase) => {
+                        dialog.submitted = Some(SecureStoreSubmission {
+                            placement: cockpit_proto::OnboardingSecurePlacement::PassphraseFile,
+                            passphrase: Some(passphrase),
+                        });
+                        dialog.status = None;
+                    }
+                    Err(error) => {
+                        dialog.status = Some(error.into());
+                        dialog.phase = SecureStoreInputPhase::Passphrase;
+                    }
+                }
+            }
+            _ => {}
+        },
+    }
+    false
+}
+
 fn apply_setup_wizard_daemon_completion(
     wizard: &mut SetupWizardDialog,
     completion: SettingsDaemonEffectCompletion,
@@ -9812,9 +10036,11 @@ fn apply_setup_wizard_daemon_completion(
     {
         return;
     }
+    wizard.settled_operation_id = wizard.pending_operation_id;
     wizard.pending_operation_id = None;
     let status = match completion.response {
         Ok(Response::SetupWizardApplied {
+            wizard_id: _,
             changed,
             model_file_written,
             default_scope,
@@ -9825,20 +10051,6 @@ fn apply_setup_wizard_daemon_completion(
             {
                 wizard.status = Some(format!(
                     "Daemon saved setup, but could not advance wizard: {error}"
-                ));
-                return;
-            }
-            if matches!(
-                wizard.run.descriptor().id,
-                cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID
-                    | cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID
-                    | cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID
-                    | cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID
-            ) && let Err(error) =
-                cockpit_core::welcome::persist_onboarding_wizard_progress(&wizard.run)
-            {
-                wizard.status = Some(format!(
-                    "Setup was saved, but progress could not be checkpointed: {error}"
                 ));
                 return;
             }
@@ -9906,19 +10118,7 @@ fn submit_setup_wizard_answer(
         status,
     } = state;
     match run.submit(answer) {
-        Ok(()) => {
-            if matches!(
-                run.descriptor().id,
-                cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID
-                    | cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID
-                    | cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID
-                    | cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID
-            ) && let Err(error) = cockpit_core::welcome::persist_onboarding_wizard_progress(run)
-            {
-                *status = Some(format!("Could not save setup progress: {error}"));
-            }
-            sync_setup_wizard_inputs(run, inputs);
-        }
+        Ok(()) => sync_setup_wizard_inputs(run, inputs),
         Err(error) => *status = Some(error),
     }
 }
@@ -10469,6 +10669,81 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
         help_line("↑/↓  space: toggle  t: tier  enter: select/continue  y/n: confirm  esc: close"),
         layout[1],
     );
+}
+
+fn render_onboarding_secure_store(
+    frame: &mut Frame,
+    area: Rect,
+    dialog: &OnboardingSecureStoreDialog,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Secure secret store ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let selected = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let mut lines = vec![
+        Line::from("Choose where Cockpit encrypts credentials before adding a provider."),
+        Line::from(Span::styled(
+            "Automatic means the platform keyring only; a failure requires a new explicit choice.",
+            muted,
+        )),
+        Line::default(),
+    ];
+    match dialog.phase {
+        SecureStoreInputPhase::Choice => {
+            let choices = [
+                ("Platform keyring (recommended)", "No silent file fallback."),
+                (
+                    "Passphrase-protected file",
+                    "You must enter it again after a pre-commit crash.",
+                ),
+                (
+                    "Machine-bound encrypted file",
+                    "Explicit fallback tied to this machine.",
+                ),
+            ];
+            for (index, (label, description)) in choices.into_iter().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::raw(if dialog.cursor == index { "▸ " } else { "  " }),
+                    Span::styled(
+                        label,
+                        if dialog.cursor == index {
+                            selected
+                        } else {
+                            Style::default()
+                        },
+                    ),
+                    Span::raw("  "),
+                    Span::styled(description, muted),
+                ]));
+            }
+        }
+        SecureStoreInputPhase::Passphrase => {
+            lines.push(Line::from("Enter a vault passphrase:"));
+            lines.push(Line::from("•".repeat(dialog.passphrase.chars().count())));
+        }
+        SecureStoreInputPhase::Confirmation => {
+            lines.push(Line::from("Confirm the vault passphrase:"));
+            lines.push(Line::from("•".repeat(dialog.confirmation.chars().count())));
+        }
+    }
+    if let Some(status) = dialog.status.as_deref() {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(status.to_string(), Color::Red)));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
+    let help = match dialog.phase {
+        SecureStoreInputPhase::Choice => "↑/↓  enter: select  esc: cancel",
+        SecureStoreInputPhase::Passphrase | SecureStoreInputPhase::Confirmation => {
+            "enter: continue  esc: choose again"
+        }
+    };
+    frame.render_widget(help_line(help), layout[1]);
 }
 
 fn render_first_run_complete(frame: &mut Frame, area: Rect, summary: &str, cursor: usize) {

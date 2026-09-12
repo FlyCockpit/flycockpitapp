@@ -532,6 +532,7 @@ pub enum AsyncActionPayload {
     GoalSettings(crate::tui::goal_settings_pane::GoalSettingsCompletion),
     Tools(crate::tui::tools_pane::ToolsCompletion),
     WorkspaceTrust(crate::tui::app::WorkspaceTrustCompletion),
+    OnboardingBootstrap(Option<cockpit_proto::OnboardingBootstrapSnapshot>),
     Sealed(crate::tui::app::slash::SealedCompletion),
     SettingsDaemon(crate::tui::settings::SettingsDaemonEffectCompletion),
     SettingsBlocking(crate::tui::settings::SettingsBlockingEffectCompletion),

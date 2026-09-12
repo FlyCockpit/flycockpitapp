@@ -109,6 +109,297 @@ const WORKSPACE_TRUST_STOP_ATTEMPTS: usize = WORKSPACE_TRUST_STOP_BACKOFF.len() 
 pub(crate) static CONFIG_PUBLICATION_RPC_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
+fn onboarding_error(error: anyhow::Error) -> ErrorPayload {
+    let message = error.to_string();
+    let code =
+        if message.contains("revision conflict") || message.contains("reused for a different") {
+            ErrorCode::Conflict
+        } else {
+            ErrorCode::BadRequest
+        };
+    ErrorPayload { code, message }
+}
+
+async fn onboarding_stage_fence(
+    ctx: &DaemonContext,
+) -> std::result::Result<(i64, u64), ErrorPayload> {
+    ctx.db
+        .onboarding_stage_fence()
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| bad_request("no onboarding run exists"))
+}
+
+fn validate_onboarding_settlement_checkpoint(
+    settlement: &proto::OnboardingStageSettlement,
+    run_id: uuid::Uuid,
+    attempt_id: uuid::Uuid,
+    stage_revision: u64,
+) -> std::result::Result<(), ErrorPayload> {
+    if settlement.settlement_operation_id.is_empty()
+        || settlement.settlement_operation_id.len() > 128
+    {
+        return Err(bad_request("invalid onboarding settlement operation id"));
+    }
+    if settlement.run_id != run_id
+        || settlement.attempt_id != attempt_id
+        || settlement.stage_revision != stage_revision
+    {
+        return Err(bad_request(
+            "onboarding settlement does not match the active run checkpoint",
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_settlement_operation_fence(
+    ctx: &DaemonContext,
+    owner: &str,
+    operation_id: &str,
+    stage_entered_at_unix_ms: i64,
+    stage_entry_config_generation: u64,
+    config_generation: u64,
+) -> std::result::Result<(), ErrorPayload> {
+    if config_generation <= stage_entry_config_generation {
+        return Err(bad_request(
+            "onboarding settlement config generation does not advance the stage checkpoint",
+        ));
+    }
+    if config_generation != inventory::current_config_generation() {
+        return Err(bad_request(
+            "onboarding settlement config generation does not match the current authority",
+        ));
+    }
+    let started_at = ctx
+        .db
+        .local_operation_started_at_unix_ms(owner.to_owned(), operation_id.to_owned())
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| {
+            bad_request("onboarding settlement operation is unknown; query exact status")
+        })?;
+    if started_at < stage_entered_at_unix_ms {
+        return Err(bad_request(
+            "onboarding settlement belongs to a superseded checkpoint",
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_terminal_local_operation_settlement(
+    ctx: &DaemonContext,
+    owner: &str,
+    operation_id: &str,
+    expected_kind: &str,
+) -> std::result::Result<
+    (
+        crate::db::local_operation_receipts::LocalOperationIdentity,
+        String,
+    ),
+    ErrorPayload,
+> {
+    let durable = ctx
+        .db
+        .local_operation_settlement(owner.to_owned(), operation_id.to_owned())
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| {
+            bad_request("onboarding settlement operation is unknown; query exact status")
+        })?;
+    match durable {
+        crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(
+            identity,
+            json,
+        ) if identity.operation_kind == expected_kind => Ok((identity, json)),
+        _ => Err(bad_request(
+            "onboarding settlement operation is not terminal; query exact status",
+        )),
+    }
+}
+
+fn onboarding_model_wizard_id(wizard_id: &str) -> bool {
+    wizard_id == crate::wizard::MODEL_WIZARD_ID
+        || wizard_id == crate::wizard::ONBOARDING_MODEL_WIZARD_ID
+}
+
+fn validate_settlement_request_hash(
+    identity: &crate::db::local_operation_receipts::LocalOperationIdentity,
+) -> std::result::Result<(), ErrorPayload> {
+    if identity.request_hash.len() != 32 {
+        return Err(bad_request(
+            "onboarding settlement operation has an invalid request hash",
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_onboarding_stage_settlement(
+    ctx: &DaemonContext,
+    stage: proto::OnboardingStage,
+    settlement: &proto::OnboardingStageSettlement,
+    owner: &str,
+    run_id: uuid::Uuid,
+    attempt_id: uuid::Uuid,
+    stage_revision: u64,
+) -> std::result::Result<(), ErrorPayload> {
+    validate_onboarding_settlement_checkpoint(settlement, run_id, attempt_id, stage_revision)?;
+    let (stage_entered_at_unix_ms, stage_entry_config_generation) =
+        onboarding_stage_fence(ctx).await?;
+    let operation_id = settlement.settlement_operation_id.clone();
+    validate_settlement_operation_fence(
+        ctx,
+        owner,
+        &operation_id,
+        stage_entered_at_unix_ms,
+        stage_entry_config_generation,
+        settlement.config_generation,
+    )
+    .await?;
+    match stage {
+        proto::OnboardingStage::Provider => {
+            let provider_id = settlement
+                .provider_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    bad_request("provider advance requires a settled provider identity")
+                })?;
+            let mutation_intent_hash = settlement
+                .mutation_intent_hash
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    bad_request("provider advance requires a settled mutation intent hash")
+                })?;
+            let (identity, response_json) = validate_terminal_local_operation_settlement(
+                ctx,
+                owner,
+                &operation_id,
+                "apply_provider_mutation",
+            )
+            .await?;
+            validate_settlement_request_hash(&identity)?;
+            let response: Response = serde_json::from_str(&response_json).map_err(internal)?;
+            match response {
+                Response::ProviderMutationCommitted {
+                    client_operation_id,
+                    config_generation,
+                    mutation_intent_hash: committed_intent_hash,
+                    upserted_provider_ids,
+                    status: proto::ConfigCommitStatus::Committed,
+                    ..
+                } if client_operation_id == operation_id
+                    && config_generation == settlement.config_generation
+                    && committed_intent_hash == mutation_intent_hash
+                    && upserted_provider_ids.iter().any(|id| id == provider_id) =>
+                {
+                    Ok(())
+                }
+                _ => Err(bad_request(
+                    "provider onboarding settlement does not match the requested advance",
+                )),
+            }
+        }
+        proto::OnboardingStage::Model => {
+            let wizard_id = settlement
+                .wizard_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    bad_request("model advance requires a settled setup wizard identity")
+                })?;
+            if !onboarding_model_wizard_id(wizard_id) {
+                return Err(bad_request(
+                    "model onboarding settlement references an invalid setup wizard",
+                ));
+            }
+            let (identity, response_json) = validate_terminal_local_operation_settlement(
+                ctx,
+                owner,
+                &operation_id,
+                "apply_setup_wizard",
+            )
+            .await?;
+            validate_settlement_request_hash(&identity)?;
+            let response: Response = serde_json::from_str(&response_json).map_err(internal)?;
+            match response {
+                Response::SetupWizardApplied {
+                    wizard_id: committed_wizard_id,
+                    changed,
+                    model_file_written,
+                    ..
+                } if committed_wizard_id == wizard_id && (changed || model_file_written) => {
+                    let global =
+                        cockpit_config::config::dirs::global_config_file().map_err(internal)?;
+                    let providers = crate::config::providers::ConfigDoc::load(&global)
+                        .map_err(internal)?
+                        .providers();
+                    if providers.active_model.is_some() {
+                        Ok(())
+                    } else {
+                        Err(bad_request(
+                            "model onboarding advance requires a committed default model",
+                        ))
+                    }
+                }
+                _ => Err(bad_request(
+                    "model onboarding settlement does not match the requested advance",
+                )),
+            }
+        }
+        proto::OnboardingStage::Agent => {
+            let wizard_id = settlement
+                .wizard_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    bad_request("agent advance requires a settled setup wizard identity")
+                })?;
+            if wizard_id != crate::wizard::ONBOARDING_AGENT_WIZARD_ID {
+                return Err(bad_request(
+                    "agent onboarding settlement references an invalid setup wizard",
+                ));
+            }
+            let (identity, response_json) = validate_terminal_local_operation_settlement(
+                ctx,
+                owner,
+                &operation_id,
+                "apply_setup_wizard",
+            )
+            .await?;
+            validate_settlement_request_hash(&identity)?;
+            let response: Response = serde_json::from_str(&response_json).map_err(internal)?;
+            match response {
+                Response::SetupWizardApplied {
+                    wizard_id: committed_wizard_id,
+                    changed,
+                    ..
+                } if committed_wizard_id == wizard_id && changed => {
+                    if ctx
+                        .db
+                        .default_agent_installation()
+                        .await
+                        .map_err(internal)?
+                        .is_some()
+                    {
+                        Ok(())
+                    } else {
+                        Err(bad_request(
+                            "agent onboarding advance requires a committed default installation",
+                        ))
+                    }
+                }
+                _ => Err(bad_request(
+                    "agent onboarding settlement does not match the requested advance",
+                )),
+            }
+        }
+        _ => Err(bad_request(
+            "onboarding settlement correlation is only valid for provider, model, or agent advance",
+        )),
+    }
+}
+
 /// An onboarding apply owns only the installation whose UUID is the fresh
 /// inner operation key it minted. Installation may instead return an existing
 /// same-source object; cleanup must never infer ownership from an answer or a
@@ -487,6 +778,10 @@ struct ProviderEditCapability {
     layer_id: String,
     revision: String,
     config_generation: u64,
+    /// Minted while the global configuration directory did not exist. This
+    /// exact capability is the sole provider-write exception for an already
+    /// selected ephemeral owner.
+    create_on_first_write: bool,
     mcp_target_path: std::path::PathBuf,
     mcp_revision: String,
     mcp_scope_targets: std::collections::BTreeMap<String, (std::path::PathBuf, String)>,
@@ -6064,6 +6359,96 @@ async fn handle_serialized_request_impl(
     // oracle that distinguishes requests the principal could never invoke.
     require_compiled_product_domain(&request)?;
     match request {
+        Request::GetOnboardingBootstrapSnapshot => {
+            let capabilities = ctx
+                .host_capabilities
+                .current()
+                .map(|value| value.as_ref().clone())
+                .unwrap_or_else(cockpit_proto::HostCapabilitySnapshot::unpublished);
+            let snapshot = ctx
+                .onboarding
+                .snapshot(capabilities)
+                .await
+                .map_err(internal)?;
+            Ok(Response::OnboardingBootstrapSnapshot(snapshot))
+        }
+        Request::BeginOrReopenOnboarding(request) => {
+            let capabilities = ctx
+                .host_capabilities
+                .current()
+                .map(|value| value.as_ref().clone())
+                .unwrap_or_else(cockpit_proto::HostCapabilitySnapshot::unpublished);
+            let (snapshot, receipt) = ctx
+                .onboarding
+                .begin_or_reopen(request, capabilities)
+                .await
+                .map_err(onboarding_error)?;
+            Ok(Response::OnboardingTransition(
+                cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
+            ))
+        }
+        Request::ApplyOnboardingTransition(request) => {
+            let capabilities = ctx
+                .host_capabilities
+                .current()
+                .map(|value| value.as_ref().clone())
+                .unwrap_or_else(cockpit_proto::HostCapabilitySnapshot::unpublished);
+            let snapshot = ctx
+                .onboarding
+                .snapshot(capabilities.clone())
+                .await
+                .map_err(onboarding_error)?
+                .ok_or_else(|| bad_request("no onboarding run exists"))?;
+            let (snapshot, receipt) = if request.transition
+                == proto::OnboardingTransitionKind::Advance
+                && matches!(
+                    snapshot.stage,
+                    proto::OnboardingStage::Provider
+                        | proto::OnboardingStage::Model
+                        | proto::OnboardingStage::Agent
+                ) {
+                let settlement = request.settlement.as_ref().ok_or_else(|| {
+                    bad_request("onboarding advance requires settlement correlation")
+                })?;
+                validate_onboarding_stage_settlement(
+                    ctx,
+                    snapshot.stage,
+                    settlement,
+                    &settings_capability_owner(state),
+                    request.run_id,
+                    request.attempt_id,
+                    request.expected_revision,
+                )
+                .await?;
+                ctx.onboarding
+                    .apply_settled_advance(request, capabilities)
+                    .await
+                    .map_err(onboarding_error)?
+            } else if request.settlement.is_some() {
+                return Err(bad_request(
+                    "settlement correlation is only valid for provider, model, or agent advance",
+                ));
+            } else {
+                ctx.onboarding
+                    .apply_transition(request, capabilities)
+                    .await
+                    .map_err(onboarding_error)?
+            };
+            Ok(Response::OnboardingTransition(
+                cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
+            ))
+        }
+        Request::GetOnboardingTransitionReceipt(query) => {
+            let receipt = ctx
+                .onboarding
+                .receipt(query)
+                .await
+                .map_err(onboarding_error)?;
+            Ok(Response::OnboardingTransitionReceipt(receipt))
+        }
+        Request::RetryOnboardingReadyConstruction => Err(bad_request(
+            "onboarding ready construction is only valid while bootstrap is locked",
+        )),
         Request::AttachKnowledgeBaseSession {
             knowledge_base_id,
             session_id,
@@ -17524,11 +17909,6 @@ async fn handle_serialized_request_impl(
             mutation_intent_hash,
             mutation,
         } => {
-            if ctx.is_ephemeral_lifetime() {
-                return Err(bad_request(
-                    "ephemeral daemons do not accept provider config writes",
-                ));
-            }
             apply_provider_mutation(
                 ctx,
                 snapshot_session_id,
@@ -17825,12 +18205,34 @@ async fn handle_serialized_request_impl(
         }
 
         Request::ApplySetupWizard {
+            client_operation_id,
             project_root,
             wizard_id,
             answers_json,
         } => {
+            let settlement_owner = settings_capability_owner(state);
+            let request_hash = local_operation_request_hash(&(
+                "apply_setup_wizard",
+                &client_operation_id,
+                &project_root,
+                &wizard_id,
+                &answers_json,
+            ))?;
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &settlement_owner,
+                &client_operation_id,
+                "apply_setup_wizard",
+                request_hash,
+            )
+            .await?
+            {
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
             #[cfg(feature = "remote")]
             let request = Request::ApplySetupWizard {
+                client_operation_id: client_operation_id.clone(),
                 project_root: project_root.clone(),
                 wizard_id: wizard_id.clone(),
                 answers_json: answers_json.clone(),
@@ -18075,7 +18477,7 @@ async fn handle_serialized_request_impl(
                     // later participant fails, compensate both authorities
                     // while the publication gate still excludes other daemon
                     // writers; onboarding must not leave a visible half-plan.
-                    match crate::wizard::persist_onboarding_agent_plan(&prepared.plan) {
+                    match crate::wizard::publish_onboarding_agent_plan(&prepared.plan) {
                         Ok(_) => {}
                         Err(error) => {
                             let compensation = compensate_onboarding_agent_publication(
@@ -18128,6 +18530,7 @@ async fn handle_serialized_request_impl(
                     .await
                     .map_err(internal)?;
                     return Ok(Response::SetupWizardApplied {
+                        wizard_id: wizard_id.clone(),
                         changed: true,
                         model_file_written: true,
                         default_scope: Some("global".into()),
@@ -18141,12 +18544,38 @@ async fn handle_serialized_request_impl(
                 .await
                 .map_err(internal)?;
                 Ok(Response::SetupWizardApplied {
+                    wizard_id: wizard_id.clone(),
                     changed: result.0,
                     model_file_written: result.1,
                     default_scope: result.2,
                 })
             };
-            finish_provider_mutation_future!(remote_operation, ctx, "apply_setup_wizard", mutation)
+            match mutation.await {
+                Ok(response) => {
+                    finish_local_operation(
+                        ctx,
+                        settlement_owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &response,
+                    )
+                    .await?;
+                    Ok(response)
+                }
+                Err(error) => {
+                    finish_local_operation_error(
+                        ctx,
+                        settlement_owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    Err(error)
+                }
+            }
         }
 
         Request::SaveMcpConfig {
@@ -18191,11 +18620,6 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Execute(generation) => generation,
             };
             let operation = async {
-                if ctx.is_ephemeral_lifetime() {
-                    return Err(bad_request(
-                        "ephemeral daemons do not accept MCP config writes",
-                    ));
-                }
                 #[cfg(feature = "remote")]
                 let request = Request::SaveMcpConfig {
                     client_operation_id: client_operation_id.clone(),
@@ -21074,13 +21498,12 @@ fn user_level_trust_policy(
 }
 
 /// Canonicalize a user-level write target without creating directories on
-/// this read path. Ephemeral/diagnostic owners fail closed when the global
-/// layer would have to be created — never a silent capability-less snapshot.
+/// this read path. The returned logical target is later bound into the
+/// snapshot capability; owner lifetime is deliberately irrelevant.
 fn canonical_user_level_write_target(
-    ctx: &DaemonContext,
+    _ctx: &DaemonContext,
     path: &std::path::Path,
 ) -> std::result::Result<std::path::PathBuf, ErrorPayload> {
-    super::refuse_ephemeral_missing_global_layer(ctx.is_ephemeral_lifetime(), path)?;
     canonical_mcp_target_path(path)
 }
 
@@ -21096,14 +21519,19 @@ fn prepare_user_level_write_target(
     Ok(path)
 }
 
-/// Journal replay of a durable user-level target. Refuses ephemeral
-/// creation of the missing global layer, then creates it only for
-/// authorized persistent owners. Does not re-canonicalize a stored path.
+fn is_missing_global_layer_target(path: &std::path::Path) -> bool {
+    cockpit_config::config::dirs::global_config_dir()
+        .is_ok_and(|global| path.starts_with(&global) && !global.exists())
+}
+
+/// Journal replay of a durable user-level target. Creates a missing global
+/// layer only after the journal's capability-bound target has been validated;
+/// owner lifetime is intentionally unchanged. Does not re-canonicalize a
+/// stored path.
 fn prepare_user_level_journal_target(
-    ctx: &DaemonContext,
+    _ctx: &DaemonContext,
     path: &std::path::Path,
 ) -> std::result::Result<(), ErrorPayload> {
-    super::refuse_ephemeral_missing_global_layer(ctx.is_ephemeral_lifetime(), path)?;
     super::ensure_authorized_global_layer(path)
 }
 
@@ -21229,6 +21657,7 @@ async fn provider_catalog_snapshot(
     }
     let mut mcp_scope_revisions = std::collections::BTreeMap::new();
     let minted_edit_capability = if let Some(target_path) = target_path {
+        let create_on_first_write = is_missing_global_layer_target(&target_path);
         let mut capabilities = PROVIDER_EDIT_CAPABILITIES
             .lock()
             .map_err(|_| internal(anyhow::anyhow!("provider capability registry poisoned")))?;
@@ -21254,6 +21683,7 @@ async fn provider_catalog_snapshot(
                 layer_id: layer_id.clone(),
                 revision: revision.clone(),
                 config_generation,
+                create_on_first_write,
                 // An absent MCP layer leaves empty bindings; `save_mcp_config`
                 // then fails its path/revision equality checks, so the
                 // capability cannot be replayed against an MCP target.
@@ -21403,6 +21833,11 @@ async fn apply_provider_mutation(
             inventory::current_config_generation(),
             &observed_revision,
         )?;
+        if ctx.is_ephemeral_lifetime() && !capability.create_on_first_write {
+            return Err(bad_request(
+                "ephemeral daemons accept only a capability-bound global create-on-first-write",
+            ));
+        }
 
         // Validate the entire intent before the first durable side effect. This is
         // also defense in depth for typed in-process callers that bypass decoding.
@@ -21456,6 +21891,7 @@ async fn apply_provider_mutation(
                     layer_id: layer_id.clone(),
                     revision: commit.result_revision.clone(),
                     config_generation: commit.config_generation,
+                    create_on_first_write: false,
                     mcp_target_path: capability.mcp_target_path,
                     mcp_revision: capability.mcp_revision,
                     mcp_scope_targets: capability.mcp_scope_targets,
@@ -21569,6 +22005,9 @@ pub(super) fn register_mcp_edit_capability_for_test(
             layer_id: String::new(),
             revision: String::new(),
             config_generation: 0,
+            create_on_first_write: is_missing_global_layer_target(std::path::Path::new(
+                config_path,
+            )),
             mcp_target_path: std::path::PathBuf::from(config_path),
             mcp_revision: revision.to_string(),
             mcp_scope_targets: std::collections::BTreeMap::new(),
@@ -22608,6 +23047,11 @@ async fn stage_and_recover_provider_batch(
         std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
     let mut credential_claims = Vec::<(String, String)>::new();
     let batch_id = Uuid::now_v7().to_string();
+    let upserted_provider_ids = mutation
+        .upserts
+        .iter()
+        .map(|upsert| upsert.provider_id.clone())
+        .collect::<Vec<_>>();
 
     for mut upsert in mutation.upserts {
         // Secret resolution validates a header against the complete provider
@@ -22741,6 +23185,7 @@ async fn stage_and_recover_provider_batch(
         layer_id: layer_id.to_owned(),
         owner_root: project_root.to_owned(),
         mutation_intent_hash: mutation_intent_hash.to_owned(),
+        upserted_provider_ids,
         consumed_revision: consumed_revision.to_owned(),
         result_revision: result_revision.clone(),
         config_generation,
@@ -24010,6 +24455,7 @@ mod provider_atomic_authority_tests {
             layer_id: "layer".into(),
             revision: "revision".into(),
             config_generation: 7,
+            create_on_first_write: false,
             mcp_target_path: "/project/.cockpit/mcp.json".into(),
             mcp_revision: "mcp-revision".into(),
             mcp_scope_targets: std::collections::BTreeMap::new(),
@@ -25790,6 +26236,11 @@ async fn save_mcp_config(
                 "MCP edit authority does not match the daemon snapshot; reload before retrying"
                     .into(),
         });
+    }
+    if ctx.is_ephemeral_lifetime() && !capability.create_on_first_write {
+        return Err(bad_request(
+            "ephemeral daemons accept only a capability-bound global create-on-first-write",
+        ));
     }
     recover_mcp_config_journals(ctx, project_root).await?;
     let patch: cockpit_proto::McpConfigPatch = serde_json::from_str(patch_json)

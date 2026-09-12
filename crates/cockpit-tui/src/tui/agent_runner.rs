@@ -4087,7 +4087,8 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         } => *session_id,
         // Daemon-global events carry no session_id: they reach every
         // client regardless of attachment.
-        CaffeinateState { .. }
+        OnboardingBootstrap(..)
+        | CaffeinateState { .. }
         | DaemonDraining { .. }
         | DaemonLifetimeChanged { .. }
         | TerminalOutput { .. }
@@ -5172,7 +5173,8 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             proto::WorkspaceTrustReconciliationState::Applied
             | proto::WorkspaceTrustReconciliationState::StopRetrying => return None,
         },
-        InterruptRaised { .. }
+        OnboardingBootstrap(..)
+        | InterruptRaised { .. }
         | EventStreamLagged { .. }
         | SessionEnded { .. }
         | TerminalOutput { .. }

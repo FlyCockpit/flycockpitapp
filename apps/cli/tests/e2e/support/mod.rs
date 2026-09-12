@@ -52,6 +52,17 @@ pub struct IsolatedHome {
 
 impl IsolatedHome {
     pub fn new() -> Self {
+        let home = Self::new_fresh();
+        home.initialize_configured_installation();
+        home
+    }
+
+    /// Create an isolated home with no database or onboarding authority.
+    ///
+    /// Most E2E scenarios model an already configured installation and use
+    /// [`Self::new`]. Diagnostics that prove read-only behavior against a
+    /// genuinely new installation must opt into this state explicitly.
+    pub fn new_fresh() -> Self {
         let root = cockpit_test_support::isolated_tempdir();
         let config_home = root.path().join("config");
         let data_home = root.path().join("data");
@@ -93,6 +104,76 @@ impl IsolatedHome {
             cache_home,
             project,
             extra_env: Vec::new(),
+        }
+    }
+
+    /// Seed the explicit authority owned by legacy E2E profiles that model an
+    /// installation which completed first run before the scenario begins.
+    pub fn initialize_configured_installation(&self) {
+        let cockpit_data_dir = self.data_home.join("cockpit");
+        std::fs::create_dir_all(&cockpit_data_dir).expect("create isolated cockpit data dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&cockpit_data_dir, std::fs::Permissions::from_mode(0o700))
+                .expect("restrict isolated cockpit data dir");
+        }
+        // A configured installation is the result of daemon boot. Seed it
+        // through the same exclusive opener so the persistent ownership-lock
+        // artifact and the SQLite ledger cannot disagree about whether boot
+        // has completed.
+        let db = cockpit_db::Db::open_daemon_owned(&cockpit_data_dir.join("cockpit.db"))
+            .expect("open isolated daemon-owned database");
+        let kek_dir = cockpit_core::secure_key::kek_dir_for_db(&db)
+            .expect("resolve isolated vault directory");
+        db.configure_secret_vault_dir(kek_dir.clone())
+            .expect("configure isolated vault directory");
+        cockpit_core::secure_key::ensure_secret_vault_with_options(
+            &db,
+            &cockpit_core::secure_key::test_missing_keyring_probe(),
+            &kek_dir,
+            cockpit_core::secure_key::SecretStoreInjected::default(),
+            cockpit_core::secure_key::SecretVaultOpenOptions {
+                first_run_intent:
+                    cockpit_core::secure_key::FirstRunSecretStoreIntent::FileMachineBound,
+                passphrase: None,
+            },
+        )
+        .expect("initialize isolated machine-bound vault authority");
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build onboarding fixture runtime");
+            runtime.block_on(async move {
+                let (snapshot, _) = db
+                    .onboarding_begin_or_reopen(None, "fixture-begin".into(), false)
+                    .await
+                    .expect("begin configured-installation onboarding fixture");
+                db.onboarding_transition(
+                    snapshot,
+                    "fixture-complete".into(),
+                    cockpit_db::db::onboarding::OnboardingStage::Complete,
+                    cockpit_db::db::onboarding::OnboardingBootstrapState::Ready,
+                    false,
+                    Some(cockpit_db::db::onboarding::OnboardingSecurePlacement::MachineBoundFile),
+                    1,
+                )
+                .await
+                .expect("complete configured-installation onboarding fixture");
+            });
+        })
+        .join()
+        .expect("configured-installation fixture thread panicked");
+    }
+
+    /// Restore the genuinely fresh pre-ledger state needed by the one
+    /// sandboxed-doctor acceptance path; that path re-seeds before daemon use.
+    pub fn clear_configured_installation(&self) {
+        let cockpit_data_dir = self.data_home.join("cockpit");
+        if cockpit_data_dir.exists() {
+            std::fs::remove_dir_all(&cockpit_data_dir)
+                .expect("clear isolated configured-installation fixture");
         }
     }
 
@@ -413,7 +494,7 @@ impl SpawnedDaemon {
         let had_owned_child = self.process.has_current();
         let grace = grace_secs.to_string();
         let mut command = self.home.cockpit();
-        let mut command_child = command
+        let command_child = command
             .args(["daemon", "restart", "--grace", &grace])
             .env("COCKPIT_LOG", "warn,cockpit::startup=info")
             .stdout(std::process::Stdio::piped())
@@ -421,13 +502,10 @@ impl SpawnedDaemon {
             .spawn()
             .expect("daemon restart command");
 
-        let owned_child_exited = self
+        let (output, owned_child_exited) = self
             .process
-            .reap_while_command_runs(&mut command_child)
+            .run_command_while_reaping(command_child)
             .expect("coordinate daemon restart with exact child");
-        let output = command_child
-            .wait_with_output()
-            .expect("wait for daemon restart command");
         assert!(
             !had_owned_child || owned_child_exited,
             "daemon restart command exited before its owned daemon (socket reachable: {socket_reachable}); stdout:\n{}\nstderr:\n{}\nlog tail:\n{}",
@@ -478,29 +556,24 @@ impl SpawnedDaemon {
     fn stop_via_command_with_socket(&self, grace_secs: u64, socket_reachable: bool) -> Output {
         let grace = grace_secs.to_string();
         let mut command = self.home.cockpit();
-        let mut command_child = command
+        let command_child = command
             .args(["daemon", "stop", "--grace", &grace])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("daemon stop command");
-        let owned_child_exited = self
+        let (output, owned_child_exited) = self
             .process
-            .reap_while_command_runs(&mut command_child)
+            .run_command_while_reaping(command_child)
             .expect("coordinate daemon stop with exact child");
-        command_child
-            .wait_with_output()
-            .map(|output| {
-                assert!(
-                    owned_child_exited,
-                    "daemon stop command exited before its owned daemon (socket reachable: {socket_reachable}); stdout:\n{}\nstderr:\n{}\nlog tail:\n{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr),
-                    log_tail(&self.home)
-                );
-                output
-            })
-            .expect("wait for daemon stop command")
+        assert!(
+            owned_child_exited,
+            "daemon stop command exited before its owned daemon (socket reachable: {socket_reachable}); stdout:\n{}\nstderr:\n{}\nlog tail:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            log_tail(&self.home)
+        );
+        output
     }
 
     pub fn command(&self) -> Command {
@@ -1113,21 +1186,30 @@ impl EphemeralDaemonGuard {
             .is_some()
     }
 
-    fn reap_while_command_runs(&self, command: &mut std::process::Child) -> std::io::Result<bool> {
-        if !command.wait()?.success() {
-            self.reap_current();
-            return Ok(false);
-        }
+    fn run_command_while_reaping(
+        &self,
+        command: std::process::Child,
+    ) -> std::io::Result<(std::process::Output, bool)> {
         let Some(mut child) = self
             .child
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take()
         else {
-            return Ok(false);
+            return command.wait_with_output().map(|output| (output, false));
         };
-        child.wait()?;
-        Ok(true)
+        std::thread::scope(|scope| {
+            // The lifecycle command waits for the old process identity to be
+            // released before it returns. Because this harness is the exact
+            // foreground child's parent, it must reap that child concurrently
+            // or the exited child remains a zombie and release cannot finish.
+            let command_wait = scope.spawn(move || command.wait_with_output());
+            let child_status = child.wait();
+            let output = command_wait
+                .join()
+                .expect("daemon lifecycle command waiter panicked")?;
+            child_status.map(|_| (output, true))
+        })
     }
 }
 

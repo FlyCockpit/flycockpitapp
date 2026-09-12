@@ -144,6 +144,7 @@ impl App {
         self.rich_text_copy = tui_cfg.rich_text_copy;
         self.sticky_user_message = tui_cfg.sticky_user_message;
         self.clipboard_recovery = tui_cfg.clipboard_recovery;
+        self.schedule_startup_clipboard_reconciliation();
         self.use_emojis = tui_cfg.use_emojis;
         self.file_icons = crate::tui::file_icons::file_icons_resolved(tui_cfg.file_icons);
         // Attention notification settings (implementation note):
@@ -171,5 +172,37 @@ impl App {
             // Mode stays whatever the composer was in; if vim flipped
             // off the composer will treat further input as Insert.
         }
+    }
+
+    /// Reconcile private clipboard recovery files only after a daemon-backed
+    /// configuration snapshot has permitted that mode.  The safe shell starts
+    /// with the built-in `Off` default, so neither construction nor first
+    /// paint can inspect or create the recovery directory.
+    fn schedule_startup_clipboard_reconciliation(&mut self) {
+        if !self.first_paint_completed
+            || self.exit_requested
+            || self.clipboard_recovery != cockpit_config::extended::ClipboardRecovery::PrivateFile
+        {
+            return;
+        }
+
+        let generation = self.startup_background.generation;
+        self.async_actions.start_blocking(
+            crate::tui::async_action::AsyncActionKind::Internal("startup.clipboard_reconcile"),
+            crate::tui::async_action::AsyncActionPolicy::Dedupe(
+                crate::tui::async_action::AsyncActionKey::new("startup.clipboard_reconcile"),
+            ),
+            move || {
+                let dir = crate::clipboard::recovery::recovery_dir_path()
+                    .map_err(|error| error.to_string())?;
+                crate::clipboard::recovery::reconcile_startup(&dir)
+                    .map(|_| crate::tui::async_action::AsyncActionPayload::Unit)
+                    .map_err(|error| error.to_string())
+            },
+        );
+        tracing::info!(
+            startup_generation = generation,
+            "startup clipboard-reconcile-scheduled"
+        );
     }
 }

@@ -929,7 +929,10 @@ impl App {
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    tracing::warn!(error = %error, "startup lifetime-policy-error");
+                    // The launch trace is a machine-readable ordering aid;
+                    // it must not leak a configuration path through an I/O
+                    // error. The visible retryable toast retains detail.
+                    tracing::warn!("startup lifetime-policy-error");
                     self.startup_background.started = false;
                     self.show_toast(
                         "Could not read daemon lifetime policy; retry startup",
@@ -1013,19 +1016,41 @@ impl App {
                     self.apply_workspace_trust_completion(completion);
                 }
             }
-            AsyncActionKind::DaemonRpc(
-                "onboarding.bootstrap"
-                | "onboarding.transition"
-                | "onboarding.secure_intent"
-                | "onboarding.ready_retry",
-            ) => match result.payload {
-                Ok(AsyncActionPayload::OnboardingBootstrap(snapshot)) => {
+            AsyncActionKind::DaemonRpc("onboarding.bootstrap") => match result.payload {
+                Ok(AsyncActionPayload::StartupOnboardingBootstrap { snapshot, endpoint }) => {
+                    if self.exit_requested {
+                        return false;
+                    }
+                    self.startup_lifecycle_endpoint = Some(endpoint);
+                    tracing::info!("startup onboarding-ready");
                     self.apply_onboarding_bootstrap_snapshot(snapshot);
                 }
-                Err(error) => self.show_toast(
-                    format!("Onboarding authority unavailable: {error}"),
+                Err(error) => {
+                    tracing::warn!("startup onboarding-error");
+                    self.show_toast(
+                        format!("Onboarding authority unavailable: {error}"),
+                        crate::tui::app::ToastKind::Error,
+                    );
+                }
+                Ok(_) => self.show_toast(
+                    "Onboarding authority returned an invalid projection",
                     crate::tui::app::ToastKind::Error,
                 ),
+            },
+            AsyncActionKind::DaemonRpc(
+                "onboarding.transition" | "onboarding.secure_intent" | "onboarding.ready_retry",
+            ) => match result.payload {
+                Ok(AsyncActionPayload::OnboardingBootstrap(snapshot)) => {
+                    tracing::info!("startup onboarding-ready");
+                    self.apply_onboarding_bootstrap_snapshot(snapshot);
+                }
+                Err(error) => {
+                    tracing::warn!("startup onboarding-error");
+                    self.show_toast(
+                        format!("Onboarding authority unavailable: {error}"),
+                        crate::tui::app::ToastKind::Error,
+                    );
+                }
                 Ok(_) => self.show_toast(
                     "Onboarding authority returned an invalid projection",
                     crate::tui::app::ToastKind::Error,
@@ -1036,7 +1061,7 @@ impl App {
                     self.apply_startup_workspace_completion(completion);
                 }
                 Err(error) => {
-                    tracing::warn!(error = %error, "startup trust-error");
+                    tracing::warn!("startup trust-error");
                     self.show_toast(
                         format!("Workspace trust could not be resolved: {error}"),
                         crate::tui::app::ToastKind::Error,

@@ -1829,6 +1829,10 @@ pub struct App {
     /// Parsed launch intent only. Its file path is activated after the
     /// accepted workspace phase, never by the safe shell constructor.
     startup_debug_last_message: bool,
+    /// Endpoint returned by the one selected lifecycle request.  It is used
+    /// for the initial trust RPC so startup never issues a second lifecycle
+    /// request merely to reconnect to the same owner.
+    startup_lifecycle_endpoint: Option<cockpit_client::ClientEndpoint>,
     /// Daemon-pushed config the TUI renders from; see [`HeldConfig`].
     pub(super) config_snapshot: HeldConfig,
     pending_workspace_trust: Option<PendingWorkspaceTrust>,
@@ -3714,6 +3718,7 @@ impl App {
             launch,
             startup_assistant_name: None,
             startup_debug_last_message: false,
+            startup_lifecycle_endpoint: None,
             config_snapshot,
             pending_workspace_trust: None,
             pending_sealed_operations: HashMap::new(),
@@ -4051,6 +4056,7 @@ impl App {
         // Resolving/opening workspace trust belongs to the post-paint
         // startup reducer. The safe shell may not inspect its root.
         let _ = startup_trust;
+        tracing::info!(target: cockpit_core::startup::TARGET, "startup shell-constructed");
         app
     }
 
@@ -4221,6 +4227,7 @@ impl App {
                 terminal.draw(|frame| self.render(frame))?;
                 self.startup_first_paint_timing.log_after_draw();
                 self.first_paint_completed = true;
+                tracing::info!(target: cockpit_core::startup::TARGET, "startup input-ready");
                 crate::tui::links::emit_osc8(&self.link_registry, self.hyperlinks)?;
                 self.sync_cursor_shape();
             }

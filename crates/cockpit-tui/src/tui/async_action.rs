@@ -161,6 +161,14 @@ impl AsyncActionKind {
                 // remains fenced, exactly like a newly added production label.
                 _ => Unclassified,
             },
+            Self::Internal(label) => match *label {
+                // Startup recovery is explicitly cancellable.  If a blocking
+                // worker has already crossed into the secure unlink it may
+                // finish, but process exit must not wait for or resurrect its
+                // completion.
+                "startup.clipboard_reconcile" | "startup.export_recovery" => ReadOnly,
+                _ => Unclassified,
+            },
             Self::DaemonRpc(label) => match *label {
                 "guidance.estimate"
                 | "git.diff"
@@ -541,6 +549,14 @@ pub enum AsyncActionPayload {
     Tools(crate::tui::tools_pane::ToolsCompletion),
     WorkspaceTrust(crate::tui::app::WorkspaceTrustCompletion),
     OnboardingBootstrap(Option<cockpit_proto::OnboardingBootstrapSnapshot>),
+    /// The initial post-paint bootstrap carries the already-selected daemon
+    /// endpoint forward to the trust reducer.  Reusing it is what keeps
+    /// startup to one lifecycle request rather than accidentally resolving a
+    /// second owner while asking for workspace trust.
+    StartupOnboardingBootstrap {
+        snapshot: Option<cockpit_proto::OnboardingBootstrapSnapshot>,
+        endpoint: cockpit_client::ClientEndpoint,
+    },
     StartupLifetimePolicy {
         generation: u64,
         background_agents: bool,

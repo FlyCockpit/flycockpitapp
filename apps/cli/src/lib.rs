@@ -1098,7 +1098,7 @@ fn init_tracing(
     print_logs: bool,
     drain_logs_on_exit: bool,
     safe_interactive_shell: bool,
-) -> Option<LogWorkerGuard> {
+) -> Option<TracingGuard> {
     use tracing_subscriber::{EnvFilter, fmt};
 
     let filter = match level {
@@ -1107,14 +1107,20 @@ fn init_tracing(
     };
 
     // The interactive shell has not painted yet. Do not open a rotating file
-    // or write stderr into the alternate-screen handoff before it does.
-    // Daemon/session tracing takes over after the shell attaches.
+    // or write stderr into the alternate-screen handoff before it does. Keep
+    // a bounded sequence of formatted trace records and flush it only when
+    // the TUI has restored the terminal on return.
     if safe_interactive_shell {
+        let log = DeferredInteractiveLog::default();
         fmt()
             .with_env_filter(filter)
-            .with_writer(std::io::sink)
+            .with_ansi(false)
+            .with_writer(log.clone())
             .init();
-        return None;
+        return Some(TracingGuard::Deferred(DeferredInteractiveLogGuard {
+            log,
+            print_logs,
+        }));
     }
 
     if print_logs {
@@ -1137,7 +1143,7 @@ fn init_tracing(
                 .with_ansi(false)
                 .with_writer(writer)
                 .init();
-            Some(guard)
+            Some(TracingGuard::Worker(guard))
         }
         None => {
             fmt()
@@ -1146,6 +1152,125 @@ fn init_tracing(
                 .init();
             None
         }
+    }
+}
+
+/// Owns the installed tracing sink for a command.  Interactive sessions use
+/// the deferred variant so construction can record the first-paint sequence
+/// without opening a cache path or contaminating the alternate screen.
+enum TracingGuard {
+    Worker(LogWorkerGuard),
+    Deferred(DeferredInteractiveLogGuard),
+}
+
+/// The early interactive sink is intentionally small and record-oriented:
+/// whole formatted records are retained in arrival order, while the oldest
+/// complete records are evicted under pressure.  It never opens a file.
+#[derive(Clone, Default)]
+struct DeferredInteractiveLog {
+    records: Arc<Mutex<DeferredInteractiveLogState>>,
+}
+
+#[derive(Default)]
+struct DeferredInteractiveLogState {
+    records: std::collections::VecDeque<Vec<u8>>,
+    bytes: usize,
+}
+
+const DEFERRED_INTERACTIVE_LOG_CAPACITY: usize = 256 * 1024;
+
+struct DeferredInteractiveLogWriter {
+    log: DeferredInteractiveLog,
+    bytes: Vec<u8>,
+}
+
+impl DeferredInteractiveLog {
+    fn records(&self) -> Vec<Vec<u8>> {
+        self.records
+            .lock()
+            .expect("deferred interactive log mutex poisoned")
+            .records
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    fn push_record(&self, bytes: Vec<u8>) {
+        if bytes.is_empty() || bytes.len() > DEFERRED_INTERACTIVE_LOG_CAPACITY {
+            return;
+        }
+        let mut state = self
+            .records
+            .lock()
+            .expect("deferred interactive log mutex poisoned");
+        while state.bytes + bytes.len() > DEFERRED_INTERACTIVE_LOG_CAPACITY {
+            let Some(removed) = state.records.pop_front() else {
+                break;
+            };
+            state.bytes -= removed.len();
+        }
+        state.bytes += bytes.len();
+        state.records.push_back(bytes);
+    }
+}
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for DeferredInteractiveLog {
+    type Writer = DeferredInteractiveLogWriter;
+
+    fn make_writer(&self) -> Self::Writer {
+        DeferredInteractiveLogWriter {
+            log: self.clone(),
+            bytes: Vec::new(),
+        }
+    }
+}
+
+impl Write for DeferredInteractiveLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for DeferredInteractiveLogWriter {
+    fn drop(&mut self) {
+        self.log.push_record(std::mem::take(&mut self.bytes));
+    }
+}
+
+/// Drops after `App::run` has cleaned up the alternate screen.  This is the
+/// sole place interactive startup records acquire an external sink.
+struct DeferredInteractiveLogGuard {
+    log: DeferredInteractiveLog,
+    print_logs: bool,
+}
+
+impl Drop for DeferredInteractiveLogGuard {
+    fn drop(&mut self) {
+        let records = self.log.records();
+        if self.print_logs {
+            let mut stderr = std::io::stderr().lock();
+            for record in records {
+                let _ = stderr.write_all(&record);
+            }
+            let _ = stderr.flush();
+            return;
+        }
+        let Some(log_dir) = dirs::cache_dir().map(|dir| dir.join("cockpit")) else {
+            return;
+        };
+        let Some(log) = open_log_file_at(log_dir) else {
+            return;
+        };
+        let mut writer = tracing_subscriber::fmt::MakeWriter::make_writer(&log);
+        for record in records {
+            let _ = writer.write_all(&record);
+        }
+        let _ = writer.flush();
     }
 }
 
@@ -1465,6 +1590,35 @@ mod production_path_ratchet;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_interactive_log_retains_complete_records_in_order() {
+        let log = DeferredInteractiveLog::default();
+        let mut first = tracing_subscriber::fmt::MakeWriter::make_writer(&log);
+        first.write_all(b"shell-constructed\n").unwrap();
+        drop(first);
+        let mut second = tracing_subscriber::fmt::MakeWriter::make_writer(&log);
+        second.write_all(b"first-paint\n").unwrap();
+        drop(second);
+
+        assert_eq!(
+            log.records(),
+            vec![b"shell-constructed\n".to_vec(), b"first-paint\n".to_vec()]
+        );
+    }
+
+    #[test]
+    fn deferred_interactive_log_evicts_whole_oldest_records() {
+        let log = DeferredInteractiveLog::default();
+        log.push_record(vec![b'a'; DEFERRED_INTERACTIVE_LOG_CAPACITY / 2]);
+        log.push_record(vec![b'b'; DEFERRED_INTERACTIVE_LOG_CAPACITY / 2]);
+        log.push_record(vec![b'c'; 1]);
+
+        let records = log.records();
+        assert_eq!(records.len(), 2);
+        assert!(records[0].iter().all(|byte| *byte == b'b'));
+        assert_eq!(records[1], b"c");
+    }
 
     #[test]
     fn lib_trust_policy_does_not_open_db() {

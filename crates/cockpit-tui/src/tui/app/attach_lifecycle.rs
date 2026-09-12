@@ -365,6 +365,7 @@ impl App {
     pub(super) fn adopt_runner(&mut self, runner: Result<AgentRunner, String>) {
         let mut runner = runner;
         if let Ok(r) = &mut runner {
+            tracing::info!("startup session-ready");
             // The daemon, not the CLI parser, is authoritative after Attach.
             self.session_mode = Some(r.session_entry_mode);
             self.start_model_state_epoch(Some(r.session_id()), r.active_model_state.as_ref());
@@ -421,6 +422,9 @@ impl App {
             if let Some(offer) = resume_compaction_offer {
                 self.arm_resume_compaction_confirm(offer);
             }
+        }
+        if runner.is_err() {
+            tracing::warn!("startup session-error");
         }
         let refresh_skills = runner.is_ok();
         let attach_ids = runner.as_ref().ok().map(|r| {

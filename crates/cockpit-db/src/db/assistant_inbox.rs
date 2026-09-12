@@ -627,15 +627,10 @@ mod tests {
                 .all(|item| item.human_read_at_unix_ms.is_none())
         );
         let unread_after_delivery = db
-            .list_session_summaries(crate::db::sessions::SessionListQuery::project(
-                Some("project"),
-                10,
-            ))
+            .session_summary(main.session_id)
             .await
             .unwrap()
-            .into_iter()
-            .find(|summary| summary.session_id == main.session_id)
-            .unwrap()
+            .expect("main session summary")
             .assistant_inbox_unread;
         assert_eq!(unread_after_delivery, 2);
 
@@ -658,15 +653,10 @@ mod tests {
             item.inbox_item_id == notify.inbox_item_id && item.delivered_at_unix_ms.is_none()
         }));
         let unread_after_human_read = db
-            .list_session_summaries(crate::db::sessions::SessionListQuery::project(
-                Some("project"),
-                10,
-            ))
+            .session_summary(main.session_id)
             .await
             .unwrap()
-            .into_iter()
-            .find(|summary| summary.session_id == main.session_id)
-            .unwrap()
+            .expect("main session summary")
             .assistant_inbox_unread;
         assert_eq!(unread_after_human_read, 0);
     }

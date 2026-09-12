@@ -5546,16 +5546,13 @@ mod tests {
             .running_work_clean;
 
         assert!(!clean);
-        let summaries = reg
+        let summary = reg
             .inner
             .db
-            .list_session_summaries(crate::db::sessions::SessionListQuery::default())
+            .session_summary(id)
             .await
-            .unwrap();
-        let summary = summaries
-            .iter()
-            .find(|summary| summary.session_id == id)
-            .unwrap();
+            .unwrap()
+            .expect("drained session summary");
         assert_eq!(
             summary.activity_state,
             Some(crate::daemon::proto::SessionActivityState::Interrupted)
@@ -5657,16 +5654,13 @@ mod tests {
             .running_work_clean;
 
         assert!(!clean);
-        let summaries = reg
+        let summary = reg
             .inner
             .db
-            .list_session_summaries(crate::db::sessions::SessionListQuery::default())
+            .session_summary(id)
             .await
-            .unwrap();
-        let summary = summaries
-            .iter()
-            .find(|summary| summary.session_id == id)
-            .unwrap();
+            .unwrap()
+            .expect("drained session summary");
         assert_eq!(summary.activity_state, None);
         let events = reg.inner.db.list_session_events(id).await.unwrap();
         assert!(events.iter().all(|event| event.kind != "turn_interrupted"));

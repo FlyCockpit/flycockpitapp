@@ -734,6 +734,11 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "set_session_favorite",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "fork_session",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -1806,6 +1811,11 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
         "sessions",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "session_favorite_applied",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
     ),
     row(
         "session_messages",
@@ -3492,13 +3502,13 @@ mod tests {
 
         // Exact table sizes, so a silent shrink is caught.
         #[cfg(feature = "extended")]
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 289);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 290);
         #[cfg(not(feature = "extended"))]
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 266);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 267);
         #[cfg(feature = "extended")]
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 202);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 203);
         #[cfg(not(feature = "extended"))]
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 194);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 195);
         #[cfg(feature = "extended")]
         assert_eq!(EVENT_CLASSIFICATION.len(), 88);
         #[cfg(not(feature = "extended"))]

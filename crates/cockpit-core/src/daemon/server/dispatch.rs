@@ -9893,16 +9893,7 @@ async fn handle_serialized_request_impl(
                                 (row, true)
                             }
                         };
-                    let summary = crate::db::Db::list_session_summaries_conn(
-                        conn,
-                        &crate::db::sessions::SessionListQuery::project(
-                            Some(&row.project_id),
-                            100,
-                        ),
-                    )?
-                    .into_iter()
-                    .find(|summary| summary.session_id == row.session_id)
-                    .ok_or_else(|| anyhow::anyhow!("resolved assistant session is unavailable"))?;
+                    let summary = crate::db::Db::session_summary_from_row_conn(conn, row)?;
                     Ok((summary, created))
                 })
                 .await

@@ -4539,6 +4539,11 @@ impl Db {
     /// method — callers attach them separately. A per-row auxiliary-query miss
     /// degrades that field to its empty default rather than failing the whole
     /// list, matching the daemon handler's best-effort behavior.
+    ///
+    /// This is a navigation projection. Callers that already have a known
+    /// `session_id` must use [`Self::session_summary`] /
+    /// [`Self::session_summary_conn`] / [`Self::session_summary_from_row_conn`]
+    /// rather than scanning this capped favorite-first result.
     pub async fn list_session_summaries(
         &self,
         query: SessionListQuery,
@@ -4660,6 +4665,126 @@ impl Db {
         })
     }
 
+    /// Project one known session as a [`crate::db::wire::SessionSummary`].
+    ///
+    /// Unlike [`Self::list_session_summaries_conn`], this is not a navigation
+    /// query: it ignores favorite grouping, durable ordering, and the card
+    /// cap. Callers that already hold the row should use
+    /// [`Self::session_summary_from_row_conn`] so they cannot miss it.
+    pub async fn session_summary(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<crate::db::wire::SessionSummary>> {
+        self.read(move |conn| Self::session_summary_conn(conn, session_id))
+            .await
+    }
+
+    pub fn session_summary_conn(
+        conn: &Connection,
+        session_id: Uuid,
+    ) -> Result<Option<crate::db::wire::SessionSummary>> {
+        let Some(row) = get_session_inner(conn, session_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self::session_summary_from_row_conn(conn, row)?))
+    }
+
+    pub fn session_summary_from_row_conn(
+        conn: &Connection,
+        row: SessionRow,
+    ) -> Result<crate::db::wire::SessionSummary> {
+        let lineage_root = row.compaction_lineage_root();
+        let favorite = Self::resolved_root_favorite_conn(conn, &row)?;
+        let fork_count = summary_count_or_zero(
+            lineage_root,
+            "fork_count",
+            Self::count_forks_for_conn(conn, lineage_root),
+        );
+        // Full subtree descendant count for the archive/delete cascade
+        // statement (GOALS §17h) — direct forks plus their descendants
+        // plus other windows in this compaction lineage.
+        let descendant_count = summary_count_or_zero(
+            row.session_id,
+            "descendant_count",
+            Self::count_descendants_conn(conn, row.session_id),
+        );
+        let lineage_window_count = summary_count_or_zero(
+            lineage_root,
+            "lineage_window_count",
+            Self::count_lineage_windows_conn(conn, lineage_root),
+        );
+        // Read/unread + pending-question inputs for the browser's tiers
+        // 3-4 (GOALS §17f). Best-effort: a query miss degrades to "no
+        // activity / no open question" rather than failing the list.
+        let latest_activity_at = summary_latest_activity_or_none(
+            row.session_id,
+            Self::latest_agent_activity_at_conn(conn, row.session_id),
+        );
+        let open_interrupts = summary_open_interrupt_count_or_zero(
+            row.session_id,
+            Self::open_interrupt_count_conn(conn, row.session_id),
+        );
+        let activity_state = summary_activity_state_or_none(
+            row.session_id,
+            Self::interrupt_activity_state_conn(conn, row.session_id),
+        );
+        // Pinned-message count (`pinned-messages`) for the browser's
+        // per-session pin chrome. Best-effort: a query miss reads as 0.
+        let pin_count =
+            summary_pin_count_or_zero(row.session_id, Self::pin_count_conn(conn, row.session_id));
+        let (assistant_inbox_unread, assistant_inbox_latest_source_session_id) = conn
+            .query_row(
+                "SELECT COUNT(*),
+                        (SELECT raising_session_id FROM assistant_inbox_items newest
+                          WHERE newest.main_session_id = ?1
+                            AND newest.human_read_at_unix_ms IS NULL
+                          ORDER BY newest.created_at_unix_ms DESC,
+                                   newest.inbox_item_id DESC LIMIT 1)
+                   FROM assistant_inbox_items
+                  WHERE main_session_id = ?1 AND human_read_at_unix_ms IS NULL",
+                [row.session_id.to_string()],
+                |record| {
+                    let count: i64 = record.get(0)?;
+                    let source: Option<String> = record.get(1)?;
+                    Ok((count.max(0).min(u32::MAX as i64) as u32, source))
+                },
+            )
+            .map(|(count, source)| (count, source.and_then(|value| Uuid::parse_str(&value).ok())))
+            .unwrap_or((0, None));
+        Ok(crate::db::wire::SessionSummary {
+            session_id: row.session_id,
+            session_entry_mode: row.session_entry_mode,
+            short_id: row.short_id,
+            project_root: row.project_root,
+            project_id: row.project_id,
+            started_at_unix_ms: row.started_at_unix_ms,
+            last_active_at_unix_ms: row.last_active_at_unix_ms,
+            turns: 0, // wire up when we track turn count
+            active_agent: row.active_agent,
+            title: row.title,
+            description: row.description,
+            parent_session_id: row.parent_session_id,
+            fork_point_turn_id: row.fork_point_turn_id,
+            is_assistant_thread: row.is_assistant_thread,
+            fork_count,
+            descendant_count,
+            last_viewed_at_unix_ms: row.last_viewed_at_unix_ms,
+            latest_activity_at_unix_ms: latest_activity_at,
+            open_interrupts,
+            activity_state,
+            archived_at_unix_ms: row.archived_at_unix_ms,
+            favorite,
+            created_by_principal: row.created_by_principal,
+            shared_with_collaborators: row.shared_with_collaborators,
+            pin_count,
+            assistant_inbox_unread,
+            assistant_inbox_latest_source_session_id,
+            compaction_predecessor_session_id: row.compaction_predecessor_session_id,
+            compaction_lineage_root_id: Some(lineage_root),
+            lineage_window_count,
+        })
+    }
+
     pub fn list_session_summaries_conn(
         conn: &Connection,
         query: &SessionListQuery,
@@ -4667,100 +4792,7 @@ impl Db {
         let rows = Self::list_session_rows_for_query_conn(conn, query)?;
         let mut summaries = Vec::with_capacity(rows.len());
         for row in rows {
-            let lineage_root = row.compaction_lineage_root();
-            let favorite = Self::resolved_root_favorite_conn(conn, &row)?;
-            let fork_count = summary_count_or_zero(
-                lineage_root,
-                "fork_count",
-                Self::count_forks_for_conn(conn, lineage_root),
-            );
-            // Full subtree descendant count for the archive/delete cascade
-            // statement (GOALS §17h) — direct forks plus their descendants
-            // plus other windows in this compaction lineage.
-            let descendant_count = summary_count_or_zero(
-                row.session_id,
-                "descendant_count",
-                Self::count_descendants_conn(conn, row.session_id),
-            );
-            let lineage_window_count = summary_count_or_zero(
-                lineage_root,
-                "lineage_window_count",
-                Self::count_lineage_windows_conn(conn, lineage_root),
-            );
-            // Read/unread + pending-question inputs for the browser's tiers
-            // 3-4 (GOALS §17f). Best-effort: a query miss degrades to "no
-            // activity / no open question" rather than failing the list.
-            let latest_activity_at = summary_latest_activity_or_none(
-                row.session_id,
-                Self::latest_agent_activity_at_conn(conn, row.session_id),
-            );
-            let open_interrupts = summary_open_interrupt_count_or_zero(
-                row.session_id,
-                Self::open_interrupt_count_conn(conn, row.session_id),
-            );
-            let activity_state = summary_activity_state_or_none(
-                row.session_id,
-                Self::interrupt_activity_state_conn(conn, row.session_id),
-            );
-            // Pinned-message count (`pinned-messages`) for the browser's
-            // per-session pin chrome. Best-effort: a query miss reads as 0.
-            let pin_count = summary_pin_count_or_zero(
-                row.session_id,
-                Self::pin_count_conn(conn, row.session_id),
-            );
-            let (assistant_inbox_unread, assistant_inbox_latest_source_session_id) = conn
-                .query_row(
-                    "SELECT COUNT(*),
-                            (SELECT raising_session_id FROM assistant_inbox_items newest
-                              WHERE newest.main_session_id = ?1
-                                AND newest.human_read_at_unix_ms IS NULL
-                              ORDER BY newest.created_at_unix_ms DESC,
-                                       newest.inbox_item_id DESC LIMIT 1)
-                       FROM assistant_inbox_items
-                      WHERE main_session_id = ?1 AND human_read_at_unix_ms IS NULL",
-                    [row.session_id.to_string()],
-                    |record| {
-                        let count: i64 = record.get(0)?;
-                        let source: Option<String> = record.get(1)?;
-                        Ok((count.max(0).min(u32::MAX as i64) as u32, source))
-                    },
-                )
-                .map(|(count, source)| {
-                    (count, source.and_then(|value| Uuid::parse_str(&value).ok()))
-                })
-                .unwrap_or((0, None));
-            summaries.push(crate::db::wire::SessionSummary {
-                session_id: row.session_id,
-                session_entry_mode: row.session_entry_mode,
-                short_id: row.short_id,
-                project_root: row.project_root,
-                project_id: row.project_id,
-                started_at_unix_ms: row.started_at_unix_ms,
-                last_active_at_unix_ms: row.last_active_at_unix_ms,
-                turns: 0, // wire up when we track turn count
-                active_agent: row.active_agent,
-                title: row.title,
-                description: row.description,
-                parent_session_id: row.parent_session_id,
-                fork_point_turn_id: row.fork_point_turn_id,
-                is_assistant_thread: row.is_assistant_thread,
-                fork_count,
-                descendant_count,
-                last_viewed_at_unix_ms: row.last_viewed_at_unix_ms,
-                latest_activity_at_unix_ms: latest_activity_at,
-                open_interrupts,
-                activity_state,
-                archived_at_unix_ms: row.archived_at_unix_ms,
-                favorite,
-                created_by_principal: row.created_by_principal,
-                shared_with_collaborators: row.shared_with_collaborators,
-                pin_count,
-                assistant_inbox_unread,
-                assistant_inbox_latest_source_session_id,
-                compaction_predecessor_session_id: row.compaction_predecessor_session_id,
-                compaction_lineage_root_id: Some(lineage_root),
-                lineage_window_count,
-            });
+            summaries.push(Self::session_summary_from_row_conn(conn, row)?);
         }
         Ok(summaries)
     }
@@ -8481,6 +8513,41 @@ mod tests {
                 .iter()
                 .any(|summary| summary.session_id == other.session_id)
         );
+    }
+
+    #[tokio::test]
+    async fn session_summary_projects_known_id_beyond_navigation_cap() {
+        let db = Db::open_in_memory().unwrap();
+        for i in 0..100 {
+            let session = db.create_session("pid", "/proj", "Build").await.unwrap();
+            db.set_session_favorite(session.session_id, true)
+                .await
+                .unwrap();
+            set_last_active(&db, session.session_id, 1_000 + i).await;
+        }
+        let target = db.create_session("pid", "/proj", "Build").await.unwrap();
+        set_last_active(&db, target.session_id, 1).await;
+
+        let listed = db
+            .list_session_summaries(SessionListQuery::project(Some("pid"), 100))
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 100);
+        assert!(
+            listed
+                .iter()
+                .all(|summary| summary.session_id != target.session_id),
+            "favorite-first cap must exclude the unfavorited known id from navigation"
+        );
+
+        let summary = db
+            .session_summary(target.session_id)
+            .await
+            .unwrap()
+            .expect("known-id projection ignores the navigation cap");
+        assert_eq!(summary.session_id, target.session_id);
+        assert!(!summary.favorite);
+        assert_eq!(summary.project_id, "pid");
     }
 
     #[tokio::test]

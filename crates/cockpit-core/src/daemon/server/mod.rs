@@ -4403,6 +4403,8 @@ pub(crate) async fn boot_with_db(
     timer.phase("lock_manager");
     run_boot_housekeeping(&db).await;
     timer.phase("prune_and_sweep");
+    let update_channel = crate::updater::effective_update_channel();
+    let _update_check = crate::updater::run_startup_check(update_channel).await;
     let fenced_refreshes = db
         .reconcile_host_capability_refresh_execution_leases_at_boot(
             crate::agent_tree::daemon_host_capability_refresh_authority(),

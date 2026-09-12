@@ -110,6 +110,7 @@ pub mod tokens;
 pub mod tool_media_authority;
 pub mod tools;
 pub mod typed_media_result;
+pub mod updater;
 pub mod user_agent;
 pub mod welcome;
 pub mod wizard;

@@ -494,7 +494,7 @@ impl SpawnedDaemon {
         let had_owned_child = self.process.has_current();
         let grace = grace_secs.to_string();
         let mut command = self.home.cockpit();
-        let mut command_child = command
+        let command_child = command
             .args(["daemon", "restart", "--grace", &grace])
             .env("COCKPIT_LOG", "warn,cockpit::startup=info")
             .stdout(std::process::Stdio::piped())
@@ -502,13 +502,10 @@ impl SpawnedDaemon {
             .spawn()
             .expect("daemon restart command");
 
-        let owned_child_exited = self
+        let (output, owned_child_exited) = self
             .process
-            .reap_while_command_runs(&mut command_child)
+            .run_command_while_reaping(command_child)
             .expect("coordinate daemon restart with exact child");
-        let output = command_child
-            .wait_with_output()
-            .expect("wait for daemon restart command");
         assert!(
             !had_owned_child || owned_child_exited,
             "daemon restart command exited before its owned daemon (socket reachable: {socket_reachable}); stdout:\n{}\nstderr:\n{}\nlog tail:\n{}",
@@ -559,29 +556,24 @@ impl SpawnedDaemon {
     fn stop_via_command_with_socket(&self, grace_secs: u64, socket_reachable: bool) -> Output {
         let grace = grace_secs.to_string();
         let mut command = self.home.cockpit();
-        let mut command_child = command
+        let command_child = command
             .args(["daemon", "stop", "--grace", &grace])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("daemon stop command");
-        let owned_child_exited = self
+        let (output, owned_child_exited) = self
             .process
-            .reap_while_command_runs(&mut command_child)
+            .run_command_while_reaping(command_child)
             .expect("coordinate daemon stop with exact child");
-        command_child
-            .wait_with_output()
-            .map(|output| {
-                assert!(
-                    owned_child_exited,
-                    "daemon stop command exited before its owned daemon (socket reachable: {socket_reachable}); stdout:\n{}\nstderr:\n{}\nlog tail:\n{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr),
-                    log_tail(&self.home)
-                );
-                output
-            })
-            .expect("wait for daemon stop command")
+        assert!(
+            owned_child_exited,
+            "daemon stop command exited before its owned daemon (socket reachable: {socket_reachable}); stdout:\n{}\nstderr:\n{}\nlog tail:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            log_tail(&self.home)
+        );
+        output
     }
 
     pub fn command(&self) -> Command {
@@ -1194,21 +1186,30 @@ impl EphemeralDaemonGuard {
             .is_some()
     }
 
-    fn reap_while_command_runs(&self, command: &mut std::process::Child) -> std::io::Result<bool> {
-        if !command.wait()?.success() {
-            self.reap_current();
-            return Ok(false);
-        }
+    fn run_command_while_reaping(
+        &self,
+        command: std::process::Child,
+    ) -> std::io::Result<(std::process::Output, bool)> {
         let Some(mut child) = self
             .child
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take()
         else {
-            return Ok(false);
+            return command.wait_with_output().map(|output| (output, false));
         };
-        child.wait()?;
-        Ok(true)
+        std::thread::scope(|scope| {
+            // The lifecycle command waits for the old process identity to be
+            // released before it returns. Because this harness is the exact
+            // foreground child's parent, it must reap that child concurrently
+            // or the exited child remains a zombie and release cannot finish.
+            let command_wait = scope.spawn(move || command.wait_with_output());
+            let child_status = child.wait();
+            let output = command_wait
+                .join()
+                .expect("daemon lifecycle command waiter panicked")?;
+            child_status.map(|_| (output, true))
+        })
     }
 }
 

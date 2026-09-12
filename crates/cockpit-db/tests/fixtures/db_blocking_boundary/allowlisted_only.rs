@@ -20,6 +20,11 @@ impl Db {
         self.write_blocking_unguarded(f)
     }
 
+    /// Permanent read-only projection used before the daemon async runtime starts.
+    pub fn load_installation_identity_for_sync_boot<T>(&self, f: impl FnOnce() -> T) -> T {
+        self.read_blocking_unguarded(f)
+    }
+
     /// Temporary; owned for removal by db-sync-wrapper-migration.
     pub fn blocking_read_for_sync_ui<F, T>(&self, f: F) -> T {
         self.read_blocking_unguarded(f)

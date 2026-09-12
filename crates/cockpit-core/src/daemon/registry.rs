@@ -2742,7 +2742,7 @@ impl SessionRegistry {
         // Snapshot + take the join handles. Taking them out of the map means
         // a worker that exits on its own mid-drain (and calls `forget`)
         // can't race us for its handle.
-        let mut joins: Vec<(Uuid, WorkerJoin)> = {
+        let joins: Vec<(Uuid, WorkerJoin)> = {
             let mut joins = crate::sync::lock_or_recover(&self.inner.worker_joins);
             joins.drain().collect()
         };
@@ -2864,12 +2864,16 @@ impl SessionRegistry {
             .iter()
             .map(|(_, entry)| entry.join.abort_handle())
             .collect();
-        let phase2_clean = match tokio::time::timeout(
-            grace,
-            futures::future::join_all(joins.iter_mut().map(|(_, entry)| &mut entry.join)),
-        )
-        .await
-        {
+        // Keep one aggregate future alive across the grace boundary. Polling
+        // the JoinHandles through one `join_all`, dropping it on timeout, and
+        // then constructing a second `join_all` re-polls handles that already
+        // completed before the deadline; Tokio rejects that as
+        // "JoinHandle polled after completion". The same in-flight aggregate
+        // owns every handle until either clean completion or the post-abort
+        // reap completes.
+        let drain = futures::future::join_all(joins.into_iter().map(|(_, entry)| entry.join));
+        tokio::pin!(drain);
+        let phase2_clean = match tokio::time::timeout(grace, &mut drain).await {
             Ok(_) => true,
             Err(_) => {
                 // Grace exhausted with work still outstanding: force-abort
@@ -2902,9 +2906,7 @@ impl SessionRegistry {
                 // The durable forced-interruption marker above precedes this
                 // external cancellation; now reap every task before daemon
                 // metadata and process ownership are released.
-                let _ =
-                    futures::future::join_all(joins.iter_mut().map(|(_, entry)| &mut entry.join))
-                        .await;
+                let _ = drain.await;
                 false
             }
         };

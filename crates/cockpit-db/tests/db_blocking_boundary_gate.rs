@@ -48,6 +48,7 @@ const DELETED_PUBLIC_METHODS: &[&str] = &["read_blocking", "write_blocking"];
 /// unguarded helper. No unnamed or wildcard entries.
 ///
 /// - `blocking_for_sync_cli`: permanent guarded boundary for synchronous CLI one-shots.
+/// - `load_installation_identity_for_sync_boot`: permanent read-only daemon boot projection.
 /// - four `blocking_*_for_sync_*` wrappers: temporary; owned by `db-sync-wrapper-migration`.
 /// - four typed agent-publication journal methods: permanent, narrow bridges
 ///   used only while a caller owns the cross-process filesystem publication
@@ -59,6 +60,12 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         kind: AllowlistKind::PermanentCli,
         owner: "db-blocking-api-removal",
         rationale: "permanent guarded boundary for synchronous CLI one-shots",
+    },
+    AllowlistEntry {
+        name: "load_installation_identity_for_sync_boot",
+        kind: AllowlistKind::PermanentBootRead,
+        owner: "daemon-boot-ordering",
+        rationale: "read-only installation identity projection before the async daemon runtime starts",
     },
     AllowlistEntry {
         name: "blocking_read_for_sync_ui",
@@ -113,6 +120,7 @@ const ALLOWLIST: &[AllowlistEntry] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AllowlistKind {
     PermanentCli,
+    PermanentBootRead,
     TemporarySyncWrapper,
     PermanentPublicationJournal,
 }
@@ -1305,6 +1313,10 @@ fn evaluate_against_allowlist(analysis: &mut Analysis) {
         );
         match entry.kind {
             AllowlistKind::PermanentCli => assert_eq!(entry.name, "blocking_for_sync_cli"),
+            AllowlistKind::PermanentBootRead => {
+                assert_eq!(entry.name, "load_installation_identity_for_sync_boot");
+                assert_eq!(entry.owner, "daemon-boot-ordering");
+            }
             AllowlistKind::TemporarySyncWrapper => {
                 assert_eq!(entry.owner, "db-sync-wrapper-migration");
             }
@@ -1449,6 +1461,7 @@ fn db_blocking_boundary_gate_allowlist_is_exact_and_documented() {
         names,
         vec![
             "blocking_for_sync_cli",
+            "load_installation_identity_for_sync_boot",
             "blocking_read_for_sync_ui",
             "blocking_write_for_sync_ui",
             "blocking_write_for_sync_event",
@@ -1461,11 +1474,14 @@ fn db_blocking_boundary_gate_allowlist_is_exact_and_documented() {
     );
     assert_eq!(ALLOWLIST[0].kind, AllowlistKind::PermanentCli);
     assert!(ALLOWLIST[0].rationale.contains("synchronous CLI"));
-    for entry in &ALLOWLIST[1..5] {
+    assert_eq!(ALLOWLIST[1].kind, AllowlistKind::PermanentBootRead);
+    assert_eq!(ALLOWLIST[1].owner, "daemon-boot-ordering");
+    assert!(ALLOWLIST[1].rationale.contains("read-only"));
+    for entry in &ALLOWLIST[2..6] {
         assert_eq!(entry.kind, AllowlistKind::TemporarySyncWrapper);
         assert_eq!(entry.owner, "db-sync-wrapper-migration");
     }
-    for entry in &ALLOWLIST[5..] {
+    for entry in &ALLOWLIST[6..] {
         assert_eq!(entry.kind, AllowlistKind::PermanentPublicationJournal);
         assert!(entry.rationale.contains("publication lock"));
     }

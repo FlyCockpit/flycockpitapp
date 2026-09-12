@@ -22,12 +22,17 @@ pub(crate) struct DaemonTestHarness {
 impl DaemonTestHarness {
     pub(crate) fn new() -> Self {
         sweep_stale_manifests().expect("sweep stale daemon test manifests");
-        let root = tempfile::tempdir().expect("daemon harness tempdir");
+        let root = cockpit_test_support::isolated_tempdir();
         let state_home = root.path().join("state");
         let runtime_dir = root.path().join("runtime");
         let data_home = root.path().join("data");
         let owner = uuid::Uuid::new_v4().to_string();
-        let db = crate::db::Db::open_in_memory().expect("daemon harness db");
+        // Daemon boot owns file-backed storage, including its vault directory,
+        // read pool, writer executor, and database lifetime lock. Keep the
+        // integration harness on that production-shaped boundary; an in-memory
+        // handle cannot satisfy the pre-socket boot authority contract.
+        let db = crate::db::Db::open(&root.path().join("cockpit.db"))
+            .expect("open daemon harness database");
         Self {
             root,
             state_home,

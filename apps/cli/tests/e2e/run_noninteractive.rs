@@ -393,12 +393,11 @@ async fn cwd_flag_sets_workspace_root() {
 async fn run_approval_auto_denied() {
     // Keep the provider alive for the spawned run processes; dropping it closes the listener.
     let mut builder = ScriptedProvider::builder();
-    // Each `cockpit run` may consume more than one provider turn (for example a
-    // denied bash call followed by adaptation text, or an extra inference pass
-    // while the ephemeral owner is still winding down). Pad several identical
-    // approval rounds before the question-script tail so later runs in this test
-    // still receive the expected tool shapes.
-    for _ in 0..4 {
+    // Each approval run consumes its tool call and the model's adaptation turn.
+    // Durable run invocations own that exact provider budget; daemon teardown
+    // must not launch detached metadata inference that consumes another run's
+    // scripted response.
+    for _ in 0..2 {
         builder = builder
             .turn(approval_tool_turn(cfg!(target_os = "linux")))
             .turn(text_turn("adapted after approval result"));

@@ -12579,7 +12579,14 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
             // existing fail-closed arms; ordinary calls exhaust the plan in
             // this loop without another provider turn.
         }
-        let outcome = crate::engine::agent::collapse_continue_without_injection(outcome, &history);
+        let outcome = if crate::tools::trusted_child_acquisition::terminal_move_selected() {
+            // A trusted-child terminal tool is a host-owned end-of-run commit.
+            // Its scheduled plan has already persisted the tool result above;
+            // do not expose that result to another provider inference.
+            TurnOutcome::Done
+        } else {
+            crate::engine::agent::collapse_continue_without_injection(outcome, &history)
+        };
         let usage_charge = crate::engine::delegation_budget::take_lane_budget_charge();
         if !usage_charge.is_empty()
             && let Err(exhaustion) = budget.charge(usage_charge)

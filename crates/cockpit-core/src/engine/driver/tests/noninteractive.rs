@@ -220,10 +220,10 @@ fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
             // accident under parallel nextest load.
             .start_blocking();
         // This regression intentionally drives five real journaled provider
-        // requests on ordinary disk-backed temporary storage. Progress is
-        // observed at the production durable-commit boundary below, so tmpfs
-        // may optimize other fixtures but is not required for correctness.
-        let fixture_root = tempfile::tempdir().unwrap();
+        // requests. Keep the production durable-commit boundary below, while
+        // using the shared isolated fixture root so unrelated workspace-disk
+        // compiler/linker traffic cannot starve its readiness witnesses.
+        let fixture_root = cockpit_test_support::isolated_tempdir();
         let (mut driver, tmp) = test_driver_with_url_vnext_in(8, provider.base_url(), fixture_root);
         let mut dispatch_commits = driver
             .session

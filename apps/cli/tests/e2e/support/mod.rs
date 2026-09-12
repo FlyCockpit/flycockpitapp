@@ -52,6 +52,17 @@ pub struct IsolatedHome {
 
 impl IsolatedHome {
     pub fn new() -> Self {
+        let home = Self::new_fresh();
+        home.initialize_configured_installation();
+        home
+    }
+
+    /// Create an isolated home with no database or onboarding authority.
+    ///
+    /// Most E2E scenarios model an already configured installation and use
+    /// [`Self::new`]. Diagnostics that prove read-only behavior against a
+    /// genuinely new installation must opt into this state explicitly.
+    pub fn new_fresh() -> Self {
         let root = cockpit_test_support::isolated_tempdir();
         let config_home = root.path().join("config");
         let data_home = root.path().join("data");
@@ -84,7 +95,7 @@ impl IsolatedHome {
             std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
                 .expect("restrict isolated temp root");
         }
-        let home = Self {
+        Self {
             _root: Some(root),
             config_home,
             data_home,
@@ -93,9 +104,7 @@ impl IsolatedHome {
             cache_home,
             project,
             extra_env: Vec::new(),
-        };
-        home.initialize_configured_installation();
-        home
+        }
     }
 
     /// Seed the explicit authority owned by legacy E2E profiles that model an
@@ -109,7 +118,12 @@ impl IsolatedHome {
             std::fs::set_permissions(&cockpit_data_dir, std::fs::Permissions::from_mode(0o700))
                 .expect("restrict isolated cockpit data dir");
         }
-        let db = cockpit_core::secure_key::test_open_db(&cockpit_data_dir.join("cockpit.db"));
+        // A configured installation is the result of daemon boot. Seed it
+        // through the same exclusive opener so the persistent ownership-lock
+        // artifact and the SQLite ledger cannot disagree about whether boot
+        // has completed.
+        let db = cockpit_db::Db::open_daemon_owned(&cockpit_data_dir.join("cockpit.db"))
+            .expect("open isolated daemon-owned database");
         let kek_dir = cockpit_core::secure_key::kek_dir_for_db(&db)
             .expect("resolve isolated vault directory");
         db.configure_secret_vault_dir(kek_dir.clone())

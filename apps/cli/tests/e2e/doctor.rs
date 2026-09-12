@@ -52,7 +52,7 @@ async fn reports_amended_migration() {
 
 #[test]
 fn reports_daemon_status_without_starting_it() {
-    let home = IsolatedHome::new();
+    let home = IsolatedHome::new_fresh();
     home.write_local_provider_config("http://127.0.0.1:9/v1");
     assert!(!home.socket_path().exists());
     assert!(!home.pid_file().exists());

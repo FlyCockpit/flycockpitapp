@@ -2871,11 +2871,7 @@ impl SessionRegistry {
         // "JoinHandle polled after completion". The same in-flight aggregate
         // owns every handle until either clean completion or the post-abort
         // reap completes.
-        let drain = futures::future::join_all(
-            joins
-                .into_iter()
-                .map(|(_, entry)| entry.join),
-        );
+        let drain = futures::future::join_all(joins.into_iter().map(|(_, entry)| entry.join));
         tokio::pin!(drain);
         let phase2_clean = match tokio::time::timeout(grace, &mut drain).await {
             Ok(_) => true,

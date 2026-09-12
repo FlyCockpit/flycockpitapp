@@ -11664,10 +11664,10 @@ async fn fresh_untrusted_provider_delete_commits_to_the_global_layer() {
     assert!(!workspace.join(".cockpit").exists());
 }
 
-/// A pre-existing ephemeral daemon serving onboarding must fail closed with
-/// an actionable error — never a capability-less snapshot.
+/// An already-selected ephemeral owner may execute the explicit, capability-
+/// bound global first write without changing its lifetime.
 #[tokio::test]
-async fn ephemeral_daemon_onboarding_fails_closed_when_global_layer_is_missing() {
+async fn ephemeral_daemon_onboarding_first_write_succeeds_without_promotion() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let tmp = tempfile::tempdir().unwrap();
     let workspace = tmp.path().join("workspace");
@@ -11680,35 +11680,41 @@ async fn ephemeral_daemon_onboarding_fails_closed_when_global_layer_is_missing()
     )
     .await;
     let mut state = owner_state();
-    let error = handle_request(
-        Request::GetProviderCatalogSnapshot {
-            project_root: workspace.to_string_lossy().into_owned(),
-            provider_id: None,
-            snapshot_session_id: "ephemeral-onboarding".into(),
-        },
-        &mut state,
-        &ctx,
-    )
-    .await
-    .expect_err("ephemeral onboarding must fail closed");
-    assert_eq!(error.code, ErrorCode::BadRequest);
-    assert!(
-        error.message.contains("ephemeral") && error.message.contains("persistent daemon"),
-        "error must tell the user to start a persistent daemon: {}",
-        error.message
-    );
+    let catalog =
+        take_onboarding_catalog(&ctx, &mut state, &workspace, "ephemeral-onboarding").await;
     assert!(
         !cockpit_config::config::dirs::global_config_dir()
             .unwrap()
             .is_dir(),
-        "ephemeral onboarding must not create the global config directory"
+        "catalog read must remain non-creating"
     );
+    apply_onboarding_mutation(
+        &ctx,
+        &mut state,
+        &catalog,
+        "ephemeral-onboarding-first-write",
+        cockpit_proto::ProviderMutationBatch {
+            upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                provider_id: "onboard".into(),
+                entry: onboard_provider_entry(),
+                header_secrets: Vec::new(),
+            }],
+            deletes: Vec::new(),
+            metadata: None,
+        },
+    )
+    .await;
+    assert!(
+        ctx.is_ephemeral_lifetime(),
+        "first write must not promote the owner"
+    );
+    assert!(global_provider_path("onboard").is_file());
 }
 
-/// Durable journal replay of a first-write into the missing global layer
-/// must fail closed on an ephemeral daemon and create nothing.
+/// Durable journal replay of a validated first-write into the missing global
+/// layer completes without promoting an ephemeral owner.
 #[tokio::test]
-async fn ephemeral_provider_journal_replay_does_not_create_the_global_config_dir() {
+async fn ephemeral_provider_first_write_journal_replays_without_promotion() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let tmp = tempfile::tempdir().unwrap();
     let workspace = tmp.path().join("workspace");
@@ -11766,18 +11772,16 @@ async fn ephemeral_provider_journal_replay_does_not_create_the_global_config_dir
             .unwrap();
     }
 
-    let error = recover_provider_config_journals(&ctx, &root, Some("onboard"))
+    recover_provider_config_journals(&ctx, &root, Some("onboard"))
         .await
-        .expect_err("ephemeral journal replay must fail closed");
-    assert_eq!(error.code, ErrorCode::BadRequest);
+        .expect("validated first-write journal must replay");
     assert!(
-        error.message.contains("ephemeral") && error.message.contains("persistent daemon"),
-        "error must tell the user to start a persistent daemon: {}",
-        error.message
+        target.is_file(),
+        "replay must publish the durable intended global provider layer"
     );
     assert!(
-        !global.is_dir(),
-        "ephemeral journal replay must not create the global config directory"
+        ctx.is_ephemeral_lifetime(),
+        "replay must not promote the owner"
     );
 }
 
@@ -19792,6 +19796,9 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "create_goal"
         | "get_workspace_trust"
         | "get_startup_disclosures"
+        | "get_onboarding_bootstrap_snapshot"
+        | "begin_or_reopen_onboarding"
+        | "get_onboarding_transition_receipt"
         | "get_app_flag"
         | "mark_app_flag_seen"
         | "set_workspace_trust"
@@ -19800,6 +19807,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "clean_managed_workspace_lease"
         | "restart_if_idle"
         | "stop_daemon" => AuthzAllowedOutcome::Response,
+        "apply_onboarding_transition" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         // The matrix deliberately drops the attached worker after its prelude;
         // refresh is authorized, then fails closed when fanout observes that
         // exact worker shutdown.
@@ -22429,6 +22437,30 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "get_workspace_trust" => Request::GetWorkspaceTrust { project_root: root },
         "get_startup_disclosures" => Request::GetStartupDisclosures { project_root: root },
+        "get_onboarding_bootstrap_snapshot" => Request::GetOnboardingBootstrapSnapshot,
+        "begin_or_reopen_onboarding" => {
+            Request::BeginOrReopenOnboarding(proto::BeginOrReopenOnboarding {
+                expected_revision: None,
+                client_operation_id: "authz-onboarding-begin".into(),
+                reentry: false,
+            })
+        }
+        "apply_onboarding_transition" => {
+            Request::ApplyOnboardingTransition(proto::ApplyOnboardingTransition {
+                run_id: Uuid::now_v7(),
+                attempt_id: Uuid::now_v7(),
+                expected_revision: 0,
+                client_operation_id: "authz-onboarding-transition".into(),
+                transition: proto::OnboardingTransitionKind::Advance,
+            })
+        }
+        "get_onboarding_transition_receipt" => {
+            Request::GetOnboardingTransitionReceipt(proto::OnboardingReceiptQuery {
+                run_id: Uuid::now_v7(),
+                attempt_id: Uuid::now_v7(),
+                client_operation_id: "authz-onboarding-receipt".into(),
+            })
+        }
         "get_app_flag" => Request::GetAppFlag {
             key: proto::AppFlagKey::DaemonAutostartNotice,
         },
@@ -30715,6 +30747,10 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::SetProviderLayerMetadata { project_root: "/tmp/project".into(), category_defaults_json: "{}".into(), on_unlisted_models_fetch: crate::config::providers::OnUnlistedModelsFetch::Keep }, kind: "set_provider_layer_metadata", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::SetupCopilotAuth { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), provider_id: "example".into() }, kind: "setup_copilot_auth", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::ApplySetupWizard { project_root: "/tmp/project".into(), wizard_id: "security".into(), answers_json: "{}".into() }, kind: "apply_setup_wizard", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::GetOnboardingBootstrapSnapshot, kind: "get_onboarding_bootstrap_snapshot", session_id: None, audit_path: None, mutating: false },
+        CommandMetadataCase { request: Request::BeginOrReopenOnboarding(proto::BeginOrReopenOnboarding { expected_revision: None, client_operation_id: "fixture-onboarding-begin".into(), reentry: false }), kind: "begin_or_reopen_onboarding", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::ApplyOnboardingTransition(proto::ApplyOnboardingTransition { run_id: Uuid::now_v7(), attempt_id: Uuid::now_v7(), expected_revision: 0, client_operation_id: "fixture-onboarding-transition".into(), transition: proto::OnboardingTransitionKind::Advance }), kind: "apply_onboarding_transition", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::GetOnboardingTransitionReceipt(proto::OnboardingReceiptQuery { run_id: Uuid::now_v7(), attempt_id: Uuid::now_v7(), client_operation_id: "fixture-onboarding-receipt".into() }), kind: "get_onboarding_transition_receipt", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::SaveExtendedConfig { project_root: "/tmp/project".into(), path: "AGENTS.md".into(), content: String::new(), base_hash: None }, kind: "save_extended_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::ExportPolicy { project_root: "/tmp/project".into() }, kind: "export_policy", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::ImportPolicy { project_root: "/tmp/project".into(), bundle_json: "{}".into(), replace: false }, kind: "import_policy", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
@@ -30997,6 +31033,10 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         MigrateKekPlacement,
         SetupCopilotAuth,
         ApplySetupWizard,
+        GetOnboardingBootstrapSnapshot,
+        BeginOrReopenOnboarding,
+        ApplyOnboardingTransition,
+        GetOnboardingTransitionReceipt,
         SaveExtendedConfig,
         ExportPolicy,
         ImportPolicy,
@@ -36868,6 +36908,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
     let (global_events, _) = broadcast::channel(1);
     let ctx = Arc::new(DaemonContext {
         db: base.db.clone(),
+        onboarding: base.onboarding.clone(),
         code_root_authority: base.code_root_authority.clone(),
         acp_catalog_composition: base.acp_catalog_composition.clone(),
         guidance_proposals: base.guidance_proposals.clone(),
@@ -37093,6 +37134,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
     let (global_events, _) = broadcast::channel(IN_PROCESS_EVENT_QUEUE + DROPPED + 16);
     let ctx = Arc::new(DaemonContext {
         db: base.db.clone(),
+        onboarding: base.onboarding.clone(),
         code_root_authority: base.code_root_authority.clone(),
         acp_catalog_composition: base.acp_catalog_composition.clone(),
         guidance_proposals: base.guidance_proposals.clone(),

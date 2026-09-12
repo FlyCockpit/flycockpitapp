@@ -109,6 +109,17 @@ const WORKSPACE_TRUST_STOP_ATTEMPTS: usize = WORKSPACE_TRUST_STOP_BACKOFF.len() 
 pub(crate) static CONFIG_PUBLICATION_RPC_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
+fn onboarding_error(error: anyhow::Error) -> ErrorPayload {
+    let message = error.to_string();
+    let code =
+        if message.contains("revision conflict") || message.contains("reused for a different") {
+            ErrorCode::Conflict
+        } else {
+            ErrorCode::BadRequest
+        };
+    ErrorPayload { code, message }
+}
+
 /// An onboarding apply owns only the installation whose UUID is the fresh
 /// inner operation key it minted. Installation may instead return an existing
 /// same-source object; cleanup must never infer ownership from an answer or a
@@ -6064,6 +6075,57 @@ async fn handle_serialized_request_impl(
     // oracle that distinguishes requests the principal could never invoke.
     require_compiled_product_domain(&request)?;
     match request {
+        Request::GetOnboardingBootstrapSnapshot => {
+            let capabilities = ctx
+                .host_capabilities
+                .current()
+                .map(|value| value.as_ref().clone())
+                .unwrap_or_else(cockpit_proto::HostCapabilitySnapshot::unpublished);
+            let snapshot = ctx
+                .onboarding
+                .snapshot(capabilities)
+                .await
+                .map_err(internal)?;
+            Ok(Response::OnboardingBootstrapSnapshot(snapshot))
+        }
+        Request::BeginOrReopenOnboarding(request) => {
+            let capabilities = ctx
+                .host_capabilities
+                .current()
+                .map(|value| value.as_ref().clone())
+                .unwrap_or_else(cockpit_proto::HostCapabilitySnapshot::unpublished);
+            let (snapshot, receipt) = ctx
+                .onboarding
+                .begin_or_reopen(request, capabilities)
+                .await
+                .map_err(onboarding_error)?;
+            Ok(Response::OnboardingTransition(
+                cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
+            ))
+        }
+        Request::ApplyOnboardingTransition(request) => {
+            let capabilities = ctx
+                .host_capabilities
+                .current()
+                .map(|value| value.as_ref().clone())
+                .unwrap_or_else(cockpit_proto::HostCapabilitySnapshot::unpublished);
+            let (snapshot, receipt) = ctx
+                .onboarding
+                .apply_transition(request, capabilities)
+                .await
+                .map_err(onboarding_error)?;
+            Ok(Response::OnboardingTransition(
+                cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
+            ))
+        }
+        Request::GetOnboardingTransitionReceipt(query) => {
+            let receipt = ctx
+                .onboarding
+                .receipt(query)
+                .await
+                .map_err(onboarding_error)?;
+            Ok(Response::OnboardingTransitionReceipt(receipt))
+        }
         Request::AttachKnowledgeBaseSession {
             knowledge_base_id,
             session_id,
@@ -18075,7 +18137,7 @@ async fn handle_serialized_request_impl(
                     // later participant fails, compensate both authorities
                     // while the publication gate still excludes other daemon
                     // writers; onboarding must not leave a visible half-plan.
-                    match crate::wizard::persist_onboarding_agent_plan(&prepared.plan) {
+                    match crate::wizard::publish_onboarding_agent_plan(&prepared.plan) {
                         Ok(_) => {}
                         Err(error) => {
                             let compensation = compensate_onboarding_agent_publication(
@@ -21074,13 +21136,12 @@ fn user_level_trust_policy(
 }
 
 /// Canonicalize a user-level write target without creating directories on
-/// this read path. Ephemeral/diagnostic owners fail closed when the global
-/// layer would have to be created — never a silent capability-less snapshot.
+/// this read path. The returned logical target is later bound into the
+/// snapshot capability; owner lifetime is deliberately irrelevant.
 fn canonical_user_level_write_target(
-    ctx: &DaemonContext,
+    _ctx: &DaemonContext,
     path: &std::path::Path,
 ) -> std::result::Result<std::path::PathBuf, ErrorPayload> {
-    super::refuse_ephemeral_missing_global_layer(ctx.is_ephemeral_lifetime(), path)?;
     canonical_mcp_target_path(path)
 }
 
@@ -21096,14 +21157,14 @@ fn prepare_user_level_write_target(
     Ok(path)
 }
 
-/// Journal replay of a durable user-level target. Refuses ephemeral
-/// creation of the missing global layer, then creates it only for
-/// authorized persistent owners. Does not re-canonicalize a stored path.
+/// Journal replay of a durable user-level target. Creates a missing global
+/// layer only after the journal's capability-bound target has been validated;
+/// owner lifetime is intentionally unchanged. Does not re-canonicalize a
+/// stored path.
 fn prepare_user_level_journal_target(
-    ctx: &DaemonContext,
+    _ctx: &DaemonContext,
     path: &std::path::Path,
 ) -> std::result::Result<(), ErrorPayload> {
-    super::refuse_ephemeral_missing_global_layer(ctx.is_ephemeral_lifetime(), path)?;
     super::ensure_authorized_global_layer(path)
 }
 

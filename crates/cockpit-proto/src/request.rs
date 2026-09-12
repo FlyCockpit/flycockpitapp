@@ -1028,6 +1028,10 @@ pub enum Request {
     GetStartupDisclosures {
         project_root: String,
     },
+    GetOnboardingBootstrapSnapshot,
+    BeginOrReopenOnboarding(crate::BeginOrReopenOnboarding),
+    ApplyOnboardingTransition(crate::ApplyOnboardingTransition),
+    GetOnboardingTransitionReceipt(crate::OnboardingReceiptQuery),
     GetAppFlag {
         key: AppFlagKey,
     },
@@ -4494,6 +4498,10 @@ macro_rules! request_variants {
             (Request::SetWorkspaceHistoryScope { .. }, "set_workspace_history_scope");
             (Request::GetWorkspaceHistoryScope { .. }, "get_workspace_history_scope");
             (Request::GetStartupDisclosures { .. }, "get_startup_disclosures");
+            (Request::GetOnboardingBootstrapSnapshot, "get_onboarding_bootstrap_snapshot");
+            (Request::BeginOrReopenOnboarding(..), "begin_or_reopen_onboarding");
+            (Request::ApplyOnboardingTransition(..), "apply_onboarding_transition");
+            (Request::GetOnboardingTransitionReceipt(..), "get_onboarding_transition_receipt");
             (Request::GetAppFlag { .. }, "get_app_flag");
             (Request::MarkAppFlagSeen { .. }, "mark_app_flag_seen");
             (Request::GetStorageReport, "get_storage_report");
@@ -4860,6 +4868,10 @@ macro_rules! command {
             (Request::SetWorkspaceHistoryScope { project_root, outbound, inbound }, "set_workspace_history_scope", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|outbound:bool|inbound:bool", [project_root: String => project_root, outbound: bool => param, inbound: bool => param]);
             (Request::GetWorkspaceHistoryScope { project_root }, "get_workspace_history_scope", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::GetStartupDisclosures { project_root }, "get_startup_disclosures", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
+            (Request::GetOnboardingBootstrapSnapshot, "get_onboarding_bootstrap_snapshot", owner_only, none, false, read_only, none, serialized, none, "-", []);
+            (Request::BeginOrReopenOnboarding(request), "begin_or_reopen_onboarding", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "request:BeginOrReopenOnboarding", [request: $crate::BeginOrReopenOnboarding => param]);
+            (Request::ApplyOnboardingTransition(request), "apply_onboarding_transition", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "request:ApplyOnboardingTransition", [request: $crate::ApplyOnboardingTransition => param]);
+            (Request::GetOnboardingTransitionReceipt(request), "get_onboarding_transition_receipt", owner_only, none, false, read_only, none, serialized, none, "request:OnboardingReceiptQuery", [request: $crate::OnboardingReceiptQuery => param]);
             (Request::GetAppFlag { key }, "get_app_flag", owner_only, none, false, local_only, none, serialized, none, "key:AppFlagKey", [key: AppFlagKey => param]);
             (Request::MarkAppFlagSeen { key, expected_version }, "mark_app_flag_seen", owner_only, none, true, local_only, none, serialized, none, "key:AppFlagKey|expected_version:u64", [key: AppFlagKey => param, expected_version: u64 => param]);
             (Request::GetStorageReport, "get_storage_report", owner_only, none, false, read_only, none, concurrent, none, "-", []);

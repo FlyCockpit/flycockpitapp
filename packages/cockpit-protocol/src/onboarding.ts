@@ -54,17 +54,20 @@ export type OnboardingTransitionReceipt = z.infer<typeof onboardingTransitionRec
  * It is an opaque redacted projection here so this mirror cannot accidentally
  * add credential or path fields to the bootstrap surface.
  */
-export interface OnboardingBootstrapSnapshot {
-  run_id: string;
-  attempt_id: string;
-  revision: number;
-  stage: OnboardingStage;
-  bootstrap_state: OnboardingBootstrapState;
-  limited_mode: boolean;
-  lifetime_selection?: string;
-  host_capabilities: object;
-  last_receipt?: OnboardingTransitionReceipt;
-}
+export const onboardingBootstrapSnapshotSchema = z
+  .object({
+    run_id: z.string().uuid(),
+    attempt_id: z.string().uuid(),
+    revision: z.number().int().nonnegative(),
+    stage: onboardingStageSchema,
+    bootstrap_state: onboardingBootstrapStateSchema,
+    limited_mode: z.boolean(),
+    lifetime_selection: z.string().optional(),
+    host_capabilities: z.object({}).passthrough(),
+    last_receipt: onboardingTransitionReceiptSchema.optional(),
+  })
+  .strict();
+export type OnboardingBootstrapSnapshot = z.infer<typeof onboardingBootstrapSnapshotSchema>;
 
 export const beginOrReopenOnboardingSchema = z
   .object({
@@ -93,6 +96,30 @@ export const applyOnboardingTransitionSchema = z
   })
   .strict();
 export type ApplyOnboardingTransition = z.infer<typeof applyOnboardingTransitionSchema>;
+
+export const onboardingReceiptQuerySchema = z
+  .object({
+    run_id: z.string().uuid(),
+    attempt_id: z.string().uuid(),
+    client_operation_id: z.string().min(1).max(128),
+  })
+  .strict();
+export type OnboardingReceiptQuery = z.infer<typeof onboardingReceiptQuerySchema>;
+
+export const onboardingTransitionResultSchema = z
+  .object({
+    snapshot: onboardingBootstrapSnapshotSchema,
+    receipt: onboardingTransitionReceiptSchema,
+  })
+  .strict();
+export type OnboardingTransitionResult = z.infer<typeof onboardingTransitionResultSchema>;
+
+export interface LockedBootstrapHello {
+  protocol_version: number;
+  bootstrap_available: boolean;
+  host_capabilities: object;
+  snapshot?: OnboardingBootstrapSnapshot;
+}
 
 /** A passphrase is intentionally absent: it is Rust-only sensitive ingress. */
 export const onboardingBootstrapEventSchema = z

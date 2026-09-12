@@ -2766,19 +2766,7 @@ fn setup_wizard_dialog(
     descriptor: cockpit_core::wizard::WizardDescriptor,
     status: Option<String>,
 ) -> Result<Dialog, String> {
-    let progress = cockpit_core::welcome::onboarding_wizard_progress(descriptor.id);
-    let run = match progress {
-        Some(progress) => cockpit_core::wizard::WizardRun::resume_from_answers_json(
-            descriptor.clone(),
-            &progress,
-        )
-        .unwrap_or_else(|error| {
-            tracing::warn!(wizard = descriptor.id, %error, "discarding invalid onboarding progress");
-            cockpit_core::wizard::WizardRun::new(descriptor)
-                .expect("validated setup descriptor remains valid")
-        }),
-        None => cockpit_core::wizard::WizardRun::new(descriptor).map_err(|e| e.to_string())?,
-    };
+    let run = cockpit_core::wizard::WizardRun::new(descriptor).map_err(|e| e.to_string())?;
     let mut cursor = 0;
     let mut text = TextField::new("");
     let mut multi = std::collections::BTreeSet::new();
@@ -3494,33 +3482,20 @@ impl SettingsCx {
 
     /// Resolve an add-wizard save that the daemon proved did not commit.
     ///
-    /// A first-run add persists a validation continuation before dispatch so
-    /// cancellation cannot lose a committed provider. The opposite is also
-    /// required: once authority rejects the mutation, remove that
-    /// continuation and return the wizard to an editable state rather than
-    /// resuming validation for a provider that does not exist.
+    /// Once authority rejects the mutation, return the wizard to an editable
+    /// state rather than presenting validation for a provider that does not
+    /// exist. Onboarding continuation is settled separately by its daemon
+    /// receipt correlation.
     fn reject_pending_provider_add(&mut self, error: String) {
-        let Some(pending) = self.pending_provider_add.take() else {
+        if self.pending_provider_add.take().is_none() {
             return;
-        };
+        }
 
         // The staged entry was never daemon-owned. Restore the last
         // authoritative snapshot so retrying the add does not see a phantom
         // duplicate provider.
         self.config = self.original_config.clone();
 
-        let error = if pending.onboarding {
-            match cockpit_core::welcome::persist_onboarding_stage(
-                cockpit_core::welcome::OnboardingStage::Provider,
-            ) {
-                Ok(()) => error,
-                Err(clear_error) => format!(
-                    "{error}; could not clear the setup validation continuation: {clear_error}"
-                ),
-            }
-        } else {
-            error
-        };
         self.completed_provider_add = Some(Err(error));
     }
 
@@ -5976,6 +5951,18 @@ impl Dialog {
             frame: 0,
             reduced_motion,
         }
+    }
+
+    pub fn open_onboarding_secure_store(cwd: &std::path::Path) -> Self {
+        let root = global_config_dir().unwrap_or_else(|_| cwd.to_path_buf());
+        let mut settings = SettingsDialog::open_from_picker(root.join(CONFIG_FILE), root);
+        let mut page = CategoryPage::new(Category::Privacy);
+        page.cursor = 2;
+        page.status = Some(
+            "Choose and confirm secure storage before provider credentials are accepted.".into(),
+        );
+        settings.page = category_page(page);
+        Dialog::Settings(Box::new(settings))
     }
 
     pub fn open_providers_add_with_status(cwd: &std::path::Path, status: Option<String>) -> Self {
@@ -9828,20 +9815,6 @@ fn apply_setup_wizard_daemon_completion(
                 ));
                 return;
             }
-            if matches!(
-                wizard.run.descriptor().id,
-                cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID
-                    | cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID
-                    | cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID
-                    | cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID
-            ) && let Err(error) =
-                cockpit_core::welcome::persist_onboarding_wizard_progress(&wizard.run)
-            {
-                wizard.status = Some(format!(
-                    "Setup was saved, but progress could not be checkpointed: {error}"
-                ));
-                return;
-            }
             if !changed {
                 "Global setup is already up to date.".to_string()
             } else if matches!(
@@ -9906,19 +9879,7 @@ fn submit_setup_wizard_answer(
         status,
     } = state;
     match run.submit(answer) {
-        Ok(()) => {
-            if matches!(
-                run.descriptor().id,
-                cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID
-                    | cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID
-                    | cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID
-                    | cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID
-            ) && let Err(error) = cockpit_core::welcome::persist_onboarding_wizard_progress(run)
-            {
-                *status = Some(format!("Could not save setup progress: {error}"));
-            }
-            sync_setup_wizard_inputs(run, inputs);
-        }
+        Ok(()) => sync_setup_wizard_inputs(run, inputs),
         Err(error) => *status = Some(error),
     }
 }

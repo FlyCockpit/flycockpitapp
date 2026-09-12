@@ -89,18 +89,6 @@ pub async fn run_mode(
         return Ok(());
     }
 
-    // Record a genuinely fresh install before daemon startup creates the
-    // config directory. Failure is user-visible and startup fails closed.
-    cockpit_core::welcome::initialize_onboarding_if_first_run()
-        .context("initializing first-run onboarding state")?;
-
-    // Onboarding is user-global state. Establish its persistent owner before
-    // workspace trust is consulted so the first-run configuration survives
-    // this TUI process and cannot be gated by the opened workspace.
-    crate::daemon::client::ensure_persistent_daemon()
-        .await
-        .context("starting persistent daemon for interactive onboarding")?;
-
     let trust = prepare_tui_workspace_trust(project)?;
 
     let (lifecycle, lifecycle_task) = lifecycle_composition();

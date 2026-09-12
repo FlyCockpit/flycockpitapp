@@ -180,7 +180,7 @@ pub fn prepare_onboarding_agent_answers_for_catalog(
     Ok(PreparedOnboardingAgent { plan, providers })
 }
 
-pub fn persist_onboarding_agent_plan(
+pub fn publish_onboarding_agent_plan(
     plan: &crate::onboarding_agent::OnboardingAgentPlan,
 ) -> Result<OnboardingConfigRollback> {
     ensure_global_layer_for_write()?;

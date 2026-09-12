@@ -19,6 +19,34 @@ use crate::db::onboarding::{
     OnboardingReceiptStatus as DbReceiptStatus, OnboardingSnapshotRow, OnboardingStage as DbStage,
 };
 
+pub fn secure_vault_open_options(
+    placement: OnboardingSecurePlacement,
+    mut passphrase: Option<Zeroizing<String>>,
+) -> Result<crate::secure_key::SecretVaultOpenOptions> {
+    let first_run_intent = match placement {
+        OnboardingSecurePlacement::Automatic => {
+            crate::secure_key::FirstRunSecretStoreIntent::Automatic
+        }
+        OnboardingSecurePlacement::Keyring => crate::secure_key::FirstRunSecretStoreIntent::Keyring,
+        OnboardingSecurePlacement::PassphraseFile => {
+            crate::secure_key::FirstRunSecretStoreIntent::FilePassphrase
+        }
+        OnboardingSecurePlacement::MachineBoundFile => {
+            crate::secure_key::FirstRunSecretStoreIntent::FileMachineBound
+        }
+    };
+    let passphrase = passphrase
+        .as_mut()
+        .map(|value| {
+            crate::secure_key::Passphrase::from_bytes(std::mem::take(&mut **value).into_bytes())
+        })
+        .transpose()?;
+    Ok(crate::secure_key::SecretVaultOpenOptions {
+        first_run_intent,
+        passphrase,
+    })
+}
+
 #[derive(Clone)]
 pub struct OnboardingAuthority {
     db: Db,
@@ -40,6 +68,20 @@ impl OnboardingAuthority {
             .transpose()
     }
 
+    pub async fn receipt(
+        &self,
+        query: cockpit_proto::OnboardingReceiptQuery,
+    ) -> Result<Option<OnboardingTransitionReceipt>> {
+        if query.client_operation_id.is_empty() {
+            bail!("onboarding client operation id is required");
+        }
+        let row = self
+            .db
+            .onboarding_receipt(query.run_id, query.attempt_id, query.client_operation_id)
+            .await?;
+        Ok(row.map(receipt))
+    }
+
     pub async fn begin_or_reopen(
         &self,
         request: BeginOrReopenOnboarding,
@@ -48,7 +90,7 @@ impl OnboardingAuthority {
         if request.client_operation_id.is_empty() {
             bail!("onboarding client operation id is required");
         }
-        let (row, receipt) = self
+        let (row, receipt_row) = self
             .db
             .onboarding_begin_or_reopen(
                 request.expected_revision,
@@ -56,7 +98,7 @@ impl OnboardingAuthority {
                 request.reentry,
             )
             .await?;
-        let receipt = receipt(receipt);
+        let receipt = receipt(receipt_row);
         let snapshot = project(row, host_capabilities, Some(receipt.clone()))?;
         Ok((snapshot, receipt))
     }
@@ -89,7 +131,7 @@ impl OnboardingAuthority {
                 DbStage::SecureStore,
                 DbBootstrapState::Materializing,
                 false,
-                Some(placement(placement)),
+                Some(db_placement(placement)),
             )
             .await?
         {
@@ -110,7 +152,16 @@ impl OnboardingAuthority {
                 host_capabilities.clone(),
             )
             .await?;
-        materialize(placement, passphrase)?;
+        if let Err(error) = materialize(placement, passphrase) {
+            self.db
+                .onboarding_set_pending_receipt_status(
+                    pending_receipt.receipt_id,
+                    DbReceiptStatus::Unknown,
+                )
+                .await
+                .context("recording uncertain secure-store materialization")?;
+            return Err(error);
+        }
         self.db
             .onboarding_set_pending_receipt_status(
                 pending_receipt.receipt_id,
@@ -126,7 +177,7 @@ impl OnboardingAuthority {
             .await?;
         let terminal = OnboardingTransitionReceipt {
             status: OnboardingReceiptStatus::Committed,
-            ..receipt(pending_receipt)
+            ..pending_receipt
         };
         Ok((ready, terminal))
     }
@@ -148,6 +199,24 @@ impl OnboardingAuthority {
             OnboardingSecurePlacement::PassphraseFile => {}
             _ if passphrase_present => bail!("passphrase is only valid for passphrase placement"),
             _ => {}
+        }
+        let capability_id = match placement {
+            OnboardingSecurePlacement::Automatic | OnboardingSecurePlacement::Keyring => {
+                "secret_store.keyring"
+            }
+            OnboardingSecurePlacement::PassphraseFile
+            | OnboardingSecurePlacement::MachineBoundFile => "secret_store.file",
+        };
+        let capability = host_capabilities
+            .feature(capability_id)
+            .context("secure-store capability has not been published")?;
+        if !capability.state.is_available() {
+            let guidance = capability
+                .fix_command
+                .as_deref()
+                .or(capability.remedy_text.as_deref())
+                .unwrap_or(capability.reason.as_str());
+            bail!("selected secure-store placement is unavailable: {guidance}");
         }
         let current = self
             .db
@@ -171,7 +240,7 @@ impl OnboardingAuthority {
                 DbStage::SecureStore,
                 DbBootstrapState::Materializing,
                 false,
-                Some(placement(placement)),
+                Some(db_placement(placement)),
             )
             .await?;
         let receipt = receipt(receipt_row);
@@ -331,7 +400,9 @@ fn ordinary_transition(
     Ok((next, false))
 }
 
-fn placement(value: OnboardingSecurePlacement) -> crate::db::onboarding::OnboardingSecurePlacement {
+fn db_placement(
+    value: OnboardingSecurePlacement,
+) -> crate::db::onboarding::OnboardingSecurePlacement {
     match value {
         OnboardingSecurePlacement::Automatic => {
             crate::db::onboarding::OnboardingSecurePlacement::Automatic
@@ -414,7 +485,19 @@ mod tests {
     };
 
     fn capabilities() -> HostCapabilitySnapshot {
-        HostCapabilitySnapshot::unpublished()
+        let mut snapshot = HostCapabilitySnapshot::unpublished();
+        snapshot.features = ["secret_store.keyring", "secret_store.file"]
+            .into_iter()
+            .map(|id| cockpit_proto::FeatureCapabilityRow {
+                id: id.into(),
+                state: cockpit_proto::FeatureCapabilityState::Available,
+                reason: "test capability available".into(),
+                fix_command: None,
+                remedy_text: None,
+                dependency_ids: Vec::new(),
+            })
+            .collect();
+        snapshot
     }
 
     async fn secure_stage(authority: &OnboardingAuthority) -> OnboardingBootstrapSnapshot {
@@ -482,7 +565,10 @@ mod tests {
                 capabilities(),
                 |placement, passphrase| {
                     assert_eq!(placement, OnboardingSecurePlacement::PassphraseFile);
-                    assert_eq!(passphrase.as_deref(), Some("passphrase-canary"));
+                    assert_eq!(
+                        passphrase.as_ref().map(|value| value.as_str()),
+                        Some("passphrase-canary")
+                    );
                     Ok(())
                 },
             )
@@ -495,7 +581,7 @@ mod tests {
                 let mut statement = conn.prepare(
                     "SELECT group_concat(run_id || ':' || active_attempt_id || ':' || coalesce(selected_secure_placement, ''), '|') FROM onboarding_runs",
                 )?;
-                statement.query_row([], |row| row.get::<_, Option<String>>(0))
+                Ok(statement.query_row([], |row| row.get::<_, Option<String>>(0))?)
             })
             .await
             .unwrap()
@@ -608,6 +694,16 @@ mod tests {
             .await
             .expect_err("failed materialization must leave an uncertain checkpoint");
         assert!(error.to_string().contains("materializer interrupted"));
+        let uncertain = authority
+            .receipt(cockpit_proto::OnboardingReceiptQuery {
+                run_id: secure.run_id,
+                attempt_id: secure.attempt_id,
+                client_operation_id: "interrupted-passphrase-intent".into(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(uncertain.status, OnboardingReceiptStatus::Unknown);
         let resumed = authority
             .reconcile_materializing_secure_intent(false, capabilities())
             .await
@@ -620,11 +716,11 @@ mod tests {
         );
         let serialized_rows = db
             .read(|conn| {
-                conn.query_row(
+                Ok(conn.query_row(
                     "SELECT group_concat(run_id || active_attempt_id || coalesce(selected_secure_placement, ''), '|') FROM onboarding_runs",
                     [],
                     |row| row.get::<_, Option<String>>(0),
-                )
+                )?)
             })
             .await
             .unwrap()
@@ -634,6 +730,119 @@ mod tests {
             !serde_json::to_string(&resumed)
                 .unwrap()
                 .contains("crash-canary")
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_keyring_requires_a_new_explicit_file_choice() {
+        let db = Db::open_in_memory_async().await.unwrap();
+        let authority = OnboardingAuthority::new(db);
+        let secure = secure_stage(&authority).await;
+        let mut unavailable = capabilities();
+        let keyring = unavailable
+            .features
+            .iter_mut()
+            .find(|feature| feature.id == "secret_store.keyring")
+            .unwrap();
+        keyring.state = cockpit_proto::FeatureCapabilityState::Missing;
+        keyring.fix_command = Some("unlock-keyring".into());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let error = authority
+            .apply_secure_intent_with(
+                ApplyOnboardingSecureIntent {
+                    run_id: secure.run_id,
+                    attempt_id: secure.attempt_id,
+                    expected_revision: secure.revision,
+                    client_operation_id: "keyring-choice".into(),
+                    placement: OnboardingSecurePlacement::Automatic,
+                    passphrase: None,
+                },
+                unavailable.clone(),
+                move |_, _| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unlock-keyring"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let (ready, _) = authority
+            .apply_secure_intent_with(
+                ApplyOnboardingSecureIntent {
+                    run_id: secure.run_id,
+                    attempt_id: secure.attempt_id,
+                    expected_revision: secure.revision,
+                    client_operation_id: "explicit-file-choice".into(),
+                    placement: OnboardingSecurePlacement::MachineBoundFile,
+                    passphrase: None,
+                },
+                unavailable,
+                |placement, _| {
+                    assert_eq!(placement, OnboardingSecurePlacement::MachineBoundFile);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready.stage, OnboardingStage::Provider);
+    }
+
+    #[tokio::test]
+    async fn concurrent_clients_can_consume_one_revision_only() {
+        let db = Db::open_in_memory_async().await.unwrap();
+        let authority = OnboardingAuthority::new(db);
+        let secure = secure_stage(&authority).await;
+        let (provider, _) = authority
+            .apply_secure_intent_with(
+                ApplyOnboardingSecureIntent {
+                    run_id: secure.run_id,
+                    attempt_id: secure.attempt_id,
+                    expected_revision: secure.revision,
+                    client_operation_id: "secure".into(),
+                    placement: OnboardingSecurePlacement::MachineBoundFile,
+                    passphrase: None,
+                },
+                capabilities(),
+                |_, _| Ok(()),
+            )
+            .await
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut tasks = Vec::new();
+        for operation in ["client-a", "client-b"] {
+            let authority = authority.clone();
+            let barrier = barrier.clone();
+            let provider = provider.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                authority
+                    .apply_transition(
+                        ApplyOnboardingTransition {
+                            run_id: provider.run_id,
+                            attempt_id: provider.attempt_id,
+                            expected_revision: provider.revision,
+                            client_operation_id: operation.into(),
+                            transition: OnboardingTransitionKind::Advance,
+                        },
+                        capabilities(),
+                    )
+                    .await
+            }));
+        }
+        barrier.wait().await;
+        let first = tasks.remove(0).await.unwrap();
+        let second = tasks.remove(0).await.unwrap();
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        assert_eq!(
+            authority
+                .snapshot(capabilities())
+                .await
+                .unwrap()
+                .unwrap()
+                .stage,
+            OnboardingStage::Model
         );
     }
 }

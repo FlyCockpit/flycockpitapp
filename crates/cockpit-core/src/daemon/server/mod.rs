@@ -967,6 +967,15 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         proto::Response::HostCapabilities { snapshot } => {
             scrub_host_capability_snapshot(snapshot, redact);
         }
+        proto::Response::OnboardingBootstrapSnapshot(snapshot) => {
+            if let Some(snapshot) = snapshot {
+                scrub_host_capability_snapshot(&mut snapshot.host_capabilities, redact);
+            }
+        }
+        proto::Response::OnboardingTransition(result) => {
+            scrub_host_capability_snapshot(&mut result.snapshot.host_capabilities, redact);
+        }
+        proto::Response::OnboardingTransitionReceipt(_) => {}
         // Exported policy bundle is opaque serialized config free-text; scrub any
         // known secret value that a caller may have placed inline (defense in
         // depth — the bundle normally carries only `$secret:` references).
@@ -1583,6 +1592,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
         proto::Event::HostCapabilitiesChanged { snapshot } => {
             scrub_host_capability_snapshot(snapshot, redact);
         }
+        proto::Event::OnboardingBootstrap(_) => {}
         proto::Event::AgentTreeChanged { .. } => {}
         // Session id, durable revision, and a closed state tag: no
         // configuration value, path, or free text can reach a client here.
@@ -2559,6 +2569,9 @@ pub(crate) fn ensure_authorized_global_layer(path: &Path) -> std::result::Result
 /// share without copying.
 pub struct DaemonContext {
     pub db: Db,
+    /// Single user-global onboarding metadata authority. It owns only
+    /// vault-free SQLite state and remains usable under IgnoreConfig.
+    pub onboarding: crate::onboarding::OnboardingAuthority,
     /// The single serialized owner of all local guidance proposal memory,
     /// accepted session rules, durable transitions, and expiry processing.
     pub(crate) guidance_proposals:
@@ -3366,6 +3379,7 @@ impl DaemonContext {
         }
         Self {
             guidance_proposals: registry.guidance_proposals(),
+            onboarding: crate::onboarding::OnboardingAuthority::new(db.clone()),
             db,
             media_ledger,
             media_admission_open: Arc::new(std::sync::atomic::AtomicBool::new(cfg!(test))),

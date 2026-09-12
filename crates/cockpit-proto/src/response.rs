@@ -95,6 +95,9 @@ pub enum Response {
     /// whose effects flow back as events (`SendUserMessage`,
     /// `CancelTurn`, `ResolveInterrupt`, …).
     Ack,
+    OnboardingBootstrapSnapshot(Option<crate::OnboardingBootstrapSnapshot>),
+    OnboardingTransition(crate::OnboardingTransitionResult),
+    OnboardingTransitionReceipt(Option<crate::OnboardingTransitionReceipt>),
 
     /// Authoritative pre/post-run receipt for CLI dream orchestration. The
     /// source IDs are consent-bound ledger candidates, never transcript data.
@@ -1642,6 +1645,9 @@ macro_rules! response_variants {
     ($with_variants:ident $(, $context:ident)*) => {
         $with_variants! { ($($context),*) [
             (Response::Ack, "ack");
+            (Response::OnboardingBootstrapSnapshot(..), "onboarding_bootstrap_snapshot");
+            (Response::OnboardingTransition(..), "onboarding_transition");
+            (Response::OnboardingTransitionReceipt(..), "onboarding_transition_receipt");
             (Response::KnowledgeDreamStatus { .. }, "knowledge_dream_status");
             (Response::KnowledgeDreamRuns { .. }, "knowledge_dream_runs");
             (Response::CodeRootCreated(..), "code_root_created");

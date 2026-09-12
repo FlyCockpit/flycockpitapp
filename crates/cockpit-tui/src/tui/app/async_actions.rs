@@ -990,6 +990,21 @@ impl App {
                     self.apply_workspace_trust_completion(completion);
                 }
             }
+            AsyncActionKind::DaemonRpc("onboarding.bootstrap" | "onboarding.transition") => {
+                match result.payload {
+                    Ok(AsyncActionPayload::OnboardingBootstrap(snapshot)) => {
+                        self.apply_onboarding_bootstrap_snapshot(snapshot);
+                    }
+                    Err(error) => self.show_toast(
+                        format!("Onboarding authority unavailable: {error}"),
+                        crate::tui::app::ToastKind::Error,
+                    ),
+                    Ok(_) => self.show_toast(
+                        "Onboarding authority returned an invalid projection",
+                        crate::tui::app::ToastKind::Error,
+                    ),
+                }
+            }
             AsyncActionKind::DaemonRpc("sealed.effect") => {
                 if let Ok(AsyncActionPayload::Sealed(completion)) = result.payload {
                     self.apply_sealed_completion(completion);

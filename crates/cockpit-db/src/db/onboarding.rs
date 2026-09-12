@@ -209,6 +209,46 @@ impl Db {
         self.read(snapshot_conn).await
     }
 
+    pub async fn onboarding_receipt(
+        &self,
+        run_id: Uuid,
+        attempt_id: Uuid,
+        client_operation_id: String,
+    ) -> Result<Option<OnboardingReceiptRow>> {
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT receipt_id, consumed_revision, status FROM onboarding_receipts
+                 WHERE run_id = ?1 AND attempt_id = ?2 AND client_operation_id = ?3",
+                params![
+                    run_id.to_string(),
+                    attempt_id.to_string(),
+                    client_operation_id
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(receipt_id, consumed_revision, status)| {
+                Ok(OnboardingReceiptRow {
+                    receipt_id: uuid(receipt_id, "receipt id")?,
+                    run_id,
+                    attempt_id,
+                    client_operation_id,
+                    consumed_revision: u64::try_from(consumed_revision)?,
+                    status: OnboardingReceiptStatus::parse(&status)?,
+                    replayed: true,
+                })
+            })
+            .transpose()
+        })
+        .await
+    }
+
     /// Begin the first durable run or reopen the active run using revision CAS.
     pub async fn onboarding_begin_or_reopen(
         &self,
@@ -354,6 +394,41 @@ fn begin_or_reopen_conn(
     reentry: bool,
 ) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
     if let Some(existing) = snapshot_conn(conn)? {
+        let replay = conn
+            .query_row(
+                "SELECT receipt_id, attempt_id, consumed_revision, operation_digest, status
+                 FROM onboarding_receipts
+                 WHERE run_id = ?1 AND client_operation_id = ?2 AND operation_kind = 'begin'
+                 ORDER BY created_at_unix_ms DESC LIMIT 1",
+                params![existing.run_id.to_string(), client_operation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((receipt_id, attempt_id, consumed_revision, digest, status)) = replay {
+            if digest != digest_begin(reentry) {
+                bail!("onboarding client operation id was reused for a different begin request");
+            }
+            return Ok((
+                existing.clone(),
+                OnboardingReceiptRow {
+                    receipt_id: uuid(receipt_id, "receipt id")?,
+                    run_id: existing.run_id,
+                    attempt_id: uuid(attempt_id, "attempt id")?,
+                    client_operation_id: client_operation_id.into(),
+                    consumed_revision: u64::try_from(consumed_revision)?,
+                    status: OnboardingReceiptStatus::parse(&status)?,
+                    replayed: true,
+                },
+            ));
+        }
         let expected = expected_revision.context("onboarding revision is required for reopen")?;
         if existing.revision != expected {
             bail!("onboarding revision conflict");
@@ -819,5 +894,21 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("reused"));
+    }
+
+    #[tokio::test]
+    async fn fresh_begin_double_submit_returns_the_same_receipt() {
+        let db = Db::open_in_memory_async().await.unwrap();
+        let (first_snapshot, first_receipt) = db
+            .onboarding_begin_or_reopen(None, "one-begin".into(), false)
+            .await
+            .unwrap();
+        let (replayed_snapshot, replayed_receipt) = db
+            .onboarding_begin_or_reopen(None, "one-begin".into(), false)
+            .await
+            .unwrap();
+        assert_eq!(replayed_snapshot, first_snapshot);
+        assert_eq!(replayed_receipt.receipt_id, first_receipt.receipt_id);
+        assert!(replayed_receipt.replayed);
     }
 }

@@ -97,9 +97,10 @@ pub use host_capabilities::{
 pub use launch::{LaunchBundle, LaunchInfo, RepoStatus};
 pub use onboarding::{
     ApplyOnboardingSecureIntent, ApplyOnboardingTransition, BeginOrReopenOnboarding,
-    OnboardingBootstrapEvent, OnboardingBootstrapSnapshot, OnboardingBootstrapState,
-    OnboardingReceiptStatus, OnboardingSecurePlacement, OnboardingStage, OnboardingTransitionKind,
-    OnboardingTransitionReceipt, SensitiveOnboardingPassphrase,
+    LockedBootstrapHello, OnboardingBootstrapEvent, OnboardingBootstrapSnapshot,
+    OnboardingBootstrapState, OnboardingReceiptQuery, OnboardingReceiptStatus,
+    OnboardingSecurePlacement, OnboardingStage, OnboardingTransitionKind,
+    OnboardingTransitionReceipt, OnboardingTransitionResult, SensitiveOnboardingPassphrase,
 };
 pub use provider_management::{
     ProviderLayerMetadataPatch, ProviderMutationBatch, ProviderMutationDelete,
@@ -1327,14 +1328,14 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v22 includes first-class assistant-thread
+/// Current wire schema version. v23 includes first-class assistant-thread
 /// creation and durable lineage projections, alongside the V2 tagged ingress envelope,
 /// queued-message delivery classes, local queue controls, MCP credential
 /// profiles, agent-dimensioned MCP scopes on the attached-session and
 /// daemon-owned setup inventory, bounded base64 media previews, the
 /// rolling-precompaction resume choice, and knowledge-dream completion
 /// receipts including ordered all-KB runs.
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -2255,6 +2256,9 @@ pub enum ErrorCode {
     NotFound,
     /// Daemon is shutting down.
     Shutdown,
+    /// The authenticated daemon is in locked first-run mode; only the named
+    /// bootstrap RPC allowlist is available.
+    BootstrapLocked,
     /// Principal is not authorized for the requested operation.
     Authorization,
     /// Principal has read-only access to this session.
@@ -2365,6 +2369,7 @@ impl<'de> Deserialize<'de> for ErrorCode {
             "unknown_interrupt" => Self::UnknownInterrupt,
             "not_found" => Self::NotFound,
             "shutdown" => Self::Shutdown,
+            "bootstrap_locked" => Self::BootstrapLocked,
             "authorization" => Self::Authorization,
             "read_only" => Self::ReadOnly,
             "root_missing" => Self::RootMissing,
@@ -2414,6 +2419,7 @@ impl std::fmt::Display for ErrorCode {
             Self::UnknownInterrupt => "unknown_interrupt",
             Self::NotFound => "not_found",
             Self::Shutdown => "shutdown",
+            Self::BootstrapLocked => "bootstrap_locked",
             Self::Authorization => "authorization",
             Self::ReadOnly => "read_only",
             Self::RootMissing => "root_missing",
@@ -7484,12 +7490,12 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 22);
+        assert_eq!(PROTOCOL_VERSION, 23);
         let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
-                .expect("current v22 config_refreshed fixture")
+                .expect("current v23 config_refreshed fixture")
                 .clone(),
         )
         .unwrap();
@@ -7504,19 +7510,19 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 22);
+        assert_eq!(PROTOCOL_VERSION, 23);
         let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
                 .get(response_name)
-                .unwrap_or_else(|| panic!("current v22 {response_name} fixture"));
+                .unwrap_or_else(|| panic!("current v23 {response_name} fixture"));
             assert_eq!(
                 response["data"]["goal"]["max_verification_attempts"], 4,
-                "current v22 {response_name} must freeze the inclusive verification cap"
+                "current v23 {response_name} must freeze the inclusive verification cap"
             );
             serde_json::from_value::<Response>(response.clone()).unwrap_or_else(|error| {
-                panic!("current v22 {response_name} must deserialize: {error}")
+                panic!("current v23 {response_name} must deserialize: {error}")
             });
         }
     }
@@ -7529,13 +7535,13 @@ mod tests {
                 serde_json::from_value(fixture[response_name]["data"]["assistant"].clone())
                     .unwrap();
             validate_assistant_summary(&summary).unwrap_or_else(|error| {
-                panic!("current v22 {response_name} assistant identity is invalid: {error}")
+                panic!("current v23 {response_name} assistant identity is invalid: {error}")
             });
         }
         let summary: AssistantSummary =
             serde_json::from_value(fixture["assistants"]["data"]["assistants"][0].clone()).unwrap();
         validate_assistant_summary(&summary)
-            .expect("current v22 assistant inventory must carry bounded opaque revisions");
+            .expect("current v23 assistant inventory must carry bounded opaque revisions");
         assert_eq!(fixture["assistants"]["data"]["config_generation"], 7);
         assert_eq!(
             fixture["agent_inventory"]["data"]["config_generation"],
@@ -7621,7 +7627,7 @@ mod tests {
         ] {
             assert!(
                 mcp[field].is_string(),
-                "current v22 MCP CAS fixture must carry {field}"
+                "current v23 MCP CAS fixture must carry {field}"
             );
         }
         assert_eq!(mcp["expected_revision"].as_str().map(str::len), Some(64));
@@ -7671,7 +7677,7 @@ mod tests {
         ] {
             assert!(
                 requests[tag]["params"]["client_operation_id"].is_string(),
-                "current v22 fixture must carry an operation id for {tag}"
+                "current v23 fixture must carry an operation id for {tag}"
             );
         }
         let responses = proto_fixture_files::read_fixture("response.json");

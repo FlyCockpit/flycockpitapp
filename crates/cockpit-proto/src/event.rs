@@ -731,6 +731,7 @@ pub enum WorkspaceTrustReconciliationState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case", content = "data")]
 pub enum Event {
+    OnboardingBootstrap(crate::OnboardingBootstrapEvent),
     EnvDriftWarning {
         baseline: EnvSnapshotMeta,
         candidate: EnvSnapshotMeta,
@@ -1847,6 +1848,7 @@ macro_rules! event_variants {
             (Event::GitignoreAllow { .. }, "gitignore_allow");
             (Event::CaffeinateState { .. }, "caffeinate_state");
             (Event::DaemonLifetimeChanged { .. }, "daemon_lifetime_changed");
+            (Event::OnboardingBootstrap(..), "onboarding_bootstrap");
             #[cfg(feature = "remote")]
             (Event::ConnectorStatus { .. }, "connector_status");
             (Event::TerminalOutput { .. }, "terminal_output");

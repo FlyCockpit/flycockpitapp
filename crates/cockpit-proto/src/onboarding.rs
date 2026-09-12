@@ -113,6 +113,30 @@ pub struct OnboardingBootstrapEvent {
     pub state: OnboardingBootstrapState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnboardingTransitionResult {
+    pub snapshot: OnboardingBootstrapSnapshot,
+    pub receipt: OnboardingTransitionReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnboardingReceiptQuery {
+    pub run_id: Uuid,
+    pub attempt_id: Uuid,
+    pub client_operation_id: String,
+}
+
+/// Redacted metadata sent after local peer authentication while normal daemon
+/// services remain locked behind first-run vault materialization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockedBootstrapHello {
+    pub protocol_version: u32,
+    pub bootstrap_available: bool,
+    pub host_capabilities: HostCapabilitySnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<OnboardingBootstrapSnapshot>,
+}
+
 /// One-shot local ingress.  This is deliberately not serializable, cloneable,
 /// or printable: any socket implementation must use the existing sensitive
 /// local boundary rather than accidentally adding a JSON representation.

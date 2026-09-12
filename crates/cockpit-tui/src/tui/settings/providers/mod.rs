@@ -35,7 +35,7 @@ use oauth_flow::handle_oauth_flow_key_with;
 #[cfg(all(test, feature = "grok-subscription"))]
 pub(crate) use oauth_flow::prepare_grok_browser_start;
 pub(crate) use oauth_flow::{
-    OAuthBeginResult, OAuthEffects, OAuthFlowOp, OAuthFlowRequest, OAuthFlowState, OAuthOption,
+    OAuthBeginResult, OAuthFlowOp, OAuthFlowRequest, OAuthFlowState, OAuthOption,
     OAuthPresentationResult, OAuthProvider, OAuthPublicBegin, present_oauth_on_blocking_worker,
 };
 use oauth_flow::{
@@ -996,23 +996,7 @@ impl AddState {
 
     pub(super) fn new_with_onboarding(onboarding: bool) -> Self {
         let descriptor = cockpit_core::wizard::provider_descriptor();
-        let run = if onboarding {
-            cockpit_core::welcome::onboarding_wizard_progress(
-                cockpit_core::wizard::PROVIDER_WIZARD_ID,
-            )
-            .and_then(|progress| {
-                cockpit_core::wizard::WizardRun::resume_from_answers_json(
-                    descriptor.clone(),
-                    &progress,
-                )
-                .ok()
-            })
-            .unwrap_or_else(|| {
-                WizardRun::new(descriptor).expect("built-in provider wizard descriptor is valid")
-            })
-        } else {
-            WizardRun::new(descriptor).expect("built-in provider wizard descriptor is valid")
-        };
+        let run = WizardRun::new(descriptor).expect("built-in provider wizard descriptor is valid");
         let mut state = Self {
             onboarding,
             run,
@@ -1062,14 +1046,6 @@ impl AddState {
             .expect("provider validation step exists");
         self.saved_provider_id = Some(provider_id.to_string());
         self.error = Some("Resume setup: test the saved credential with the daemon.".into());
-    }
-
-    fn checkpoint(&mut self) {
-        if self.onboarding
-            && let Err(error) = cockpit_core::welcome::persist_onboarding_wizard_progress(&self.run)
-        {
-            self.error = Some(format!("could not save setup progress: {error}"));
-        }
     }
 
     fn restore_non_secret_inputs(&mut self) {
@@ -1649,15 +1625,6 @@ impl SettingsCx {
         // process) is gone. Persist its validation continuation before the
         // mutation is handed off so Escape can never detach a committed
         // provider from first-run onboarding.
-        if s.onboarding
-            && let Err(error) =
-                cockpit_core::welcome::persist_onboarding_provider_pending_validation(&id)
-        {
-            s.error = Some(format!(
-                "could not record setup progress before saving provider: {error}"
-            ));
-            return;
-        }
         self.config.providers.insert(id.clone(), entry.clone());
         self.pending_provider_add = Some(super::PendingProviderAdd {
             id,
@@ -1813,7 +1780,6 @@ impl SettingsCx {
                     s.run
                         .submit(WizardAnswer::Select(t.id.to_string()))
                         .expect("provider template is a valid select answer");
-                    s.checkpoint();
                 }
                 _ => {}
             },
@@ -1835,7 +1801,6 @@ impl SettingsCx {
                             s.error = Some(error);
                         } else {
                             s.error = None;
-                            s.checkpoint();
                         }
                     }
                     _ => {}
@@ -1856,7 +1821,6 @@ impl SettingsCx {
                         if let Err(error) = s.run.submit(WizardAnswer::Text(id)) {
                             s.error = Some(error);
                         } else {
-                            s.checkpoint();
                         }
                     }
                 }
@@ -1874,7 +1838,6 @@ impl SettingsCx {
                         if let Err(error) = s.run.submit(WizardAnswer::Text(url)) {
                             s.error = Some(error);
                         } else {
-                            s.checkpoint();
                             match s.run.current_step_id() {
                                 Some("copilot-auth") => {
                                     s.copilot_auth = Some(CopilotSetupState::new());
@@ -1963,7 +1926,6 @@ impl SettingsCx {
                             s.error = Some(error);
                         } else {
                             s.error = None;
-                            s.checkpoint();
                         }
                     }
                     _ => {}

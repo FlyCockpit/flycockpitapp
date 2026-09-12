@@ -6157,6 +6157,9 @@ impl Dialog {
 
     pub fn onboarding_provider_settlement(
         &mut self,
+        run_id: uuid::Uuid,
+        attempt_id: uuid::Uuid,
+        stage_revision: u64,
     ) -> Option<cockpit_proto::OnboardingStageSettlement> {
         let Dialog::Settings(settings) = self else {
             return None;
@@ -6178,6 +6181,9 @@ impl Dialog {
                     .then_some(settings.cx.config.resolution_generation)
             })?;
         Some(cockpit_proto::OnboardingStageSettlement {
+            run_id,
+            attempt_id,
+            stage_revision,
             settlement_operation_id: operation_id,
             provider_id: Some(provider_id),
             config_generation,
@@ -6188,6 +6194,9 @@ impl Dialog {
         &self,
         wizard_id: &str,
         config_generation: u64,
+        run_id: uuid::Uuid,
+        attempt_id: uuid::Uuid,
+        stage_revision: u64,
     ) -> Option<cockpit_proto::OnboardingStageSettlement> {
         let Dialog::SetupWizard(wizard) = self else {
             return None;
@@ -6197,6 +6206,9 @@ impl Dialog {
         }
         let operation_id = wizard.settled_operation_id?.to_string();
         Some(cockpit_proto::OnboardingStageSettlement {
+            run_id,
+            attempt_id,
+            stage_revision,
             settlement_operation_id: operation_id,
             provider_id: None,
             config_generation,
@@ -9763,6 +9775,7 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
                     operation_id,
                     target,
                     work: SettingsDaemonEffectWork::Request(Request::ApplySetupWizard {
+                        client_operation_id: operation_id.to_string(),
                         project_root,
                         wizard_id: run.descriptor().id.to_string(),
                         answers_json,

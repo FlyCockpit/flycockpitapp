@@ -35,6 +35,22 @@ pub struct LocalOperationIdentity {
 }
 
 impl Db {
+    pub async fn local_operation_started_at_unix_ms(
+        &self,
+        owner_digest: String,
+        client_operation_id: String,
+    ) -> Result<Option<i64>> {
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT created_at_unix_ms FROM local_operation_receipts WHERE owner_digest=?1 AND client_operation_id=?2",
+                params![owner_digest, client_operation_id],
+                |row| row.get(0),
+            )
+            .optional()
+        })
+        .await
+    }
+
     pub async fn local_operation_settlement(
         &self,
         owner_digest: String,

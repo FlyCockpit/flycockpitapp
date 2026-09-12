@@ -101,6 +101,9 @@ pub enum OnboardingTransitionKind {
 /// owning authority before the onboarding reducer may advance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OnboardingStageSettlement {
+    pub run_id: Uuid,
+    pub attempt_id: Uuid,
+    pub stage_revision: u64,
     pub settlement_operation_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,

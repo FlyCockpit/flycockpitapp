@@ -7058,6 +7058,7 @@ fn onboarding_profile_save_completes_after_daemon_apply() {
         .take_settings_daemon_effect()
         .expect("profile-save queues ApplySetupWizard");
     let SettingsDaemonEffectWork::Request(Request::ApplySetupWizard {
+        client_operation_id,
         wizard_id,
         answers_json,
         project_root,

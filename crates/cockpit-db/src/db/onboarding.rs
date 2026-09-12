@@ -273,6 +273,7 @@ impl Db {
         bootstrap_state: OnboardingBootstrapState,
         limited_mode: bool,
         selected_secure_placement: Option<OnboardingSecurePlacement>,
+        stage_entry_config_generation: u64,
     ) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
         self.onboarding_transition_with_receipt_status(
             snapshot,
@@ -282,6 +283,7 @@ impl Db {
             limited_mode,
             selected_secure_placement,
             OnboardingReceiptStatus::Committed,
+            stage_entry_config_generation,
         )
         .await
     }
@@ -297,6 +299,7 @@ impl Db {
         bootstrap_state: OnboardingBootstrapState,
         limited_mode: bool,
         selected_secure_placement: Option<OnboardingSecurePlacement>,
+        stage_entry_config_generation: u64,
     ) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
         self.onboarding_transition_with_receipt_status(
             snapshot,
@@ -306,7 +309,21 @@ impl Db {
             limited_mode,
             selected_secure_placement,
             OnboardingReceiptStatus::Pending,
+            stage_entry_config_generation,
         )
+        .await
+    }
+
+    /// Return the durable checkpoint fence for the active onboarding stage.
+    pub async fn onboarding_stage_fence(&self) -> Result<Option<(i64, u64)>> {
+        self.read(|conn| {
+            conn.query_row(
+                "SELECT stage_entered_at_unix_ms, stage_entry_config_generation FROM onboarding_runs WHERE id = 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, u64::try_from(row.get::<_, i64>(1)?)?)),
+            )
+            .optional()
+        })
         .await
     }
 
@@ -319,6 +336,7 @@ impl Db {
         limited_mode: bool,
         selected_secure_placement: Option<OnboardingSecurePlacement>,
         receipt_status: OnboardingReceiptStatus,
+        stage_entry_config_generation: u64,
     ) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
         self.write(move |conn| {
             transition_conn(
@@ -330,6 +348,7 @@ impl Db {
                 limited_mode,
                 selected_secure_placement,
                 receipt_status,
+                stage_entry_config_generation,
             )
         })
         .await
@@ -447,8 +466,8 @@ fn begin_or_reopen_conn(
     let now = Utc::now().timestamp_millis();
     conn.execute(
         "INSERT INTO onboarding_runs
-         (id, run_id, active_attempt_id, revision, stage, bootstrap_state, limited_mode, created_at_unix_ms, updated_at_unix_ms)
-         VALUES (1, ?1, ?2, 0, 'welcome', 'awaiting_choice', 0, ?3, ?3)",
+         (id, run_id, active_attempt_id, revision, stage, bootstrap_state, limited_mode, stage_entered_at_unix_ms, stage_entry_config_generation, created_at_unix_ms, updated_at_unix_ms)
+         VALUES (1, ?1, ?2, 0, 'welcome', 'awaiting_choice', 0, ?3, 0, ?3, ?3)",
         params![run_id.to_string(), attempt_id.to_string(), now],
     )?;
     conn.execute(
@@ -486,6 +505,7 @@ fn transition_conn(
     limited_mode: bool,
     selected_secure_placement: Option<OnboardingSecurePlacement>,
     receipt_status: OnboardingReceiptStatus,
+    stage_entry_config_generation: u64,
 ) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
     if client_operation_id.is_empty() || client_operation_id.len() > 128 {
         bail!("invalid onboarding client operation id");
@@ -537,10 +557,25 @@ fn transition_conn(
         .checked_add(1)
         .context("onboarding revision overflow")?;
     let now = Utc::now().timestamp_millis();
+    let stage_changed = next_stage != current.stage;
     let changed = conn.execute(
-        "UPDATE onboarding_runs SET revision = ?1, stage = ?2, bootstrap_state = ?3, limited_mode = ?4, selected_secure_placement = ?5, updated_at_unix_ms = ?6
+        "UPDATE onboarding_runs SET revision = ?1, stage = ?2, bootstrap_state = ?3, limited_mode = ?4, selected_secure_placement = ?5, updated_at_unix_ms = ?6,
+         stage_entered_at_unix_ms = CASE WHEN ?10 THEN ?6 ELSE stage_entered_at_unix_ms END,
+         stage_entry_config_generation = CASE WHEN ?10 THEN ?11 ELSE stage_entry_config_generation END
          WHERE id = 1 AND run_id = ?7 AND active_attempt_id = ?8 AND revision = ?9",
-        params![i64::try_from(next_revision)?, next_stage.as_str(), bootstrap_state.as_str(), if limited_mode { 1_i64 } else { 0_i64 }, selected_secure_placement.map(OnboardingSecurePlacement::as_str), now, current.run_id.to_string(), current.attempt_id.to_string(), i64::try_from(current.revision)?],
+        params![
+            i64::try_from(next_revision)?,
+            next_stage.as_str(),
+            bootstrap_state.as_str(),
+            if limited_mode { 1_i64 } else { 0_i64 },
+            selected_secure_placement.map(OnboardingSecurePlacement::as_str),
+            now,
+            current.run_id.to_string(),
+            current.attempt_id.to_string(),
+            i64::try_from(current.revision)?,
+            stage_changed,
+            i64::try_from(stage_entry_config_generation)?,
+        ],
     )?;
     if changed != 1 {
         bail!("onboarding revision conflict");
@@ -687,7 +722,8 @@ fn reopen_conn(
     let receipt_id = Uuid::new_v4();
     let now = Utc::now().timestamp_millis();
     let changed = conn.execute(
-        "UPDATE onboarding_runs SET active_attempt_id = ?1, revision = ?2, updated_at_unix_ms = ?3
+        "UPDATE onboarding_runs SET active_attempt_id = ?1, revision = ?2, updated_at_unix_ms = ?3,
+         stage_entered_at_unix_ms = ?3
          WHERE id = 1 AND run_id = ?4 AND active_attempt_id = ?5 AND revision = ?6",
         params![
             next_attempt_id.to_string(),
@@ -784,6 +820,7 @@ mod tests {
                 OnboardingBootstrapState::Materializing,
                 false,
                 Some(OnboardingSecurePlacement::Keyring),
+                0,
             )
             .await
             .unwrap();
@@ -798,6 +835,7 @@ mod tests {
                 OnboardingBootstrapState::Materializing,
                 false,
                 Some(OnboardingSecurePlacement::Keyring),
+                0,
             )
             .await
             .unwrap();
@@ -812,6 +850,7 @@ mod tests {
                 OnboardingBootstrapState::Ready,
                 false,
                 None,
+                0,
             )
             .await
             .unwrap_err();
@@ -834,6 +873,7 @@ mod tests {
                 OnboardingBootstrapState::Materializing,
                 false,
                 Some(OnboardingSecurePlacement::MachineBoundFile),
+                0,
             )
             .await
             .unwrap();
@@ -858,6 +898,7 @@ mod tests {
                 OnboardingBootstrapState::Materializing,
                 false,
                 Some(OnboardingSecurePlacement::MachineBoundFile),
+                0,
             )
             .await
             .unwrap();
@@ -879,6 +920,7 @@ mod tests {
             OnboardingBootstrapState::Materializing,
             false,
             Some(OnboardingSecurePlacement::Keyring),
+            0,
         )
         .await
         .unwrap();
@@ -890,6 +932,7 @@ mod tests {
                 OnboardingBootstrapState::Materializing,
                 false,
                 Some(OnboardingSecurePlacement::MachineBoundFile),
+                0,
             )
             .await
             .unwrap_err();

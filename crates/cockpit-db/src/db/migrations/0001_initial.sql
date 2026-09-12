@@ -7380,6 +7380,8 @@ CREATE TABLE onboarding_runs (
     )),
     limited_mode        INTEGER NOT NULL DEFAULT 0 CHECK (limited_mode IN (0, 1)),
     lifetime_selection  TEXT,
+    stage_entered_at_unix_ms INTEGER NOT NULL,
+    stage_entry_config_generation INTEGER NOT NULL DEFAULT 0 CHECK (stage_entry_config_generation >= 0),
     created_at_unix_ms  INTEGER NOT NULL,
     updated_at_unix_ms  INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms)
 );

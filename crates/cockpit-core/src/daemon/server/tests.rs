@@ -14131,6 +14131,7 @@ async fn remote_owner_import_policy_rejects_literal_credential_and_closes_ledger
 async fn remote_owner_setup_mutations_reserve_and_close_ledger() {
     for request in [
         Request::ApplySetupWizard {
+            client_operation_id: "remote-setup-wizard".into(),
             project_root: tempfile::tempdir()
                 .unwrap()
                 .path()
@@ -22861,6 +22862,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             provider_id: "matrix-provider".into(),
         },
         "apply_setup_wizard" => Request::ApplySetupWizard {
+            client_operation_id: "matrix-operation".into(),
             project_root: root.clone(),
             // A recognized wizard id ("security"/"model") so the request passes
             // `validate_request_semantics` and reaches the authz gate; the empty
@@ -30781,7 +30783,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::SetProviderLayerMetadata { project_root: "/tmp/project".into(), category_defaults_json: "{}".into(), on_unlisted_models_fetch: crate::config::providers::OnUnlistedModelsFetch::Keep }, kind: "set_provider_layer_metadata", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::SetupCopilotAuth { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), provider_id: "example".into() }, kind: "setup_copilot_auth", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::ApplySetupWizard { project_root: "/tmp/project".into(), wizard_id: "security".into(), answers_json: "{}".into() }, kind: "apply_setup_wizard", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ApplySetupWizard { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), wizard_id: "security".into(), answers_json: "{}".into() }, kind: "apply_setup_wizard", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::GetOnboardingBootstrapSnapshot, kind: "get_onboarding_bootstrap_snapshot", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::BeginOrReopenOnboarding(proto::BeginOrReopenOnboarding { expected_revision: None, client_operation_id: "fixture-onboarding-begin".into(), reentry: false }), kind: "begin_or_reopen_onboarding", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::ApplyOnboardingTransition(proto::ApplyOnboardingTransition { run_id: Uuid::now_v7(), attempt_id: Uuid::now_v7(), expected_revision: 0, client_operation_id: "fixture-onboarding-transition".into(), transition: proto::OnboardingTransitionKind::Advance, settlement: None }), kind: "apply_onboarding_transition", session_id: None, audit_path: None, mutating: true },

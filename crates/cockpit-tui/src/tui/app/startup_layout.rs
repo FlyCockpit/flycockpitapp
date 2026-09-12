@@ -237,14 +237,10 @@ impl App {
             }
             return true;
         }
-        let Some(stage) = self
-            .onboarding_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.stage)
-        else {
+        let Some(snapshot) = self.onboarding_snapshot.clone() else {
             return false;
         };
-        match stage {
+        match snapshot.stage {
             cockpit_proto::OnboardingStage::Complete => false,
             cockpit_proto::OnboardingStage::Welcome => {
                 if !self
@@ -319,7 +315,11 @@ impl App {
                 true
             }
             cockpit_proto::OnboardingStage::Provider => {
-                let settlement = self.dialog.onboarding_provider_settlement();
+                let settlement = self.dialog.onboarding_provider_settlement(
+                    snapshot.run_id,
+                    snapshot.attempt_id,
+                    snapshot.revision,
+                );
                 let Some(settlement) = settlement else {
                     return false;
                 };
@@ -367,6 +367,9 @@ impl App {
                 let settlement = self.dialog.onboarding_wizard_settlement(
                     cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID,
                     config_generation,
+                    snapshot.run_id,
+                    snapshot.attempt_id,
+                    snapshot.revision,
                 );
                 if settlement.is_none() {
                     return false;
@@ -389,6 +392,9 @@ impl App {
                 let settlement = self.dialog.onboarding_wizard_settlement(
                     cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID,
                     config_generation,
+                    snapshot.run_id,
+                    snapshot.attempt_id,
+                    snapshot.revision,
                 );
                 if settlement.is_none() {
                     return false;

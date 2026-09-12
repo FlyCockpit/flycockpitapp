@@ -19,6 +19,10 @@ use crate::db::onboarding::{
     OnboardingReceiptStatus as DbReceiptStatus, OnboardingSnapshotRow, OnboardingStage as DbStage,
 };
 
+fn stage_entry_config_generation() -> u64 {
+    crate::daemon::server::inventory::current_config_generation()
+}
+
 pub fn secure_vault_open_options(
     placement: OnboardingSecurePlacement,
     mut passphrase: Option<Zeroizing<String>>,
@@ -245,6 +249,7 @@ impl OnboardingAuthority {
                 DbBootstrapState::Materializing,
                 false,
                 Some(db_placement(placement)),
+                stage_entry_config_generation(),
             )
             .await?;
         let receipt = receipt(receipt_row);
@@ -289,7 +294,15 @@ impl OnboardingAuthority {
         let operation_id = format!("bootstrap-reconcile-{}", current.revision);
         let (snapshot, _) = self
             .db
-            .onboarding_transition(current, operation_id, stage, state, false, placement)
+            .onboarding_transition(
+                current,
+                operation_id,
+                stage,
+                state,
+                false,
+                placement,
+                stage_entry_config_generation(),
+            )
             .await?;
         Ok(Some(project(snapshot, host_capabilities, None)?))
     }
@@ -321,6 +334,7 @@ impl OnboardingAuthority {
                 DbBootstrapState::Ready,
                 false,
                 selected_secure_placement,
+                stage_entry_config_generation(),
             )
             .await?;
         let receipt = receipt(receipt_row);
@@ -378,6 +392,12 @@ impl OnboardingAuthority {
         {
             bail!("invalid onboarding settlement operation id");
         }
+        if settlement.run_id != request.run_id
+            || settlement.attempt_id != request.attempt_id
+            || settlement.stage_revision != request.expected_revision
+        {
+            bail!("onboarding settlement does not match the active run checkpoint");
+        }
         let current = self
             .db
             .onboarding_snapshot()
@@ -426,6 +446,7 @@ impl OnboardingAuthority {
                 DbBootstrapState::Ready,
                 limited_mode,
                 selected_secure_placement,
+                stage_entry_config_generation(),
             )
             .await?;
         let receipt = receipt(receipt_row);
@@ -926,6 +947,9 @@ mod tests {
                             client_operation_id: operation.into(),
                             transition: OnboardingTransitionKind::Advance,
                             settlement: Some(cockpit_proto::OnboardingStageSettlement {
+                                run_id: provider.run_id,
+                                attempt_id: provider.attempt_id,
+                                stage_revision: provider.revision,
                                 settlement_operation_id: "provider-settled".into(),
                                 provider_id: Some("provider".into()),
                                 config_generation: 1,

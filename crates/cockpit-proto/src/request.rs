@@ -2187,6 +2187,8 @@ pub enum Request {
     /// Answers are validated against the daemon's current descriptor; the
     /// descriptor itself never crosses the wire.
     ApplySetupWizard {
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
+        client_operation_id: String,
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
         #[serde(deserialize_with = "deserialize_owner_provider_id")]
@@ -3633,10 +3635,12 @@ impl Request {
                 validate_owner_identifier("provider id", provider_id, MAX_OWNER_PROVIDER_ID_BYTES)?;
             }
             Self::ApplySetupWizard {
+                client_operation_id,
                 project_root,
                 wizard_id,
                 answers_json,
             } => {
+                validate_owner_identifier("client operation", client_operation_id, 128)?;
                 validate_owner_project_root(project_root)?;
                 if !matches!(
                     wizard_id.as_str(),
@@ -5017,7 +5021,7 @@ macro_rules! command {
             #[cfg(feature = "remote")]
             (Request::SaveProviderConfig { project_root, provider_id, entry, header_secrets }, "save_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|entry:cockpit_config::config::providers::ProviderEntry|header_secrets:Vec<Option<crate::ProviderSecretValue>>", [project_root: String => project_root, provider_id: String => param, entry: cockpit_config::config::providers::ProviderEntry => param, header_secrets: Vec<Option<cockpit_proto::ProviderSecretValue>> => param]);
             (Request::SetupCopilotAuth { client_operation_id, project_root, provider_id }, "setup_copilot_auth", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "client_operation_id:String|project_root:String|provider_id:String", [client_operation_id: String => param, project_root: String => project_root, provider_id: String => param]);
-            (Request::ApplySetupWizard { project_root, wizard_id, answers_json }, "apply_setup_wizard", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|wizard_id:String|answers_json:String", [project_root: String => project_root, wizard_id: String => param, answers_json: String => param]);
+            (Request::ApplySetupWizard { client_operation_id, project_root, wizard_id, answers_json }, "apply_setup_wizard", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|wizard_id:String|answers_json:String", [client_operation_id: String => param, project_root: String => project_root, wizard_id: String => param, answers_json: String => param]);
             // Composite MCP publication is reserved in the remote ledger
             // before dispatch. The daemon's journal + staged vault commit
             // makes the nonrepeatable outcome replay-safe.

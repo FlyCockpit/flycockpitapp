@@ -1713,6 +1713,7 @@
   },
   "apply_setup_wizard": {
     "params": {
+      "client_operation_id": "fixture-operation",
       "project_root": "/tmp/project",
       "wizard_id": "security",
       "answers_json": "{}"

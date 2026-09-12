@@ -120,22 +120,119 @@ fn onboarding_error(error: anyhow::Error) -> ErrorPayload {
     ErrorPayload { code, message }
 }
 
-async fn validate_onboarding_stage_settlement(
+async fn onboarding_stage_fence(
     ctx: &DaemonContext,
-    stage: proto::OnboardingStage,
+) -> std::result::Result<(i64, u64), ErrorPayload> {
+    ctx.db
+        .onboarding_stage_fence()
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| bad_request("no onboarding run exists"))
+}
+
+fn validate_onboarding_settlement_checkpoint(
     settlement: &proto::OnboardingStageSettlement,
-    owner: &str,
+    run_id: uuid::Uuid,
+    attempt_id: uuid::Uuid,
+    stage_revision: u64,
 ) -> std::result::Result<(), ErrorPayload> {
     if settlement.settlement_operation_id.is_empty()
         || settlement.settlement_operation_id.len() > 128
     {
         return Err(bad_request("invalid onboarding settlement operation id"));
     }
-    if settlement.config_generation != inventory::current_config_generation() {
+    if settlement.run_id != run_id
+        || settlement.attempt_id != attempt_id
+        || settlement.stage_revision != stage_revision
+    {
+        return Err(bad_request(
+            "onboarding settlement does not match the active run checkpoint",
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_settlement_operation_fence(
+    ctx: &DaemonContext,
+    owner: &str,
+    operation_id: &str,
+    stage_entered_at_unix_ms: i64,
+    stage_entry_config_generation: u64,
+    config_generation: u64,
+) -> std::result::Result<(), ErrorPayload> {
+    if config_generation <= stage_entry_config_generation {
+        return Err(bad_request(
+            "onboarding settlement config generation does not advance the stage checkpoint",
+        ));
+    }
+    if config_generation != inventory::current_config_generation() {
         return Err(bad_request(
             "onboarding settlement config generation does not match the current authority",
         ));
     }
+    let started_at = ctx
+        .db
+        .local_operation_started_at_unix_ms(owner.to_owned(), operation_id.to_owned())
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| {
+            bad_request("onboarding settlement operation is unknown; query exact status")
+        })?;
+    if started_at < stage_entered_at_unix_ms {
+        return Err(bad_request(
+            "onboarding settlement belongs to a superseded checkpoint",
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_terminal_local_operation_settlement(
+    ctx: &DaemonContext,
+    owner: &str,
+    operation_id: &str,
+    expected_kind: &str,
+) -> std::result::Result<String, ErrorPayload> {
+    let durable = ctx
+        .db
+        .local_operation_settlement(owner.to_owned(), operation_id.to_owned())
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| {
+            bad_request("onboarding settlement operation is unknown; query exact status")
+        })?;
+    match durable {
+        crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(
+            identity,
+            json,
+        ) if identity.operation_kind == expected_kind => Ok(json),
+        _ => Err(bad_request(
+            "onboarding settlement operation is not terminal; query exact status",
+        )),
+    }
+}
+
+async fn validate_onboarding_stage_settlement(
+    ctx: &DaemonContext,
+    stage: proto::OnboardingStage,
+    settlement: &proto::OnboardingStageSettlement,
+    owner: &str,
+    run_id: uuid::Uuid,
+    attempt_id: uuid::Uuid,
+    stage_revision: u64,
+) -> std::result::Result<(), ErrorPayload> {
+    validate_onboarding_settlement_checkpoint(settlement, run_id, attempt_id, stage_revision)?;
+    let (stage_entered_at_unix_ms, stage_entry_config_generation) =
+        onboarding_stage_fence(ctx).await?;
+    let operation_id = settlement.settlement_operation_id.clone();
+    validate_settlement_operation_fence(
+        ctx,
+        owner,
+        &operation_id,
+        stage_entered_at_unix_ms,
+        stage_entry_config_generation,
+        settlement.config_generation,
+    )
+    .await?;
     match stage {
         proto::OnboardingStage::Provider => {
             let provider_id = settlement
@@ -145,31 +242,13 @@ async fn validate_onboarding_stage_settlement(
                 .ok_or_else(|| {
                     bad_request("provider advance requires a settled provider identity")
                 })?;
-            let operation_id = settlement.settlement_operation_id.clone();
-            let durable = ctx
-                .db
-                .local_operation_settlement(owner.to_owned(), operation_id.clone())
-                .await
-                .map_err(internal)?
-                .ok_or_else(|| {
-                    bad_request("provider onboarding settlement is unknown; query exact status")
-                })?;
-            let (operation_kind, response_json) = match durable {
-                crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(
-                    identity,
-                    json,
-                ) => (identity.operation_kind, json),
-                _ => {
-                    return Err(bad_request(
-                        "provider onboarding settlement is not terminal; query exact status",
-                    ));
-                }
-            };
-            if operation_kind != "apply_provider_mutation" {
-                return Err(bad_request(
-                    "provider onboarding settlement references the wrong daemon operation",
-                ));
-            }
+            let response_json = validate_terminal_local_operation_settlement(
+                ctx,
+                owner,
+                &operation_id,
+                "apply_provider_mutation",
+            )
+            .await?;
             let response: Response = serde_json::from_str(&response_json).map_err(internal)?;
             match response {
                 Response::ProviderMutationCommitted {
@@ -190,31 +269,66 @@ async fn validate_onboarding_stage_settlement(
             }
         }
         proto::OnboardingStage::Model => {
-            let global = cockpit_config::config::dirs::global_config_file().map_err(internal)?;
-            let providers = crate::config::providers::ConfigDoc::load(&global)
-                .map_err(internal)?
-                .providers();
-            if providers.active_model.is_some() {
-                Ok(())
-            } else {
-                Err(bad_request(
-                    "model onboarding advance requires a committed default model",
-                ))
+            let response_json = validate_terminal_local_operation_settlement(
+                ctx,
+                owner,
+                &operation_id,
+                "apply_setup_wizard",
+            )
+            .await?;
+            let response: Response = serde_json::from_str(&response_json).map_err(internal)?;
+            match response {
+                Response::SetupWizardApplied {
+                    changed,
+                    model_file_written,
+                    ..
+                } if changed || model_file_written => {
+                    let global =
+                        cockpit_config::config::dirs::global_config_file().map_err(internal)?;
+                    let providers = crate::config::providers::ConfigDoc::load(&global)
+                        .map_err(internal)?
+                        .providers();
+                    if providers.active_model.is_some() {
+                        Ok(())
+                    } else {
+                        Err(bad_request(
+                            "model onboarding advance requires a committed default model",
+                        ))
+                    }
+                }
+                _ => Err(bad_request(
+                    "model onboarding settlement does not match the requested advance",
+                )),
             }
         }
         proto::OnboardingStage::Agent => {
-            if ctx
-                .db
-                .default_agent_installation()
-                .await
-                .map_err(internal)?
-                .is_some()
-            {
-                Ok(())
-            } else {
-                Err(bad_request(
-                    "agent onboarding advance requires a committed default installation",
-                ))
+            let response_json = validate_terminal_local_operation_settlement(
+                ctx,
+                owner,
+                &operation_id,
+                "apply_setup_wizard",
+            )
+            .await?;
+            let response: Response = serde_json::from_str(&response_json).map_err(internal)?;
+            match response {
+                Response::SetupWizardApplied { changed, .. } if changed => {
+                    if ctx
+                        .db
+                        .default_agent_installation()
+                        .await
+                        .map_err(internal)?
+                        .is_some()
+                    {
+                        Ok(())
+                    } else {
+                        Err(bad_request(
+                            "agent onboarding advance requires a committed default installation",
+                        ))
+                    }
+                }
+                _ => Err(bad_request(
+                    "agent onboarding settlement does not match the requested advance",
+                )),
             }
         }
         _ => Err(bad_request(
@@ -6238,6 +6352,9 @@ async fn handle_serialized_request_impl(
                     snapshot.stage,
                     settlement,
                     &settings_capability_owner(state),
+                    request.run_id,
+                    request.attempt_id,
+                    request.expected_revision,
                 )
                 .await?;
                 ctx.onboarding
@@ -18022,12 +18139,34 @@ async fn handle_serialized_request_impl(
         }
 
         Request::ApplySetupWizard {
+            client_operation_id,
             project_root,
             wizard_id,
             answers_json,
         } => {
+            let settlement_owner = settings_capability_owner(state);
+            let request_hash = local_operation_request_hash(&(
+                "apply_setup_wizard",
+                &client_operation_id,
+                &project_root,
+                &wizard_id,
+                &answers_json,
+            ))?;
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &settlement_owner,
+                &client_operation_id,
+                "apply_setup_wizard",
+                request_hash,
+            )
+            .await?
+            {
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
             #[cfg(feature = "remote")]
             let request = Request::ApplySetupWizard {
+                client_operation_id: client_operation_id.clone(),
                 project_root: project_root.clone(),
                 wizard_id: wizard_id.clone(),
                 answers_json: answers_json.clone(),
@@ -18343,7 +18482,32 @@ async fn handle_serialized_request_impl(
                     default_scope: result.2,
                 })
             };
-            finish_provider_mutation_future!(remote_operation, ctx, "apply_setup_wizard", mutation)
+            match mutation.await {
+                Ok(response) => {
+                    finish_local_operation(
+                        ctx,
+                        settlement_owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &response,
+                    )
+                    .await?;
+                    Ok(response)
+                }
+                Err(error) => {
+                    finish_local_operation_error(
+                        ctx,
+                        settlement_owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    Err(error)
+                }
+            }
         }
 
         Request::SaveMcpConfig {

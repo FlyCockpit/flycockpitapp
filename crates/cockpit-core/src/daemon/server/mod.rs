@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -4370,28 +4370,37 @@ pub(crate) fn locked_in_process_endpoint(
                 )
             } else {
                 match cockpit_proto::decode_sensitive_onboarding_intent(&request.payload) {
-                    Ok(frame) => match locked.apply_secure_intent(frame.request).await {
-                        Ok(result) => match locked.into_ready().await {
-                            Ok(ready) => {
-                                let ctx = Arc::new(ready.context);
-                                if recover_before_socket_publish(&ctx).await.is_err() {
-                                    cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
+                    Ok(frame) => {
+                        match locked.apply_secure_intent(frame.request).await {
+                            Ok(result) => {
+                                locked.begin_locked_to_ready_transition().await;
+                                match locked.into_ready().await {
+                                    Ok(ready) => {
+                                        let ctx = Arc::new(ready.context);
+                                        if recover_before_socket_publish(&ctx).await.is_err() {
+                                            locked.closing.store(false, Ordering::Release);
+                                            cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
+                                            cockpit_proto::SensitiveOnboardingIntentError::MaterializationFailed,
+                                        )
+                                        } else {
+                                            let _ = ready_tx.send(Some(ctx));
+                                            locked.ready.store(true, Ordering::Release);
+                                            cockpit_proto::SensitiveOnboardingIntentResponse::Applied(result)
+                                        }
+                                    }
+                                    Err(_) => {
+                                        locked.closing.store(false, Ordering::Release);
+                                        cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
                                         cockpit_proto::SensitiveOnboardingIntentError::MaterializationFailed,
                                     )
-                                } else {
-                                    let _ = ready_tx.send(Some(ctx));
-                                    locked.ready.store(true, Ordering::Release);
-                                    cockpit_proto::SensitiveOnboardingIntentResponse::Applied(result)
+                                    }
                                 }
                             }
-                            Err(_) => cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
-                                cockpit_proto::SensitiveOnboardingIntentError::MaterializationFailed,
-                            ),
-                        },
-                        Err(error) => {
-                            cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(error)
+                            Err(error) => {
+                                cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(error)
+                            }
                         }
-                    },
+                    }
                     Err(_) => cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
                         cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest,
                     ),
@@ -4430,6 +4439,12 @@ async fn handle_locked_in_process_request(
     locked: &LockedServices,
     request: Request,
 ) -> std::result::Result<Response, ErrorPayload> {
+    if locked.locked_admission_denied() {
+        return Err(ErrorPayload {
+            code: ErrorCode::BootstrapLocked,
+            message: "daemon bootstrap is locked".into(),
+        });
+    }
     let result: Result<Response> = async {
         match request {
             Request::DaemonStatus => locked_bootstrap_hello_for_any_platform(locked, true).await,
@@ -4440,38 +4455,54 @@ async fn handle_locked_in_process_request(
                     .await?,
             )),
             Request::BeginOrReopenOnboarding(request) => {
-                let (snapshot, receipt) = locked
-                    .onboarding
-                    .begin_or_reopen(request, locked.host_capabilities.clone())
-                    .await?;
-                Ok(Response::OnboardingTransition(
-                    cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
-                ))
+                if !locked.begin_locked_mutation() {
+                    anyhow::bail!("bootstrap is locked");
+                }
+                let outcome = async {
+                    let (snapshot, receipt) = locked
+                        .onboarding
+                        .begin_or_reopen(request, locked.host_capabilities.clone())
+                        .await?;
+                    Ok(Response::OnboardingTransition(
+                        cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
+                    ))
+                }
+                .await;
+                locked.end_locked_mutation();
+                outcome
             }
             Request::GetOnboardingTransitionReceipt(query) => Ok(
                 Response::OnboardingTransitionReceipt(locked.onboarding.receipt(query).await?),
             ),
             Request::ApplyOnboardingTransition(request) => {
-                let current = locked
-                    .onboarding
-                    .snapshot(locked.host_capabilities.clone())
-                    .await?
-                    .context("onboarding run is absent")?;
-                anyhow::ensure!(
-                    matches!(
-                        current.stage,
-                        cockpit_proto::OnboardingStage::Welcome
-                            | cockpit_proto::OnboardingStage::Profile
-                    ),
-                    "bootstrap is locked"
-                );
-                let (snapshot, receipt) = locked
-                    .onboarding
-                    .apply_transition(request, locked.host_capabilities.clone())
-                    .await?;
-                Ok(Response::OnboardingTransition(
-                    cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
-                ))
+                if !locked.begin_locked_mutation() {
+                    anyhow::bail!("bootstrap is locked");
+                }
+                let outcome = async {
+                    let current = locked
+                        .onboarding
+                        .snapshot(locked.host_capabilities.clone())
+                        .await?
+                        .context("onboarding run is absent")?;
+                    anyhow::ensure!(
+                        matches!(
+                            current.stage,
+                            cockpit_proto::OnboardingStage::Welcome
+                                | cockpit_proto::OnboardingStage::Profile
+                        ),
+                        "bootstrap is locked"
+                    );
+                    let (snapshot, receipt) = locked
+                        .onboarding
+                        .apply_transition(request, locked.host_capabilities.clone())
+                        .await?;
+                    Ok(Response::OnboardingTransition(
+                        cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
+                    ))
+                }
+                .await;
+                locked.end_locked_mutation();
+                outcome
             }
             _ => Err(anyhow::anyhow!("bootstrap is locked")),
         }
@@ -4618,6 +4649,8 @@ pub(crate) struct LockedServices {
     peer_credential_registry: Arc<crate::daemon::peer_authority::PeerCredentialRegistry>,
     approved_client_executable: PathBuf,
     ready: AtomicBool,
+    closing: AtomicBool,
+    inflight_mutations: AtomicUsize,
 }
 
 /// Vault-bearing daemon composition. Ordinary dispatch and recovery accept
@@ -4712,7 +4745,36 @@ impl LockedServices {
             approved_client_executable: std::env::current_exe()
                 .context("resolving approved local client executable")?,
             ready: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
+            inflight_mutations: AtomicUsize::new(0),
         })
+    }
+
+    fn locked_admission_denied(&self) -> bool {
+        self.closing.load(Ordering::Acquire) || self.ready.load(Ordering::Acquire)
+    }
+
+    fn begin_locked_mutation(&self) -> bool {
+        if self.locked_admission_denied() {
+            return false;
+        }
+        self.inflight_mutations.fetch_add(1, Ordering::AcqRel);
+        true
+    }
+
+    fn end_locked_mutation(&self) {
+        self.inflight_mutations.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    async fn drain_inflight_mutations(&self) {
+        while self.inflight_mutations.load(Ordering::Acquire) > 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn begin_locked_to_ready_transition(&self) {
+        self.closing.store(true, Ordering::Release);
+        self.drain_inflight_mutations().await;
     }
 
     pub(crate) fn vault_authority_exists(&self) -> Result<bool> {
@@ -5771,7 +5833,7 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
         ))
         .await?;
     while let Some(frame) = proto_stream.recv().await? {
-        if locked.ready.load(Ordering::Acquire) {
+        if locked.locked_admission_denied() {
             break;
         }
         let RecvFrame::Envelope(envelope) = frame else {
@@ -5786,7 +5848,7 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
         else {
             continue;
         };
-        if locked.ready.load(Ordering::Acquire) {
+        if locked.locked_admission_denied() {
             break;
         }
         if let Some(token) = owner_capability.as_ref()
@@ -5868,38 +5930,54 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
                     .await?,
             )),
             Request::BeginOrReopenOnboarding(request) => {
-                let (snapshot, receipt) = locked
-                    .onboarding
-                    .begin_or_reopen(request, locked.host_capabilities.clone())
-                    .await?;
-                Ok(Response::OnboardingTransition(
-                    cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
-                ))
+                if !locked.begin_locked_mutation() {
+                    anyhow::bail!("bootstrap is locked");
+                }
+                let outcome = async {
+                    let (snapshot, receipt) = locked
+                        .onboarding
+                        .begin_or_reopen(request, locked.host_capabilities.clone())
+                        .await?;
+                    Ok(Response::OnboardingTransition(
+                        cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
+                    ))
+                }
+                .await;
+                locked.end_locked_mutation();
+                outcome
             }
             Request::GetOnboardingTransitionReceipt(query) => Ok(
                 Response::OnboardingTransitionReceipt(locked.onboarding.receipt(query).await?),
             ),
             Request::ApplyOnboardingTransition(request) => {
-                let snapshot = locked
-                    .onboarding
-                    .snapshot(locked.host_capabilities.clone())
-                    .await?
-                    .context("onboarding run is absent")?;
-                anyhow::ensure!(
-                    matches!(
-                        snapshot.stage,
-                        cockpit_proto::OnboardingStage::Welcome
-                            | cockpit_proto::OnboardingStage::Profile
-                    ),
-                    "bootstrap is locked"
-                );
-                let (snapshot, receipt) = locked
-                    .onboarding
-                    .apply_transition(request, locked.host_capabilities.clone())
-                    .await?;
-                Ok(Response::OnboardingTransition(
-                    cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
-                ))
+                if !locked.begin_locked_mutation() {
+                    anyhow::bail!("bootstrap is locked");
+                }
+                let outcome = async {
+                    let snapshot = locked
+                        .onboarding
+                        .snapshot(locked.host_capabilities.clone())
+                        .await?
+                        .context("onboarding run is absent")?;
+                    anyhow::ensure!(
+                        matches!(
+                            snapshot.stage,
+                            cockpit_proto::OnboardingStage::Welcome
+                                | cockpit_proto::OnboardingStage::Profile
+                        ),
+                        "bootstrap is locked"
+                    );
+                    let (snapshot, receipt) = locked
+                        .onboarding
+                        .apply_transition(request, locked.host_capabilities.clone())
+                        .await?;
+                    Ok(Response::OnboardingTransition(
+                        cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
+                    ))
+                }
+                .await;
+                locked.end_locked_mutation();
+                outcome
             }
             _ => Err(anyhow::anyhow!("bootstrap is locked")),
         };
@@ -5971,7 +6049,7 @@ pub(crate) async fn run_locked_until_ready(
                 };
                 match outcome {
                     Ok(result) => {
-                        locked.ready.store(true, Ordering::Release);
+                        locked.begin_locked_to_ready_transition().await;
                         locked_clients.abort_all();
                         while locked_clients.join_next().await.is_some() {}
                         match locked.into_ready().await {
@@ -5985,6 +6063,7 @@ pub(crate) async fn run_locked_until_ready(
                                 return Ok((ready, listener, sensitive));
                             }
                             Err(_) => {
+                                locked.closing.store(false, Ordering::Release);
                                 let response = cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
                                     cockpit_proto::SensitiveOnboardingIntentError::MaterializationFailed,
                                 );

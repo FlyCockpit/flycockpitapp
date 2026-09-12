@@ -76,6 +76,7 @@ impl App {
     fn request_onboarding_transition(
         &mut self,
         transition: cockpit_proto::OnboardingTransitionKind,
+        settlement: Option<cockpit_proto::OnboardingStageSettlement>,
     ) {
         let Some(snapshot) = self.onboarding_snapshot.clone() else {
             self.show_toast(
@@ -100,6 +101,7 @@ impl App {
                     expected_revision: snapshot.revision,
                     client_operation_id: uuid::Uuid::new_v4().to_string(),
                     transition,
+                    settlement,
                 };
                 match client
                     .request(cockpit_proto::Request::ApplyOnboardingTransition(request))
@@ -229,6 +231,7 @@ impl App {
                     self.onboarding_completion_visible = false;
                     self.request_onboarding_transition(
                         cockpit_proto::OnboardingTransitionKind::Complete,
+                        None,
                     );
                 }
             }
@@ -252,6 +255,7 @@ impl App {
                 }
                 self.request_onboarding_transition(
                     cockpit_proto::OnboardingTransitionKind::Advance,
+                    None,
                 );
                 true
             }
@@ -265,6 +269,7 @@ impl App {
                 self.refresh_bootstrap_config_snapshot();
                 self.request_onboarding_transition(
                     cockpit_proto::OnboardingTransitionKind::Advance,
+                    None,
                 );
                 true
             }
@@ -314,9 +319,14 @@ impl App {
                 true
             }
             cockpit_proto::OnboardingStage::Provider => {
-                let Some(provider_id) = self.dialog.take_completed_provider_id() else {
+                let settlement = self.dialog.onboarding_provider_settlement();
+                let Some(settlement) = settlement else {
                     return false;
                 };
+                let provider_id = settlement
+                    .provider_id
+                    .clone()
+                    .expect("provider settlement always carries provider identity");
                 self.refresh_bootstrap_config_snapshot();
                 let model_id =
                     first_provider_model_id(&self.config_snapshot.providers, &provider_id);
@@ -337,6 +347,7 @@ impl App {
                     Ok(_dialog) => {
                         self.request_onboarding_transition(
                             cockpit_proto::OnboardingTransitionKind::Advance,
+                            Some(settlement),
                         );
                     }
                     Err(error) => {
@@ -352,8 +363,17 @@ impl App {
                     return false;
                 }
                 self.refresh_bootstrap_config_snapshot();
+                let config_generation = self.config_snapshot.providers.resolution_generation;
+                let settlement = self.dialog.onboarding_wizard_settlement(
+                    cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID,
+                    config_generation,
+                );
+                if settlement.is_none() {
+                    return false;
+                }
                 self.request_onboarding_transition(
                     cockpit_proto::OnboardingTransitionKind::Advance,
+                    settlement,
                 );
                 true
             }
@@ -365,8 +385,17 @@ impl App {
                     return false;
                 }
                 self.refresh_bootstrap_config_snapshot();
+                let config_generation = self.config_snapshot.providers.resolution_generation;
+                let settlement = self.dialog.onboarding_wizard_settlement(
+                    cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID,
+                    config_generation,
+                );
+                if settlement.is_none() {
+                    return false;
+                }
                 self.request_onboarding_transition(
                     cockpit_proto::OnboardingTransitionKind::Advance,
+                    settlement,
                 );
                 true
             }

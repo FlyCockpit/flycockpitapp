@@ -2752,6 +2752,7 @@ pub struct SetupWizardDialog {
     dialog_id: uuid::Uuid,
     queued_daemon_effect: Option<SettingsDaemonEffectRequest>,
     pending_operation_id: Option<uuid::Uuid>,
+    settled_operation_id: Option<uuid::Uuid>,
 }
 
 pub struct OnboardingSecureStoreDialog {
@@ -2820,6 +2821,7 @@ fn setup_wizard_dialog(
         dialog_id: uuid::Uuid::new_v4(),
         queued_daemon_effect: None,
         pending_operation_id: None,
+        settled_operation_id: None,
     })))
 }
 
@@ -3214,6 +3216,7 @@ pub struct SettingsCx {
     /// sidecar editor records it so a terminal rejection can release only its
     /// own busy state.
     last_extended_save_operation_id: Option<String>,
+    last_provider_mutation_operation_id: Option<String>,
     completed_extended_save_rejections: BTreeMap<String, String>,
     completed_extended_save_commits: BTreeSet<String>,
     /// Malformed known extended-config fields reported by the daemon during
@@ -4223,6 +4226,8 @@ impl SettingsCx {
                             base_revision: result_revision,
                             config_generation,
                         });
+                        self.last_provider_mutation_operation_id =
+                            Some(client_operation_id.clone());
                         self.last_secret_notice = notice;
                         self.extended_warnings = vec![if publication
                             == cockpit_proto::ConfigPublicationStatus::Published
@@ -6150,6 +6155,54 @@ impl Dialog {
         None
     }
 
+    pub fn onboarding_provider_settlement(
+        &mut self,
+    ) -> Option<cockpit_proto::OnboardingStageSettlement> {
+        let Dialog::Settings(settings) = self else {
+            return None;
+        };
+        let provider_id = self.take_completed_provider_id()?;
+        let operation_id = settings
+            .cx
+            .last_provider_mutation_operation_id
+            .clone()
+            .or_else(|| settings.cx.last_extended_save_operation_id.clone())?;
+        let config_generation = settings
+            .cx
+            .provider_edit_authority
+            .as_ref()
+            .map(|authority| authority.config_generation)
+            .filter(|generation| *generation > 0)
+            .or_else(|| {
+                (settings.cx.config.resolution_generation > 0)
+                    .then_some(settings.cx.config.resolution_generation)
+            })?;
+        Some(cockpit_proto::OnboardingStageSettlement {
+            settlement_operation_id: operation_id,
+            provider_id: Some(provider_id),
+            config_generation,
+        })
+    }
+
+    pub fn onboarding_wizard_settlement(
+        &self,
+        wizard_id: &str,
+        config_generation: u64,
+    ) -> Option<cockpit_proto::OnboardingStageSettlement> {
+        let Dialog::SetupWizard(wizard) = self else {
+            return None;
+        };
+        if wizard.run.descriptor().id != wizard_id || config_generation == 0 {
+            return None;
+        }
+        let operation_id = wizard.settled_operation_id?.to_string();
+        Some(cockpit_proto::OnboardingStageSettlement {
+            settlement_operation_id: operation_id,
+            provider_id: None,
+            config_generation,
+        })
+    }
+
     pub fn setup_wizard_is_complete(&self, wizard_id: &str) -> bool {
         matches!(
             self,
@@ -7582,6 +7635,7 @@ impl SettingsDialog {
                 extended_base,
                 extended_revision,
                 last_extended_save_operation_id: None,
+                last_provider_mutation_operation_id: None,
                 completed_extended_save_rejections: BTreeMap::new(),
                 completed_extended_save_commits: BTreeSet::new(),
                 extended_warnings,
@@ -9949,6 +10003,7 @@ fn apply_setup_wizard_daemon_completion(
     {
         return;
     }
+    wizard.settled_operation_id = wizard.pending_operation_id;
     wizard.pending_operation_id = None;
     let status = match completion.response {
         Ok(Response::SetupWizardApplied {

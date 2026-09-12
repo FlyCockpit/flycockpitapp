@@ -60,6 +60,7 @@ async fn advance_to_secure_store(
                 expected_revision: welcome.revision,
                 client_operation_id: "commit-welcome".into(),
                 transition: OnboardingTransitionKind::Advance,
+                settlement: None,
             },
             locked.host_capabilities.clone(),
         )
@@ -74,6 +75,7 @@ async fn advance_to_secure_store(
                 expected_revision: profile.revision,
                 client_operation_id: "commit-profile".into(),
                 transition: OnboardingTransitionKind::Advance,
+                settlement: None,
             },
             locked.host_capabilities.clone(),
         )

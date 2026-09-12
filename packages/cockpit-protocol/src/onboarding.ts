@@ -136,6 +136,15 @@ export const onboardingTransitionKindSchema = z.enum([
 ]);
 export type OnboardingTransitionKind = z.infer<typeof onboardingTransitionKindSchema>;
 
+export const onboardingStageSettlementSchema = z
+  .object({
+    settlement_operation_id: z.string().min(1).max(128),
+    provider_id: z.string().optional(),
+    config_generation: z.number().int().nonnegative(),
+  })
+  .strict();
+export type OnboardingStageSettlement = z.infer<typeof onboardingStageSettlementSchema>;
+
 export const applyOnboardingTransitionSchema = z
   .object({
     run_id: z.string().uuid(),
@@ -143,6 +152,7 @@ export const applyOnboardingTransitionSchema = z
     expected_revision: z.number().int().nonnegative(),
     client_operation_id: z.string().min(1).max(128),
     transition: onboardingTransitionKindSchema,
+    settlement: onboardingStageSettlementSchema.optional(),
   })
   .strict();
 export type ApplyOnboardingTransition = z.infer<typeof applyOnboardingTransitionSchema>;

@@ -99,12 +99,12 @@ pub use onboarding::{
     ApplyOnboardingSecureIntent, ApplyOnboardingTransition, BeginOrReopenOnboarding,
     LockedBootstrapHello, OnboardingBootstrapEvent, OnboardingBootstrapSnapshot,
     OnboardingBootstrapState, OnboardingReceiptQuery, OnboardingReceiptStatus,
-    OnboardingSecurePlacement, OnboardingStage, OnboardingTransitionKind,
-    OnboardingTransitionReceipt, OnboardingTransitionResult, SensitiveOnboardingIntentError,
-    SensitiveOnboardingIntentFrame, SensitiveOnboardingIntentResponse,
-    SensitiveOnboardingPassphrase, decode_sensitive_onboarding_intent,
-    decode_sensitive_onboarding_response, encode_sensitive_onboarding_intent,
-    encode_sensitive_onboarding_response,
+    OnboardingSecurePlacement, OnboardingStage, OnboardingStageSettlement,
+    OnboardingTransitionKind, OnboardingTransitionReceipt, OnboardingTransitionResult,
+    SensitiveOnboardingIntentError, SensitiveOnboardingIntentFrame,
+    SensitiveOnboardingIntentResponse, SensitiveOnboardingPassphrase,
+    decode_sensitive_onboarding_intent, decode_sensitive_onboarding_response,
+    encode_sensitive_onboarding_intent, encode_sensitive_onboarding_response,
 };
 pub use provider_management::{
     ProviderLayerMetadataPatch, ProviderMutationBatch, ProviderMutationDelete,

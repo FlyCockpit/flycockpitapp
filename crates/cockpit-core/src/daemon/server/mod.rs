@@ -4432,7 +4432,7 @@ async fn handle_locked_in_process_request(
 ) -> std::result::Result<Response, ErrorPayload> {
     let result: Result<Response> = async {
         match request {
-            Request::DaemonStatus => locked_bootstrap_hello_for_any_platform(locked).await,
+            Request::DaemonStatus => locked_bootstrap_hello_for_any_platform(locked, true).await,
             Request::GetOnboardingBootstrapSnapshot => Ok(Response::OnboardingBootstrapSnapshot(
                 locked
                     .onboarding
@@ -4483,19 +4483,15 @@ async fn handle_locked_in_process_request(
     })
 }
 
-async fn locked_bootstrap_hello_for_any_platform(locked: &LockedServices) -> Result<Response> {
-    let snapshot = locked
-        .onboarding
-        .snapshot(locked.host_capabilities.clone())
-        .await?;
-    Ok(Response::LockedBootstrapHello(
-        cockpit_proto::LockedBootstrapHello {
-            protocol_version: cockpit_proto::PROTOCOL_VERSION,
-            bootstrap_available: true,
-            host_capabilities: locked.host_capabilities.clone(),
-            snapshot,
-        },
-    ))
+async fn locked_bootstrap_hello_for_any_platform(
+    locked: &LockedServices,
+    authenticated: bool,
+) -> Result<Response> {
+    if authenticated {
+        locked_bootstrap_hello(locked).await
+    } else {
+        Ok(locked_bootstrap_hello_minimal())
+    }
 }
 
 pub(crate) async fn handle_ready_onboarding_secure_intent(
@@ -4510,9 +4506,16 @@ pub(crate) async fn handle_ready_onboarding_secure_intent(
             );
         }
     };
-    // Possession of the in-process endpoint is the owner capability. Wire
-    // callers are authenticated by the sibling socket handler before reaching
-    // this shared reducer.
+    if ctx
+        .db
+        .blocking_write_for_sync_maintenance(cockpit_db::secret_vault::load_authority_conn)
+        .map(|authority| authority.is_some())
+        .unwrap_or(true)
+    {
+        return cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
+            cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest,
+        );
+    }
     let capabilities = ctx
         .host_capabilities
         .current()
@@ -4525,20 +4528,25 @@ pub(crate) async fn handle_ready_onboarding_secure_intent(
         .or_else(|| crate::secure_key::kek_dir_for_db(&db).ok());
     let result = ctx
         .onboarding
-        .apply_secure_intent_with(frame.request, capabilities, move |placement, passphrase| {
-            let options = crate::onboarding::secure_vault_open_options(placement, passphrase)?;
-            let probe = crate::secure_key::probe_platform_keyring();
-            let kek_dir = kek_dir.context("resolving onboarding vault directory")?;
-            crate::secure_key::ensure_secret_vault_with_options(
-                &db,
-                &probe,
-                &kek_dir,
-                crate::secure_key::SecretStoreInjected::default(),
-                options,
-            )
-            .map_err(|error| error.into_error())?;
-            Ok(())
-        })
+        .apply_secure_intent_with(
+            frame.request,
+            capabilities,
+            false,
+            move |placement, passphrase| {
+                let options = crate::onboarding::secure_vault_open_options(placement, passphrase)?;
+                let probe = crate::secure_key::probe_platform_keyring();
+                let kek_dir = kek_dir.context("resolving onboarding vault directory")?;
+                crate::secure_key::ensure_secret_vault_with_options(
+                    &db,
+                    &probe,
+                    &kek_dir,
+                    crate::secure_key::SecretStoreInjected::default(),
+                    options,
+                )
+                .map_err(|error| error.into_error())?;
+                Ok(())
+            },
+        )
         .await;
     match result {
         Ok((snapshot, receipt)) => cockpit_proto::SensitiveOnboardingIntentResponse::Applied(
@@ -4550,7 +4558,10 @@ pub(crate) async fn handle_ready_onboarding_secure_intent(
                 cockpit_proto::SensitiveOnboardingIntentError::RevisionConflict
             } else if message.contains("unavailable") {
                 cockpit_proto::SensitiveOnboardingIntentError::PlacementUnavailable
-            } else if message.contains("requires") || message.contains("only valid") {
+            } else if message.contains("requires")
+                || message.contains("only valid")
+                || message.contains("already committed")
+            {
                 cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest
             } else {
                 cockpit_proto::SensitiveOnboardingIntentError::MaterializationFailed
@@ -4717,6 +4728,9 @@ impl LockedServices {
         cockpit_proto::OnboardingTransitionResult,
         cockpit_proto::SensitiveOnboardingIntentError,
     > {
+        if self.vault_authority_exists().unwrap_or(true) {
+            return Err(cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest);
+        }
         let db = self.db.clone();
         let keyring_probe = self.keyring_probe.clone();
         let kek_dir = self.kek_dir.clone();
@@ -4724,6 +4738,7 @@ impl LockedServices {
             .apply_secure_intent_with(
                 request,
                 self.host_capabilities.clone(),
+                false,
                 move |placement, passphrase| {
                     let options =
                         crate::onboarding::secure_vault_open_options(placement, passphrase)?;
@@ -4751,7 +4766,10 @@ impl LockedServices {
                     cockpit_proto::SensitiveOnboardingIntentError::RevisionConflict
                 } else if message.contains("unavailable") {
                     cockpit_proto::SensitiveOnboardingIntentError::PlacementUnavailable
-                } else if message.contains("requires") || message.contains("only valid") {
+                } else if message.contains("requires")
+                    || message.contains("only valid")
+                    || message.contains("already committed")
+                {
                     cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest
                 } else {
                     cockpit_proto::SensitiveOnboardingIntentError::MaterializationFailed
@@ -5713,6 +5731,15 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, mut listener: DaemonListen
 }
 
 #[cfg(any(unix, windows))]
+fn locked_bootstrap_hello_minimal() -> Response {
+    Response::LockedBootstrapHello(cockpit_proto::LockedBootstrapHello {
+        protocol_version: cockpit_proto::PROTOCOL_VERSION,
+        bootstrap_available: true,
+        host_capabilities: cockpit_proto::HostCapabilitySnapshot::unpublished(),
+        snapshot: None,
+    })
+}
+
 async fn locked_bootstrap_hello(locked: &LockedServices) -> Result<Response> {
     let snapshot = locked
         .onboarding
@@ -5740,7 +5767,7 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
     proto_stream
         .send(&Envelope::response(
             Uuid::nil(),
-            locked_bootstrap_hello(&locked).await?,
+            locked_bootstrap_hello_minimal(),
         ))
         .await?;
     while let Some(frame) = proto_stream.recv().await? {
@@ -5759,6 +5786,9 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
         else {
             continue;
         };
+        if locked.ready.load(Ordering::Acquire) {
+            break;
+        }
         if let Some(token) = owner_capability.as_ref()
             && locked
                 .peer_credential_registry
@@ -5768,7 +5798,8 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
             authenticated_owner = true;
         }
         let result = match request {
-            Request::DaemonStatus => locked_bootstrap_hello(&locked).await,
+            Request::DaemonStatus if authenticated_owner => locked_bootstrap_hello(&locked).await,
+            Request::DaemonStatus => Ok(locked_bootstrap_hello_minimal()),
             Request::ExchangeLocalPeerCredential => {
                 use crate::daemon::peer_authority::{
                     attest_local_client_role, default_agent_child_grants, proto_local_role,
@@ -5900,6 +5931,7 @@ pub(crate) async fn run_locked_until_ready(
     DaemonListener,
     crate::daemon::leak_reveal_socket::BoundRevealSocket,
 )> {
+    let mut locked_clients = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             accepted = accept_daemon_stream(&mut listener) => {
@@ -5908,7 +5940,7 @@ pub(crate) async fn run_locked_until_ready(
                     continue;
                 }
                 let locked = locked.clone();
-                tokio::spawn(async move {
+                locked_clients.spawn(async move {
                     let _ = handle_locked_client(stream, locked).await;
                 });
             }
@@ -5939,6 +5971,9 @@ pub(crate) async fn run_locked_until_ready(
                 };
                 match outcome {
                     Ok(result) => {
+                        locked.ready.store(true, Ordering::Release);
+                        locked_clients.abort_all();
+                        while locked_clients.join_next().await.is_some() {}
                         match locked.into_ready().await {
                             Ok(ready) => {
                                 let response = cockpit_proto::SensitiveOnboardingIntentResponse::Applied(result);
@@ -5947,7 +5982,6 @@ pub(crate) async fn run_locked_until_ready(
                                 stream.write_all(&bytes).await?;
                                 stream.flush().await?;
                                 stream.shutdown().await?;
-                                locked.ready.store(true, Ordering::Release);
                                 return Ok((ready, listener, sensitive));
                             }
                             Err(_) => {

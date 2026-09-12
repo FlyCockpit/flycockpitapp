@@ -96,6 +96,17 @@ pub enum OnboardingTransitionKind {
     Complete,
 }
 
+/// Opaque correlation to a terminal daemon settlement that authorizes leaving
+/// provider, model, or agent.  The dispatcher validates this against the
+/// owning authority before the onboarding reducer may advance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnboardingStageSettlement {
+    pub settlement_operation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    pub config_generation: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplyOnboardingTransition {
     pub run_id: Uuid,
@@ -103,6 +114,8 @@ pub struct ApplyOnboardingTransition {
     pub expected_revision: u64,
     pub client_operation_id: String,
     pub transition: OnboardingTransitionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement: Option<OnboardingStageSettlement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -554,6 +567,7 @@ mod tests {
             expected_revision: 0,
             client_operation_id: "operation".into(),
             transition: OnboardingTransitionKind::DeferProvider,
+            settlement: None,
         })
         .unwrap();
         for forbidden in [

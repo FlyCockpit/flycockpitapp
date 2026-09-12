@@ -120,6 +120,109 @@ fn onboarding_error(error: anyhow::Error) -> ErrorPayload {
     ErrorPayload { code, message }
 }
 
+async fn validate_onboarding_stage_settlement(
+    ctx: &DaemonContext,
+    stage: proto::OnboardingStage,
+    settlement: &proto::OnboardingStageSettlement,
+    owner: &str,
+) -> std::result::Result<(), ErrorPayload> {
+    if settlement.settlement_operation_id.is_empty()
+        || settlement.settlement_operation_id.len() > 128
+    {
+        return Err(bad_request("invalid onboarding settlement operation id"));
+    }
+    if settlement.config_generation != inventory::current_config_generation() {
+        return Err(bad_request(
+            "onboarding settlement config generation does not match the current authority",
+        ));
+    }
+    match stage {
+        proto::OnboardingStage::Provider => {
+            let provider_id = settlement
+                .provider_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    bad_request("provider advance requires a settled provider identity")
+                })?;
+            let operation_id = settlement.settlement_operation_id.clone();
+            let durable = ctx
+                .db
+                .local_operation_settlement(owner.to_owned(), operation_id.clone())
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| {
+                    bad_request("provider onboarding settlement is unknown; query exact status")
+                })?;
+            let (operation_kind, response_json) = match durable {
+                crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(
+                    identity,
+                    json,
+                ) => (identity.operation_kind, json),
+                _ => {
+                    return Err(bad_request(
+                        "provider onboarding settlement is not terminal; query exact status",
+                    ));
+                }
+            };
+            if operation_kind != "apply_provider_mutation" {
+                return Err(bad_request(
+                    "provider onboarding settlement references the wrong daemon operation",
+                ));
+            }
+            let response: Response = serde_json::from_str(&response_json).map_err(internal)?;
+            match response {
+                Response::ProviderMutationCommitted {
+                    client_operation_id,
+                    config_generation,
+                    config,
+                    status: proto::ConfigCommitStatus::Committed,
+                    ..
+                } if client_operation_id == operation_id
+                    && config_generation == settlement.config_generation
+                    && config.providers.contains_key(provider_id) =>
+                {
+                    Ok(())
+                }
+                _ => Err(bad_request(
+                    "provider onboarding settlement does not match the requested advance",
+                )),
+            }
+        }
+        proto::OnboardingStage::Model => {
+            let global = cockpit_config::config::dirs::global_config_file().map_err(internal)?;
+            let providers = crate::config::providers::ConfigDoc::load(&global)
+                .map_err(internal)?
+                .providers();
+            if providers.active_model.is_some() {
+                Ok(())
+            } else {
+                Err(bad_request(
+                    "model onboarding advance requires a committed default model",
+                ))
+            }
+        }
+        proto::OnboardingStage::Agent => {
+            if ctx
+                .db
+                .default_agent_installation()
+                .await
+                .map_err(internal)?
+                .is_some()
+            {
+                Ok(())
+            } else {
+                Err(bad_request(
+                    "agent onboarding advance requires a committed default installation",
+                ))
+            }
+        }
+        _ => Err(bad_request(
+            "onboarding settlement correlation is only valid for provider, model, or agent advance",
+        )),
+    }
+}
+
 /// An onboarding apply owns only the installation whose UUID is the fresh
 /// inner operation key it minted. Installation may instead return an existing
 /// same-source object; cleanup must never infer ownership from an answer or a
@@ -6113,11 +6216,44 @@ async fn handle_serialized_request_impl(
                 .current()
                 .map(|value| value.as_ref().clone())
                 .unwrap_or_else(cockpit_proto::HostCapabilitySnapshot::unpublished);
-            let (snapshot, receipt) = ctx
+            let snapshot = ctx
                 .onboarding
-                .apply_transition(request, capabilities)
+                .snapshot(capabilities.clone())
                 .await
-                .map_err(onboarding_error)?;
+                .map_err(onboarding_error)?
+                .ok_or_else(|| bad_request("no onboarding run exists"))?;
+            let (snapshot, receipt) = if request.transition
+                == proto::OnboardingTransitionKind::Advance
+                && matches!(
+                    snapshot.stage,
+                    proto::OnboardingStage::Provider
+                        | proto::OnboardingStage::Model
+                        | proto::OnboardingStage::Agent
+                ) {
+                let settlement = request.settlement.as_ref().ok_or_else(|| {
+                    bad_request("onboarding advance requires settlement correlation")
+                })?;
+                validate_onboarding_stage_settlement(
+                    ctx,
+                    snapshot.stage,
+                    settlement,
+                    &settings_capability_owner(state),
+                )
+                .await?;
+                ctx.onboarding
+                    .apply_settled_advance(request, capabilities)
+                    .await
+                    .map_err(onboarding_error)?
+            } else if request.settlement.is_some() {
+                return Err(bad_request(
+                    "settlement correlation is only valid for provider, model, or agent advance",
+                ));
+            } else {
+                ctx.onboarding
+                    .apply_transition(request, capabilities)
+                    .await
+                    .map_err(onboarding_error)?
+            };
             Ok(Response::OnboardingTransition(
                 cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
             ))

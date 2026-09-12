@@ -899,6 +899,7 @@ fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
                     | crate::cli::DaemonCommand::DiagnosticFailedCalls { .. }
             ))
             | Some(Command::Trust(_))
+            | Some(Command::Update(_))
             | Some(Command::Jq(_))
             | Some(Command::Completion { .. })
             | Some(Command::BashHints(_))
@@ -1570,6 +1571,14 @@ mod tests {
                 path: None,
                 offline: false,
                 dependencies_json: false,
+            }
+        ))));
+        assert!(!command_requires_workspace_trust(Some(&Command::Update(
+            crate::cli::UpdateArgs {
+                check: true,
+                status: false,
+                version: None,
+                channel: None,
             }
         ))));
         assert!(!command_requires_workspace_trust(Some(&Command::Init(

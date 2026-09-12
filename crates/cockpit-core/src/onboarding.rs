@@ -1005,6 +1005,8 @@ mod tests {
                                 stage_revision: provider.revision,
                                 settlement_operation_id: "provider-settled".into(),
                                 provider_id: Some("provider".into()),
+                                mutation_intent_hash: Some("aa".repeat(32)),
+                                wizard_id: None,
                                 config_generation: 1,
                             }),
                         },

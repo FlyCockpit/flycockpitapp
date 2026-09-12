@@ -1,5 +1,50 @@
 use super::*;
 
+fn onboarding_ready_construction_retry_required(error: &cockpit_proto::ErrorPayload) -> bool {
+    error.code == cockpit_proto::ErrorCode::Internal
+        && error.message.contains("retry ready construction")
+}
+
+async fn retry_onboarding_ready_construction_snapshot(
+    lifecycle: &cockpit_client::LifecycleClient,
+) -> Result<Option<cockpit_proto::OnboardingBootstrapSnapshot>, String> {
+    let client = crate::tui::settings::settings_daemon_client(lifecycle)
+        .await
+        .map_err(|error| error.to_string())?;
+    match client
+        .retry_onboarding_ready_construction()
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+async fn onboarding_snapshot_after_secure_intent(
+    lifecycle: &cockpit_client::LifecycleClient,
+    request: cockpit_proto::ApplyOnboardingSecureIntent,
+) -> Result<Option<cockpit_proto::OnboardingBootstrapSnapshot>, String> {
+    let resolved = lifecycle
+        .resolve_default()
+        .await
+        .map_err(|error| error.to_string())?;
+    let client = cockpit_client::DaemonClient::connect_endpoint(&resolved.endpoint)
+        .await
+        .map_err(|error| error.to_string())?;
+    match client
+        .apply_onboarding_secure_intent(&resolved.endpoint, request)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        Ok(result) => Ok(Some(result.snapshot)),
+        Err(error) if onboarding_ready_construction_retry_required(&error) => {
+            retry_onboarding_ready_construction_snapshot(lifecycle).await
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 impl App {
     pub fn configure_onboarding_launch(&mut self, skip: bool, force: bool) {
         self.onboarding_skip = skip;
@@ -36,6 +81,13 @@ impl App {
                     Err(error) => return Err(error.to_string()),
                 };
                 if current.as_ref().is_some_and(|snapshot| {
+                    snapshot.bootstrap_state == cockpit_proto::OnboardingBootstrapState::Failed
+                }) {
+                    return retry_onboarding_ready_construction_snapshot(&lifecycle)
+                        .await
+                        .map(crate::tui::async_action::AsyncActionPayload::OnboardingBootstrap);
+                }
+                if current.as_ref().is_some_and(|snapshot| {
                     !force && snapshot.stage == cockpit_proto::OnboardingStage::Complete
                 }) {
                     return Ok(
@@ -68,9 +120,30 @@ impl App {
         &mut self,
         snapshot: Option<cockpit_proto::OnboardingBootstrapSnapshot>,
     ) {
+        if snapshot.as_ref().is_some_and(|current| {
+            current.bootstrap_state == cockpit_proto::OnboardingBootstrapState::Failed
+        }) {
+            self.start_onboarding_ready_construction_retry();
+            return;
+        }
         self.onboarding_completion_visible = false;
         self.onboarding_snapshot = snapshot;
         self.maybe_open_add_provider_wizard();
+    }
+
+    fn start_onboarding_ready_construction_retry(&mut self) {
+        let lifecycle = self.lifecycle.clone();
+        self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.ready_retry"),
+            crate::tui::async_action::AsyncActionPolicy::Dedupe(
+                crate::tui::async_action::AsyncActionKey::new("onboarding.ready_retry"),
+            ),
+            async move {
+                retry_onboarding_ready_construction_snapshot(&lifecycle)
+                    .await
+                    .map(crate::tui::async_action::AsyncActionPayload::OnboardingBootstrap)
+            },
+        );
     }
 
     fn request_onboarding_transition(
@@ -293,23 +366,9 @@ impl App {
                         crate::tui::async_action::AsyncActionKey::new("onboarding.secure_intent"),
                     ),
                     async move {
-                        let resolved = lifecycle.resolve_default().await?;
-                        let client =
-                            cockpit_client::DaemonClient::connect_endpoint(&resolved.endpoint)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                        match client
-                            .apply_onboarding_secure_intent(&resolved.endpoint, request)
+                        onboarding_snapshot_after_secure_intent(&lifecycle, request)
                             .await
-                            .map_err(|error| error.to_string())?
-                        {
-                            Ok(result) => Ok(
-                                crate::tui::async_action::AsyncActionPayload::OnboardingBootstrap(
-                                    Some(result.snapshot),
-                                ),
-                            ),
-                            Err(error) => Err(error.to_string()),
-                        }
+                            .map(crate::tui::async_action::AsyncActionPayload::OnboardingBootstrap)
                     },
                 );
                 true

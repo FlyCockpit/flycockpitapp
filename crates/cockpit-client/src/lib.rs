@@ -704,6 +704,26 @@ impl DaemonClient {
     /// Apply the one Rust-only onboarding secure intent through the dedicated
     /// zeroizing local channel. The passphrase never enters the ordinary
     /// request queue, serde, logs, or a clonable client command.
+    pub async fn retry_onboarding_ready_construction(
+        &self,
+    ) -> Result<std::result::Result<proto::OnboardingBootstrapSnapshot, ErrorPayload>> {
+        match self
+            .request(proto::Request::RetryOnboardingReadyConstruction)
+            .await?
+        {
+            Ok(proto::Response::OnboardingBootstrapSnapshot(snapshot)) => {
+                Ok(snapshot.ok_or_else(|| ErrorPayload {
+                    code: proto::ErrorCode::Internal,
+                    message: "onboarding run is absent after ready construction".into(),
+                }))
+            }
+            Ok(other) => Err(anyhow::anyhow!(
+                "unexpected onboarding retry response: {other:?}"
+            )),
+            Err(payload) => Ok(Err(payload)),
+        }
+    }
+
     pub async fn apply_onboarding_secure_intent(
         &self,
         endpoint: &ClientEndpoint,

@@ -3217,6 +3217,7 @@ pub struct SettingsCx {
     /// own busy state.
     last_extended_save_operation_id: Option<String>,
     last_provider_mutation_operation_id: Option<String>,
+    last_provider_mutation_intent_hash: Option<String>,
     completed_extended_save_rejections: BTreeMap<String, String>,
     completed_extended_save_commits: BTreeSet<String>,
     /// Malformed known extended-config fields reported by the daemon during
@@ -4228,6 +4229,8 @@ impl SettingsCx {
                         });
                         self.last_provider_mutation_operation_id =
                             Some(client_operation_id.clone());
+                        self.last_provider_mutation_intent_hash =
+                            Some(mutation_intent_hash.clone());
                         self.last_secret_notice = notice;
                         self.extended_warnings = vec![if publication
                             == cockpit_proto::ConfigPublicationStatus::Published
@@ -6170,6 +6173,7 @@ impl Dialog {
             .last_provider_mutation_operation_id
             .clone()
             .or_else(|| settings.cx.last_extended_save_operation_id.clone())?;
+        let mutation_intent_hash = settings.cx.last_provider_mutation_intent_hash.clone()?;
         let config_generation = settings
             .cx
             .provider_edit_authority
@@ -6186,6 +6190,8 @@ impl Dialog {
             stage_revision,
             settlement_operation_id: operation_id,
             provider_id: Some(provider_id),
+            mutation_intent_hash: Some(mutation_intent_hash),
+            wizard_id: None,
             config_generation,
         })
     }
@@ -6211,6 +6217,8 @@ impl Dialog {
             stage_revision,
             settlement_operation_id: operation_id,
             provider_id: None,
+            mutation_intent_hash: None,
+            wizard_id: Some(wizard_id.to_string()),
             config_generation,
         })
     }
@@ -7648,6 +7656,7 @@ impl SettingsDialog {
                 extended_revision,
                 last_extended_save_operation_id: None,
                 last_provider_mutation_operation_id: None,
+                last_provider_mutation_intent_hash: None,
                 completed_extended_save_rejections: BTreeMap::new(),
                 completed_extended_save_commits: BTreeSet::new(),
                 extended_warnings,

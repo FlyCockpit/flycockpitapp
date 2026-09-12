@@ -10,6 +10,7 @@ name: CLI CI
       - "apps/cli/**"
       - "apps/tenant-authority/**"
       - "crates/**"
+      - "tools/tuf-release/**"
       # Rust tests read the shared cross-language protocol fixtures, so a
       # change to them must trigger the Rust gate as well as the TS one.
       - "packages/cockpit-protocol/**"
@@ -30,6 +31,7 @@ name: CLI CI
       - "apps/cli/**"
       - "apps/tenant-authority/**"
       - "crates/**"
+      - "tools/tuf-release/**"
       # Rust tests read the shared cross-language protocol fixtures, so a
       # change to them must trigger the Rust gate as well as the TS one.
       - "packages/cockpit-protocol/**"

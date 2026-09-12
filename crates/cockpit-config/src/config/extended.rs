@@ -3236,8 +3236,8 @@ impl ExtendedConfigDoc {
                 warnings.push("ignored invalid `knowledgeBases` policy".to_string());
             }
             "updates" => {
-                tracing::warn!("ignored invalid update channel configuration");
-                warnings.push("ignored invalid update channel configuration".to_string());
+                tracing::warn!("ignored invalid `updates` configuration");
+                warnings.push("ignored invalid `updates` configuration".to_string());
             }
             _ => {
                 tracing::warn!(

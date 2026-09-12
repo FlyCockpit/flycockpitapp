@@ -85,27 +85,31 @@ These are validation templates only. `{USER_SID}` means the ordinary,
 unconfined current-user client principal. `SY` is LocalSystem. There is no
 Cockpit Windows service identity in the current topology; no other service SID
 may be added merely to make a test pass. `0x00100003` is exactly
-`SYNCHRONIZE | FILE_READ_DATA | FILE_WRITE_DATA`; it deliberately excludes
+`SYNCHRONIZE | FILE_READ_DATA | FILE_WRITE_DATA`. `0x00100007` adds
 `FILE_APPEND_DATA` / `FILE_CREATE_PIPE_INSTANCE`.
 
 | Object | Protected SDDL template | Rule |
 | --- | --- | --- |
-| Supervisor control pipe | `D:P(A;;0x00100003;;;{USER_SID})(A;;0x00100003;;;SY)` | `{USER_SID}` and SYSTEM may open a client endpoint only with `FILE_READ_DATA | FILE_WRITE_DATA | SYNCHRONIZE` for an admission exchange. The supervisor owns its already-created server handle. |
-| Admitted worker pipe | `D:P(A;;0x00100003;;;{USER_SID})(A;;0x00100003;;;SY)` | The same principal receives the post-admission direct-worker exchange with exactly `FILE_READ_DATA | FILE_WRITE_DATA | SYNCHRONIZE`; there is no generic write ACE. |
+| Supervisor control pipe | `D:P(A;;0x00100007;;;{USER_SID})(A;;0x00100003;;;SY)` | `{USER_SID}` is also the live daemon's server principal, so its ACE explicitly grants `FILE_CREATE_PIPE_INSTANCE` for the next server instance. Ordinary `{USER_SID}` clients still open only with `FILE_READ_DATA | FILE_WRITE_DATA | SYNCHRONIZE` for an admission exchange; SYSTEM has that same narrow client access. |
+| Admitted worker pipe | `D:P(A;;0x00100007;;;{USER_SID})(A;;0x00100003;;;SY)` | The same current-user server principal may re-arm an instance; the direct-worker client exchange requests exactly `FILE_READ_DATA | FILE_WRITE_DATA | SYNCHRONIZE`. There is no generic write ACE. |
 | Supervisor process object | `D:P(A;;0x00100000;;;{USER_SID})(A;;0x00100000;;;SY)` | Only `SYNCHRONIZE` is permitted. It grants none of `PROCESS_DUP_HANDLE`, `PROCESS_CREATE_PROCESS`, VM access, `WRITE_DAC`, or `WRITE_OWNER`. The trusted supervisor retains its lifecycle handle. |
 | Worker process object | `D:P(A;;0x00100000;;;{USER_SID})(A;;0x00100000;;;SY)` | Same denial rule; the trusted worker/supervisor retains needed lifecycle/private-control handles. |
 
 [Named-pipe security](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights)
 documents that both server and client access are checked against the pipe DACL,
-and that `FILE_GENERIC_WRITE` confers `FILE_CREATE_PIPE_INSTANCE` because
-`FILE_APPEND_DATA` and that right share a value. Therefore these templates use
-individual rights, not `GW`, `GA`, `FILE_GENERIC_WRITE`, or a generic service
-ACE. [Process security and access
+including a subsequent `CreateNamedPipeW` by the daemon. `FILE_GENERIC_WRITE`
+confers `FILE_CREATE_PIPE_INSTANCE` because `FILE_APPEND_DATA` and that right
+share a value. The current daemon and ordinary client have the same user SID,
+so an ACE cannot distinguish those roles: the server-required instance right is
+explicit in the current-user ACE, while client open helpers request only the
+three client bits. Therefore these templates use individual rights, not `GW`,
+`GA`, `FILE_GENERIC_WRITE`, or a generic service ACE. [Process security and access
 rights](https://learn.microsoft.com/en-us/windows/win32/procthread/process-security-and-access-rights)
 defines the process-object rights that the templates intentionally omit.
 
-The existing `OwnerOnlyPipeSecurity` and both ordinary Cockpit named-pipe
-client open helpers use this same `0x00100003` contract. They call
+`OwnerOnlyPipeSecurity` grants the current-user server principal
+`0x00100007`; both ordinary Cockpit named-pipe client open helpers use the
+narrow `0x00100003` contract. They call
 `CreateFileW` with `FILE_READ_DATA | FILE_WRITE_DATA | SYNCHRONIZE`, rather
 than `OpenOptions` or Tokio `ClientOptions`, because those helpers request
 generic read/write and generic write would not match (or be safe under) this
@@ -237,7 +241,7 @@ decision supplies a finite model.
 | Agent hooks | `crates/cockpit-core/src/engine/agent/hooks.rs` |
 | Harness invocation and probes | `crates/cockpit-core/src/harness/spawn.rs`; `crates/cockpit-core/src/harness/preflight.rs`; `crates/cockpit-core/src/harness/models.rs` |
 | MCP stdio | `crates/cockpit-core/src/mcp/transport/stdio.rs` |
-| LSP and command actions | `crates/cockpit-core/src/daemon/lsp.rs`; `crates/cockpit-core/src/tools/lsp.rs` |
+| LSP and command actions | `crates/cockpit-core/src/daemon/lsp.rs`; `crates/cockpit-core/src/tools/lsp.rs`; `crates/cockpit-core/src/worktree_orchestration/validation.rs`; `crates/cockpit-core/src/tools/write.rs`; `crates/cockpit-core/src/tools/edit.rs` |
 | Command-resource introspection | `crates/cockpit-core/src/tools/command_resource_profiles/mod.rs` |
 | Container runtime client | `crates/cockpit-core/src/container/mod.rs` |
 | Media runners | `crates/cockpit-core/src/tools/audio_video/runner.rs`; `crates/cockpit-core/src/media_storage.rs` |
@@ -257,10 +261,13 @@ cargo test -p cockpit-host --test windows_child_isolation_stop_record -- --nocap
 
 On a non-Windows host it reports the typed `Unavailable { WindowsHost }`
 state. On Windows it first provisions and ACLs a unique alternate window
-station and desktop. A real OS/API failure in required temporary-object, token,
-launch, attribute-list, inspection, or Job setup is a typed `Unavailable`;
-denial, DACL, identity, image, and inheritance assertion mismatches fail the
-fixture. It then creates two unique temporary named pipes under the
+station and desktop. A typed `Unavailable` is reserved for an absent documented
+Windows primitive (`ERROR_NOT_SUPPORTED` or `ERROR_CALL_NOT_IMPLEMENTED`);
+every other temporary-object, token, launch, attribute-list, inspection, Job,
+or DACL failure fails closed. In particular, access denied while creating the
+alternate station/desktop is evidence that the normal test-runner account
+cannot perform the documented sequence, not passing conformance evidence. It
+then creates two unique temporary named pipes under the
 existing test-runner account with the ordinary-client descriptor above, spawns
 a second test-runner process, and measures its control admission and
 direct-worker exchanges using exactly `FILE_READ_DATA | FILE_WRITE_DATA |
@@ -282,10 +289,13 @@ for every forbidden supervisor/worker right: `PROCESS_DUP_HANDLE`,
 `PROCESS_CREATE_PROCESS`, `PROCESS_VM_OPERATION`, `PROCESS_VM_READ`,
 `PROCESS_VM_WRITE`, `WRITE_DAC`, and `WRITE_OWNER`.
 
-It then creates two restricted-token children through the suspended test-only
+Before the ordinary exchange, it creates and drops a second temporary server
+instance for each pipe. This measures the same DACL check that the live listener
+uses to re-arm after an accept. It then creates two restricted-token children through the suspended test-only
 launch path: one with `bInheritHandles = FALSE` and no handle list, and one
 with `bInheritHandles = TRUE` and an exact three-endpoint standard-I/O handle
-list. Both receive the alternate desktop through `lpDesktop`; before either
+list. Both receive the alternate desktop through `lpDesktop` and independently
+verify their process window-station and thread-desktop names; before either
 resume, the fixture verifies its token and image, protects its process DACL,
 and assigns/checks Job membership. A denial or inheritance mismatch is a
 fixture failure. Neither result activates a supervisor.
@@ -300,15 +310,24 @@ The temporary-object runner records each of:
    `WRITE_OWNER`, and an actual `DuplicateHandle` call using a non-null,
    deliberately under-righted source-process handle that owns a known protected
    worker handle;
-4. zero-handle and exact standard-I/O inheritance modes, with no Cockpit
-   handle inherited.
+4. zero-handle and exact standard-I/O inheritance modes, with a deliberately
+   inheritable known Cockpit marker handle absent from both children. The stdio
+   child reads fixture bytes from stdin and writes fixture bytes to stdout, so
+   a non-null standard handle or reversed pipe endpoint is not evidence.
 
 All fixture pipe accepts, pipe reads/writes, and child observations have a
 finite timeout. On timeout the launcher terminates and reaps the affected
 child before closing its kill-on-close Job or remaining handles.
 
-It reports typed `Unavailable` only for a real required Windows setup API
-failure, uses no
+For each of the six resource classes, the runner records the typed result
+`NoDocumentedAllowRule`, rather than treating the endpoint-only denial as an
+allow/deny conformance result. That per-class blocked observation is deliberate:
+the current capability matrix has no finite resource model. A later selected
+model must replace every such blocked observation with an actual resource
+operation and documented allow/deny assertion before supervisor activation.
+
+It reports typed `Unavailable` only when the documented Windows primitive is
+absent, uses no
 daemon, credentials, OS-user creation, privileged installation, persistent ACL
 change, or production launch path, and preserve a typed pass/denied/unavailable
 observation for every assertion. A Job-assignment success or a unit fake does

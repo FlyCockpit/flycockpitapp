@@ -6,6 +6,7 @@
 //! but does not select a child-isolation policy or activate a production launch
 //! path: the documented finite resource model is still blocked.
 
+#[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlockedResourceClass {
     UnconfinedFilesystemAndDependencies,
@@ -15,15 +16,6 @@ enum BlockedResourceClass {
     ConfiguredNetwork,
     NativeApprovalBoundary,
 }
-
-const BLOCKED_RESOURCE_CLASSES: [BlockedResourceClass; 6] = [
-    BlockedResourceClass::UnconfinedFilesystemAndDependencies,
-    BlockedResourceClass::ConfiguredExecutableAndRuntime,
-    BlockedResourceClass::TemporaryAndWorkspaceResources,
-    BlockedResourceClass::PtyAndStandardIo,
-    BlockedResourceClass::ConfiguredNetwork,
-    BlockedResourceClass::NativeApprovalBoundary,
-];
 
 #[cfg(not(windows))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +42,7 @@ fn temporary_object_runner_reports_the_measured_host_capability() {
 #[cfg(windows)]
 mod windows_fixture {
     use std::env;
+    use std::ffi::OsString;
     use std::io;
     use std::process::{Child, Command};
     use std::thread;
@@ -57,9 +50,9 @@ mod windows_fixture {
 
     use cockpit_host::named_pipe::OwnerOnlyPipeSecurity;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED,
-        GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
-        WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE, ERROR_IO_PENDING,
+        ERROR_PIPE_CONNECTED, GetHandleInformation, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
+        INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -87,19 +80,20 @@ mod windows_fixture {
     };
     use windows_sys::Win32::System::StationsAndDesktops::{
         CloseDesktop, CloseWindowStation, CreateDesktopW, CreateWindowStationW,
-        GetProcessWindowStation, SetProcessWindowStation,
+        GetProcessWindowStation, GetThreadDesktop, GetUserObjectInformationW,
+        SetProcessWindowStation, UOI_NAME,
     };
     use windows_sys::Win32::System::Threading::{
         CREATE_SUSPENDED, CreateEventW, CreateProcessAsUserW, DeleteProcThreadAttributeList,
-        EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetCurrentProcessId, GetProcessId,
-        InitializeProcThreadAttributeList, OpenProcess, OpenProcessToken,
+        EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId,
+        GetProcessId, InitializeProcThreadAttributeList, OpenProcess, OpenProcessToken,
         PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_CREATE_PROCESS, PROCESS_DUP_HANDLE,
         PROCESS_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
         QueryFullProcessImageNameW, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
         STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
     };
 
-    use super::BLOCKED_RESOURCE_CLASSES;
+    use super::BlockedResourceClass;
 
     const SUPERVISOR_PIPE_ENV: &str = "COCKPIT_HOST_398_SUPERVISOR_PIPE";
     const WORKER_PIPE_ENV: &str = "COCKPIT_HOST_398_WORKER_PIPE";
@@ -110,6 +104,8 @@ mod windows_fixture {
     const HOLDER_TARGET_PID_ENV: &str = "COCKPIT_HOST_398_HOLDER_TARGET_PID";
     const HOLDER_REPORT_PIPE_ENV: &str = "COCKPIT_HOST_398_HOLDER_REPORT_PIPE";
     const INHERITANCE_MODE_ENV: &str = "COCKPIT_HOST_398_INHERITANCE_MODE";
+    const EXPECTED_DESKTOP_ENV: &str = "COCKPIT_HOST_398_EXPECTED_DESKTOP";
+    const KNOWN_COCKPIT_HANDLE_ENV: &str = "COCKPIT_HOST_398_KNOWN_COCKPIT_HANDLE";
     const CLIENT_PIPE_ACCESS: u32 = FILE_READ_DATA | FILE_WRITE_DATA | SYNCHRONIZE;
     const FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
     const FIXTURE_TIMEOUT_MS: u32 = 10_000;
@@ -121,12 +117,23 @@ mod windows_fixture {
     enum FixtureOutcome {
         Blocked {
             ordinary_current_user_exchanges: bool,
-            resources: Vec<super::BlockedResourceClass>,
+            resources: Vec<ResourceClassObservation>,
         },
         Unavailable {
             capability: &'static str,
             os_error: Option<i32>,
         },
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ResourceClassObservation {
+        class: BlockedResourceClass,
+        outcome: ResourceClassOutcome,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ResourceClassOutcome {
+        NoDocumentedAllowRule,
     }
 
     struct TemporaryPipe(HANDLE);
@@ -142,7 +149,7 @@ mod windows_fixture {
                     wide.as_ptr(),
                     PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                     PIPE_TYPE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
-                    1,
+                    windows_sys::Win32::System::Pipes::PIPE_UNLIMITED_INSTANCES,
                     1024,
                     1024,
                     0,
@@ -217,39 +224,25 @@ mod windows_fixture {
         let desktop = match AlternateDesktop::provision() {
             Ok(desktop) => desktop,
             Err(error) => {
-                let outcome = FixtureOutcome::Unavailable {
-                    capability: "PrivateAlternateWindowStationAndDesktop",
-                    os_error: error.raw_os_error(),
-                };
-                eprintln!("Windows child-isolation fixture outcome: {outcome:?}");
-                return match outcome {
-                    FixtureOutcome::Unavailable {
-                        capability,
-                        os_error: _,
-                    } => {
-                        assert_eq!(capability, "PrivateAlternateWindowStationAndDesktop");
-                    }
-                    FixtureOutcome::Blocked { .. } => unreachable!(),
-                };
+                return report_missing_capability_or_fail(
+                    "PrivateAlternateWindowStationAndDesktop",
+                    error,
+                );
             }
         };
         let fixture = match ordinary_current_user_exchange() {
             Ok(fixture) => fixture,
-            Err(error) if error.raw_os_error().is_some() => {
-                return report_setup_unavailable("TemporaryNamedPipesAndTestRunner", error);
+            Err(error) => {
+                return report_missing_capability_or_fail("TemporaryNamedPipesAndTestRunner", error);
             }
-            Err(error) => panic!("ordinary current-user endpoint assertion failed: {error}"),
         };
         match restricted_child_denials(&fixture, &desktop) {
             Ok(()) => {}
-            Err(error) if error.raw_os_error().is_some() => {
-                return report_setup_unavailable("RestrictedChildSetup", error);
-            }
-            Err(error) => panic!("restricted-child evidence assertion failed: {error}"),
+            Err(error) => return report_missing_capability_or_fail("RestrictedChildSetup", error),
         }
         let outcome = FixtureOutcome::Blocked {
             ordinary_current_user_exchanges: true,
-            resources: BLOCKED_RESOURCE_CLASSES.to_vec(),
+            resources: blocked_resource_observations(),
         };
 
         eprintln!("Windows child-isolation fixture outcome: {outcome:?}");
@@ -262,18 +255,68 @@ mod windows_fixture {
                     ordinary_current_user_exchanges,
                     "the result is blocked only after the real ordinary-client exchanges"
                 );
-                assert_eq!(resources, BLOCKED_RESOURCE_CLASSES);
+                assert_blocked_resource_observations(&resources);
             }
-            FixtureOutcome::Unavailable {
-                capability,
-                os_error: _,
-            } => {
-                assert_eq!(capability, "PrivateAlternateWindowStationAndDesktop");
+            FixtureOutcome::Unavailable { .. } => {
+                unreachable!("unavailable returns before conformance outcome")
             }
         }
     }
 
-    fn report_setup_unavailable(capability: &'static str, error: io::Error) {
+    fn blocked_resource_observations() -> Vec<ResourceClassObservation> {
+        use BlockedResourceClass::{
+            ConfiguredExecutableAndRuntime, ConfiguredNetwork, NativeApprovalBoundary,
+            PtyAndStandardIo, TemporaryAndWorkspaceResources, UnconfinedFilesystemAndDependencies,
+        };
+        [
+            UnconfinedFilesystemAndDependencies,
+            ConfiguredExecutableAndRuntime,
+            TemporaryAndWorkspaceResources,
+            PtyAndStandardIo,
+            ConfiguredNetwork,
+            NativeApprovalBoundary,
+        ]
+        .into_iter()
+        .map(|class| ResourceClassObservation {
+            class,
+            outcome: ResourceClassOutcome::NoDocumentedAllowRule,
+        })
+        .collect()
+    }
+
+    fn assert_blocked_resource_observations(resources: &[ResourceClassObservation]) {
+        assert_eq!(
+            resources.len(),
+            6,
+            "every current Windows resource class is recorded"
+        );
+        for class in [
+            BlockedResourceClass::UnconfinedFilesystemAndDependencies,
+            BlockedResourceClass::ConfiguredExecutableAndRuntime,
+            BlockedResourceClass::TemporaryAndWorkspaceResources,
+            BlockedResourceClass::PtyAndStandardIo,
+            BlockedResourceClass::ConfiguredNetwork,
+            BlockedResourceClass::NativeApprovalBoundary,
+        ] {
+            assert!(
+                resources.iter().any(|observation| {
+                    observation.class == class
+                        && observation.outcome == ResourceClassOutcome::NoDocumentedAllowRule
+                }),
+                "resource class {class:?} was not independently recorded as lacking an allow rule",
+            );
+        }
+    }
+
+    fn report_missing_capability_or_fail(capability: &'static str, error: io::Error) {
+        // A capable Windows host must fail closed on an ordinary setup, launch,
+        // descriptor, inspection, or Job error. Only the two documented OS
+        // signals that the primitive is absent are a typed unavailable result.
+        let missing = matches!(error.raw_os_error(), Some(50 | 120));
+        assert!(
+            missing,
+            "required Windows capability {capability} failed on a capable host: {error}"
+        );
         let outcome = FixtureOutcome::Unavailable {
             capability,
             os_error: error.raw_os_error(),
@@ -281,9 +324,11 @@ mod windows_fixture {
         eprintln!("Windows child-isolation fixture outcome: {outcome:?}");
         match outcome {
             FixtureOutcome::Unavailable {
-                capability: actual, ..
+                capability: actual,
+                os_error,
             } => {
                 assert_eq!(actual, capability);
+                assert_eq!(os_error, error.raw_os_error());
             }
             FixtureOutcome::Blocked { .. } => unreachable!(),
         }
@@ -356,6 +401,51 @@ mod windows_fixture {
         child: Child,
     }
 
+    struct FixtureHandle(HANDLE);
+
+    impl Drop for FixtureHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+                // SAFETY: FixtureHandle has unique ownership of this test-only
+                // Windows handle and clears it after closing.
+                unsafe { CloseHandle(self.0) };
+                self.0 = std::ptr::null_mut();
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct FixtureEnvironment {
+        previous: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl FixtureEnvironment {
+        fn set(&mut self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) {
+            if !self.previous.iter().any(|(saved, _)| *saved == name) {
+                self.previous.push((name, env::var_os(name)));
+            }
+            // SAFETY: this test process owns these unique fixture variables;
+            // Drop restores the caller's prior environment on every exit path.
+            unsafe { env::set_var(name, value) };
+        }
+    }
+
+    impl Drop for FixtureEnvironment {
+        fn drop(&mut self) {
+            for (name, prior) in self.previous.drain(..).rev() {
+                // SAFETY: restores the exact process-global state captured by
+                // FixtureEnvironment::set for this test-only child launch.
+                unsafe {
+                    if let Some(value) = prior {
+                        env::set_var(name, value);
+                    } else {
+                        env::remove_var(name);
+                    }
+                }
+            }
+        }
+    }
+
     impl FixtureHolder {
         fn spawn(executable: &std::path::Path, test_name: &str) -> io::Result<Self> {
             let child = Command::new(executable)
@@ -387,7 +477,7 @@ mod windows_fixture {
         }
 
         fn raw_handle(&self) -> HANDLE {
-            use std::os::windows::process::ChildExt;
+            use std::os::windows::io::AsRawHandle;
 
             self.child.as_raw_handle().cast()
         }
@@ -410,6 +500,14 @@ mod windows_fixture {
             OwnerOnlyPipeSecurity::for_current_user().map_err(io::Error::other)?;
         let supervisor = TemporaryPipe::create(&supervisor_name, &mut supervisor_security)?;
         let worker = TemporaryPipe::create(&worker_name, &mut worker_security)?;
+        // A live daemon must re-arm before returning an accepted connection.
+        // Exercise the same subsequent CreateNamedPipeW DACL check here, then
+        // drop the disposable pending instances before the exchange below.
+        drop(TemporaryPipe::create(
+            &supervisor_name,
+            &mut supervisor_security,
+        )?);
+        drop(TemporaryPipe::create(&worker_name, &mut worker_security)?);
 
         let executable = env::current_exe()?;
         let mut child = Command::new(executable)
@@ -445,45 +543,62 @@ mod windows_fixture {
         desktop: &AlternateDesktop,
     ) -> io::Result<()> {
         let targets = ProcessTargets::spawn()?;
-        let token = restricted_code_token()?;
+        let token = FixtureHandle(restricted_code_token()?);
         let executable = env::current_exe()?;
         let command = format!(
             "\"{}\" --exact windows_fixture::restricted_child_denials --ignored --nocapture",
             executable.display()
         );
-        // SAFETY: these names are unique to this test process and are removed
-        // immediately after CreateProcessAsUserW has copied its environment.
-        unsafe {
-            env::set_var(SUPERVISOR_PIPE_ENV, &fixture.supervisor_name);
-            env::set_var(WORKER_PIPE_ENV, &fixture.worker_name);
-            env::set_var(SUPERVISOR_PID_ENV, targets.supervisor.pid().to_string());
-            env::set_var(WORKER_PID_ENV, targets.worker.pid().to_string());
-            env::set_var(
-                DUPLICATION_SOURCE_PID_ENV,
-                targets.duplication_source.pid().to_string(),
-            );
-            env::set_var(
-                DUPLICATION_SOURCE_HANDLE_ENV,
-                targets.known_worker_handle.to_string(),
-            );
+        // Mark the real temporary supervisor control-pipe server handle
+        // inheritable. It is never placed in either child handle mode, so the
+        // child can prove that no Cockpit control-pipe handle leaked.
+        let known_cockpit_handle = fixture.supervisor.0;
+        // SAFETY: this live test-only pipe handle remains owned by fixture;
+        // marking it inheritable gives the two launch modes a known marker.
+        if unsafe {
+            SetHandleInformation(
+                known_cockpit_handle,
+                HANDLE_FLAG_INHERIT,
+                HANDLE_FLAG_INHERIT,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
         }
+        let mut environment = FixtureEnvironment::default();
+        environment.set(SUPERVISOR_PIPE_ENV, &fixture.supervisor_name);
+        environment.set(WORKER_PIPE_ENV, &fixture.worker_name);
+        environment.set(SUPERVISOR_PID_ENV, targets.supervisor.pid().to_string());
+        environment.set(WORKER_PID_ENV, targets.worker.pid().to_string());
+        environment.set(
+            DUPLICATION_SOURCE_PID_ENV,
+            targets.duplication_source.pid().to_string(),
+        );
+        environment.set(
+            DUPLICATION_SOURCE_HANDLE_ENV,
+            targets.known_worker_handle.to_string(),
+        );
+        environment.set(EXPECTED_DESKTOP_ENV, &desktop.full_name);
+        environment.set(
+            KNOWN_COCKPIT_HANDLE_ENV,
+            (known_cockpit_handle as usize).to_string(),
+        );
         // The empty variant is a separate process creation: no inherited
         // handles and no attribute list are permitted in that proof.
-        unsafe { env::set_var(INHERITANCE_MODE_ENV, "none") };
+        environment.set(INHERITANCE_MODE_ENV, "none");
         let empty =
-            launch_restricted_suspended(token, &executable, &command, desktop, Inheritance::None);
-        unsafe { env::remove_var(INHERITANCE_MODE_ENV) };
+            launch_restricted_suspended(token.0, &executable, &command, desktop, Inheritance::None);
         let mut empty = empty?;
         let empty_job = prepare_restricted_child(&mut empty, &executable)?;
-        resume_and_require_success(&mut empty, empty_job)?;
+        resume_and_require_success(&mut empty, empty_job, None)?;
 
         let mut stdio = FixtureStdio::create()?;
         // This variant has precisely the three standard-I/O endpoints in its
         // explicit handle list; the protected Cockpit pipe is deliberately not
         // inheritable and not listed.
-        unsafe { env::set_var(INHERITANCE_MODE_ENV, "stdio") };
+        environment.set(INHERITANCE_MODE_ENV, "stdio");
         let listed = launch_restricted_suspended(
-            token,
+            token.0,
             &executable,
             &command,
             desktop,
@@ -492,20 +607,17 @@ mod windows_fixture {
         // Creation has copied the three explicit child endpoints. The parent
         // closes its duplicate endpoints before the target is allowed to run.
         stdio.close_child_ends();
-        // SAFETY: remove only the test-specific variables this fixture created.
-        unsafe {
-            env::remove_var(SUPERVISOR_PIPE_ENV);
-            env::remove_var(WORKER_PIPE_ENV);
-            env::remove_var(SUPERVISOR_PID_ENV);
-            env::remove_var(WORKER_PID_ENV);
-            env::remove_var(DUPLICATION_SOURCE_PID_ENV);
-            env::remove_var(DUPLICATION_SOURCE_HANDLE_ENV);
-            env::remove_var(INHERITANCE_MODE_ENV);
-            let _ = CloseHandle(token);
+        drop(environment);
+        // SAFETY: restore the fixture pipe's non-inheritable state before
+        // releasing it back to EndpointFixture's Drop implementation.
+        let cleared = unsafe { SetHandleInformation(known_cockpit_handle, HANDLE_FLAG_INHERIT, 0) };
+        drop(token);
+        if cleared == 0 {
+            return Err(io::Error::last_os_error());
         }
         let mut listed = listed?;
         let listed_job = prepare_restricted_child(&mut listed, &executable)?;
-        resume_and_require_success(&mut listed, listed_job)
+        resume_and_require_success(&mut listed, listed_job, Some(&stdio))
     }
 
     fn restricted_code_token() -> io::Result<HANDLE> {
@@ -754,7 +866,9 @@ mod windows_fixture {
                 lpSecurityDescriptor: std::ptr::null_mut(),
                 bInheritHandle: 1,
             };
-            let (parent_stdin, child_stdin) = anonymous_pipe(&attributes)?;
+            // CreatePipe returns (read, write): the child reads stdin while
+            // the parent writes it; stdout/stderr reverse that direction.
+            let (child_stdin, parent_stdin) = anonymous_pipe(&attributes)?;
             // CreatePipe returns (read, write). The child reads stdin and
             // writes stdout/stderr; the parent keeps the opposing endpoints.
             let (parent_stdout, child_stdout) = anonymous_pipe(&attributes)?;
@@ -799,6 +913,32 @@ mod windows_fixture {
                     }
                 }
             }
+        }
+
+        fn prove_child_stdio(&self) -> io::Result<()> {
+            write_all(self.parent_stdin, b"fixture-stdin\n")?;
+            let mut transcript = Vec::new();
+            while !transcript
+                .windows(b"fixture-stdout\n".len())
+                .any(|line| line == b"fixture-stdout\n")
+            {
+                let mut chunk = [0_u8; 256];
+                let read = read_with_timeout(self.parent_stdout, &mut chunk)? as usize;
+                transcript.extend_from_slice(&chunk[..read]);
+                if transcript.len() > 8 * 1024 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "exact handle-list child stdout omitted its expected bytes",
+                    ));
+                }
+            }
+            if transcript.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "exact handle-list child stdout did not carry the expected bytes",
+                ));
+            }
+            Ok(())
         }
     }
 
@@ -943,6 +1083,9 @@ mod windows_fixture {
             StartupInfo: *startup,
             lpAttributeList: attributes,
         };
+        // CreateProcess reads the STARTUPINFOEXW form only when cb identifies
+        // that larger structure; STARTUPINFOW's size would ignore the list.
+        extended.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
         // SAFETY: all Windows strings, STARTUPINFOEXW fields, and the exact
         // three inheritable stdio handles remain valid for the system call.
         let created = unsafe {
@@ -1072,6 +1215,7 @@ mod windows_fixture {
     fn resume_and_require_success(
         process: &mut PROCESS_INFORMATION,
         job: HANDLE,
+        stdio: Option<&FixtureStdio>,
     ) -> io::Result<()> {
         // SAFETY: the initial thread is still suspended; all token, image,
         // protected-DACL, and job assertions ran before this resume.
@@ -1079,6 +1223,13 @@ mod windows_fixture {
             terminate_and_close(process);
             unsafe { CloseHandle(job) };
             return Err(io::Error::last_os_error());
+        }
+        if let Some(stdio) = stdio {
+            if let Err(error) = stdio.prove_child_stdio() {
+                terminate_and_close(process);
+                unsafe { CloseHandle(job) };
+                return Err(error);
+            }
         }
         let waited = unsafe { WaitForSingleObject(process.hProcess, FIXTURE_TIMEOUT_MS) };
         if waited == WAIT_TIMEOUT {
@@ -1184,7 +1335,11 @@ mod windows_fixture {
         {
             return Err(io::Error::last_os_error());
         }
-        if unsafe { EqualSid(group.Groups[0].Sid, restricted_code.as_mut_ptr().cast()) } == 0 {
+        let groups =
+            unsafe { std::slice::from_raw_parts(group.Groups.as_ptr(), group.GroupCount as usize) };
+        if !groups.iter().any(|candidate| unsafe {
+            EqualSid(candidate.Sid, restricted_code.as_mut_ptr().cast()) != 0
+        }) {
             return Err(io::Error::other(
                 "restricted child token does not carry WinRestrictedCodeSid",
             ));
@@ -1224,6 +1379,8 @@ mod windows_fixture {
             .expect("numeric fixture duplication source handle")
             as HANDLE;
         let inheritance = env::var(INHERITANCE_MODE_ENV).expect("fixture inheritance mode");
+
+        assert_child_desktop_identity();
 
         assert_access_denied(open_client_with_exact_rights(&supervisor));
         assert_access_denied(open_client_with_exact_rights(&worker));
@@ -1300,9 +1457,7 @@ mod windows_fixture {
     }
 
     fn assert_zero_inheritance_proof() {
-        // The protected handle assertion above is the observable proof for the
-        // zero-list CreateProcessAsUserW call. No attribute list and
-        // bInheritHandles=FALSE were used for this child.
+        assert_known_cockpit_handle_is_absent();
     }
 
     fn assert_exact_stdio_inheritance_proof() {
@@ -1333,6 +1488,83 @@ mod windows_fixture {
             stdin, stderr,
             "stdio handle list must retain distinct stdin/error"
         );
+        assert_known_cockpit_handle_is_absent();
+        let mut input = [0_u8; b"fixture-stdin\n".len()];
+        std::io::Read::read_exact(&mut std::io::stdin(), &mut input)
+            .expect("exact stdin handle-list endpoint reads parent bytes");
+        assert_eq!(&input, b"fixture-stdin\n");
+        use std::io::Write as _;
+        let mut output = std::io::stdout();
+        output
+            .write_all(b"fixture-stdout\n")
+            .expect("exact stdout handle-list endpoint writes parent bytes");
+        output.flush().expect("flush fixture stdout");
+    }
+
+    fn assert_known_cockpit_handle_is_absent() {
+        let handle = env::var(KNOWN_COCKPIT_HANDLE_ENV)
+            .expect("known Cockpit marker handle")
+            .parse::<usize>()
+            .expect("numeric Cockpit marker handle") as HANDLE;
+        let mut flags = 0_u32;
+        assert_eq!(
+            unsafe { GetHandleInformation(handle, &mut flags) },
+            0,
+            "restricted child inherited a known Cockpit marker handle",
+        );
+        assert_eq!(unsafe { GetLastError() }, ERROR_INVALID_HANDLE);
+    }
+
+    fn assert_child_desktop_identity() {
+        let expected = env::var(EXPECTED_DESKTOP_ENV).expect("expected alternate desktop");
+        let (expected_station, expected_desktop) = expected
+            .split_once('\\')
+            .expect("alternate desktop has station and desktop name");
+        let station = unsafe { GetProcessWindowStation() };
+        assert!(
+            !station.is_null(),
+            "restricted child has no process window station"
+        );
+        let desktop = unsafe { GetThreadDesktop(GetCurrentThreadId()) };
+        assert!(!desktop.is_null(), "restricted child has no thread desktop");
+        assert_eq!(
+            user_object_name(station).expect("read restricted child window-station name"),
+            expected_station,
+            "restricted child attached to an unexpected window station",
+        );
+        assert_eq!(
+            user_object_name(desktop).expect("read restricted child desktop name"),
+            expected_desktop,
+            "restricted child attached to an unexpected desktop",
+        );
+    }
+
+    fn user_object_name(handle: HANDLE) -> io::Result<String> {
+        let mut bytes = 0_u32;
+        unsafe {
+            GetUserObjectInformationW(handle, UOI_NAME, std::ptr::null_mut(), 0, &mut bytes);
+        }
+        if bytes == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut name = vec![0_u16; (bytes as usize).div_ceil(std::mem::size_of::<u16>())];
+        if unsafe {
+            GetUserObjectInformationW(
+                handle,
+                UOI_NAME,
+                name.as_mut_ptr().cast(),
+                bytes,
+                &mut bytes,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let length = name
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(name.len());
+        Ok(String::from_utf16_lossy(&name[..length]))
     }
 
     fn assert_access_denied(result: io::Result<HANDLE>) {
@@ -1630,6 +1862,7 @@ fn platform_contract_retains_the_real_runner_and_route_inventory() {
         "bInheritHandles = TRUE",
         "STARTUPINFOW.lpDesktop",
         "Create and ACL a unique alternate window station and desktop before process",
+        "process window-station and thread-desktop names",
         "the child process token",
         "QueryFullProcessImageNameW",
         "AssignProcessToJobObject",
@@ -1638,6 +1871,8 @@ fn platform_contract_retains_the_real_runner_and_route_inventory() {
         "PROCESS_DUP_HANDLE",
         "ordinary-current-user supervisor admission",
         "typed `Unavailable`",
+        "ERROR_NOT_SUPPORTED` or `ERROR_CALL_NOT_IMPLEMENTED`",
+        "NoDocumentedAllowRule",
         "#399 remains deferred",
         "test-only temporary-object fixture runner",
         "spawns\na second test-runner process",
@@ -1658,6 +1893,9 @@ fn platform_contract_retains_the_real_runner_and_route_inventory() {
         "`apps/cli/src/terminal_host.rs`",
         "`crates/cockpit-core/src/container/mod.rs`",
         "`crates/cockpit-core/src/git/mod.rs`",
+        "`crates/cockpit-core/src/worktree_orchestration/validation.rs`",
+        "`crates/cockpit-core/src/tools/write.rs`",
+        "`crates/cockpit-core/src/tools/edit.rs`",
     ] {
         assert!(
             contract.contains(required_text),

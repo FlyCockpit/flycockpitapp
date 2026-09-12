@@ -204,11 +204,14 @@ pub struct OwnerOnlyPipeSecurity {
 impl OwnerOnlyPipeSecurity {
     pub fn for_current_user() -> Result<Self> {
         let sid = current_user_sid()?;
-        // A duplex named-pipe client needs only read, write, and synchronize.
-        // Do not use Generic Write here: named-pipe generic-write expansion
-        // includes FILE_APPEND_DATA, which is FILE_CREATE_PIPE_INSTANCE for a
-        // pipe and would let an ordinary client create a server instance.
-        Self::from_sddl(&format!("D:P(A;;0x00100003;;;{sid})"))
+        // The daemon creates the first and every subsequent server instance as
+        // this same user. Named-pipe instance creation is DACL-checked against
+        // FILE_CREATE_PIPE_INSTANCE (the FILE_APPEND_DATA bit), so that right
+        // must be explicit here. Ordinary client helpers still request only
+        // read, write, and synchronize below; they never receive generic write.
+        // Do not replace this with Generic Write: its other generic rights are
+        // not part of either the client or server contract.
+        Self::from_sddl(&format!("D:P(A;;0x00100007;;;{sid})"))
     }
 
     fn from_sddl(sddl: &str) -> Result<Self> {

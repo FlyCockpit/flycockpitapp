@@ -546,8 +546,38 @@ impl SecureKeyActor {
             Some(dir) => dir,
             None => super::resolve::kek_dir_for_db(&db)?,
         };
-        let effective =
-            super::resolve::ensure_secret_vault(&db, keyring_probe, &kek_dir, injected)?;
+        Self::start_production_resolved_with_options(
+            db,
+            reconciler,
+            keyring_probe,
+            Some(kek_dir),
+            injected,
+            super::resolve::SecretVaultOpenOptions::default(),
+        )
+    }
+
+    /// First-run daemon composition path. The caller supplies the explicit
+    /// placement and moves an optional zeroizing passphrase directly into the
+    /// vault initializer; no bootstrap journal can retain it.
+    pub fn start_production_resolved_with_options(
+        db: Db,
+        reconciler: Arc<dyn ConsumerReconciler>,
+        keyring_probe: &super::platform::KeyringProbeResult,
+        kek_dir: Option<std::path::PathBuf>,
+        injected: super::resolve::SecretStoreInjected,
+        options: super::resolve::SecretVaultOpenOptions,
+    ) -> Result<Self, SecureKeyError> {
+        let kek_dir = match kek_dir {
+            Some(dir) => dir,
+            None => super::resolve::kek_dir_for_db(&db)?,
+        };
+        let effective = super::resolve::ensure_secret_vault_with_options(
+            &db,
+            keyring_probe,
+            &kek_dir,
+            injected,
+            options,
+        )?;
         let owns_default_store =
             effective.placement == cockpit_proto::SecretStorePlacement::Keyring;
         Self::start_inner(

@@ -168,7 +168,9 @@ pub struct WindowsWorkspaceExecutionLease {
 
 #[cfg(windows)]
 impl WindowsWorkspaceExecutionLease {
-    pub(crate) fn canonical_path(&self) -> &Path {
+    /// The canonical spelling whose complete no-delete handle chain this
+    /// lease keeps alive.
+    pub fn canonical_path(&self) -> &Path {
         &self.canonical_path
     }
 
@@ -177,7 +179,7 @@ impl WindowsWorkspaceExecutionLease {
     /// chain remains live during this check and through child completion, so a
     /// successful check cannot be followed by a pathname substitution before
     /// `CreateProcess` consumes `canonical_path`.
-    pub(crate) fn revalidate_before_spawn(&self) -> Result<()> {
+    pub fn revalidate_before_spawn(&self) -> Result<()> {
         self.imp_revalidate()
     }
 
@@ -191,27 +193,6 @@ impl WindowsWorkspaceExecutionLease {
             &self.canonical_path,
             &self.expected_identity,
         )
-    }
-}
-
-#[cfg(windows)]
-impl cockpit_config::config::extended::hooks::HookExecutionLease
-    for WindowsWorkspaceExecutionLease
-{
-}
-
-#[cfg(windows)]
-impl cockpit_config::config::extended::hooks::RetainedWindowsHookWorkingDirectory
-    for WindowsWorkspaceExecutionLease
-{
-    fn canonical_path(&self) -> &Path {
-        WindowsWorkspaceExecutionLease::canonical_path(self)
-    }
-
-    fn revalidate_before_spawn(&self) -> std::result::Result<(), String> {
-        WindowsWorkspaceExecutionLease::revalidate_before_spawn(self).map_err(|error| {
-            format!("Windows retained hook cwd lease verification failed: {error:#}")
-        })
     }
 }
 
@@ -707,7 +688,7 @@ fn digest(parts: &[&[u8]]) -> String {
 #[cfg(unix)]
 mod imp {
     use std::ffi::{CString, OsStr};
-    use std::io::{Read as _, Write as _};
+    use std::io::Read as _;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
@@ -1654,7 +1635,7 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use std::ffi::c_void;
-    use std::io::{Read as _, Write as _};
+    use std::io::Read as _;
     use std::mem::size_of;
     use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};

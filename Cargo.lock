@@ -1467,6 +1467,7 @@ name = "cockpit-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cockpit-test-support",
  "libc",
  "rand 0.10.2",
  "serde",

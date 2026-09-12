@@ -434,7 +434,12 @@ fn named_pipe_pid_is_current_user(pid: u32) -> Result<()> {
     };
     let current_sid = current_user_sid_bytes()?;
     // SAFETY: both SID buffers are live TokenUser allocations.
-    let equal = unsafe { EqualSid(peer_sid.as_ptr().cast(), current_sid.as_ptr().cast()) };
+    let equal = unsafe {
+        EqualSid(
+            peer_sid.as_ptr().cast_mut().cast(),
+            current_sid.as_ptr().cast_mut().cast(),
+        )
+    };
     if equal == 0 {
         bail!("named-pipe process SID does not match the current user");
     }
@@ -553,7 +558,7 @@ pub fn open_client_pipe_blocking(pipe: &PipeName) -> std::io::Result<std::fs::Fi
 pub async fn connect_client_pipe(
     pipe: &PipeName,
 ) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
-    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::os::windows::io::AsRawHandle;
     use tokio::net::windows::named_pipe::NamedPipeClient;
 
     let handle = retry_busy_open_async(pipe, CLIENT_PIPE_CONNECT_TIMEOUT, || {
@@ -666,7 +671,7 @@ pub fn read_bounded(
     buf: &mut [u8],
     timeout: Duration,
 ) -> std::io::Result<usize> {
-    use std::io::Read as _;
+    use std::io::Read;
     use std::os::windows::io::AsRawHandle;
     use std::time::Instant;
     use windows_sys::Win32::Foundation::HANDLE;

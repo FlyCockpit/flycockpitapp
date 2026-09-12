@@ -192,7 +192,7 @@ unsafe extern "system" {
 /// Every other status carries the raw NTSTATUS in its message so a
 /// fail-closed caller can still diagnose it.
 fn io_from_status(status: i32) -> io::Error {
-    let kind = match status as u32 {
+    let kind = match status {
         STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => io::ErrorKind::NotFound,
         STATUS_OBJECT_NAME_COLLISION => io::ErrorKind::AlreadyExists,
         STATUS_ACCESS_DENIED => io::ErrorKind::PermissionDenied,
@@ -226,8 +226,8 @@ fn component_units(name: &OsStr) -> io::Result<Vec<u16>> {
     if name == std::ffi::OsStr::new(".")
         || name == std::ffi::OsStr::new("..")
         || units.contains(&0)
-        || units.contains(&b'\\' as u16)
-        || units.contains(&b'/' as u16)
+        || units.contains(&(b'\\' as u16))
+        || units.contains(&(b'/' as u16))
     {
         return Err(invalid_input(
             "held Windows component name contains an unsafe character",

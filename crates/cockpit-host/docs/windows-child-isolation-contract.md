@@ -182,25 +182,28 @@ network behavior, and native resource approval across all rows. A later product
 prompt may deliberately narrow a route and then define its resources; this
 prerequisite may not narrow it silently.
 
-## Test-only conformance runner and evidence rule
+## Test-only stop recorder and evidence rule
 
-`crates/cockpit-host/tests/windows_child_isolation_fixture.rs` is a manual,
-test-only stop-record runner. Run it on Windows with:
+`crates/cockpit-host/tests/windows_child_isolation_fixture.rs` is a test-only
+typed stop recorder, not a conformance fixture. Run it on any host with:
 
 ```text
 cargo test -p cockpit-host --test windows_child_isolation_fixture -- --nocapture
 ```
 
 On a non-Windows host it reports the typed `Unavailable { WindowsHost }`
-state. On Windows it currently reports the typed `Blocked` state with the
-unbounded resource classes above. It does not create a Job, a token, a pipe,
-or a process because doing so would falsely present a partial RC experiment as
-conformance evidence.
+state. On Windows it reports the typed `Blocked` state with the unbounded
+resource classes above. It deliberately does not create a Job, token, pipe, or
+process: an endpoint-only RC experiment cannot be called a conformance fixture
+while executable/runtime, workspace, temp, PTY, configured-network, and
+native-approval behavior have no finite allow rule. Its result is a stop
+record, never pass evidence.
 
 When and only when a later prompt supplies a finite product resource model, the
-runner must be replaced with a real temporary-object fixture under the existing
-test-runner account. That fixture must create temporary pipes/directories,
-launch a restricted child through the sequence above, and record each of:
+stop recorder must be replaced with a real temporary-object fixture under the
+existing test-runner account. That fixture must create temporary
+pipes/directories, launch a restricted child through the sequence above, and
+record each of:
 
 1. ordinary-current-user supervisor admission and admitted direct-worker
    exchange with exactly the client pipe rights;

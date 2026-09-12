@@ -1,11 +1,13 @@
-//! Manual stop-record runner for issue #398.
+//! Typed stop recorder for issue #398.
 //!
 //! This test intentionally does not impersonate Windows conformance. The
 //! documented candidate cannot preserve Cockpit's current unbounded Windows
 //! subprocess routes, so creating a restricted token and proving only endpoint
 //! denial would be misleading evidence. A later finite product resource model
 //! must replace this test with the real temporary-object fixture described in
-//! `../docs/windows-child-isolation-contract.md`.
+//! `../docs/windows-child-isolation-contract.md`. It is deliberately not a
+//! conformance fixture: a partial restricted-token experiment cannot establish
+//! a boundary that preserves the current subprocess contract.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequiredCapability {
@@ -55,6 +57,8 @@ fn current_outcome() -> FixtureOutcome {
 fn conformance_runner_fails_closed_until_every_current_route_has_a_finite_model() {
     let outcome = current_outcome();
 
+    eprintln!("Windows child-isolation stop outcome: {outcome:?}");
+
     if cfg!(windows) {
         assert_eq!(
             outcome,
@@ -94,6 +98,9 @@ fn platform_contract_records_the_stop_outcome_and_required_real_observations() {
         "ordinary-current-user supervisor admission",
         "typed `Unavailable`",
         "#399 remains deferred",
+        "test-only\ntyped stop recorder, not a conformance fixture",
+        "It deliberately does not create a Job, token, pipe, or\nprocess",
+        "stop recorder must be replaced with a real temporary-object fixture",
     ] {
         assert!(
             contract.contains(required_text),

@@ -1657,6 +1657,7 @@ impl App {
                     promoted_from_ephemeral,
                 }) => {
                     if self.launch.session_id == source_session_id {
+                        self.startup_assistant_name = None;
                         if let Some(notice) = startup_notice {
                             // A lifecycle warning is independent of the
                             // ownership transition below. Keep it in the

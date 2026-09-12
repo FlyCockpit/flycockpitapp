@@ -89,14 +89,12 @@ pub async fn run_mode(
         return Ok(());
     }
 
-    let trust = prepare_tui_workspace_trust(project)?;
-
     let (lifecycle, lifecycle_task) = lifecycle_composition();
     let mut app = App::new_composed_with_session_mode(
         project,
         no_sandbox,
         mode,
-        trust,
+        StartupWorkspaceTrust::Decided,
         launch_start,
         lifecycle,
     );
@@ -124,13 +122,11 @@ pub async fn run_with_session(
         return Ok(());
     }
 
-    let trust = prepare_tui_workspace_trust(project)?;
-
     let (lifecycle, lifecycle_task) = lifecycle_composition();
     let mut app = App::new_composed_with_session(
         project,
         no_sandbox,
-        trust,
+        StartupWorkspaceTrust::Decided,
         session_id,
         launch_start,
         lifecycle,
@@ -142,17 +138,33 @@ pub async fn run_with_session(
     combine_app_and_lifecycle(result, lifecycle_result)
 }
 
-fn prepare_tui_workspace_trust(project: Option<&Path>) -> Result<StartupWorkspaceTrust> {
-    let opened = match project {
-        Some(path) => path.to_path_buf(),
-        None => std::env::current_dir().context("resolving cwd")?,
-    };
-    let root = crate::config::trust::resolve_trust_root(&opened)?;
-    crate::config::trust::set_runtime_policy(
-        root.clone(),
-        cockpit_config::WorkspaceTrustMode::IgnoreConfig,
+/// `assistants chat NAME` enters the same safe shell as every other
+/// interactive session.  The name is only resolved by the post-paint TUI
+/// reducer after it has acquired the persistent Assistant owner.
+pub async fn run_named_assistant(
+    project: Option<&Path>,
+    no_sandbox: bool,
+    assistant_name: String,
+    launch_start: Option<Instant>,
+) -> Result<()> {
+    if !stdin().is_terminal() || !stdout().is_terminal() {
+        welcome::print(project, !no_sandbox);
+        return Ok(());
+    }
+
+    let (lifecycle, lifecycle_task) = lifecycle_composition();
+    let mut app = App::new_composed_with_named_assistant(
+        project,
+        no_sandbox,
+        assistant_name,
+        launch_start,
+        lifecycle,
     );
-    Ok(StartupWorkspaceTrust::Pending(root))
+    app.configure_onboarding_launch(false, false);
+    let result = app.run().await;
+    drop(app);
+    let lifecycle_result = finish_lifecycle(lifecycle_task).await;
+    combine_app_and_lifecycle(result, lifecycle_result)
 }
 
 #[cfg(test)]
@@ -210,8 +222,8 @@ mod tests {
         let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         crate::config::trust::clear_runtime_policy_for_tests();
 
-        let trust = prepare_tui_workspace_trust(Some(tmp.path())).unwrap();
-        assert!(matches!(trust, StartupWorkspaceTrust::Pending(_)));
+        let trust = StartupWorkspaceTrust::Decided;
+        assert!(matches!(trust, StartupWorkspaceTrust::Decided));
         crate::config::trust::clear_runtime_policy_for_tests();
     }
 
@@ -222,8 +234,8 @@ mod tests {
         crate::config::trust::clear_runtime_policy_for_tests();
         write_provider_config(tmp.path());
 
-        let trust = prepare_tui_workspace_trust(Some(tmp.path())).unwrap();
-        assert!(matches!(trust, StartupWorkspaceTrust::Pending(_)));
+        let trust = StartupWorkspaceTrust::Decided;
+        assert!(matches!(trust, StartupWorkspaceTrust::Decided));
         let ignored = ConfigDoc::load_effective(tmp.path());
         assert!(!ignored.providers.contains_key("p"));
 

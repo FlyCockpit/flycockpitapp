@@ -10,22 +10,20 @@ fn reset_startup_counters() {
 }
 
 #[test]
-fn app_new_loads_launch_config_once_and_defers_first_paint_work() {
+fn app_new_is_a_safe_shell_and_defers_all_startup_work() {
     let tmp = tempfile::tempdir().unwrap();
     reset_startup_counters();
 
     let app = App::new(Some(tmp.path()), false);
 
-    assert_eq!(cockpit_config::extended::load_for_cwd_call_count(), 1);
-    // Provider/credential resolution moved daemon-side (`tui-config-single-source`):
-    // the bootstrap projects the redacted provider view without resolving
-    // credentials, so it never calls the credential-aware `load_effective`.
+    assert_eq!(cockpit_config::extended::load_for_cwd_call_count(), 0);
     assert_eq!(cockpit_config::providers::load_effective_call_count(), 0);
     assert_eq!(cockpit_core::daemon::blocking_probe_call_count(), 0);
     assert_eq!(cockpit_core::container::detect_runtime_call_count(), 0);
     assert_eq!(cockpit_tokenizer::count_call_count(), 0);
     assert!(app.guidance_estimate.is_none());
     assert!(!app.startup_background.started);
+    assert!(!app.first_paint_completed);
 }
 
 #[test]
@@ -72,6 +70,7 @@ async fn startup_background_tasks_are_explicitly_started_after_construction() {
     assert!(!app.startup_background.started);
     assert_eq!(app.async_actions.pending_count(), 0);
 
+    app.first_paint_completed = true;
     app.start_startup_background_tasks();
 
     assert!(app.startup_background.started);

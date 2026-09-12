@@ -17,8 +17,8 @@ use crate::cli::{
     AssistantSoulEditMode, MediaAccountingCommand,
 };
 use crate::commands::setup::{TerminalActionHandler, TerminalIo, run_terminal_wizard};
-use crate::daemon::client::{ensure_assistant_persistent_daemon, ensure_persistent_daemon};
-use crate::daemon::proto::{AssistantSessionResolutionMode, Request, Response};
+use crate::daemon::client::ensure_persistent_daemon;
+use crate::daemon::proto::{Request, Response};
 #[cfg(test)]
 use crate::session::project_id_for;
 use crate::wizard::WizardRun;
@@ -499,42 +499,10 @@ async fn fetch_assistant(
 
 async fn chat(name: &str, no_sandbox: bool, launch_start: Option<Instant>) -> Result<()> {
     crate::assistants::validate_named_assistant_name(name)?;
-    let project_root = std::env::current_dir().context("resolving cwd")?;
-    let project_root_str = project_root.to_string_lossy().into_owned();
-    let daemon = ensure_assistant_persistent_daemon()
+    // Named-session resolution is presentation work and therefore belongs
+    // behind the shell's first-paint lifecycle gate.
+    crate::commands::tui::run_named_assistant(None, no_sandbox, name.to_string(), launch_start)
         .await
-        .context("starting persistent daemon for assistant chat")?;
-    if daemon.promoted_from_ephemeral() {
-        eprintln!(
-            "{}",
-            cockpit_core::daemon::client::ASSISTANT_PERSISTENCE_NOTICE
-        );
-    }
-    let response = daemon
-        .client
-        .request(Request::ResolveAssistantSession {
-            assistant_id: name.to_string(),
-            project_root: project_root_str,
-            mode: AssistantSessionResolutionMode::MostRecentOrCreate,
-        })
-        .await
-        .context("requesting assistant session resolution from daemon")?
-        .map_err(|error| {
-            anyhow::anyhow!("daemon rejected assistant session resolution: {error}")
-        })?;
-    let session_id = match response {
-        Response::AssistantSessionResolved { session, .. } => session.session_id,
-        other => {
-            bail!("daemon returned unexpected response to assistant session resolution: {other:?}")
-        }
-    };
-    crate::commands::tui::run_with_session(
-        Some(&project_root),
-        no_sandbox,
-        session_id,
-        launch_start,
-    )
-    .await
 }
 
 struct StdTerminalIo;

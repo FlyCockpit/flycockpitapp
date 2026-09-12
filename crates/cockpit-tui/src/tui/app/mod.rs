@@ -1813,9 +1813,15 @@ pub struct App {
     pub(super) session_mode: Option<SessionMode>,
     /// Typed channel to the CLI-owned lifecycle composition task.
     pub(super) lifecycle: cockpit_client::LifecycleClient,
+    /// No lifecycle, root, config, or cleanup work may start until the first
+    /// completed terminal draw has crossed this fence.
+    first_paint_completed: bool,
     pub(super) monotonic_origin: Instant,
     pub(super) paste_client_instance_id: uuid::Uuid,
     pub(super) launch: LaunchInfo,
+    /// A named Assistant resume request. It is consumed only by the
+    /// post-onboarding attach reducer.
+    startup_assistant_name: Option<String>,
     /// Daemon-pushed config the TUI renders from; see [`HeldConfig`].
     pub(super) config_snapshot: HeldConfig,
     pending_workspace_trust: Option<PendingWorkspaceTrust>,
@@ -3373,6 +3379,30 @@ pub(crate) fn startup_first_paint_log_count() -> usize {
     STARTUP_FIRST_PAINT_LOG_COUNT.load(Ordering::SeqCst)
 }
 
+fn safe_shell_launch_info(project: Option<&Path>) -> LaunchInfo {
+    // `.` is a presentation placeholder, not a current-directory query. The
+    // parsed project is retained separately and resolved only after paint.
+    let unresolved = project.unwrap_or_else(|| Path::new(".")).to_path_buf();
+    LaunchInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        session_id: None,
+        session_short_id: None,
+        provider_line: "Loading session setup…".to_string(),
+        active_model: None,
+        active_model_diverged: false,
+        active_model_is_favorite: false,
+        active_model_is_trusted: false,
+        active_model_max_context: None,
+        active_model_supports_images: false,
+        cwd_display: unresolved.display().to_string(),
+        cwd: unresolved,
+        repo_status: None,
+        agent_name: "Cockpit".to_string(),
+        user_name: None,
+        banner_enabled: true,
+    }
+}
+
 impl App {
     #[cfg(test)]
     pub fn new(project: Option<&Path>, no_sandbox: bool) -> Self {
@@ -3503,6 +3533,28 @@ impl App {
         app
     }
 
+    /// Construct the safe shell for `assistants chat NAME`.  Resolving NAME's
+    /// session is deliberately deferred until after the first frame and the
+    /// daemon onboarding bootstrap are accepted.
+    pub fn new_composed_with_named_assistant(
+        project: Option<&Path>,
+        no_sandbox: bool,
+        assistant_name: String,
+        launch_start: Option<Instant>,
+        lifecycle: cockpit_client::LifecycleClient,
+    ) -> Self {
+        let mut app = Self::new_inner(
+            project,
+            no_sandbox,
+            Some(SessionMode::Assistant),
+            StartupWorkspaceTrust::Decided,
+            launch_start,
+            Some(lifecycle),
+        );
+        app.startup_assistant_name = Some(assistant_name);
+        app
+    }
+
     pub fn new_with_session(
         project: Option<&Path>,
         no_sandbox: bool,
@@ -3547,27 +3599,18 @@ impl App {
         lifecycle: Option<cockpit_client::LifecycleClient>,
     ) -> Self {
         let mut timer = cockpit_core::startup::PhaseTimer::start("App::new");
-        // Skip the synchronous `git status` here — it can take seconds in a
-        // giant repo and would block the first frame. `spawn_git_refresh`
-        // does an immediate background refresh and the branch pill pops in
-        // a tick later (chrome guards on `repo_status.is_some()`).
-        // Bootstrap resolution (`tui-config-single-source`): resolve only the
-        // `ExtendedConfig` from disk; provider config is projected without
-        // resolving credentials. Provider/credential resolution is daemon-side
-        // — the daemon pushes the resolved snapshot on attach and the held
-        // `config_snapshot` replaces this seed.
-        let LaunchBundle {
-            launch,
-            providers,
-            extended,
-        } = welcome::load_bundle_bootstrap_redacted(project, false);
+        // Interactive construction is a safe shell. It intentionally owns no
+        // current-directory, config, trust, daemon, clipboard, or export I/O.
+        let launch = safe_shell_launch_info(project);
+        let providers = cockpit_config::providers::ProvidersConfig::default();
+        let extended = cockpit_config::extended::ExtendedConfig::default();
         let config_snapshot = HeldConfig::from_view(
             0,
             false,
             extended.clone(),
             cockpit_core::secret_ref::redact_provider_view(&providers),
         );
-        timer.phase("welcome_load");
+        timer.phase("safe_shell");
         let tui_cfg = extended.tui.clone();
         timer.phase("config_load");
         // Skills populate after the first GetInventoryBundle; pre-attach is
@@ -3590,10 +3633,7 @@ impl App {
         let preflight_enabled = extended.preflight.enabled;
         let sandbox_escalation_enabled = extended.sandbox_escalation_enabled;
         let has_no_providers_at_startup = providers.providers.is_empty();
-        let startup_dependency_notice =
-            cockpit_core::external_runtime::current_startup_dependency_policy()
-                .and_then(|policy| policy.summary)
-                .map(|summary| format!("Dependency warning: {summary}"));
+        let startup_dependency_notice = None;
         let vim_setting = tui_cfg.vim_mode;
         let thinking_setting = tui_cfg.thinking;
         let markdown_opts = MarkdownOpts {
@@ -3612,8 +3652,7 @@ impl App {
 
         // The global background-agents setting selects the owner lifetime
         // only if lifecycle acquisition has to spawn a new owner.
-        let ephemeral_preference = !extended.daemon.background_agents;
-        timer.phase("daemon_probe");
+        let ephemeral_preference = false;
         #[cfg(feature = "remote")]
         let org_sync_disclosure = None;
         #[cfg(feature = "remote")]
@@ -3629,16 +3668,6 @@ impl App {
         let sticky_user_message = tui_cfg.sticky_user_message;
         let copy_on_release = tui_cfg.copy_on_release;
         let clipboard_recovery = tui_cfg.clipboard_recovery;
-        // Startup reconciliation (spec: "startup retains newest/removes
-        // older after containment checks"). `Off` never reaches this
-        // branch, so it stays entirely filesystem-free; a reconcile
-        // failure is swallowed (best-effort, never blocks startup) —
-        // `/doctor` still reports the directory's live state independently.
-        if clipboard_recovery == cockpit_config::extended::ClipboardRecovery::PrivateFile
-            && let Ok(dir) = crate::clipboard::recovery::recovery_dir_path()
-        {
-            let _ = crate::clipboard::recovery::reconcile_startup(&dir);
-        }
         let use_emojis = tui_cfg.use_emojis;
         let file_icons = crate::tui::file_icons::file_icons_resolved(tui_cfg.file_icons);
         let attention = tui_cfg.attention;
@@ -3668,9 +3697,11 @@ impl App {
                     })
                 })
                 .unwrap_or_else(cockpit_client::LifecycleClient::disconnected),
+            first_paint_completed: false,
             monotonic_origin: Instant::now(),
             paste_client_instance_id: uuid::Uuid::new_v4(),
             launch,
+            startup_assistant_name: None,
             config_snapshot,
             pending_workspace_trust: None,
             pending_sealed_operations: HashMap::new(),
@@ -4003,27 +4034,13 @@ impl App {
             keys_overlay: None,
             keyboard_enhancement_active: false,
         };
-        // First-run convenience: if the daemon prompt doesn't gate
-        // startup, open the Add-Provider wizard immediately when no
-        // providers are configured. The prompt-resolution branches
-        // call this same helper after the user dismisses the daemon
-        // prompt.
-        match startup_trust {
-            StartupWorkspaceTrust::Pending(root) => {
-                app.dialog = Dialog::open_workspace_trust(root);
-            }
-            StartupWorkspaceTrust::Decided => {
-                app.maybe_open_add_provider_wizard();
-            }
-        }
+        // Resolving/opening workspace trust belongs to the post-paint
+        // startup reducer. The safe shell may not inspect its root.
+        let _ = startup_trust;
         app
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        export_actions::recover_deferred_export_cleanup(
-            &self.launch.cwd.join(".cockpit").join("exports"),
-        )
-        .await;
         // Apply the latest completed dependency policy after startup.
         if let Some(notice) = self.startup_dependency_notice.take() {
             self.show_toast(notice, ToastKind::Warning);
@@ -4081,21 +4098,7 @@ impl App {
             }
         }
 
-        let refresh_handle = spawn_git_refresh(
-            self.launch.cwd.clone(),
-            self.lifecycle.clone(),
-            self.repo_status.clone(),
-        );
-        let worktree_handle = spawn_worktree_root_resolve(
-            self.launch.cwd.clone(),
-            self.lifecycle.clone(),
-            self.worktree_root.clone(),
-        );
-
         let result = self.event_loop(&mut terminal).await;
-
-        refresh_handle.abort();
-        worktree_handle.abort();
 
         // Process-exit cleanup for an open `/side` (no orphaned ephemeral
         // sessions): discard the throwaway fork *before* the daemon guard
@@ -4203,6 +4206,7 @@ impl App {
                 self.link_registry.begin_frame();
                 terminal.draw(|frame| self.render(frame))?;
                 self.startup_first_paint_timing.log_after_draw();
+                self.first_paint_completed = true;
                 crate::tui::links::emit_osc8(&self.link_registry, self.hyperlinks)?;
                 self.sync_cursor_shape();
             }

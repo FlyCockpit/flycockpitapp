@@ -564,15 +564,54 @@ impl App {
     }
 
     pub(super) fn start_startup_background_tasks(&mut self) {
+        if !self.first_paint_completed {
+            return;
+        }
         if self.startup_background.started {
             return;
         }
         self.startup_background.started = true;
 
+        // This is deliberately the first startup authority operation after
+        // paint. It reads only the user-global daemon lifetime preference;
+        // project/layered configuration remains unavailable here.
+        match cockpit_config::extended::load_global_daemon_lifetime_policy() {
+            Ok(background_agents) => {
+                self.ephemeral_preference = !background_agents;
+                self.lifecycle.set_default_intent(self.lifecycle_intent());
+                tracing::info!(background_agents, "startup lifetime-policy-ready");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "startup lifetime-policy-error");
+                self.show_toast(
+                    "Could not read daemon lifetime policy; retry startup",
+                    super::ToastKind::Error,
+                );
+                self.startup_background.started = false;
+                return;
+            }
+        }
+
         // First paint has already occurred before this entry point. Acquire
         // the lifecycle-selected owner now and ask its global authority for
         // the resumable checkpoint; this never pre-promotes an ephemeral owner.
         self.start_onboarding_bootstrap_fetch();
+
+        // Recovery is security cleanup, not a startup gate.  It is owned by
+        // the cancellable async-action registry so closing the shell before
+        // the worker starts performs no recovery I/O.
+        let exports_dir = self.launch.cwd.join(".cockpit").join("exports");
+        self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::Internal("startup.export_recovery"),
+            crate::tui::async_action::AsyncActionPolicy::Dedupe(
+                crate::tui::async_action::AsyncActionKey::new("startup.export_recovery"),
+            ),
+            async move {
+                crate::tui::app::export_actions::recover_deferred_export_cleanup(&exports_dir)
+                    .await;
+                Ok(crate::tui::async_action::AsyncActionPayload::Unit)
+            },
+        );
 
         tokio::task::spawn_blocking(cockpit_core::tokens::warm_cl100k);
 

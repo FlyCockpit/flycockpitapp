@@ -879,6 +879,9 @@ fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
         command,
         Some(Command::Run(_))
             | Some(Command::Init(_))
+            | Some(Command::Assistants(
+                crate::cli::AssistantCommand::Chat { .. }
+            ))
             | Some(Command::Assistants(crate::cli::AssistantCommand::Learn(_)))
     ) {
         return false;
@@ -934,6 +937,15 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         crate::cli::PublicCli::from_arg_matches(&crate::cli::public_v0_1_command().get_matches())?
             .into();
 
+    let interactive_shell = tui_mode_for_command(cli.command.as_ref()).is_some()
+        || matches!(
+            cli.command.as_ref(),
+            Some(Command::Setup(crate::cli::SetupArgs { wizard: None }))
+                | Some(Command::Assistants(
+                    crate::cli::AssistantCommand::Chat { .. }
+                ))
+        );
+
     // File-backed tracing must never put filesystem latency on the daemon's
     // boot/publication path. Keep the worker guard alive for the whole command
     // so shutdown can drain the bounded queue before the process exits.
@@ -941,18 +953,8 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         cli.log_level.as_deref(),
         cli.print_logs,
         drain_logs_on_exit(cli.command.as_ref()),
+        interactive_shell,
     );
-
-    if cli.debug_last_message {
-        match std::env::current_dir() {
-            Ok(cwd) => engine::model::enable_debug_last_message(cwd.join(".lastmessage")),
-            Err(e) => tracing::warn!(error = %e, "--debug-last-message: cwd unavailable"),
-        }
-    }
-
-    if command_requires_workspace_trust(cli.command.as_ref()) {
-        install_cli_trust_policy(cli.project.as_deref()).await?;
-    }
 
     if let Some(mode) = tui_mode_for_command(cli.command.as_ref()) {
         return commands::tui::run_mode(
@@ -979,6 +981,17 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
             true,
         )
         .await;
+    }
+
+    if cli.debug_last_message {
+        match std::env::current_dir() {
+            Ok(cwd) => engine::model::enable_debug_last_message(cwd.join(".lastmessage")),
+            Err(e) => tracing::warn!(error = %e, "--debug-last-message: cwd unavailable"),
+        }
+    }
+
+    if command_requires_workspace_trust(cli.command.as_ref()) {
+        install_cli_trust_policy(cli.project.as_deref()).await?;
     }
 
     match cli.command {
@@ -1076,6 +1089,7 @@ fn init_tracing(
     level: Option<&str>,
     print_logs: bool,
     drain_logs_on_exit: bool,
+    safe_interactive_shell: bool,
 ) -> Option<LogWorkerGuard> {
     use tracing_subscriber::{EnvFilter, fmt};
 
@@ -1083,6 +1097,17 @@ fn init_tracing(
         Some(l) => EnvFilter::try_new(l).unwrap_or_else(|_| EnvFilter::new("warn")),
         None => EnvFilter::try_from_env("COCKPIT_LOG").unwrap_or_else(|_| EnvFilter::new("warn")),
     };
+
+    // The interactive shell has not painted yet. Do not open a rotating file
+    // or write stderr into the alternate-screen handoff before it does.
+    // Daemon/session tracing takes over after the shell attaches.
+    if safe_interactive_shell {
+        fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::sink)
+            .init();
+        return None;
+    }
 
     if print_logs {
         fmt()

@@ -16,6 +16,15 @@ impl App {
     ///   owner's socket may not be bound for a beat, so probing in the
     ///   background lets us wait quietly and attach without blocking a tick.
     pub(super) fn ensure_session_for_display(&mut self) {
+        if !self.first_paint_completed || self.onboarding_snapshot.is_none() {
+            return;
+        }
+        if let Some(name) = self.startup_assistant_name.clone()
+            && self.launch.session_id.is_none()
+        {
+            self.start_named_assistant_resolution(name);
+            return;
+        }
         // Evaluate the cheap struct-only gates first; the daemon probe is the
         // only costly check, so only start it when everything else already
         // permits an attach (`probe_when` is lazy for exactly this reason).
@@ -27,6 +36,35 @@ impl App {
         if should_probe && self.display_attach_backoff.can_attempt(Instant::now()) {
             self.try_attach_for_display();
         }
+    }
+
+    fn start_named_assistant_resolution(&mut self, assistant_id: String) {
+        let lifecycle = self.lifecycle.clone();
+        let project_root = self.launch.cwd.to_string_lossy().into_owned();
+        self.async_actions.start_blocking(
+            AsyncActionKind::DaemonRpc("assistant.resolve"),
+            AsyncActionPolicy::Dedupe(AsyncActionKey::new("startup.assistant.resolve")),
+            move || {
+                let request = cockpit_proto::Request::ResolveAssistantSession {
+                    assistant_id,
+                    project_root,
+                    mode: cockpit_proto::AssistantSessionResolutionMode::MostRecentOrCreate,
+                };
+                let resolution =
+                    agent_runner::resolve_assistant_session_blocking(lifecycle, request)?;
+                let cockpit_proto::Response::AssistantSessionResolved { session, .. } =
+                    resolution.response
+                else {
+                    return Err("unexpected assistant session response".to_string());
+                };
+                Ok(AsyncActionPayload::AssistantSessionResolved {
+                    session_id: session.session_id,
+                    source_session_id: None,
+                    startup_notice: resolution.startup_notice,
+                    promoted_from_ephemeral: resolution.promoted_from_ephemeral,
+                })
+            },
+        );
     }
 
     #[cfg(test)]
@@ -72,6 +110,9 @@ impl App {
     /// The TUI attaches to the current ledger owner, preferring the selected
     /// lifetime only when it must create that owner.
     pub(super) fn lifecycle_intent(&self) -> cockpit_client::LifecycleIntent {
+        if self.session_mode == Some(SessionMode::Assistant) {
+            return cockpit_client::LifecycleIntent::PromoteToPersistent;
+        }
         if self.ephemeral_preference {
             cockpit_client::LifecycleIntent::AttachOrEphemeral
         } else {

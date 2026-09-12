@@ -4405,7 +4405,9 @@ pub(crate) async fn boot_with_db(
     timer.phase("prune_and_sweep");
     let update_channel = crate::updater::effective_update_channel()
         .context("invalid installation update channel")?;
-    let _update_check = crate::updater::run_startup_check(update_channel).await;
+    if crate::updater::update_checks_enabled(update_channel) {
+        let _update_check = crate::updater::run_startup_check(update_channel).await;
+    }
     let fenced_refreshes = db
         .reconcile_host_capability_refresh_execution_leases_at_boot(
             crate::agent_tree::daemon_host_capability_refresh_authority(),

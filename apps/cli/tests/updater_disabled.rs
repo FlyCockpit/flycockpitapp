@@ -13,6 +13,21 @@ use cockpit_core::updater::{
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+const UPDATER_CONSUMER_SCAN_ROOTS: &[&str] = &[
+    "apps/cli/src",
+    "apps/cli/tests",
+    "crates/cockpit-core/src",
+    "crates/cockpit-tui/src",
+];
+
+const EXPECTED_UPDATER_CONSUMERS: &[&str] = &[
+    "apps/cli/src/commands/update.rs",
+    "apps/cli/tests/updater_disabled.rs",
+    "crates/cockpit-core/src/daemon/mod.rs",
+    "crates/cockpit-core/src/daemon/server/mod.rs",
+    "crates/cockpit-tui/src/tui/app/update_notice.rs",
+];
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
@@ -35,16 +50,79 @@ fn production_updater_implementation_sources() -> Vec<PathBuf> {
         .collect()
 }
 
+fn is_updater_implementation_source(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == "updater")
+        && path
+            .components()
+            .any(|component| component.as_os_str() == "cockpit-core")
+}
+
+fn references_installed_updater_module(source: &str) -> bool {
+    source.contains("cockpit_core::updater") || source.contains("crate::updater::")
+}
+
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    if !dir.is_dir() {
+        return;
+    }
+    let entries = fs::read_dir(dir).unwrap_or_else(|error| {
+        panic!(
+            "failed to read updater consumer scan root {}: {error}",
+            dir.display()
+        )
+    });
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+fn discover_updater_consumer_sources() -> Vec<PathBuf> {
+    let root = workspace_root();
+    let mut sources = Vec::new();
+    for relative in UPDATER_CONSUMER_SCAN_ROOTS {
+        collect_rs_files(&root.join(relative), &mut sources);
+    }
+
+    let mut consumers = sources
+        .into_iter()
+        .filter(|path| !is_updater_implementation_source(path))
+        .filter(|path| {
+            let source = fs::read_to_string(path).unwrap_or_else(|error| {
+                panic!(
+                    "failed to read updater consumer candidate {}: {error}",
+                    path.display()
+                )
+            });
+            let production_source = strip_test_modules(&source);
+            references_installed_updater_module(&production_source)
+        })
+        .collect::<Vec<_>>();
+    consumers.sort();
+    consumers.dedup();
+    consumers
+}
+
+fn expected_updater_consumer_sources() -> Vec<PathBuf> {
+    EXPECTED_UPDATER_CONSUMERS
+        .iter()
+        .map(|relative| workspace_root().join(relative))
+        .collect()
+}
+
 fn production_updater_consumer_sources() -> Vec<PathBuf> {
-    [
-        "apps/cli/src/commands/update.rs",
-        "crates/cockpit-core/src/daemon/server/mod.rs",
-        "crates/cockpit-core/src/daemon/mod.rs",
-        "crates/cockpit-tui/src/tui/app/update_notice.rs",
-    ]
-    .into_iter()
-    .map(|relative| workspace_root().join(relative))
-    .collect()
+    let discovered = discover_updater_consumer_sources();
+    let expected = expected_updater_consumer_sources();
+    assert_eq!(
+        discovered, expected,
+        "updater consumer surface changed; update EXPECTED_UPDATER_CONSUMERS and review boundary scans"
+    );
+    expected
 }
 
 fn production_updater_boundary_sources() -> Vec<PathBuf> {
@@ -70,35 +148,8 @@ fn boundary_side_effect_sources() -> Vec<PathBuf> {
     sources
 }
 
-const UPDATER_ENTRYPOINT_WINDOW: usize = 25;
-
-fn embedded_updater_consumer(path: &Path) -> bool {
-    path.ends_with("crates/cockpit-core/src/daemon/mod.rs")
-}
-
-fn extract_updater_entrypoint_regions(source: &str, window: usize) -> Vec<String> {
-    let lines: Vec<&str> = source.lines().collect();
-    let mut regions = Vec::new();
-    for (idx, line) in lines.iter().enumerate() {
-        if line.contains("crate::updater::") {
-            let start = idx.saturating_sub(window);
-            let end = (idx + window + 1).min(lines.len());
-            regions.push(lines[start..end].join("\n"));
-        }
-    }
-    assert!(
-        !regions.is_empty(),
-        "embedded updater consumer must declare crate::updater:: entrypoints"
-    );
-    regions
-}
-
-fn side_effect_scan_segments(path: &Path, source: &str) -> Vec<String> {
-    if embedded_updater_consumer(path) {
-        extract_updater_entrypoint_regions(source, UPDATER_ENTRYPOINT_WINDOW)
-    } else {
-        vec![strip_test_modules(source)]
-    }
+fn side_effect_scan_segments(_path: &Path, source: &str) -> Vec<String> {
+    vec![strip_test_modules(source)]
 }
 
 fn scan_segments_for_forbidden(segments: &[String], needles: &[&str], path: &Path, label: &str) {
@@ -113,8 +164,45 @@ fn scan_segments_for_forbidden(segments: &[String], needles: &[&str], path: &Pat
     }
 }
 
+fn assert_update_checks_suppressed_when_off() {
+    let server =
+        fs::read_to_string(workspace_root().join("crates/cockpit-core/src/daemon/server/mod.rs"))
+            .expect("read daemon server source");
+    assert!(
+        server.contains("update_checks_enabled(update_channel)"),
+        "daemon boot must gate startup update checks behind update_checks_enabled"
+    );
+    assert!(
+        !server.contains(
+            "let _update_check = crate::updater::run_startup_check(update_channel).await;"
+        ),
+        "daemon boot must not unconditionally invoke run_startup_check"
+    );
+
+    let daemon = fs::read_to_string(workspace_root().join("crates/cockpit-core/src/daemon/mod.rs"))
+        .expect("read daemon source");
+    assert!(
+        daemon.contains("maybe_spawn_background"),
+        "daemon must spawn background update checks only through maybe_spawn_background"
+    );
+    assert!(
+        !daemon.contains("crate::updater::spawn_background(ctx.clone())"),
+        "daemon must not unconditionally spawn background update checks"
+    );
+
+    let background =
+        fs::read_to_string(workspace_root().join("crates/cockpit-core/src/updater/background.rs"))
+            .expect("read updater background source");
+    assert!(
+        background.contains("update_checks_enabled(channel)"),
+        "background update loop must skip checks when the effective channel is off"
+    );
+}
+
 #[test]
 fn installed_composition_has_no_trust_or_transport() {
+    assert_update_checks_suppressed_when_off();
+
     let transport_forbidden = [
         "reqwest",
         "tough",

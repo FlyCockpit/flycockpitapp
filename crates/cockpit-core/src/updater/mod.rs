@@ -26,12 +26,36 @@ pub use types::{
     UpdaterApplyError,
 };
 
+use std::sync::Arc;
+
 use cockpit_config::config::update_channel::UpdateChannel;
+
+use crate::daemon::server::DaemonContext;
 
 /// Resolve the effective update channel for the current installation.
 pub fn effective_update_channel() -> anyhow::Result<UpdateChannel> {
     let configured = cockpit_config::extended::load_installation_update_channel()?;
     UpdateChannel::resolve_effective(configured).map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+/// Returns whether startup and periodic update checks should run.
+pub fn update_checks_enabled(channel: UpdateChannel) -> bool {
+    channel != UpdateChannel::Off
+}
+
+/// Spawn periodic update checks only when the effective channel permits them.
+pub fn maybe_spawn_background(ctx: Arc<DaemonContext>) -> Option<tokio::task::JoinHandle<()>> {
+    match effective_update_channel() {
+        Ok(channel) if update_checks_enabled(channel) => Some(spawn_background(ctx)),
+        Ok(_) => None,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "skipping background update checker due to invalid channel configuration"
+            );
+            None
+        }
+    }
 }
 
 /// Startup and background check entrypoint. Never performs network, filesystem

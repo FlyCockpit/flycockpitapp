@@ -1,6 +1,10 @@
 //! Closed update-channel parsing contract.
 
+use std::fs;
+
+use cockpit_config::config::dirs::{CONFIG_FILE, global_config_dir};
 use cockpit_config::config::update_channel::{COCKPIT_UPDATES_ENV, UpdateChannel};
+use cockpit_config::extended::load_installation_update_channel;
 
 #[test]
 fn closed_channel_parse() {
@@ -57,6 +61,22 @@ fn closed_channel_parse() {
     guard.remove_var(COCKPIT_UPDATES_ENV);
     assert_eq!(
         UpdateChannel::resolve_effective(UpdateChannel::Auto).unwrap(),
+        UpdateChannel::Auto
+    );
+}
+
+#[test]
+fn installation_update_channel_honors_closed_parser_spellings() {
+    let guard = cockpit_test_support::TestEnvGuard::blocking_lock();
+    guard.remove_var(COCKPIT_UPDATES_ENV);
+
+    let config_dir = global_config_dir().expect("global config dir");
+    fs::create_dir_all(&config_dir).expect("create global config dir");
+    fs::write(config_dir.join(CONFIG_FILE), r#"{"updates":"AUTO"}"#)
+        .expect("write installation config");
+
+    assert_eq!(
+        load_installation_update_channel().expect("load installation update channel"),
         UpdateChannel::Auto
     );
 }

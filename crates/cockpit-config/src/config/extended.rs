@@ -2156,18 +2156,12 @@ pub fn load_installation_update_channel() -> Result<crate::config::update_channe
         );
     }
     let doc = ExtendedConfigDoc::load(&path)?;
-    if let Some(raw) = doc.raw_field("updates") {
-        parse_installation_update_channel_value(raw)
-            .with_context(|| format!("invalid update channel in {}", path.display()))?;
-    }
-    let (cfg, warnings) = doc.config_with_warnings();
-    if warnings
-        .iter()
-        .any(|warning| warning.contains("update channel"))
-    {
-        anyhow::bail!("invalid update channel in {}", path.display());
-    }
-    crate::config::update_channel::UpdateChannel::resolve_effective(cfg.updates)
+    let configured = match doc.raw_field("updates") {
+        Some(raw) => parse_installation_update_channel_value(raw)
+            .with_context(|| format!("invalid update channel in {}", path.display()))?,
+        None => crate::config::update_channel::UpdateChannel::default(),
+    };
+    crate::config::update_channel::UpdateChannel::resolve_effective(configured)
 }
 
 fn parse_installation_update_channel_value(

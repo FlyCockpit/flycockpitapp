@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::daemon::server::DaemonContext;
 
-use super::{effective_update_channel, run_startup_check};
+use super::{effective_update_channel, run_startup_check, update_checks_enabled};
 
 pub const BACKGROUND_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -24,9 +24,10 @@ pub fn spawn_background(ctx: Arc<DaemonContext>) -> tokio::task::JoinHandle<()> 
                 break;
             }
             match effective_update_channel() {
-                Ok(channel) => {
+                Ok(channel) if update_checks_enabled(channel) => {
                     let _ = run_startup_check(channel).await;
                 }
+                Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(
                         error = %error,

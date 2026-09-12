@@ -899,6 +899,7 @@ fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
                     | crate::cli::DaemonCommand::DiagnosticFailedCalls { .. }
             ))
             | Some(Command::Trust(_))
+            | Some(Command::Update(_))
             | Some(Command::Jq(_))
             | Some(Command::Completion { .. })
             | Some(Command::BashHints(_))
@@ -1007,6 +1008,7 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         Some(Command::Jq(args)) => commands::jq::run(args).await,
         Some(Command::Daemon(sub)) => commands::daemon::run(sub).await,
         Some(Command::Doctor(args)) => commands::doctor::run(args, cli.no_sandbox).await,
+        Some(Command::Update(args)) => commands::update::run(args).await,
         Some(Command::Session(sub)) => commands::session::run(sub).await,
         Some(Command::Knowledge(sub)) => commands::knowledge::run(sub).await,
         Some(Command::Dream(args)) => {
@@ -1569,6 +1571,14 @@ mod tests {
                 path: None,
                 offline: false,
                 dependencies_json: false,
+            }
+        ))));
+        assert!(!command_requires_workspace_trust(Some(&Command::Update(
+            crate::cli::UpdateArgs {
+                check: true,
+                status: false,
+                version: None,
+                channel: None,
             }
         ))));
         assert!(!command_requires_workspace_trust(Some(&Command::Init(

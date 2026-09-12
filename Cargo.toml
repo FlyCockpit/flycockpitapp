@@ -11,8 +11,10 @@ members = [
     "crates/cockpit-proto",
     "crates/cockpit-test-support",
     "crates/cockpit-tokenizer",
+    "crates/cockpit-updater-evidence",
     "crates/cockpit-tui",
     "crates/relay-protocol",
+    "tools/tuf-release",
 ]
 resolver = "3"
 

@@ -54,4 +54,5 @@ windows-sys = { version = "=0.61.2", default-features = false, features = [
 ] }
 
 [dev-dependencies]
+cockpit-test-support = { path = "../cockpit-test-support" }
 syn = { version = "2", features = ["full"] }

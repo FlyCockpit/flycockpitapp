@@ -42,7 +42,6 @@ fn temporary_object_runner_reports_the_measured_host_capability() {
 #[cfg(windows)]
 mod windows_fixture {
     use std::env;
-    use std::ffi::OsString;
     use std::io;
     use std::process::{Child, Command};
     use std::thread;
@@ -642,38 +641,6 @@ mod windows_fixture {
         }
     }
 
-    #[derive(Default)]
-    struct FixtureEnvironment {
-        previous: Vec<(&'static str, Option<OsString>)>,
-    }
-
-    impl FixtureEnvironment {
-        fn set(&mut self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) {
-            if !self.previous.iter().any(|(saved, _)| *saved == name) {
-                self.previous.push((name, env::var_os(name)));
-            }
-            // SAFETY: this test process owns these unique fixture variables;
-            // Drop restores the caller's prior environment on every exit path.
-            unsafe { env::set_var(name, value) };
-        }
-    }
-
-    impl Drop for FixtureEnvironment {
-        fn drop(&mut self) {
-            for (name, prior) in self.previous.drain(..).rev() {
-                // SAFETY: restores the exact process-global state captured by
-                // FixtureEnvironment::set for this test-only child launch.
-                unsafe {
-                    if let Some(value) = prior {
-                        env::set_var(name, value);
-                    } else {
-                        env::remove_var(name);
-                    }
-                }
-            }
-        }
-    }
-
     impl FixtureHolder {
         fn spawn(executable: &std::path::Path, test_name: &str) -> io::Result<Self> {
             let child = Command::new(executable)
@@ -801,27 +768,31 @@ mod windows_fixture {
             return Err(io::Error::last_os_error());
         }
         let restricted_result = (|| {
-            let mut environment = FixtureEnvironment::default();
-            environment.set(SUPERVISOR_PIPE_ENV, &fixture.supervisor_name);
-            environment.set(WORKER_PIPE_ENV, &fixture.worker_name);
-            environment.set(SUPERVISOR_PID_ENV, targets.supervisor.pid().to_string());
-            environment.set(WORKER_PID_ENV, targets.worker.pid().to_string());
-            environment.set(
+            // The process environment is shared by every test in this runner.
+            // Hold the workspace-wide guard until both suspended children have
+            // captured their launch environment, then restore it before either
+            // child is resumed.
+            let environment = cockpit_test_support::TestEnvGuard::blocking_lock();
+            environment.set_var(SUPERVISOR_PIPE_ENV, &fixture.supervisor_name);
+            environment.set_var(WORKER_PIPE_ENV, &fixture.worker_name);
+            environment.set_var(SUPERVISOR_PID_ENV, targets.supervisor.pid().to_string());
+            environment.set_var(WORKER_PID_ENV, targets.worker.pid().to_string());
+            environment.set_var(
                 DUPLICATION_SOURCE_PID_ENV,
                 targets.duplication_source.pid().to_string(),
             );
-            environment.set(
+            environment.set_var(
                 DUPLICATION_SOURCE_HANDLE_ENV,
                 targets.known_worker_handle.to_string(),
             );
-            environment.set(EXPECTED_DESKTOP_ENV, &desktop.full_name);
-            environment.set(
+            environment.set_var(EXPECTED_DESKTOP_ENV, &desktop.full_name);
+            environment.set_var(
                 KNOWN_COCKPIT_HANDLE_ENV,
                 (known_cockpit_handle as usize).to_string(),
             );
             // The empty variant is a separate process creation: no inherited
             // handles and no attribute list are permitted in that proof.
-            environment.set(INHERITANCE_MODE_ENV, "none");
+            environment.set_var(INHERITANCE_MODE_ENV, "none");
             let empty = launch_restricted_suspended(
                 token.0,
                 &executable,
@@ -838,7 +809,7 @@ mod windows_fixture {
             // its explicit handle list. The protected Cockpit pipe remains
             // inheritable only as the known unlisted-leak marker; it is never
             // included in the attribute allowlist.
-            environment.set(INHERITANCE_MODE_ENV, "stdio");
+            environment.set_var(INHERITANCE_MODE_ENV, "stdio");
             let listed = launch_restricted_suspended(
                 token.0,
                 &executable,

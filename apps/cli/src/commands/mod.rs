@@ -155,3 +155,4 @@ pub mod stats;
 pub mod sync;
 pub mod trust;
 pub mod tui;
+pub mod update;

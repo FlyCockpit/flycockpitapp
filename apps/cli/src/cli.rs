@@ -146,6 +146,8 @@ pub enum PublicCommand {
     #[command(subcommand)]
     Daemon(DaemonCommand),
     Doctor(DoctorArgs),
+    /// Check or apply installed-binary updates (disabled until activation).
+    Update(UpdateArgs),
     #[command(subcommand)]
     Session(SessionCommand),
     /// Run governed knowledge-base synthesis.
@@ -247,6 +249,7 @@ impl From<PublicCli> for Cli {
                 PublicCommand::Jq(args) => Command::Jq(args),
                 PublicCommand::Daemon(args) => Command::Daemon(args),
                 PublicCommand::Doctor(args) => Command::Doctor(args),
+                PublicCommand::Update(args) => Command::Update(args),
                 PublicCommand::Session(args) => Command::Session(args),
                 PublicCommand::Knowledge(args) => Command::Knowledge(args),
                 PublicCommand::Dream(args) => Command::Dream(args),
@@ -355,6 +358,9 @@ pub enum Command {
 
     /// Print read-only diagnostics, including trust/model policy and delegation status.
     Doctor(DoctorArgs),
+
+    /// Check or apply installed-binary updates (disabled until activation).
+    Update(UpdateArgs),
 
     /// Manage sessions.
     #[command(subcommand)]
@@ -1694,7 +1700,24 @@ pub struct FailedCallsArgs {
     pub json: bool,
 }
 
-// ---- connect / init ----
+// ---- connect / init / update ----
+
+#[derive(Debug, clap::Args)]
+#[command(disable_version_flag = true)]
+pub struct UpdateArgs {
+    /// Check for updates without applying them.
+    #[arg(long)]
+    pub check: bool,
+    /// Print updater status for the effective channel.
+    #[arg(long, conflicts_with = "check")]
+    pub status: bool,
+    /// Explicit authorized target version to apply.
+    #[arg(long = "target-version", value_name = "VERSION")]
+    pub version: Option<String>,
+    /// Override the configured update channel for this invocation.
+    #[arg(long, value_name = "CHANNEL")]
+    pub channel: Option<String>,
+}
 
 // ---- packages / kcl import ----
 

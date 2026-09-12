@@ -1022,6 +1022,7 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         Some(Command::Jq(args)) => commands::jq::run(args).await,
         Some(Command::Daemon(sub)) => commands::daemon::run(sub).await,
         Some(Command::Doctor(args)) => commands::doctor::run(args, cli.no_sandbox).await,
+        Some(Command::Update(args)) => commands::update::run(args).await,
         Some(Command::Session(sub)) => commands::session::run(sub).await,
         Some(Command::Knowledge(sub)) => commands::knowledge::run(sub).await,
         Some(Command::Dream(args)) => {

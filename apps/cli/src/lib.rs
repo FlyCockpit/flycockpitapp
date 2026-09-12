@@ -1117,10 +1117,9 @@ fn init_tracing(
             .with_ansi(false)
             .with_writer(log.clone())
             .init();
-        return Some(TracingGuard::Deferred(DeferredInteractiveLogGuard {
-            log,
-            print_logs,
-        }));
+        return Some(TracingGuard::Deferred {
+            _guard: DeferredInteractiveLogGuard { log, print_logs },
+        });
     }
 
     if print_logs {
@@ -1143,7 +1142,7 @@ fn init_tracing(
                 .with_ansi(false)
                 .with_writer(writer)
                 .init();
-            Some(TracingGuard::Worker(guard))
+            Some(TracingGuard::Worker { _guard: guard })
         }
         None => {
             fmt()
@@ -1159,8 +1158,8 @@ fn init_tracing(
 /// the deferred variant so construction can record the first-paint sequence
 /// without opening a cache path or contaminating the alternate screen.
 enum TracingGuard {
-    Worker(LogWorkerGuard),
-    Deferred(DeferredInteractiveLogGuard),
+    Worker { _guard: LogWorkerGuard },
+    Deferred { _guard: DeferredInteractiveLogGuard },
 }
 
 /// The early interactive sink is intentionally small and record-oriented:

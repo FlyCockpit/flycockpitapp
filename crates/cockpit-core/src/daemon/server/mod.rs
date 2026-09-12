@@ -4755,7 +4755,8 @@ impl ConstructedReady {
     fn publish_stored(mut self) {
         self.published = true;
         self.permit.release();
-        self.locked.store_achieved_ready(self.take_ready());
+        let ready = self.take_ready();
+        self.locked.store_achieved_ready(ready);
     }
 
     fn publish_returned(mut self) -> ReadyServices {
@@ -5012,10 +5013,13 @@ impl LockedServices {
 
     async fn prepare_retry_ready_handoff(self: &Arc<Self>) -> Result<(Response, ConstructedReady)> {
         let constructed = self.finish_ready_transition().await?;
-        let snapshot = self.onboarding_snapshot_present().await.map_err(|error| {
-            drop(constructed);
-            error
-        })?;
+        let snapshot = match self.onboarding_snapshot_present().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                drop(constructed);
+                return Err(error);
+            }
+        };
         Ok((
             Response::OnboardingBootstrapSnapshot(Some(snapshot)),
             constructed,

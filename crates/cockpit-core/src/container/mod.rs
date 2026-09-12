@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::tools::command_resource_profiles::CommandResourcePlan;
@@ -123,6 +123,12 @@ pub fn set_detect_runtime_override(
 }
 
 pub fn detect_runtime() -> (Option<ContainerRuntime>, ContainerAvailability) {
+    detect_runtime_with_probe_paths(&crate::config::extended::DaemonContainerProbePaths::default())
+}
+
+pub fn detect_runtime_with_probe_paths(
+    probe_paths: &crate::config::extended::DaemonContainerProbePaths,
+) -> (Option<ContainerRuntime>, ContainerAvailability) {
     #[cfg(any(test, feature = "test-support"))]
     DETECT_RUNTIME_CALLS.with(|calls| calls.set(calls.get() + 1));
     #[cfg(any(test, feature = "test-support"))]
@@ -141,9 +147,9 @@ pub fn detect_runtime() -> (Option<ContainerRuntime>, ContainerAvailability) {
             None,
             ContainerAvailability {
                 runtime: None,
-                harness_in_container: harness_in_container(),
+                harness_in_container: harness_in_container_with_probe_paths(probe_paths),
                 available: false,
-                reason: Some(if harness_in_container() {
+                reason: Some(if harness_in_container_with_probe_paths(probe_paths) {
                     ContainerUnavailableReason::HarnessInContainer
                 } else {
                     ContainerUnavailableReason::NoRuntime
@@ -154,7 +160,7 @@ pub fn detect_runtime() -> (Option<ContainerRuntime>, ContainerAvailability) {
     #[cfg(not(test))]
     {
         let mode = crate::external_runtime::current_container_engine_mode();
-        let harness = harness_in_container();
+        let harness = harness_in_container_with_probe_paths(probe_paths);
         let platform = crate::external_runtime::detect_host_platform();
         // Prefer the latest published doctor/safety snapshot when it carries
         // engine rows — so a later refresh affects later detect() calls while
@@ -189,11 +195,27 @@ pub fn detect_runtime() -> (Option<ContainerRuntime>, ContainerAvailability) {
 }
 
 pub fn harness_in_container() -> bool {
-    if Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists() {
+    harness_in_container_with_probe_paths(
+        &crate::config::extended::DaemonContainerProbePaths::default(),
+    )
+}
+
+pub fn harness_in_container_with_probe_paths(
+    paths: &crate::config::extended::DaemonContainerProbePaths,
+) -> bool {
+    if [&paths.docker_env, &paths.container_env]
+        .iter()
+        .any(|path| {
+            std::fs::symlink_metadata(path)
+                .map(|metadata| metadata.file_type().is_file())
+                .unwrap_or(false)
+        })
+    {
         return true;
     }
-    for path in ["/proc/1/cgroup", "/proc/self/mountinfo"] {
-        if let Ok(body) = std::fs::read_to_string(path)
+    for path in [&paths.init_cgroup, &paths.self_mountinfo] {
+        if let Ok(bytes) = cockpit_host::bounded::read_at_most(path, 1024 * 1024)
+            && let Ok(body) = std::str::from_utf8(&bytes)
             && harness_markers(&body)
         {
             return true;
@@ -223,11 +245,21 @@ pub struct ContainerManager {
     selection: Arc<std::sync::Mutex<SelectedEngine>>,
     build_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     create_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    probe_paths: crate::config::extended::DaemonContainerProbePaths,
 }
 
 impl ContainerManager {
+    fn same_authority(&self, other: &Self) -> bool {
+        self.probe_paths == other.probe_paths
+    }
     pub fn detect() -> Self {
-        let (runtime, availability) = detect_runtime();
+        Self::detect_with_probe_paths(crate::config::extended::DaemonContainerProbePaths::default())
+    }
+
+    pub fn detect_with_probe_paths(
+        probe_paths: crate::config::extended::DaemonContainerProbePaths,
+    ) -> Self {
+        let (runtime, availability) = detect_runtime_with_probe_paths(&probe_paths);
         Self {
             selection: Arc::new(std::sync::Mutex::new(SelectedEngine {
                 runtime,
@@ -235,12 +267,13 @@ impl ContainerManager {
             })),
             build_locks: Arc::new(Mutex::new(HashMap::new())),
             create_locks: Arc::new(Mutex::new(HashMap::new())),
+            probe_paths,
         }
     }
 
     /// Atomically reselect from health and return a launch-scoped runtime.
     pub fn select_for_launch(&self) -> Result<ContainerRuntime, String> {
-        let (runtime, availability) = detect_runtime();
+        let (runtime, availability) = detect_runtime_with_probe_paths(&self.probe_paths);
         let mut sel = self.selection.lock().unwrap_or_else(|p| p.into_inner());
         sel.runtime = runtime.clone();
         sel.availability = availability.clone();
@@ -254,7 +287,7 @@ impl ContainerManager {
 
     /// Reselect without returning (status path). Prefer [`Self::select_for_launch`].
     pub fn reselect_for_launch(&self) {
-        let (runtime, availability) = detect_runtime();
+        let (runtime, availability) = detect_runtime_with_probe_paths(&self.probe_paths);
         let mut sel = self.selection.lock().unwrap_or_else(|p| p.into_inner());
         sel.runtime = runtime;
         sel.availability = availability;
@@ -456,9 +489,41 @@ impl ContainerManager {
     }
 }
 
-pub fn container_manager() -> &'static OnceCell<ContainerManager> {
-    static CELL: OnceCell<ContainerManager> = OnceCell::const_new();
-    &CELL
+fn container_managers()
+-> &'static std::sync::Mutex<HashMap<String, std::sync::Weak<ContainerManager>>> {
+    static MANAGERS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, std::sync::Weak<ContainerManager>>>,
+    > = std::sync::OnceLock::new();
+    MANAGERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+pub fn publish_container_manager(
+    db: &crate::db::Db,
+    manager: Arc<ContainerManager>,
+) -> Result<(), String> {
+    let key = db.identity_key();
+    let mut managers = container_managers()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    managers.retain(|_, manager| manager.strong_count() != 0);
+    if let Some(existing) = managers.get(&key).and_then(std::sync::Weak::upgrade) {
+        if !existing.same_authority(&manager) {
+            return Err(format!(
+                "conflicting container-manager authority for database {key}"
+            ));
+        }
+        return Ok(());
+    }
+    managers.insert(key, Arc::downgrade(&manager));
+    Ok(())
+}
+
+pub fn container_manager_for_db(db: &crate::db::Db) -> Option<Arc<ContainerManager>> {
+    container_managers()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&db.identity_key())
+        .and_then(std::sync::Weak::upgrade)
 }
 
 pub fn initial_availability_unknown() -> ContainerAvailability {
@@ -466,23 +531,17 @@ pub fn initial_availability_unknown() -> ContainerAvailability {
 }
 
 pub fn availability_snapshot() -> ContainerAvailability {
-    container_manager()
-        .get()
+    #[cfg(any(test, feature = "test-support"))]
+    if DETECT_RUNTIME_OVERRIDE.with(|slot| slot.borrow().is_none()) {
+        return initial_availability_unknown();
+    }
+    detect_runtime().1
+}
+
+pub fn availability_snapshot_for_db(db: &crate::db::Db) -> ContainerAvailability {
+    container_manager_for_db(db)
         .map(|manager| manager.availability())
-        .unwrap_or_else(|| {
-            // When no manager is installed (unit tests, pre-daemon UI), do not
-            // spawn docker/podman probes. Production daemon installs the manager
-            // via `ContainerManager::detect()` once at startup.
-            #[cfg(any(test, feature = "test-support"))]
-            {
-                if DETECT_RUNTIME_OVERRIDE.with(|slot| slot.borrow().is_none())
-                    && container_manager().get().is_none()
-                {
-                    return initial_availability_unknown();
-                }
-            }
-            detect_runtime().1
-        })
+        .unwrap_or_else(availability_snapshot)
 }
 
 pub fn default_config_dir() -> Result<PathBuf> {
@@ -901,6 +960,21 @@ pub fn tail_text(text: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use crate::tools::shell_sandbox::{ExtraSandboxPath, SandboxPathAccess};
+
+    #[test]
+    fn container_environment_detection_uses_configured_probe_paths() {
+        let tmp = tempfile::tempdir().expect("probe root");
+        let paths = crate::config::extended::DaemonContainerProbePaths {
+            docker_env: tmp.path().join("dockerenv"),
+            container_env: tmp.path().join("containerenv"),
+            init_cgroup: tmp.path().join("cgroup"),
+            self_mountinfo: tmp.path().join("mountinfo"),
+        };
+        assert!(!harness_in_container_with_probe_paths(&paths));
+
+        std::fs::write(&paths.init_cgroup, "0::/kubepods/test").expect("write cgroup probe");
+        assert!(harness_in_container_with_probe_paths(&paths));
+    }
 
     #[test]
     fn runtime_detection_prefers_docker_and_blocks_nested_container() {
@@ -1376,5 +1450,23 @@ mod tests {
         assert!(rendered.contains(&"-w".into()));
         assert!(rendered.contains(&"/workspace".into()));
         assert!(rendered.contains(&"KEEP=ok".into()));
+    }
+
+    #[test]
+    fn manager_publication_is_database_scoped_and_conflicts_fail_closed() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let paths = crate::config::extended::DaemonContainerProbePaths::default();
+        let manager = Arc::new(ContainerManager::detect_with_probe_paths(paths.clone()));
+        publish_container_manager(&db, manager.clone()).unwrap();
+        let published = container_manager_for_db(&db).expect("published manager");
+        assert!(Arc::ptr_eq(&manager, &published));
+
+        let mut conflicting_paths = paths;
+        conflicting_paths.docker_env = PathBuf::from("/different/dockerenv");
+        let conflicting = Arc::new(ContainerManager::detect_with_probe_paths(conflicting_paths));
+        assert!(publish_container_manager(&db, conflicting).is_err());
+
+        let other_db = crate::db::Db::open_in_memory().unwrap();
+        publish_container_manager(&other_db, Arc::new(ContainerManager::detect())).unwrap();
     }
 }

@@ -1729,11 +1729,22 @@ fn finish_control_row(
     result: Option<&str>,
     now: i64,
 ) -> Result<()> {
+    // `goal_control_jobs.result_json` must hold valid JSON (schema CHECK).
+    // A planner/evaluator can return malformed text; keep that diagnostic
+    // payload as a JSON-encoded string instead of failing the finish write
+    // and losing the failure record.
+    let stored = match result {
+        Some(raw) if serde_json::from_str::<serde_json::Value>(raw).is_ok() => Some(raw.to_owned()),
+        Some(raw) => {
+            Some(serde_json::to_string(raw).context("encoding non-JSON control job result")?)
+        }
+        None => None,
+    };
     conn.execute(
         "UPDATE goal_control_jobs SET state = 'finished', result_json = ?1,
                 lease_expires_at = NULL, updated_at = ?2
          WHERE job_id = ?3 AND state = 'leased'",
-        params![result, now, job.job_id.to_string()],
+        params![stored, now, job.job_id.to_string()],
     )?;
     Ok(())
 }

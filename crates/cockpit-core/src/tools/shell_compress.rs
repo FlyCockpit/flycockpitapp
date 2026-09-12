@@ -75,10 +75,12 @@ const PRUNE_BOUNDARY_SIGNAL_TAIL: usize = 40;
 /// `redact` is the session redaction table (issue #294): every line-omission
 /// boundary this filter creates (middle-truncation head/tail edges, trace-block
 /// elisions, per-command noise drops, the prune-boundary signal budget) elides
-/// the unsafe margin in RAW joined-line coordinates, so a registered secret
-/// straddling the boundary — a multi-line literal spanning several lines
-/// included — never leaves a PARTIAL the downstream §7 whole-value scrub
-/// cannot match.
+/// exactly the bytes a registered secret could straddle, in RAW coordinates
+/// (the noise-drop pass knows the raw text on both sides of each boundary and
+/// cuts precisely; the other omission sites use the safe `(M - 1)`-byte
+/// margin), so a straddling secret — a multi-line literal spanning several
+/// lines included — never leaves a PARTIAL the downstream §7 whole-value
+/// scrub cannot match.
 ///
 /// Order is: generic noise filter first (ANSI/spinner/dedup/boilerplate +
 /// middle-truncation), then the recognized per-command strategy. The
@@ -773,7 +775,12 @@ fn summarize_trace_blocks(redact: &crate::redact::RedactionTable, lines: Vec<Str
 /// redaction-aware margins (issue #294): the joined run content's front edge
 /// is elided when omitted content precedes it and its back edge when omitted
 /// content follows, so only WHOLE secrets — which §7 scrubs normally —
-/// remain. Shared by the trace-block summarizer and the noise-drop pass.
+/// remain. Used by the trace-block summarizer, whose omitted rows are
+/// discarded before this runs, so the margin stays the blind `(M - 1)`-byte
+/// window and a run it covers entirely is withheld fail-closed. The
+/// noise-drop pass instead flushes through [`flush_retained_run`], which has
+/// the raw text on both sides of each boundary and elides exactly the bytes
+/// a registered literal straddles.
 fn flush_compress_run(
     redact: &crate::redact::RedactionTable,
     rendered: &mut Vec<String>,
@@ -828,28 +835,49 @@ pub fn command_strategy(
 /// family predicate — the belt-and-suspenders signal guarantee: even a buggy
 /// noise predicate can't eat an error/warning/panic/failure line.
 ///
-/// Redaction-aware (issue #294): every dropped noise line is an omission
-/// boundary for its retained neighbours, so each contiguous kept run gets
-/// the unsafe margin elided at the edges that abut dropped lines (in joined
-/// line coordinates, covering multi-line registered literals). With <3
-/// omissions the summary marker is elided too, but the run-edge margins
-/// still apply — the omission is real even when unmarked.
+/// Redaction-aware (issue #294): every dropped noise segment is an omission
+/// boundary for its retained neighbours. The raw body stays available to
+/// this pass, so each kept run is flushed with EXACT boundary coordinates
+/// (see [`flush_retained_run`]) and only the bytes a registered literal
+/// actually straddles are elided — a multi-line literal spanning several
+/// dropped noise segments and a kept run included. With <3 omissions the
+/// summary marker is elided too, but the run-edge margins still apply — the
+/// omission is real even when unmarked.
 fn drop_noise(
     redact: &crate::redact::RedactionTable,
     body: &str,
     is_noise: impl Fn(&str) -> bool,
 ) -> String {
     let mut rendered: Vec<String> = Vec::new();
-    let mut run: Vec<String> = Vec::new();
+    let mut run: Vec<KeptSegment<'_>> = Vec::new();
     let mut front_omitted = false;
+    let mut back_omitted = false;
     let mut omitted = OmittedCounts::default();
-    for line in body.lines() {
-        if looks_like_signal(line) || !is_noise(line) {
-            run.push(line.to_string());
+    for (segment, raw_start, raw_end) in segments_with_raw_offsets(body) {
+        if segment.is_empty() {
+            continue;
+        }
+        if looks_like_signal(segment) || !is_noise(segment) {
+            // The previous run is complete here: everything after it in the
+            // raw body is known, so flush it with its exact back boundary.
+            if !run.is_empty() && back_omitted {
+                flush_retained_run(redact, body, &mut rendered, &mut run, front_omitted, true);
+                // The new run abuts the noise that separated the runs.
+                front_omitted = true;
+            }
+            back_omitted = false;
+            run.push(KeptSegment {
+                text: segment,
+                raw_start,
+                raw_end,
+            });
         } else {
-            omitted.add(classify_omitted_line(line));
-            flush_compress_run(redact, &mut rendered, &mut run, front_omitted, true);
-            front_omitted = true;
+            omitted.add(classify_omitted_line(segment));
+            if run.is_empty() {
+                front_omitted = true;
+            } else {
+                back_omitted = true;
+            }
         }
     }
     let total_omitted = omitted.total();
@@ -860,19 +888,136 @@ fn drop_noise(
     if rendered.is_empty() && run.is_empty() && !body.trim().is_empty() && total_omitted < 3 {
         return body.to_string();
     }
+    flush_retained_run(
+        redact,
+        body,
+        &mut rendered,
+        &mut run,
+        front_omitted,
+        back_omitted,
+    );
     if total_omitted >= 3 {
-        flush_compress_run(redact, &mut rendered, &mut run, front_omitted, true);
         rendered.push(omitted.marker());
-    } else {
-        flush_compress_run(
-            redact,
-            &mut rendered,
-            &mut run,
-            front_omitted,
-            total_omitted > 0,
-        );
     }
     rendered.join("\n")
+}
+
+/// One retained `drop_noise` segment with its RAW `body` byte coordinates.
+/// `raw_start`/`raw_end` delimit the segment text itself; the raw separator
+/// between adjacent segments (a real newline between physical lines, or the
+/// two-byte `\n` escape inside one) lies in the gap between one segment's
+/// `raw_end` and the next segment's `raw_start`.
+struct KeptSegment<'a> {
+    text: &'a str,
+    raw_start: usize,
+    raw_end: usize,
+}
+
+/// Enumerate the `drop_noise` segments of `body` in raw order with their
+/// byte offsets, mirroring `body.lines()` plus the embedded `\n` escape
+/// split: physical lines are separated by a real newline (an optional `\r`
+/// stays in the raw bytes inside the gap) and one line's segments by the
+/// two-byte `\n` escape.
+fn segments_with_raw_offsets(body: &str) -> Vec<(&str, usize, usize)> {
+    let mut segments = Vec::new();
+    let mut pos = 0;
+    for raw_line in body.split('\n') {
+        let line_start = pos;
+        pos += raw_line.len() + 1;
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        let mut seg_start = line_start;
+        for segment in line.split("\\n") {
+            segments.push((segment, seg_start, seg_start + segment.len()));
+            seg_start += segment.len() + 2;
+        }
+    }
+    segments
+}
+
+/// Flush one contiguous retained `drop_noise` run with EXACT boundary
+/// coordinates (issue #294). A registered literal that straddles a
+/// dropped|kept boundary leaves a PARTIAL at the run edge that the §7
+/// whole-value scrub cannot match, so each edge that abuts dropped noise is
+/// elided with a fixpoint cut computed against the raw text on BOTH sides of
+/// the boundary — only bytes a literal actually straddles are removed, so a
+/// short signal line with nothing straddling its boundary survives
+/// untouched and a run is withheld entirely only when a straddling secret
+/// genuinely covers it (fail-closed). This is why the noise-drop pass no
+/// longer needs the blind `(M - 1)`-byte margin that would erase whole
+/// short runs.
+fn flush_retained_run<'a>(
+    redact: &crate::redact::RedactionTable,
+    body: &'a str,
+    rendered: &mut Vec<String>,
+    run: &mut Vec<KeptSegment<'a>>,
+    front_omitted: bool,
+    back_omitted: bool,
+) {
+    if run.is_empty() {
+        return;
+    }
+    let joined = run
+        .iter()
+        .map(|segment| segment.text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let max_match = redact.max_match_len();
+    let mut cut_front = 0;
+    let mut cut_back = joined.len();
+    if max_match > 1 {
+        let run_raw_start = run[0].raw_start;
+        let run_raw_end = run[run.len() - 1].raw_end;
+        if front_omitted {
+            // A literal straddling the boundary starts at most `max_match - 1`
+            // bytes before it, so the raw window from `run_raw_start -
+            // max_match` covers every possible straddler. Hand the fixpoint
+            // the whole tail so its rescan of the advanced cut cannot stop
+            // early on a further straddler.
+            let window_start = run_raw_start.saturating_sub(max_match);
+            let cut =
+                redact.straddle_fixpoint_cut(&body[window_start..], run_raw_start - window_start);
+            cut_front = rendered_run_offset(run, window_start + cut);
+        }
+        if back_omitted {
+            // Mirror: a literal straddling the kept|dropped boundary ends at
+            // most `max_match - 1` bytes after it, and the fixpoint retreats
+            // leftward, so the whole raw prefix bounds the scan.
+            let window_end = (run_raw_end + max_match).min(body.len());
+            let cut = redact.straddle_fixpoint_cut_back(&body[..window_end], run_raw_end);
+            cut_back = rendered_run_offset(run, cut);
+        }
+    }
+    let safe = if cut_front >= cut_back {
+        // A straddling secret covers the whole retained run; withholding it
+        // entirely is the fail-closed boundary rule (issue #294).
+        ""
+    } else {
+        &joined[cut_front..cut_back]
+    };
+    rendered.extend(safe.split('\n').map(str::to_string));
+    run.clear();
+}
+
+/// Map a raw `body` byte offset inside or around a retained run to its
+/// offset in the run's rendered (`\n`-joined) form. Offsets in the gaps
+/// between segments (separators, blank segments) map to the next segment's
+/// rendered start: the gap bytes are not rendered, so the content following
+/// the offset begins exactly there.
+fn rendered_run_offset(run: &[KeptSegment<'_>], raw: usize) -> usize {
+    let mut rendered = 0;
+    for (index, segment) in run.iter().enumerate() {
+        if raw < segment.raw_start {
+            return rendered;
+        }
+        if raw < segment.raw_end {
+            return rendered + (raw - segment.raw_start);
+        }
+        rendered += segment.text.len();
+        if index + 1 < run.len() {
+            rendered += 1;
+        }
+    }
+    rendered
 }
 
 /// Whether a line carries signal that must NEVER be dropped: errors,

@@ -46,6 +46,8 @@ struct FakeInner {
     multi_match: bool,
     context_digest: String,
     context_drift: bool,
+    /// When set, the next `recover` call fails with this reason.
+    recover_fail: Option<String>,
 }
 
 /// Controllable Proven adapter for unit tests.
@@ -120,6 +122,10 @@ impl FakeProvenAdapter {
 
     pub fn recover_log(&self) -> Vec<(String, u64)> {
         self.inner.lock().unwrap().recover_log.clone()
+    }
+
+    pub fn fail_recover_with(&self, reason: impl Into<String>) {
+        self.inner.lock().unwrap().recover_fail = Some(reason.into());
     }
 }
 
@@ -309,6 +315,9 @@ impl ContainmentAdapter for FakeProvenAdapter {
         generation: u64,
     ) -> Result<EmptyOutcome, ContainmentError> {
         let mut g = self.inner.lock().unwrap();
+        if let Some(reason) = g.recover_fail.clone() {
+            return Err(ContainmentError::Internal(reason));
+        }
         let key = locator.locator_key.clone().unwrap_or_default();
         g.recover_log.push((key.clone(), generation));
         if g.multi_match {

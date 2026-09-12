@@ -261,16 +261,21 @@ pub(crate) fn persist_btw_fork_with_redaction_custody_on_conn(
 }
 
 #[cfg(test)]
-thread_local! {
-    static FAIL_NEXT_REDACTION_VAULT_WRITE: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-}
+static FAIL_NEXT_REDACTION_VAULT_WRITE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
-/// Arm the next session redaction vault write in this thread to fail before
+/// Arm the next session redaction vault write in this process to fail before
 /// committing, so tests can assert cache identity after a failed persist.
+///
+/// The flag is process-global, not thread-local: `Db::transaction` runs its
+/// closure on a database worker thread, so a thread-local seam is invisible to
+/// the very vault writes this must cover (session inserts inside
+/// `db.transaction`). One-shot semantics (`swap`) keep a single armed write
+/// failing; nextest isolates each test in its own process, so the flag never
+/// leaks between tests in CI.
 #[cfg(test)]
 pub(crate) fn fail_next_redaction_vault_write_for_test() {
-    FAIL_NEXT_REDACTION_VAULT_WRITE.with(|flag| flag.set(true));
+    FAIL_NEXT_REDACTION_VAULT_WRITE.store(true, std::sync::atomic::Ordering::Release);
 }
 
 pub(crate) fn persist_empty_redaction_table_on_conn(
@@ -402,7 +407,7 @@ fn persist_redaction_table_to_vault(
     json: &[u8],
 ) -> Result<()> {
     #[cfg(test)]
-    if FAIL_NEXT_REDACTION_VAULT_WRITE.with(|flag| flag.replace(false)) {
+    if FAIL_NEXT_REDACTION_VAULT_WRITE.swap(false, std::sync::atomic::Ordering::AcqRel) {
         return Err(anyhow::anyhow!("injected redaction vault write failure"));
     }
     let item_id = crate::secure_key::redaction_table_item_id(&session_id.to_string());
@@ -422,7 +427,7 @@ fn persist_redaction_table_to_vault_on_conn(
     json: &[u8],
 ) -> Result<()> {
     #[cfg(test)]
-    if FAIL_NEXT_REDACTION_VAULT_WRITE.with(|flag| flag.replace(false)) {
+    if FAIL_NEXT_REDACTION_VAULT_WRITE.swap(false, std::sync::atomic::Ordering::AcqRel) {
         return Err(anyhow::anyhow!("injected redaction vault write failure"));
     }
     let item_id = crate::secure_key::redaction_table_item_id(&session_id.to_string());
@@ -436,6 +441,10 @@ fn persist_redaction_table_to_vault_on_conn(
         .map_err(|error| anyhow::anyhow!("persisting session redaction table: {error}"))
 }
 
+/// Test-only convenience over [`persist_redaction_table_to_vault`]: it opens
+/// the vault from `db` directly. Every production writer injects its
+/// session/boot vault and calls [`persist_redaction_table_to_vault`].
+#[cfg(test)]
 pub(crate) fn write_redaction_table_json_to_vault(
     db: &crate::db::Db,
     session_id: uuid::Uuid,
@@ -542,6 +551,12 @@ pub(crate) fn require_redaction_table_json_from_vault_on_conn(
 fn capture_model_system_prompt_snapshot_json(project_root: &std::path::Path) -> String {
     let (_, providers) = crate::auto_title::load_configs_for(project_root);
     ModelSystemPromptSnapshot::capture(&providers).to_json_string()
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn default_test_model_system_prompt_snapshot_json() -> String {
+    ModelSystemPromptSnapshot::capture(&crate::config::providers::ProvidersConfig::default())
+        .to_json_string()
 }
 
 fn capture_knowledge_base_prompt_snapshot_json(
@@ -654,8 +669,7 @@ impl Session {
                 &active_agent_for_db,
             )
         })?;
-        row.model_system_prompt_snapshot_json =
-            capture_model_system_prompt_snapshot_json(&project_root);
+        row.model_system_prompt_snapshot_json = default_test_model_system_prompt_snapshot_json();
         let row_for_db = row.clone();
         let vault_for_insert = Arc::clone(&vault);
         let row = persist_built_session_row_with_redaction_custody(
@@ -701,8 +715,7 @@ impl Session {
                 )
             })
             .context("building deferred test session row")?;
-        row.model_system_prompt_snapshot_json =
-            capture_model_system_prompt_snapshot_json(&project_root);
+        row.model_system_prompt_snapshot_json = default_test_model_system_prompt_snapshot_json();
         let session = Self::from_row(
             db,
             project_root,
@@ -745,8 +758,7 @@ impl Session {
                 )
             })
             .context("building deferred assistant test session row")?;
-        row.model_system_prompt_snapshot_json =
-            capture_model_system_prompt_snapshot_json(&project_root);
+        row.model_system_prompt_snapshot_json = default_test_model_system_prompt_snapshot_json();
         let session = Self::from_row(
             db,
             project_root,
@@ -820,17 +832,19 @@ impl Session {
         vault: Arc<crate::secure_key::SecretVault>,
         allow_unbound_test_fixture_project_id: bool,
     ) -> Result<Option<Self>> {
+        let requested_id = session_id;
         let Some(row) = db
             .blocking_write_for_sync_maintenance(move |conn| {
-                crate::db::Db::get_session_conn(conn, session_id)
+                crate::db::Db::resolve_live_compaction_session_conn(conn, requested_id)
             })
             .context("fetching test session")?
         else {
             return Ok(None);
         };
+        let live_id = row.session_id;
         let (project_root, initialize_workspace_scratch) =
             Self::test_workspace_root(PathBuf::from(&row.project_root));
-        Ok(Some(Self::from_row(
+        let mut session = Self::from_row(
             db,
             project_root,
             row,
@@ -839,7 +853,15 @@ impl Session {
             false,
             initialize_workspace_scratch,
             allow_unbound_test_fixture_project_id,
-        )?))
+        )?;
+        if live_id != session_id {
+            session.id = session_id;
+            *session
+                .live_id
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = live_id;
+        }
+        Ok(Some(session))
     }
 
     /// Create a brand-new session, inserting its row in the DB.
@@ -1219,25 +1241,27 @@ impl Session {
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Option<Self>> {
+        let requested_id = session_id;
         let Some(row) = db
             .blocking_write_for_sync_maintenance(move |conn| {
-                crate::db::Db::get_session_conn(conn, session_id)
+                crate::db::Db::resolve_live_compaction_session_conn(conn, requested_id)
             })
             .context("fetching session")?
         else {
             return Ok(None);
         };
+        let live_id = row.session_id;
         let project_root = PathBuf::from(&row.project_root);
-        Ok(Some(Self::from_row(
-            db,
-            project_root,
-            row,
-            resolver,
-            vault,
-            false,
-            true,
-            false,
-        )?))
+        let mut session =
+            Self::from_row(db, project_root, row, resolver, vault, false, true, false)?;
+        if live_id != session_id {
+            session.id = session_id;
+            *session
+                .live_id
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = live_id;
+        }
+        Ok(Some(session))
     }
 
     fn from_row(
@@ -1379,17 +1403,20 @@ impl Session {
             workspace_scratch_dir_for_session(&row.project_id, &project_root, row.session_id)
                 .context("initializing required durable workspace scratch")?
         } else {
-            let path = workspace_scratch_path_for_session(&row.project_id, row.session_id)
-                .or_else(|error| {
-                    #[cfg(any(test, feature = "test-support"))]
-                    if legacy_short_fixture_project_id {
-                        return super::test_fixture_workspace_scratch_path_for_session(
-                            &row.project_id,
-                            row.session_id,
-                        );
-                    }
-                    Err(error)
-                })?;
+            #[cfg(any(test, feature = "test-support"))]
+            let path = if legacy_short_fixture_project_id {
+                super::test_fixture_workspace_scratch_path_for_session(
+                    &row.project_id,
+                    row.session_id,
+                )?
+            } else {
+                super::test_support_workspace_scratch_path_for_session(
+                    &row.project_id,
+                    row.session_id,
+                )?
+            };
+            #[cfg(not(any(test, feature = "test-support")))]
+            let path = workspace_scratch_path_for_session(&row.project_id, row.session_id)?;
             std::fs::create_dir_all(&path)
                 .with_context(|| format!("creating test workspace scratch `{}`", path.display()))?;
             path
@@ -1449,6 +1476,7 @@ impl Session {
             ),
             knowledge_read_snapshots: Mutex::new(super::KnowledgeReadSnapshotStore::default()),
             last_time_prelude: Mutex::new(None),
+            replay_time_prelude: Mutex::new(None),
             user_content_tokens: AtomicUsize::new(row.user_content_tokens.max(0) as usize),
             user_content_turns: AtomicUsize::new(user_content_turns),
             title_stage: AtomicU8::new(normalize_title_slot(row.title_stage)),
@@ -1644,9 +1672,15 @@ impl Session {
     /// session's vault handle. Cross-session readers must fold this table into
     /// their own redactor before returning any target-owned history.
     ///
-    /// A missing, malformed, or unloadable vault table is an error rather than
-    /// a reason to return target content unredacted. `Ok(None)` means the
-    /// target is not visible to `reader_project`, not that custody is absent.
+    /// `Ok(None)` means the target is not visible to `reader_project`, or the
+    /// target owns no durable redaction-table vault item — a target that never
+    /// established custody contributes no additional durable knowledge, and
+    /// the caller must still scrub with its own table. Production inserts
+    /// establish custody in the same transaction as the `sessions` row
+    /// (enforced at the database layer), so a durable production session
+    /// always carries its table here. Malformed or unloadable vault bytes
+    /// still fail closed: a corrupt custody item is never silently treated
+    /// as an empty table.
     pub(crate) async fn persisted_redaction_table_for_session(
         &self,
         reader_project: &str,
@@ -1662,11 +1696,10 @@ impl Session {
         {
             return Ok(None);
         }
-        let json = require_redaction_table_json_from_vault(
-            &self.secret_vault,
-            session_id,
-            "loading persisted target-session redaction table",
-        )?;
+        let json = match load_redaction_table_from_vault(&self.secret_vault, session_id)? {
+            Some(json) => json,
+            None => return Ok(None),
+        };
         crate::redact::RedactionTable::from_persisted_json(&json)
             .map(Some)
             .context("loading persisted target-session redaction table")

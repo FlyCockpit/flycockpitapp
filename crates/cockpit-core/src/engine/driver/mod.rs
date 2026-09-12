@@ -67,7 +67,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use tokio::{
     sync::mpsc,
-    time::{Duration, Sleep},
+    time::{Duration, Instant, Interval, Sleep},
 };
 use uuid::Uuid;
 
@@ -86,6 +86,41 @@ use crate::{
 
 const AUTO_COMPACT_DEFAULT_PCT: u8 = 80;
 use crate::session::{InferenceSendIdentity, Session};
+
+/// An interval whose selectable future is authoritative for whether it is
+/// armed. Keeping the gate beside the interval prevents boundary observation
+/// and `select!` eligibility from becoming independently maintained booleans.
+struct GatedInterval {
+    interval: Interval,
+    armed: bool,
+}
+
+impl GatedInterval {
+    fn new(period: Duration) -> Self {
+        let mut interval = tokio::time::interval_at(Instant::now() + period, period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Self {
+            interval,
+            armed: false,
+        }
+    }
+
+    fn set_armed(&mut self, armed: bool) {
+        self.armed = armed;
+    }
+
+    fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    async fn tick(&mut self) {
+        if self.armed {
+            self.interval.tick().await;
+        } else {
+            std::future::pending().await
+        }
+    }
+}
 
 /// Serializes the detached automatic-title write with retraction of the user
 /// message that triggered it. A retraction either fences the write before it
@@ -184,9 +219,6 @@ pub enum DriverControl {
             std::result::Result<Vec<RecoveredNoninteractiveResolverEndpoint>, String>,
         >,
     },
-    #[cfg(test)]
-    #[allow(dead_code)]
-    AbortForTest,
     /// Ask the driver to deliver send-now items at the next safe boundary.
     /// Never cancels an in-flight tool; backgroundable tools (`bash`) observe
     /// the queue escalation directly and transfer their process waiter to
@@ -425,6 +457,21 @@ pub struct RecoveredInteractiveTaskChild {
     /// session worker releases this gate only after it atomically consumes the
     /// exact durable resume claim for the whole recovered unit.
     pub activation_gate: RecoveryActivationGate,
+}
+
+/// Read-only snapshot of the readiness predicates at a driver-loop select
+/// boundary.
+///
+/// The driver is the sole publisher. Observers can use this to distinguish a
+/// worker that is genuinely waiting for boundary work from one that is still
+/// finishing the previous iteration; subscribing never gates or otherwise
+/// influences scheduling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DriverLoopBoundaryObservation {
+    pub sequence: u64,
+    pub human_input_already_ready: bool,
+    pub assistant_inbox_defer_heartbeat_armed: bool,
+    pub assistant_inbox_idle_poll_armed: bool,
 }
 
 /// The durable identity of an accepted late-user steer supplied by the
@@ -1557,6 +1604,11 @@ pub struct Driver {
     /// test machine's on-disk config layers. Never set in production.
     #[cfg(test)]
     test_providers_override: Option<(crate::config::providers::ProvidersConfig, String, String)>,
+    /// Scheduling-state observable published immediately before each idle
+    /// select. It is always present and observation-only: receivers cannot
+    /// delay the driver, and the driver never branches on receiver state.
+    loop_boundary_state: tokio::sync::watch::Sender<Option<DriverLoopBoundaryObservation>>,
+    loop_boundary_sequence: u64,
     #[cfg(test)]
     test_fail_next_active_model_session_persist: bool,
     #[cfg(test)]
@@ -1999,6 +2051,14 @@ fn subagent_routing_event_data(
 const JOB_CHANNEL_CAPACITY: usize = 256;
 
 impl Driver {
+    /// Subscribe to semantic idle-select boundary state. The returned watch is
+    /// read-only and receives the most recent boundary immediately.
+    pub fn subscribe_loop_boundaries(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<DriverLoopBoundaryObservation>> {
+        self.loop_boundary_state.subscribe()
+    }
+
     pub fn set_guidance_proposal_service(
         &mut self,
         service: Arc<
@@ -2492,6 +2552,8 @@ impl Driver {
             tandem_set: self.tandem_set.clone(),
             #[cfg(test)]
             test_providers_override: self.test_providers_override.clone(),
+            loop_boundary_state: tokio::sync::watch::channel(None).0,
+            loop_boundary_sequence: 0,
             #[cfg(test)]
             test_fail_next_active_model_session_persist: self
                 .test_fail_next_active_model_session_persist,
@@ -2887,6 +2949,8 @@ impl Driver {
             tandem_set: crate::engine::schedule::TandemSet::default(),
             #[cfg(test)]
             test_providers_override: None,
+            loop_boundary_state: tokio::sync::watch::channel(None).0,
+            loop_boundary_sequence: 0,
             #[cfg(test)]
             test_fail_next_active_model_session_persist: false,
             #[cfg(test)]
@@ -3208,7 +3272,12 @@ impl Driver {
         // baked into the local cap); re-allotting would drop `task.budget`.
         let root = self.root_budget_handle();
         root.remint_root(resolved);
-        self.max_primary_rounds = resolved.max_rounds.unwrap_or(0);
+        let config_overlay = self.config.extended().max_primary_rounds;
+        self.max_primary_rounds = if config_overlay > 0 {
+            config_overlay
+        } else {
+            resolved.max_rounds.unwrap_or(0)
+        };
         self.budget.reset_retry_turn();
         self.schedule.set_budget(root.share());
         self.bind_active_retry_budget();
@@ -3287,6 +3356,11 @@ impl Driver {
         match self.budget.charge_round() {
             Ok(()) => Ok(true),
             Err(exhaustion) => {
+                if std::env::var("DRIVER_DEBUG_ADMIT").is_ok() {
+                    eprintln!(
+                        "ADMIT-DEBUG: round refused is_root={is_root} max_rounds={max_primary_rounds} exhaustion={exhaustion:?}"
+                    );
+                }
                 if is_root
                     && max_primary_rounds > 0
                     && exhaustion.dimension
@@ -3574,13 +3648,47 @@ impl Driver {
     /// through the snapshot handle exactly as a worker re-resolution would.
     #[cfg(test)]
     pub(crate) fn refresh_config_from_disk_for_tests(&mut self) {
+        use cockpit_config::config::delegation_budget::{DelegationBudgetConfig, SpendLimit};
+
         let cwd = self.cwd.clone();
         let generation = self.config.generation().saturating_add(1);
-        self.set_config_handle(
+        let handle =
             crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests_at_generation(
                 &cwd, generation,
-            ),
+            );
+        let mut snapshot = (*handle.snapshot()).clone();
+        let previous = self.config.snapshot();
+        if snapshot.providers.providers.is_empty() && !previous.providers.providers.is_empty() {
+            snapshot.providers = previous.providers.clone();
+            snapshot.provider_model_sources = previous.provider_model_sources.clone();
+        }
+        if snapshot.extended.delegation_budget.is_empty() {
+            snapshot.extended.delegation_budget = DelegationBudgetConfig {
+                max_rounds: if snapshot.extended.max_primary_rounds > 0 {
+                    None
+                } else {
+                    Some(SpendLimit::Unlimited)
+                },
+                max_input_tokens: Some(SpendLimit::Unlimited),
+                max_output_tokens: Some(SpendLimit::Unlimited),
+                max_cost_microusd: Some(SpendLimit::Unlimited),
+                max_wall_clock_secs: Some(SpendLimit::Unlimited),
+                ..DelegationBudgetConfig::default()
+            };
+        }
+        self.set_config_handle(
+            crate::daemon::session_worker::SessionConfigHandle::detached(snapshot),
         );
+        if let Some(active) = self.config.providers().active_model.clone()
+            && let Ok(refreshed) = self.build_live_model_for_running(
+                &self.stack[0].agent.model,
+                &active.provider,
+                &active.model,
+            )
+        {
+            Arc::make_mut(&mut self.stack[0].agent).model = Arc::new(refreshed);
+            self.schedule.set_agent(self.stack[0].agent.clone());
+        }
     }
 
     /// The session config reader, re-pinned to the current generation for a
@@ -3589,6 +3697,17 @@ impl Driver {
     fn repin_config_for_turn(&mut self) {
         self.config = self.config.repin();
         self.schedule.set_config_handle(self.config.clone());
+    }
+
+    /// Hand the exact generation-pinned worker snapshot to a nested lane.
+    fn config_for_noninteractive_child(
+        &self,
+    ) -> crate::daemon::session_worker::SessionConfigHandle {
+        let snapshot = (*self.config.snapshot()).clone();
+        // A child attempt owns the exact parent snapshot selected at admission.
+        // Never forward a live handle whose shared cell can advance before the
+        // child constructs its model or nested scheduler driver.
+        crate::daemon::session_worker::SessionConfigHandle::detached(snapshot)
     }
 
     pub fn set_resource_scheduler(
@@ -5064,12 +5183,17 @@ impl Driver {
             cwd: &self.cwd,
             hooks: config_snapshot.hooks(),
         };
-        let call_completed = self.stack.last().is_some_and(|frame| {
+        let history_has_result = self.stack.last().is_some_and(|frame| {
             crate::engine::agent::history_ends_with_tool_result_call(
                 &frame.history,
                 &payload.call_id,
             )
         });
+        // A paired history result is not an execution receipt. The process may
+        // have stopped after appending it but before the ordinary audit row was
+        // committed, so only the durable audit permits replay to skip dispatch.
+        let call_completed = history_has_result
+            && delegation_helpers::parked_tool_audit_is_committed(&self.session, &payload).await?;
         if !call_completed {
             crate::engine::interrupt::with_pre_resolved_interrupt_question(
                 interrupt_id,
@@ -5093,6 +5217,7 @@ impl Driver {
             )
             .await?;
         }
+        ensure_parked_tool_audit_committed(&self.session, &payload).await?;
         if payload.call_id.starts_with("seed-read-") {
             let pending = self
                 .stack
@@ -5218,9 +5343,13 @@ impl Driver {
             hooks: snapshot.hooks(),
         };
         let frame = self.stack.last_mut().context("driver stack is empty")?;
-        frame.history.push(brief);
         crate::engine::seed_reads::execute_declared_seed_calls(&env, &mut frame.history, pending)
             .await?;
+        // Keep every declared assistant tool call adjacent to its paired
+        // result. Appending the handoff brief first makes request rehydration
+        // treat the call as dangling and synthesize an interrupted result,
+        // hiding the freshly executed seed from the child.
+        frame.history.push(brief);
         Ok(crate::engine::seed_reads::completion_prompt())
     }
 
@@ -5905,14 +6034,9 @@ impl Driver {
         }
 
         let mut goal_watchdog: Option<Pin<Box<Sleep>>> = None;
-        let mut assistant_inbox_idle_poll = tokio::time::interval(Duration::from_millis(250));
-        assistant_inbox_idle_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        assistant_inbox_idle_poll.tick().await;
+        let mut assistant_inbox_idle_poll = GatedInterval::new(Duration::from_millis(250));
         let mut assistant_inbox_defer_heartbeat =
-            tokio::time::interval(ASSISTANT_INBOX_DEFER_HEARTBEAT_INTERVAL);
-        assistant_inbox_defer_heartbeat
-            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        assistant_inbox_defer_heartbeat.tick().await;
+            GatedInterval::new(ASSISTANT_INBOX_DEFER_HEARTBEAT_INTERVAL);
         loop {
             let active_target_id = self.active_queue_target_id();
             // Persist-on-re-entry owns started-unsettled keep-parked
@@ -5925,13 +6049,23 @@ impl Driver {
             // settling the in-memory plan.
             let waiting_for_keep_parked_siblings =
                 self.persist_on_reentry_owns_started_unsettled_siblings();
-            // Pending human input takes priority over a previously completed
-            // noninteractive result before the boundary select runs.
-            let human_input_already_pending =
-                input_queue.has_pending_for(Some(&active_target_id)).await;
+            // Ready human input takes priority over a previously completed
+            // noninteractive result before the boundary select runs. Deferred
+            // input remains owned by the queue but must not suppress idle work
+            // until its dequeue deadline.
+            let human_input_already_ready =
+                input_queue.has_ready_for(Some(&active_target_id)).await;
+            // Both assistant-inbox timers are lower-priority idle work. An
+            // input observed ready in this boundary snapshot disables both
+            // arms explicitly; the biased select remains the honest arbiter
+            // only for input that becomes ready after this snapshot.
+            let assistant_inbox_timers_armed =
+                !waiting_for_keep_parked_siblings && !human_input_already_ready;
+            assistant_inbox_defer_heartbeat.set_armed(assistant_inbox_timers_armed);
+            assistant_inbox_idle_poll.set_armed(assistant_inbox_timers_armed);
             if !waiting_for_keep_parked_siblings
                 && !self.pending_noninteractive_completions.is_empty()
-                && !human_input_already_pending
+                && !human_input_already_ready
                 && self
                     .run_next_pending_noninteractive_completion(&input_queue, tx)
                     .await?
@@ -5959,8 +6093,22 @@ impl Driver {
             // history or run a turn). Compact/Prune controls already defer
             // on the same predicate; auto-compact and prune-after-switch
             // must not bypass it.
+            self.loop_boundary_state
+                .send_replace(Some(DriverLoopBoundaryObservation {
+                    sequence: self.loop_boundary_sequence,
+                    human_input_already_ready,
+                    assistant_inbox_defer_heartbeat_armed: assistant_inbox_defer_heartbeat
+                        .is_armed(),
+                    assistant_inbox_idle_poll_armed: assistant_inbox_idle_poll.is_armed(),
+                }));
+            self.loop_boundary_sequence = self.loop_boundary_sequence.saturating_add(1);
             tokio::select! {
                 biased;
+                // Queue closure is lifecycle control, not user input. Keep it
+                // observable even while a parked-continuation fence disables
+                // dequeueing; otherwise graceful shutdown can wait forever
+                // for a driver that intentionally refuses the message arm.
+                _ = input_queue.wait_closed() => break,
                 msg = input_queue.recv_group_order_for(Some(&active_target_id)),
                     if !waiting_for_keep_parked_siblings => {
                     goal_watchdog = None;
@@ -6043,10 +6191,6 @@ impl Driver {
                         // under a long turn it cannot fire until that turn
                         // ends, so a caller that waited for it here would be
                         // measuring turn length, not worker health.
-                        #[cfg(test)]
-                        Some(DriverControl::AbortForTest) => {
-                            anyhow::bail!("driver abort requested for test");
-                        }
                         Some(control) => {
                             self.run_control_with_input_queue(control, &input_queue, tx)
                                 .await
@@ -6058,8 +6202,7 @@ impl Driver {
                 // control. In a biased select, a timer that became ready
                 // while another turn was running must not start inference
                 // ahead of either already-ready boundary request.
-                _ = assistant_inbox_defer_heartbeat.tick(),
-                    if !waiting_for_keep_parked_siblings => {
+                _ = assistant_inbox_defer_heartbeat.tick() => {
                     match self.claim_assistant_inbox_text(true).await {
                         Ok(Some((text, inbox_item_ids))) => {
                             self.preempt_shadow_brief_for_foreground().await;
@@ -6074,20 +6217,16 @@ impl Driver {
                         Err(error) => tracing::warn!(%error, "assistant inbox deferred delivery failed"),
                     }
                 }
-                _ = assistant_inbox_idle_poll.tick(),
-                    if !waiting_for_keep_parked_siblings => {
-                    match self.claim_assistant_inbox_text(false).await {
-                        Ok(Some((text, inbox_item_ids))) => {
-                            self.preempt_shadow_brief_for_foreground().await;
-                            let mut submission =
-                                crate::engine::message::UserSubmission::text(text);
-                            submission.origin =
-                                crate::engine::message::SubmissionOrigin::Internal;
-                            self.run_user_input(submission, &input_queue, tx).await?;
-                            self.acknowledge_assistant_inbox(inbox_item_ids).await?;
-                        }
-                        Ok(None) => {}
-                        Err(error) => tracing::warn!(%error, "assistant inbox immediate delivery failed"),
+                _ = assistant_inbox_idle_poll.tick() => {
+                    if self
+                        .try_deliver_immediate_assistant_inbox(
+                            &input_queue,
+                            tx,
+                            &mut goal_watchdog,
+                        )
+                        .await?
+                    {
+                        continue;
                     }
                 }
                 ev = self.job_event_rx.recv(),
@@ -6563,8 +6702,6 @@ impl Driver {
             return;
         }
         match control {
-            #[cfg(test)]
-            DriverControl::AbortForTest => unreachable!("handled before run_control"),
             DriverControl::WakeGoal => {
                 if let Err(error) = self.maybe_continue_active_goal(input_queue, tx).await {
                     tracing::warn!(%error, "waking supervised goal failed");
@@ -9039,7 +9176,13 @@ impl Driver {
         };
         let seq = match record_outcome {
             UserMessageRecordOutcome::Recorded(seq) => Some(seq),
-            UserMessageRecordOutcome::Untracked => None,
+            UserMessageRecordOutcome::Untracked => {
+                if folded.queue_item_ids.is_empty() {
+                    None
+                } else {
+                    return Err(());
+                }
+            }
             UserMessageRecordOutcome::RetryRequired => return Err(()),
         };
         // Folded submissions never enter `run_user_input`, so this is the
@@ -9764,6 +9907,33 @@ impl Driver {
         self.acknowledge_assistant_inbox(inbox_item_ids).await
     }
 
+    async fn try_deliver_immediate_assistant_inbox(
+        &mut self,
+        input_queue: &crate::engine::message::UserSubmissionQueue,
+        tx: &mpsc::Sender<TurnEvent>,
+        goal_watchdog: &mut Option<Pin<Box<Sleep>>>,
+    ) -> Result<bool> {
+        match self.claim_assistant_inbox_text(false).await {
+            Ok(Some((text, inbox_item_ids))) => {
+                self.preempt_shadow_brief_for_foreground().await;
+                let mut submission = crate::engine::message::UserSubmission::text(text);
+                submission.origin = crate::engine::message::SubmissionOrigin::Internal;
+                self.run_user_input(submission, input_queue, tx).await?;
+                self.acknowledge_assistant_inbox(inbox_item_ids).await?;
+                self.reset_goal_progress_tracking().await;
+                self.clear_goal_idle_intervention();
+                self.maybe_continue_active_goal(input_queue, tx).await?;
+                self.refresh_goal_watchdog(goal_watchdog).await;
+                Ok(true)
+            }
+            Ok(None) => Ok(false),
+            Err(error) => {
+                tracing::warn!(%error, "assistant inbox immediate delivery failed");
+                Ok(false)
+            }
+        }
+    }
+
     async fn claim_assistant_inbox_text(
         &self,
         include_deferred: bool,
@@ -10136,6 +10306,32 @@ impl Driver {
         )
     }
 
+    fn merge_live_model_selection_fields(
+        &self,
+        mut selection: crate::config::providers::ActiveModelRef,
+    ) -> crate::config::providers::ActiveModelRef {
+        let Some(live) = self
+            .live_providers_config()
+            .ok()
+            .and_then(|providers| providers.active_model)
+        else {
+            return selection;
+        };
+        if live.provider != selection.provider || live.model != selection.model {
+            return selection;
+        }
+        if selection.reasoning_effort.is_none() {
+            selection.reasoning_effort = live.reasoning_effort.clone();
+        }
+        if selection.thinking_mode.is_none() {
+            selection.thinking_mode = live.thinking_mode.clone();
+        }
+        if selection.prompt_cache_retention.is_none() {
+            selection.prompt_cache_retention = live.prompt_cache_retention.clone();
+        }
+        selection
+    }
+
     fn active_selection_for_model(
         &self,
         model: &crate::engine::model::Model,
@@ -10144,7 +10340,7 @@ impl Driver {
             return if selection.provider == model.provider_id()
                 && selection.model == model.model_id_ref()
             {
-                selection
+                self.merge_live_model_selection_fields(selection)
             } else {
                 crate::config::providers::ActiveModelRef {
                     provider: model.provider_id().to_string(),
@@ -10162,6 +10358,7 @@ impl Driver {
             .filter(|selection| {
                 selection.provider == model.provider_id() && selection.model == model.model_id_ref()
             })
+            .map(|selection| self.merge_live_model_selection_fields(selection))
             .unwrap_or_else(|| crate::config::providers::ActiveModelRef {
                 provider: model.provider_id().to_string(),
                 model: model.model_id_ref().to_string(),
@@ -13390,7 +13587,16 @@ impl Driver {
         let title_progress_before_turn = self.session.title_progress_snapshot().await?;
         let (extended, providers) = self.config.configs();
         let use_session_model_metadata = use_session_model_for_auto_title(&extended);
-        let (title_action, mut metadata_work) = if use_session_model_metadata {
+        // A durable run invocation owns an exact provider-turn budget and
+        // terminal. Metadata/title inference is deliberately outside the
+        // conversation, so launching it here would spend unaccounted provider
+        // turns that can outlive this invocation and consume another
+        // invocation's responses. Headless runs therefore defer metadata
+        // inference; interactive turns retain the existing title cadence.
+        let run_invocation_owns_provider_budget = run_invocation_id.is_some();
+        let (title_action, mut metadata_work) = if run_invocation_owns_provider_budget {
+            (crate::session::TitleAction::None, None)
+        } else if use_session_model_metadata {
             (
                 crate::session::TitleAction::None,
                 self.session
@@ -13400,7 +13606,9 @@ impl Driver {
             (self.session.note_user_content(&canonical_user_text), None)
         };
         let mut auto_title_task = None;
-        if !use_session_model_metadata && !matches!(title_action, crate::session::TitleAction::None)
+        if !run_invocation_owns_provider_budget
+            && !use_session_model_metadata
+            && !matches!(title_action, crate::session::TitleAction::None)
         {
             let session = self.session.clone();
             let content_prefix = if artifact_frame.is_some() {
@@ -13693,7 +13901,12 @@ impl Driver {
                     // ReplayParkedInterrupt can enter persist-on-re-entry.
                     return Ok(());
                 }
-                PendingScheduledReentry::WaitForStartedSiblings => return Ok(()),
+                PendingScheduledReentry::WaitForStartedSiblings => {
+                    if std::env::var("DRIVER_DEBUG_ADMIT").is_ok() {
+                        eprintln!("ADMIT-DEBUG: reentry WaitForStartedSiblings");
+                    }
+                    return Ok(());
+                }
                 PendingScheduledReentry::Advanced(result) => Some(result),
             };
             // Per-turn backup-model fallback (`per-model-backup-
@@ -13862,11 +14075,17 @@ impl Driver {
                     .admit_provider_round(is_root, max_primary_rounds, tx)
                     .await?
             {
+                if std::env::var("DRIVER_DEBUG_ADMIT").is_ok() {
+                    eprintln!("ADMIT-DEBUG: provider round refused");
+                }
                 return Ok(());
             }
             let turn_result = if let Some(result) = scheduled_turn_result {
                 result
             } else {
+                if std::env::var("DRIVER_DEBUG_ADMIT").is_ok() {
+                    eprintln!("ADMIT-DEBUG: dispatching foreground turn");
+                }
                 if is_root && let Some(work) = metadata_work.take() {
                     // The turn phase consumes this only after it has assembled
                     // and successfully dispatched the foreground request. That
@@ -14020,52 +14239,64 @@ impl Driver {
                             .user_cancel_requested
                             .load(std::sync::atomic::Ordering::Acquire)
                         && !response_window_closed.load(std::sync::atomic::Ordering::SeqCst);
-                    if retractable_direct_turn
-                        && let Some(seq) = recorded_user_seq
-                        && self
-                            .session
-                            .db
-                            .remove_latest_user_message(self.session.live_id(), seq)
-                            .await
-                            .unwrap_or_else(|error| {
-                                tracing::warn!(%error, seq, "initial-thinking user-message retract failed");
-                                false
-                            })
-                    {
-                        let generated_title = if let Some((title_state, task)) = auto_title_task.take() {
-                            // The state handoff and the durable title write share
-                            // one mutex. Marking retracted before aborting either
-                            // prevents a later write or captures the exact title
-                            // already written for the rollback predicate.
-                            let generated_title = {
-                                let mut state = title_state.lock().unwrap();
-                                state.retracted = true;
-                                state.persisted_title.clone()
+                    if retractable_direct_turn && let Some(seq) = recorded_user_seq {
+                        let generated_title =
+                            if let Some((title_state, task)) = auto_title_task.take() {
+                                // The state handoff and the durable title write share
+                                // one mutex. Freeze it before the combined DB
+                                // transition so the title predicate cannot race a
+                                // detached write between snapshot and commit.
+                                {
+                                    let mut state = title_state.lock().unwrap();
+                                    state.retracted = true;
+                                }
+                                task.abort();
+                                let _ = task.await;
+                                title_state.lock().unwrap().persisted_title.clone()
+                            } else {
+                                None
                             };
-                            task.abort();
-                            let _ = task.await;
-                            generated_title
-                        } else {
-                            None
-                        };
-                        if let Err(error) = self.session.restore_title_progress_after_retract(
-                            title_progress_before_turn,
-                            generated_title.as_deref(),
-                        ).await {
-                            tracing::warn!(%error, "auto_title: retract rollback lost");
-                        }
-                        if let Err(error) = crate::text_artifact_blob::reconcile_cleanup_intents(&self.session.db).await {
-                            tracing::warn!(%error, seq, "retracted user-message blob cleanup remains pending");
-                        }
-                        let _ = tx
-                            .send(TurnEvent::UserMessageRemoved {
+                        match self
+                            .session
+                            .retract_latest_user_message(
                                 seq,
-                                client_submission_ids: client_submissions
-                                    .iter()
-                                    .map(|receipt| receipt.id)
-                                    .collect(),
-                            })
-                            .await;
+                                title_progress_before_turn,
+                                generated_title.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok(true) => {
+                                if let Err(error) =
+                                    crate::text_artifact_blob::reconcile_cleanup_intents(
+                                        &self.session.db,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(%error, seq, "retracted user-message blob cleanup remains pending");
+                                }
+                                let _ = tx
+                                    .send(TurnEvent::UserMessageRemoved {
+                                        seq,
+                                        client_submission_ids: client_submissions
+                                            .iter()
+                                            .map(|receipt| receipt.id)
+                                            .collect(),
+                                    })
+                                    .await;
+                            }
+                            Ok(false) => {
+                                // A newer durable row won, so this turn was not
+                                // retracted. Keep its already-committed title and
+                                // accounting: both are valid state derived from a
+                                // user row that remains in the ledger. The aborted
+                                // task only fences a later title write; a completed
+                                // `set_auto_title` is atomic and is intentionally
+                                // not rolled back without removing its source row.
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, seq, "initial-thinking user-message retract failed");
+                            }
+                        }
                     }
                     if let Some((goal_id, generation, turn_id)) = self.goal_root_turn.take() {
                         let _ = self
@@ -14262,6 +14493,9 @@ impl Driver {
                     .map(|frame| frame.history.as_slice())
                     .unwrap_or(&[]),
             );
+            if std::env::var("DRIVER_DEBUG_ADMIT").is_ok() {
+                eprintln!("ADMIT-DEBUG: turn outcome = {outcome:?}");
+            }
             if let Err(exhaustion) = self.charge_recorded_usage() {
                 self.on_budget_exhausted(&exhaustion, tx).await;
                 return Ok(());
@@ -14677,7 +14911,7 @@ impl Driver {
                     let task_args_json = serde_json::to_string(&serde_json::json!({
                         "child_agent": &child_agent,
                         "model": model_selector_json(&model),
-                        "remaining_depth": remaining_depth,
+                        "remaining_depth": child_recursion.remaining_depth,
                         "granted_tools": &granted_tools,
                         "seed_reads": &seed_reads,
                         "todo_ids": &todo_ids,
@@ -16121,6 +16355,8 @@ impl Driver {
         model: Option<crate::engine::model_roles::DelegationModelSelector>,
         recursion: crate::engine::builtin::DelegationRecursionContext,
     ) -> crate::engine::builtin::SpawnArgs {
+        let mut inherited = self.spawn_args(interactive);
+        inherited.config = self.config_for_noninteractive_child();
         let parent = self.stack.last().expect("stack never empty");
         let inherited_vnext_root_pin = parent.agent.vnext_grant.is_some()
             && self.model_override.as_ref().is_some_and(|override_model| {
@@ -16165,7 +16401,7 @@ impl Driver {
                 .stack
                 .last()
                 .map(|frame| frame.agent.mcp_resolver.catalog().admitted_entries()),
-            ..self.spawn_args(interactive)
+            ..inherited
         }
     }
 
@@ -16205,6 +16441,8 @@ impl Driver {
         recursion: crate::engine::builtin::DelegationRecursionContext,
         confinement: DelegationConfinement,
     ) -> crate::engine::builtin::SpawnArgs {
+        let mut inherited = self.spawn_args(interactive);
+        inherited.config = self.config_for_noninteractive_child();
         let parent = self.stack.last().expect("stack never empty");
         let inherited_vnext_root_pin = parent.agent.vnext_grant.is_some()
             && self.model_override.as_ref().is_some_and(|override_model| {
@@ -16249,7 +16487,7 @@ impl Driver {
                 .last()
                 .map(|frame| frame.agent.mcp_resolver.catalog().admitted_entries()),
             workspace_lease: confinement.workspace_lease,
-            ..self.spawn_args(interactive)
+            ..inherited
         }
     }
 

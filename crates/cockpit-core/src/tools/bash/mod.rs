@@ -412,6 +412,7 @@ async fn call_bash_inner(
     options: BashRunOptions,
 ) -> Result<ToolOutput> {
     let workspace_scratch_dir = ctx.session.workspace_scratch_dir();
+    let mut approved_access_effects = Vec::new();
     if let Some(lease) = ctx.workspace_lease.as_ref()
         && (!lease.is_live(crate::workspace_lease::now_unix_ms()) || !lease.allows_execute())
     {
@@ -440,12 +441,36 @@ async fn call_bash_inner(
         .collect::<Vec<_>>();
     let attached_knowledge_read = !attached_knowledge_paths.is_empty();
     let mut denied_knowledge_paths = crate::knowledge::denied_local_knowledge_roots(ctx).await?;
-    let write_denied_knowledge_paths = crate::knowledge::configured_local_knowledge_roots(
+    let mut write_denied_knowledge_paths = configured_local_knowledge_write_roots(ctx);
+    for root in crate::knowledge::configured_local_knowledge_roots(
         &ctx.session,
         &ctx.cwd,
         &ctx.config.extended(),
     )
-    .await;
+    .await
+    {
+        if !write_denied_knowledge_paths
+            .iter()
+            .any(|existing| existing == &root)
+        {
+            write_denied_knowledge_paths.push(root);
+        }
+    }
+    // The assistant's implicit knowledge tree is governed by the assistant
+    // identity layer (SOUL.md/USER.md authority plus the identity shell
+    // gate), not by this configured-KB write fence. Keep its root out of the
+    // fence list so an assistant session's dynamic shell writes reach the
+    // identity gate instead of the blanket dynamic-target refusal.
+    if let Some(assistant_root) =
+        crate::knowledge::assistant_local_knowledge_root(&ctx.session).await
+    {
+        write_denied_knowledge_paths.retain(|root| root != &assistant_root);
+    }
+    if let Some(message) =
+        refuse_configured_knowledge_shell_writes(command, &cwd, &write_denied_knowledge_paths)
+    {
+        return Ok(ToolOutput::text(message));
+    }
     crate::workspace_lease::ensure_shell_execution_allowed(ctx.workspace_lease.as_deref())
         .map_err(|error| crate::engine::tool::invalid_input(error.to_string()))?;
     let timeouts = normalize_bash_timeouts(&args);
@@ -472,7 +497,8 @@ async fn call_bash_inner(
             Some(&workspace_scratch_dir),
         )
     {
-        approve_outside_working_directory(ctx, &outside).await?;
+        let effect = approve_outside_working_directory(ctx, &outside).await?;
+        retain_unique_concrete_effect(&mut approved_access_effects, effect);
     }
     if ctx.workspace_lease.is_none()
         && let Some(outside) = crate::tools::bash::command_directory_escape_with_workspace_scratch(
@@ -483,7 +509,8 @@ async fn call_bash_inner(
             Some(&workspace_scratch_dir),
         )
     {
-        approve_outside_working_directory(ctx, &outside).await?;
+        let effect = approve_outside_working_directory(ctx, &outside).await?;
+        retain_unique_concrete_effect(&mut approved_access_effects, effect);
     }
     let mut identity_denied_paths = Vec::new();
     let identity_accounting = match crate::assistants::identity::check_identity_shell(ctx).await? {
@@ -633,6 +660,7 @@ async fn call_bash_inner(
             ctx,
             timeout_note,
             identity_accounting,
+            &approved_access_effects,
         )
         .await;
     }
@@ -824,6 +852,7 @@ async fn call_bash_inner(
         timeout_ms,
         &mut resource_lease,
         identity_accounting.clone(),
+        &approved_access_effects,
     )
     .await;
     let outcome = match attempt {
@@ -970,6 +999,7 @@ async fn call_bash_inner(
                 timeout_ms,
                 &mut resource_lease,
                 identity_accounting.clone(),
+                &approved_access_effects,
             )
             .await;
             match rerun {
@@ -1156,7 +1186,10 @@ async fn call_bash_inner(
     Ok(out)
 }
 
-async fn approve_outside_working_directory(ctx: &ToolCtx, path: &Path) -> Result<()> {
+async fn approve_outside_working_directory(
+    ctx: &ToolCtx,
+    path: &Path,
+) -> Result<serde_json::Value> {
     let Some(approver) = ctx.approver.as_ref() else {
         return Err(crate::engine::tool::invalid_input(outside_cwd_error(
             &ctx.cwd,
@@ -1169,7 +1202,10 @@ async fn approve_outside_working_directory(ctx: &ToolCtx, path: &Path) -> Result
         )
         .await?;
     if decision.is_allowed() {
-        Ok(())
+        Ok(crate::tools::sandbox::native_access_effect(
+            path,
+            crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+        ))
     } else if matches!(decision, crate::approval::Decision::NoninteractiveDeny) {
         Err(crate::engine::tool::invalid_input(
             crate::approval::NONINTERACTIVE_RUN_DENIAL,
@@ -1181,11 +1217,69 @@ async fn approve_outside_working_directory(ctx: &ToolCtx, path: &Path) -> Result
     }
 }
 
+fn retain_unique_concrete_effect(
+    concrete_effects: &mut Vec<serde_json::Value>,
+    effect: serde_json::Value,
+) {
+    if !concrete_effects.contains(&effect) {
+        concrete_effects.push(effect);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ShellWriteTargets {
     None,
     Concrete(Vec<PathBuf>),
     Dynamic,
+}
+
+fn configured_local_knowledge_write_roots(ctx: &ToolCtx) -> Vec<PathBuf> {
+    ctx.config
+        .extended()
+        .knowledge_bases
+        .iter()
+        .filter_map(|entry| {
+            let crate::config::extended::KnowledgeBaseSource::Local { path } = &entry.source else {
+                return None;
+            };
+            Some(if path.is_absolute() {
+                path.clone()
+            } else {
+                ctx.cwd.join(path)
+            })
+        })
+        .collect()
+}
+
+fn refuse_configured_knowledge_shell_writes(
+    command: &str,
+    cwd: &Path,
+    write_denied_knowledge_paths: &[PathBuf],
+) -> Option<String> {
+    if write_denied_knowledge_paths.is_empty() {
+        return None;
+    }
+    match shell_write_targets(command, cwd) {
+        ShellWriteTargets::None => None,
+        ShellWriteTargets::Dynamic => Some(
+            "Error: shell commands with dynamic file targets cannot write while a configured local knowledge base is attached; use native file tools or a fixed path instead"
+                .to_string(),
+        ),
+        ShellWriteTargets::Concrete(targets) => {
+            for target in targets {
+                for root in write_denied_knowledge_paths {
+                    if cockpit_host::path_containment::contained_under(root, &target) {
+                        return Some(format!(
+                            "Error: cannot write `{}` because it is inside configured local knowledge base `{}`",
+                            target.display(),
+                            root.display()
+                        ));
+                    }
+                }
+            }
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2530,6 +2624,7 @@ async fn run_container_bash(
     ctx: &ToolCtx,
     timeout_note: Option<&str>,
     identity_accounting: Option<crate::assistants::identity::IdentityShellAccounting>,
+    approved_access_effects: &[serde_json::Value],
 ) -> Result<ToolOutput> {
     let mode = ctx.session.sandbox_mode();
     let mut meta = crate::engine::tool::SandboxMeta {
@@ -2558,6 +2653,7 @@ async fn run_container_bash(
         timeout_ms,
         &mut resource_lease,
         identity_accounting,
+        approved_access_effects,
     )
     .await;
     let final_outcome = match attempt {
@@ -2627,10 +2723,10 @@ async fn run_container_shell(
     timeout_ms: u64,
     resource_lease: &mut Option<ResourceLeaseGuard>,
     identity_accounting: Option<crate::assistants::identity::IdentityShellAccounting>,
+    approved_access_effects: &[serde_json::Value],
 ) -> RunOutcome {
-    let manager = crate::container::container_manager()
-        .get_or_init(|| async { crate::container::ContainerManager::detect() })
-        .await;
+    let manager = crate::container::container_manager_for_db(&ctx.session.db)
+        .unwrap_or_else(|| std::sync::Arc::new(crate::container::ContainerManager::detect()));
     // Atomic reselect + capture: owned runtime is immutable for this launch.
     let runtime = match manager.select_for_launch() {
         Ok(runtime) => runtime,
@@ -2701,11 +2797,13 @@ async fn run_container_shell(
         Ok(cmd) => cmd,
         Err(e) => return RunOutcome::SpawnError(std::io::Error::other(e.to_string())),
     };
+    let mut concrete_effects = vec![serde_json::json!({"execute": {"command": command}})];
+    concrete_effects.extend_from_slice(approved_access_effects);
     run_prepared_command(
         cmd,
         ctx,
         timeout_ms,
-        vec![serde_json::json!({"execute": {"command": command}})],
+        concrete_effects,
         resource_lease,
         false,
         identity_accounting,
@@ -2820,6 +2918,7 @@ async fn run_shell(
     timeout_ms: u64,
     resource_lease: &mut Option<ResourceLeaseGuard>,
     identity_accounting: Option<crate::assistants::identity::IdentityShellAccounting>,
+    approved_access_effects: &[serde_json::Value],
 ) -> RunOutcome {
     let attached_knowledge_read = extra_sandbox_paths
         .iter()
@@ -2904,8 +3003,7 @@ async fn run_shell(
     // zerobox handed us a plain `tokio::process::Command`.
     #[cfg(unix)]
     cmd.process_group(0);
-
-    let concrete_effects = vec![
+    let mut concrete_effects = vec![
         // Ordinary command approval binds the exact shell text.
         serde_json::json!({"execute": {"command": command}}),
         // A run-fail-escalate approval additionally binds the actual retry
@@ -2915,6 +3013,22 @@ async fn run_shell(
             "sandbox": if confine { "confined" } else { "unconfined" },
         }}),
     ];
+    if confine {
+        // Confined bash prompts for path access rather than a separate
+        // command approval. Preserve the cwd candidate as a concrete effect
+        // while also carrying any exact outside-path candidates collected
+        // before sandbox construction.
+        concrete_effects.push(serde_json::json!({
+            "access": {
+                "path": cwd.display().to_string(),
+                "required_access": format!(
+                    "{:?}",
+                    crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite
+                ),
+            }
+        }));
+    }
+    concrete_effects.extend_from_slice(&approved_access_effects);
     run_prepared_command(
         cmd,
         ctx,
@@ -2953,7 +3067,7 @@ async fn run_prepared_command(
     {
         return RunOutcome::SpawnError(std::io::Error::other(error.to_string()));
     }
-    let mut child = match cmd.spawn() {
+    let mut child = match cockpit_host::process::spawn_pinned(cmd) {
         Ok(c) => c,
         Err(e) => return RunOutcome::SpawnError(e),
     };
@@ -3350,6 +3464,28 @@ mod idle_wake_effect_tests {
         assert_eq!(
             tool.completed_call_effect(&json!({ "command": "touch marker && false" }), &output),
             ToolEffect::Dynamic
+        );
+    }
+}
+
+#[cfg(test)]
+mod approved_access_effect_tests {
+    use super::retain_unique_concrete_effect;
+
+    #[test]
+    fn outside_access_effects_retain_exact_candidate_and_dedupe() {
+        let effect = crate::tools::sandbox::native_access_effect(
+            std::path::Path::new("/outside/exact"),
+            crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+        );
+        let mut effects = Vec::new();
+        retain_unique_concrete_effect(&mut effects, effect.clone());
+        retain_unique_concrete_effect(&mut effects, effect.clone());
+
+        assert_eq!(effects, vec![effect]);
+        assert_eq!(
+            effects[0]["access"]["path"],
+            serde_json::Value::String("/outside/exact".to_string())
         );
     }
 }

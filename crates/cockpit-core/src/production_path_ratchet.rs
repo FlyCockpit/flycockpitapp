@@ -48,17 +48,45 @@ fn production_source(path: &Path) -> String {
     strip_test_modules(&raw)
 }
 
+/// True when a `#[cfg(...)]` attribute enables test-only code, e.g.
+/// `#[cfg(test)]` or `#[cfg(all(test, feature = "remote"))]`. A negated gate
+/// (`#[cfg(not(test))]`) selects the production fallback and is not stripped.
+fn cfg_enables_test(attr: &str) -> bool {
+    attr.contains("test") && !attr.contains("not(test)")
+}
+
 fn strip_test_modules(src: &str) -> String {
     let mut out = String::new();
     let mut i = 0;
     let bytes = src.as_bytes();
     while i < src.len() {
-        if let Some(rel) = src[i..].find("#[cfg(test)]") {
+        if let Some(rel) = src[i..].find("#[cfg(") {
             out.push_str(&src[i..i + rel]);
-            let after = i + rel + "#[cfg(test)]".len();
-            if let Some(mod_rel) = src[after..].find('{') {
+            let attr_start = i + rel;
+            let Some(attr_end_rel) = src[attr_start..].find(']') else {
+                out.push_str(&src[attr_start..]);
+                break;
+            };
+            let attr_end = attr_start + attr_end_rel + 1;
+            let attr = &src[attr_start..attr_end];
+            if !cfg_enables_test(attr) {
+                out.push_str(attr);
+                i = attr_end;
+                continue;
+            }
+            // A test-gated item is stripped whole: an inline `mod`/`fn` block
+            // up to its matching brace, or a file-module declaration up to its
+            // semicolon (the sibling file is scanned on its own).
+            let mut j = attr_end;
+            while j < src.len() && bytes[j] != b'{' && bytes[j] != b';' {
+                j += 1;
+            }
+            if j < src.len() && bytes[j] == b';' {
+                i = j + 1;
+                continue;
+            }
+            if j < src.len() && bytes[j] == b'{' {
                 let mut depth = 0;
-                let mut j = after + mod_rel;
                 while j < src.len() {
                     match bytes[j] {
                         b'{' => depth += 1,
@@ -74,9 +102,10 @@ fn strip_test_modules(src: &str) -> String {
                     j += 1;
                 }
                 i = j;
-            } else {
-                i = after;
+                continue;
             }
+            out.push_str(attr);
+            i = attr_end;
             continue;
         }
         out.push_str(&src[i..]);

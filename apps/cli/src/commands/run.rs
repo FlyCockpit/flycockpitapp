@@ -630,8 +630,30 @@ pub(crate) async fn attach_send_pump(
 
     let was_processing = is_processing(client, session_id).await?;
     let submitted_message = !prompt.trim().is_empty();
-    // Sole invocation identity: allocated once before the V2 message send.
-    let client_submission_id = Uuid::now_v7();
+    // Sole invocation identity: one nonce per attach/send/pump; the submission
+    // id is derived from that nonce plus the payload fingerprint so retries of
+    // the same payload dedup while distinct invocations never collide.
+    let invocation_nonce = Uuid::now_v7();
+    let client_submission_id = if submitted_message {
+        let images = options
+            .image_data
+            .iter()
+            .cloned()
+            .map(cockpit_client::image_upload::SubmissionImage::png)
+            .collect::<Vec<_>>();
+        cockpit_client::submission::derive_client_submission_id(
+            invocation_nonce,
+            &cockpit_client::submission::ClientUserSubmission {
+                origin: cockpit_client::submission::SubmissionOrigin::ExternalRoot,
+                text: prompt.clone(),
+                images,
+                ..Default::default()
+            }
+            .client_fingerprint(),
+        )
+    } else {
+        Uuid::nil()
+    };
     if submitted_message {
         let use_bulk = cockpit_client::bulk_upload::user_message_needs_bulk(&prompt, None);
         if use_bulk && !options.image_data.is_empty() {
@@ -1076,6 +1098,7 @@ pub(crate) async fn pump_events(
                 })
                 .await
                 .context("auto-resolving noninteractive run approval")?;
+            outcome.expect_parked_continuation();
             if matches!(format, OutputFormat::Json) {
                 writeln!(
                     stdout,
@@ -1256,6 +1279,10 @@ struct RunOutcome {
     streamed_text: bool,
     terminal_failure: bool,
     terminal_seen: bool,
+    /// A noninteractive resolution has acknowledged a parked tool/question,
+    /// so the original turn's `NeedsIntervention(parked_interrupt)` idle is an
+    /// intermediate boundary. The replay continuation owns the real terminal.
+    awaiting_parked_continuation: bool,
 }
 
 impl RunOutcome {
@@ -1296,8 +1323,15 @@ impl RunOutcome {
             | proto::Event::ToolError { .. } => {
                 self.terminal_failure = true;
             }
-            proto::Event::AgentIdle { .. } => {
-                self.terminal_seen = true;
+            proto::Event::AgentIdle { reason, .. } => {
+                if self.awaiting_parked_continuation
+                    && matches!(reason, proto::IdleReason::NeedsIntervention { code } if code == "parked_interrupt")
+                {
+                    self.terminal_seen = false;
+                } else {
+                    self.awaiting_parked_continuation = false;
+                    self.terminal_seen = true;
+                }
             }
             proto::Event::SessionEnded { .. } => {
                 self.terminal_seen = true;
@@ -1309,6 +1343,11 @@ impl RunOutcome {
 
     fn ready_to_finish(&self) -> bool {
         self.terminal_seen && (!self.expect_submitted_message || self.message_recorded)
+    }
+
+    fn expect_parked_continuation(&mut self) {
+        self.awaiting_parked_continuation = true;
+        self.terminal_seen = false;
     }
 
     fn is_empty_turn(&self) -> bool {
@@ -1984,6 +2023,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | Usage { session_id, .. }
         | InterruptRaised { session_id, .. }
         | InterruptResolved { session_id, .. }
+        | InterruptInterrupted { session_id, .. }
         | HistoryReplay { session_id, .. }
         | InterruptQueueChanged { session_id, .. }
         | AgentIdle { session_id, .. }
@@ -2557,6 +2597,48 @@ mod tests {
             turn_id: None,
             reason: crate::engine::IdleReason::Completed,
         });
+        assert_eq!(outcome.exit_code(), 0);
+    }
+
+    #[test]
+    fn auto_resolved_park_idle_waits_for_replay_continuation_terminal() {
+        let session_id = Uuid::new_v4();
+        let mut outcome = RunOutcome::new(true);
+        outcome.observe(&proto::Event::UserMessageRecorded {
+            session_id,
+            seq: 1,
+            preflight_cleaned: None,
+            client_submission_ids: Vec::new(),
+        });
+        outcome.observe(&proto::Event::ThinkingStarted {
+            session_id,
+            agent: "Build".into(),
+            turn_id: Some("submitted-turn".into()),
+        });
+        outcome.expect_parked_continuation();
+        outcome.observe(&proto::Event::AgentIdle {
+            session_id,
+            turn_id: Some("submitted-turn".into()),
+            reason: proto::IdleReason::NeedsIntervention {
+                code: "parked_interrupt".into(),
+            },
+        });
+        assert!(
+            !outcome.ready_to_finish(),
+            "the parked turn's idle is not the auto-resolved invocation terminal"
+        );
+
+        outcome.observe(&proto::Event::ThinkingStarted {
+            session_id,
+            agent: "Build".into(),
+            turn_id: Some("replay-continuation".into()),
+        });
+        outcome.observe(&proto::Event::AgentIdle {
+            session_id,
+            turn_id: Some("replay-continuation".into()),
+            reason: proto::IdleReason::Completed,
+        });
+        assert!(outcome.ready_to_finish());
         assert_eq!(outcome.exit_code(), 0);
     }
 

@@ -224,7 +224,7 @@ fn run_bounded_command(
         }
     }
 
-    let mut child = match cmd.spawn() {
+    let mut child = match cockpit_host::process::spawn_std_pinned(cmd) {
         Ok(child) => child,
         Err(error) => {
             return ProbeCommandResult {

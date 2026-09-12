@@ -398,6 +398,8 @@ async fn leak_reveal_peer_auth_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
     let reveal_path = dir.path().join("cockpit-leak-reveal.sock");
     let listener = crate::daemon::bind_private_socket(&reveal_path).expect("bind reveal socket");
+    let listener =
+        crate::daemon::leak_reveal_socket::BoundRevealSocket::new(listener, reveal_path.clone());
     let server_ctx = ctx.clone();
     let accept = tokio::spawn(async move {
         let _ =
@@ -458,6 +460,8 @@ async fn leak_reveal_socket_rejects_trailing_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let reveal_path = dir.path().join("cockpit-leak-reveal.sock");
     let listener = crate::daemon::bind_private_socket(&reveal_path).expect("bind reveal socket");
+    let listener =
+        crate::daemon::leak_reveal_socket::BoundRevealSocket::new(listener, reveal_path.clone());
     let server_ctx = ctx.clone();
     let accept = tokio::spawn(async move {
         let _ =

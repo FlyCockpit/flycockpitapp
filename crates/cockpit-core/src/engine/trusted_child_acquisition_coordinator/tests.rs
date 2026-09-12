@@ -97,6 +97,28 @@ fn acquisition_spawn_args(
     }
 }
 
+fn test_approver(
+    session: &Arc<Session>,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    interrupts: &Arc<crate::engine::interrupt::InterruptHub>,
+    redaction: &Arc<RedactionTable>,
+) -> Arc<crate::approval::Approver> {
+    let store = crate::approval::store::GrantStore::new(
+        session.db.clone(),
+        session.id,
+        session.project_root.clone(),
+        config.clone(),
+    );
+    Arc::new(crate::approval::Approver::new_for_session(
+        store,
+        session.db.clone(),
+        session.clone(),
+        Arc::new(std::sync::RwLock::new(redaction.clone())),
+        "Build",
+        interrupts.clone(),
+    ))
+}
+
 fn interrupt_hub(
     session: &Session,
     redaction: Arc<RedactionTable>,
@@ -161,6 +183,11 @@ fn command_output_is_quarantined_before_child_history_and_sealed_by_reference() 
             )
             .expect("create test session"),
         );
+        session.install_test_external_journal();
+        session.set_sandbox_enabled(false);
+        session.set_approval_mode(ApprovalMode::Yolo);
+        let interrupts = interrupt_hub(&session, redaction.clone());
+        let approver = test_approver(&session, &config, &interrupts, &redaction);
 
         let outcome = run_trusted_child_acquisition(
             AcquisitionRequest {
@@ -188,9 +215,9 @@ fn command_output_is_quarantined_before_child_history_and_sealed_by_reference() 
                 redaction: redaction.clone(),
                 config,
                 guidance_compiler: None,
-                interrupts: interrupt_hub(&session, redaction.clone()),
+                interrupts,
                 cancel: tokio_util::sync::CancellationToken::new(),
-                approver: None,
+                approver: Some(approver),
                 resource_scheduler: None,
                 local_installations: crate::agents::LocalInstallationResolver::no_installations(),
             },
@@ -210,8 +237,8 @@ fn command_output_is_quarantined_before_child_history_and_sealed_by_reference() 
         let requests = provider.captured();
         assert_eq!(
             requests.len(),
-            3,
-            "the scripted child completed its live loop"
+            2,
+            "the scripted child completed command + capture before the unused final text turn"
         );
         for request in requests {
             let body = request.body.to_string();

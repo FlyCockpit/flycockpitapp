@@ -127,6 +127,12 @@ fn first_run_flow_completes_end_to_end() {
     assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
     assert_eq!(
         app.dialog.test_page_name(),
+        Some(cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID)
+    );
+    app.dialog.test_mark_setup_complete("agent-install");
+    assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
+    assert_eq!(
+        app.dialog.test_page_name(),
         Some(cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID)
     );
     app.dialog.test_mark_setup_complete("lifetime-save");
@@ -159,6 +165,8 @@ fn first_run_configuration_queues_held_draft_behind_selected_model() {
     assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
     app.dialog.test_mark_setup_complete("model-save");
 
+    assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
+    app.dialog.test_mark_setup_complete("agent-install");
     assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
     app.dialog.test_mark_setup_complete("lifetime-save");
 

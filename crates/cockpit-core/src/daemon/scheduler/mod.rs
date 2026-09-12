@@ -905,22 +905,44 @@ async fn run_scheduler_loop(
 #[derive(Clone)]
 pub struct ProductionJobExecutor {
     db: Db,
+    // The daemon boot vault, injected once at construction. The scheduler is
+    // a production path and must not open the vault per job.
+    vault: Arc<crate::secure_key::SecretVault>,
     prompt_runner: Arc<dyn ScheduledPromptRunner>,
     callbacks: CallbackRegistry,
 }
 
 impl ProductionJobExecutor {
-    pub fn new(db: Db, registry: SessionRegistry) -> Self {
+    /// Production constructor: the caller injects the daemon boot vault.
+    pub fn with_vault(
+        db: Db,
+        vault: Arc<crate::secure_key::SecretVault>,
+        registry: SessionRegistry,
+    ) -> Self {
         Self {
             db,
+            vault,
             prompt_runner: Arc::new(RegistryPromptRunner { registry }),
             callbacks: CallbackRegistry::default(),
         }
     }
 
+    /// Test convenience: opens the vault directly. Production paths inject
+    /// the daemon boot vault through [`ProductionJobExecutor::with_vault`].
+    #[cfg(test)]
+    pub fn new(db: Db, registry: SessionRegistry) -> Self {
+        let vault = crate::secure_key::vault_for_db(&db).expect("test vault");
+        Self::with_vault(db, vault, registry)
+    }
+
+    /// Test convenience: opens the vault directly. Production paths inject
+    /// the daemon boot vault through [`ProductionJobExecutor::with_vault`].
+    #[cfg(test)]
     pub fn with_prompt_runner(db: Db, prompt_runner: Arc<dyn ScheduledPromptRunner>) -> Self {
+        let vault = crate::secure_key::vault_for_db(&db).expect("test vault");
         Self {
             db,
+            vault,
             prompt_runner,
             callbacks: CallbackRegistry::default(),
         }
@@ -983,9 +1005,7 @@ impl ProductionJobExecutor {
         let root = PathBuf::from(project_root);
         let project_id = crate::session::project_id_for(&root)?;
         let root_str = root.to_string_lossy().into_owned();
-        let vault = crate::secure_key::vault_for_db(&self.db).map_err(|error| {
-            anyhow::anyhow!("opening vault for scheduled assistant session: {error}")
-        })?;
+        let vault = self.vault.clone();
         let session = crate::session::lifecycle::persist_assistant_session_with_redaction_custody(
             &self.db,
             vault,

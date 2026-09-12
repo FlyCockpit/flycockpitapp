@@ -110,7 +110,7 @@ pub async fn check_native_access(
     let cage_path = effective_native_path(path).unwrap_or_else(|_| path.to_path_buf());
     if let Some(cage) = &ctx.review_cage
         && cage.auto_deny_approvals()
-        && !cage.preauthorizes_package_path(&cage_path)
+        && !cage.admits_caged_path(&cage_path)
     {
         return Err(invalid_input(format!(
             "`{}` is outside the session boundary and background review cannot approve it",
@@ -288,7 +288,7 @@ pub(crate) async fn check_native_human_knowledge_write_access(
     }
     if let Some(cage) = &ctx.review_cage
         && cage.auto_deny_approvals()
-        && !cage.preauthorizes_package_path(&effective)
+        && !cage.admits_caged_path(&effective)
     {
         return Err(invalid_input(format!(
             "`{}` is outside the session boundary and background review cannot approve it",
@@ -421,13 +421,17 @@ pub async fn check_gitignore_read(
         return Ok(Some(gitignore_refusal(&display)));
     }
 
-    // No approver (headless / background) must settle through the shared
-    // machine-readable denial. This keeps synthetic seed reads and ordinary
-    // tool calls on the same noninteractive approval contract.
+    // No approver (headless / background) → deny with the same clear,
+    // gate-naming refusal an explicit rejection produces, never the
+    // generic noninteractive denial: the refusal must tell the caller
+    // WHICH gate stopped the read (`secret-bearing` / `gitignored`) so a
+    // headless run cannot mistake a secret-path stop for a generic
+    // approval failure. The shared machine-readable
+    // [`crate::approval::NONINTERACTIVE_RUN_DENIAL`] stays the contract
+    // of the approver-driven noninteractive path below, where an
+    // approval surface exists to auto-deny through.
     let Some(approver) = ctx.approver.as_ref() else {
-        return Ok(Some(ToolOutput::text(
-            crate::approval::NONINTERACTIVE_RUN_DENIAL,
-        )));
+        return Ok(Some(gitignore_refusal(&display)));
     };
 
     // Build the glob shapes + the project-relative parent label for stage 1.
@@ -795,23 +799,107 @@ mod tests {
         let db = ctx.session.db.clone();
         let sid = ctx.session.id;
         let hub = ctx.interrupts.clone();
+        let mut raised = hub.subscribe_raised();
         tokio::spawn(async move {
-            let iid = loop {
-                let open = db.list_open_interrupts(sid).await.unwrap();
-                if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
-                    break row.interrupt_id;
-                }
-                tokio::task::yield_now().await;
-            };
-            db.resolve_interrupt(iid, &response).await.unwrap();
-            assert!(hub.resolve(iid, response));
+            resolve_next_path_prompt(db, sid, hub, &mut raised, response).await;
         })
+    }
+
+    async fn resolve_next_path_prompt(
+        db: crate::db::Db,
+        sid: uuid::Uuid,
+        hub: Arc<InterruptHub>,
+        raised: &mut tokio::sync::mpsc::UnboundedReceiver<uuid::Uuid>,
+        response: ResolveResponse,
+    ) {
+        let interrupt_id = raised
+            .recv()
+            .await
+            .expect("path prompt publishes its exact interrupt id");
+        assert!(hub.has_waiter(interrupt_id));
+        let decision = db
+            .decision_request_for_interrupt(sid, interrupt_id)
+            .await
+            .unwrap()
+            .expect("path prompt is bound to its durable decision");
+        let interrupt = db
+            .get_interrupt(interrupt_id)
+            .await
+            .unwrap()
+            .expect("path prompt interrupt remains available");
+        let offered = interrupt
+            .questions
+            .clone()
+            .or_else(|| {
+                interrupt.question.clone().map(|question| {
+                    crate::daemon::proto::InterruptQuestionSet {
+                        questions: vec![question],
+                    }
+                })
+            })
+            .expect("path prompt has an offered question set");
+        let lifecycle = crate::agent_tree::AgentTreeLifecycle::new(db.clone());
+        let envelope = serde_json::to_string(&response).unwrap();
+        let settlement = if crate::approval::host_approval_response_allows(&response, &offered) {
+            lifecycle
+                .resolve_host_approval(
+                    sid,
+                    decision.decision_request_id,
+                    interrupt_id,
+                    &envelope,
+                    crate::agent_tree::HostApprovalAuthority::for_durable_interrupt_binding(
+                        sid, &decision, &interrupt,
+                    )
+                    .unwrap(),
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await
+        } else {
+            lifecycle
+                .cancel_host_approval(
+                    sid,
+                    decision.decision_request_id,
+                    interrupt_id,
+                    &envelope,
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await
+        }
+        .unwrap();
+        assert!(matches!(
+            settlement,
+            crate::agent_tree::DecisionSettlement::Resolved(_)
+        ));
+        assert!(hub.resolve(interrupt_id, response));
+    }
+
+    /// Exercise native approval through the same concrete effect scope as a
+    /// production tool dispatch. A durable approval response is only a ready
+    /// capability; the filesystem boundary must claim its exact path before
+    /// the enclosing dispatcher can publish the terminal receipt.
+    async fn check_native_access_as_tool_effect(
+        ctx: &ToolCtx,
+        path: &std::path::Path,
+        required: SandboxPathAccess,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        crate::engine::interrupt::with_host_approval_effect_scope(
+            "native_filesystem_access",
+            ctx.cancel.clone(),
+            async {
+                let checked = check_native_access(ctx, path, required).await?;
+                recheck_native_access_effect_boundary(&checked, required).await?;
+                Ok(checked)
+            },
+            |_| Some(true),
+        )
+        .await
     }
 
     /// Build a `ToolCtx` rooted at `cwd` with sandboxing ON and an
     /// approver wired to a detached interrupt hub, so a prompt can be
     /// resolved from a sibling task.
-    fn sandboxed_ctx(cwd: &std::path::Path) -> ToolCtx {
+    async fn sandboxed_ctx(cwd: &std::path::Path) -> (crate::test_env::TestEnvGuard, ToolCtx) {
+        let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = crate::session::Session::create_for_test(
             db.clone(),
@@ -825,7 +913,38 @@ mod tests {
         let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
         let cfg = crate::config::extended::RedactConfig::default();
         let redact = Arc::new(crate::redact::RedactionTable::build(&cfg, cwd).unwrap());
-        let hub = Arc::new(InterruptHub::detached());
+        let owner = db
+            .ensure_session_root_agent(
+                sid,
+                None,
+                crate::agent_tree::workspace_ref_for_host_path(cwd).unwrap(),
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap();
+        let owner = match db
+            .transition_agent_instance(
+                sid,
+                owner.agent_instance_id,
+                owner.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                r#"{"state":"running"}"#,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap()
+        {
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(owner) => owner,
+            outcome => panic!("sandbox fixture root did not start: {outcome:?}"),
+        };
+        let (events, _events_rx) = tokio::sync::broadcast::channel(16);
+        let hub = Arc::new(InterruptHub::new(
+            events,
+            Arc::new(std::sync::RwLock::new(redact.clone())),
+            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            db.clone(),
+            sid,
+        ));
         let store = GrantStore::new(
             db.clone(),
             sid,
@@ -833,57 +952,63 @@ mod tests {
             crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
         );
         let approver = Arc::new(Approver::new(store, db, sid, "builder", hub.clone()));
-        ToolCtx {
-            agent_id: "builder".to_string(),
-            allowed_knowledge_bases: None,
-            executing_model_trusted: false,
-            knowledge_access_trusted: false,
-            caller_model: None,
-            agent_instance_id: None,
-            lock_identity: "builder".to_string().clone(),
-            write_scope: None,
-            dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
-            workspace_lease: None,
-            current_tool_call_id: None,
-            current_tool_call_scope: None,
-            tool_steering: crate::agents::ToolSteering::Terse,
-            locks,
-            session: Arc::new(session),
-            cwd: cwd.to_path_buf(),
-            redact,
-            interrupts: hub,
-            cancel: tokio_util::sync::CancellationToken::new(),
-            shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
-            approver: Some(approver),
-            #[cfg(feature = "extended")]
-            image_generation_dispatch: None,
-            transcription_dispatch: None,
-            deferred_log: crate::engine::deferred::DeferredLog::new(),
-            root_agent_frame: true,
-            skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
-            review_cage: None,
-            context_usage: None,
-            available_tools: Arc::new(std::collections::HashSet::new()),
-            mcp_builtin_registry: Arc::new(crate::mcp::builtin::BuiltinRegistry::default_with(
-                Vec::new(),
-            )),
-            has_tree: false,
-            has_bash: false,
-            events: None,
-            lsp: None,
-            resource_scheduler: None,
-            media_authority: None,
-            media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(),
-            config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
-            env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(cwd),
-        }
+        (
+            env,
+            ToolCtx {
+                agent_id: "builder".to_string(),
+                allowed_knowledge_bases: None,
+                executing_model_trusted: false,
+                knowledge_access_trusted: false,
+                caller_model: None,
+                agent_instance_id: Some(owner.agent_instance_id),
+                lock_identity: "builder".to_string().clone(),
+                write_scope: None,
+                dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
+                workspace_lease: None,
+                current_tool_call_id: None,
+                current_tool_call_scope: None,
+                tool_steering: crate::agents::ToolSteering::Terse,
+                locks,
+                session: Arc::new(session),
+                cwd: cwd.to_path_buf(),
+                redact,
+                interrupts: hub,
+                cancel: tokio_util::sync::CancellationToken::new(),
+                shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
+                approver: Some(approver),
+                #[cfg(feature = "extended")]
+                image_generation_dispatch: None,
+                transcription_dispatch: None,
+                deferred_log: crate::engine::deferred::DeferredLog::new(),
+                root_agent_frame: true,
+                skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
+                review_cage: None,
+                context_usage: None,
+                available_tools: Arc::new(std::collections::HashSet::new()),
+                mcp_builtin_registry: Arc::new(crate::mcp::builtin::BuiltinRegistry::default_with(
+                    Vec::new(),
+                )),
+                has_tree: false,
+                has_bash: false,
+                events: None,
+                lsp: None,
+                resource_scheduler: None,
+                media_authority: None,
+                media_availability: crate::tool_media_authority::MediaToolAvailability::unavailable(
+                ),
+                config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
+                    cwd,
+                ),
+                env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(cwd),
+            },
+        )
     }
 
     #[tokio::test]
     async fn native_inside_cwd_allowed_without_prompt() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         // A path under cwd is allowed silently — no client attached, so a
         // prompt would block forever; this returns immediately.
         let inside = tmp.path().join("src/main.rs");
@@ -895,7 +1020,7 @@ mod tests {
     #[tokio::test]
     async fn native_inside_session_tmp_allowed_without_prompt() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         // The per-session tmp dir counts as inside the boundary.
         let tmp_dir = ctx.session.tmp_dir().expect("session tmp dir");
         let scratch = tmp_dir.join("scratch.txt");
@@ -907,7 +1032,7 @@ mod tests {
     #[tokio::test]
     async fn leased_native_access_allows_durable_workspace_scratch() {
         let lease_root = tempfile::tempdir().unwrap();
-        let mut ctx = sandboxed_ctx(lease_root.path());
+        let (_env, mut ctx) = sandboxed_ctx(lease_root.path()).await;
         ctx.workspace_lease = Some(Arc::new(crate::workspace_lease::WorkspaceLease::ephemeral(
             crate::workspace_lease::WorkspaceLeaseKind::SameRoot,
             lease_root.path().to_path_buf(),
@@ -924,7 +1049,7 @@ mod tests {
     #[tokio::test]
     async fn native_parent_traversal_stays_inside() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         // `cwd/sub/../keep.txt` resolves back inside cwd when the traversed
         // parent exists — no prompt.
         std::fs::create_dir(tmp.path().join("sub")).unwrap();
@@ -937,7 +1062,7 @@ mod tests {
     #[tokio::test]
     async fn native_missing_inside_path_allowed_without_prompt() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         let target = tmp.path().join("new/nested/file.txt");
         check_native_access(&ctx, &target, SandboxPathAccess::Read)
             .await
@@ -951,7 +1076,7 @@ mod tests {
         std::fs::create_dir(&knowledge_root).unwrap();
         let target = knowledge_root.join("notes.md");
 
-        let mut ctx = sandboxed_ctx(tmp.path());
+        let (_env, mut ctx) = sandboxed_ctx(tmp.path()).await;
         let mut extended = crate::config::extended::ExtendedConfig::default();
         extended
             .knowledge_bases
@@ -1003,7 +1128,7 @@ mod tests {
         std::fs::write(&attached_note, "attached").unwrap();
         std::fs::write(&withheld_note, "withheld").unwrap();
 
-        let mut ctx = sandboxed_ctx(workspace.path());
+        let (_env, mut ctx) = sandboxed_ctx(workspace.path()).await;
         ctx.allowed_knowledge_bases =
             Some(std::collections::BTreeSet::from(["attached".to_string()]));
         let mut extended = crate::config::extended::ExtendedConfig::default();
@@ -1065,7 +1190,7 @@ mod tests {
         let note = nested.join("note.md");
         std::fs::write(&note, "private").unwrap();
 
-        let mut ctx = sandboxed_ctx(workspace.path());
+        let (_env, mut ctx) = sandboxed_ctx(workspace.path()).await;
         ctx.allowed_knowledge_bases = Some(std::collections::BTreeSet::from(["outer".to_string()]));
         let mut extended = crate::config::extended::ExtendedConfig::default();
         for (id, path) in [
@@ -1109,7 +1234,7 @@ mod tests {
         let knowledge = tempfile::tempdir().unwrap();
         let note = knowledge.path().join("note.md");
         std::fs::write(&note, "protected").unwrap();
-        let mut ctx = sandboxed_ctx(workspace.path());
+        let (_env, mut ctx) = sandboxed_ctx(workspace.path()).await;
         ctx.executing_model_trusted = false;
         ctx.knowledge_access_trusted = true;
         let mut extended = crate::config::extended::ExtendedConfig::default();
@@ -1152,7 +1277,7 @@ mod tests {
         let knowledge = tempfile::tempdir().unwrap();
         let note = knowledge.path().join("note.md");
         std::fs::write(&note, "attached").unwrap();
-        let mut ctx = sandboxed_ctx(workspace.path());
+        let (_env, mut ctx) = sandboxed_ctx(workspace.path()).await;
         ctx.review_cage = Some(
             crate::engine::tool::ReviewCage::skills_review_with_package_roots([package
                 .path()
@@ -1202,7 +1327,7 @@ mod tests {
     #[tokio::test]
     async fn remote_knowledge_contributes_no_native_read_root() {
         let workspace = tempfile::tempdir().unwrap();
-        let mut ctx = sandboxed_ctx(workspace.path());
+        let (_env, mut ctx) = sandboxed_ctx(workspace.path()).await;
         let mut extended = crate::config::extended::ExtendedConfig::default();
         extended
             .knowledge_bases
@@ -1241,7 +1366,8 @@ mod tests {
         let skills = tempfile::tempdir().unwrap();
         let package = skills.path().join("reviewed");
         std::fs::create_dir_all(&package).unwrap();
-        let mut ctx = crate::tools::common::test_ctx(cwd.path());
+        let (_env, mut ctx) = sandboxed_ctx(cwd.path()).await;
+        ctx.cwd = cwd.path().to_path_buf();
         ctx.review_cage = Some(
             crate::engine::tool::ReviewCage::skills_review_with_package_roots([package.clone()]),
         );
@@ -1274,7 +1400,7 @@ mod tests {
         std::fs::write(&secret, "secret").unwrap();
         let link = tmp.path().join("link.txt");
         symlink_file(&secret, &link);
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
 
         let resolver = spawn_cancel_next_path_prompt(&ctx);
         let err = check_native_access(&ctx, &link, SandboxPathAccess::Read)
@@ -1295,7 +1421,7 @@ mod tests {
         std::fs::write(&secret, "secret").unwrap();
         let link = tmp.path().join("link.txt");
         symlink_file(&secret, &link);
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         ctx.session.set_sandbox_enabled(false);
 
         let resolver = spawn_cancel_next_path_prompt(&ctx);
@@ -1319,7 +1445,7 @@ mod tests {
         #[cfg(windows)]
         std::os::windows::fs::symlink_dir(outside.path(), &link).unwrap();
         let target = link.join("new-file.txt");
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
 
         let resolver = spawn_cancel_next_path_prompt(&ctx);
         let err = check_native_access(&ctx, &target, SandboxPathAccess::Read)
@@ -1347,7 +1473,7 @@ mod tests {
         let target = link.join("../secret.txt");
 
         for surface in ["read", "write", "edit"] {
-            let ctx = sandboxed_ctx(tmp.path());
+            let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
             let resolver = spawn_cancel_next_path_prompt(&ctx);
             let err = check_native_access(&ctx, &target, SandboxPathAccess::Read)
                 .await
@@ -1364,7 +1490,7 @@ mod tests {
     async fn native_access_parent_traversal_still_rejected_with_sandbox_off() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let mut ctx = sandboxed_ctx(tmp.path());
+        let (_env, mut ctx) = sandboxed_ctx(tmp.path()).await;
         ctx.session.set_sandbox_enabled(false);
         ctx.approver = None;
         let target = outside.path().join("missing/../secret.txt");
@@ -1399,7 +1525,7 @@ mod tests {
     async fn native_access_prompts_outside_boundary_with_sandbox_off() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         ctx.session.set_sandbox_enabled(false);
         let target = outside.path().join("secret.txt");
         std::fs::write(&target, "secret").unwrap();
@@ -1420,7 +1546,7 @@ mod tests {
     async fn native_access_granted_path_is_silent_with_sandbox_off() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         ctx.session.set_sandbox_enabled(false);
         let target = outside.path().join("notes.txt");
         std::fs::write(&target, "notes").unwrap();
@@ -1448,7 +1574,7 @@ mod tests {
     async fn native_access_unprovable_path_prompts_with_sandbox_off() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         ctx.session.set_sandbox_enabled(false);
         let broken = outside.path().join("broken-link");
         #[cfg(unix)]
@@ -1472,7 +1598,7 @@ mod tests {
     async fn native_access_behavior_unchanged_with_sandbox_on() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         assert!(ctx.session.sandbox_enabled());
 
         check_native_access(
@@ -1502,7 +1628,7 @@ mod tests {
         for sandbox_enabled in [true, false] {
             let tmp = tempfile::tempdir().unwrap();
             let outside = tempfile::tempdir().unwrap();
-            let mut ctx = sandboxed_ctx(tmp.path());
+            let (_env, mut ctx) = sandboxed_ctx(tmp.path()).await;
             ctx.session.set_sandbox_enabled(sandbox_enabled);
             ctx.approver = None;
             let target = outside.path().join("x.txt");
@@ -1522,29 +1648,18 @@ mod tests {
     async fn native_outside_granted_allows_and_persists() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         let target = outside.path().join("notes.txt");
 
         // Resolve the raised prompt with a Session-scope grant.
-        let db = ctx.session.db.clone();
-        let sid = ctx.session.id;
-        let hub = ctx.interrupts.clone();
-        let resolver = tokio::spawn(async move {
-            let iid = loop {
-                let open = db.list_open_interrupts(sid).await.unwrap();
-                if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
-                    break row.interrupt_id;
-                }
-                tokio::task::yield_now().await;
-            };
-            let response = ResolveResponse::Single {
+        let resolver = spawn_resolve_next_path_prompt(
+            &ctx,
+            ResolveResponse::Single {
                 selected_id: ID_APPROVE_SESSION.into(),
-            };
-            db.resolve_interrupt(iid, &response).await.unwrap();
-            assert!(hub.resolve(iid, response));
-        });
+            },
+        );
         // First access prompts → granted → allowed.
-        check_native_access(&ctx, &target, SandboxPathAccess::Read)
+        check_native_access_as_tool_effect(&ctx, &target, SandboxPathAccess::Read)
             .await
             .unwrap();
         resolver.await.unwrap();
@@ -1560,7 +1675,7 @@ mod tests {
     async fn native_read_grant_does_not_authorize_write_access() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         let target = outside.path().join("notes.txt");
         std::fs::write(&target, "notes").unwrap();
         let store = GrantStore::new(
@@ -1597,24 +1712,10 @@ mod tests {
     async fn native_outside_denied_refuses() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let ctx = sandboxed_ctx(tmp.path());
+        let (_env, ctx) = sandboxed_ctx(tmp.path()).await;
         let target = outside.path().join("secret.txt");
 
-        let db = ctx.session.db.clone();
-        let sid = ctx.session.id;
-        let hub = ctx.interrupts.clone();
-        let resolver = tokio::spawn(async move {
-            let iid = loop {
-                let open = db.list_open_interrupts(sid).await.unwrap();
-                if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
-                    break row.interrupt_id;
-                }
-                tokio::task::yield_now().await;
-            };
-            let response = ResolveResponse::Cancel;
-            db.resolve_interrupt(iid, &response).await.unwrap();
-            assert!(hub.resolve(iid, response));
-        });
+        let resolver = spawn_resolve_next_path_prompt(&ctx, ResolveResponse::Cancel);
         let err = check_native_access(&ctx, &target, SandboxPathAccess::Read)
             .await
             .unwrap_err();
@@ -1630,7 +1731,7 @@ mod tests {
     #[tokio::test]
     async fn native_no_approver_allows_proven_inside_but_fails_closed_outside() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut ctx = sandboxed_ctx(tmp.path());
+        let (_env, mut ctx) = sandboxed_ctx(tmp.path()).await;
         ctx.approver = None;
 
         check_native_access(
@@ -1656,7 +1757,7 @@ mod tests {
 
     /// Build a git worktree with a `.gitignore` ignoring `target/` + `.env`,
     /// plus a tracked source file, and a ctx rooted there.
-    fn gitignore_ctx(cwd: &std::path::Path) -> ToolCtx {
+    async fn gitignore_ctx(cwd: &std::path::Path) -> (crate::test_env::TestEnvGuard, ToolCtx) {
         std::fs::create_dir_all(cwd.join(".git")).unwrap();
         std::fs::write(cwd.join(".gitignore"), "target/\n.env\n").unwrap();
         std::fs::create_dir_all(cwd.join("target/debug")).unwrap();
@@ -1664,7 +1765,9 @@ mod tests {
         std::fs::write(cwd.join(".env"), "SECRET=x").unwrap();
         std::fs::create_dir_all(cwd.join("src")).unwrap();
         std::fs::write(cwd.join("src/main.rs"), "fn main() {}").unwrap();
-        sandboxed_ctx(cwd)
+        let (env, mut ctx) = sandboxed_ctx(cwd).await;
+        ctx.session.set_sandbox_enabled(false);
+        (env, ctx)
     }
 
     /// A non-gitignored path reads silently — the gate returns `None` with no
@@ -1672,7 +1775,7 @@ mod tests {
     #[tokio::test]
     async fn gitignore_gate_permits_tracked_file_silently() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gitignore_ctx(tmp.path());
+        let (_env, ctx) = gitignore_ctx(tmp.path()).await;
         let out = check_gitignore_read(&ctx, &tmp.path().join("src/main.rs"))
             .await
             .unwrap();
@@ -1683,7 +1786,7 @@ mod tests {
     #[tokio::test]
     async fn secret_path_gate_denies_non_gitignored_env_file_headless() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut ctx = gitignore_ctx(tmp.path());
+        let (_env, mut ctx) = gitignore_ctx(tmp.path()).await;
         ctx.approver = None;
         let path = tmp.path().join(".env.production");
         std::fs::write(&path, "TOKEN=long-secret-value").unwrap();
@@ -1698,7 +1801,7 @@ mod tests {
     #[tokio::test]
     async fn secret_path_gate_honors_explicit_session_allow() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut ctx = gitignore_ctx(tmp.path());
+        let (_env, mut ctx) = gitignore_ctx(tmp.path()).await;
         ctx.approver = None;
         let path = tmp.path().join(".env.production");
         std::fs::write(&path, "TOKEN=long-secret-value").unwrap();
@@ -1710,7 +1813,7 @@ mod tests {
     #[tokio::test]
     async fn gitignore_gate_permits_session_allowlisted() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gitignore_ctx(tmp.path());
+        let (_env, ctx) = gitignore_ctx(tmp.path()).await;
         ctx.session.add_gitignore_session_allow("target/");
         let out = check_gitignore_read(&ctx, &tmp.path().join("target/debug/app"))
             .await
@@ -1723,7 +1826,7 @@ mod tests {
     #[tokio::test]
     async fn gitignore_gate_headless_denies_with_refusal() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut ctx = gitignore_ctx(tmp.path());
+        let (_env, mut ctx) = gitignore_ctx(tmp.path()).await;
         ctx.approver = None;
         let out = check_gitignore_read(&ctx, &tmp.path().join(".env"))
             .await
@@ -1736,7 +1839,7 @@ mod tests {
     #[tokio::test]
     async fn gitignore_gate_uses_canonical_symlink_target() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut ctx = gitignore_ctx(tmp.path());
+        let (_env, mut ctx) = gitignore_ctx(tmp.path()).await;
         ctx.approver = None;
         let link = tmp.path().join("visible-env");
         symlink_file(&tmp.path().join(".env"), &link);
@@ -1752,7 +1855,7 @@ mod tests {
     #[tokio::test]
     async fn gitignore_gate_remembered_rejection_refuses_without_prompt() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gitignore_ctx(tmp.path());
+        let (_env, ctx) = gitignore_ctx(tmp.path()).await;
         let display = std::fs::canonicalize(tmp.path().join(".env"))
             .unwrap_or_else(|_| tmp.path().join(".env"))
             .display()
@@ -1774,45 +1877,43 @@ mod tests {
         use crate::approval::{ID_APPROVE_SESSION, ID_GITIGNORE_FILE};
         use crate::daemon::proto::ResolveResponse;
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gitignore_ctx(tmp.path());
+        let (_env, ctx) = gitignore_ctx(tmp.path()).await;
         let db = ctx.session.db.clone();
         let sid = ctx.session.id;
         let hub = ctx.interrupts.clone();
-        // Resolve stage 1 (file), then stage 2 (session). The detached hub
-        // doesn't clear the DB open-interrupt row, so wait for a *new* id at
-        // stage 2 (mirrors the compound-command approval test).
+        let mut raised = hub.subscribe_raised();
+        // Resolve stage 1 (file), then stage 2 (session) through the same
+        // durable decision settlement boundary as the daemon worker.
         let resolver = tokio::spawn(async move {
-            let iid1 = loop {
-                let open = db.list_open_interrupts(sid).await.unwrap();
-                if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
-                    break row.interrupt_id;
-                }
-                tokio::task::yield_now().await;
-            };
-            let response = ResolveResponse::Single {
-                selected_id: ID_GITIGNORE_FILE.into(),
-            };
-            db.resolve_interrupt(iid1, &response).await.unwrap();
-            assert!(hub.resolve(iid1, response));
-            let iid2 = loop {
-                let open = db.list_open_interrupts(sid).await.unwrap();
-                if let Some(row) = open
-                    .iter()
-                    .find(|r| r.interrupt_id != iid1 && hub.has_waiter(r.interrupt_id))
-                {
-                    break row.interrupt_id;
-                }
-                tokio::task::yield_now().await;
-            };
-            let response = ResolveResponse::Single {
-                selected_id: ID_APPROVE_SESSION.into(),
-            };
-            db.resolve_interrupt(iid2, &response).await.unwrap();
-            assert!(hub.resolve(iid2, response));
+            resolve_next_path_prompt(
+                db.clone(),
+                sid,
+                hub.clone(),
+                &mut raised,
+                ResolveResponse::Single {
+                    selected_id: ID_GITIGNORE_FILE.into(),
+                },
+            )
+            .await;
+            resolve_next_path_prompt(
+                db,
+                sid,
+                hub,
+                &mut raised,
+                ResolveResponse::Single {
+                    selected_id: ID_APPROVE_SESSION.into(),
+                },
+            )
+            .await;
         });
-        let out = check_gitignore_read(&ctx, &tmp.path().join(".env"))
-            .await
-            .unwrap();
+        let out = crate::engine::interrupt::with_host_approval_effect_scope(
+            "native_filesystem_access",
+            ctx.cancel.clone(),
+            check_gitignore_read(&ctx, &tmp.path().join(".env")),
+            |_| Some(true),
+        )
+        .await
+        .unwrap();
         resolver.await.unwrap();
         assert!(out.is_none(), "approved read proceeds");
         // The session allowlist now holds the `.env` file glob → silent reread.
@@ -1826,24 +1927,14 @@ mod tests {
     async fn gitignore_gate_preserves_noninteractive_run_denial_and_audit_source() {
         use crate::daemon::proto::ResolveResponse;
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gitignore_ctx(tmp.path());
-        let db = ctx.session.db.clone();
+        let (_env, ctx) = gitignore_ctx(tmp.path()).await;
         let sid = ctx.session.id;
-        let hub = ctx.interrupts.clone();
-        let resolver = tokio::spawn(async move {
-            let interrupt_id = loop {
-                let open = db.list_open_interrupts(sid).await.unwrap();
-                if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
-                    break row.interrupt_id;
-                }
-                tokio::task::yield_now().await;
-            };
-            let response = ResolveResponse::Freetext {
+        let resolver = spawn_resolve_next_path_prompt(
+            &ctx,
+            ResolveResponse::Freetext {
                 text: crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string(),
-            };
-            db.resolve_interrupt(interrupt_id, &response).await.unwrap();
-            assert!(hub.resolve(interrupt_id, response));
-        });
+            },
+        );
 
         let out = check_gitignore_read(&ctx, &tmp.path().join(".env"))
             .await

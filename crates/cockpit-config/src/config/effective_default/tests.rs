@@ -853,7 +853,7 @@ fn retained_config_only_recovery_matches_prepared_and_committed_journal_contract
 
         let recovery = recover_retained_effective_default_journal(&target)
             .expect("retained recovery converges the journal");
-        let (recovered, mut finalization, receipt_validation) = recovery.into_parts();
+        let (recovered, finalization, receipt_validation) = recovery.into_parts();
         assert!(receipt_validation.is_none());
         assert_eq!(recovered.len(), 1);
         match (&recovered[0].outcome, expect_target) {

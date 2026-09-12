@@ -274,6 +274,10 @@ pub(crate) struct TitleProgressSnapshot {
     /// provider request. A successful user-message retract must put it back
     /// so the resend produces the same request/cache prefix.
     last_time_prelude: Option<DateTime<Utc>>,
+    /// Exact prelude already owed by an earlier retract. Capturing it makes a
+    /// second cancel/resend cycle replay the same value again rather than
+    /// replacing it with the wall clock at the later attempt.
+    replay_time_prelude: Option<DateTime<Utc>>,
 }
 
 /// Work due for the cache-reusing, same-model metadata fork. The title slots
@@ -659,6 +663,11 @@ pub struct Session {
     /// memory only: the daemon re-evaluates the interval on every
     /// send, so re-attaching a resumed session naturally re-injects.
     pub last_time_prelude: Mutex<Option<DateTime<Utc>>>,
+    /// Exact timestamp consumed by a retracted request and owed to its resend.
+    /// This is kept separately from `last_time_prelude`: the latter must be
+    /// rolled back for cadence accounting, while this value preserves the
+    /// provider request/cache prefix byte-for-byte.
+    replay_time_prelude: Mutex<Option<DateTime<Utc>>>,
     /// Running token estimate of RAW typed user-authored content
     /// (pre-skill-injection) this session. Bumped by
     /// [`Self::note_user_content`] and retained for stats/compatibility.
@@ -2615,6 +2624,25 @@ pub(crate) fn workspace_scratch_path_for_session(
         .join(session_id.to_string()))
 }
 
+#[cfg(any(test, feature = "test-support"))]
+fn test_session_scratch_root() -> PathBuf {
+    std::env::temp_dir().join("cockpit-test-session-workspace-scratch")
+}
+
+/// Durable scratch for synthetic test-support sessions. These paths live under
+/// a process-local temp namespace so they never publish production workspace
+/// markers or touch the developer `cockpit_state_dir`.
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn test_support_workspace_scratch_path_for_session(
+    project_id: &str,
+    session_id: Uuid,
+) -> Result<PathBuf> {
+    Ok(test_session_scratch_root()
+        .join(project_id)
+        .join("sessions")
+        .join(session_id.to_string()))
+}
+
 /// Isolate direct, pre-identity test fixtures from the production workspace
 /// namespace.  These rows deliberately retain their short labels in the
 /// ledger, so using the label as a directory component would bypass the
@@ -2627,11 +2655,28 @@ pub(super) fn test_fixture_workspace_scratch_path_for_session(
     let directory_id = project_id_from_workspace_object(&format!(
         "cockpit-legacy-test-fixture-workspace-v1\\0{fixture_project_id}"
     ));
-    Ok(cockpit_config::config::resolve::cockpit_state_dir()?
-        .join("test-workspaces")
-        .join(directory_id)
-        .join("sessions")
-        .join(session_id.to_string()))
+    test_support_workspace_scratch_path_for_session(&directory_id, session_id)
+}
+
+/// Resolve a persisted row's durable scratch directory for row-only readers
+/// (export, tandem tool-call validation). Production rows carry fixed-length
+/// workspace-object digests and take the production path; under test builds
+/// the same short fixture labels session construction recognizes keep their
+/// isolated fixture scratch namespace instead of failing project-id
+/// validation.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn workspace_scratch_path_for_session_allowing_test_fixture(
+    project_id: &str,
+    session_id: Uuid,
+) -> Result<PathBuf> {
+    if project_id.len() <= 24
+        && project_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return test_fixture_workspace_scratch_path_for_session(project_id, session_id);
+    }
+    workspace_scratch_path_for_session(project_id, session_id)
 }
 
 const TITLE_SCHEDULE_SLOTS: [u8; 5] = [1, 2, 4, 8, 16];
@@ -4543,7 +4588,10 @@ mod tests {
                 r#"{"tools":["read","bash"],"toolTiers":{}}"#.to_string(),
             ))
             .expect_err("missing durable row must reject the replacement");
-        assert!(error.to_string().contains("not found"), "{error:#}");
+        // The rejection travels as the cause under the generic persistence
+        // context, so assert against the full chain rather than the
+        // top-level message.
+        assert!(format!("{error:#}").contains("not found"), "{error:#}");
         assert_eq!(
             session.tool_surface_override_json().as_deref(),
             Some(original),

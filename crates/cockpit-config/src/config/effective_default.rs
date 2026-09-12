@@ -2696,37 +2696,6 @@ pub fn journal_diagnostics(cwd: &Path) -> Vec<JournalDiagnostic> {
     out
 }
 
-impl ConfigDoc {
-    /// Like [`Self::load_effective`] but skips journal *recovery* — used
-    /// inside the mutation lock and by recovery itself so neither recurses.
-    ///
-    /// Masking still applies: a pending session-bearing or correlated
-    /// transaction on any layer (including a lower-precedence one) must not
-    /// leak its half-committed value into a resolution.
-    pub(crate) fn load_effective_without_recovery(cwd: &Path) -> ProvidersConfig {
-        Self::load_effective_masked_except(cwd, None)
-    }
-
-    /// Masked resolution that deliberately does **not** mask `owned`.
-    ///
-    /// The layer an in-flight transaction is writing has its own journal on
-    /// disk; masking it would serve the prior bytes and make the transaction's
-    /// own reload verification fail against itself.
-    pub(crate) fn load_effective_masked_except(
-        cwd: &Path,
-        owned: Option<&Path>,
-    ) -> ProvidersConfig {
-        let paths = config_file_paths_for_load(cwd);
-        let mut masks = masked_layer_bytes(&paths);
-        if let Some(owned) = owned {
-            let owned = canonical_config_path(owned);
-            masks.retain(|path, _| canonical_config_path(path) != owned);
-        }
-        Self::providers_from_paths_with_masks(&paths, &masks)
-            .with_resolution_generation(crate::config::providers::next_load_effective_generation())
-    }
-}
-
 // ---- Mutation --------------------------------------------------------------
 
 /// Mutate a config-only default through an attach-time retained directory.

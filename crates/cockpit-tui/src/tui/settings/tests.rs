@@ -87,7 +87,7 @@ fn queued_secret_payloads_have_redacted_debug_and_single_owners() {
 
     let settings = include_str!("mod.rs");
     let mcp = include_str!("mcp_page.rs");
-    assert!(settings.contains("Vec<Option<zeroize::Zeroizing<String>>>"));
+    assert!(settings.contains("ProviderSecretValue"));
     assert!(mcp.contains("SecretPayload::new(secret_values_json)"));
 }
 
@@ -885,10 +885,11 @@ fn save_extended_repairs_private_config_permissions() {
 
     let tmp = TempDir::new().unwrap();
     let _env = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-    let config_dir = tmp.path().join("config/cockpit");
+    let config_dir = tmp.path().join("home/.config/cockpit");
     std::fs::create_dir_all(&config_dir).unwrap();
     let config_path = config_dir.join("config.json");
     std::fs::write(&config_path, "{}").unwrap();
+    disk_daemon_fake::register_settings_layer_target(&config_path);
     let mut d = SettingsDialog::open(config_path);
     d.settle_test_effects();
     std::fs::set_permissions(&d.extended_path, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -1256,14 +1257,17 @@ pub(super) fn settings_mouse(kind: MouseEventKind, column: u16, row: u16) -> Mou
 /// 69 rows. Counting the section headers, web/user/MCP rows, the reset row and
 /// the bottom detail controls, the tallest fixture (a user tool selected, so
 /// the contextual `[Enable/disable]`/`[Delete]` pair sits last) is ~93 rows
-/// with its deepest control at row index ~90. The settings dialog gives the
-/// page a list body of `render_height - 4` rows (2 block borders + a header
-/// row + a footer row), so any height short of ~95 scrolls those bottom
-/// detail controls off-screen and `render_control_lines` never registers them
-/// — which is exactly why 90 (body 86) still failed the exhaustiveness
-/// assertions. Render these fixtures tall enough that every page fits on
-/// screen (offset stays 0) and every control target is registered.
-const POINTER_TOOLS_FIXTURE_HEIGHT: u16 = 120;
+/// with its deepest control at row index ~90. Wave-7 sealed-value inventory
+/// growth pushed the built-in section to ~58 rows (57 tools with several
+/// long summaries wrapping at the ~78-column value width), so the tallest
+/// user-tool fixture now lands around row ~102 with contextual
+/// `[Enable/disable]` / `[Delete]` controls a few lines below. The settings
+/// dialog gives the page a list body of `render_height - 4` rows (2 block
+/// borders + a header row + a footer row), so any height short of ~106
+/// scrolls those bottom detail controls off-screen and `render_control_lines`
+/// never registers them. Render these fixtures tall enough that every page
+/// fits on screen (offset stays 0) and every control target is registered.
+const POINTER_TOOLS_FIXTURE_HEIGHT: u16 = 150;
 
 /// Real rendered/reducer regressions reused by the named pointer acceptance
 /// suites. Keeping these here lets them share the same concrete page fixtures
@@ -8443,6 +8447,11 @@ fn scoped_create_scaffold_failure_still_returns_to_picker_with_path_status() {
     let existing = tmp.path().join(".cockpit");
     std::fs::create_dir_all(&existing).unwrap();
     std::fs::write(existing.join("config.json"), "{}").unwrap();
+    let policy = cockpit_config::trust::WorkspaceTrustPolicy {
+        root: cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap(),
+        mode: cockpit_config::WorkspaceTrustMode::Trust,
+    };
+    let _trust = cockpit_config::trust::enter_workspace_trust_policy(policy);
     let blocked = tmp.path().join("not-a-dir");
     std::fs::write(&blocked, "file blocks directory creation").unwrap();
     let mut d = Dialog::CreateScopedConfig {

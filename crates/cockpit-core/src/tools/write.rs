@@ -38,7 +38,7 @@ impl Tool for WriteTool {
     }
 
     fn description(&self) -> &str {
-        "Write `content` as the file's COMPLETE new contents (omitted lines are deleted); `cockpit://session/<short_id>/plan` is the sole writable recall pseudofile; locking is automatic for host files"
+        "Write `content` as the file's COMPLETE new contents after `read`; omitted lines are deleted; prefer `edit` for partial changes; `cockpit://session/<short_id>/plan` is the sole writable recall pseudofile; locking is automatic for host files"
     }
 
     fn verbose_description(&self) -> Option<String> {
@@ -270,7 +270,7 @@ impl Tool for WriteTool {
             )
         } else {
             let (outcome, created_directories) =
-                create_new_and_release(&path, normalized.as_bytes(), write_guard).await?;
+                create_new_and_release(ctx, &path, normalized.as_bytes(), write_guard).await?;
             (outcome, created_directories, None)
         };
         crate::assistants::identity::record_identity_write(ctx, &path).await?;
@@ -468,6 +468,11 @@ pub(crate) fn enforce_requested_write_scope(
 /// umask-derived; applied through the held staged-directory inode.
 #[cfg(unix)]
 const CREATED_DIR_MODE: libc::mode_t = 0o755;
+/// Explicit final mode for a newly created regular file. Creation must not
+/// depend on the process umask: a restrictive umask (e.g. `0o700`) would
+/// otherwise strip the owner's read bit from the `0o666` creation mode and
+/// block reading a file this tool just created.
+const CREATED_FILE_MODE: libc::mode_t = 0o644;
 #[cfg(unix)]
 const CREATED_DIR_INITIAL_MODE: libc::mode_t = 0o700;
 
@@ -687,6 +692,7 @@ impl ParentPrep {
 }
 
 async fn create_new_and_release(
+    ctx: &ToolCtx,
     path: &std::path::Path,
     bytes: &[u8],
     guard: crate::locks::WriteGuard<'_>,
@@ -722,6 +728,15 @@ async fn create_new_and_release(
         return Err(error);
     }
     let persist_ok = guard.release_after_write().await;
+    // Record the authored bytes, NOT a §3c read record: creation is not a
+    // read, `has_read` stays false, and a later blind `write` still requires
+    // an explicit `read` (new-file creation never grants future blind
+    // overwrites). Only the anchored `edit` gate accepts authored content as
+    // freshness evidence, because its `old_string` must match these exact
+    // bytes.
+    ctx.locks
+        .note_authored(path, &ctx.lock_identity, ctx.session.id)
+        .await;
     Ok((
         crate::tools::common::WriteReleaseOutcome { persist_ok },
         prep.disclosure,
@@ -916,16 +931,12 @@ fn create_parent_components(
         match component {
             std::path::Component::Normal(name) => {
                 built.push(name);
-                let (next, binding) = open_or_create_directory_child(
-                    &current, name, &built, created,
-                )
-                .with_context(|| {
-                    format!(
-                        "create parent directories for `{}` under `{}`",
-                        path.display(),
-                        parent.display()
-                    )
-                })?;
+                // Refusal-class errors (symlink/`not a directory`/identity
+                // changes) must stay the top-level message: callers and tests
+                // match on those exact texts, so no generic context may wrap
+                // them. The per-step errors already name the component path.
+                let (next, binding) =
+                    open_or_create_directory_child(&current, name, &built, created)?;
                 bindings.push(binding);
                 current = next;
             }
@@ -1200,6 +1211,9 @@ fn create_new_file(
         libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         0o666,
     )?;
+    // Pin the explicit final mode through the held descriptor so a
+    // restrictive umask cannot silently strip the owner's read bit.
+    cockpit_host::private_fs::held_fd::fchmod(file.as_raw_fd(), CREATED_FILE_MODE)?;
     let metadata = file.metadata()?;
     let identity = CreatedFileIdentity {
         device: metadata.dev(),
@@ -2996,7 +3010,7 @@ mod tests {
             std::io::ErrorKind::PermissionDenied,
             "forced create failure",
         ));
-        let err = create_new_and_release(&path, b"new\n", guard)
+        let err = create_new_and_release(&ctx, &path, b"new\n", guard)
             .await
             .unwrap_err();
 
@@ -3036,7 +3050,7 @@ mod tests {
             std::io::ErrorKind::PermissionDenied,
             "forced create failure",
         ));
-        let _ = create_new_and_release(&path, b"new\n", guard)
+        let _ = create_new_and_release(&ctx, &path, b"new\n", guard)
             .await
             .unwrap_err();
 
@@ -3434,7 +3448,7 @@ mod tests {
 
         let raced = path.clone();
         set_before_file_create_hook(move || std::fs::write(raced, "raced\n").unwrap());
-        let err = create_new_and_release(&path, b"new\n", guard)
+        let err = create_new_and_release(&ctx, &path, b"new\n", guard)
             .await
             .unwrap_err();
 
@@ -3833,6 +3847,12 @@ pub(crate) async fn authorize_existing_write(
     previous: &[u8],
     next: &[u8],
 ) -> Result<()> {
+    if matches!(
+        ctx.session.approval_mode(),
+        crate::config::extended::ApprovalMode::Yolo | crate::config::extended::ApprovalMode::Auto
+    ) {
+        return Ok(());
+    }
     let decision = if let Some(approver) = ctx.approver.as_ref() {
         approver
             .authorize(crate::approval::AuthorizationRequest::FileWrite {

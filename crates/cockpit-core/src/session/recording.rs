@@ -559,9 +559,20 @@ impl Session {
         let provider = self.active_provider().unwrap_or_default();
         let model = self.active_model().unwrap_or_default();
         let project_root = self.project_root.to_string_lossy().into_owned();
+        // Parked work follows the live compaction window for its continuation
+        // state, but the replayed host effect belongs to the stable logical
+        // session exposed to attach/export/invocation clients. Keep its audit
+        // on that owner so a compaction successor cannot make a completed
+        // effect disappear from the owning session's ledger.
+        let audit_session_id =
+            if crate::engine::interrupt::current_interrupt_park_payload().is_some() {
+                self.id
+            } else {
+                self.live_id()
+            };
         ToolCallEvent {
             event_id: row.event_id,
-            session_id: self.live_id(),
+            session_id: audit_session_id,
             call_id: row.call_id,
             parent_call_id: row.parent_call_id,
             parent_child_index: row.parent_child_index,

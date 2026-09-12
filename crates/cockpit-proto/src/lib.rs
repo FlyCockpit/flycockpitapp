@@ -7191,8 +7191,15 @@ mod tests {
 
     #[tokio::test]
     async fn v10_only_request_is_not_sent_to_v9_daemon() {
-        let (a, _b) = duplex(4096);
-        let mut v9 = ProtoStream::with_version(a, 9);
+        // Fold-time schema (review-loop(#308) cycle 2) removed the prerelease
+        // per-payload send gates: the sender stamps its negotiated version
+        // and never rejects a payload by kind. The protection is the
+        // receiver's exact-version check: a v9-labeled frame is classified
+        // as a version mismatch and the payload never executes on a v9
+        // connection.
+        let (a, b) = duplex(4096);
+        let mut v9_sender = ProtoStream::with_version(a, 9);
+        let mut v9_receiver = ProtoStream::with_version(b, 9);
         let request = Envelope::request(
             Uuid::new_v4(),
             Request::ListSecretInventory {
@@ -7200,18 +7207,28 @@ mod tests {
                 limit: Some(32),
             },
         );
-        let error = v9
+        v9_sender
             .send(&request)
             .await
-            .expect_err("v10-only payload must be gated on a v9 connection");
-        assert!(error.to_string().contains("requires v10"));
-        assert!(error.to_string().contains("daemon restart"));
+            .expect("sender stamps the negotiated version without a payload gate");
+        match v9_receiver.recv().await.unwrap().expect("frame") {
+            RecvFrame::VersionMismatch { v, kind, id } => {
+                assert_eq!(v, 9);
+                assert_eq!(kind, "req");
+                assert!(id.is_some());
+            }
+            other => panic!("expected version mismatch, got {other:?}"),
+        }
     }
 
     #[tokio::test]
     async fn v17_provider_credential_receipt_is_not_sent_to_v9_daemon() {
-        let (a, _b) = duplex(4096);
-        let mut v9 = ProtoStream::with_version(a, 9);
+        // Same fold-time contract as the v10 request gate above: the sender
+        // stamps the negotiated version; the receiver's exact-version check
+        // keeps the credential receipt off every v9 connection.
+        let (a, b) = duplex(4096);
+        let mut v9_sender = ProtoStream::with_version(a, 9);
+        let mut v9_receiver = ProtoStream::with_version(b, 9);
         let response = Envelope::response(
             Uuid::new_v4(),
             Response::ProviderCredentialCommitted {
@@ -7228,12 +7245,18 @@ mod tests {
                 config_generation: 7,
             },
         );
-        let error = v9
+        v9_sender
             .send(&response)
             .await
-            .expect_err("v17 response must be gated on a v9 connection");
-        assert!(error.to_string().contains("provider_credential_committed"));
-        assert!(error.to_string().contains("requires v17"));
+            .expect("sender stamps the negotiated version without a payload gate");
+        match v9_receiver.recv().await.unwrap().expect("frame") {
+            RecvFrame::VersionMismatch { v, kind, id } => {
+                assert_eq!(v, 9);
+                assert_eq!(kind, "res");
+                assert!(id.is_some());
+            }
+            other => panic!("expected version mismatch, got {other:?}"),
+        }
     }
 
     #[tokio::test]

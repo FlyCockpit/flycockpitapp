@@ -90,15 +90,15 @@ pub struct PublicCli {
     pub command: Option<PublicCommand>,
 }
 
-/// The public command surface.
-///
-/// Every command implemented in the default (local, featureless) build is
-/// public here: the binary parses only this shape, so a variant that exists
-/// only on [`Command`] is unreachable from the command line. Commands that
-/// require an opt-in Cargo feature (`remote`, `extended`) are mirrored under
-/// the same `#[cfg]` gate so each build profile exposes exactly the commands
-/// it compiles. The hidden `login`/`logout`/`whoami` stubs are the one
-/// exception: they parse only to print the split-command pointer.
+// The public command surface.
+//
+// Every command implemented in the default (local, featureless) build is
+// public here: the binary parses only this shape, so a variant that exists
+// only on [`Command`] is unreachable from the command line. Commands that
+// require an opt-in Cargo feature (`remote`, `extended`) are mirrored under
+// the same `#[cfg]` gate so each build profile exposes exactly the commands
+// it compiles. The hidden `login`/`logout`/`whoami` stubs are the one
+// exception: they parse only to print the split-command pointer.
 #[derive(Debug, Subcommand)]
 pub enum PublicCommand {
     /// Run the local Agent Client Protocol stdio server.

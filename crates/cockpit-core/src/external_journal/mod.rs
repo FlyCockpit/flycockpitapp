@@ -42,6 +42,7 @@ use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
 
+use crate::sync::lock_or_recover;
 use cockpit_db::Db;
 use cockpit_db::external_journal::{
     CapsuleAdmission, CapsulePartition, EXTERNAL_JOURNAL_ADMISSION_BYTES,
@@ -200,6 +201,39 @@ pub struct UnresolvedFact {
     pub observed_at_wall_ms: i64,
 }
 
+/// Process/facade-local acknowledgement of one successful dispatch ticket.
+///
+/// This is an observation receipt for callers sharing this [`ExternalJournal`]
+/// instance. It is not stored in SQLite, does not survive a restart, and does
+/// not claim a database-global ordering. Durable recovery remains keyed by the
+/// operation id and journal version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchCommit {
+    operation_id: Uuid,
+    journal_version: i64,
+    state: ExternalJournalState,
+    sequence: u64,
+}
+
+impl DispatchCommit {
+    pub fn operation_id(&self) -> Uuid {
+        self.operation_id
+    }
+
+    pub fn journal_version(&self) -> i64 {
+        self.journal_version
+    }
+
+    pub fn state(&self) -> ExternalJournalState {
+        self.state
+    }
+
+    /// Monotonic acknowledged-ticket sequence within this journal facade.
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
 /// Proof that pre-dispatch provisioning completed. Holding one is the only
 /// legitimate way to reach a provider.
 #[derive(Debug, Clone)]
@@ -218,6 +252,7 @@ pub struct DispatchTicket {
     /// Version SQLite is known to hold. Lower than `version` exactly while a
     /// spool fallback is waiting to be imported.
     committed_version: i64,
+    dispatch_commit: DispatchCommit,
     projection: Vec<u8>,
 }
 
@@ -256,6 +291,11 @@ impl DispatchTicket {
     /// The state the last written slot asserts.
     pub fn state(&self) -> ExternalJournalState {
         self.state
+    }
+
+    /// Receipt for the durable dispatch commit acknowledged by this ticket.
+    pub fn dispatch_commit(&self) -> &DispatchCommit {
+        &self.dispatch_commit
     }
 
     /// Note a cancellation that was committed through the separate
@@ -423,6 +463,12 @@ pub struct ExternalJournal {
     integrity: Arc<Mutex<Option<String>>>,
     unresolved_facts: Arc<Mutex<Vec<UnresolvedFact>>>,
     db_faults: Arc<Mutex<DbFaults>>,
+    /// Process/facade-local observation of acknowledged dispatch tickets. The
+    /// database remains authoritative across restarts; this retained watch is
+    /// only an in-process view of the same receipt carried by the successful
+    /// ticket.
+    dispatch_commits: tokio::sync::watch::Sender<Option<DispatchCommit>>,
+    dispatch_commit_sequence: Mutex<u64>,
     #[cfg(test)]
     fail_remote_rename_cleanup_sync: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -487,6 +533,43 @@ impl ExternalJournal {
         };
         *self.dispatch_gate.lock().unwrap() = Some(gate.clone());
         gate
+    }
+
+    /// Observe acknowledged dispatch tickets in this journal facade.
+    ///
+    /// The retained receipt and its monotonic sequence are process-local. A
+    /// receipt is published only when the same call returns `Ok(DispatchTicket)`;
+    /// recovery and cross-restart ordering remain database-driven.
+    pub fn subscribe_dispatch_commits(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<DispatchCommit>> {
+        self.dispatch_commits.subscribe()
+    }
+
+    fn acknowledge_dispatch_ticket(
+        &self,
+        operation_id: Uuid,
+        journal_version: i64,
+        state: ExternalJournalState,
+        build_ticket: impl FnOnce(DispatchCommit) -> DispatchTicket,
+    ) -> DispatchTicket {
+        let mut sequence = lock_or_recover(&self.dispatch_commit_sequence);
+        // Saturation preserves monotonicity without introducing a post-commit
+        // panic. Reaching u64::MAX would require acknowledging tickets for
+        // centuries at hardware-limited dispatch rates.
+        *sequence = sequence.saturating_add(1);
+        let receipt = DispatchCommit {
+            operation_id,
+            journal_version,
+            state,
+            sequence: *sequence,
+        };
+        // Finish constructing the ticket before publication. In particular,
+        // allocation of its owned projection cannot leave a retained receipt
+        // for a call that never returned the corresponding ticket.
+        let ticket = build_ticket(receipt.clone());
+        self.dispatch_commits.send_replace(Some(receipt));
+        ticket
     }
     /// Open the owner-private namespace used by remote operation recovery.
     /// Callers receive a held no-follow directory authority, never its path.
@@ -641,6 +724,7 @@ impl ExternalJournal {
     }
 
     pub fn new(db: Db, spool: Spool, keys: SpoolKeyRing) -> Self {
+        let (dispatch_commits, _) = tokio::sync::watch::channel(None);
         Self {
             db,
             spool,
@@ -648,6 +732,8 @@ impl ExternalJournal {
             integrity: Arc::new(Mutex::new(None)),
             unresolved_facts: Arc::new(Mutex::new(Vec::new())),
             db_faults: Arc::new(Mutex::new(DbFaults::default())),
+            dispatch_commits,
+            dispatch_commit_sequence: Mutex::new(0),
             #[cfg(test)]
             fail_remote_rename_cleanup_sync: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -1091,16 +1177,22 @@ impl ExternalJournal {
             let _ = self.spool.remove_capsule(prepared.capsule_uuid);
             return Err(error);
         }
-        Ok(DispatchTicket {
-            operation_id: committed.operation_id,
-            capsule_uuid: prepared.capsule_uuid,
-            version: committed.version,
-            state: committed.state,
-            cancellation_requested: false,
-            active_slot: 1,
-            committed_version: committed.version,
-            projection: prepared.encoded,
-        })
+        Ok(self.acknowledge_dispatch_ticket(
+            committed.operation_id,
+            committed.version,
+            committed.state,
+            |dispatch_commit| DispatchTicket {
+                operation_id: committed.operation_id,
+                capsule_uuid: prepared.capsule_uuid,
+                version: committed.version,
+                state: committed.state,
+                cancellation_requested: false,
+                active_slot: 1,
+                committed_version: committed.version,
+                dispatch_commit,
+                projection: prepared.encoded,
+            },
+        ))
     }
 
     pub(crate) fn discard_preprovisioned(&self, prepared: &PreprovisionedDispatch) {
@@ -1276,16 +1368,22 @@ impl ExternalJournal {
             ));
         }
 
-        Ok(DispatchTicket {
-            operation_id: record.operation_id,
-            capsule_uuid,
-            version: committed.version,
-            state: ExternalJournalState::Dispatching,
-            cancellation_requested: false,
-            active_slot: 1,
-            committed_version: committed.version,
-            projection: encoded.to_vec(),
-        })
+        Ok(self.acknowledge_dispatch_ticket(
+            committed.operation_id,
+            committed.version,
+            committed.state,
+            |dispatch_commit| DispatchTicket {
+                operation_id: record.operation_id,
+                capsule_uuid,
+                version: committed.version,
+                state: ExternalJournalState::Dispatching,
+                cancellation_requested: false,
+                active_slot: 1,
+                committed_version: committed.version,
+                dispatch_commit,
+                projection: encoded.to_vec(),
+            },
+        ))
     }
 
     fn slot(

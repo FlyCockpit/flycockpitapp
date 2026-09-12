@@ -306,7 +306,7 @@ mod tests {
     fn effective_default_line_names_the_reference_and_scope_without_a_path() {
         let tmp = tempfile::tempdir().unwrap();
         let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-        let user = tmp.path().join("config/cockpit");
+        let user = tmp.path().join("home/.config/cockpit");
         std::fs::create_dir_all(&user).unwrap();
         std::fs::write(user.join("config.json"), "{}").unwrap();
         let _ = &env;

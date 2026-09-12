@@ -83,6 +83,12 @@ impl Db {
     pub async fn load_installation_identity(&self) -> Result<Option<InstallationIdentity>> {
         self.read(load_installation_identity_conn).await
     }
+
+    /// Synchronous boot-only projection through the file-backed read pool.
+    /// Unlike the create path this never queues work on the writer executor.
+    pub fn load_installation_identity_for_sync_boot(&self) -> Result<Option<InstallationIdentity>> {
+        self.read_blocking_unguarded(load_installation_identity_conn)
+    }
 }
 
 /// Create-or-load the singleton on a writer connection (transactional).

@@ -1184,7 +1184,9 @@ fn apply_provider_mutation(
     };
     if !capability.target.exists() {
         if let Some(parent) = capability.target.parent() {
-            std::fs::create_dir_all(parent)
+            // Same funnel the daemon uses: a side-effect mkdir must never
+            // materialize the missing global config layer.
+            cockpit_config::dirs::create_dir_all_except_missing_global(parent)
                 .map_err(|error| format!("creating {}: {error}", parent.display()))?;
         }
         cockpit_config::config::write_config_bytes_atomic(&capability.target, b"{}")
@@ -1845,7 +1847,9 @@ fn write_agent_definition(target: &Path, markdown: &str) -> Result<(), String> {
     let parent = target
         .parent()
         .ok_or_else(|| "agent path has no parent".to_string())?;
-    std::fs::create_dir_all(parent)
+    // Same funnel the daemon uses: a side-effect mkdir must never
+    // materialize the missing global config layer.
+    cockpit_config::dirs::create_dir_all_except_missing_global(parent)
         .map_err(|error| format!("creating {}: {error}", parent.display()))?;
     cockpit_config::config::write_config_bytes_atomic(target, markdown.as_bytes())
         .map_err(|error| format!("writing {}: {error}", target.display()))

@@ -3181,7 +3181,23 @@ mod tests {
                     prompt: "start",
                     help: "",
                     help_hook: None,
-                    kind: StepKind::Select { options: vec![] },
+                    // Select answers are validated against the declared
+                    // options, so the fixture lists the choices its tests
+                    // submit.
+                    kind: StepKind::Select {
+                        options: vec![
+                            SelectOption {
+                                id: "fast".into(),
+                                label: "Fast".into(),
+                                description: "Fast path".into(),
+                            },
+                            SelectOption {
+                                id: "slow".into(),
+                                label: "Slow".into(),
+                                description: "Slow path".into(),
+                            },
+                        ],
+                    },
                     default_answer: None,
                     prefill: None,
                     validate: None,
@@ -3447,13 +3463,19 @@ mod tests {
             .find(|option| option.id == "grok-oauth")
             .expect("disabled Grok entry remains visible");
         assert!(grok.label.contains("disabled pending xAI authorization"));
-        assert!(grok.description.contains("auth_command"));
+        assert!(
+            grok.description
+                .contains("Grok subscriptions are not yet officially supported")
+        );
 
         let mut run = WizardRun::new(descriptor).unwrap();
         let error = run
             .submit(WizardAnswer::Select("grok-oauth".to_string()))
             .unwrap_err();
-        assert!(error.contains("disabled pending xAI authorization"));
+        assert!(
+            error.contains("Grok subscriptions are not yet officially supported"),
+            "{error}"
+        );
     }
 
     fn custom_provider_entry_for_wire(wire: &str) -> crate::config::providers::ProviderEntry {

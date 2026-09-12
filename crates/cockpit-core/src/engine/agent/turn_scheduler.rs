@@ -436,13 +436,9 @@ fn classify_delegate_call(delegate_args: &Value, force_noninteractive: bool) -> 
     // write-capable surface drains earlier lane members and runs exclusively
     // there; classifying it here would skip that attempt-time pin/rebind.
 
-    // Determine interactivity from the parsed args. A resume_handle always
-    // makes a delegate noninteractive. An explicit mode override wins;
-    // otherwise the agent's default applies.
-    let mode = delegate_args
-        .get("mode")
-        .and_then(Value::as_str)
-        .map(str::trim);
+    // Use the same precedence resolver as dispatch: resume_handle, explicit
+    // mode, the vNext forced-noninteractive default, then the agent default.
+    let mode = delegate_args.get("mode").and_then(Value::as_str);
     let has_resume_handle = delegate_args
         .get("resume_handle")
         .and_then(Value::as_str)
@@ -450,15 +446,8 @@ fn classify_delegate_call(delegate_args: &Value, force_noninteractive: bool) -> 
         .filter(|s| !s.is_empty())
         .is_some();
 
-    let interactive = if force_noninteractive || has_resume_handle {
-        false // follow-up is always noninteractive
-    } else {
-        match mode {
-            Some("subagent_interactive") => true,
-            Some("subagent") => false,
-            _ => !crate::engine::builtin::is_noninteractive(child_agent),
-        }
-    };
+    let interactive =
+        !super::resolve_interactivity(mode, child_agent, has_resume_handle, force_noninteractive);
 
     if interactive {
         return CallClassification::SerialBarrier {
@@ -723,6 +712,50 @@ mod tests {
         // explore with write_scope remains a candidate. The mixed lane binds
         // write_authority from the live surface at attempt start.
         assert!(plan.calls[1].is_delegate_candidate());
+    }
+
+    #[test]
+    fn padded_explicit_modes_match_dispatch_precedence_in_canonical_envelopes() {
+        let toolbox = ToolBox::new();
+        let calls = vec![
+            tool_call(
+                "task",
+                serde_json::json!({
+                    "intent": "delegate",
+                    "payload": {
+                        "agent": "builder",
+                        "prompt": "handoff",
+                        "mode": "  subagent_interactive  "
+                    }
+                }),
+            ),
+            tool_call(
+                "task",
+                serde_json::json!({
+                    "intent": "delegate",
+                    "payload": {
+                        "agent": "builder",
+                        "prompt": "work synchronously",
+                        "mode": "  subagent  "
+                    }
+                }),
+            ),
+        ];
+        let names = resolved_names(&calls);
+        let plan = build_plan_with_delegate_context(&calls, &names, &toolbox, 4, true);
+
+        assert_eq!(
+            plan.calls[0].classification,
+            CallClassification::SerialBarrier {
+                reason: SerialBarrierReason::InteractiveDelegate,
+            },
+            "vNext changes only the default; an explicit interactive mode must match dispatch"
+        );
+        assert_eq!(
+            plan.calls[1].classification,
+            CallClassification::DelegateCandidate,
+            "a padded explicit subagent mode must match noninteractive dispatch"
+        );
     }
 
     /// AC3 (plan-level): `plan_keeps_batch_and_distinct_delegates_separate` —
@@ -997,7 +1030,7 @@ mod tests {
         );
         assert!(
             driver.contains(
-                "if !waiting_for_keep_parked_siblings {\n                self.maybe_shadow_brief(tx).await;\n                self.maybe_auto_compact(tx).await;\n                self.maybe_schedule_keep_warm().await;\n            }"
+                "if !waiting_for_keep_parked_siblings && settled_user_turn {\n                self.maybe_shadow_brief(tx).await;\n                self.maybe_auto_compact(tx).await;\n                self.maybe_schedule_keep_warm().await;\n            }"
             ),
             "post-select idle tail must not run shadow-brief/auto-compact/keep-warm while persist-on-re-entry owns keep-parked siblings"
         );

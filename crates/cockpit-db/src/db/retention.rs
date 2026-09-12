@@ -33,7 +33,8 @@ pub struct RetentionConfig {
     pub vacuum_interval_days: u32,
     /// Number of most-recent compaction windows in a lineage whose
     /// transcripts stay verbatim. Older windows past the transcript
-    /// horizon may be rolled up. Zero means keep every window verbatim.
+    /// horizon may be rolled up. Zero disables the verbatim guard so
+    /// only the transcript horizon applies.
     #[serde(default = "default_compaction_lineage_keep_windows")]
     pub compaction_lineage_keep_windows: u32,
 }
@@ -1454,7 +1455,12 @@ mod tests {
 
         let outcome = db.run_retention_pass(&cfg, 100_000).await.unwrap();
 
-        assert_eq!(outcome.payload_rows_deleted, 4);
+        // The default lineage policy (compaction_lineage_keep_windows = 3)
+        // keeps the newest window of every lineage verbatim, so this lone
+        // closed session's session_events row is held while the raw wire and
+        // terminal evidence windows still sweep their three rows.
+        assert_eq!(outcome.payload_rows_deleted, 3);
+        assert_eq!(payload_count(&db, "session_events", s.session_id).await, 1);
         assert_eq!(outcome.sessions_expired, 0);
         assert!(!outcome.vacuumed);
     }
@@ -1524,7 +1530,11 @@ mod tests {
         let first = db.run_retention_pass(&cfg, 100_000).await.unwrap();
         let second = db.run_retention_pass(&cfg, 100_000).await.unwrap();
 
-        assert_eq!(first.payload_rows_deleted, 4);
+        // Same lineage hold as the async pass test: the lone closed session is
+        // the newest verbatim window, so only the raw wire and terminal
+        // evidence rows (3) go on the first pass, and the held transcript row
+        // keeps the second pass at zero.
+        assert_eq!(first.payload_rows_deleted, 3);
         assert_eq!(first.sessions_expired, 0);
         assert_eq!(second.payload_rows_deleted, 0);
         assert_eq!(second.sessions_expired, 0);

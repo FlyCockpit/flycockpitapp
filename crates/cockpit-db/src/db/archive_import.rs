@@ -442,6 +442,12 @@ fn import_session_archive_graph_conn(
                 &session.active_agent,
             )?;
             row.session_id = id_map[&source_id];
+            // The builder minted the lineage root for its throwaway id. An
+            // imported session is always the root of a fresh lineage in the
+            // destination graph (archives do not carry compaction lineage),
+            // so rebase it to the remapped identity before the insert hits
+            // the `compaction_lineage_root_id` self-foreign-key.
+            row.compaction_lineage_root_id = Some(row.session_id);
             row.parent_session_id = session.parent_source_id.map(|parent| id_map[&parent]);
             row.assistant_name = session.assistant_name.clone();
             if let Some(short_id) = session.short_id.filter(|id| is_crockford_short_id(id)) {

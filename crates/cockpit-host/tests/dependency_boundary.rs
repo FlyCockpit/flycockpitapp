@@ -259,7 +259,10 @@ fn daemon_pid_and_metadata_guard_live_only_in_host() {
         "struct SerializedDaemonPidReceipt",
         "write_private_file_exclusive",
         "fn read_process_start_identity",
-        "offset_of!(ProcBsdInfo, start_sec) == 120",
+        // The macOS proc-struct layout assertion was renamed with its struct
+        // in review-loop(#337) cycle 2 (`MacosProcBsdInfo`); the pinned
+        // compile-time layout check itself is unchanged.
+        "offset_of!(MacosProcBsdInfo, start_sec) == 120",
         "let error = (ok == 0).then(std::io::Error::last_os_error)",
         "with_lifecycle_lock",
         "reclaim_stale_and_reserve",

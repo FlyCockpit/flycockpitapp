@@ -167,7 +167,10 @@ where
     let lock = lock_for(key);
     let _guard = lock.lock().await;
 
-    let tokens = load_tokens_from_store(&store, key, parse_context, missing_auth_error)?;
+    // Durable re-read: this caller's store snapshot predates the lock, so a
+    // concurrent winner's save is only visible through the backend. That
+    // double-check is what lets waiters reuse the winner's value.
+    let tokens = reread_tokens_from_store(&store, key, parse_context, missing_auth_error)?;
     let now = unix_now();
     if !needs_refresh(&tokens, now) {
         return Ok(tokens);
@@ -176,16 +179,20 @@ where
     let attempted_refresh_token = refresh_token(&tokens).to_string();
     match refresh(tokens.clone()).await {
         Ok(fresh) => {
+            // Durable re-read for the same reason: the merge baseline must be
+            // whatever survived on disk, not this snapshot's pre-lock copy.
             let latest =
-                load_tokens_from_store(&store, key, parse_context, missing_auth_error).ok();
+                reread_tokens_from_store(&store, key, parse_context, missing_auth_error).ok();
             let previous = latest.as_ref().unwrap_or(&tokens);
             let merged = merge_refresh(previous, fresh);
             store.save_record_merged(key, serde_json::to_value(&merged)?)?;
             Ok(merged)
         }
         Err(e) if is_terminal_refresh_error(&e) => {
+            // Durable re-read: the terminal decision hinges on whether the
+            // on-disk refresh token changed under us while the refresh ran.
             let latest = store
-                .get_owned(key)
+                .reread_owned(key)
                 .ok()
                 .flatten()
                 .and_then(|raw| serde_json::from_value::<T>(raw).ok());
@@ -216,6 +223,23 @@ where
     Missing: Fn() -> anyhow::Error,
 {
     let raw = store.get_owned(key)?.ok_or_else(missing_auth_error)?;
+    serde_json::from_value(raw).context(parse_context)
+}
+
+/// Like [`load_tokens_from_store`] but the read bypasses the store snapshot
+/// and goes to the durable backend. Inside the refresh lock this is the only
+/// read that can observe another waiter's (or writer's) committed value.
+fn reread_tokens_from_store<T, Missing>(
+    store: &CredentialStore,
+    key: &str,
+    parse_context: &'static str,
+    missing_auth_error: Missing,
+) -> Result<T>
+where
+    T: DeserializeOwned,
+    Missing: Fn() -> anyhow::Error,
+{
+    let raw = store.reread_owned(key)?.ok_or_else(missing_auth_error)?;
     serde_json::from_value(raw).context(parse_context)
 }
 

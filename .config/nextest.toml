@@ -37,10 +37,14 @@ slow-timeout = { period = "90s", terminate-after = 4 }
 filter = "test(=daemon::server::tests::dispatch_matrix_readonly_cases_traverse_socket_path)"
 slow-timeout = { period = "90s", terminate-after = 4 }
 
-# Detached IsolatedHome boot applies 0001 + vault before accept; handshake
-# waits up to 90s for the hello line rather than execing status in a loop.
+# Detached IsolatedHome boot applies 0001 + vault before accept; the
+# handshake wait is driven by the daemon's pid liveness and socket hello, not
+# a wall-clock budget, so a slow (fsync-bound) boot on a loaded machine is
+# patient rather than flaky. Every e2e test boots at least one detached
+# daemon, so the whole binary gets the same slow-test budget: boot alone can
+# exceed the default 120s kill window under full-workspace IO saturation.
 [[profile.default.overrides]]
-filter = "package(cockpit-cli) & binary(e2e) & test(/daemon_lifecycle/)"
+filter = "package(cockpit-cli) & binary(e2e)"
 slow-timeout = { period = "90s", terminate-after = 3 }
 
 # Two sequential vault-backed provider wizards; first apply is ~60s.

@@ -570,9 +570,11 @@ impl ModelAnswersOutcome {
 pub fn apply_model_answers(_cwd: &Path, run: &WizardRun) -> Result<ModelAnswersOutcome> {
     let (provider_id, model_id) = model_ref_answer(run).context("model answer")?;
     let global_config = global_config_file().context("resolving global config for model setup")?;
+    // Provider-id resolution is the fail-closed gate for the model write:
+    // an id that cannot name a provider config file must surface its own
+    // `invalid provider id` error, not a generic wrapper message.
     let model_target =
-        crate::config::providers::provider_file_path_for_config(&global_config, &provider_id)
-            .context("resolving global provider config for model setup")?;
+        crate::config::providers::provider_file_path_for_config(&global_config, &provider_id)?;
     // Model onboarding is authored against the global layer alone; resolving
     // workspace overlays here would make an untrusted project influence the
     // user's durable provider/model defaults.
@@ -1191,13 +1193,7 @@ mod tests {
     fn security_wizard_write_target_is_global_in_fresh_workspace() {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path().join("repo");
-        let home = tmp.path().join("home");
-        let data = tmp.path().join("data");
-        let state = tmp.path().join("state");
         std::fs::create_dir_all(&cwd).unwrap();
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::create_dir_all(&state).unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -1206,10 +1202,7 @@ mod tests {
                 "--nocapture",
             ])
             .env("COCKPIT_SECURITY_FALLBACK_CWD", &cwd)
-            .env("HOME", &home)
-            .env("XDG_DATA_HOME", &data)
-            .env("XDG_STATE_HOME", &state)
-            .env_remove("XDG_CONFIG_HOME")
+            .env("COCKPIT_SECURITY_FALLBACK_HOME_ROOT", tmp.path())
             .env_remove(COCKPIT_CONFIG_ENV)
             .output()
             .unwrap();
@@ -1228,9 +1221,16 @@ mod tests {
         let cwd = std::path::PathBuf::from(
             std::env::var_os("COCKPIT_SECURITY_FALLBACK_CWD").expect("fallback cwd env var"),
         );
-        let global =
-            std::path::PathBuf::from(std::env::var_os("HOME").expect("isolated home env var"))
-                .join(".config/cockpit/config.json");
+        let root = std::path::PathBuf::from(
+            std::env::var_os("COCKPIT_SECURITY_FALLBACK_HOME_ROOT")
+                .expect("isolated home root env var"),
+        );
+        // The child installs its own isolated home instead of inheriting a
+        // raw `HOME`: a test-build process captures its inherited home as the
+        // developer profile and redirects it, so explicit overrides installed
+        // after capture are the only way to drive the real global-layer path.
+        let _guard = TestEnvGuard::isolate_cockpit_home_at_async(&root).await;
+        let global = root.join("home/.config/cockpit/config.json");
         assert!(!global.exists());
         let mut run = security_run_for_cwd(&cwd);
         submit_security_wizard_until_save(
@@ -1659,9 +1659,12 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("bad/provider"));
-        assert!(error.contains("writable"));
-        assert!(!error.contains("not found"));
+        assert!(error.contains("bad/provider"), "{error}");
+        // Global-layer targeting made the provider-id resolution the
+        // fail-closed gate: an id that cannot name a provider config file
+        // errors cleanly instead of resolving a writable layer.
+        assert!(error.contains("invalid provider id"), "{error}");
+        assert!(!error.contains("not found"), "{error}");
     }
 
     #[test]

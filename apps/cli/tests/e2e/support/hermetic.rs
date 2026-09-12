@@ -42,7 +42,9 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use super::osc52_observer::Osc52Observer;
 use super::tui_pty::{COMPOSER_PLACEHOLDER, CellPos, ScreenSnapshot, UNWANTED_STARTUP_MARKERS};
-use super::{IsolatedHome, assert_success, log_tail, output_text, pid_is_live};
+use super::{
+    IsolatedHome, assert_success, log_tail, output_text, pid_is_live, socket_answers_receipt_hello,
+};
 
 /// Dummy loopback provider URL. Foundation tests must not contact a provider.
 pub const DUMMY_PROVIDER_URL: &str = "http://127.0.0.1:9/v1";
@@ -309,6 +311,11 @@ impl HermeticLaunchSpec {
         &self.executable
     }
 
+    /// The isolated `XDG_CONFIG_HOME` every launch path exports to children.
+    pub fn xdg_config_home(&self) -> &Path {
+        &self.xdg_config_home
+    }
+
     pub fn home(&self) -> &Path {
         &self.home
     }
@@ -446,6 +453,18 @@ struct PtyObserver {
     osc52: Osc52Observer,
 }
 
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    windows
+))]
+#[derive(Debug)]
+struct DaemonGeneration {
+    receipt: cockpit_host::daemon_lifecycle::DaemonPidReceipt,
+    process: cockpit_host::daemon_lifecycle::VerifiedDaemonProcess,
+}
+
 impl PtyObserver {
     fn new(rows: u16, cols: u16) -> Self {
         Self {
@@ -471,6 +490,13 @@ pub struct HermeticCockpit {
     spec: HermeticLaunchSpec,
     inherited: InheritedEnvironmentModel,
     daemon_pid: Option<u32>,
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        windows
+    ))]
+    daemon_generation: Option<DaemonGeneration>,
     reaped_pty_pid: Option<u32>,
     reaped_daemon_pid: Option<u32>,
     pty: Option<PtyHandles>,
@@ -496,6 +522,13 @@ impl HermeticCockpit {
             spec,
             inherited,
             daemon_pid: None,
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "freebsd",
+                windows
+            ))]
+            daemon_generation: None,
             reaped_pty_pid: None,
             reaped_daemon_pid: None,
             pty: None,
@@ -548,6 +581,32 @@ impl HermeticCockpit {
     #[cfg(not(target_os = "linux"))]
     pub fn enable_isolated_secret_service(&mut self) {}
 
+    /// Async-runtime-safe counterpart to [`Self::enable_isolated_secret_service`].
+    #[cfg(target_os = "linux")]
+    pub async fn enable_isolated_secret_service_async(&mut self) {
+        let service = super::start_mock_secret_service_async().await;
+        self.spec
+            .extra_env
+            .push(("DBUS_SESSION_BUS_ADDRESS".into(), service.address.clone()));
+        self._secret_service = Some(service);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub async fn enable_isolated_secret_service_async(&mut self) {}
+
+    /// Reap Cockpit-owned processes and await the private Secret Service's
+    /// owner boundary before the isolated home is dropped.
+    pub async fn finish(mut self) {
+        self.reap();
+        #[cfg(target_os = "linux")]
+        if let Some(service) = self._secret_service.take() {
+            assert!(
+                service.shutdown().await,
+                "Secret Service owner must acknowledge shutdown"
+            );
+        }
+    }
+
     pub fn project_path(&self) -> &Path {
         self.home.project_path()
     }
@@ -557,9 +616,7 @@ impl HermeticCockpit {
     }
 
     pub fn daemon_pid(&self) -> Option<u32> {
-        self.daemon_pid
-            .or(self.reaped_daemon_pid)
-            .or_else(|| self.pid_from_file())
+        self.daemon_pid.or(self.reaped_daemon_pid)
     }
 
     pub fn pty_pid(&self) -> Option<u32> {
@@ -583,17 +640,154 @@ impl HermeticCockpit {
             .expect("hermetic cockpit daemon start --detach");
         assert_success("hermetic cockpit daemon start --detach", &start, &self.home);
         self.wait_for_daemon(DEFAULT_DAEMON_TIMEOUT);
-        self.daemon_pid = Some(
-            self.pid_from_file()
-                .expect("daemon pid file after hermetic daemon start"),
-        );
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            windows
+        ))]
+        {
+            self.install_current_daemon_generation(false)
+                .expect("capture receipt-verified initial daemon generation");
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            windows
+        )))]
+        {
+            self.daemon_pid = self.pid_from_file();
+        }
+    }
+
+    /// Run the product restart command and refresh the receipt-bound ownership
+    /// witness before any later cleanup can observe the replacement as current.
+    pub fn restart_daemon(&mut self) -> Output {
+        let output = self.command(&["daemon", "restart"]);
+        assert_success("hermetic cockpit daemon restart", &output, &self.home);
+        self.wait_for_daemon(DEFAULT_DAEMON_TIMEOUT);
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            windows
+        ))]
+        self.install_current_daemon_generation(true)
+            .expect("refresh receipt-verified daemon generation after restart");
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            windows
+        )))]
+        {
+            self.daemon_pid = self.pid_from_file();
+        }
+        output
+    }
+
+    fn command(&self, args: &[&str]) -> Output {
+        let mut command = Command::new(self.spec.executable());
+        command
+            .env_clear()
+            .envs(self.spec.subprocess_env())
+            .current_dir(self.project_path())
+            .args(args)
+            .output()
+            .expect("run hermetic cockpit command")
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        windows
+    ))]
+    fn capture_current_daemon_generation(&self) -> Result<DaemonGeneration, String> {
+        use cockpit_host::daemon_lifecycle::{
+            DaemonPidRecord, VerifiedProcessOutcome, acquire_verified_daemon_process,
+            read_daemon_pid_record,
+        };
+
+        let pid_file = self.home.pid_file();
+        let receipt = match read_daemon_pid_record(&pid_file) {
+            Some(DaemonPidRecord::Receipt(receipt)) => receipt,
+            Some(DaemonPidRecord::LegacyNumeric(pid)) => {
+                return Err(format!(
+                    "refusing unverified legacy daemon PID {pid} for hermetic ownership"
+                ));
+            }
+            None => return Err("daemon receipt missing during ownership capture".into()),
+        };
+        let process = match acquire_verified_daemon_process(&receipt) {
+            VerifiedProcessOutcome::Verified(process) => process,
+            VerifiedProcessOutcome::Identity(identity) => {
+                return Err(format!(
+                    "daemon receipt did not acquire a verified process: {identity:?}"
+                ));
+            }
+        };
+        if read_daemon_pid_record(&pid_file) != Some(DaemonPidRecord::Receipt(receipt.clone())) {
+            return Err("daemon receipt changed during verified process acquisition".into());
+        }
+        if !socket_answers_receipt_hello(&self.socket_path(), &pid_file, &receipt) {
+            return Err(format!(
+                "daemon hello was not bound to receipt PID {}",
+                receipt.pid
+            ));
+        }
+        if read_daemon_pid_record(&pid_file) != Some(DaemonPidRecord::Receipt(receipt.clone())) {
+            return Err("daemon receipt changed during exact hello verification".into());
+        }
+        Ok(DaemonGeneration { receipt, process })
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        windows
+    ))]
+    fn install_current_daemon_generation(&mut self, replacing: bool) -> Result<(), String> {
+        let current = self.capture_current_daemon_generation()?;
+        let current_pid = current.receipt.pid;
+        if replacing {
+            let previous = self.daemon_generation.as_ref().ok_or_else(|| {
+                "daemon restart replacement had no predecessor ownership witness".to_string()
+            })?;
+            if previous.receipt == current.receipt {
+                return Err("daemon restart retained the predecessor receipt".into());
+            }
+            let exited = previous.process.has_exited().map_err(|error| {
+                format!(
+                    "checking predecessor daemon PID {} exit: {error}",
+                    previous.receipt.pid
+                )
+            })?;
+            if !exited {
+                return Err(format!(
+                    "product restart did not prove predecessor daemon PID {} exit",
+                    previous.receipt.pid
+                ));
+            }
+            self.reaped_daemon_pid = Some(previous.receipt.pid);
+        } else if self.daemon_generation.is_some() {
+            return Err("initial daemon ownership capture attempted twice".into());
+        }
+        // Keep the predecessor witness installed until its exact kernel exit
+        // signal has been proved. Any error above therefore leaves cleanup
+        // bound to the last verified generation instead of silently losing it.
+        self.daemon_generation = Some(current);
+        self.daemon_pid = Some(current_pid);
+        Ok(())
     }
 
     fn wait_for_daemon(&self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         let mut delay = Duration::from_millis(20);
         loop {
-            if super::socket_answers_hello(&self.home.socket_path()) {
+            if super::socket_answers_hello(&self.home.socket_path(), &self.home.pid_file()) {
                 break;
             }
             assert!(
@@ -950,30 +1144,21 @@ impl HermeticCockpit {
         self.pty.as_ref().map(|pty| (pty.cols, pty.rows))
     }
 
-    pub fn child_exited(&mut self) -> bool {
+    pub fn wait_for_child_exit(&mut self) {
         let Some(pty) = self.pty.as_mut() else {
-            return true;
+            return;
         };
-        matches!(pty.child.try_wait(), Ok(Some(_)))
-    }
-
-    pub fn wait_for_child_exit(&mut self, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        let mut delay = Duration::from_millis(2);
-        loop {
-            if self.child_exited() {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return self.child_exited();
-            }
-            std::thread::sleep(delay);
-            delay = (delay * 2).min(Duration::from_millis(50));
-        }
+        pty.child.wait().expect("wait for exact PTY child exit");
     }
 
     /// Stop the PTY child and owned daemon. Safe to call more than once.
     pub fn reap(&mut self) {
+        if let Err(error) = self.try_reap() {
+            panic!("hermetic cleanup failed closed: {error}");
+        }
+    }
+
+    fn try_reap(&mut self) -> Result<(), String> {
         let pty_pid = self.pty.as_ref().map(|pty| pty.pid);
         if pty_pid.is_some() {
             self.reaped_pty_pid = pty_pid;
@@ -991,35 +1176,94 @@ impl HermeticCockpit {
         }
         self.pty = None;
 
-        let daemon_pid = self.daemon_pid.take();
-        if daemon_pid.is_some() {
-            self.reaped_daemon_pid = daemon_pid;
-        }
-        if daemon_pid.is_some() {
-            let stop: Result<Output, _> = self
-                .spec
-                .launch_path(HermeticLaunchKind::DaemonStop)
+        let stop_path = self.spec.launch_path(HermeticLaunchKind::DaemonStop);
+        self.try_reap_daemon_with(move || {
+            stop_path
                 .std_command()
-                .output();
-            let _ = stop;
-        }
-        if let Some(pid) = daemon_pid {
-            assert!(
-                super::wait_for_pid_exit_blocking(pid, Duration::from_secs(2)),
-                "daemon pid {pid} still live after `cockpit daemon stop`; not sending SIGKILL to a numeric PID"
-            );
+                .output()
+                .map_err(|error| format!("running hermetic daemon stop: {error}"))
+        })
+    }
+
+    fn try_reap_daemon_with(
+        &mut self,
+        stop: impl FnOnce() -> Result<Output, String>,
+    ) -> Result<(), String> {
+        let Some(daemon_pid) = self.daemon_pid else {
+            return Ok(());
+        };
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            windows
+        ))]
+        {
+            use cockpit_host::daemon_lifecycle::{DaemonPidRecord, read_daemon_pid_record};
+            let generation = self
+                .daemon_generation
+                .as_ref()
+                .ok_or_else(|| "daemon PID exists without a verified generation".to_string())?;
+            if generation.receipt.pid != daemon_pid {
+                return Err("cached daemon PID diverged from its generation receipt".into());
+            }
+            if read_daemon_pid_record(&self.home.pid_file())
+                != Some(DaemonPidRecord::Receipt(generation.receipt.clone()))
+            {
+                return Err(format!(
+                    "current daemon receipt replaced before stop; preserving all metadata for PID {daemon_pid}"
+                ));
+            }
         }
 
-        let socket = self.socket_path();
-        if socket.exists() {
-            if daemon_pid.is_none() && self.reaped_daemon_pid.is_none() {
-                panic!(
-                    "refusing to unlink {} without a recorded daemon pid",
-                    socket.display()
-                );
-            }
-            let _ = std::fs::remove_file(&socket);
+        let output = stop()?;
+        if !output.status.success() {
+            return Err(format!(
+                "daemon stop did not complete successfully; preserving receipt and socket\n{}",
+                output_text(&output)
+            ));
         }
+
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            windows
+        ))]
+        {
+            let generation = self.daemon_generation.as_ref().unwrap();
+            let exited = generation.process.has_exited().map_err(|error| {
+                format!("checking exact daemon PID {daemon_pid} completion: {error}")
+            })?;
+            if !exited {
+                return Err(format!(
+                    "daemon stop returned without exact PID {daemon_pid} completion; preserving metadata"
+                ));
+            }
+        }
+
+        if cockpit_host::daemon_lifecycle::read_daemon_pid_record(&self.home.pid_file()).is_some() {
+            return Err("daemon stop left or replaced current PID metadata".into());
+        }
+        if self.socket_path().exists() {
+            return Err(format!(
+                "daemon stop left current socket metadata at {}",
+                self.socket_path().display()
+            ));
+        }
+
+        self.daemon_pid = None;
+        self.reaped_daemon_pid = Some(daemon_pid);
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            windows
+        ))]
+        {
+            self.daemon_generation = None;
+        }
+        Ok(())
     }
 
     pub fn assert_reaped(&self) {
@@ -1033,6 +1277,10 @@ impl HermeticCockpit {
             assert!(!pid_is_live(pid), "daemon pid {pid} still live after reap");
         }
         assert!(
+            cockpit_host::daemon_lifecycle::read_daemon_pid_record(&self.home.pid_file()).is_none(),
+            "isolated daemon PID metadata still exists after reap"
+        );
+        assert!(
             !self.socket_path().exists(),
             "isolated daemon socket still exists: {}",
             self.socket_path().display()
@@ -1042,7 +1290,13 @@ impl HermeticCockpit {
 
 impl Drop for HermeticCockpit {
     fn drop(&mut self) {
-        self.reap();
+        if let Err(error) = self.try_reap() {
+            let preserved = self.home.preserve_after_cleanup_failure();
+            eprintln!(
+                "hermetic cleanup failed closed during drop: {error}; preserved {}",
+                preserved.display()
+            );
+        }
     }
 }
 
@@ -1100,4 +1354,118 @@ pub fn find_close_settings(session: &HermeticCockpit) -> CellPos {
         .snapshot()
         .find_text("[Close settings]")
         .expect("[Close settings] visible")
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        windows
+    )
+))]
+mod generation_tests {
+    use super::*;
+    use cockpit_host::daemon_lifecycle::{DaemonPidRecord, read_daemon_pid_record};
+
+    #[test]
+    fn product_restart_refreshes_verified_generation_and_reaps_repeatedly() {
+        let mut session = HermeticCockpit::prepare(HermeticProfile::Default);
+        session.start_trusted_daemon();
+        let initial = session
+            .daemon_generation
+            .as_ref()
+            .expect("initial generation")
+            .receipt
+            .clone();
+
+        let output = session.restart_daemon();
+        assert_success("receipt-bound restart", &output, session.home());
+        let replacement = session
+            .daemon_generation
+            .as_ref()
+            .expect("replacement generation")
+            .receipt
+            .clone();
+        assert_ne!(initial, replacement, "restart must replace the receipt");
+        assert_eq!(session.daemon_pid(), Some(replacement.pid));
+
+        session.reap();
+        session.reap();
+        session.assert_reaped();
+    }
+
+    #[test]
+    fn stop_failure_and_replaced_receipt_preserve_current_metadata() {
+        let mut session = HermeticCockpit::prepare(HermeticProfile::Default);
+        session.start_trusted_daemon();
+        let pid_file = session.home.pid_file();
+        let socket = session.socket_path();
+        let original_bytes = std::fs::read(&pid_file).expect("original daemon receipt bytes");
+        let original = session
+            .daemon_generation
+            .as_ref()
+            .expect("owned generation")
+            .receipt
+            .clone();
+
+        let stop_error = session
+            .try_reap_daemon_with(|| Err("forced stop launch failure".into()))
+            .expect_err("stop failure must fail closed");
+        assert!(stop_error.contains("forced stop launch failure"));
+        assert_eq!(
+            read_daemon_pid_record(&pid_file),
+            Some(DaemonPidRecord::Receipt(original.clone()))
+        );
+        assert!(
+            socket.exists(),
+            "failed stop must not unlink control metadata"
+        );
+        assert!(session.daemon_generation.is_some());
+
+        let nonzero_error = session
+            .try_reap_daemon_with(|| {
+                Command::new("sh")
+                    .args(["-c", "exit 7"])
+                    .output()
+                    .map_err(|error| format!("run failing stop command: {error}"))
+            })
+            .expect_err("nonzero stop result must fail closed");
+        assert!(nonzero_error.contains("did not complete successfully"));
+        assert_eq!(
+            read_daemon_pid_record(&pid_file),
+            Some(DaemonPidRecord::Receipt(original.clone()))
+        );
+        assert!(
+            socket.exists(),
+            "nonzero stop must preserve control metadata"
+        );
+        assert!(session.daemon_generation.is_some());
+
+        std::fs::remove_file(&pid_file).expect("replace receipt for recycling regression");
+        cockpit_host::daemon_lifecycle::write_pid_file(
+            &pid_file,
+            std::process::id(),
+            &std::env::current_exe().expect("test executable"),
+        )
+        .expect("write replacement receipt");
+        let replacement_error = session
+            .capture_current_daemon_generation()
+            .expect_err("non-daemon/recycled replacement must not be captured");
+        assert!(replacement_error.contains("verified process"));
+        assert_eq!(
+            session.daemon_generation.as_ref().unwrap().receipt,
+            original,
+            "failed refresh must retain the prior ownership witness"
+        );
+        assert!(
+            socket.exists(),
+            "failed refresh must preserve socket metadata"
+        );
+
+        std::fs::write(&pid_file, original_bytes).expect("restore owned daemon receipt");
+        session.reap();
+        session.assert_reaped();
+    }
 }

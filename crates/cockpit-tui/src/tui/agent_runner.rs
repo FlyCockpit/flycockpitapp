@@ -135,6 +135,45 @@ impl AttachedRequestBinding {
             .await
             .map_err(|_| "daemon client dropped reply channel".to_string())?
     }
+
+    pub(crate) async fn request_with_shutdown(
+        &self,
+        request: Request,
+        shutdown: &crate::tui::async_action::AsyncActionCancellation,
+    ) -> Result<Response, String> {
+        let (response_tx, response_rx) = oneshot::channel();
+        let reply_slot = shutdown.register_attached_reply(response_rx);
+        self.sender
+            .send(AttachedRequest {
+                request,
+                intended_session_id: self.intended_session_id,
+                intended_attachment_epoch: self.intended_attachment_epoch,
+                response_tx,
+            })
+            .await
+            .map_err(|_| "daemon client task has stopped".to_string())?;
+        let result = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                Err("daemon client dropped reply channel".to_string())
+            }
+            response = Self::take_attached_reply(&reply_slot) => response,
+        };
+        shutdown.unregister_attached_reply(&reply_slot);
+        result
+    }
+
+    async fn take_attached_reply(
+        slot: &crate::tui::async_action::AttachedReplySlot,
+    ) -> Result<Response, String> {
+        let rx = slot
+            .lock()
+            .expect("attached reply slot poisoned")
+            .take()
+            .ok_or_else(|| "daemon client dropped reply channel".to_string())?;
+        rx.await
+            .map_err(|_| "daemon client dropped reply channel".to_string())?
+    }
 }
 
 pub struct ControlRequest {
@@ -679,7 +718,12 @@ impl AgentRunner {
         &self,
         submission: ClientUserSubmission,
     ) -> Result<(), InputNotDelivered> {
-        self.try_send_optimistic_input(submission, Uuid::now_v7())
+        let invocation_nonce = Uuid::now_v7();
+        let client_submission_id = cockpit_client::submission::derive_client_submission_id(
+            invocation_nonce,
+            &submission.client_fingerprint(),
+        );
+        self.try_send_optimistic_input(submission, client_submission_id)
             .map_err(|(outcome, _submission)| outcome)
     }
 
@@ -2299,6 +2343,7 @@ fn is_global_event(event: &proto::Event) -> bool {
             | proto::Event::EnvDriftWarning { .. }
             | proto::Event::InterruptRaised { .. }
             | proto::Event::InterruptResolved { .. }
+            | proto::Event::InterruptInterrupted { .. }
             | proto::Event::InterruptQueueChanged { .. }
             | proto::Event::HostCapabilitiesChanged { .. }
     ) || {
@@ -4007,6 +4052,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | Usage { session_id, .. }
         | InterruptRaised { session_id, .. }
         | InterruptResolved { session_id, .. }
+        | InterruptInterrupted { session_id, .. }
         | HistoryReplay { session_id, .. }
         | InterruptQueueChanged { session_id, .. }
         | AgentIdle { session_id, .. }
@@ -5100,6 +5146,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             session_id,
             interrupt_id,
         },
+        InterruptInterrupted { .. } => return None,
         ConfigSnapshot { snapshot } => TurnEvent::ConfigSnapshot { snapshot },
         HostCapabilitiesChanged { snapshot } => TurnEvent::HostCapabilitiesChanged {
             snapshot: Box::new(snapshot),
@@ -5335,6 +5382,29 @@ mod tests {
                         // metadata; keep this socket fixture independent of
                         // cockpit-core's private storage implementation.
                         schema_version: 0,
+                    },
+                ))
+                .await
+                .unwrap();
+            let credential = match proto.recv().await.unwrap().unwrap() {
+                RecvFrame::Envelope(env) => env,
+                RecvFrame::Unknown { .. } => panic!("unexpected unknown frame"),
+                RecvFrame::VersionMismatch { .. } => panic!("unexpected version mismatch"),
+            };
+            let Body::Request {
+                id: credential_id,
+                request: Request::ExchangeLocalPeerCredential,
+                ..
+            } = credential.body
+            else {
+                panic!("expected peer credential exchange request");
+            };
+            proto
+                .send(&Envelope::response(
+                    credential_id,
+                    Response::LocalPeerCredential {
+                        token: cockpit_proto::OwnerCapabilityToken::new("test-peer-token"),
+                        role: cockpit_proto::LocalClientRole::Cli,
                     },
                 ))
                 .await

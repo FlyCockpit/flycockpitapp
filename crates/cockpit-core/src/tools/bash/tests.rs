@@ -840,7 +840,7 @@ use crate::approval::{ID_APPROVE_ONCE, ID_APPROVE_SESSION, ID_REJECT};
 use crate::daemon::proto::ResolveResponse;
 
 /// Build a sandbox-enabled ctx with an approver + grant store.
-fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
+async fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
     let db = crate::db::Db::open_in_memory().unwrap();
     let session = Arc::new(
         crate::session::Session::create_for_test(
@@ -853,6 +853,30 @@ fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
     );
     session.set_sandbox_enabled(true);
     let sid = session.id;
+    let owner = db
+        .ensure_session_root_agent(
+            sid,
+            None,
+            crate::agent_tree::workspace_ref_for_host_path(cwd).unwrap(),
+            crate::agent_tree::system_now_unix_ms(),
+        )
+        .await
+        .unwrap();
+    let owner = match db
+        .transition_agent_instance(
+            sid,
+            owner.agent_instance_id,
+            owner.revision,
+            crate::db::agent_tree_decisions::AgentInstanceState::Running,
+            r#"{"state":"running"}"#,
+            crate::agent_tree::system_now_unix_ms(),
+        )
+        .await
+        .unwrap()
+    {
+        crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(owner) => owner,
+        outcome => panic!("bash fixture root did not start: {outcome:?}"),
+    };
     let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
     let cfg = crate::config::extended::RedactConfig::default();
     let redaction_slot = Arc::new(std::sync::RwLock::new(Arc::new(
@@ -880,7 +904,7 @@ fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
         executing_model_trusted: false,
         knowledge_access_trusted: false,
         caller_model: None,
-        agent_instance_id: None,
+        agent_instance_id: Some(owner.agent_instance_id),
         lock_identity: "builder".to_string().clone(),
         write_scope: None,
         dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
@@ -952,7 +976,7 @@ async fn grant_command(ctx: &ToolCtx, command: &str, scope: Scope) {
 }
 
 async fn sandbox_off_ctx_with_grant(cwd: &std::path::Path, command: &str) -> ToolCtx {
-    let ctx = ctx_with_store(cwd);
+    let ctx = ctx_with_store(cwd).await;
     ctx.session.set_sandbox_enabled(false);
     grant_command(&ctx, command, Scope::Session).await;
     ctx
@@ -976,7 +1000,7 @@ async fn user_path_grants_merge_into_sandbox_and_container_mount_plan() {
     for dir in [&project, &read_dir, &write_dir] {
         std::fs::create_dir_all(dir).unwrap();
     }
-    let ctx = ctx_with_store(&project);
+    let ctx = ctx_with_store(&project).await;
     let store = GrantStore::new(
         ctx.session.db.clone(),
         ctx.session.id,
@@ -1031,11 +1055,11 @@ async fn user_path_grants_merge_into_sandbox_and_container_mount_plan() {
     );
 }
 
-fn ctx_with_scheduler(
+async fn ctx_with_scheduler(
     cwd: &std::path::Path,
     scheduler: Arc<crate::engine::resource_scheduler::ResourceScheduler>,
 ) -> ToolCtx {
-    let mut ctx = ctx_with_store(cwd);
+    let mut ctx = ctx_with_store(cwd).await;
     ctx.session.set_sandbox_enabled(false);
     ctx.resource_scheduler = Some(scheduler);
     ctx
@@ -1115,7 +1139,7 @@ async fn bash_without_effective_resources_bypasses_scheduler() {
 #[tokio::test]
 async fn bash_resource_over_capacity_returns_model_error() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_scheduler(tmp.path(), scheduler(1, 1));
+    let ctx = ctx_with_scheduler(tmp.path(), scheduler(1, 1)).await;
     grant_command(&ctx, "printf nope", Scope::Session).await;
     let out = BashTool::new()
         .call(
@@ -1150,7 +1174,7 @@ async fn bash_queue_timeout_cancels_wait_without_spawning() {
         )
         .await
         .unwrap();
-    let ctx = ctx_with_scheduler(tmp.path(), scheduler.clone());
+    let ctx = ctx_with_scheduler(tmp.path(), scheduler.clone()).await;
     grant_command(&ctx, "touch should-not-exist", Scope::Session).await;
     let out = BashTool::new()
         .call(
@@ -1185,7 +1209,7 @@ async fn bash_cancel_while_queued_removes_scheduler_request() {
         )
         .await
         .unwrap();
-    let ctx = ctx_with_scheduler(tmp.path(), scheduler.clone());
+    let ctx = ctx_with_scheduler(tmp.path(), scheduler.clone()).await;
     grant_command(&ctx, "printf nope", Scope::Session).await;
     ctx.cancel.cancel();
     let out = BashTool::new()
@@ -1205,7 +1229,7 @@ async fn bash_cancel_while_queued_removes_scheduler_request() {
 #[tokio::test]
 async fn bash_runtime_timeout_starts_after_resource_acquire() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_scheduler(tmp.path(), scheduler(1, 1));
+    let ctx = ctx_with_scheduler(tmp.path(), scheduler(1, 1)).await;
     grant_command(&ctx, "sleep 2", Scope::Session).await;
     let out = BashTool::new()
         .call(
@@ -1347,14 +1371,14 @@ async fn bash_timeout_ms_valid_and_absent_emit_no_note() {
     assert!(!valid.content.contains("note:"), "{}", valid.content);
 }
 
-async fn resolve_next_interrupt(
+fn resolve_next_interrupt(
     db: crate::db::Db,
     sid: uuid::Uuid,
     hub: Arc<crate::engine::interrupt::InterruptHub>,
     selected_id: &'static str,
     exclude: Option<uuid::Uuid>,
-) -> uuid::Uuid {
-    resolve_next_interrupt_with_response(
+) -> tokio::task::JoinHandle<uuid::Uuid> {
+    spawn_resolve_next_interrupt_with_response(
         db,
         sid,
         hub,
@@ -1363,51 +1387,123 @@ async fn resolve_next_interrupt(
         },
         exclude,
     )
-    .await
 }
 
-async fn resolve_next_interrupt_with_response(
+fn spawn_resolve_next_interrupt_with_response(
     db: crate::db::Db,
     sid: uuid::Uuid,
     hub: Arc<crate::engine::interrupt::InterruptHub>,
     response: ResolveResponse,
     exclude: Option<uuid::Uuid>,
-) -> uuid::Uuid {
-    let iid = loop {
-        let open = db.list_open_interrupts(sid).await.unwrap();
-        if let Some(row) = open
-            .iter()
-            .find(|row| Some(row.interrupt_id) != exclude && hub.has_waiter(row.interrupt_id))
-        {
-            break row.interrupt_id;
-        }
-        tokio::task::yield_now().await;
-    };
-    db.resolve_interrupt(iid, &response).await.unwrap();
-    assert!(hub.resolve(iid, response));
-    iid
+) -> tokio::task::JoinHandle<uuid::Uuid> {
+    let mut raised = hub.subscribe_raised();
+    tokio::spawn(async move {
+        let row = loop {
+            let row = crate::engine::interrupt::test_support::settle_published_host_approval(
+                &db,
+                sid,
+                &hub,
+                &mut raised,
+                response.clone(),
+            )
+            .await
+            .unwrap();
+            if Some(row.interrupt_id) != exclude {
+                break row;
+            }
+        };
+        row.interrupt_id
+    })
 }
 
-async fn resolve_next_interrupt_with_escalation(
+async fn call_bash_host_effect_for_test(
+    input: serde_json::Value,
+    ctx: &ToolCtx,
+) -> anyhow::Result<crate::engine::tool::ToolOutput> {
+    crate::engine::interrupt::with_host_approval_effect_scope(
+        "bash_test_dispatch",
+        tokio_util::sync::CancellationToken::new(),
+        BashTool::new().call(input, ctx),
+        |output| Some(output.exit_code == Some(0)),
+    )
+    .await
+}
+
+async fn settle_host_approval_interrupt(
+    db: &crate::db::Db,
+    sid: uuid::Uuid,
+    hub: &crate::engine::interrupt::InterruptHub,
+    iid: uuid::Uuid,
+    response: ResolveResponse,
+) {
+    let interrupt = db.get_interrupt(iid).await.unwrap().unwrap();
+    let decision = db
+        .decision_request_for_interrupt(sid, iid)
+        .await
+        .unwrap()
+        .expect("bash approval prompt is bound to a lifecycle decision");
+    let envelope = serde_json::to_string(&response).unwrap();
+    let lifecycle = crate::agent_tree::AgentTreeLifecycle::new(db.clone());
+    let settlement = if interrupt.questions.as_ref().is_some_and(|questions| {
+        crate::approval::host_approval_response_allows(&response, questions)
+    }) {
+        lifecycle
+            .resolve_host_approval(
+                sid,
+                decision.decision_request_id,
+                iid,
+                &envelope,
+                crate::agent_tree::HostApprovalAuthority::for_durable_interrupt_binding(
+                    sid, &decision, &interrupt,
+                )
+                .unwrap(),
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+    } else {
+        lifecycle
+            .cancel_host_approval(
+                sid,
+                decision.decision_request_id,
+                iid,
+                &envelope,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+    }
+    .unwrap();
+    assert!(matches!(
+        settlement,
+        crate::agent_tree::DecisionSettlement::Resolved(_)
+    ));
+    assert!(hub.resolve(iid, response));
+}
+
+fn resolve_next_interrupt_with_escalation(
     db: crate::db::Db,
     sid: uuid::Uuid,
     hub: Arc<crate::engine::interrupt::InterruptHub>,
     selected_id: &'static str,
-) -> (uuid::Uuid, Option<SandboxEscalation>) {
-    let iid = loop {
-        let open = db.list_open_interrupts(sid).await.unwrap();
-        if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
-            break row.interrupt_id;
-        }
-        tokio::task::yield_now().await;
-    };
-    let escalation = open_escalation(&db, sid, iid).await;
-    let response = ResolveResponse::Single {
-        selected_id: selected_id.into(),
-    };
-    db.resolve_interrupt(iid, &response).await.unwrap();
-    assert!(hub.resolve(iid, response));
-    (iid, escalation)
+) -> tokio::task::JoinHandle<(uuid::Uuid, Option<SandboxEscalation>)> {
+    let mut raised = hub.subscribe_raised();
+    tokio::spawn(async move {
+        let iid = raised
+            .recv()
+            .await
+            .expect("bash escalation publishes its exact interrupt identity");
+        let escalation = open_escalation(&db, sid, iid).await;
+        settle_host_approval_interrupt(
+            &db,
+            sid,
+            &hub,
+            iid,
+            ResolveResponse::Single {
+                selected_id: selected_id.into(),
+            },
+        )
+        .await;
+        (iid, escalation)
+    })
 }
 
 async fn approve_next_path_prompt(ctx: &ToolCtx) {
@@ -1418,38 +1514,26 @@ async fn approve_next_path_prompt(ctx: &ToolCtx) {
         ID_APPROVE_SESSION,
         None,
     )
-    .await;
+    .await
+    .unwrap();
 }
 
 async fn deny_next_path_prompt(ctx: &ToolCtx) {
-    let iid = loop {
-        let open = ctx
-            .session
-            .db
-            .list_open_interrupts(ctx.session.id)
-            .await
-            .unwrap();
-        if let Some(row) = open
-            .iter()
-            .find(|row| ctx.interrupts.has_waiter(row.interrupt_id))
-        {
-            break row.interrupt_id;
-        }
-        tokio::task::yield_now().await;
-    };
-    let response = ResolveResponse::Cancel;
-    ctx.session
-        .db
-        .resolve_interrupt(iid, &response)
-        .await
-        .unwrap();
-    assert!(ctx.interrupts.resolve(iid, response));
+    spawn_resolve_next_interrupt_with_response(
+        ctx.session.db.clone(),
+        ctx.session.id,
+        ctx.interrupts.clone(),
+        ResolveResponse::Cancel,
+        None,
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn bash_child_receives_session_env_overlay() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     ctx.session.set_sandbox_enabled(false);
     let command = "printf '%s' \"$COCKPIT_REFRESH_TEST_VALUE\"";
     grant_command(&ctx, command, Scope::Session).await;
@@ -1468,7 +1552,7 @@ async fn bash_child_receives_session_env_overlay() {
 #[tokio::test]
 async fn sealed_child_injection_is_absent() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     ctx.session.set_sandbox_enabled(false);
     let command = "printf ok";
     grant_command(&ctx, command, Scope::Session).await;
@@ -1520,7 +1604,7 @@ async fn sealed_child_injection_is_absent() {
 #[tokio::test]
 async fn sealed_shell_injection_removed() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     ctx.session.set_sandbox_enabled(false);
     let command = format!("printf %s \"{}SEALED_PROD_TOKEN\"", char::from(36));
     grant_command(&ctx, &command, Scope::Session).await;
@@ -1573,7 +1657,7 @@ async fn sealed_shell_injection_removed() {
 async fn bash_child_does_not_receive_aws_access_key_from_parent_env() {
     let env = crate::test_env::lock_async().await;
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     ctx.session.set_sandbox_enabled(false);
     let command = "printf '%s' \"${AWS_ACCESS_KEY_ID:-scrubbed}\"";
     grant_command(&ctx, command, Scope::Session).await;
@@ -1737,7 +1821,7 @@ async fn bash_refuses_shell_redirection_into_local_knowledge_bases() {
     let tmp = tempfile::tempdir().unwrap();
     let knowledge = tmp.path().join(".cockpit/knowledge");
     std::fs::create_dir_all(&knowledge).unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     ctx.config.set_full_config_snapshot_for_tests(
         crate::daemon::session_worker::SessionConfigSnapshot::new(
             1,
@@ -1777,7 +1861,7 @@ async fn bash_refuses_shell_redirection_into_local_knowledge_bases() {
 async fn bash_refuses_dynamic_shell_write_targets_when_local_knowledge_is_attached() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join(".cockpit/knowledge")).unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     ctx.config.set_full_config_snapshot_for_tests(
         crate::daemon::session_worker::SessionConfigSnapshot::new(
             1,
@@ -1884,7 +1968,7 @@ async fn explicit_inside_cwd_runs() {
 #[tokio::test]
 async fn denied_outside_cwd_prevents_execution() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     ctx.session.set_sandbox_enabled(false);
     let marker = tmp.path().join("marker");
     let deny = {
@@ -1915,19 +1999,35 @@ async fn denied_outside_cwd_prevents_execution() {
 #[tokio::test]
 async fn approved_outside_cwd_executes() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     ctx.session.set_sandbox_enabled(false);
     grant_command(&ctx, "pwd", Scope::Session).await;
     let parent = tmp.path().parent().unwrap().to_path_buf();
-    let approve = {
+    let mut raised = ctx.interrupts.subscribe_raised();
+    let call = {
         let ctx = ctx.clone_for_dispatch();
-        tokio::spawn(async move { approve_next_path_prompt(&ctx).await })
+        tokio::spawn(async move {
+            crate::engine::interrupt::with_host_approval_effect_scope(
+                "bash_test_dispatch",
+                tokio_util::sync::CancellationToken::new(),
+                BashTool::new().call(serde_json::json!({ "command": "pwd", "cwd": ".." }), &ctx),
+                |output| Some(output.exit_code == Some(0)),
+            )
+            .await
+        })
     };
-    let out = BashTool::new()
-        .call(serde_json::json!({ "command": "pwd", "cwd": ".." }), &ctx)
-        .await
-        .expect("approved outside cwd runs");
-    approve.await.unwrap();
+    crate::engine::interrupt::test_support::settle_published_host_approval(
+        &ctx.session.db,
+        ctx.session.id,
+        &ctx.interrupts,
+        &mut raised,
+        ResolveResponse::Single {
+            selected_id: ID_APPROVE_SESSION.into(),
+        },
+    )
+    .await
+    .unwrap();
+    let out = call.await.unwrap().expect("approved outside cwd runs");
     assert!(out.content.contains(&parent.display().to_string()));
     assert_eq!(out.exit_code, Some(0));
 }
@@ -1950,7 +2050,7 @@ async fn cd_inside_root_is_allowed() {
 #[tokio::test]
 async fn cd_escape_triggers_approval_before_execution() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     ctx.session.set_sandbox_enabled(false);
     let marker = tmp.path().join("marker");
     let deny = {
@@ -1978,7 +2078,7 @@ async fn cd_escape_triggers_approval_before_execution() {
 #[tokio::test]
 async fn pushd_escape_triggers_approval_before_execution() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     ctx.session.set_sandbox_enabled(false);
     let marker = tmp.path().join("marker");
     let deny = {
@@ -2021,7 +2121,7 @@ async fn dotdot_as_data_is_not_rejected() {
 #[tokio::test]
 async fn command_escalation_preauthorized_returns_scope() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     assert_eq!(
         command_escalation_preauthorized(&ctx, "cargo build --release")
             .await
@@ -2047,7 +2147,7 @@ async fn command_escalation_preauthorized_returns_scope() {
 #[tokio::test]
 async fn risky_grant_above_policy_cap_does_not_preauthorize_escalation() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     let approver = ctx.approver.as_ref().unwrap();
     let info = crate::approval::classify::classify("rm foo").simple_commands()[0].clone();
     approver
@@ -2072,7 +2172,7 @@ async fn risky_grant_above_policy_cap_does_not_preauthorize_escalation() {
 #[tokio::test]
 async fn wrapper_never_preauthorizes_escalation() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     // A wrapper can't be persisted, so it can never preauthorize the
     // unconfined rerun.
     assert_eq!(
@@ -2122,7 +2222,7 @@ async fn no_approver_never_preauthorizes_escalation() {
 #[tokio::test]
 async fn sandbox_meta_records_sandbox_off_state() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     ctx.session.set_sandbox_enabled(false);
     grant_command(&ctx, "printf hi", Scope::Session).await;
     let _guard = set_bash_test_overrides(None, None, [(false, shell_out("hi", "", 0))]);
@@ -2145,7 +2245,7 @@ async fn sandbox_meta_records_sandbox_off_state() {
 #[tokio::test]
 async fn escalation_preauthorized_computed_without_sandbox() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     ctx.session.set_sandbox_enabled(false);
     grant_command(&ctx, "printf hi", Scope::Session).await;
 
@@ -2160,15 +2260,14 @@ async fn escalation_preauthorized_computed_without_sandbox() {
 #[tokio::test]
 async fn sandbox_off_ungranted_command_prompts_and_deny_blocks_run() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     ctx.session.set_sandbox_enabled(false);
     let marker = tmp.path().join("marker");
     let db = ctx.session.db.clone();
     let sid = ctx.session.id;
     let hub = ctx.interrupts.clone();
-    let resolver = tokio::spawn(async move {
-        resolve_next_interrupt_with_response(db, sid, hub, ResolveResponse::Cancel, None).await
-    });
+    let resolver =
+        spawn_resolve_next_interrupt_with_response(db, sid, hub, ResolveResponse::Cancel, None);
 
     let out = BashTool::new()
         .call(
@@ -2189,7 +2288,7 @@ async fn sandbox_off_ungranted_command_prompts_and_deny_blocks_run() {
 #[tokio::test]
 async fn yolo_sandbox_off_ungranted_bash_runs_without_prompt() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     ctx.session.set_sandbox_enabled(false);
     ctx.session
         .set_approval_mode(crate::config::extended::ApprovalMode::Yolo);
@@ -2214,7 +2313,7 @@ async fn yolo_sandbox_off_ungranted_bash_runs_without_prompt() {
 #[tokio::test]
 async fn auto_unconfined_bash_unsafe_gate_prompts_or_denies() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     ctx.session.set_sandbox_enabled(false);
     ctx.session
         .set_approval_mode(crate::config::extended::ApprovalMode::Auto);
@@ -2222,9 +2321,8 @@ async fn auto_unconfined_bash_unsafe_gate_prompts_or_denies() {
     let db = ctx.session.db.clone();
     let sid = ctx.session.id;
     let hub = ctx.interrupts.clone();
-    let resolver = tokio::spawn(async move {
-        resolve_next_interrupt_with_response(db, sid, hub, ResolveResponse::Cancel, None).await
-    });
+    let resolver =
+        spawn_resolve_next_interrupt_with_response(db, sid, hub, ResolveResponse::Cancel, None);
 
     let out = BashTool::new()
         .call(
@@ -2245,7 +2343,7 @@ async fn auto_unconfined_bash_unsafe_gate_prompts_or_denies() {
 #[tokio::test]
 async fn sandbox_off_granted_command_runs_without_prompt() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     ctx.session.set_sandbox_enabled(false);
     grant_command(&ctx, "printf hi", Scope::Session).await;
     let _guard = set_bash_test_overrides(None, None, [(false, shell_out("hi", "", 0))]);
@@ -2297,24 +2395,21 @@ async fn sandbox_off_without_approver_denies() {
 #[tokio::test]
 async fn sandbox_off_noninteractive_denial_blocks_run() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     ctx.session.set_sandbox_enabled(false);
     let marker = tmp.path().join("marker");
     let db = ctx.session.db.clone();
     let sid = ctx.session.id;
     let hub = ctx.interrupts.clone();
-    let resolver = tokio::spawn(async move {
-        resolve_next_interrupt_with_response(
-            db,
-            sid,
-            hub,
-            ResolveResponse::Freetext {
-                text: crate::approval::NONINTERACTIVE_RUN_DENIAL.into(),
-            },
-            None,
-        )
-        .await
-    });
+    let resolver = spawn_resolve_next_interrupt_with_response(
+        db,
+        sid,
+        hub,
+        ResolveResponse::Freetext {
+            text: crate::approval::NONINTERACTIVE_RUN_DENIAL.into(),
+        },
+        None,
+    );
 
     let out = BashTool::new()
         .call(
@@ -2331,13 +2426,12 @@ async fn sandbox_off_noninteractive_denial_blocks_run() {
 #[tokio::test]
 async fn sandbox_off_wrapper_always_prompts() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     ctx.session.set_sandbox_enabled(false);
     let db = ctx.session.db.clone();
     let sid = ctx.session.id;
     let hub = ctx.interrupts.clone();
-    let resolver =
-        tokio::spawn(async move { resolve_next_interrupt(db, sid, hub, ID_REJECT, None).await });
+    let resolver = resolve_next_interrupt(db, sid, hub, ID_REJECT, None);
     let _guard = set_bash_test_overrides(None, None, [(false, shell_out("hi", "", 0))]);
 
     let out = BashTool::new()
@@ -2355,7 +2449,7 @@ async fn sandbox_off_wrapper_always_prompts() {
 #[tokio::test]
 async fn force_unconfined_rerun_does_not_reprompt() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut ctx = ctx_with_store(tmp.path());
+    let mut ctx = ctx_with_store(tmp.path()).await;
     ctx.approver = None;
     let _guard = set_bash_test_overrides(None, None, [(false, shell_out("hi", "", 0))]);
 
@@ -2380,7 +2474,7 @@ async fn force_unconfined_rerun_does_not_reprompt() {
 #[tokio::test]
 async fn granted_command_still_runs_confined() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     let command = "printf hi";
     grant_command(&ctx, command, Scope::Session).await;
     let _guard = set_bash_test_overrides(
@@ -2406,7 +2500,7 @@ async fn granted_command_still_runs_confined() {
 #[tokio::test]
 async fn granted_command_escalates_without_prompting() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     let command = "printf hi";
     grant_command(&ctx, command, Scope::Session).await;
     let _guard = set_bash_test_overrides(
@@ -2444,13 +2538,11 @@ async fn granted_command_escalates_without_prompting() {
 #[tokio::test]
 async fn ungranted_command_still_prompts_on_confined_failure() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     let db = ctx.session.db.clone();
     let sid = ctx.session.id;
     let hub = ctx.interrupts.clone();
-    let resolver = tokio::spawn(async move {
-        resolve_next_interrupt_with_escalation(db, sid, hub, ID_APPROVE_ONCE).await
-    });
+    let resolver = resolve_next_interrupt_with_escalation(db, sid, hub, ID_APPROVE_ONCE);
     let _guard = set_bash_test_overrides(
         Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
         Some((13, "sandbox denied".to_string())),
@@ -2460,8 +2552,7 @@ async fn ungranted_command_still_prompts_on_confined_failure() {
         ],
     );
 
-    let out = BashTool::new()
-        .call(serde_json::json!({ "command": "printf hi" }), &ctx)
+    let out = call_bash_host_effect_for_test(serde_json::json!({ "command": "printf hi" }), &ctx)
         .await
         .expect("bash call returns");
     resolver.await.unwrap();
@@ -2477,7 +2568,7 @@ async fn ungranted_command_still_prompts_on_confined_failure() {
 #[tokio::test]
 async fn sandbox_denial_grant_auto_rerun_once() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     let work = tmp.path().join("work");
     std::fs::create_dir(&work).unwrap();
     let command = "cat ../secret.txt";
@@ -2524,7 +2615,7 @@ async fn sandbox_denial_grant_auto_rerun_once() {
 #[tokio::test]
 async fn sandbox_denial_high_without_grant_raises_escalation() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     let work = tmp.path().join("work");
     std::fs::create_dir(&work).unwrap();
     let outside = tmp.path().join("secret.txt");
@@ -2532,9 +2623,7 @@ async fn sandbox_denial_high_without_grant_raises_escalation() {
     let db = ctx.session.db.clone();
     let sid = ctx.session.id;
     let hub = ctx.interrupts.clone();
-    let resolver = tokio::spawn(async move {
-        resolve_next_interrupt_with_escalation(db, sid, hub, ID_APPROVE_ONCE).await
-    });
+    let resolver = resolve_next_interrupt_with_escalation(db, sid, hub, ID_APPROVE_ONCE);
     let _guard = set_bash_test_overrides(
         Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
         None,
@@ -2547,13 +2636,12 @@ async fn sandbox_denial_high_without_grant_raises_escalation() {
         ],
     );
 
-    let out = BashTool::new()
-        .call(
-            serde_json::json!({ "command": command, "cwd": work.display().to_string() }),
-            &ctx,
-        )
-        .await
-        .expect("bash call returns");
+    let out = call_bash_host_effect_for_test(
+        serde_json::json!({ "command": command, "cwd": work.display().to_string() }),
+        &ctx,
+    )
+    .await
+    .expect("bash call returns");
     let (_iid, escalation) = resolver.await.unwrap();
     let escalation = escalation.expect("escalation carries detail");
     let denial = escalation
@@ -2583,7 +2671,7 @@ async fn sandbox_denial_high_without_grant_raises_escalation() {
 #[tokio::test]
 async fn sandbox_denial_wire_report_populated_on_auto_raise() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     let work = tmp.path().join("work");
     std::fs::create_dir(&work).unwrap();
     let outside = tmp.path().join("secret.txt");
@@ -2591,9 +2679,7 @@ async fn sandbox_denial_wire_report_populated_on_auto_raise() {
     let db = ctx.session.db.clone();
     let sid = ctx.session.id;
     let hub = ctx.interrupts.clone();
-    let resolver = tokio::spawn(async move {
-        resolve_next_interrupt_with_escalation(db, sid, hub, ID_REJECT).await
-    });
+    let resolver = resolve_next_interrupt_with_escalation(db, sid, hub, ID_REJECT);
     let _guard = set_bash_test_overrides(
         Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
         None,
@@ -2637,7 +2723,7 @@ async fn sandbox_denial_wire_report_populated_on_auto_raise() {
 #[tokio::test]
 async fn sandbox_denial_possible_appends_evidence_note() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     ctx.session.set_sandbox_escalation_enabled(true);
     let _guard = set_bash_test_overrides(
         Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
@@ -2665,7 +2751,7 @@ async fn sandbox_denial_possible_appends_evidence_note() {
 #[tokio::test]
 async fn sandbox_denial_no_rerun_loop() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     let work = tmp.path().join("work");
     std::fs::create_dir(&work).unwrap();
     let command = "cat ../secret.txt";
@@ -2698,7 +2784,7 @@ async fn sandbox_denial_no_rerun_loop() {
 #[tokio::test]
 async fn confined_success_never_prompts() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     let _guard = set_bash_test_overrides(
         Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
         None,
@@ -2729,12 +2815,11 @@ async fn confined_success_never_prompts() {
 #[tokio::test]
 async fn wrapper_is_never_preauthorized_for_escalation() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     let db = ctx.session.db.clone();
     let sid = ctx.session.id;
     let hub = ctx.interrupts.clone();
-    let resolver =
-        tokio::spawn(async move { resolve_next_interrupt(db, sid, hub, ID_REJECT, None).await });
+    let resolver = resolve_next_interrupt(db, sid, hub, ID_REJECT, None);
     let _guard = set_bash_test_overrides(
         Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
         Some((13, "sandbox denied".to_string())),
@@ -2760,7 +2845,7 @@ async fn wrapper_is_never_preauthorized_for_escalation() {
 #[tokio::test]
 async fn sandbox_unavailable_is_not_turned_into_a_prompt() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     let _guard = set_bash_test_overrides(
         Some(
             crate::tools::shell_sandbox::SandboxAvailability::Unavailable {
@@ -2810,7 +2895,7 @@ fn assert_no_escalate_note(content: &str) {
 #[tokio::test]
 async fn confined_failure_names_escalate_and_call_id_in_normal_mode() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut ctx = ctx_with_store(tmp.path());
+    let mut ctx = ctx_with_store(tmp.path()).await;
     ctx.current_tool_call_id = Some("call-normal".to_string());
     ctx.session.set_sandbox_escalation_enabled(true);
     let _guard = set_bash_test_overrides(
@@ -2837,7 +2922,7 @@ async fn confined_failure_names_escalate_and_call_id_in_normal_mode() {
 #[tokio::test]
 async fn confined_failure_omits_call_id_clause_when_missing() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     ctx.session.set_sandbox_escalation_enabled(true);
     let _guard = set_bash_test_overrides(
         Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
@@ -2862,7 +2947,7 @@ async fn confined_failure_omits_call_id_clause_when_missing() {
 #[tokio::test]
 async fn confined_failure_names_escalate_when_escalate_tool_available() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut ctx = ctx_with_store(tmp.path());
+    let mut ctx = ctx_with_store(tmp.path()).await;
     // Issue #75: the escalate capability is now resolved at toolbox-construction
     // time, so the bash runtime gate checks `escalate` tool presence.
     ctx.available_tools = Arc::new(std::collections::HashSet::from(["escalate".to_string()]));
@@ -2890,7 +2975,7 @@ async fn confined_failure_names_escalate_when_escalate_tool_available() {
 #[tokio::test]
 async fn confined_failure_omits_escalate_note_when_escalate_tool_absent() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut ctx = ctx_with_store(tmp.path());
+    let mut ctx = ctx_with_store(tmp.path()).await;
     // No `escalate` tool registered → the runtime gate omits the note even
     // under verbose steering.
     ctx.available_tools = Arc::new(std::collections::HashSet::new());
@@ -2921,7 +3006,7 @@ async fn confined_failure_omits_escalate_note_when_escalate_tool_absent() {
 #[tokio::test]
 async fn confined_failure_omits_escalate_note_when_escalation_disabled() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut ctx = ctx_with_store(tmp.path());
+    let mut ctx = ctx_with_store(tmp.path()).await;
     ctx.available_tools = Arc::new(std::collections::HashSet::from(["escalate".to_string()]));
     ctx.current_tool_call_id = Some("call-disabled".to_string());
     ctx.session.set_sandbox_escalation_enabled(false);
@@ -2944,7 +3029,7 @@ async fn confined_failure_omits_escalate_note_when_escalation_disabled() {
 #[tokio::test]
 async fn confined_failure_omits_escalate_note_on_an_already_escalated_run() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut ctx = ctx_with_store(tmp.path());
+    let mut ctx = ctx_with_store(tmp.path()).await;
     ctx.current_tool_call_id = Some("call-escalated".to_string());
     ctx.session.set_sandbox_escalation_enabled(true);
     let _guard = set_bash_test_overrides(
@@ -2966,7 +3051,7 @@ async fn confined_failure_omits_escalate_note_on_an_already_escalated_run() {
 #[tokio::test]
 async fn confined_success_body_is_unchanged() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut ctx = ctx_with_store(tmp.path());
+    let mut ctx = ctx_with_store(tmp.path()).await;
     ctx.current_tool_call_id = Some("call-success".to_string());
     ctx.session.set_sandbox_escalation_enabled(true);
     let outcome = shell_out("ok", "", 0);
@@ -3014,7 +3099,7 @@ async fn unconfined_failure_omits_escalate_note() {
 #[tokio::test]
 async fn sandbox_unavailable_refusal_names_escalate_in_normal_mode() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut ctx = ctx_with_store(tmp.path());
+    let mut ctx = ctx_with_store(tmp.path()).await;
     ctx.current_tool_call_id = Some("call-unavailable".to_string());
     ctx.session.set_sandbox_escalation_enabled(true);
     let _guard = set_bash_test_overrides(Some(sandbox_unavailable("bwrap absent")), None, []);
@@ -3034,7 +3119,7 @@ async fn sandbox_unavailable_refusal_names_escalate_in_normal_mode() {
 #[tokio::test]
 async fn sandbox_unavailable_refusal_names_escalate_when_escalate_tool_available() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut ctx = ctx_with_store(tmp.path());
+    let mut ctx = ctx_with_store(tmp.path()).await;
     ctx.available_tools = Arc::new(std::collections::HashSet::from(["escalate".to_string()]));
     ctx.current_tool_call_id = Some("call-unavailable-escalate".to_string());
     ctx.session.set_sandbox_escalation_enabled(true);
@@ -3057,7 +3142,7 @@ async fn sandbox_unavailable_refusal_names_escalate_when_escalate_tool_available
 #[tokio::test]
 async fn sandbox_unavailable_refusal_is_unchanged_without_escalation() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut ctx = ctx_with_store(tmp.path());
+    let mut ctx = ctx_with_store(tmp.path()).await;
     ctx.tool_steering = crate::agents::ToolSteering::Verbose;
     ctx.current_tool_call_id = Some("call-no-escalation-unavailable".to_string());
     ctx.session.set_sandbox_escalation_enabled(false);
@@ -3156,7 +3241,7 @@ async fn open_escalation(
 #[tokio::test]
 async fn defensive_human_escalation_offer_is_run_once_or_deny_only() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut ctx = ctx_with_store(tmp.path());
+    let mut ctx = ctx_with_store(tmp.path()).await;
     ctx.tool_steering = crate::agents::ToolSteering::Verbose;
     ctx.session.set_sandbox_escalation_enabled(true);
     ctx.session
@@ -3165,15 +3250,10 @@ async fn defensive_human_escalation_offer_is_run_once_or_deny_only() {
     let db = ctx.session.db.clone();
     let sid = ctx.session.id;
     let hub = ctx.interrupts.clone();
+    let mut raised = hub.subscribe_raised();
     let cwd = tmp.path().display().to_string();
     let resolver = tokio::spawn(async move {
-        let iid = loop {
-            let open = db.list_open_interrupts(sid).await.unwrap();
-            if let Some(row) = open.first() {
-                break row.interrupt_id;
-            }
-            tokio::task::yield_now().await;
-        };
+        let iid = raised.recv().await.expect("escalation prompt is published");
         let open = db.list_open_interrupts(sid).await.unwrap();
         let row = open
             .iter()
@@ -3213,8 +3293,7 @@ async fn defensive_human_escalation_offer_is_run_once_or_deny_only() {
         let response = crate::daemon::proto::ResolveResponse::Single {
             selected_id: crate::approval::ID_REJECT.into(),
         };
-        db.resolve_interrupt(iid, &response).await.unwrap();
-        assert!(hub.resolve(iid, response));
+        settle_host_approval_interrupt(&db, sid, &hub, iid, response).await;
     });
 
     let decision = defensive_human_escalation_offer(
@@ -3234,7 +3313,7 @@ async fn defensive_human_escalation_offer_is_run_once_or_deny_only() {
 #[tokio::test]
 async fn defensive_human_escalation_offer_yolo_runs_unconfined_once() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut ctx = ctx_with_store(tmp.path());
+    let mut ctx = ctx_with_store(tmp.path()).await;
     ctx.tool_steering = crate::agents::ToolSteering::Verbose;
     ctx.session.set_sandbox_escalation_enabled(true);
     ctx.session
@@ -3262,7 +3341,7 @@ async fn defensive_human_escalation_offer_yolo_runs_unconfined_once() {
 #[tokio::test]
 async fn defensive_human_escalation_offer_auto_prompts_human() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut ctx = ctx_with_store(tmp.path());
+    let mut ctx = ctx_with_store(tmp.path()).await;
     ctx.tool_steering = crate::agents::ToolSteering::Verbose;
     ctx.session.set_sandbox_escalation_enabled(true);
     ctx.session
@@ -3271,28 +3350,27 @@ async fn defensive_human_escalation_offer_auto_prompts_human() {
     let db = ctx.session.db.clone();
     let sid = ctx.session.id;
     let hub = ctx.interrupts.clone();
+    let mut raised = hub.subscribe_raised();
     let resolver = tokio::spawn(async move {
-        let iid = loop {
-            let open = db.list_open_interrupts(sid).await.unwrap();
-            if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
-                break row.interrupt_id;
-            }
-            tokio::task::yield_now().await;
-        };
+        let iid = raised.recv().await.expect("escalation prompt is published");
         let response = crate::daemon::proto::ResolveResponse::Single {
             selected_id: crate::approval::ID_ESCALATE_RUN_UNCONFINED_ONCE.into(),
         };
-        db.resolve_interrupt(iid, &response).await.unwrap();
-        assert!(hub.resolve(iid, response));
+        settle_host_approval_interrupt(&db, sid, &hub, iid, response).await;
     });
 
-    let out = defensive_human_escalation_offer(
-        serde_json::json!({ "command": "printf auto" }),
-        "printf auto",
-        tmp.path(),
-        1,
-        "sandbox unavailable".to_string(),
-        &ctx,
+    let out = crate::engine::interrupt::with_host_approval_effect_scope(
+        "defensive_human_escalation_test",
+        tokio_util::sync::CancellationToken::new(),
+        defensive_human_escalation_offer(
+            serde_json::json!({ "command": "printf auto" }),
+            "printf auto",
+            tmp.path(),
+            1,
+            "sandbox unavailable".to_string(),
+            &ctx,
+        ),
+        |output| output.as_ref().map(|output| output.exit_code == Some(0)),
     )
     .await
     .unwrap()
@@ -3311,22 +3389,17 @@ async fn defensive_human_escalation_offer_auto_prompts_human() {
 #[tokio::test]
 async fn escalate_approve_session_carries_confined_detail_and_records_scope() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     let approver = ctx.approver.as_ref().unwrap().clone();
     let db = ctx.session.db.clone();
     let sid = ctx.session.id;
     let hub = ctx.interrupts.clone();
+    let mut raised = hub.subscribe_raised();
 
     let resolver = tokio::spawn(async move {
         // The approval prompt carries the distinct escalation block and
         // resolves directly to a scoped action.
-        let iid = loop {
-            let open = db.list_open_interrupts(sid).await.unwrap();
-            if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
-                break row.interrupt_id;
-            }
-            tokio::task::yield_now().await;
-        };
+        let iid = raised.recv().await.expect("escalation prompt is published");
         let esc = open_escalation(&db, sid, iid)
             .await
             .expect("escalation block present");
@@ -3335,14 +3408,17 @@ async fn escalate_approve_session_carries_confined_detail_and_records_scope() {
         let response = crate::daemon::proto::ResolveResponse::Single {
             selected_id: crate::approval::ID_APPROVE_SESSION.into(),
         };
-        db.resolve_interrupt(iid, &response).await.unwrap();
-        assert!(hub.resolve(iid, response));
+        settle_host_approval_interrupt(&db, sid, &hub, iid, response).await;
     });
 
-    let decision = approver
-        .approve_command_escalated("cat /etc/secret", 13, "cat: Permission denied".into())
-        .await
-        .unwrap();
+    let decision = crate::engine::interrupt::with_host_approval_effect_scope(
+        "escalated_command_approval_test",
+        tokio_util::sync::CancellationToken::new(),
+        approver.approve_command_escalated("cat /etc/secret", 13, "cat: Permission denied".into()),
+        |decision| Some(decision.is_allowed()),
+    )
+    .await
+    .unwrap();
     resolver.await.unwrap();
     assert_eq!(
         decision,
@@ -3368,23 +3444,17 @@ async fn escalate_approve_session_carries_confined_detail_and_records_scope() {
 #[tokio::test]
 async fn escalate_deny_keeps_confined_failure_and_records_no_scope() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     let approver = ctx.approver.as_ref().unwrap().clone();
     let db = ctx.session.db.clone();
     let sid = ctx.session.id;
     let hub = ctx.interrupts.clone();
+    let mut raised = hub.subscribe_raised();
 
     let resolver = tokio::spawn(async move {
-        let iid = loop {
-            let open = db.list_open_interrupts(sid).await.unwrap();
-            if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
-                break row.interrupt_id;
-            }
-            tokio::task::yield_now().await;
-        };
+        let iid = raised.recv().await.expect("escalation prompt is published");
         let response = crate::daemon::proto::ResolveResponse::Cancel;
-        db.resolve_interrupt(iid, &response).await.unwrap();
-        assert!(hub.resolve(iid, response));
+        settle_host_approval_interrupt(&db, sid, &hub, iid, response).await;
     });
 
     let decision = approver
@@ -3708,14 +3778,11 @@ async fn spawn_error_diagnostic_includes_command_cwd_and_error() {
 #[tokio::test]
 async fn windows_unconfined_shell_takes_grant_or_ask() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     let db = ctx.session.db.clone();
     let sid = ctx.session.id;
     let hub = ctx.interrupts.clone();
-    let resolver =
-        tokio::spawn(
-            async move { resolve_next_interrupt(db, sid, hub, ID_APPROVE_ONCE, None).await },
-        );
+    let resolver = resolve_next_interrupt(db, sid, hub, ID_APPROVE_ONCE, None);
     let _guard = set_bash_test_overrides(
         Some(
             crate::tools::shell_sandbox::SandboxAvailability::UnsupportedPlatform {
@@ -3726,10 +3793,10 @@ async fn windows_unconfined_shell_takes_grant_or_ask() {
         [(false, shell_out("approved", "", 0))],
     );
 
-    let output = BashTool::new()
-        .call(serde_json::json!({ "command": "printf approved" }), &ctx)
-        .await
-        .expect("unconfined bash call returns");
+    let output =
+        call_bash_host_effect_for_test(serde_json::json!({ "command": "printf approved" }), &ctx)
+            .await
+            .expect("unconfined bash call returns");
     resolver.await.unwrap();
 
     assert!(output.content.contains("approved"));
@@ -3741,7 +3808,7 @@ async fn windows_unconfined_shell_takes_grant_or_ask() {
 #[tokio::test]
 async fn windows_grant_suppresses_prompt() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     let command = "printf granted";
     grant_command(&ctx, command, Scope::Session).await;
     let _guard = set_bash_test_overrides(
@@ -3771,7 +3838,7 @@ async fn windows_grant_suppresses_prompt() {
 #[tokio::test]
 async fn windows_no_approver_fails_closed() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut ctx = ctx_with_store(tmp.path());
+    let mut ctx = ctx_with_store(tmp.path()).await;
     ctx.approver = None;
     let _guard = set_bash_test_overrides(
         Some(
@@ -3928,7 +3995,7 @@ async fn capability_refuse_never_runs_unconfined_even_if_live_probe_is_available
     use cockpit_proto::FeatureCapabilityState;
 
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
+    let ctx = ctx_with_store(tmp.path()).await;
     ctx.session.set_sandbox_mode(SandboxMode::Refuse);
     ctx.config.set_full_config_snapshot_for_tests(
         crate::daemon::session_worker::SessionConfigSnapshot::new(
@@ -3987,7 +4054,7 @@ async fn capability_refuse_covers_missing_and_unpublished_snapshots() {
         crate::daemon::session_worker::unpublished_host_capability_snapshot(),
     ] {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = ctx_with_store(tmp.path());
+        let ctx = ctx_with_store(tmp.path()).await;
         ctx.session.set_sandbox_mode(SandboxMode::Refuse);
         ctx.config.set_full_config_snapshot_for_tests(
             crate::daemon::session_worker::SessionConfigSnapshot::new(

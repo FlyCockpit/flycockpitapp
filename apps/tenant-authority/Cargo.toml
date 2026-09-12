@@ -57,3 +57,4 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 base64 = { workspace = true }
+cockpit-config = { path = "../../crates/cockpit-config", features = ["test-support"] }

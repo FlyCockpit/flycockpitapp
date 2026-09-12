@@ -5245,7 +5245,237 @@ async fn active_interrupt_hydration_rebroadcasts_with_rehydration_reason() {
 }
 
 #[tokio::test]
-async fn shutdown_activity_snapshot_counts_open_and_parked_interrupts_as_pending_paused_work() {
+async fn interrupted_interrupt_hydration_requires_and_replays_committed_state() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_for_test(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let session_id = session.id;
+    let set = proto::InterruptQuestionSet {
+        questions: vec![proto::InterruptQuestion::Freetext {
+            prompt: "Why?".to_string(),
+            masked: false,
+        }],
+    };
+    let interrupt_id = db
+        .raise_interrupt_questions(session_id, "Build", "context", &set)
+        .await
+        .unwrap();
+    let locks = Arc::new(LockManager::in_memory(db.clone()));
+    let handle = SessionWorkerHandle::test_handle(Arc::new(session), locks);
+    let mut rx = handle.subscribe();
+
+    handle.broadcast_interrupted_interrupts().await.unwrap();
+    assert!(
+        rx.try_recv().is_err(),
+        "an open row must not emit interrupted state"
+    );
+
+    assert!(db.mark_interrupt_interrupted(interrupt_id).await.unwrap());
+    handle.broadcast_interrupted_interrupts().await.unwrap();
+    assert!(matches!(
+        rx.try_recv().expect("durable interrupted-state replay").event,
+        proto::Event::InterruptInterrupted {
+            session_id: got_session_id,
+            interrupt_id: got_interrupt_id,
+        } if got_session_id == session_id && got_interrupt_id == interrupt_id
+    ));
+    assert!(rx.try_recv().is_err(), "exactly one committed row replayed");
+}
+
+#[tokio::test]
+async fn failed_interrupt_settlement_does_not_emit_interrupted_event() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_for_test(
+        db,
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(8);
+    let redaction: SharedRedactionTable = Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
+
+    assert!(
+        !settle_unrecoverable_interrupt(
+            &session,
+            &event_tx,
+            &redaction,
+            session.id,
+            Uuid::new_v4(),
+            false,
+            "failed settlement".to_string(),
+        )
+        .await
+    );
+    while let Ok(envelope) = event_rx.try_recv() {
+        assert!(
+            !matches!(envelope.event, proto::Event::InterruptInterrupted { .. }),
+            "a failed durable transition must not emit interrupted state"
+        );
+    }
+}
+
+fn parked_replay_test_payload() -> crate::db::needs_attention::InterruptParkPayload {
+    crate::db::needs_attention::InterruptParkPayload {
+        tool: "question".to_string(),
+        args: serde_json::json!({}),
+        call_id: "call-1".to_string(),
+        resume: crate::db::needs_attention::InterruptResumeAnchor {
+            agent_id: "Build".to_string(),
+            call_id: "call-1".to_string(),
+            provider_item_id: None,
+            provider_call_id: None,
+            assistant_seq: None,
+            call_origin: crate::db::needs_attention::InterruptCallOrigin::Foreground,
+        },
+        gate: None,
+        verification: None,
+    }
+}
+
+async fn executing_parked_interrupt(
+    db: &Db,
+    session_id: Uuid,
+) -> (Uuid, crate::db::needs_attention::NeedsAttentionRow) {
+    let set = proto::InterruptQuestionSet {
+        questions: vec![proto::InterruptQuestion::Freetext {
+            prompt: "Why?".to_string(),
+            masked: false,
+        }],
+    };
+    let interrupt_id = db
+        .raise_interrupt_questions_with_payload(
+            session_id,
+            "Build",
+            "context",
+            &set,
+            Some(&parked_replay_test_payload()),
+        )
+        .await
+        .unwrap();
+    assert!(db.park_interrupt(interrupt_id).await.unwrap());
+    assert!(
+        db.begin_parked_interrupt_execution(
+            interrupt_id,
+            &proto::ResolveResponse::Freetext {
+                text: "answer".to_string(),
+            },
+        )
+        .await
+        .unwrap()
+    );
+    let row = db.get_interrupt(interrupt_id).await.unwrap().unwrap();
+    (interrupt_id, row)
+}
+
+#[tokio::test]
+async fn parked_replay_failure_emits_exact_interrupted_completion_after_commit() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_for_test(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let session_id = session.id;
+    let (interrupt_id, _) = executing_parked_interrupt(&db, session_id).await;
+    let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(8);
+    let redaction: SharedRedactionTable = Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
+    let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached());
+
+    assert!(
+        !finish_parked_replay_completion(
+            &session,
+            &event_tx,
+            &redaction,
+            &interrupts,
+            session_id,
+            ParkedReplayCompletion {
+                interrupt_id,
+                decision: None,
+                was_active: true,
+                result: Err("executor disappeared".to_string()),
+            },
+        )
+        .await
+    );
+    assert!(matches!(
+        event_rx.try_recv().expect("typed completion").event,
+        proto::Event::InterruptInterrupted {
+            session_id: got_session_id,
+            interrupt_id: got_interrupt_id,
+        } if got_session_id == session_id && got_interrupt_id == interrupt_id
+    ));
+    assert_eq!(
+        db.get_interrupt(interrupt_id).await.unwrap().unwrap().state,
+        crate::db::needs_attention::InterruptState::Interrupted
+    );
+}
+
+#[tokio::test]
+async fn malformed_claimed_parked_rows_emit_exact_interrupted_completion_after_commit() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_for_test(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let session_id = session.id;
+    let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(8);
+    let redaction: SharedRedactionTable = Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
+
+    for malformed in [
+        ClaimedParkedReplayError::MissingPayload,
+        ClaimedParkedReplayError::MissingQuestion,
+    ] {
+        let (interrupt_id, mut row) = executing_parked_interrupt(&db, session_id).await;
+        match malformed {
+            ClaimedParkedReplayError::MissingPayload => row.parked = None,
+            ClaimedParkedReplayError::MissingQuestion => {
+                row.question = None;
+                row.questions = None;
+            }
+        }
+        assert_eq!(claimed_parked_replay_parts(&row).unwrap_err(), malformed);
+        assert!(
+            mark_client_visible_interrupt_interrupted(
+                &session,
+                &event_tx,
+                &redaction,
+                session_id,
+                interrupt_id,
+                false,
+            )
+            .await
+        );
+        assert!(matches!(
+            event_rx.try_recv().expect("typed completion").event,
+            proto::Event::InterruptInterrupted {
+                session_id: got_session_id,
+                interrupt_id: got_interrupt_id,
+            } if got_session_id == session_id && got_interrupt_id == interrupt_id
+        ));
+        assert_eq!(
+            db.get_interrupt(interrupt_id).await.unwrap().unwrap().state,
+            crate::db::needs_attention::InterruptState::Interrupted
+        );
+    }
+}
+
+#[tokio::test]
+async fn shutdown_durability_commit_parks_interrupt_and_writes_paused_work_atomically() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open_in_memory().unwrap();
     let session = Session::create_for_test(
@@ -5272,28 +5502,66 @@ async fn shutdown_activity_snapshot_counts_open_and_parked_interrupts_as_pending
             sandbox_escalation: None,
         }],
     };
+    let successor_id = db
+        .create_session("p", tmp.path().to_str().unwrap(), "Build")
+        .await
+        .unwrap()
+        .session_id;
+    session.adopt_compaction_successor(successor_id, "successor".to_string());
+    assert_eq!(session.live_id(), successor_id);
     let open = db
-        .raise_interrupt_questions(session_id, "Build", "open", &set)
+        .raise_interrupt_questions(successor_id, "Build", "open", &set)
         .await
         .unwrap();
     let parked = db
-        .raise_interrupt_questions(session_id, "Build", "parked", &set)
+        .raise_interrupt_questions(successor_id, "Build", "parked", &set)
         .await
         .unwrap();
     assert!(db.park_interrupt(parked).await.unwrap());
 
     let live = LiveState::default();
     let interrupts = crate::engine::interrupt::InterruptHub::detached();
-    let (active, pending_tool_count, _committed) =
-        shutdown_activity_snapshot(&session, session_id, &interrupts, &live).await;
+    let (active, pending_tool_count, committed) = shutdown_activity_snapshot(
+        &session,
+        session_id,
+        "Build",
+        tmp.path(),
+        &interrupts,
+        &live,
+    )
+    .await;
 
+    assert!(
+        committed,
+        "the atomic shutdown durability commit must succeed"
+    );
     assert!(active, "blocked-only sessions must be paused on shutdown");
     assert_eq!(
         pending_tool_count, 2,
         "paused row count must include both open and already-parked interrupts"
     );
-    assert_eq!(db.list_open_interrupts(session_id).await.unwrap().len(), 2);
-    assert!(db.get_interrupt(open).await.unwrap().is_some());
+    assert!(db.paused_session_work(session_id).await.unwrap().is_some());
+    assert!(
+        db.paused_session_work(successor_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        db.list_open_interrupts(successor_id).await.unwrap().len(),
+        2
+    );
+    assert_eq!(
+        db.get_interrupt(open).await.unwrap().unwrap().state,
+        crate::db::needs_attention::InterruptState::Parked,
+        "the shared drain durability operation must park open work"
+    );
+}
+
+#[test]
+fn shutdown_pending_count_retains_parked_waiters_excluded_from_recovery_projection() {
+    assert_eq!(shutdown_pending_tool_count(0, 1), 1);
+    assert_eq!(shutdown_pending_tool_count(2, 1), 2);
 }
 
 /// §6.5 de-dupe: the latch fires the broadcast exactly once per condition.

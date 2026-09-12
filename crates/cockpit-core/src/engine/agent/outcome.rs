@@ -359,19 +359,22 @@ pub(crate) fn validate_batch_dependencies(entries: &[BatchTaskEntry]) -> Result<
 /// conversation handoff — even though those agents are interactive when spawned
 /// fresh. Absent a resume handle, an explicit `mode` override wins
 /// (`subagent` → noninteractive, `subagent_interactive` → interactive — the
-/// per-call execution style), then the agent's own default
+/// per-call execution style), then a caller-supplied forced-noninteractive
+/// default (used by vNext trees), then the agent's own default
 /// ([`crate::engine::builtin::is_noninteractive`]).
 pub(super) fn resolve_interactivity(
     mode: Option<&str>,
     child: &str,
     has_resume_handle: bool,
+    force_noninteractive: bool,
 ) -> bool {
     if has_resume_handle {
         return true;
     }
-    match mode {
+    match mode.map(str::trim) {
         Some("subagent_interactive") => false,
         Some("subagent") => true,
+        _ if force_noninteractive => true,
         _ => crate::engine::builtin::is_noninteractive(child),
     }
 }
@@ -523,18 +526,29 @@ mod interactivity_tests {
     /// noninteractive leaf.
     #[test]
     fn fresh_delegation_uses_agent_default() {
-        assert!(!resolve_interactivity(None, "builder", false));
-        assert!(resolve_interactivity(None, "explore", false));
-        assert!(resolve_interactivity(None, "my-custom-subagent", false));
+        assert!(!resolve_interactivity(None, "builder", false, false));
+        assert!(resolve_interactivity(None, "explore", false, false));
+        assert!(resolve_interactivity(
+            None,
+            "my-custom-subagent",
+            false,
+            false
+        ));
     }
 
     /// An explicit `mode` overrides the default for a fresh delegation.
     #[test]
     fn explicit_mode_overrides_for_fresh_delegation() {
-        assert!(resolve_interactivity(Some("subagent"), "builder", false));
+        assert!(resolve_interactivity(
+            Some("  subagent  "),
+            "builder",
+            false,
+            false
+        ));
         assert!(!resolve_interactivity(
-            Some("subagent_interactive"),
+            Some("  subagent_interactive  "),
             "explore",
+            false,
             false
         ));
     }
@@ -546,13 +560,14 @@ mod interactivity_tests {
     /// (implementation note).
     #[test]
     fn followup_is_always_noninteractive() {
-        assert!(resolve_interactivity(None, "builder", true));
-        assert!(resolve_interactivity(None, "explore", true));
+        assert!(resolve_interactivity(None, "builder", true, false));
+        assert!(resolve_interactivity(None, "explore", true, false));
         // An interactive `mode` request cannot un-noninteractive a follow-up.
         assert!(resolve_interactivity(
-            Some("subagent_interactive"),
+            Some("  subagent_interactive  "),
             "builder",
-            true
+            true,
+            false
         ));
     }
 }

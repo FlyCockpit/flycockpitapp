@@ -258,8 +258,12 @@ fn load_cached(
     provider_id: &str,
     configuration_identity: &str,
 ) -> Result<Option<CachedCommandCredential>> {
+    // Both call sites sit inside the serialized-refresh lock, where the
+    // store snapshot may predate another waiter's save. Only a durable
+    // re-read can observe (and reuse) the winner's credential, and only a
+    // durable re-read computes the next generation from the winner's.
     store
-        .get_owned(provider_id)?
+        .reread_owned(provider_id)?
         .and_then(|record| record.get("auth_command").cloned())
         .map(serde_json::from_value::<CachedCommandCredential>)
         .transpose()

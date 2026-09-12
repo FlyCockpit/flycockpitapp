@@ -377,11 +377,22 @@ fn edit_model_switch_config(
     driver: &mut Driver,
     edit: impl FnOnce(&mut crate::config::providers::ProvidersConfig),
 ) {
-    let (cfg, _, _) = driver
-        .test_providers_override
-        .as_mut()
-        .expect("model switch harness installs provider override");
-    edit(cfg);
+    let mut providers = driver.config.providers();
+    if let Some((cfg, _, _)) = driver.test_providers_override.as_mut() {
+        edit(cfg);
+        providers = cfg.clone();
+    } else {
+        edit(&mut providers);
+    }
+    driver.set_config_handle(
+        crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                driver.config.generation(),
+                providers,
+                driver.config.extended().clone(),
+            ),
+        ),
+    );
 }
 
 #[test]
@@ -1146,7 +1157,13 @@ async fn plain_enter_leaves_an_existing_default_untouched() {
 #[tokio::test]
 async fn plain_enter_never_establishes_a_first_default() {
     let (mut driver, _tmp) = model_switch_driver();
-    edit_model_switch_config(&mut driver, |cfg| cfg.active_model = None);
+    let mut providers = driver.config.providers();
+    providers.active_model = None;
+    install_test_provider_config(&mut driver, providers);
+    assert!(
+        driver.session.active_model_ref().is_none(),
+        "installing a provider snapshot without an active model must clear the session mirror too"
+    );
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
 
     driver
@@ -1213,7 +1230,11 @@ async fn concurrent_plain_enter_switches_write_no_default_at_all() {
     let (tx_b, mut rx_b) = mpsc::channel::<TurnEvent>(64);
     let root = shared.path();
 
-    let a = run_control_with_trusted_project_config(
+    // Keep each full driver future independently owned on the heap. `join!`
+    // otherwise embeds both large `run_control` state machines in this test
+    // future, overflowing an ordinary libtest worker stack before either one
+    // can be polled.
+    let a = Box::pin(run_control_with_trusted_project_config(
         &mut driver_a,
         root,
         DriverControl::SetActiveModel {
@@ -1227,8 +1248,8 @@ async fn concurrent_plain_enter_switches_write_no_default_at_all() {
             prompt_cache_retention: None,
         },
         &tx_a,
-    );
-    let b = run_control_with_trusted_project_config(
+    ));
+    let b = Box::pin(run_control_with_trusted_project_config(
         &mut driver_b,
         root,
         DriverControl::SetActiveModel {
@@ -1242,7 +1263,7 @@ async fn concurrent_plain_enter_switches_write_no_default_at_all() {
             prompt_cache_retention: None,
         },
         &tx_b,
-    );
+    ));
     tokio::join!(a, b);
 
     let outcomes = [
@@ -1286,7 +1307,9 @@ async fn a_concurrent_plain_enter_cannot_disturb_an_explicit_replace() {
     let (session_only_tx, _session_only_rx) = mpsc::channel::<TurnEvent>(64);
     let root = shared.path();
 
-    let explicit = run_control_with_trusted_project_config(
+    // The two independently pinned futures retain genuine interleaving while
+    // bounding the join future's inline state to two owning pointers.
+    let explicit = Box::pin(run_control_with_trusted_project_config(
         &mut explicit_driver,
         root,
         DriverControl::SetActiveModel {
@@ -1300,8 +1323,8 @@ async fn a_concurrent_plain_enter_cannot_disturb_an_explicit_replace() {
             prompt_cache_retention: None,
         },
         &explicit_tx,
-    );
-    let session_only = run_control_with_trusted_project_config(
+    ));
+    let session_only = Box::pin(run_control_with_trusted_project_config(
         &mut session_only_driver,
         root,
         DriverControl::SetActiveModel {
@@ -1315,7 +1338,7 @@ async fn a_concurrent_plain_enter_cannot_disturb_an_explicit_replace() {
             prompt_cache_retention: None,
         },
         &session_only_tx,
-    );
+    ));
     tokio::join!(explicit, session_only);
 
     assert_disk_config_active_model(root, "provider-a", "model-a");
@@ -2312,7 +2335,7 @@ async fn run_control_with_trusted_project_config(
         .await;
 }
 
-fn write_two_model_config(root: &std::path::Path, provider: &str, model: &str) {
+pub(super) fn write_two_model_config(root: &std::path::Path, provider: &str, model: &str) {
     let cockpit = root.join(".cockpit");
     std::fs::create_dir_all(&cockpit).unwrap();
     let config_path = cockpit.join("config.json");

@@ -97,6 +97,10 @@ impl Tool for HarnessListTool {
             .as_deref()
             .map(|raw| normalize_harness_selector(raw, &ctx.config))
             .transpose()?;
+        // The local-KB fence runs before the workspace-trust gate so a
+        // configured knowledge base is refused on its own terms even when the
+        // trust policy is not yet resolved for the session.
+        ensure_harness_cannot_reach_local_knowledge_bases(ctx).await?;
         // Listing can launch each configured harness's auth probe, and a
         // refresh launches its model-list command. Keep direct callers from
         // bypassing the dispatcher fence and handing an ambient filesystem
@@ -105,7 +109,6 @@ impl Tool for HarnessListTool {
             .await
             .map_err(|error| invalid_input(error.to_string()))?;
         require_workspace_trust_for_harness_spawn()?;
-        ensure_harness_cannot_reach_local_knowledge_bases(ctx).await?;
         let env_overlay = ctx
             .env_overlay
             .read()
@@ -334,11 +337,6 @@ impl Tool for HarnessInvokeTool {
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         crate::tools::bash::reject_retired_sealed_child_bindings(&args)?;
-        // The dispatcher normally applies this fence, but direct tool callers
-        // must not be able to hand ambient filesystem access to a harness.
-        crate::knowledge::ensure_workspace_tool_access(ctx, self.name())
-            .await
-            .map_err(|error| invalid_input(error.to_string()))?;
         // An external harness is an OS subprocess, not a Cockpit native tool.
         // We do not yet have an OS confinement primitive that can prove every
         // configured harness operation stays within a workspace lease's
@@ -382,8 +380,16 @@ impl Tool for HarnessInvokeTool {
         };
 
         let cwd = ctx.cwd.clone();
-        require_workspace_trust_for_harness_spawn()?;
+        // The local-KB fence runs before the workspace-trust gate so a
+        // configured knowledge base is refused on its own terms even when the
+        // trust policy is not yet resolved for the session.
         ensure_harness_cannot_reach_local_knowledge_bases(ctx).await?;
+        // The dispatcher normally applies this fence, but direct tool callers
+        // must not be able to hand ambient filesystem access to a harness.
+        crate::knowledge::ensure_workspace_tool_access(ctx, self.name())
+            .await
+            .map_err(|error| invalid_input(error.to_string()))?;
+        require_workspace_trust_for_harness_spawn()?;
         let env_overlay = ctx
             .env_overlay
             .read()
@@ -703,7 +709,7 @@ async fn ensure_harness_cannot_reach_local_knowledge_bases(ctx: &ToolCtx) -> Res
         return Ok(());
     }
     Err(invalid_input(
-        "external harnesses are unavailable while local knowledge bases are configured because their subprocesses do not have OS-enforced knowledge-base confinement",
+        "external harnesses are unavailable while local knowledge bases are configured because their subprocesses do not have OS-enforced knowledge-base confinement; attached knowledge bases are read-only and cannot be delegated to an external process",
     ))
 }
 
@@ -747,7 +753,7 @@ mod tests {
         })
     }
 
-    fn ctx_with_approver(
+    async fn ctx_with_approver(
         root: &std::path::Path,
     ) -> (
         crate::engine::tool::ToolCtx,
@@ -757,22 +763,71 @@ mod tests {
     ) {
         let mut ctx = crate::tools::common::test_ctx(root);
         ctx.agent_id = "Build".to_string();
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
         let db = ctx.session.db.clone();
-        let hub = Arc::new(InterruptHub::detached());
+        let (events, _rx) = tokio::sync::broadcast::channel(16);
+        let redaction = Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::redact::RedactionTable::empty(),
+        )));
+        let hub = Arc::new(InterruptHub::new(
+            events,
+            redaction,
+            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            db.clone(),
+            ctx.session.id,
+        ));
         let store = GrantStore::new(
             db.clone(),
             ctx.session.id,
             root.to_path_buf(),
             ctx.config.clone(),
         );
-        let approver = Arc::new(Approver::new(
+        let approver = Arc::new(Approver::new_for_session(
             store,
             db.clone(),
-            ctx.session.id,
+            ctx.session.clone(),
+            Arc::new(std::sync::RwLock::new(Arc::new(
+                crate::redact::RedactionTable::empty(),
+            ))),
             "Build",
             hub.clone(),
         ));
         ctx.approver = Some(approver.clone());
+        ctx.interrupts = hub.clone();
+        let workspace_ref =
+            crate::agent_tree::workspace_ref_for_host_path(root).expect("test workspace ref");
+        let root_agent = db
+            .ensure_session_root_agent(
+                ctx.session.id,
+                None,
+                workspace_ref,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .expect("session root agent");
+        match db
+            .transition_agent_instance(
+                ctx.session.id,
+                root_agent.agent_instance_id,
+                root_agent.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                "{}",
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .expect("session root transition")
+        {
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(row) => {
+                ctx.agent_instance_id = Some(row.agent_instance_id);
+            }
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::AlreadyTerminal(_) => {
+                ctx.agent_instance_id = Some(root_agent.agent_instance_id);
+            }
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::RevisionConflict => {
+                panic!("session root transition raced");
+            }
+        }
         (ctx, approver, db, hub)
     }
 
@@ -814,22 +869,65 @@ mod tests {
         response: ResolveResponse,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            loop {
+            let interrupt_id = loop {
                 let open = db.list_open_interrupts(session_id).await.unwrap();
-                if let Some(row) = open.first() {
-                    if !hub.has_waiter(row.interrupt_id) {
-                        tokio::task::yield_now().await;
-                        continue;
-                    }
-                    db.resolve_interrupt(row.interrupt_id, &response)
+                if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id))
+                    && db
+                        .decision_request_for_interrupt(session_id, row.interrupt_id)
                         .await
-                        .unwrap();
-                    if hub.resolve(row.interrupt_id, response.clone()) {
-                        break;
-                    }
+                        .unwrap()
+                        .is_some()
+                {
+                    break row.interrupt_id;
                 }
                 tokio::task::yield_now().await;
+            };
+            let interrupt = db
+                .get_interrupt(interrupt_id)
+                .await
+                .unwrap()
+                .expect("open interrupt remains available for lifecycle settlement");
+            let decision = db
+                .decision_request_for_interrupt(session_id, interrupt_id)
+                .await
+                .unwrap()
+                .expect("host approval interrupt has a bound lifecycle decision");
+            let response_json = serde_json::to_string(&response).unwrap();
+            let lifecycle = crate::agent_tree::AgentTreeLifecycle::new(db.clone());
+            if interrupt.questions.as_ref().is_some_and(|offered| {
+                crate::approval::host_approval_response_allows(&response, offered)
+            }) {
+                let authority =
+                    crate::agent_tree::HostApprovalAuthority::for_durable_interrupt_binding(
+                        session_id, &decision, &interrupt,
+                    )
+                    .expect("host approval response retains its durable interrupt binding");
+                lifecycle
+                    .resolve_host_approval(
+                        session_id,
+                        decision.decision_request_id,
+                        interrupt_id,
+                        &response_json,
+                        authority,
+                        crate::agent_tree::system_now_unix_ms(),
+                    )
+                    .await
+                    .unwrap();
+            } else if interrupt.questions.as_ref().is_some_and(|offered| {
+                crate::approval::host_approval_response_declines(&response, offered)
+            }) {
+                lifecycle
+                    .cancel_host_approval(
+                        session_id,
+                        decision.decision_request_id,
+                        interrupt_id,
+                        &response_json,
+                        crate::agent_tree::system_now_unix_ms(),
+                    )
+                    .await
+                    .unwrap();
             }
+            assert!(hub.resolve(interrupt_id, response));
         })
     }
 
@@ -1243,7 +1341,7 @@ mod tests {
     async fn harness_invoke_approval_denial_blocks_before_preflight() {
         let tmp = tempfile::tempdir().unwrap();
         write_test_harness_config(tmp.path(), false);
-        let (ctx, _approver, db, hub) = ctx_with_approver(tmp.path());
+        let (ctx, _approver, db, hub) = ctx_with_approver(tmp.path()).await;
         let resolver = resolve_next_interrupt(
             db.clone(),
             ctx.session.id,
@@ -1274,7 +1372,7 @@ mod tests {
     async fn harness_invoke_approval_noninteractive_denial_returns_structured_message() {
         let tmp = tempfile::tempdir().unwrap();
         write_test_harness_config(tmp.path(), false);
-        let (ctx, _approver, db, hub) = ctx_with_approver(tmp.path());
+        let (ctx, _approver, db, hub) = ctx_with_approver(tmp.path()).await;
         let resolver = resolve_next_interrupt(
             db.clone(),
             ctx.session.id,
@@ -1303,7 +1401,7 @@ mod tests {
     async fn harness_invoke_approval_yolo_opens_no_interrupt_and_reaches_preflight() {
         let tmp = tempfile::tempdir().unwrap();
         write_test_harness_config(tmp.path(), false);
-        let (mut ctx, _approver, db, _hub) = ctx_with_approver(tmp.path());
+        let (mut ctx, _approver, db, _hub) = ctx_with_approver(tmp.path()).await;
         ctx.approver = None;
         ctx.session.set_approval_mode(ApprovalMode::Yolo);
 
@@ -1328,7 +1426,7 @@ mod tests {
         for mode in [ApprovalMode::Manual, ApprovalMode::Auto] {
             let tmp = tempfile::tempdir().unwrap();
             write_test_harness_config(tmp.path(), true);
-            let (ctx, _approver, db, _hub) = ctx_with_approver(tmp.path());
+            let (ctx, _approver, db, _hub) = ctx_with_approver(tmp.path()).await;
             ctx.session.set_approval_mode(mode);
 
             let err = with_trusted_workspace(tmp.path(), async {
@@ -1384,7 +1482,7 @@ mod tests {
     async fn harness_invoke_session_grant_opens_no_interrupt_and_reaches_preflight() {
         let tmp = tempfile::tempdir().unwrap();
         write_test_harness_config(tmp.path(), false);
-        let (ctx, approver, db, _hub) = ctx_with_approver(tmp.path());
+        let (ctx, approver, db, _hub) = ctx_with_approver(tmp.path()).await;
         approver
             .store()
             .record_harness("codex", Scope::Session)

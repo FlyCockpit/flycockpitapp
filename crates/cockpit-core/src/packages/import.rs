@@ -519,11 +519,9 @@ pub(super) async fn import_from_legacy_kcl_db(db: &Db) -> Result<KclImport> {
 /// `~/.local/share/kcl/kcl.db`.
 #[cfg(test)]
 pub(super) fn kcl_db_path() -> Result<PathBuf> {
-    if let Ok(s) = std::env::var("XDG_DATA_HOME")
-        && !s.trim().is_empty()
-    {
-        return Ok(PathBuf::from(s).join("kcl").join("kcl.db"));
-    }
-    let home = dirs::home_dir().context("could not locate home dir")?;
-    Ok(home.join(".local/share/kcl/kcl.db"))
+    let data_home = cockpit_config::config::resolve::cockpit_data_dir()?
+        .parent()
+        .context("cockpit data dir must have a parent")?
+        .to_path_buf();
+    Ok(data_home.join("kcl").join("kcl.db"))
 }

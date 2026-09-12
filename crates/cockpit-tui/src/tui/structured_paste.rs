@@ -582,6 +582,24 @@ impl SubmissionOrderCoordinator {
             .map(|(sequence, intent, _)| (*sequence, *intent))
     }
 
+    /// Replace the identity of an intent without changing its reserved FIFO
+    /// position. Submission assembly uses this to bind the Enter reservation
+    /// to the final full-payload-derived id before dispatch.
+    pub fn replace(&mut self, sequence: u64, intent: OrderedIntent) -> bool {
+        let Some((_, current, completed)) = self
+            .queue
+            .iter_mut()
+            .find(|(candidate, _, _)| *candidate == sequence)
+        else {
+            return false;
+        };
+        if *completed {
+            return false;
+        }
+        *current = intent;
+        true
+    }
+
     pub fn complete(&mut self, sequence: u64) -> bool {
         let was_head = self
             .queue

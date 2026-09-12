@@ -418,7 +418,7 @@ impl Db {
                   WHERE session_id = ?1
                   ORDER BY timestamp ASC, rowid ASC",
             )
-            .context("preparing list_tool_calls")?;
+            .map_err(|error| anyhow::anyhow!("preparing list_tool_calls: {error}"))?;
 
         let rows = stmt
             .query_map([session_id.to_string()], decode_row)

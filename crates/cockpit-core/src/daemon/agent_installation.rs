@@ -7313,7 +7313,11 @@ pub(crate) mod session_setup_test_support {
             db.prepare_agent_session(PrepareAgentSessionInput {
                 session_id,
                 session_create: AgentSessionCreateInput {
-                    project_id: "session-setup-fixture-project".into(),
+                    // Short human label (<= 24 chars, alnum/-/_): the strict
+                    // durable-resume identity check admits only these legacy
+                    // raw-fixture labels; production rows use workspace
+                    // digests.
+                    project_id: "session-setup-fixture".into(),
                     project_root: workspace.to_string_lossy().into_owned(),
                     active_agent: "reviewer".into(),
                     started_at_unix_ms: 4,
@@ -8943,7 +8947,7 @@ mod tests {
         let home = tempfile::tempdir().expect("isolated Cockpit home");
         let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(home.path());
         let workspace = tempfile::tempdir().expect("workspace");
-        let global_dir = home.path().join("config/cockpit");
+        let global_dir = home.path().join("home/.config/cockpit");
         let global_config = global_dir.join("config.json");
         std::fs::create_dir_all(&global_dir).expect("global config directory");
         std::fs::write(&global_config, r#"{"providers":{"global":{}}}"#).expect("global config");
@@ -9023,7 +9027,7 @@ mod tests {
         let home = tempfile::tempdir().expect("isolated Cockpit home");
         let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(home.path());
         let workspace = tempfile::tempdir().expect("workspace");
-        let global_config = home.path().join("config/cockpit/config.json");
+        let global_config = home.path().join("home/.config/cockpit/config.json");
         let project_config = workspace.path().join(".cockpit/config.json");
         for config in [&global_config, &project_config] {
             std::fs::create_dir_all(config.parent().expect("config parent")).unwrap();
@@ -9089,7 +9093,7 @@ mod tests {
         let home = tempfile::tempdir().expect("isolated Cockpit home");
         let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(home.path());
         let workspace = tempfile::tempdir().expect("workspace");
-        let global_config = home.path().join("config/cockpit/config.json");
+        let global_config = home.path().join("home/.config/cockpit/config.json");
         let project_config = workspace.path().join(".cockpit/config.json");
         for (config, name) in [(&global_config, "global"), (&project_config, "project")] {
             std::fs::create_dir_all(config.parent().expect("config parent")).unwrap();
@@ -9140,7 +9144,7 @@ mod tests {
         let home = tempfile::tempdir().expect("isolated Cockpit home");
         let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(home.path());
         let workspace = tempfile::tempdir().expect("workspace");
-        let global_config = home.path().join("config/cockpit/config.json");
+        let global_config = home.path().join("home/.config/cockpit/config.json");
         let project_config = workspace.path().join(".cockpit/config.json");
         for (config, rounds, hook, name) in [
             (&global_config, 11, "global-hook", "global"),

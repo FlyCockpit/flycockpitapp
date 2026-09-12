@@ -150,12 +150,10 @@ async fn export_via_attached_daemon(
     command: &'static str,
     shutdown: std::sync::Arc<crate::tui::async_action::AsyncActionCancellation>,
 ) -> Result<String, String> {
-    let response = tokio::select! {
-        biased;
-        () = shutdown.cancelled() => return Err(format!("{command}: export cancelled by shutdown")),
-        response = attached_request.request(request) => response,
-    }
-    .map_err(|error| format!("{command}: daemon request failed: {error}"))?;
+    let response = attached_request
+        .request_with_shutdown(request, &shutdown)
+        .await
+        .map_err(|error| format!("{command}: daemon request failed: {error}"))?;
     let Response::ExportSessionData { data } = response else {
         return Err(format!(
             "{command}: daemon request failed: unexpected daemon response"
@@ -483,14 +481,13 @@ mod tests {
 
     async fn drain_until_idle(app: &mut App) {
         for _ in 0..200 {
-            let notify = app.async_actions.notifier();
-            let notified = notify.notified();
+            tokio::task::yield_now().await;
             app.drain_async_actions();
             if app.async_actions.pending_count() == 0 {
                 app.drain_async_actions();
                 return;
             }
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(25), notified).await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         panic!(
             "export action did not complete; pending={}",
@@ -747,6 +744,8 @@ mod tests {
         app.export_transcript_json("first", &exports);
         let first = rx.recv().await.unwrap();
         app.export_debug_bundle(session_id, "second", &exports);
+        tokio::task::yield_now().await;
+        app.drain_async_actions();
         let second = rx.recv().await.unwrap();
         assert!(
             first

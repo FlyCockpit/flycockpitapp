@@ -1795,6 +1795,58 @@ async fn dropped_overlay_validation_kills_wrapper_descendants_before_restore() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn normally_exited_overlay_wrapper_kills_descendants_before_restore_and_return() {
+    let h = harness().await;
+    let file = h.repo.join("a.txt");
+    // Keep synchronization evidence outside the validation tree so the
+    // byte-identical receipt measures only descendant writes to `file`.
+    let ready = h.state.join("normal-exit-wrapper-ready");
+    let script = format!(
+        "trap '' TERM HUP\n( trap '' TERM HUP; while true; do printf 'dirty\\n' > '{}'; done ) &\ntouch '{}'\nexit 0",
+        file.display(),
+        ready.display(),
+    );
+    let mut validation = CandidateValidation::for_primary(&h.repo).with_locks(
+        h.orch.lock_manager().clone(),
+        h.orch.lock_identity().to_string(),
+        h.orch.session_id(),
+    );
+    validation.wrapper = PathBuf::from("sh");
+    let mut overlay = BTreeMap::new();
+    overlay.insert(PathBuf::from("a.txt"), b"overlay\n".to_vec());
+
+    let evidence = validation
+        .validate_overlay(&overlay, &["-c", &script])
+        .await
+        .unwrap();
+
+    assert!(
+        ready.exists(),
+        "wrapper leader did not launch its descendant"
+    );
+    assert_eq!(
+        evidence.exit_code, 0,
+        "preserve the leader's natural status"
+    );
+    assert!(evidence.restored);
+    assert_restored_and_descendants_dead(
+        &file,
+        "a0\n",
+        "normal wrapper exit must kill descendants before overlay restoration and return",
+    )
+    .await;
+    assert!(
+        h.orch.lock_manager().holder(&h.repo).is_none(),
+        "normal wrapper exit must release the repository-root exclusive lock"
+    );
+    assert!(
+        h.orch.lock_manager().holder(&file).is_none(),
+        "normal wrapper exit must release affected-path exclusive locks"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn dropped_patch_validation_kills_wrapper_descendants_before_restore() {
     let h = harness().await;
     write_uncommitted(&h.repo, "a.txt", "candidate\n");

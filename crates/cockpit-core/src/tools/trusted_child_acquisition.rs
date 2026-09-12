@@ -119,16 +119,37 @@ where
     CURRENT_ACQUISITION_RUNTIME.scope(runtime, future).await
 }
 
-/// Tokio task-locals are not inherited by `tokio::spawn`. Every scheduler lane
-/// enters through this wrapper, preserving the exact acquisition capability
-/// when one is active while leaving ordinary non-acquisition turns unchanged.
-pub(crate) async fn with_inherited_acquisition_runtime<F>(future: F) -> F::Output
+/// Preserve the active acquisition task-local across an await boundary in the
+/// current task. Parallel scheduler lanes use [`with_inherited_acquisition_runtime`]
+/// at the spawn call site instead; serial dispatch uses this helper.
+pub(crate) async fn scope_inherited_acquisition_runtime<F, T>(future: F) -> T
 where
-    F: std::future::Future,
+    F: std::future::Future<Output = T>,
 {
     match CURRENT_ACQUISITION_RUNTIME.try_with(Clone::clone) {
         Ok(runtime) => CURRENT_ACQUISITION_RUNTIME.scope(runtime, future).await,
         Err(_) => future.await,
+    }
+}
+
+/// Tokio task-locals are not inherited by `tokio::spawn`. Every scheduler lane
+/// enters through this wrapper, preserving the exact acquisition capability
+/// when one is active while leaving ordinary non-acquisition turns unchanged.
+///
+/// This is a plain function, not an `async fn`, on purpose: the capture must
+/// run at the call site — the last place the parent task's task-local still
+/// exists. An `async fn` body first runs when the returned future is polled,
+/// which for a spawned lane is already inside the child task, where
+/// `CURRENT_ACQUISITION_RUNTIME` is absent and nothing would be inherited.
+pub(crate) fn with_inherited_acquisition_runtime<F>(
+    future: F,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + Send>>
+where
+    F: std::future::Future + Send + 'static,
+{
+    match CURRENT_ACQUISITION_RUNTIME.try_with(Clone::clone) {
+        Ok(runtime) => Box::pin(CURRENT_ACQUISITION_RUNTIME.scope(runtime, future)),
+        Err(_) => Box::pin(future),
     }
 }
 
@@ -230,7 +251,13 @@ impl Tool for RunAcquisitionCommandTool {
         true
     }
     fn parameters(&self) -> Value {
-        serde_json::json!({ "type": "object", "additionalProperties": false })
+        serde_json::json!({ "type": "object", "properties": {}, "additionalProperties": false })
+    }
+    fn verbose_description(&self) -> Option<String> {
+        Some(
+            "Run the one host-supplied acquisition command for this trusted-child session. Use only inside the sealed-acquisition child; the command bytes never appear in tool arguments. Do not call repeatedly or paste command output into prompts."
+                .to_string(),
+        )
     }
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         if args.as_object().is_none_or(|object| !object.is_empty()) {
@@ -260,6 +287,12 @@ impl Tool for AcquireSealedValueTool {
     }
     fn effect(&self) -> ToolEffect {
         ToolEffect::Mutating
+    }
+    fn verbose_description(&self) -> Option<String> {
+        Some(
+            "Delegate one trusted-child acquisition command from the parent agent. Returns only sealed, requires-user, or failed outcomes; never paste or repeat raw command output. Do not use for ordinary shell work — use `bash` instead."
+                .to_string(),
+        )
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -372,7 +405,7 @@ impl Tool for AcquisitionFailTool {
         ToolEffect::ReadOnly
     }
     fn parameters(&self) -> Value {
-        serde_json::json!({ "type": "object", "additionalProperties": false })
+        serde_json::json!({ "type": "object", "properties": {}, "additionalProperties": false })
     }
     async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
         if args.as_object().is_none_or(|object| !object.is_empty()) {

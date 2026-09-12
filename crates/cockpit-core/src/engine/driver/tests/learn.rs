@@ -56,16 +56,36 @@ fn learn_respects_write_gate() {
         let db = driver.session.db.clone();
         let session_id = driver.session.id;
         let (events, _event_rx) = tokio::sync::broadcast::channel(8);
-        let hub = Arc::new(crate::engine::interrupt::InterruptHub::new(
-            events,
+        let hub = Arc::new(
+            crate::engine::interrupt::InterruptHub::new(
+                events,
+                Arc::new(std::sync::RwLock::new(Arc::new(
+                    crate::redact::RedactionTable::empty(),
+                ))),
+                Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+                db.clone(),
+                session_id,
+            )
+            .with_live_session(driver.session.clone()),
+        );
+        driver.set_interrupt_hub(hub.clone());
+        let store = crate::approval::store::GrantStore::new(
+            db.clone(),
+            session_id,
+            driver.cwd.clone(),
+            driver.config.clone(),
+        );
+        driver.set_approver(Arc::new(crate::approval::Approver::new_for_session(
+            store,
+            db.clone(),
+            driver.session.clone(),
             Arc::new(std::sync::RwLock::new(Arc::new(
                 crate::redact::RedactionTable::empty(),
             ))),
-            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
-            db.clone(),
-            session_id,
-        ));
-        driver.set_interrupt_hub(hub.clone());
+            "Build",
+            hub.clone(),
+        )));
+        let mut raised = hub.subscribe_raised();
         let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
         let (turn_tx, _turn_rx) = mpsc::channel(64);
@@ -83,18 +103,11 @@ fn learn_respects_write_gate() {
             .await
         });
 
-        loop {
-            if !db
-                .list_open_interrupts(session_id)
-                .await
-                .unwrap()
-                .is_empty()
-                && hub.park_all_registered().await == 1
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        let interrupt_id = raised
+            .recv()
+            .await
+            .expect("learn interrupt is published after lifecycle binding");
+        assert!(hub.park(interrupt_id).await);
         task.await.unwrap().unwrap();
         assert!(!root.join("gated-learn/SKILL.md").exists());
         let row = db.list_open_interrupts(session_id).await.unwrap().remove(0);

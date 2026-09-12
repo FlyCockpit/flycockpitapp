@@ -436,6 +436,15 @@ fn apply_text_artifact_tool_projections(
         }
         match event.kind.as_str() {
             "tool_call" => {
+                if event
+                    .data
+                    .get("model_projection_required")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    artifacts_by_owner.remove(&(event.seq, 0));
+                    continue;
+                }
                 let projection = event.data.get("artifact_projection");
                 let artifact = artifacts_by_owner.remove(&(event.seq, 0));
                 match (projection, artifact) {
@@ -2629,6 +2638,19 @@ fn rebuild_history(
                                 crate::engine::tool::CanonicalToolResultContents::new(parts).ok()
                             })
                             .and_then(|parts| parts.to_rig_contents().ok());
+                        let model_canonical_result = ev
+                            .data
+                            .get("model_canonical_output")
+                            .and_then(|value| {
+                                serde_json::from_value::<
+                                    Vec<crate::typed_media_result::CanonicalToolResultContent>,
+                                >(value.clone())
+                                .ok()
+                            })
+                            .and_then(|parts| {
+                                crate::engine::tool::CanonicalToolResultContents::new(parts).ok()
+                            })
+                            .and_then(|parts| parts.to_rig_contents().ok());
                         let projection_required = ev
                             .data
                             .get("model_projection_required")
@@ -2639,8 +2661,13 @@ fn rebuild_history(
                             .get("canonical_output_text")
                             .and_then(serde_json::Value::as_str)
                             .map(|text| vec![ToolResultContent::text(text.to_string())]);
-                        let result_content = canonical_result
-                            .or_else(|| projection_required.then(|| canonical_text).flatten());
+                        let result_content = if projection_required {
+                            model_canonical_result.or(canonical_text)
+                        } else if !tc.output.is_empty() {
+                            Some(vec![ToolResultContent::text(tc.output.clone())])
+                        } else {
+                            canonical_result.or(canonical_text)
+                        };
                         if projection_required && result_content.is_none() {
                             return Err(anyhow::Error::new(RehydrateRepairRequired::new(
                                 "missing_model_projection",

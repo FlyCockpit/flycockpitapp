@@ -183,13 +183,9 @@ impl fmt::Debug for SealedLiteralHandle<'_> {
 /// would put sealed literals back into the generic named-secret namespace that
 /// redaction and diagnostics enumerate.
 pub fn default_compartment_path() -> Option<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_STATE_HOME")
-        && !xdg.trim().is_empty()
-    {
-        return Some(PathBuf::from(xdg).join("cockpit/sealed-compartment.json"));
-    }
-    let home = dirs::home_dir()?;
-    Some(home.join(".local/state/cockpit/sealed-compartment.json"))
+    cockpit_config::config::resolve::cockpit_state_dir()
+        .ok()
+        .map(|dir| dir.join("sealed-compartment.json"))
 }
 
 /// The sealed-value-only compartment.

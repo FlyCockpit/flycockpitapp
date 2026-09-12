@@ -90,7 +90,7 @@ async fn run_system_process(
     for (key, value) in &spec.environment {
         command.env(key, value);
     }
-    let mut child = match command.spawn() {
+    let mut child = match cockpit_host::process::spawn_pinned(command) {
         Ok(child) => child,
         Err(error) => {
             return Err(error.into());

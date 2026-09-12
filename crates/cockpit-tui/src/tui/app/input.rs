@@ -2559,6 +2559,24 @@ impl App {
         true
     }
 
+    fn release_provisional_submission_fence(
+        &mut self,
+        client_submission_id: uuid::Uuid,
+        fence_sequence: u64,
+        pending_probe_ids: &[uuid::Uuid],
+    ) {
+        let _ = self.submission_order.cancel(fence_sequence);
+        self.submission_fences.remove(&client_submission_id);
+        for id in pending_probe_ids {
+            if let Some(probe) = self.pending_paste_probes.get_mut(id)
+                && probe.owner_fence == Some(client_submission_id)
+            {
+                probe.owner_fence = None;
+            }
+        }
+        self.dispatch_next_ready_paste_fence();
+    }
+
     pub(super) fn submit_input(&mut self) -> bool {
         if !self.queue_edit_submission_ready() {
             return false;
@@ -2656,9 +2674,12 @@ impl App {
             return false;
         }
 
-        // The Enter fence owns the durable identity before any submit
-        // sidecar is detached. Retry and reconciliation keep this exact ID.
-        let client_submission_id = uuid::Uuid::now_v7();
+        // Reserve FIFO ownership before any submit sidecar is detached. This
+        // v7 nonce is only the provisional fence key; once the complete
+        // submission exists below, the reservation is atomically re-keyed to
+        // the payload-derived durable identity without changing its order.
+        let invocation_nonce = uuid::Uuid::now_v7();
+        let mut client_submission_id = invocation_nonce;
         let Ok(fence_sequence) =
             self.submission_order
                 .enqueue(crate::tui::structured_paste::OrderedIntent::Fence(
@@ -2895,6 +2916,11 @@ impl App {
             if !paste_images.is_empty() {
                 self.pending_queue_edit_item_id = Some(queue_item_id);
                 self.pending_queue_edit_class = Some(delivery_class);
+                self.release_provisional_submission_fence(
+                    client_submission_id,
+                    fence_sequence,
+                    &pending_probe_ids,
+                );
                 self.show_toast(
                     "queued-message edits cannot add images",
                     super::ToastKind::Info,
@@ -2902,6 +2928,11 @@ impl App {
                 return false;
             }
             let Some(operation_id) = self.pending_queue_edit_operation_id else {
+                self.release_provisional_submission_fence(
+                    client_submission_id,
+                    fence_sequence,
+                    &pending_probe_ids,
+                );
                 self.show_toast(
                     "queued-message edit identity is unavailable; submission is blocked",
                     super::ToastKind::Info,
@@ -2921,6 +2952,11 @@ impl App {
                 replacement: Some(replacement),
             });
             self.pending_queue_edit_commit = true;
+            self.release_provisional_submission_fence(
+                client_submission_id,
+                fence_sequence,
+                &pending_probe_ids,
+            );
             return false;
         }
         let submission = cockpit_client::submission::ClientUserSubmission {
@@ -2943,6 +2979,39 @@ impl App {
             queue_target: Some(queue_target.clone()),
             ..Default::default()
         };
+        let identity_pending =
+            !pending_probe_ids.is_empty() || self.pending_model_selection.is_some();
+        if !identity_pending {
+            let derived_submission_id = cockpit_client::submission::derive_client_submission_id(
+                invocation_nonce,
+                &submission.client_fingerprint(),
+            );
+            if !self.submission_order.replace(
+                fence_sequence,
+                crate::tui::structured_paste::OrderedIntent::Fence(derived_submission_id),
+            ) {
+                let _ = self.submission_order.cancel(fence_sequence);
+                self.submission_fences.remove(&client_submission_id);
+                self.dispatch_next_ready_paste_fence();
+                self.show_toast(
+                    "Submission ordering identity is unavailable",
+                    super::ToastKind::Error,
+                );
+                return false;
+            }
+            let Some(mut fence) = self.submission_fences.remove(&client_submission_id) else {
+                let _ = self.submission_order.cancel(fence_sequence);
+                self.dispatch_next_ready_paste_fence();
+                self.show_toast(
+                    "Submission fence identity is unavailable",
+                    super::ToastKind::Error,
+                );
+                return false;
+            };
+            fence.client_submission_id = derived_submission_id;
+            self.submission_fences.insert(derived_submission_id, fence);
+            client_submission_id = derived_submission_id;
+        }
         // A model switch is itself the earlier ordered intent. Attach this
         // fence to that transaction rather than treating it as a generic
         // deferred fence: the terminal model result completes the switch,
@@ -2981,6 +3050,7 @@ impl App {
                     display: submitted,
                     submission,
                     tag_expansions,
+                    identity_nonce: identity_pending.then_some(invocation_nonce),
                     waiting_model_selection: self
                         .pending_model_selection
                         .as_ref()

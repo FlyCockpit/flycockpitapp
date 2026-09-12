@@ -622,6 +622,35 @@ impl LockManager {
             .unwrap_or(false)
     }
 
+    /// Record that `agent` in `session` authored `path`'s current bytes by
+    /// creating the file (the `write` tool's new-file path). This is NOT a
+    /// §3c read record: [`Self::has_read`] stays false and a later blind
+    /// `write` still requires an explicit `read` — new-file creation never
+    /// grants future blind overwrites. Only the anchored `edit` gate treats
+    /// it as freshness evidence, and only while the on-disk hash still
+    /// matches these authored bytes. In-memory only: it is deliberately
+    /// not persisted to `lock_reads`, so a daemon restart drops it and the
+    /// agent must read again (fail-closed).
+    ///
+    /// Handles from [`Self::without_read_recording`] return immediately,
+    /// matching [`Self::note_read`]: a recording-disabled handle writes no
+    /// freshness evidence of any kind.
+    pub async fn note_authored(&self, path: &Path, agent: &str, session: Uuid) {
+        if !self.records_lock_reads {
+            return;
+        }
+        let canon = canonicalize(path);
+        let Some(authored_hash) = file_hash(&canon) else {
+            return;
+        };
+        let mut state = crate::sync::lock_or_recover(&self.inner);
+        state
+            .authored_tracker
+            .entry((session, agent.to_string()))
+            .or_default()
+            .insert(canon, authored_hash);
+    }
+
     /// The `(session_id, agent_id)` currently holding `path`, if any.
     // Holder-introspection query; retained for the lock-manager API surface.
     #[allow(dead_code)]
@@ -757,6 +786,54 @@ impl LockManager {
         acquired_by_wait: bool,
         require_fresh_read: bool,
     ) -> Result<WriteGuard<'a>> {
+        self.begin_guard_after_wait(
+            path,
+            agent,
+            session,
+            tool_name,
+            acquired_by_wait,
+            require_fresh_read,
+            false,
+        )
+        .await
+    }
+
+    /// Anchored-edit variant of [`Self::begin_write_after_wait`]. The §3c
+    /// gate accepts the usual read record OR content this `(session, agent)`
+    /// authored by creating the file: the tool's `old_string` must match
+    /// the current bytes, so authored content is freshness evidence in
+    /// itself. A blind full overwrite (`write`) still demands an explicit
+    /// read — new-file creation never grants future blind overwrites.
+    pub async fn begin_anchored_edit_after_wait<'a>(
+        &'a self,
+        path: &Path,
+        agent: &str,
+        session: Uuid,
+        tool_name: &str,
+        acquired_by_wait: bool,
+    ) -> Result<WriteGuard<'a>> {
+        self.begin_guard_after_wait(
+            path,
+            agent,
+            session,
+            tool_name,
+            acquired_by_wait,
+            true,
+            true,
+        )
+        .await
+    }
+
+    async fn begin_guard_after_wait<'a>(
+        &'a self,
+        path: &Path,
+        agent: &str,
+        session: Uuid,
+        tool_name: &str,
+        acquired_by_wait: bool,
+        require_fresh_read: bool,
+        accept_authored_content: bool,
+    ) -> Result<WriteGuard<'a>> {
         let canon = canonicalize(path);
         let agent_id = agent.to_string();
         let result = {
@@ -769,10 +846,31 @@ impl LockManager {
                             .get(&(session, agent_id.clone()))
                             .and_then(|s| s.get(&canon).copied());
                         match read_hash {
-                            None => Err(crate::engine::tool::invalid_input(
-                                ValidationCorrection::write_requires_read(&canon, tool_name)
-                                    .model_message(),
-                            )),
+                            None => {
+                                // No read record. An anchored edit may still
+                                // proceed on content this session authored,
+                                // provided the on-disk hash still matches
+                                // those bytes; a blind write may not —
+                                // creation is not a read.
+                                let authored_fresh = accept_authored_content
+                                    && state
+                                        .authored_tracker
+                                        .get(&(session, agent_id.clone()))
+                                        .and_then(|s| s.get(&canon).copied())
+                                        .is_some_and(|expected| {
+                                            file_hash(&canon) == Some(expected)
+                                        });
+                                if authored_fresh {
+                                    Ok(())
+                                } else {
+                                    Err(crate::engine::tool::invalid_input(
+                                        ValidationCorrection::write_requires_read(
+                                            &canon, tool_name,
+                                        )
+                                        .model_message(),
+                                    ))
+                                }
+                            }
                             Some(Some(expected)) if file_hash(&canon) == Some(expected) => Ok(()),
                             Some(_) => Err(crate::engine::tool::invalid_input(stale_read_message(
                                 &canon,

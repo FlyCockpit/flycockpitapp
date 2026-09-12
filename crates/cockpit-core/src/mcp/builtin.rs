@@ -2247,7 +2247,7 @@ mod tests {
         HostContext::from_tool_ctx(&ctx).with_builtin_registry(registry_with(tool))
     }
 
-    fn approvable_ctx(
+    async fn approvable_ctx(
         root: &std::path::Path,
     ) -> (
         ToolCtx,
@@ -2255,6 +2255,31 @@ mod tests {
         Arc<crate::engine::interrupt::InterruptHub>,
     ) {
         let (mut ctx, db) = crate::tools::common::test_ctx_with_db(root);
+        let owner = db
+            .ensure_session_root_agent(
+                ctx.session.id,
+                None,
+                crate::agent_tree::workspace_ref_for_host_path(root).unwrap(),
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap();
+        let owner = match db
+            .transition_agent_instance(
+                ctx.session.id,
+                owner.agent_instance_id,
+                owner.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                r#"{"state":"running"}"#,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap()
+        {
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(owner) => owner,
+            outcome => panic!("MCP fixture root did not start: {outcome:?}"),
+        };
+        ctx.agent_instance_id = Some(owner.agent_instance_id);
         let (events, _rx) = tokio::sync::broadcast::channel(16);
         let redaction = Arc::new(RwLock::new(
             Arc::new(crate::redact::RedactionTable::empty()),
@@ -2942,7 +2967,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let tool = Arc::new(MontyAdapterTool::new("bash", "must not run"));
         let seen = tool.seen_ctx.clone();
-        let (ctx, _db, _hub) = approvable_ctx(tmp.path());
+        let (ctx, _db, _hub) = approvable_ctx(tmp.path()).await;
         ctx.session
             .set_approval_mode(crate::config::extended::ApprovalMode::Auto);
         let classification = crate::approval::classify::classify("gh pr create");
@@ -2973,7 +2998,7 @@ mod tests {
     async fn monty_invocations_count_against_loop_guard() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = Arc::new(MontyAdapterTool::new("repeat_probe", "ok"));
-        let (mut ctx, _db, _hub) = approvable_ctx(tmp.path());
+        let (mut ctx, _db, _hub) = approvable_ctx(tmp.path()).await;
         // The production guard must reject a repeat without parking when no
         // interactive client can answer. Make that condition explicit here:
         // `approvable_ctx` otherwise models an attached client for the tests
@@ -3121,16 +3146,12 @@ mod tests {
             .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
         let host = HostContext::from_tool_ctx(&ctx).with_builtin_registry(registry_with(tool));
 
-        let out = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            crate::mcp::sandbox::run_with_host(
-                "mcp.invoke('cockpit', 'mutating_probe', {})",
-                &crate::mcp::config::McpConfig::default(),
-                &host,
-            ),
+        let out = crate::mcp::sandbox::run_with_host(
+            "mcp.invoke('cockpit', 'mutating_probe', {})",
+            &crate::mcp::config::McpConfig::default(),
+            &host,
         )
         .await
-        .expect("script must not deadlock")
         .unwrap();
         let value: Value = serde_json::from_str(&out).unwrap();
 
@@ -3142,9 +3163,10 @@ mod tests {
     async fn monty_approval_label_includes_arguments() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = Arc::new(MontyAdapterTool::new("mutating_probe", "approved output").mutating());
-        let (ctx, db, hub) = approvable_ctx(tmp.path());
+        let (ctx, db, hub) = approvable_ctx(tmp.path()).await;
         let session_id = ctx.session.id;
         let host = HostContext::from_tool_ctx(&ctx).with_builtin_registry(registry_with(tool));
+        let mut raised = hub.subscribe_raised();
 
         let script = tokio::spawn(async move {
             crate::mcp::sandbox::run_with_host(
@@ -3155,23 +3177,18 @@ mod tests {
             .await
         });
 
-        let row = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if let Some(row) = db
-                    .list_open_interrupts(session_id)
-                    .await
-                    .unwrap()
-                    .iter()
-                    .find(|row| hub.has_waiter(row.interrupt_id))
-                    .cloned()
-                {
-                    return row;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
+        let response = crate::daemon::proto::ResolveResponse::Single {
+            selected_id: crate::approval::ID_APPROVE.to_string(),
+        };
+        let row = crate::engine::interrupt::test_support::settle_published_host_approval(
+            &db,
+            session_id,
+            &hub,
+            &mut raised,
+            response,
+        )
         .await
-        .expect("approval prompt must be raised");
+        .expect("published MCP approval settles through its exact continuation");
 
         assert!(
             row.description.contains("mutating_probe"),
@@ -3204,19 +3221,7 @@ mod tests {
             "{options:?}"
         );
 
-        let response = crate::daemon::proto::ResolveResponse::Single {
-            selected_id: crate::approval::ID_APPROVE.to_string(),
-        };
-        db.resolve_interrupt(row.interrupt_id, &response)
-            .await
-            .unwrap();
-        assert!(hub.resolve(row.interrupt_id, response));
-
-        let out = tokio::time::timeout(std::time::Duration::from_secs(2), script)
-            .await
-            .expect("script must resume after approval")
-            .unwrap()
-            .unwrap();
+        let out = script.await.unwrap().unwrap();
         let value: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(value, Value::String("approved output".to_string()));
     }

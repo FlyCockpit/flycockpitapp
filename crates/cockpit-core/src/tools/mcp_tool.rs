@@ -76,8 +76,8 @@ fn identity_accounting_key(ctx: &ToolCtx) -> usize {
     ctx as *const ToolCtx as usize
 }
 
-const NORMAL_DESCRIPTION_PREFIX: &str = "Run Python over native tools. Enabled packages: ";
-const NORMAL_DESCRIPTION_SUFFIX: &str = ". `requests` is a governed per-agent package: enable it or grant/revoke a host only with mcp.network_configure(...), which always requires an explicit user approval. Every request still requires an explicit user-granted host and whole-request redaction. Example: r=mcp.invoke('cockpit','read',{'path':'README.md'}); emit(r). Discover with mcp.search, mcp.grep_tool_names, mcp.grep_tool_definitions, or mcp.describe.";
+const NORMAL_DESCRIPTION_PREFIX: &str = "Run Python (";
+const NORMAL_DESCRIPTION_SUFFIX: &str = "): discover mcp.search, mcp.grep_tool_names, mcp.grep_tool_definitions, mcp.describe; call mcp.invoke in try/except.";
 const DEFENSIVE_DESCRIPTION_PREFIX: &str = "Execute a Python script in an isolated sandbox to reach MCP tools. Inside the \
      script call `mcp.search(query)` for cheap discovery (returns dicts with server, tool, \
      and description), `mcp.grep_tool_names(regex)` for cheap name-only regex discovery, \

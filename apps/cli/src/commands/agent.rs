@@ -239,6 +239,11 @@ async fn begin(input: BeginInput) -> Result<()> {
         displayed_choice_selector,
         target_installation_id,
     } = input;
+    let (scope, workspace_path) = scope_request(
+        scope,
+        workspace,
+        matches!(operation, AgentInstallationOperationKind::Install),
+    )?;
     if matches!(
         operation,
         AgentInstallationOperationKind::Install | AgentInstallationOperationKind::Update
@@ -247,11 +252,6 @@ async fn begin(input: BeginInput) -> Result<()> {
     {
         third_party_trust_confirmed = prompt_for_third_party_trust()?;
     }
-    let (scope, workspace_path) = scope_request(
-        scope,
-        workspace,
-        matches!(operation, AgentInstallationOperationKind::Install),
-    )?;
     let daemon = ensure_persistent_daemon()
         .await
         .context("starting persistent daemon for agent operation")?;

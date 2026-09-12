@@ -39,7 +39,10 @@ pub use crate::config::delegation_budget::{
     resolve_delegation_budget, resolve_schedule_run_budget,
 };
 #[allow(unused_imports)]
-pub use daemon::{DaemonConfig, DaemonUploadLimitsConfig, RetentionConfig};
+pub use daemon::{
+    DaemonBootConfig, DaemonConfig, DaemonContainerProbePaths, DaemonSecretStoreBackend,
+    DaemonUploadLimitsConfig, RetentionConfig,
+};
 #[allow(unused_imports)]
 pub use data_syntax::DataSyntaxConfig;
 #[allow(unused_imports)]
@@ -2132,6 +2135,28 @@ pub fn load_for_cwd(cwd: &Path) -> ExtendedConfig {
     load_for_cwd_with_computer_use_policy(cwd).0
 }
 
+/// Load machine installation bootstrap controls from the canonical user-owned
+/// global layer only. Project, machine-local-per-project, explicit override,
+/// retained workspace, and remote layers are intentionally outside this
+/// authority boundary.
+pub fn load_installation_daemon_boot() -> Result<DaemonBootConfig> {
+    let path = crate::config::dirs::global_config_dir()?.join(crate::config::dirs::CONFIG_FILE);
+    if !path.exists() {
+        return Ok(DaemonBootConfig::default());
+    }
+    let doc = ExtendedConfigDoc::load(&path)?;
+    let boot = match doc.raw_field("daemon") {
+        Some(raw) => {
+            serde_json::from_value::<DaemonConfig>(raw.clone())
+                .context("invalid installation daemon configuration")?
+                .boot
+        }
+        None => DaemonBootConfig::default(),
+    };
+    boot.validate_paths()?;
+    Ok(boot)
+}
+
 /// Effective config plus the non-secret warnings raised while merging the
 /// layered documents. This is the real layered load path's warning channel:
 /// it surfaces fail-closed events that happen during layer merge (e.g. a
@@ -2757,6 +2782,19 @@ pub(crate) fn strip_remote_agent_runtime_defaults(raw: &mut Value) {
     }
 }
 
+/// Daemon bootstrap composition is installation authority. An untrusted
+/// response may still contribute ordinary daemon tuning, but never key-store
+/// placement or host probe paths.
+pub(crate) fn strip_remote_daemon_boot(raw: &mut Value) {
+    if let Some(daemon) = raw
+        .as_object_mut()
+        .and_then(|root| root.get_mut("daemon"))
+        .and_then(Value::as_object_mut)
+    {
+        daemon.remove("boot");
+    }
+}
+
 /// Parse config.json bytes into an object root, mirroring
 /// [`ExtendedConfigDoc::load`]: empty/whitespace bytes are an empty object, and
 /// a non-object root is rejected (fail closed). Shared by the layered loader's
@@ -2926,9 +2964,10 @@ impl ExtendedConfigDoc {
     /// [`ConfigLayerOrigin::Remote`] and `image_generation` is stripped at
     /// construction. See the [`ConfigLayerOrigin`] invariant.
     pub fn load(path: &Path) -> Result<Self> {
-        let raw_str = match crate::config::files::read_workspace_config_text(path)
-            .with_context(|| format!("reading config.json at {}", path.display()))?
-        {
+        // No outer read context: the bounded reader already attaches a
+        // `reading <path>` context to IO failures and surfaces over-cap
+        // files as a top-level `exceeds the byte limit` failure.
+        let raw_str = match crate::config::files::read_workspace_config_text(path)? {
             Some(raw) => raw,
             None => "{}".to_string(),
         };
@@ -2974,6 +3013,7 @@ impl ExtendedConfigDoc {
         strip_remote_image_generation(&mut raw);
         strip_remote_image_sidecar(&mut raw);
         strip_remote_agent_runtime_defaults(&mut raw);
+        strip_remote_daemon_boot(&mut raw);
         strip_secret_store_key(&mut raw);
         Self {
             path: PathBuf::from("<remote .well-known/cockpit>"),
@@ -3190,6 +3230,7 @@ impl ExtendedConfigDoc {
             strip_remote_image_generation(&mut raw);
             strip_remote_image_sidecar(&mut raw);
             strip_remote_agent_runtime_defaults(&mut raw);
+            strip_remote_daemon_boot(&mut raw);
         }
         strip_secret_store_key(&mut raw);
         let Some(obj) = raw.as_object_mut() else {

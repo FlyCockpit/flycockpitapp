@@ -232,13 +232,12 @@ impl Tool for EditTool {
             crate::tools::lock_wait::acquire_waiting(ctx, &path, self.name(), false).await?;
         let write_guard = ctx
             .locks
-            .begin_write_after_wait(
+            .begin_anchored_edit_after_wait(
                 &path,
                 &ctx.lock_identity,
                 ctx.session.id,
                 self.name(),
                 !acquire.preexisting_hold,
-                true,
             )
             .await?;
         // The content approval and lock wait may have parked after the first

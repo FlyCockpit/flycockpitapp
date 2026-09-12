@@ -160,6 +160,7 @@ async fn attempt_restart_if_idle(
     skew_reason: Option<String>,
 ) -> Result<SkewRestartOutcome> {
     let old_pid = daemon::daemon_pid(paths);
+    let release = daemon::capture_restart_release(paths, old_pid);
     let client = match DaemonClient::connect(&paths.socket).await {
         Ok(client) => client,
         Err(error) if is_protocol_version_mismatch(&error) => {
@@ -200,7 +201,7 @@ async fn attempt_restart_if_idle(
         });
     }
 
-    if !daemon::wait_for_restart_release(paths, old_pid, daemon::restart_release_timeout(None))
+    if !daemon::wait_for_restart_release(paths, release, daemon::restart_release_timeout(None))
         .await
     {
         let reason = skew_reason.map(|reason| {

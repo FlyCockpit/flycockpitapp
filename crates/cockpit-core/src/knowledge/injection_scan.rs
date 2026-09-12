@@ -1177,9 +1177,9 @@ mod tests {
     fn base64_depth_cap_bounds_nested_decodes() {
         let once = "aWdub3JlIHByZXZpb3VzIGluc3RydWN0aW9ucw==";
         // Single encode: found.
-        assert!(!base64_layer_findings(once, 0, &mut B64_MAX_DECODED_BYTES).is_empty());
-        // Depth cap: no further decoding past B64_MAX_DEPTH.
         let mut budget = B64_MAX_DECODED_BYTES;
+        assert!(!base64_layer_findings(once, 0, &mut budget).is_empty());
+        // Depth cap: no further decoding past B64_MAX_DEPTH.
         assert!(base64_layer_findings(once, B64_MAX_DEPTH, &mut budget).is_empty());
     }
 

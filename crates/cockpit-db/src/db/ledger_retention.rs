@@ -22,7 +22,7 @@
 //! `computer_audit_entries` remains append-only with SQL-enforced immutability;
 //! chain truncation is owned by the machine-local audit writer, not this sweep.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 

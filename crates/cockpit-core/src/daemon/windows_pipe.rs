@@ -18,10 +18,19 @@ pub struct NamedPipeListener {
 }
 
 impl NamedPipeListener {
-    pub fn bind(identity_path: &Path) -> Result<Self> {
+    /// Allocate and bind a private control pipe without publishing its
+    /// filesystem identity. The caller may prepare required sibling endpoints
+    /// first and then make this listener observable with [`Self::publish`].
+    pub fn prepare() -> Result<Self> {
         let sid = current_user_sid().context("reading current-user SID for pipe ACL")?;
         let pipe_name = allocate_pipe_name(&sid)?;
-        Self::bind_named(identity_path, pipe_name, true)
+        Self::prepare_named(pipe_name, true)
+    }
+
+    pub fn bind(identity_path: &Path) -> Result<Self> {
+        let listener = Self::prepare()?;
+        listener.publish(identity_path)?;
+        Ok(listener)
     }
 
     pub fn bind_named(
@@ -29,15 +38,27 @@ impl NamedPipeListener {
         pipe_name: PipeName,
         first_instance: bool,
     ) -> Result<Self> {
+        let listener = Self::prepare_named(pipe_name, first_instance)?;
+        listener.publish(identity_path)?;
+        Ok(listener)
+    }
+
+    pub fn prepare_named(pipe_name: PipeName, first_instance: bool) -> Result<Self> {
         let mut security =
             OwnerOnlyPipeSecurity::for_current_user().context("building owner-only pipe DACL")?;
         let pending = create_server(&pipe_name, first_instance, &mut security)?;
-        write_pipe_identity(identity_path, &pipe_name)?;
         Ok(Self {
             pipe_name,
             pending: Some(pending),
             security,
         })
+    }
+
+    /// Publish the already-bound listener. This identity file is the Windows
+    /// readiness boundary; no client can discover the random pipe name before
+    /// this succeeds.
+    pub fn publish(&self, identity_path: &Path) -> Result<()> {
+        write_pipe_identity(identity_path, &self.pipe_name)
     }
 
     pub fn pipe_name(&self) -> &PipeName {

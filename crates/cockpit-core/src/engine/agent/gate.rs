@@ -560,7 +560,7 @@ mod safety_gate_tests {
     /// The hub is detached → not interactive, so an escalation prompt would
     /// never resolve; the tests only exercise paths that don't actually wait
     /// (no approver, or modes that skip the gate).
-    fn gate_ctx(root: &std::path::Path, mode: ApprovalMode, with_approver: bool) -> ToolCtx {
+    async fn gate_ctx(root: &std::path::Path, mode: ApprovalMode, with_approver: bool) -> ToolCtx {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = crate::session::Session::create_for_test(
             db.clone(),
@@ -572,6 +572,28 @@ mod safety_gate_tests {
         session.set_sandbox_enabled(false);
         session.set_approval_mode(mode);
         let sid = session.id;
+        let owner = db
+            .ensure_session_root_agent(
+                sid,
+                None,
+                crate::agent_tree::workspace_ref_for_host_path(root).unwrap(),
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.transition_agent_instance(
+                sid,
+                owner.agent_instance_id,
+                owner.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                r#"{"state":"running"}"#,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap(),
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(_)
+        ));
         let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
         let cfg = crate::config::extended::RedactConfig::default();
         let redact = Arc::new(crate::redact::RedactionTable::build(&cfg, root).unwrap());
@@ -599,7 +621,7 @@ mod safety_gate_tests {
             executing_model_trusted: false,
             knowledge_access_trusted: false,
             caller_model: None,
-            agent_instance_id: None,
+            agent_instance_id: Some(owner.agent_instance_id),
             lock_identity: "builder".to_string().clone(),
             write_scope: None,
             dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
@@ -684,23 +706,6 @@ mod safety_gate_tests {
         ))
     }
 
-    async fn wait_for_open_interrupt(ctx: &ToolCtx) -> uuid::Uuid {
-        for _ in 0..1000 {
-            if let Some(row) = ctx
-                .session
-                .db
-                .list_open_interrupts(ctx.session.id)
-                .await
-                .unwrap()
-                .first()
-            {
-                return row.interrupt_id;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!("timed out waiting for gate interrupt");
-    }
-
     async fn replay_question_from_row(
         ctx: &ToolCtx,
         interrupt_id: uuid::Uuid,
@@ -761,7 +766,7 @@ mod safety_gate_tests {
         let (tx, _rx) = mpsc::channel(8);
 
         for mode in [ApprovalMode::Manual, ApprovalMode::Auto, ApprovalMode::Yolo] {
-            let ctx = gate_ctx(root, mode, true);
+            let ctx = gate_ctx(root, mode, true).await;
             for (tool, args) in [
                 (
                     "webfetch",
@@ -789,7 +794,7 @@ mod safety_gate_tests {
         // `sandbox_off_ungranted_command_prompts_and_deny_blocks_run`, and
         // the `escalate` tool prompts through its Manual route.
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gate_ctx(tmp.path(), ApprovalMode::Manual, true);
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Manual, true).await;
         let (tx, _rx) = mpsc::channel(8);
         let args = serde_json::json!({ "command": "rm -rf /" });
         let outcome = safety_gate_decision("bash", &args, &ctx, &tx).await;
@@ -801,7 +806,7 @@ mod safety_gate_tests {
         // `yolo`: everything runs unprompted; the gate is bypassed even for a
         // destructive command, with no model call.
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gate_ctx(tmp.path(), ApprovalMode::Yolo, true);
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Yolo, true).await;
         let (tx, _rx) = mpsc::channel(8);
         let args = serde_json::json!({ "command": "rm -rf /" });
         let outcome = safety_gate_decision("bash", &args, &ctx, &tx).await;
@@ -811,7 +816,7 @@ mod safety_gate_tests {
     #[tokio::test]
     async fn auto_mode_routes_write_through_safety_gate() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true);
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true).await;
         let (tx, _rx) = mpsc::channel(8);
         let providers = crate::config::providers::ProvidersConfig::default();
         reset_safety_gate_evaluate_calls();
@@ -838,7 +843,7 @@ mod safety_gate_tests {
     async fn non_gated_tool_is_never_gated_even_in_auto() {
         // A non-scoped tool runs ungated in `auto` mode — no model call.
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true);
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true).await;
         let (tx, _rx) = mpsc::channel(8);
         let args = serde_json::json!({ "path": "src/main.rs" });
         let outcome = safety_gate_decision("read", &args, &ctx, &tx).await;
@@ -848,7 +853,7 @@ mod safety_gate_tests {
     #[tokio::test]
     async fn standing_reject_gate_blocks_before_model() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true);
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true).await;
         let approver = ctx.approver.as_ref().unwrap();
         let classification = classify("gh pr create");
         let info = classification.simple_commands().iter().next().unwrap();
@@ -889,8 +894,9 @@ mod safety_gate_tests {
         // of dropping standing rejects and letting the utility-model path
         // judge with them missing.
         let env = tempfile::tempdir().unwrap();
-        cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(env.path()).await;
-        let ctx = gate_ctx(env.path(), ApprovalMode::Auto, true);
+        let _home =
+            cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(env.path()).await;
+        let ctx = gate_ctx(env.path(), ApprovalMode::Auto, true).await;
         let global = crate::approval::store::global_approvals_dir().unwrap();
         std::fs::create_dir_all(&global).unwrap();
         std::fs::write(global.join("approvals.json"), b"not json at all").unwrap();
@@ -916,7 +922,7 @@ mod safety_gate_tests {
     #[tokio::test]
     async fn standing_reject_gate_passthrough_when_absent() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false).await;
         let (tx, _rx) = mpsc::channel(8);
         let args = serde_json::json!({ "command": "gh pr create" });
         let providers = crate::config::providers::ProvidersConfig::default();
@@ -947,7 +953,7 @@ mod safety_gate_tests {
     #[tokio::test]
     async fn standing_reject_allow_flip_unblocks_gate() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true);
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true).await;
         let approver = ctx.approver.as_ref().unwrap();
         let classification = classify("gh pr create");
         let info = classification.simple_commands().iter().next().unwrap();
@@ -1001,7 +1007,7 @@ mod safety_gate_tests {
             cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(env.path()).await;
         let project = tempfile::tempdir_in(env.path()).unwrap();
         init_git_repo(project.path());
-        let ctx = gate_ctx(project.path(), ApprovalMode::Auto, true);
+        let ctx = gate_ctx(project.path(), ApprovalMode::Auto, true).await;
         let approver = ctx.approver.as_ref().unwrap();
         approver
             .store()
@@ -1035,7 +1041,7 @@ mod safety_gate_tests {
     #[tokio::test]
     async fn standing_reject_precedes_replay_gate_memo() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true);
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true).await;
         let approver = ctx.approver.as_ref().unwrap();
         let classification = classify("gh pr create");
         let info = classification.simple_commands().iter().next().unwrap();
@@ -1082,7 +1088,7 @@ mod safety_gate_tests {
     #[tokio::test]
     async fn standing_reject_yolo_bypass_pinned() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gate_ctx(tmp.path(), ApprovalMode::Yolo, true);
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Yolo, true).await;
         let approver = ctx.approver.as_ref().unwrap();
         let classification = classify("gh pr create");
         let info = classification.simple_commands().iter().next().unwrap();
@@ -1123,7 +1129,7 @@ mod safety_gate_tests {
         outcome: Option<crate::engine::safety_gate::SafetyOutcome>,
     ) {
         let tmp = tempfile::tempdir().unwrap();
-        let mut ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
+        let mut ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false).await;
         let hub = attached_interrupt_hub(&ctx);
         attach_approver_with_hub(&mut ctx, hub.clone());
         let ctx = Arc::new(ctx);
@@ -1138,6 +1144,7 @@ mod safety_gate_tests {
         let task_ctx = ctx.clone_for_dispatch();
         let task_args = args.clone();
         let task_tx = tx.clone();
+        let mut raised = hub.subscribe_raised();
         let task = tokio::spawn(async move {
             safety_gate_decision_with_configs(
                 "bash",
@@ -1149,7 +1156,10 @@ mod safety_gate_tests {
             )
             .await
         });
-        let interrupt_id = wait_for_open_interrupt(&ctx).await;
+        let interrupt_id = raised
+            .recv()
+            .await
+            .expect("gate interrupt is published after lifecycle binding");
         let row = ctx
             .session
             .db
@@ -1161,15 +1171,7 @@ mod safety_gate_tests {
             row.parked.is_none(),
             "ordinary gate escalation must await an open user interrupt"
         );
-        let mut parked = 0;
-        for _ in 0..1000 {
-            parked = hub.park_all_registered().await;
-            if parked == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(parked, 1, "gate interrupt must register before parking");
+        assert!(hub.park(interrupt_id).await);
         assert!(matches!(task.await.unwrap(), GateOutcome::Parked));
     }
 
@@ -1218,7 +1220,7 @@ mod safety_gate_tests {
     #[tokio::test]
     async fn gate_degrade_unset_warns_once_and_asks_manual_equivalent() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false).await;
         let (tx, mut rx) = mpsc::channel(8);
         let args = serde_json::json!({ "command": "gh pr create" });
         let providers = crate::config::providers::ProvidersConfig::default();
@@ -1259,7 +1261,7 @@ mod safety_gate_tests {
     #[tokio::test]
     async fn gate_degrade_unusable_warns_once_but_keeps_probing() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false).await;
         let (tx, mut rx) = mpsc::channel(8);
         let args = serde_json::json!({ "command": "gh pr create" });
         let providers = crate::config::providers::ProvidersConfig::default();
@@ -1300,7 +1302,7 @@ mod safety_gate_tests {
     #[tokio::test]
     async fn gate_degrade_recovery_resumes_auto_and_rearms_notice() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false).await;
         let (tx, mut rx) = mpsc::channel(8);
         let args = serde_json::json!({ "command": "gh pr create" });
         let providers = crate::config::providers::ProvidersConfig::default();
@@ -1377,7 +1379,7 @@ mod safety_gate_tests {
     #[tokio::test]
     async fn gate_degrade_config_refresh_upgrades_live() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
+        let mut ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false).await;
         let shared = Arc::new(std::sync::RwLock::new(
             crate::daemon::session_worker::SessionConfigSnapshot::new(
                 0,
@@ -1416,7 +1418,7 @@ mod safety_gate_tests {
     #[tokio::test]
     async fn gate_degrade_unrelated_config_change_no_rewarn() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
+        let mut ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false).await;
         let shared = Arc::new(std::sync::RwLock::new(
             crate::daemon::session_worker::SessionConfigSnapshot::new(
                 0,
@@ -1503,7 +1505,7 @@ mod safety_gate_tests {
     #[tokio::test]
     async fn dispatch_duration_excludes_pre_call_approval_wait() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gate_ctx(tmp.path(), ApprovalMode::Manual, false);
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Manual, false).await;
         let tools = ToolBox::new().with(Arc::new(SleepTool));
 
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -1524,7 +1526,7 @@ mod safety_gate_tests {
     #[tokio::test]
     async fn gate_degrade_unset_no_client_blocks_before_dispatch() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false).await;
         let (tx, mut rx) = mpsc::channel(8);
         let args = serde_json::json!({ "command": "ls" });
         let providers = crate::config::providers::ProvidersConfig::default();
@@ -1539,7 +1541,7 @@ mod safety_gate_tests {
     #[tokio::test]
     async fn interrupt_replay_reuses_memoized_gate_decision() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false).await;
         let (tx, _rx) = mpsc::channel(8);
         let args = serde_json::json!({ "command": "ls" });
         let providers = crate::config::providers::ProvidersConfig::default();
@@ -1573,7 +1575,7 @@ mod safety_gate_tests {
     fn interrupt_replay_gate_escalation_parks_and_replays() {
         crate::test_env::run_async_with_large_stack(|| async {
             let tmp = tempfile::tempdir().unwrap();
-            let mut ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
+            let mut ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false).await;
             let hub = attached_interrupt_hub(&ctx);
             attach_approver_with_hub(&mut ctx, hub.clone());
             let ctx = Arc::new(ctx);
@@ -1598,6 +1600,7 @@ mod safety_gate_tests {
             let first_tx = tx.clone();
             let first_args = args.clone();
             let first_payload = payload.clone();
+            let mut raised = hub.subscribe_raised();
             let first = tokio::spawn(async move {
                 crate::engine::interrupt::with_interrupt_park_payload(first_payload, async {
                     escalate_gated_call("mcp", &first_args, &first_ctx, true, &first_tx, true).await
@@ -1605,7 +1608,10 @@ mod safety_gate_tests {
                 .await
             });
 
-            let interrupt_id = wait_for_open_interrupt(&ctx).await;
+            let interrupt_id = raised
+                .recv()
+                .await
+                .expect("gate interrupt is published after lifecycle binding");
             let row = ctx
                 .session
                 .db
@@ -1617,32 +1623,66 @@ mod safety_gate_tests {
                 row.parked.is_some(),
                 "gate interrupt must carry replay payload"
             );
-            assert_eq!(hub.park_all_registered().await, 1);
+            assert!(hub.park(interrupt_id).await);
             assert_eq!(first.await.unwrap(), GateApproval::Parked);
 
             let response = crate::daemon::proto::ResolveResponse::Single {
                 selected_id: crate::approval::ID_APPROVE.to_string(),
             };
-            assert!(
-                ctx.session
-                    .db
-                    .begin_parked_interrupt_execution(interrupt_id, &response)
-                    .await
-                    .unwrap()
-            );
             let question = replay_question_from_row(&ctx, interrupt_id).await;
-            let replayed = crate::engine::interrupt::with_pre_resolved_interrupt_question(
-                interrupt_id,
-                response,
-                question,
-                async {
-                    crate::engine::interrupt::with_interrupt_park_payload(payload, async {
-                        escalate_gated_call("mcp", &args, &ctx, true, &tx, true).await
-                    })
+            let decision = ctx
+                .session
+                .db
+                .decision_request_for_interrupt(ctx.session.id, interrupt_id)
+                .await
+                .unwrap()
+                .expect("parked gate approval lifecycle decision");
+            assert!(matches!(
+                crate::agent_tree::AgentTreeLifecycle::new(ctx.session.db.clone())
+                    .resolve_host_approval(
+                        ctx.session.id,
+                        decision.decision_request_id,
+                        interrupt_id,
+                        &serde_json::to_string(&response).unwrap(),
+                        crate::agent_tree::HostApprovalAuthority::for_durable_interrupt_binding(
+                            ctx.session.id,
+                            &decision,
+                            &row,
+                        )
+                        .unwrap(),
+                        crate::agent_tree::system_now_unix_ms(),
+                    )
                     .await
+                    .unwrap(),
+                crate::agent_tree::DecisionSettlement::Resolved(_)
+            ));
+            let replayed = crate::engine::interrupt::with_host_approval_effect_scope(
+                "gate_replay_test",
+                ctx.cancel.clone(),
+                async {
+                    Ok(
+                        crate::engine::interrupt::with_pre_resolved_interrupt_question(
+                            interrupt_id,
+                            response,
+                            question,
+                            async {
+                                crate::engine::interrupt::with_interrupt_park_payload(
+                                    payload,
+                                    async {
+                                        escalate_gated_call("mcp", &args, &ctx, true, &tx, true)
+                                            .await
+                                    },
+                                )
+                                .await
+                            },
+                        )
+                        .await,
+                    )
                 },
+                |approval| Some(*approval == GateApproval::Allow),
             )
-            .await;
+            .await
+            .unwrap();
             assert_eq!(replayed, GateApproval::Allow);
         });
     }
@@ -1659,7 +1699,7 @@ mod safety_gate_tests {
     #[tokio::test]
     async fn fail_closed_without_approver_denies() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false).await;
         let (tx, _rx) = mpsc::channel(8);
         let args = serde_json::json!({ "command": "git status" });
         let providers = crate::config::providers::ProvidersConfig::default();
@@ -1689,7 +1729,7 @@ mod safety_gate_tests {
     #[tokio::test]
     async fn safe_verdict_runs_without_prompt() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false).await;
         let (tx, _rx) = mpsc::channel(8);
         let args = serde_json::json!({ "command": "git status" });
         let providers = crate::config::providers::ProvidersConfig::default();

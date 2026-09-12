@@ -22,6 +22,7 @@ use crate::config::providers::ProvidersConfig;
 use crate::config::trust::WorkspaceTrustPolicy;
 
 type LoadFn = dyn Fn(&Path) -> Result<(ProvidersConfig, ExtendedConfig)> + Send + Sync;
+type BootLoadFn = dyn Fn() -> Result<crate::config::extended::DaemonBootConfig> + Send + Sync;
 type DaemonLoadFn = dyn Fn(&Path) -> Result<DaemonConfigLoad> + Send + Sync;
 type WorkspaceDaemonLoadFn = dyn Fn(
         &Path,
@@ -89,6 +90,7 @@ impl ConfigWatchPaths {
 #[derive(Clone)]
 pub struct ConfigSource {
     load: Arc<LoadFn>,
+    boot_load: Arc<BootLoadFn>,
     daemon_load: Arc<DaemonLoadFn>,
     workspace_daemon_load: Arc<WorkspaceDaemonLoadFn>,
     write_target: Arc<WriteTargetFn>,
@@ -134,6 +136,10 @@ impl ConfigSource {
         let daemon_source = load.clone();
         let workspace_daemon_source = load.clone();
         Self {
+            boot_load: Arc::new({
+                let load = load.clone();
+                move || Ok(load(Path::new("/"))?.1.daemon.boot)
+            }),
             daemon_load: Arc::new(move |cwd| {
                 let (providers, extended) = daemon_source(cwd)?;
                 Ok(DaemonConfigLoad {
@@ -175,6 +181,10 @@ impl ConfigSource {
         let workspace_daemon_load_source = daemon_load.clone();
         Self {
             load: Arc::new(load),
+            boot_load: Arc::new({
+                let daemon_load = daemon_load.clone();
+                move || Ok(daemon_load(Path::new("/"))?.extended.daemon.boot)
+            }),
             daemon_load,
             workspace_daemon_load: Arc::new(move |cwd, _workspace| {
                 workspace_daemon_load_source(cwd)
@@ -257,6 +267,7 @@ impl ConfigSource {
         }) as Arc<PrepareGlobalLayersFn>;
         Self {
             load,
+            boot_load: Arc::new(crate::config::extended::load_installation_daemon_boot),
             daemon_load,
             workspace_daemon_load,
             write_target: Arc::new(|cwd, provider_id| {
@@ -326,6 +337,10 @@ impl ConfigSource {
     /// applied (the caller's ambient policy, if any, governs).
     pub fn load(&self, cwd: &Path) -> Result<(ProvidersConfig, ExtendedConfig)> {
         (self.load)(cwd)
+    }
+
+    pub fn load_boot(&self) -> Result<crate::config::extended::DaemonBootConfig> {
+        (self.boot_load)()
     }
 
     /// Load the effective configs for `cwd` under a resolved workspace-trust
@@ -564,7 +579,7 @@ mod tests {
         let home = tempfile::tempdir().expect("isolated Cockpit home");
         let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(home.path());
         let workspace = tempfile::tempdir().expect("workspace");
-        let global_config = home.path().join("config/cockpit/config.json");
+        let global_config = home.path().join("home/.config/cockpit/config.json");
         let replacement_config = home.path().join("replacement-config.json");
         std::fs::create_dir_all(global_config.parent().expect("global config parent")).unwrap();
         std::fs::write(&global_config, r#"{"maxPrimaryRounds":22}"#).unwrap();
@@ -747,7 +762,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(home.path());
         let workspace = tempfile::tempdir().unwrap();
-        let global_config = home.path().join("config/cockpit/config.json");
+        let global_config = home.path().join("home/.config/cockpit/config.json");
         let project_config = workspace.path().join(".cockpit/config.json");
         let explicit_config = workspace.path().join("override.json");
         let literal_global = "Bearer sk-global-preparation-1234567890";

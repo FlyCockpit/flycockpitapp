@@ -171,10 +171,11 @@ pub async fn search(cfg: &McpConfig, host: &HostContext, query: &str) -> Vec<Sea
     }
     let catalog = catalog_view(cfg, host);
     for (name, _server, entry) in catalog.enabled_servers() {
-        let tools = match list_tools_for_entry(name, entry, connect_context(host)).await {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
+        let tools =
+            match list_tools_for_entry(name, entry, connect_context(host).for_discovery()).await {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
         // `list_tools_cached*` is the sanitization boundary for external
         // descriptors; search/grep hit builders use those bytes directly.
         for tool in tools {
@@ -230,10 +231,11 @@ pub async fn grep_tool_names(
     }
     let catalog = catalog_view(cfg, host);
     for (name, _server, entry) in catalog.enabled_servers() {
-        let tools = match list_tools_for_entry(name, entry, connect_context(host)).await {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
+        let tools =
+            match list_tools_for_entry(name, entry, connect_context(host).for_discovery()).await {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
         // `list_tools_cached*` already sanitized external descriptors.
         for tool in tools {
             if re.is_match(&tool.name) {
@@ -282,10 +284,11 @@ pub async fn grep_tool_definitions(
     }
     let catalog = catalog_view(cfg, host);
     for (name, _server, entry) in catalog.enabled_servers() {
-        let tools = match list_tools_for_entry(name, entry, connect_context(host)).await {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
+        let tools =
+            match list_tools_for_entry(name, entry, connect_context(host).for_discovery()).await {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
         // `list_tools_cached*` already sanitized external descriptors.
         for tool in tools {
             push_definition_hit(&mut hits, &re, name, &tool);
@@ -338,7 +341,7 @@ pub async fn describe(
     {
         bail!("MCP server `{server}` is disabled");
     }
-    let tools = list_tools_for_entry(server, entry, connect_context(host)).await?;
+    let tools = list_tools_for_entry(server, entry, connect_context(host).for_discovery()).await?;
     let Some(desc) = tools.into_iter().find(|desc| desc.name == tool) else {
         bail!("unknown MCP tool `{server}.{tool}`");
     };
@@ -497,7 +500,7 @@ pub async fn invoke(
     if let Some(result) = host.test_external_invoke(server, tool, args.clone()) {
         return result;
     }
-    let tools = list_tools_for_entry(server, entry, connect_context(host)).await?;
+    let tools = list_tools_for_entry(server, entry, connect_context(host).for_discovery()).await?;
     if !tools.iter().any(|desc| desc.name == tool) {
         if let Some(suggestion) = crate::mcp::suggest::closest_tool(
             tool,

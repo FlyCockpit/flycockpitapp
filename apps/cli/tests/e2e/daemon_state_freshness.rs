@@ -1,7 +1,10 @@
 use std::process::Stdio;
 use std::time::Duration;
 
-use crate::support::{IsolatedHome, SpawnedDaemon, assert_failure, assert_success, output_text};
+use crate::support::{
+    DAEMON_START_HANDSHAKE_TIMEOUT, EphemeralDaemonGuard, IsolatedHome, SpawnedDaemon,
+    assert_failure, assert_success, output_text, wait_for_daemon_handshake_on_socket,
+};
 use cockpit_cli::integration::{DaemonClient, DaemonEvent};
 use cockpit_test_support::provider::{ScriptedProvider, Turn};
 use rusqlite::{Connection, params};
@@ -91,55 +94,47 @@ async fn ephemeral_session_resumes_on_shared_daemon() {
     let provider = text_provider().await;
     let home = IsolatedHome::new();
     home.write_local_provider_config(&provider.base_url());
-    home.trust_project();
-    // `trust set` starts a persistent daemon that holds the exclusive boot
-    // lock. Ephemeral and persistent cannot share that lock; stop the
-    // trust-started process before the explicit ephemeral daemon boots.
-    let stop_trust_daemon = home
-        .cockpit()
-        .args(["daemon", "stop", "--grace", "0"])
-        .output()
-        .expect("stop trust-started persistent daemon");
-    assert_success(
-        "stop trust-started persistent daemon",
-        &stop_trust_daemon,
-        &home,
-    );
 
     // Ephemeral ownership is a lifetime policy on the canonical ledger
     // endpoint. A shared follow-up daemon must discover the exact same socket
     // and durable session after this owner exits.
     let ephemeral_socket = home.socket_path();
+    let launch_ticket = format!(
+        "{:032x}{:032x}",
+        uuid::Uuid::new_v4().as_u128(),
+        uuid::Uuid::new_v4().as_u128()
+    );
     let mut daemon_command = home.cockpit();
     daemon_command
         .args(["daemon", "start", "--foreground"])
         .env("COCKPIT_DAEMON_LIFETIME", "ephemeral")
+        .env("COCKPIT_DAEMON_LAUNCH_TICKET", launch_ticket)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut ephemeral_process = daemon_command
+    let child = daemon_command
         .spawn()
         .expect("spawn explicit ephemeral daemon process");
-    let socket_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !ephemeral_socket.exists() {
-        if let Some(status) = ephemeral_process
-            .try_wait()
-            .expect("probe ephemeral daemon")
-        {
-            let output = ephemeral_process
-                .wait_with_output()
-                .expect("collect failed ephemeral daemon output");
-            panic!(
-                "ephemeral daemon exited before binding ({status}): {}",
-                output_text(&output)
-            );
-        }
-        assert!(
-            tokio::time::Instant::now() < socket_deadline,
-            "timed out waiting for ephemeral daemon socket"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let ephemeral_guard =
+        EphemeralDaemonGuard::new(child, ephemeral_socket.clone(), home.pid_file());
+    wait_for_daemon_handshake_on_socket(
+        &ephemeral_socket,
+        &home.pid_file(),
+        DAEMON_START_HANDSHAKE_TIMEOUT,
+        || {
+            if let Ok(Some(status)) = ephemeral_guard.try_wait() {
+                panic!(
+                    "ephemeral daemon exited before handshake ({status}): socket={}",
+                    ephemeral_socket.display()
+                );
+            }
+            None
+        },
+    )
+    .await;
+    // Establish trust through the already-published exact child. Starting
+    // trust first would auto-spawn an unowned persistent daemon.
+    home.trust_project();
     let ephemeral_client = DaemonClient::connect(&ephemeral_socket)
         .await
         .expect("connect explicit ephemeral daemon");
@@ -182,7 +177,7 @@ async fn ephemeral_session_resumes_on_shared_daemon() {
         .await
         .expect("gracefully stop ephemeral daemon");
     drop(ephemeral_client);
-    let ephemeral_output = ephemeral_process
+    let ephemeral_output = ephemeral_guard
         .wait_with_output()
         .expect("wait for ephemeral daemon exit");
     assert_success(
@@ -245,11 +240,7 @@ async fn daemon_refuses_newer_migration_ledger() {
     // Doctor is read-only and never materializes SQLite. Boot (then stop) a
     // real daemon so the ledger exists before we seed a future migration row.
     let daemon = SpawnedDaemon::start().await;
-    let stop = daemon
-        .command()
-        .args(["daemon", "stop", "--grace", "0"])
-        .output()
-        .expect("stop daemon before seeding newer migration ledger");
+    let stop = daemon.stop_via_command(0);
     assert_success(
         "stop daemon before seeding newer migration ledger",
         &stop,

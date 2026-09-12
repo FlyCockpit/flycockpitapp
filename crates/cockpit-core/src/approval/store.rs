@@ -616,6 +616,30 @@ impl GrantStore {
         Ok(None)
     }
 
+    pub async fn any_mcp_tool_allow_for_server(
+        &self,
+        agent: Option<&str>,
+        profile: &str,
+        server: &str,
+    ) -> Result<bool> {
+        let prefix = mcp_tool_server_prefix(agent, profile, server);
+        if self
+            .session_mcp_tool_prefix_matches(&prefix, Verdict::Allow)
+            .await
+        {
+            return Ok(true);
+        }
+        let project = self.project_file()?;
+        let global = self.global_file()?;
+        if project.is_some_and(|file| file.mcp_tools.iter().any(|key| key.starts_with(&prefix))) {
+            return Ok(true);
+        }
+        if global.is_some_and(|file| file.mcp_tools.iter().any(|key| key.starts_with(&prefix))) {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Scope of the persisted connection grant for one exact server identity.
     /// This is distinct from ordinary MCP tool lookup because the second key
     /// component is namespaced and is derived only from the transport identity.
@@ -1602,6 +1626,29 @@ impl GrantStore {
             .unwrap_or(false)
     }
 
+    async fn session_mcp_tool_prefix_matches(&self, prefix: &str, verdict: Verdict) -> bool {
+        let session_id = self.session_id;
+        let prefix = prefix.to_owned();
+        self.db
+            .read(move |conn| {
+                let n: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM approval_grants \
+                     WHERE session_id = ?1 AND grant_kind = ?2 AND grant_key LIKE ?3 \
+                       AND verdict = ?4",
+                    rusqlite::params![
+                        session_id.to_string(),
+                        GrantKind::McpTool.as_str(),
+                        format!("{prefix}%"),
+                        verdict.as_str()
+                    ],
+                    |row| row.get(0),
+                )?;
+                Ok(n > 0)
+            })
+            .await
+            .unwrap_or(false)
+    }
+
     async fn session_path_entries(&self, verdict: Verdict) -> Vec<(String, SandboxPathAccess)> {
         let session_id = self.session_id;
         self.db
@@ -1871,6 +1918,17 @@ pub fn mcp_tool_key_for(agent: Option<&str>, profile: &str, server: &str, tool: 
             format!("agent:{}/{}", escape_mcp_tool_key_part(agent), profiled)
         }
         _ => profiled,
+    }
+}
+
+pub fn mcp_tool_server_prefix(agent: Option<&str>, profile: &str, server: &str) -> String {
+    let base = escape_mcp_tool_key_part(server);
+    let profiled = format!("profile:{}/{}", escape_mcp_tool_key_part(profile), base);
+    match agent {
+        Some(agent) if !agent.is_empty() => {
+            format!("agent:{}/{}/", escape_mcp_tool_key_part(agent), profiled)
+        }
+        _ => format!("{profiled}/"),
     }
 }
 
@@ -6229,7 +6287,8 @@ mod tests {
     #[tokio::test]
     async fn global_approvals_mutation_does_not_create_a_missing_global_config_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        let _env =
+            crate::config::dirs::test_support::IsolatedCockpitHome::new_async(tmp.path()).await;
         crate::config::trust::clear_runtime_policy_for_tests();
         let global = crate::config::dirs::global_config_dir().unwrap();
         assert!(

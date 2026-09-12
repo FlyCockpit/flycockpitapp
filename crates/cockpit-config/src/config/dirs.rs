@@ -94,6 +94,14 @@ pub fn global_config_dir() -> anyhow::Result<PathBuf> {
     crate::config::resolve::cockpit_config_dir()
 }
 
+pub(crate) fn global_config_dir_unchecked() -> anyhow::Result<PathBuf> {
+    crate::config::resolve::cockpit_config_dir_unchecked()
+}
+
+pub(crate) fn global_config_file_unchecked() -> anyhow::Result<PathBuf> {
+    Ok(global_config_dir_unchecked()?.join(CONFIG_FILE))
+}
+
 /// The canonical global `config.json` path. Onboarding and other
 /// user-level setup must use this rather than selecting a workspace layer.
 pub fn global_config_file() -> anyhow::Result<PathBuf> {
@@ -127,7 +135,7 @@ pub fn ensure_global_config_dir() -> anyhow::Result<PathBuf> {
 /// File-write helpers must not create this directory. Call
 /// [`ensure_global_config_dir`] from an authorized write funnel instead.
 pub fn path_is_under_missing_global_config_dir(path: &Path) -> bool {
-    let Ok(global) = global_config_dir() else {
+    let Ok(global) = global_config_dir_unchecked() else {
         return false;
     };
     !global.is_dir() && cockpit_host::path_containment::contained_under(&global, path)

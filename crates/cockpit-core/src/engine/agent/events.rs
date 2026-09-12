@@ -434,8 +434,9 @@ pub enum TurnEvent {
         output: String,
         truncated: bool,
         /// `session_events.seq` for the durable tool-call timeline row when
-        /// the call was persisted. `None` for synthetic/display-only tool
-        /// events or when persistence failed.
+        /// the call was persisted. For ordinary calls, `Some` also proves the
+        /// audit row committed. `None` marks synthetic/display-only events or
+        /// a required persistence failure.
         seq: Option<i64>,
         /// Post-result hint text (`engine::bash_hints`, the user-side
         /// `data.hint.text`) when a rule fired on this `bash` call; `None`
@@ -480,8 +481,9 @@ pub enum TurnEvent {
         error: String,
         kind: crate::engine::tool::ToolFailKind,
         /// `session_events.seq` for the durable tool-call timeline row when
-        /// the call was persisted. `None` for synthetic/display-only tool
-        /// events or when persistence failed.
+        /// the call was persisted. For ordinary calls, `Some` also proves the
+        /// audit row committed. `None` marks synthetic/display-only events or
+        /// a required persistence failure.
         seq: Option<i64>,
     },
     /// An inference call failed terminally — a TTFT / idle timeout, a

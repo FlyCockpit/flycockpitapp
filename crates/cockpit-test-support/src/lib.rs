@@ -5,7 +5,33 @@ use std::sync::OnceLock;
 
 use tokio::sync::{Mutex, MutexGuard};
 
+pub mod home_isolation;
 pub mod provider;
+
+/// Create a small test root on a latency-isolated temporary filesystem when
+/// the platform exposes one, with a normal OS temporary directory as the
+/// portable fallback.
+///
+/// Linux's conventional `/dev/shm` mount keeps fsync-heavy durability fixtures
+/// independent of shared workspace-disk latency. Creating the directory is
+/// the capability check: containers without that mount (or without access to
+/// it), and every other platform, safely fall back to `tempfile::tempdir`.
+/// Callers must still exercise their real durable write/flush path; this helper
+/// changes only the test root and never mutates `TMPDIR` or a user directory.
+pub fn latency_isolated_tempdir() -> tempfile::TempDir {
+    #[cfg(target_os = "linux")]
+    if let Ok(tempdir) = tempfile::Builder::new()
+        .prefix("cockpit-latency-isolated-")
+        .tempdir_in("/dev/shm")
+    {
+        return tempdir;
+    }
+
+    tempfile::Builder::new()
+        .prefix("cockpit-latency-isolated-")
+        .tempdir()
+        .expect("create latency-isolated test tempdir fallback")
+}
 
 #[cfg(test)]
 mod clippy_workflow_gate;
@@ -30,6 +56,29 @@ static TEST_ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn test_env_mutex() -> &'static Mutex<()> {
     TEST_ENV_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+/// Create an isolated Cockpit home without coupling daemon/storage acceptance
+/// tests to unrelated compiler and linker traffic on the workspace disk.
+/// The HOME/XDG production inputs still provide every path consumed by the
+/// code under test; only the backing filesystem differs on Linux.
+pub fn isolated_tempdir() -> tempfile::TempDir {
+    #[cfg(target_os = "linux")]
+    {
+        // Respect the platform-standard override so loaded acceptance runs can
+        // exercise the ordinary disk-backed fallback explicitly. Otherwise
+        // prefer tmpfs, but do not make its presence a correctness condition.
+        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+            return tempfile::tempdir_in(tmpdir).expect("create isolated Cockpit home in TMPDIR");
+        }
+        tempfile::tempdir_in("/dev/shm")
+            .or_else(|_| tempfile::tempdir())
+            .expect("create isolated Cockpit home")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        tempfile::tempdir().expect("create isolated Cockpit home tempdir")
+    }
 }
 
 #[must_use]
@@ -60,7 +109,7 @@ impl TestEnvGuard {
     }
 
     pub fn isolated_cockpit_home() -> Self {
-        let tempdir = tempfile::tempdir().expect("create isolated cockpit home tempdir");
+        let tempdir = isolated_tempdir();
         let root = tempdir.path().to_path_buf();
         let mut guard = Self::blocking_lock();
         guard.set_isolated_home(&root);
@@ -69,7 +118,7 @@ impl TestEnvGuard {
     }
 
     pub async fn isolated_cockpit_home_async() -> Self {
-        let tempdir = tempfile::tempdir().expect("create isolated cockpit home tempdir");
+        let tempdir = isolated_tempdir();
         let root = tempdir.path().to_path_buf();
         let mut guard = Self::lock().await;
         guard.set_isolated_home(&root);
@@ -90,6 +139,7 @@ impl TestEnvGuard {
     }
 
     fn from_guard(guard: MutexGuard<'static, ()>) -> Self {
+        home_isolation::ensure_real_developer_roots_captured();
         Self {
             _guard: guard,
             snapshots: RefCell::new(
@@ -237,7 +287,6 @@ pub fn workspace_root() -> PathBuf {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[derive(Clone, Copy)]
     struct AllowedMutation {
@@ -281,36 +330,88 @@ mod tests {
 
     #[tokio::test]
     async fn guard_serializes_concurrent_async_acquisition() {
-        let first_entered = Arc::new(AtomicBool::new(false));
-        let first_can_finish = Arc::new(AtomicBool::new(false));
-        let second_entered_while_first_held = Arc::new(AtomicBool::new(false));
-
-        let first_entered_for_task = Arc::clone(&first_entered);
-        let first_can_finish_for_task = Arc::clone(&first_can_finish);
+        let (first_entered_tx, first_entered_rx) = tokio::sync::oneshot::channel();
+        let (first_can_finish_tx, first_can_finish_rx) = tokio::sync::oneshot::channel();
+        let (second_entered_tx, mut second_entered_rx) = tokio::sync::oneshot::channel();
         let first = tokio::spawn(async move {
             let _guard = TestEnvGuard::lock().await;
-            first_entered_for_task.store(true, Ordering::SeqCst);
-            while !first_can_finish_for_task.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
+            first_entered_tx
+                .send(())
+                .expect("signal first guard acquisition");
+            first_can_finish_rx.await.expect("release first guard");
         });
 
-        while !first_entered.load(Ordering::SeqCst) {
-            tokio::task::yield_now().await;
-        }
+        first_entered_rx
+            .await
+            .expect("observe first guard acquisition");
 
-        let second_entered_while_first_held_for_task = Arc::clone(&second_entered_while_first_held);
         let second = tokio::spawn(async move {
             let _guard = TestEnvGuard::lock().await;
-            second_entered_while_first_held_for_task.store(true, Ordering::SeqCst);
+            second_entered_tx
+                .send(())
+                .expect("signal second guard acquisition");
         });
 
-        tokio::task::yield_now().await;
-        assert!(!second_entered_while_first_held.load(Ordering::SeqCst));
-        first_can_finish.store(true, Ordering::SeqCst);
+        assert!(
+            second_entered_rx.try_recv().is_err(),
+            "second guard acquired while first was held"
+        );
+        first_can_finish_tx.send(()).expect("release first guard");
         first.await.unwrap();
+        second_entered_rx
+            .await
+            .expect("observe second guard acquisition");
         second.await.unwrap();
-        assert!(second_entered_while_first_held.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn home_isolation_redirects_real_paths_without_test_env_guard() {
+        let real_config = dirs::config_dir()
+            .expect("real developer config dir")
+            .join("cockpit");
+        let redirected = home_isolation::finalize_test_cockpit_path(
+            real_config,
+            home_isolation::CockpitHomeKind::Config,
+        );
+        home_isolation::assert_not_real_developer_cockpit_path(&redirected);
+    }
+
+    #[test]
+    fn home_isolation_redirects_real_developer_cockpit_paths() {
+        let setup = test_env_mutex().blocking_lock();
+        home_isolation::ensure_real_developer_roots_captured();
+        let real_config = dirs::config_dir()
+            .expect("real developer config dir")
+            .join("cockpit");
+        let redirected = home_isolation::finalize_test_cockpit_path(
+            real_config,
+            home_isolation::CockpitHomeKind::Config,
+        );
+        home_isolation::assert_not_real_developer_cockpit_path(&redirected);
+        drop(setup);
+    }
+
+    #[test]
+    fn home_isolation_allow_real_home_env_keeps_developer_paths() {
+        let guard = TestEnvGuard::blocking_lock();
+        guard.set_var(home_isolation::COCKPIT_TEST_ALLOW_REAL_HOME_ENV, "1");
+        let real_config = dirs::config_dir()
+            .expect("real developer config dir")
+            .join("cockpit");
+        let kept = home_isolation::finalize_test_cockpit_path(
+            real_config.clone(),
+            home_isolation::CockpitHomeKind::Config,
+        );
+        assert_eq!(kept, real_config);
+    }
+
+    #[test]
+    fn home_isolation_guard_allows_isolated_cockpit_paths() {
+        let tempdir = tempfile::tempdir().expect("isolated home tempdir");
+        let guard = TestEnvGuard::isolate_cockpit_home_at(tempdir.path());
+        let isolated_config = tempdir.path().join("home/.config/cockpit");
+        home_isolation::assert_not_real_developer_cockpit_path(&isolated_config);
+        drop(guard);
     }
 
     #[test]
@@ -320,6 +421,26 @@ mod tests {
                 file: "apps/cli/src/commands/daemon.rs",
                 symbol: "run",
                 reason: "foreground daemon startup intentionally exports the no-sandbox marker before worker tasks start",
+            },
+            AllowedMutation {
+                file: "crates/cockpit-core/src/bin/cockpit-daemon-spawn-harness.rs",
+                symbol: "run",
+                reason: "foreground daemon spawn harness intentionally exports the no-sandbox marker before the runtime starts worker tasks, mirroring foreground daemon startup",
+            },
+            AllowedMutation {
+                file: "crates/cockpit-core/src/daemon/peer_authority.rs",
+                symbol: "record_launch_provenance_from_environment",
+                reason: "daemon boot scrubs the launch-ticket environment slot once so descendant processes never inherit owner-class provenance",
+            },
+            AllowedMutation {
+                file: "crates/cockpit-core/src/providers/provider_http.rs",
+                symbol: "set",
+                reason: "test-local proxy env guard saves/restores one variable serialized by its own static mutex for the test lifetime",
+            },
+            AllowedMutation {
+                file: "crates/cockpit-core/src/providers/provider_http.rs",
+                symbol: "drop",
+                reason: "test-local proxy env guard restores the saved variable serialized by its own static mutex for the test lifetime",
             },
             AllowedMutation {
                 file: "crates/cockpit-config/src/config/trust.rs",

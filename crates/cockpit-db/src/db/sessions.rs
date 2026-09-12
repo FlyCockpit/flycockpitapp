@@ -1230,14 +1230,23 @@ pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<u64> {
 
 /// Delete every collected member. Compaction predecessor/lineage-root FKs are
 /// RESTRICT, so successors (and any other remaining referencers) are removed
-/// before the rows they point at. Fork children may CASCADE off a parent
-/// delete; a later DELETE of an already-cascaded id is a no-op.
+/// before the rows they point at. Deletion is also leaves-first in the
+/// fork/`/btw` cascade tree: deleting a parent CASCADEs to its remaining
+/// children, and a cascade-removed child would trip its own successor's
+/// RESTRICT predecessor/lineage-root FKs (a root delete cascades to a fork
+/// while the fork's compaction window still references it). A leaf delete
+/// cascades nothing, so once a member's own referencers are gone its DELETE
+/// cannot violate a RESTRICT FK. A later DELETE of an already-cascaded id is
+/// a no-op.
 fn delete_subtree_rows_conn(conn: &Connection, subtree: &[Uuid]) -> Result<()> {
     let mut remaining: std::collections::HashSet<Uuid> = subtree.iter().copied().collect();
     while !remaining.is_empty() {
         let candidates: Vec<Uuid> = remaining.iter().copied().collect();
         let mut deleted_any = false;
         for id in candidates {
+            if cascade_child_in_remaining(conn, id, &remaining)? {
+                continue;
+            }
             if compaction_fk_blocks_delete(conn, id, &remaining)? {
                 continue;
             }
@@ -1251,10 +1260,41 @@ fn delete_subtree_rows_conn(conn: &Connection, subtree: &[Uuid]) -> Result<()> {
         }
         anyhow::ensure!(
             deleted_any,
-            "compaction lineage delete could not make progress; remaining {remaining:?}"
+            "session subtree delete could not make progress; remaining {remaining:?}"
         );
     }
     Ok(())
+}
+
+/// True when another member of the delete set is still a fork/`/btw` child of
+/// `id`, so deleting `id` now would CASCADE-remove that child instead of
+/// waiting for its own leaf delete (and could violate the child's successor's
+/// RESTRICT FKs).
+fn cascade_child_in_remaining(
+    conn: &Connection,
+    id: Uuid,
+    remaining: &std::collections::HashSet<Uuid>,
+) -> Result<bool> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT session_id FROM sessions
+              WHERE (parent_session_id = ?1 OR btw_parent_session_id = ?1)
+                AND session_id <> ?1",
+        )
+        .context("preparing cascade child scan")?;
+    let rows = stmt
+        .query_map([id.to_string()], |row| {
+            let raw: String = row.get(0)?;
+            parse_uuid(&raw)
+        })
+        .context("querying cascade children")?;
+    for row in rows {
+        let child = row.context("decoding cascade child")?;
+        if remaining.contains(&child) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn compaction_fk_blocks_delete(
@@ -2199,15 +2239,25 @@ impl Db {
         let session_id = Uuid::new_v4();
         let now_unix_ms = Utc::now().timestamp_millis();
         self.write(move |conn| {
-            Self::create_fork_row_body_conn(
-                conn,
+            // `Db::write` autocommits each statement separately, but a fork
+            // is one invariant: the child row plus its copied events, tool
+            // calls, pins, and artifacts must appear or vanish together. Run
+            // the body in one transaction (mirroring `create_fork_conn`) so a
+            // mid-copy failure rolls back the half-created child.
+            let tx = conn
+                .unchecked_transaction()
+                .context("begin create_fork tx")?;
+            let row = Self::create_fork_row_body_conn(
+                &tx,
                 parent_session_id,
                 fork_point_turn_id,
                 ephemeral,
                 fresh_thread,
                 session_id,
                 now_unix_ms,
-            )
+            )?;
+            tx.commit().context("commit create_fork tx")?;
+            Ok(row)
         })
         .await
     }
@@ -2629,6 +2679,11 @@ impl Db {
             params![session_id.to_string(), predecessor_session_id.to_string()],
         )
         .context("moving session-scoped sealed records onto compaction successor")?;
+        conn.execute(
+            "UPDATE sealed_values SET session_id = ?1 WHERE session_id = ?2",
+            params![session_id.to_string(), predecessor_session_id.to_string()],
+        )
+        .context("moving legacy sealed values onto compaction successor")?;
         {
             let grants: Vec<(
                 String,
@@ -2728,6 +2783,39 @@ impl Db {
 
     pub fn get_session_conn(conn: &Connection, session_id: Uuid) -> Result<Option<SessionRow>> {
         Ok(get_session_inner(conn, session_id)?)
+    }
+
+    /// Follow a linear compaction chain from `session_id` to the live window.
+    /// Returns the durable row for the active successor when the requested
+    /// session was ended by compaction.
+    pub fn resolve_live_compaction_session_conn(
+        conn: &Connection,
+        session_id: Uuid,
+    ) -> Result<Option<SessionRow>> {
+        let mut current_id = session_id;
+        let mut row = get_session_inner(conn, current_id)?;
+        while let Some(current) = row {
+            if current.ended_at_unix_ms.is_none() {
+                return Ok(Some(current));
+            }
+            let successor_id: Option<Uuid> = conn
+                .query_row(
+                    "SELECT session_id FROM sessions
+                      WHERE compaction_predecessor_session_id = ?1",
+                    [current_id.to_string()],
+                    |row| parse_uuid(&row.get::<_, String>(0)?),
+                )
+                .optional()
+                .context("reading compaction successor for live window resolution")?;
+            match successor_id {
+                Some(successor_id) => {
+                    current_id = successor_id;
+                    row = get_session_inner(conn, current_id)?;
+                }
+                None => return Ok(Some(current)),
+            }
+        }
+        Ok(None)
     }
 
     /// Compare-and-swap the durable session active model. Succeeds only when

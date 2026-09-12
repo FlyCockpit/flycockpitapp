@@ -649,7 +649,10 @@ impl BtwPane {
             forced_skill: None,
             ..Default::default()
         };
-        let client_submission_id = Uuid::new_v4();
+        let client_submission_id = cockpit_client::submission::derive_client_submission_id(
+            Uuid::now_v7(),
+            &submission.client_fingerprint(),
+        );
         runner
             .try_send_optimistic_input(submission, client_submission_id)
             .map_err(|_| "btw message could not be sent".to_string())?;

@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io::Cursor,
     path::Path,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -39,7 +40,9 @@ const INLINE_USER_TEXT_BYTES: usize = 64 * 1024;
 const MAX_TEXT_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SESSION_TEXT_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 
-/// Import a parsed session archive into `db`.
+/// Import a parsed session archive into `db`, installing redaction custody
+/// with the caller's injected vault. Production callers (daemon dispatch)
+/// hold the daemon boot vault and must not open one here.
 ///
 /// `include_sensitive` is the explicit raw-custody acknowledgement for an
 /// unredacted archive (`redacted == false`, written by
@@ -51,8 +54,9 @@ const MAX_SESSION_TEXT_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 /// custody for that historical material cannot be reconstructed. Refusing
 /// without an explicit acknowledgement keeps that custody drop from being
 /// silent; with the acknowledgement it is the caller's informed choice.
-pub async fn import_archive(
+pub async fn import_archive_with_vault(
     db: &Db,
+    vault: Arc<crate::secure_key::SecretVault>,
     archive: ImportArchive,
     include_sensitive: bool,
 ) -> Result<ImportResult> {
@@ -65,9 +69,6 @@ pub async fn import_archive(
         );
     }
     stage_blob_backed_import_artifacts(db, &mut archive).await?;
-    let vault = crate::secure_key::vault_for_db(db).map_err(|error| {
-        anyhow!("opening vault for imported session redaction custody: {error}")
-    })?;
     db.transaction(move |conn| {
         Db::import_session_archive_graph_conn(conn, archive, |conn, session_id| {
             crate::session::lifecycle::persist_empty_redaction_table_on_conn(
@@ -76,6 +77,21 @@ pub async fn import_archive(
         })
     })
     .await
+}
+
+/// Test-only convenience over [`import_archive_with_vault`]: opens the vault
+/// from `db` directly so tests can import against an in-memory database
+/// without plumbing a boot vault.
+#[cfg(test)]
+pub(crate) async fn import_archive(
+    db: &Db,
+    archive: ImportArchive,
+    include_sensitive: bool,
+) -> Result<ImportResult> {
+    let vault = crate::secure_key::vault_for_db(db).map_err(|error| {
+        anyhow!("opening vault for imported session redaction custody: {error}")
+    })?;
+    import_archive_with_vault(db, vault, archive, include_sensitive).await
 }
 
 /// Archive members contain the complete portable body, while the source
@@ -177,7 +193,13 @@ fn update_imported_tool_projection_blob_path(
         .get_mut("provenance")
         .and_then(Value::as_object_mut)
         .ok_or_else(|| anyhow!("imported tool projection lacks object provenance"))?;
-    if Value::Object(provenance.clone()) != *original_provenance {
+    // The projection still carries the source machine's `blob_path` while
+    // `original_provenance` is the semantic provenance parse produced after
+    // discarding the artifact side's path. They must agree modulo that
+    // machine-local path; overwriting it below re-establishes exact equality.
+    let mut semantic_projection_provenance = provenance.clone();
+    semantic_projection_provenance.remove("blob_path");
+    if Value::Object(semantic_projection_provenance) != *original_provenance {
         bail!("imported tool projection provenance differs from its artifact");
     }
     provenance.insert("blob_path".to_owned(), Value::String(blob_path.to_owned()));
@@ -794,7 +816,13 @@ fn validate_text_artifact_graph(
         };
         let has_source_artifact =
             source_by_event.contains_key(&(event.source_session_id, event.seq));
-        if has_source_artifact && user_event_has_media_or_file_parts(&data) {
+        // An oversized event is spill-eligible only when it is text-only: a
+        // legacy/corrupt long event with media parts stays artifact-ineligible
+        // no matter whether a source sidecar happens to accompany it, so the
+        // media rejection is checked before the missing-source rejection.
+        if (has_source_artifact || text.len() > INLINE_USER_TEXT_BYTES)
+            && user_event_has_media_or_file_parts(&data)
+        {
             bail!("oversized user event cannot carry media/file parts");
         }
         if text.len() > INLINE_USER_TEXT_BYTES && !has_source_artifact {
@@ -1103,15 +1131,35 @@ fn validate_tool_artifact_projection_state(
     let provenance = provenance
         .as_object()
         .ok_or_else(|| anyhow!("tool artifact projection provenance must be an object"))?;
-    let valid_provenance_keys = ["agent_id", "tool", "call_id", "source", "preview_lines"];
+    // `blob_path` is machine-local storage metadata: it may ride along in the
+    // durable projection (mirroring the DB/rehydrate contract) but always
+    // paired with the line-preview ingress markers (`source` + `preview_lines`)
+    // whose body the restage step recreates as a destination blob.
+    let valid_provenance_keys = [
+        "agent_id",
+        "tool",
+        "call_id",
+        "source",
+        "preview_lines",
+        "blob_path",
+    ];
     if !provenance.contains_key("agent_id")
         || !provenance.contains_key("tool")
         || !provenance.contains_key("call_id")
         || !provenance
             .keys()
             .all(|key| valid_provenance_keys.contains(&key.as_str()))
+        || (provenance.contains_key("blob_path")
+            && (!provenance.contains_key("source") || !provenance.contains_key("preview_lines")))
     {
         bail!("tool artifact projection provenance has an invalid shape");
+    }
+    if let Some(path) = provenance.get("blob_path")
+        && !path
+            .as_str()
+            .is_some_and(|path| path.starts_with("text-artifacts/") && !path.contains(".."))
+    {
+        bail!("tool artifact projection provenance blob_path is invalid");
     }
     if provenance.contains_key("source")
         && provenance.get("source").and_then(Value::as_str) != Some("tool_result")
@@ -1184,22 +1232,46 @@ fn validate_tool_artifact_projection_state(
             }
             let artifact_provenance: Value = serde_json::from_str(&artifact.provenance_json)
                 .context("parsing artifact provenance while validating projection state")?;
-            if artifact_provenance != Value::Object(provenance.clone()) {
+            // The archived projection still carries the source machine's
+            // `blob_path` while parse already discarded the artifact side's
+            // path as a non-portable disk reference. Compare the semantic
+            // provenance exactly; the restage step re-establishes byte-for-byte
+            // equality on both sides with a destination blob path.
+            let mut semantic_projection_provenance = provenance.clone();
+            semantic_projection_provenance.remove("blob_path");
+            if artifact_provenance != Value::Object(semantic_projection_provenance) {
                 bail!("available tool artifact projection provenance differs from its sidecar");
             }
-            let preview_lines = provenance
-                .get("preview_lines")
-                .and_then(Value::as_u64)
-                .and_then(|value| usize::try_from(value).ok())
-                .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES);
-            let expected_head = crate::engine::text_artifact_frame::utf8_preview_lines(
-                &artifact.content,
-                preview_lines,
-            );
+            // Mirror the durable projection contract the DB layer enforces
+            // (`validate_available_durable_projection`): an ingress
+            // line-preview artifact (provenance carries `preview_lines`)
+            // stores the selected line preview with an empty tail; every other
+            // artifact stores the 2KiB/2KiB UTF-8 preview pair, whose tail is
+            // nonempty for a long body. Comparing a line preview against the
+            // pair, or demanding an empty tail for a long non-ingress body,
+            // would reject every valid archive of that shape.
+            let (expected_head, expected_tail) = if provenance.contains_key("preview_lines") {
+                let preview_lines = provenance
+                    .get("preview_lines")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(crate::agents::ContextPolicy::DEFAULT_ARTIFACT_PREVIEW_LINES);
+                (
+                    crate::engine::text_artifact_frame::utf8_preview_lines(
+                        &artifact.content,
+                        preview_lines,
+                    ),
+                    String::new(),
+                )
+            } else {
+                let (head, tail) =
+                    crate::engine::text_artifact_frame::utf8_preview_pair(&artifact.content);
+                (head.to_owned(), tail.to_owned())
+            };
             if projection.get("line_count").and_then(Value::as_u64)
                 != Some(artifact.content.lines().count() as u64)
                 || preview_head != expected_head
-                || !preview_tail.is_empty()
+                || preview_tail != expected_tail
             {
                 bail!("available tool artifact projection previews differ from its sidecar");
             }
@@ -1483,6 +1555,17 @@ mod tests {
     use rusqlite::OptionalExtension;
     use zip::write::{SimpleFileOptions, ZipWriter};
 
+    /// The default export path fails closed when a bundled session lacks
+    /// redaction-table vault custody. Fixture rows inserted without custody
+    /// must install an empty table before a test re-exports them.
+    fn persist_test_redaction_custody(db: &Db, session_id: Uuid) {
+        let json = crate::redact::RedactionTable::empty()
+            .to_persisted_json()
+            .unwrap();
+        crate::session::lifecycle::write_redaction_table_json_to_vault(db, session_id, &json)
+            .unwrap();
+    }
+
     #[test]
     fn import_parser_accepts_every_closed_durable_event_kind() {
         for kind in SessionEventKind::ALL {
@@ -1710,6 +1793,7 @@ mod tests {
             let mut row =
                 Db::build_new_session_row_conn(conn, "import-test", "/tmp/import-test", "Build")?;
             row.session_id = id;
+            row.compaction_lineage_root_id = Some(id);
             Db::insert_session_row_without_redaction_custody_conn(conn, &row)?;
             Ok(())
         })
@@ -1741,6 +1825,7 @@ mod tests {
             let mut row =
                 Db::build_new_session_row_conn(conn, "import-test", "/tmp/import-test", "Build")?;
             row.session_id = id;
+            row.compaction_lineage_root_id = Some(id);
             Db::insert_session_row_without_redaction_custody_conn(conn, &row)?;
             Ok(())
         })
@@ -2231,6 +2316,7 @@ mod tests {
             })
             .await
             .unwrap();
+        persist_test_redaction_custody(&source, row.session_id);
         let source_id = row.session_id;
         source
             .transaction(move |conn| {
@@ -2292,6 +2378,7 @@ mod tests {
             })
             .await
             .unwrap();
+        persist_test_redaction_custody(&source, row.session_id);
         let source_id = row.session_id;
         source
             .transaction(move |conn| {

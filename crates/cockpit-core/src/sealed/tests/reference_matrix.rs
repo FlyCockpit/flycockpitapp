@@ -448,7 +448,12 @@ async fn built_in_and_monty_sealed_reference_matrix() {
         "a trusted caller is reference-only too"
     );
     // …but the tool surface is identical for both, and there is no sibling
-    // tool that returns a literal.
+    // tool that returns a literal. Since the trusted-child acquisition work
+    // (#240/PR #317) the sealed-named surface also carries the host-mediated
+    // `acquire_sealed_value` request tool and the binary-owned
+    // `capture_sealed_value` (held only by the embedded sealed-acquisition
+    // child, never grantable to an authored agent) — neither returns a
+    // literal to a caller.
     let sealed_named_tools: Vec<&str> = crate::engine::builtin::known_agent_tool_names()
         .iter()
         .copied()
@@ -456,8 +461,13 @@ async fn built_in_and_monty_sealed_reference_matrix() {
         .collect();
     assert_eq!(
         sealed_named_tools,
-        vec![LIST_SEALED_VALUE_DESCRIPTIONS_TOOL, USE_SEALED_VALUE_TOOL],
-        "the sealed surface is scoped safe metadata plus reference-only use"
+        vec![
+            LIST_SEALED_VALUE_DESCRIPTIONS_TOOL,
+            USE_SEALED_VALUE_TOOL,
+            "acquire_sealed_value",
+            "capture_sealed_value",
+        ],
+        "the sealed surface is scoped safe metadata plus reference-only use and host-mediated acquisition"
     );
 
     // =====================================================================

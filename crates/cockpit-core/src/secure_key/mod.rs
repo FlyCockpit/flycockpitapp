@@ -63,8 +63,9 @@ pub use resolve::{
     FirstRunSecretStoreIntent, KekUnavailable, MACHINE_BOUND_FILE_VAULT_WARNING,
     SecretStoreInjected, SecretVaultOpenOptions, ensure_secret_vault,
     ensure_secret_vault_with_options, first_run_secret_store_capabilities, kek_dir_for_db,
-    migrate_installation_kek, open_for_db, project_secret_store_snapshot, resolve_secret_store,
-    resolve_secret_store_with_intent, vault_for_db,
+    migrate_installation_kek, migrate_installation_kek_at, open_for_db,
+    project_secret_store_snapshot, resolve_secret_store, resolve_secret_store_with_intent,
+    vault_for_db,
 };
 
 #[cfg(feature = "test-support")]

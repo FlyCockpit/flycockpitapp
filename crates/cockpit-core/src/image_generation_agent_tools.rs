@@ -1643,6 +1643,31 @@ mod tests {
         ToolRegistryProof,
     ) {
         let (mut ctx, db) = crate::tools::common::test_ctx_with_db(root);
+        let owner = db
+            .ensure_session_root_agent(
+                ctx.session.id,
+                None,
+                crate::agent_tree::workspace_ref_for_host_path(root).unwrap(),
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap();
+        let owner = match db
+            .transition_agent_instance(
+                ctx.session.id,
+                owner.agent_instance_id,
+                owner.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                r#"{"state":"running"}"#,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap()
+        {
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(owner) => owner,
+            outcome => panic!("image tool fixture root did not start: {outcome:?}"),
+        };
+        ctx.agent_instance_id = Some(owner.agent_instance_id);
         let endpoint = tool_generation_endpoint();
         let credential = CredentialIdentityDigest::from_sha256([7; 32]);
         let registry = Arc::new(
@@ -1664,7 +1689,8 @@ mod tests {
             1,
             credential.clone(),
         )
-        .await;
+        .await
+        .unwrap();
         db.save_image_spend_policy(
             ctx.session.project_id.clone(),
             ImageSpendSettings {
@@ -1717,31 +1743,22 @@ mod tests {
         })
     }
 
-    async fn reject_next_image_generation_prompt(ctx: &ToolCtx) -> String {
-        let interrupt = loop {
-            let open = ctx
-                .session
-                .db
-                .list_open_interrupts(ctx.session.id)
-                .await
-                .unwrap();
-            if let Some(interrupt) = open
-                .iter()
-                .find(|interrupt| ctx.interrupts.has_waiter(interrupt.interrupt_id))
-            {
-                break interrupt.clone();
-            }
-            tokio::task::yield_now().await;
-        };
+    async fn reject_next_image_generation_prompt(
+        ctx: &ToolCtx,
+        raised: &mut tokio::sync::mpsc::UnboundedReceiver<uuid::Uuid>,
+    ) -> String {
         let response = ResolveResponse::Single {
             selected_id: "reject".to_string(),
         };
-        ctx.session
-            .db
-            .resolve_interrupt(interrupt.interrupt_id, &response)
-            .await
-            .unwrap();
-        assert!(ctx.interrupts.resolve(interrupt.interrupt_id, response));
+        let interrupt = crate::engine::interrupt::test_support::settle_published_host_approval(
+            &ctx.session.db,
+            ctx.session.id,
+            &ctx.interrupts,
+            raised,
+            response,
+        )
+        .await
+        .unwrap();
         interrupt.description
     }
 
@@ -1932,9 +1949,10 @@ mod tests {
         denied_ctx
             .session
             .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
+        let mut raised = denied_ctx.interrupts.subscribe_raised();
         let (denied, approval_description) = tokio::join!(
             GenerateImageTool.call(tool_generation_args(&denied_output), &denied_ctx),
-            reject_next_image_generation_prompt(&denied_ctx),
+            reject_next_image_generation_prompt(&denied_ctx, &mut raised),
         );
         let denied = denied.unwrap();
         let digest_prefix = approval_description

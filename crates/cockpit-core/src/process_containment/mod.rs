@@ -13,7 +13,8 @@
 mod actor;
 mod adapter;
 mod container;
-mod fake;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod fake;
 mod linux;
 mod macos;
 mod observability;
@@ -34,6 +35,7 @@ pub use adapter::{
     NativeSpawnRequest, SharedAdapter,
 };
 pub use container::{ContainerRuntimeAdapter, RuntimeKind};
+#[cfg(any(test, feature = "test-support"))]
 pub use fake::{FakeEmptyMode, FakeProvenAdapter, FakeUnsupportedAdapter};
 pub use linux::{
     LINUX_PROCESS_TREE_UNAVAILABLE_ON_HOST, LinuxCgroupAdapter, MANAGEMENT_BOUNDARY_UNAVAILABLE,

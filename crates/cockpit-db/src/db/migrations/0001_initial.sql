@@ -460,9 +460,10 @@ BEGIN
 END;
 
 -- ---- typed media attachments ----------------------------------------------
--- Full-range monotonic values are canonical decimal text because SQLite's
--- INTEGER is signed i64. Application codecs reject zero, leading zeroes and
--- values outside u64 before any mutation.
+-- Monotonic versions, generations, and byte lengths are positive integers
+-- bounded by SQLite's signed i64. Application codecs reject zero and values
+-- outside i64 before any mutation, so a value at the i64 ceiling is the
+-- overflow boundary (see AvailabilityGenerationOverflow in the discard path).
 CREATE TABLE media_attachments (
     attachment_id                  TEXT PRIMARY KEY CHECK (
         length(attachment_id) = 36 AND attachment_id = lower(attachment_id)
@@ -1416,7 +1417,10 @@ CREATE TABLE tool_call_events (
     event_id            TEXT    PRIMARY KEY,
     session_id          TEXT    NOT NULL,
     call_id             TEXT    NOT NULL,
-    -- [relationship:foreign] Same-session parent tool call attribution.
+    -- [relationship:denormalized] Same-session parent tool call attribution.
+    -- Children persist before the parent audit row exists (MCP nested
+    -- dispatches), and journal-failure may store a scrubbed placeholder, so
+    -- this is not a hard parent pointer.
     parent_call_id      TEXT    DEFAULT NULL,
     parent_child_index  INTEGER DEFAULT NULL,
     timestamp           INTEGER NOT NULL,
@@ -1484,10 +1488,9 @@ CREATE TABLE tool_call_events (
     wire_api                TEXT DEFAULT NULL,
     provider_family         TEXT DEFAULT NULL,
 
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
-    FOREIGN KEY (session_id, parent_call_id)
-        REFERENCES tool_call_events(session_id, call_id)
-        ON DELETE CASCADE ON UPDATE RESTRICT
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
+    -- parent_call_id is denormalized attribution (including scrubbed
+    -- placeholders after journal failure) and is not a hard parent pointer.
 );
 -- Leading-timestamp index for retention sweeps (issue #308): deletes filter on timestamp alone for closed sessions; a session_id-leading index cannot satisfy that predicate without a full scan.
 CREATE INDEX idx_tool_call_events_retention_ts ON tool_call_events (timestamp);
@@ -1497,7 +1500,7 @@ CREATE INDEX idx_tce_project_ts ON tool_call_events (project_id, timestamp);
 CREATE INDEX idx_tce_model_ts   ON tool_call_events (model, timestamp);
 CREATE INDEX idx_tce_tool_ts    ON tool_call_events (tool, timestamp);
 CREATE INDEX idx_tce_lang_ts    ON tool_call_events (language, timestamp);
-CREATE UNIQUE INDEX uq_tce_session_call ON tool_call_events(session_id, call_id);
+CREATE INDEX idx_tce_session_call ON tool_call_events(session_id, call_id);
 CREATE INDEX idx_tce_parent     ON tool_call_events (session_id, parent_call_id);
 
 -- ---- inference_calls -------------------------------------------------------
@@ -1897,11 +1900,43 @@ CREATE TABLE agent_transition_receipts (
         REFERENCES session_events(session_id, seq) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
--- Only the trusted daemon host creates these identities, before it raises a
--- host-approval decision.  Resolution joins this record rather than trusting
--- a caller-authored boolean or a string-shaped "operation" token.
+-- One authorization group is the durable consent/cancellation fence for one
+-- concrete host-effect scope. Individual prompts remain separately bound
+-- operations below, but adding a member never advances this revision: only a
+-- replacement effect plan may do that. This lets a compound invocation retain
+-- earlier member approvals while later members are being answered.
+CREATE TABLE agent_host_authorization_groups (
+    authorization_group_id TEXT PRIMARY KEY,
+    tool_call_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL,
+    concrete_effect_digest TEXT NOT NULL CHECK (length(concrete_effect_digest) = 64),
+    revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+    state TEXT NOT NULL CHECK (state IN ('collecting', 'dispatching', 'completed', 'declined', 'cancelled', 'submission_unknown')),
+    created_at_unix_ms INTEGER NOT NULL,
+    resolved_at_unix_ms INTEGER,
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
+);
+CREATE UNIQUE INDEX idx_agent_host_authorization_group_tool_call
+    ON agent_host_authorization_groups(agent_instance_id, session_id, tool_call_id);
+CREATE TRIGGER agent_host_authorization_group_state_is_forward_only
+BEFORE UPDATE OF state ON agent_host_authorization_groups
+WHEN NOT (
+    (OLD.state = 'collecting' AND NEW.state IN ('dispatching', 'completed', 'declined', 'cancelled', 'submission_unknown'))
+    OR (OLD.state = 'dispatching' AND NEW.state IN ('completed', 'declined', 'submission_unknown'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'host authorization group state transition is invalid');
+END;
+
+-- Only the trusted daemon host creates these ordered group members, before it
+-- raises their host-approval decisions. Resolution joins these records rather
+-- than trusting a caller-authored boolean or a string-shaped operation token.
 CREATE TABLE agent_host_approval_operations (
     operation_id TEXT PRIMARY KEY,
+    authorization_group_id TEXT NOT NULL,
+    member_index INTEGER NOT NULL CHECK (member_index >= 0),
     session_id TEXT NOT NULL,
     agent_instance_id TEXT NOT NULL,
     -- Immutable host-owned effect binding. The prompt UUID alone is never
@@ -1948,6 +1983,8 @@ CREATE TABLE agent_host_approval_operations (
     ),
     created_at_unix_ms INTEGER NOT NULL,
     resolved_at_unix_ms INTEGER,
+    UNIQUE (authorization_group_id, member_index),
+    FOREIGN KEY (authorization_group_id) REFERENCES agent_host_authorization_groups(authorization_group_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (agent_instance_id, session_id)
         REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
@@ -2041,6 +2078,19 @@ END;
 CREATE UNIQUE INDEX idx_agent_host_approval_pending
     ON agent_host_approval_operations(session_id, agent_instance_id)
     WHERE state = 'pending';
+
+CREATE TRIGGER agent_host_approval_member_matches_group
+BEFORE INSERT ON agent_host_approval_operations
+WHEN NOT EXISTS (
+    SELECT 1 FROM agent_host_authorization_groups approval_group
+     WHERE approval_group.authorization_group_id = NEW.authorization_group_id
+       AND approval_group.session_id = NEW.session_id
+       AND approval_group.agent_instance_id = NEW.agent_instance_id
+       AND approval_group.state = 'collecting'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'host approval member does not match a collecting authorization group');
+END;
 
 -- A host operation is reserved first by the host composition boundary. It may
 -- not be inserted already bound by a generic decision caller.
@@ -3103,7 +3153,7 @@ CREATE TABLE session_events (
         'user_message', 'user_note', 'assistant_message', 'inference_request',
         'tool_call', 'tandem_inference', 'tool_call_started',
         'tool_call_completed', 'subagent_spawned', 'subagent_routing',
-        'subagent_report', 'context_pruned', 'session_compacted',
+        'subagent_report', 'subagent_compacted', 'context_pruned', 'session_compacted',
         'permission_decision', 'interrupt_decision', 'tool_rejected',
         'primary_swap', 'inference_failure', 'failed_turn_recovery',
         'turn_interrupted', 'skill_auto_select', 'auto_prune_diagnostic',
@@ -4972,9 +5022,16 @@ BEGIN
                     AND json_type(e.data_json, '$.artifact_projection.content_bytes') = 'integer'
                     AND json_extract(e.data_json, '$.artifact_projection.content_bytes') = a.content_bytes
                     AND json_type(e.data_json, '$.artifact_projection.line_count') = 'integer'
-                    AND json_extract(e.data_json, '$.artifact_projection.line_count') =
-                        length(a.content) - length(replace(a.content, char(10), ''))
-                        + CASE WHEN substr(a.content, -1) = char(10) THEN 0 ELSE 1 END
+                    -- Blob-backed rows retain only the ingress preview in
+                    -- `a.content`; their projection line_count describes the
+                    -- full daemon-owned body, which only the blob holds, so
+                    -- core validates that count against the complete body.
+                    AND (
+                        json_type(a.provenance_json, '$.blob_path') = 'text'
+                        OR json_extract(e.data_json, '$.artifact_projection.line_count') =
+                            length(a.content) - length(replace(a.content, char(10), ''))
+                            + CASE WHEN substr(a.content, -1) = char(10) THEN 0 ELSE 1 END
+                    )
                     AND json_type(e.data_json, '$.artifact_projection.preview_head') = 'text'
                     AND json_type(e.data_json, '$.artifact_projection.preview_tail') = 'text'
                     AND json_type(e.data_json, '$.artifact_projection.provenance') = 'object'
@@ -5046,9 +5103,13 @@ BEGIN
                     AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].content_bytes') = 'integer'
                     AND json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].content_bytes') = a.content_bytes
                     AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].line_count') = 'integer'
-                    AND json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].line_count') =
-                        length(a.content) - length(replace(a.content, char(10), ''))
-                        + CASE WHEN substr(a.content, -1) = char(10) THEN 0 ELSE 1 END
+                    -- Same blob-backed carve-out as the tool_call lane above.
+                    AND (
+                        json_type(a.provenance_json, '$.blob_path') = 'text'
+                        OR json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].line_count') =
+                            length(a.content) - length(replace(a.content, char(10), ''))
+                            + CASE WHEN substr(a.content, -1) = char(10) THEN 0 ELSE 1 END
+                    )
                     AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].preview_head') = 'text'
                     AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].preview_tail') = 'text'
                     AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].provenance') = 'object'
@@ -6666,6 +6727,10 @@ CREATE INDEX idx_external_journal_queue_queued
 CREATE INDEX idx_external_journal_queue_terminal_retention
     ON external_journal_queue_entries (updated_at_wall_ms)
     WHERE state IN ('cancelled', 'expired', 'journaled');
+-- Reviewed leading index for the journaled-operation FK: resolution scans
+-- queue entries by their durable journal operation without a state filter.
+CREATE INDEX idx_external_journal_queue_journal_operation
+    ON external_journal_queue_entries (journal_operation_id);
 
 -- Session deletion tombstone. Writing one never deletes an unresolved
 -- operation; resolution afterwards emits owner-visible recovery status
@@ -8157,6 +8222,8 @@ CREATE TABLE onboarding_agent_publication_journals (
     previous_default_installation_id TEXT REFERENCES agent_installations(installation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     created_at_unix_ms           INTEGER NOT NULL
 );
+CREATE INDEX idx_onboarding_agent_publication_journals_previous
+    ON onboarding_agent_publication_journals (previous_default_installation_id);
 
 CREATE TABLE installation_continuations (
     continuation_token           TEXT PRIMARY KEY,

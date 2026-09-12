@@ -70,16 +70,21 @@ pub fn elide_applied_write_edit_args(history: &mut [Message]) -> usize {
     elide_applied_write_edit_args_with_upcoming(history, None)
 }
 
+/// Live ordinary dispatch elision: settled prior turns may be rewritten, but
+/// signed write/edit calls stay intact until canonical inference reconciliation.
+pub fn elide_applied_write_edit_args_deferring_signed(history: &mut [Message]) -> usize {
+    let deferred = deferred_signed_write_edit_call_ids(history, None);
+    elide_applied_write_edit_args_except(history, None, &deferred)
+}
+
 pub fn elide_applied_write_edit_args_with_upcoming(
     history: &mut [Message],
     upcoming_result: Option<&Message>,
 ) -> usize {
-    // A settled signed turn may still carry a repaired tool name or arguments
-    // from dispatch. Its canonical audit row is the only source of truth for
-    // that repair, so ordinary dispatch must leave it intact until inference
-    // performs the reconciliation below. Unsigned calls remain audit-free.
-    let deferred = deferred_signed_write_edit_call_ids(history, upcoming_result);
-    elide_applied_write_edit_args_except(history, upcoming_result, &deferred)
+    // Pure projection: settled prior turns may be elided immediately. Signed
+    // turns that still need canonical repair stay deferred only on the
+    // inference reconciliation path below.
+    elide_applied_write_edit_args_except(history, upcoming_result, &HashSet::new())
 }
 
 fn elide_applied_write_edit_args_except(

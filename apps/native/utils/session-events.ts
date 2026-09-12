@@ -1118,7 +1118,7 @@ export function reduceNativeSessionEvent(
     return { state: { ...state, history: upsertHistory(state.history, entry) } };
   }
 
-  if (event.event === "interrupt_resolved") {
+  if (event.event === "interrupt_resolved" || event.event === "interrupt_interrupted") {
     const data = event.data as { interrupt_id: string };
     return {
       state: {

@@ -18,7 +18,7 @@ fn ephemeral_spawn_arms_raii_before_the_first_wait() {
         .map(|offset| spawn + offset)
         .expect("provisional owner armed after spawn");
     let wait = source[spawn..]
-        .find("wait_for_daemon(&paths.socket).await")
+        .find("wait_for_owned_daemon(&paths.socket, pid).await")
         .map(|offset| spawn + offset)
         .expect("daemon readiness wait");
     assert!(
@@ -237,7 +237,9 @@ async fn accept_in_place_promotion(
                 .expect("accept post-promotion client on the same socket");
             let mut promoted = ProtoStream::new(stream);
             send_daemon_hello(&mut promoted, "0.1.persistent", proto::PROTOCOL_VERSION).await;
-            confirm_client_lifetime(&mut promoted).await;
+            // The re-attached client performs the full wire connect handshake
+            // (lifetime confirmation plus the local peer credential exchange).
+            complete_wire_connect_handshake(&mut promoted).await;
             loop {
                 match tokio::time::timeout(std::time::Duration::from_millis(200), promoted.recv())
                     .await

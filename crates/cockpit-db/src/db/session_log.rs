@@ -29,6 +29,25 @@ use crate::db::session_search::HistoryCallerTrust;
 const READ_SESSION_MESSAGES_MAX_LIMIT: u32 = 200;
 const LIST_SESSION_EVENTS_MAX_LIMIT: u32 = 500;
 
+/// Durable title/accounting state restored when an initial-thinking user turn
+/// is retracted. These fields commit in the same SQLite transaction as the
+/// user-row removal and its remote tombstone.
+#[derive(Debug, Clone)]
+pub struct UserMessageRetractionTitleRestore {
+    pub prior_title: Option<String>,
+    pub generated_title: Option<String>,
+    pub expected_user_renamed: bool,
+    pub user_content_tokens: i64,
+    pub title_stage: i64,
+    pub title_recovery_nudge_state: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserMessageRetractionOutcome {
+    pub removed: bool,
+    pub title_restored: bool,
+}
+
 /// Structural, content-free redaction descriptor for a trusted-body JSON
 /// [`Value`]. Used by every manual `Debug` over a raw request / response /
 /// payload body so `{:?}`/`tracing`/panic paths never print the verbatim
@@ -1395,6 +1414,31 @@ impl Db {
     /// already-uploaded message be retracted remotely while AUTOINCREMENT
     /// keeps global cursors strictly monotonic under concurrent sessions.
     pub async fn remove_latest_user_message(&self, session_id: Uuid, seq: i64) -> Result<bool> {
+        Ok(self
+            .remove_latest_user_message_inner(session_id, seq, None)
+            .await?
+            .removed)
+    }
+
+    /// Retract the latest user row and restore its title/accounting snapshot
+    /// as one durable transition. A failure after the delete but before the
+    /// metadata update rolls the entire transaction back.
+    pub async fn remove_latest_user_message_with_title_restore(
+        &self,
+        session_id: Uuid,
+        seq: i64,
+        restore: UserMessageRetractionTitleRestore,
+    ) -> Result<UserMessageRetractionOutcome> {
+        self.remove_latest_user_message_inner(session_id, seq, Some(restore))
+            .await
+    }
+
+    async fn remove_latest_user_message_inner(
+        &self,
+        session_id: Uuid,
+        seq: i64,
+        restore: Option<UserMessageRetractionTitleRestore>,
+    ) -> Result<UserMessageRetractionOutcome> {
         self.transaction(move |conn| {
             let mut blob_paths = std::collections::BTreeSet::new();
             {
@@ -1431,7 +1475,9 @@ impl Db {
                     params![session_id.to_string(), seq],
                 )
                 .context("removing latest retractable user message")?;
-            if removed == 1 {
+            let removed = removed == 1;
+            let mut title_restored = false;
+            if removed {
                 let retract_data = serde_json::json!({ "retracted_seq": seq }).to_string();
                 Self::insert_session_event_json_conn(
                     conn,
@@ -1462,8 +1508,45 @@ impl Db {
                         )?;
                     }
                 }
+                if let Some(restore) = restore {
+                    let progress_restored = conn.execute(
+                        "UPDATE sessions
+                            SET user_content_tokens = ?1,
+                                title_stage = ?2,
+                                title_recovery_nudge_state = ?3
+                          WHERE session_id = ?4",
+                        params![
+                            restore.user_content_tokens,
+                            restore.title_stage,
+                            restore.title_recovery_nudge_state,
+                            session_id.to_string(),
+                        ],
+                    )?;
+                    ensure!(
+                        progress_restored == 1,
+                        "retracted user message lost its owning session"
+                    );
+                    if let Some(generated_title) = restore.generated_title {
+                        title_restored = conn.execute(
+                            "UPDATE sessions
+                                SET title = ?1
+                              WHERE session_id = ?2
+                                AND user_renamed = ?3
+                                AND title = ?4",
+                            params![
+                                restore.prior_title,
+                                session_id.to_string(),
+                                restore.expected_user_renamed,
+                                generated_title,
+                            ],
+                        )? == 1;
+                    }
+                }
             }
-            Ok(removed == 1)
+            Ok(UserMessageRetractionOutcome {
+                removed,
+                title_restored,
+            })
         })
         .await
     }
@@ -2192,6 +2275,66 @@ mod tests {
                 .unwrap()
         );
     }
+
+    #[tokio::test]
+    async fn title_restore_failure_rolls_back_user_retraction_and_tombstone() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("p", "/atomic-retract", "Build")
+            .await
+            .unwrap();
+        let seq = db
+            .insert_session_event(
+                session.session_id,
+                SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &json!({"text": "still durable on rollback"}),
+            )
+            .await
+            .unwrap();
+        let session_id = session.session_id;
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET title='generated', user_content_tokens=10, title_stage=1
+                  WHERE session_id=?1",
+                [session_id.to_string()],
+            )?;
+            conn.execute_batch(
+                "CREATE TRIGGER fail_retract_title_restore
+                   BEFORE UPDATE OF user_content_tokens ON sessions
+                   BEGIN SELECT RAISE(ABORT, 'injected title restore failure'); END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let error = db
+            .remove_latest_user_message_with_title_restore(
+                session.session_id,
+                seq,
+                UserMessageRetractionTitleRestore {
+                    prior_title: None,
+                    generated_title: Some("generated".to_string()),
+                    expected_user_renamed: false,
+                    user_content_tokens: 0,
+                    title_stage: 0,
+                    title_recovery_nudge_state: 0,
+                },
+            )
+            .await
+            .expect_err("mid-transition SQL failure must abort the transaction");
+        assert!(error.to_string().contains("injected title restore failure"));
+
+        let events = db.list_session_events(session.session_id).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "user_message");
+        let row = db.get_session(session.session_id).await.unwrap().unwrap();
+        assert_eq!(row.title.as_deref(), Some("generated"));
+        assert_eq!(row.user_content_tokens, 10);
+        assert_eq!(row.title_stage, 1);
+    }
     use serde_json::json;
 
     fn hook_audit(status: HookRunStatus) -> HookRunAudit {
@@ -2269,9 +2412,9 @@ mod tests {
             SessionEventKind::ToolCallScheduling.as_str(),
             "tool_call_scheduling"
         );
-        // The closed inventory has 31 kinds (appended, not substituted) and
+        // The closed inventory has 32 kinds (appended, not substituted) and
         // every wire string is distinct.
-        assert_eq!(SessionEventKind::ALL.len(), 31);
+        assert_eq!(SessionEventKind::ALL.len(), 32);
         let unique: std::collections::BTreeSet<&str> = kinds.iter().copied().collect();
         assert_eq!(
             unique.len(),

@@ -1040,10 +1040,11 @@ impl Driver {
         self.publish_shadow_brief_result(task, result).await;
     }
 
-    /// Drain shadow work when the owning driver is exiting.  Unlike an idle
-    /// poll, this joins an in-flight task so a successful rolling summary
-    /// cannot be discarded between its final turn boundary and durable
-    /// persistence during shutdown.
+    /// Drain shadow work when the owning driver is exiting. A result that is
+    /// already complete is persisted, but unfinished utility inference is
+    /// cancelled and joined. Utility work must never hold the daemon's
+    /// interrupt-park commit (and therefore pid/socket replacement) behind an
+    /// unbounded provider response during shutdown.
     pub(in crate::engine::driver) async fn drain_shadow_brief_on_shutdown(&mut self) {
         let Some(state) = self.shadow_brief.take() else {
             return;
@@ -1052,11 +1053,18 @@ impl Driver {
             self.shadow_brief = Some(state);
             return;
         };
-        let result = (&mut task.handle).await.ok();
-        self.publish_shadow_brief_result(task, result).await;
+        if task.handle.is_finished() {
+            let result = (&mut task.handle).await.ok();
+            self.publish_shadow_brief_result(task, result).await;
+        } else {
+            task.cancel.cancel();
+            task.handle.abort();
+            let _ = (&mut task.handle).await;
+            self.shadow_brief_generation = self.shadow_brief_generation.wrapping_add(1);
+        }
     }
 
-    async fn publish_shadow_brief_result(
+    pub(in crate::engine::driver) async fn publish_shadow_brief_result(
         &mut self,
         task: ShadowBriefInFlight,
         result: Option<crate::engine::compact_draft::CompactDraftOutcome>,
@@ -2353,6 +2361,7 @@ impl Driver {
         {
             Ok(prepared) => prepared,
             Err(error) => {
+                eprintln!("AUTOCOMPACT-DEBUG prepare error: {error:#}");
                 self.stack[0].history = saved_history;
                 let _ = tx
                     .send(TurnEvent::Notice {
@@ -2383,6 +2392,10 @@ impl Driver {
     > {
         let actual = prepared_compaction_coverage(&self.stack[0].history);
         if actual != prepared.coverage {
+            eprintln!(
+                "AUTOCOMPACT-DEBUG stale coverage: actual={actual:?} prepared={:?}",
+                prepared.coverage
+            );
             let _ = tx
                 .send(TurnEvent::Notice {
                     text: "/compact: prepared subagent compaction is stale; history was left unchanged"
@@ -2458,6 +2471,7 @@ impl Driver {
         )
         .await;
         if let Err(error) = record_result {
+            eprintln!("AUTOCOMPACT-DEBUG record error: {error:#}");
             let _ = tx
                 .send(TurnEvent::Notice {
                     text: format!(
@@ -2513,21 +2527,6 @@ impl Driver {
         // chain (implementation note):
         // `compact_prompt` (the brief-prompt override) and `compact_model`
         // (the dedicated drafting model).
-        #[cfg(test)]
-        let (mut extended, providers) =
-            if let Some((providers, _, _)) = &self.test_providers_override {
-                (
-                    crate::config::extended::ExtendedConfig::default(),
-                    providers.clone(),
-                )
-            } else {
-                self.config.configs()
-            };
-        #[cfg(test)]
-        if let Some(model_ref) = &self.test_compact_model_ref {
-            extended.compact_model = Some(model_ref.clone());
-        }
-        #[cfg(not(test))]
         let (extended, providers) = self.config.configs();
         // Two-level model precedence: a configured `compact_model` (when it
         // resolves) drafts the brief; otherwise the active agent's own model.
@@ -2630,6 +2629,17 @@ impl Driver {
             failure => return Err(PrepareCompactionError::Draft(failure)),
         }
 
+        self.draft_brief_chunked_synthesis(draft, authoring, prompt_text, history)
+            .await
+    }
+
+    async fn draft_brief_chunked_synthesis(
+        &self,
+        draft: CompactBriefDraft,
+        authoring: CompactAuthoringModel,
+        prompt_text: String,
+        history: Vec<Message>,
+    ) -> Result<(String, CompactAuthoringModel), PrepareCompactionError> {
         let Some(window) = draft.context_window else {
             return Err(PrepareCompactionError::Draft(
                 crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow {
@@ -2812,8 +2822,21 @@ impl Driver {
                 // shadow's revision history intentionally contains only its
                 // prior tail plus newer turns, so it is not a full-coverage
                 // fallback source by itself.
-                self.draft_brief(tx, tail_message_seqs, full_history, quota)
-                    .await
+                let draft = self
+                    .compact_brief_draft(tx, full_history.clone(), quota.clone())
+                    .await;
+                let authoring = CompactAuthoringModel {
+                    provider_id: draft.model.provider_id().to_string(),
+                    model_id: draft.model.model_id_ref().to_string(),
+                };
+                let mut prompt_text =
+                    crate::engine::compact::brief_prompt(draft.prompt_override.as_deref());
+                prompt_text.push_str(&crate::engine::compact::tail_anti_duplication_instruction(
+                    tail_message_seqs,
+                ));
+                return self
+                    .draft_brief_chunked_synthesis(draft, authoring, prompt_text, full_history)
+                    .await;
             }
             failure => Err(PrepareCompactionError::Draft(failure)),
         }
@@ -2852,9 +2875,9 @@ pub(in crate::engine::driver) async fn execute_compact_brief(
         Ok(fitted) => fitted,
         Err(diagnostic) => return O::ContextOverflow { diagnostic },
     };
-    draft.history = fitted.history;
-    let mut fit_rung = fitted.rung;
-    let mut input_coverage = fitted.coverage;
+    let (fitted_history, mut fit_rung, mut input_coverage) =
+        (fitted.history, fitted.rung, fitted.coverage);
+    draft.history = fitted_history;
     #[cfg(test)]
     if let Some(calls) = &draft.test_calls {
         for attempt in 1..=MAX_WIRE_SAMPLES_PER_NODE {

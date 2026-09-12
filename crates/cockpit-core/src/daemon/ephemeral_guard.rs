@@ -995,6 +995,33 @@ mod tests {
             ))
             .await
             .unwrap();
+        // Socket peers present their launch ticket for an owner-class
+        // credential right after lifetime confirmation (issue #337). Model
+        // the real daemon: mint the credential, then expect the stop.
+        let credential_id = match stream.recv().await.unwrap().unwrap() {
+            RecvFrame::Envelope(envelope) => {
+                let Envelope { body, .. } = *envelope;
+                match body {
+                    Body::Request {
+                        id,
+                        request: Request::ExchangeLocalPeerCredential,
+                        ..
+                    } => id,
+                    other => panic!("expected peer credential exchange, got {other:?}"),
+                }
+            }
+            frame => panic!("expected peer credential exchange, got {frame:?}"),
+        };
+        stream
+            .send(&Envelope::response(
+                credential_id,
+                Response::LocalPeerCredential {
+                    token: crate::daemon::proto::OwnerCapabilityToken::new("fixture-owner"),
+                    role: crate::daemon::proto::LocalClientRole::Cli,
+                },
+            ))
+            .await
+            .unwrap();
         match stream.recv().await.unwrap().unwrap() {
             RecvFrame::Envelope(envelope) => {
                 let Envelope { body, .. } = *envelope;
@@ -1585,6 +1612,30 @@ mod tests {
                 .send(&Envelope::response(
                     confirmation_id,
                     hello_response(crate::daemon::proto::PROTOCOL_VERSION),
+                ))
+                .await
+                .unwrap();
+            // Answer the owner-class peer credential exchange (issue #337)
+            // the guard presents right after lifetime confirmation, so the
+            // observation window starts from the post-credential steady state.
+            let credential_id = match stream.recv().await.unwrap().unwrap() {
+                RecvFrame::Envelope(envelope) => match envelope.body {
+                    Body::Request {
+                        id,
+                        request: Request::ExchangeLocalPeerCredential,
+                        ..
+                    } => id,
+                    other => panic!("expected peer credential exchange, got {other:?}"),
+                },
+                other => panic!("expected peer credential exchange envelope, got {other:?}"),
+            };
+            stream
+                .send(&Envelope::response(
+                    credential_id,
+                    Response::LocalPeerCredential {
+                        token: crate::daemon::proto::OwnerCapabilityToken::new("fixture-owner"),
+                        role: crate::daemon::proto::LocalClientRole::Cli,
+                    },
                 ))
                 .await
                 .unwrap();

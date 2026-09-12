@@ -76,8 +76,14 @@ tokio::task_local! {
     static CURRENT_HOST_APPROVAL_HANDOFFS: RefCell<HostApprovalEffectScope>;
 }
 
+tokio::task_local! {
+    static CURRENT_HOST_APPROVAL_TOOL_CALL_ID: String;
+}
+
 struct HostApprovalEffectScope {
     handoffs: Vec<HostApprovalEffectHandoff>,
+    authorization_group: Option<(Uuid, String, String)>,
+    next_member_index: u32,
     /// Stable name of the actual host-effect boundary that owns every
     /// capability registered in this task-local scope.  It is selected by the
     /// concrete dispatcher, never by the prompt or resolver, and becomes part
@@ -465,6 +471,8 @@ where
         .scope(
             RefCell::new(HostApprovalEffectScope {
                 handoffs: Vec::new(),
+                authorization_group: None,
+                next_member_index: 0,
                 boundary,
                 cancellations: vec![cancelled.clone()],
                 outcome: None,
@@ -475,6 +483,8 @@ where
                     let mut scope = slot.borrow_mut();
                     HostApprovalEffectScope {
                         handoffs: std::mem::take(&mut scope.handoffs),
+                        authorization_group: scope.authorization_group.take(),
+                        next_member_index: scope.next_member_index,
                         boundary: scope.boundary,
                         cancellations: std::mem::take(&mut scope.cancellations),
                         outcome: scope.outcome.take(),
@@ -520,6 +530,29 @@ where
         .await
 }
 
+/// Attach the provider's stable call identity to every approval member raised
+/// while one ordinary tool invocation is composed. Nested concrete boundaries
+/// inherit it through the shared task-local effect scope.
+pub(crate) async fn with_host_approval_effect_scope_for_tool<T, F, S>(
+    boundary: &'static str,
+    tool_call_id: &str,
+    cancelled: tokio_util::sync::CancellationToken,
+    future: F,
+    is_success: S,
+) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = anyhow::Result<T>> + Send,
+    T: Send,
+    S: Fn(&T) -> Option<bool>,
+{
+    CURRENT_HOST_APPROVAL_TOOL_CALL_ID
+        .scope(
+            tool_call_id.to_owned(),
+            with_host_approval_effect_scope(boundary, cancelled, future, is_success),
+        )
+        .await
+}
+
 fn current_host_approval_effect_scope_is_cancelled() -> bool {
     CURRENT_HOST_APPROVAL_HANDOFFS
         .try_with(|slot| {
@@ -537,6 +570,74 @@ fn register_host_approval_effect_handoff(handoff: HostApprovalEffectHandoff) -> 
     CURRENT_HOST_APPROVAL_HANDOFFS
         .try_with(|slot| slot.borrow_mut().handoffs.push(handoff))
         .is_ok()
+}
+
+/// Bind every approval prompt raised beneath one concrete effect boundary to
+/// the same durable authorization group. Adding a member advances only its
+/// ordered member index, never the group's effect revision.
+pub(crate) fn bind_current_host_authorization_group(
+    operation: crate::agent_tree::HostApprovalOperation,
+) -> crate::agent_tree::HostApprovalOperation {
+    CURRENT_HOST_APPROVAL_HANDOFFS
+        .try_with(|slot| {
+            let mut scope = slot.borrow_mut();
+            let (group_id, tool_call_id, effect_digest) = scope
+                .authorization_group
+                .get_or_insert_with(|| {
+                    (
+                        operation.authorization_group_id,
+                        CURRENT_HOST_APPROVAL_TOOL_CALL_ID
+                            .try_with(Clone::clone)
+                            .unwrap_or_else(|_| operation.tool_call_id.clone()),
+                        operation.concrete_effect_digest.clone(),
+                    )
+                })
+                .clone();
+            let member_index = scope.next_member_index;
+            scope.next_member_index = scope
+                .next_member_index
+                .checked_add(1)
+                .expect("host authorization group member index overflow");
+            operation.clone().bind_authorization_group(
+                group_id,
+                tool_call_id,
+                member_index,
+                effect_digest,
+            )
+        })
+        .unwrap_or(operation)
+}
+
+async fn adopt_live_host_approval_effect_handoff(
+    db: &crate::db::Db,
+    authority: crate::agent_tree::HostApprovalAuthority,
+    session_id: Uuid,
+    agent_instance_id: Uuid,
+    interrupt_id: Uuid,
+    operation: &crate::agent_tree::HostApprovalOperation,
+) -> Option<HostApprovalEffectHandoff> {
+    let state = db
+        .live_host_approval_effect_handoff_state(
+            session_id,
+            agent_instance_id,
+            operation.operation_id,
+            operation.operation_kind.clone(),
+            operation.canonical_input_json.clone(),
+            operation.input_digest.clone(),
+        )
+        .await
+        .ok()
+        .flatten()?;
+    let mut handoff = HostApprovalEffectHandoff::new(
+        db.clone(),
+        authority,
+        session_id,
+        agent_instance_id,
+        interrupt_id,
+        operation.clone(),
+    );
+    handoff.claimed = state == "dispatching";
+    Some(handoff)
 }
 
 /// Publish the definitive result of the currently-active host effect boundary.
@@ -1139,7 +1240,7 @@ struct ParkCommitInner {
     /// whether this worker owes a shutdown park-commit.
     registered: AtomicUsize,
     shutdown: watch::Sender<ShutdownParkState>,
-    startup_reconciled: watch::Sender<bool>,
+    startup_reconciled: watch::Sender<ShutdownParkState>,
 }
 
 impl Default for ParkCommit {
@@ -1154,7 +1255,7 @@ impl ParkCommit {
             inner: Arc::new(ParkCommitInner {
                 registered: AtomicUsize::new(0),
                 shutdown: watch::channel(ShutdownParkState::Pending).0,
-                startup_reconciled: watch::channel(false).0,
+                startup_reconciled: watch::channel(ShutdownParkState::Pending).0,
             }),
         }
     }
@@ -1207,7 +1308,17 @@ impl ParkCommit {
     /// Producer (worker startup): the crash-reconciliation pass finished; any
     /// stale `Open` interrupt has been flipped to `Parked` (or none needed it).
     pub fn report_startup_reconciled(&self) {
-        let _ = self.inner.startup_reconciled.send_replace(true);
+        let _ = self
+            .inner
+            .startup_reconciled
+            .send_replace(ShutdownParkState::Committed);
+    }
+
+    pub fn report_startup_reconciliation_failed(&self) {
+        let _ = self
+            .inner
+            .startup_reconciled
+            .send_replace(ShutdownParkState::FailedWrite);
     }
 
     /// Consumer (drain): await the shutdown park-commit, bounded by `deadline`.
@@ -1243,26 +1354,35 @@ impl ParkCommit {
     }
 
     /// Consumer (attach): await the worker's startup reconciliation pass,
-    /// bounded by `deadline`. Returns `true` if the pass committed within the
-    /// deadline, `false` if the worker wedged (attach then proceeds anyway —
-    /// the reconciliation is idempotent and re-runs on the next attach).
-    pub async fn await_startup_reconciled(&self, deadline: std::time::Duration) -> bool {
+    /// bounded by `deadline`. Every attach caller rejects a non-clean result;
+    /// otherwise a failed or timed-out `Open -> Parked` write could be exposed.
+    pub async fn await_startup_reconciled(
+        &self,
+        deadline: std::time::Duration,
+    ) -> ParkCommitTerminal {
         let mut rx = self.inner.startup_reconciled.subscribe();
-        if *rx.borrow_and_update() {
-            return true;
+        match *rx.borrow_and_update() {
+            ShutdownParkState::Committed => return ParkCommitTerminal::Committed,
+            ShutdownParkState::FailedWrite => return ParkCommitTerminal::KnownFailedWrite,
+            ShutdownParkState::Pending => {}
         }
         let resolved = tokio::time::timeout(deadline, async {
             loop {
                 if rx.changed().await.is_err() {
-                    return false;
+                    return ShutdownParkState::Pending;
                 }
-                if *rx.borrow_and_update() {
-                    return true;
+                match *rx.borrow_and_update() {
+                    ShutdownParkState::Pending => continue,
+                    other => return other,
                 }
             }
         })
         .await;
-        matches!(resolved, Ok(true))
+        match resolved {
+            Ok(ShutdownParkState::Committed) => ParkCommitTerminal::Committed,
+            Ok(ShutdownParkState::FailedWrite) => ParkCommitTerminal::KnownFailedWrite,
+            Ok(ShutdownParkState::Pending) | Err(_) => ParkCommitTerminal::DeadlineUnresolved,
+        }
     }
 
     /// Test-only: simulate a worker registering an interrupt waiter without a
@@ -1285,6 +1405,19 @@ pub struct InterruptHub {
     /// [`Self::register`] and removed when [`Self::resolve`] fires it
     /// (or when the [`PendingInterrupt`] guard drops on cancellation).
     waiters: Mutex<HashMap<Uuid, oneshot::Sender<InterruptOutcome>>>,
+    /// Exact waiter identities published at registration to an optional,
+    /// single consuming owner. This mirrors `raised_interrupts`: readiness is
+    /// an identity stream, never a collapsible hub-wide permit.
+    registered_interrupts: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Uuid>>>,
+    /// Producer-owned stream of exact identities whose raise path has reached
+    /// event publication. AgentTree callers publish only after their durable
+    /// decision bind commits. The legacy isolated path also publishes its
+    /// exact id, but deliberately makes no AgentTree durability claim.
+    /// The optional unbounded sender exists only while a consumer has
+    /// subscribed before starting a producer. Thus distinct concurrent and
+    /// sequential UUIDs cannot collapse or lag, while normal production with
+    /// no readiness observer retains no queue.
+    raised_interrupts: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Uuid>>>,
     /// Outbound event channel to attached clients. `None` in
     /// non-daemon paths (tool unit tests, the standalone run shim) where
     /// no client is listening — raising still works; the event is just
@@ -1384,6 +1517,8 @@ impl InterruptHub {
     ) -> Self {
         Self {
             waiters: Mutex::new(HashMap::new()),
+            registered_interrupts: Mutex::new(None),
+            raised_interrupts: Mutex::new(None),
             events: Some(events),
             redaction: Some(redaction),
             db: Some(db),
@@ -1401,6 +1536,8 @@ impl InterruptHub {
     pub fn detached() -> Self {
         Self {
             waiters: Mutex::new(HashMap::new()),
+            registered_interrupts: Mutex::new(None),
+            raised_interrupts: Mutex::new(None),
             events: None,
             redaction: None,
             db: None,
@@ -1638,15 +1775,85 @@ impl InterruptHub {
     /// tool whose future is cancelled (e.g. the worker shuts down) never
     /// leaves a dangling sender.
     pub fn register(&self, interrupt_id: Uuid) -> PendingInterrupt<'_> {
+        self.register_inner(interrupt_id, None)
+    }
+
+    /// Register the exact durable interrupt continuation. `PendingInterrupt`
+    /// reconciles this row before blocking, closing the persist-before-register
+    /// window without polling or weakening the in-memory identity rendezvous.
+    fn register_durable(
+        &self,
+        db: &crate::db::Db,
+        session_id: Uuid,
+        interrupt_id: Uuid,
+    ) -> PendingInterrupt<'_> {
+        self.register(interrupt_id).with_durable(db, session_id)
+    }
+
+    fn register_inner(
+        &self,
+        interrupt_id: Uuid,
+        durable: Option<(crate::db::Db, Uuid)>,
+    ) -> PendingInterrupt<'_> {
         let (tx, rx) = oneshot::channel();
         lock_or_recover(&self.waiters).insert(interrupt_id, tx);
+        let mut registered = lock_or_recover(&self.registered_interrupts);
+        if registered
+            .as_ref()
+            .is_some_and(|subscriber| subscriber.send(interrupt_id).is_err())
+        {
+            *registered = None;
+        }
         if let Some(park_commit) = &self.park_commit {
             park_commit.on_register();
         }
         PendingInterrupt {
             hub: self,
             interrupt_id,
+            durable,
             rx: Some(rx),
+        }
+    }
+
+    /// Subscribe before starting a waiter producer. The receiver observes the
+    /// exact UUID registered, so multiple registrations cannot collapse or
+    /// release a consumer for a sibling waiter.
+    pub(crate) fn subscribe_registered(&self) -> tokio::sync::mpsc::UnboundedReceiver<Uuid> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut subscriber = lock_or_recover(&self.registered_interrupts);
+        assert!(
+            subscriber
+                .as_ref()
+                .is_none_or(|current| current.is_closed()),
+            "interrupt registration readiness has exactly one consuming owner"
+        );
+        *subscriber = Some(tx);
+        rx
+    }
+
+    /// Subscribe before starting an interrupt producer. Each received item is
+    /// the exact UUID whose raise path reached publication; unlike a bare
+    /// notification permit, items cannot collapse or release the wrong waiter.
+    pub(crate) fn subscribe_raised(&self) -> tokio::sync::mpsc::UnboundedReceiver<Uuid> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut subscriber = lock_or_recover(&self.raised_interrupts);
+        assert!(
+            subscriber
+                .as_ref()
+                .is_none_or(|current| current.is_closed()),
+            "interrupt readiness has exactly one consuming owner"
+        );
+        *subscriber = Some(tx);
+        rx
+    }
+
+    fn publish_raised_identity(&self, interrupt_id: Uuid) {
+        let mut raised = lock_or_recover(&self.raised_interrupts);
+        if raised
+            .as_ref()
+            .is_some_and(|subscriber| subscriber.send(interrupt_id).is_err())
+        {
+            *raised = None;
         }
     }
 
@@ -1671,6 +1878,7 @@ impl InterruptHub {
             let active = open.first().map(|row| row.interrupt_id);
             if active != Some(interrupt_id) {
                 self.emit_queue_changed(active, open.len().saturating_sub(1));
+                self.publish_raised_identity(interrupt_id);
                 return;
             }
         }
@@ -1696,6 +1904,7 @@ impl InterruptHub {
                 },
             );
         }
+        self.publish_raised_identity(interrupt_id);
     }
 
     pub async fn emit_active_from_db(&self) {
@@ -1837,13 +2046,10 @@ impl InterruptHub {
     }
 
     /// Park every currently-registered interrupt waiter WITHOUT publishing the
-    /// shutdown park-commit terminal. The worker's `SessionWork::Shutdown` drain
-    /// calls this repeatedly — re-parking any interrupt the in-flight turn
-    /// registered after an earlier sweep (`daemon-lifecycle-replay-timing-
-    /// robustness.md`, finding 2) — and only reports once, via
-    /// [`Self::report_shutdown_commit`], after the driver task has exited and no
-    /// further registration is possible. Returns the woken count and whether
-    /// every `park_interrupt` write in this sweep committed.
+    /// shutdown park-commit terminal. Runtime suspension paths use this narrow
+    /// operation; graceful shutdown instead commits its broader atomic
+    /// park-and-summary transaction before waking waiters. Returns the woken
+    /// count and whether every `park_interrupt` write in this sweep committed.
     pub async fn park_all_registered_collect(&self) -> ParkSweep {
         let interrupt_ids = {
             let guard = lock_or_recover(&self.waiters);
@@ -1866,16 +2072,35 @@ impl InterruptHub {
         }
     }
 
-    /// Park every currently-registered interrupt waiter and publish the
-    /// shutdown park-commit terminal in one shot. Retained for non-drain
-    /// callers (loop/skill runners, tests) whose hubs carry no [`ParkCommit`]
-    /// so the report is a no-op; the worker's graceful drain instead uses
-    /// [`Self::park_all_registered_collect`] + a deferred
+    /// Wake every registered waiter after the caller has parked the matching
+    /// durable rows in a broader transaction. This is shutdown-only: the
+    /// worker first commits both `needs_attention` and `paused_session_work`,
+    /// then releases the blocked driver so no acknowledgement can outrun the
+    /// recovery summary.
+    pub fn wake_all_registered_after_durable_park(&self) -> usize {
+        let interrupt_ids = {
+            let guard = lock_or_recover(&self.waiters);
+            guard.keys().copied().collect::<Vec<_>>()
+        };
+        let mut count = 0;
+        for interrupt_id in interrupt_ids {
+            if let Some(tx) = lock_or_recover(&self.waiters).remove(&interrupt_id) {
+                let _ = tx.send(InterruptOutcome::Parked);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Park every currently-registered interrupt waiter without publishing a
+    /// shutdown terminal. Runtime callers use this to suspend a gate/tool
+    /// continuation, and production worker hubs carry a [`ParkCommit`]; marking
+    /// that one-shot shutdown fence here would let a later daemon drain observe
+    /// a stale `Committed` value before its paused-work summary is durable.
+    /// The graceful drain is the sole publisher via
     /// [`Self::report_shutdown_commit`].
     pub async fn park_all_registered(&self) -> usize {
-        let sweep = self.park_all_registered_collect().await;
-        self.report_shutdown_commit(sweep.all_committed);
-        sweep.count
+        self.park_all_registered_collect().await.count
     }
 
     /// Publish the shutdown park-commit terminal for this worker (no-op when no
@@ -1913,6 +2138,11 @@ pub struct ParkSweep {
 pub struct PendingInterrupt<'a> {
     hub: &'a InterruptHub,
     interrupt_id: Uuid,
+    /// Durable row identity used to reconcile a terminal write that committed
+    /// before this exact in-memory waiter was registered. The database clone
+    /// owns no lock from the hub; `wait` reads it only after registration, so
+    /// the ordering is waiter insert -> durable read -> oneshot await.
+    durable: Option<(crate::db::Db, Uuid)>,
     /// `Option` so [`Self::wait`] can take the receiver out of `self`
     /// without fighting the `Drop` guard (a `Drop` type can't be moved
     /// out of field-by-field).
@@ -1920,6 +2150,15 @@ pub struct PendingInterrupt<'a> {
 }
 
 impl PendingInterrupt<'_> {
+    /// Attach the durable identity after the in-memory sender is installed.
+    /// Keeping registration as the first operation makes publication ordering
+    /// explicit at call sites while retaining terminal-row reconciliation for
+    /// the unavoidable persist-before-register boundary.
+    fn with_durable(mut self, db: &crate::db::Db, session_id: Uuid) -> Self {
+        self.durable = Some((db.clone(), session_id));
+        self
+    }
+
     /// Issue the host-approval capability from this live waiter.  The opaque
     /// capability therefore cannot be created from a durable operation UUID
     /// alone: the caller must hold the actual registered QuestionTool
@@ -1940,10 +2179,155 @@ impl PendingInterrupt<'_> {
     /// as parked: teardown must never auto-answer or auto-cancel a row.
     pub async fn wait(mut self) -> InterruptOutcome {
         let rx = self.rx.take().expect("wait called once");
+        if let Some((db, session_id)) = &self.durable {
+            match db.get_interrupt(self.interrupt_id).await {
+                Ok(Some(row)) if row.session_id == *session_id => match row.state {
+                    crate::db::needs_attention::InterruptState::Resolved
+                    | crate::db::needs_attention::InterruptState::Executing => {
+                        if let Some(response) = row.response {
+                            return InterruptOutcome::Resolved(response);
+                        }
+                        tracing::warn!(
+                            interrupt_id = %self.interrupt_id,
+                            state = ?row.state,
+                            "durable terminal interrupt lacks its response; parking waiter"
+                        );
+                        return InterruptOutcome::Parked;
+                    }
+                    crate::db::needs_attention::InterruptState::Parked
+                    | crate::db::needs_attention::InterruptState::Interrupted => {
+                        return InterruptOutcome::Parked;
+                    }
+                    crate::db::needs_attention::InterruptState::Open => {}
+                },
+                Ok(Some(row)) => {
+                    tracing::warn!(
+                        interrupt_id = %self.interrupt_id,
+                        expected_session_id = %session_id,
+                        actual_session_id = %row.session_id,
+                        "refusing to reconcile interrupt waiter across session identity"
+                    );
+                    return InterruptOutcome::Parked;
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        interrupt_id = %self.interrupt_id,
+                        expected_session_id = %session_id,
+                        "durable interrupt disappeared before waiter reconciliation; parking waiter"
+                    );
+                    return InterruptOutcome::Parked;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        interrupt_id = %self.interrupt_id,
+                        "loading durable interrupt while registering waiter failed"
+                    );
+                    return InterruptOutcome::Parked;
+                }
+            }
+        }
         match rx.await {
             Ok(outcome) => outcome,
             Err(_) => InterruptOutcome::Parked,
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Settle the exact host-approval interrupt whose production raise boundary
+    /// has published its identity. Test fixtures subscribe before starting the
+    /// producer, so observing this UUID proves waiter registration, durable
+    /// decision binding, and publication in the same order as a real client.
+    pub(crate) async fn settle_published_host_approval(
+        db: &crate::db::Db,
+        session_id: Uuid,
+        hub: &InterruptHub,
+        raised: &mut tokio::sync::mpsc::UnboundedReceiver<Uuid>,
+        response: ResolveResponse,
+    ) -> anyhow::Result<crate::db::db::needs_attention::NeedsAttentionRow> {
+        let interrupt_id = raised
+            .recv()
+            .await
+            .context("host approval producer ended before publishing its interrupt identity")?;
+        let interrupt = db
+            .get_interrupt(interrupt_id)
+            .await
+            .context("loading published host approval interrupt")?
+            .context("published host approval lost its durable attention row")?;
+        anyhow::ensure!(
+            interrupt.session_id == session_id,
+            "published host approval belongs to a different session"
+        );
+        anyhow::ensure!(
+            hub.has_waiter(interrupt_id),
+            "published host approval has no registered continuation"
+        );
+        let decision = db
+            .decision_request_for_interrupt(session_id, interrupt_id)
+            .await
+            .context("loading published host approval lifecycle decision")?
+            .context("published host approval is not bound to a lifecycle decision")?;
+        let offered = interrupt
+            .questions
+            .clone()
+            .or_else(|| {
+                interrupt
+                    .question
+                    .clone()
+                    .map(|question| InterruptQuestionSet {
+                        questions: vec![question],
+                    })
+            })
+            .context("published host approval has no offered question set")?;
+        let response = crate::approval::normalize_host_approval_response(&response, &offered);
+        let envelope = serde_json::to_string(&response)
+            .context("serializing published host approval response")?;
+        let lifecycle = crate::agent_tree::AgentTreeLifecycle::new(db.clone());
+        let settlement = if crate::approval::host_approval_response_allows(&response, &offered) {
+            lifecycle
+                .resolve_host_approval(
+                    session_id,
+                    decision.decision_request_id,
+                    interrupt_id,
+                    &envelope,
+                    crate::agent_tree::HostApprovalAuthority::for_durable_interrupt_binding(
+                        session_id, &decision, &interrupt,
+                    )
+                    .unwrap(),
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await
+        } else if crate::approval::host_approval_response_declines(&response, &offered) {
+            lifecycle
+                .cancel_host_approval(
+                    session_id,
+                    decision.decision_request_id,
+                    interrupt_id,
+                    &envelope,
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await
+        } else {
+            anyhow::bail!(
+                "published host approval response is not an offered allow or decline option"
+            );
+        }?;
+        anyhow::ensure!(
+            matches!(
+                settlement,
+                crate::agent_tree::DecisionSettlement::Resolved(_)
+            ),
+            "published host approval did not win terminal settlement"
+        );
+        anyhow::ensure!(
+            hub.resolve(interrupt_id, response),
+            "published host approval continuation was not live at delivery"
+        );
+        Ok(interrupt)
     }
 }
 
@@ -2078,7 +2462,7 @@ async fn raise_and_wait_legacy(
             return InterruptOutcome::Resolved(ResolveResponse::Cancel);
         }
     };
-    let pending = interrupts.register(interrupt_id);
+    let pending = interrupts.register_durable(db, session_id, interrupt_id);
     interrupts
         .emit_raised(session_id, interrupt_id, agent, description, set.clone())
         .await;
@@ -2185,8 +2569,10 @@ async fn abort_unbound_host_capability_refresh_initialization(
 /// first, registers the existing continuation before any lifecycle delivery can
 /// settle it, binds that *same* Attention row to the requesting agent's durable
 /// decision, and then emits through the unchanged InterruptHub continuation.
-/// Tests and non-daemon helpers may not have a lifecycle instance; those retain
-/// the historical interrupt-only path.
+/// Only an ownerless user question may retain the historical interrupt path.
+/// Every host-affecting decision requires a durable AgentTree owner regardless
+/// of how the hub was constructed; hub topology is transport state, not
+/// authority.
 pub(crate) async fn raise_and_wait_with_agent_tree(
     db: &crate::db::Db,
     interrupts: &InterruptHub,
@@ -2310,27 +2696,53 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                         {
                             response
                         }
-                        Ok(true) => {
-                            // There is no production effect boundary in this
-                            // task (for example a test-only direct caller).
-                            // The capability is still ready, not submitted,
-                            // so record a known rejection rather than an
-                            // ambiguous external handoff.
-                            let _ = db
-                                .reject_unclaimed_host_approval_final_operation(
-                                    db_authority,
-                                    interrupt_id,
-                                    session_id,
-                                    decision.agent_instance_id,
-                                    operation_id,
-                                    operation.operation_kind.clone(),
-                                    operation.canonical_input_json.clone(),
-                                    operation.input_digest.clone(),
-                                    crate::agent_tree::system_now_unix_ms(),
-                                )
-                                .await;
-                            ResolveResponse::Cancel
-                        }
+                        Ok(true) => match adopt_live_host_approval_effect_handoff(
+                            db,
+                            authority,
+                            session_id,
+                            decision.agent_instance_id,
+                            interrupt_id,
+                            &operation,
+                        )
+                        .await
+                        {
+                            Some(handoff) if !handoff.claimed => {
+                                if register_host_approval_effect_handoff(handoff) {
+                                    response
+                                } else {
+                                    let _ = db
+                                        .reject_unclaimed_host_approval_final_operation(
+                                            db_authority,
+                                            interrupt_id,
+                                            session_id,
+                                            decision.agent_instance_id,
+                                            operation_id,
+                                            operation.operation_kind.clone(),
+                                            operation.canonical_input_json.clone(),
+                                            operation.input_digest.clone(),
+                                            crate::agent_tree::system_now_unix_ms(),
+                                        )
+                                        .await;
+                                    ResolveResponse::Cancel
+                                }
+                            }
+                            _ => {
+                                let _ = db
+                                    .reject_unclaimed_host_approval_final_operation(
+                                        db_authority,
+                                        interrupt_id,
+                                        session_id,
+                                        decision.agent_instance_id,
+                                        operation_id,
+                                        operation.operation_kind.clone(),
+                                        operation.canonical_input_json.clone(),
+                                        operation.input_digest.clone(),
+                                        crate::agent_tree::system_now_unix_ms(),
+                                    )
+                                    .await;
+                                ResolveResponse::Cancel
+                            }
+                        },
                         // A pre-resolved replay that observes an existing
                         // dispatch is deliberately denied.  We cannot prove
                         // whether a non-idempotent shell/MCP/harness/fs
@@ -2339,39 +2751,69 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                         // duplicate effect.  Promote a still-dispatching
                         // handoff to the explicit audit state when possible;
                         // completed/rejected rows make this a fenced no-op.
-                        Ok(false) => {
-                            // A concurrent replay can observe either a
-                            // still-ready capability (no submission happened)
-                            // or an already-claimed dispatch. Reject the former
-                            // first; only the latter is promoted to unknown.
-                            let _ = db
-                                .reject_unclaimed_host_approval_final_operation(
-                                    db_authority,
-                                    interrupt_id,
-                                    session_id,
-                                    decision.agent_instance_id,
-                                    operation_id,
-                                    operation.operation_kind.clone(),
-                                    operation.canonical_input_json.clone(),
-                                    operation.input_digest.clone(),
-                                    crate::agent_tree::system_now_unix_ms(),
-                                )
-                                .await;
-                            let _ = db
-                                .mark_host_approval_final_operation_submission_unknown(
-                                    db_authority,
-                                    interrupt_id,
-                                    session_id,
-                                    decision.agent_instance_id,
-                                    operation_id,
-                                    operation.operation_kind.clone(),
-                                    operation.canonical_input_json.clone(),
-                                    operation.input_digest.clone(),
-                                    crate::agent_tree::system_now_unix_ms(),
-                                )
-                                .await;
-                            ResolveResponse::Cancel
-                        }
+                        Ok(false) => match adopt_live_host_approval_effect_handoff(
+                            db,
+                            authority,
+                            session_id,
+                            decision.agent_instance_id,
+                            interrupt_id,
+                            &operation,
+                        )
+                        .await
+                        {
+                            Some(handoff) if handoff.claimed => {
+                                let _ = db
+                                    .mark_host_approval_final_operation_submission_unknown(
+                                        db_authority,
+                                        interrupt_id,
+                                        session_id,
+                                        decision.agent_instance_id,
+                                        operation_id,
+                                        operation.operation_kind.clone(),
+                                        operation.canonical_input_json.clone(),
+                                        operation.input_digest.clone(),
+                                        crate::agent_tree::system_now_unix_ms(),
+                                    )
+                                    .await;
+                                ResolveResponse::Cancel
+                            }
+                            Some(handoff) => {
+                                if register_host_approval_effect_handoff(handoff) {
+                                    response
+                                } else {
+                                    let _ = db
+                                        .reject_unclaimed_host_approval_final_operation(
+                                            db_authority,
+                                            interrupt_id,
+                                            session_id,
+                                            decision.agent_instance_id,
+                                            operation_id,
+                                            operation.operation_kind.clone(),
+                                            operation.canonical_input_json.clone(),
+                                            operation.input_digest.clone(),
+                                            crate::agent_tree::system_now_unix_ms(),
+                                        )
+                                        .await;
+                                    ResolveResponse::Cancel
+                                }
+                            }
+                            None => {
+                                let _ = db
+                                    .reject_unclaimed_host_approval_final_operation(
+                                        db_authority,
+                                        interrupt_id,
+                                        session_id,
+                                        decision.agent_instance_id,
+                                        operation_id,
+                                        operation.operation_kind.clone(),
+                                        operation.canonical_input_json.clone(),
+                                        operation.input_digest.clone(),
+                                        crate::agent_tree::system_now_unix_ms(),
+                                    )
+                                    .await;
+                                ResolveResponse::Cancel
+                            }
+                        },
                         Err(_) => ResolveResponse::Cancel,
                     }
                 }
@@ -2386,16 +2828,15 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
         return InterruptOutcome::Resolved(response);
     }
     // The normal turn dispatcher is intentionally usable by lightweight
-    // helpers too. An isolated caller has no typed owner, so only that
-    // explicit legacy case can use the historical name-keyed path.
+    // helpers and the standalone shim too, but hub construction is never an
+    // authority fact. Retain the legacy route only for user questions. Every
+    // host-affecting subject must bind to a durable AgentTree owner before an
+    // interrupt is raised, on detached, standalone, and daemon hubs alike.
     let Some(agent_instance_id) = agent_instance_id else {
-        // An isolated helper has no tree to own. Do not make the compatibility
-        // path affect normal production behavior. Unit tests exercise
-        // historical Approver prompt shapes without a daemon tree, so retain
-        // their isolated interrupt-only path; production host effects still
-        // fail closed below.
-        #[cfg(test)]
-        {
+        if matches!(
+            &decision_subject,
+            crate::agent_tree::HostDecisionSubject::UserQuestion
+        ) {
             return raise_and_wait_legacy(
                 db,
                 interrupts,
@@ -2407,26 +2848,8 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
             )
             .await;
         }
-        #[cfg(not(test))]
-        {
-            if matches!(
-                &decision_subject,
-                crate::agent_tree::HostDecisionSubject::UserQuestion
-            ) {
-                return raise_and_wait_legacy(
-                    db,
-                    interrupts,
-                    interrupt_session_id,
-                    agent,
-                    description,
-                    set,
-                    log_label,
-                )
-                .await;
-            }
-            tracing::warn!(%session_id, "host effect has no durable lifecycle owner");
-            return InterruptOutcome::Resolved(ResolveResponse::Cancel);
-        }
+        tracing::warn!(%session_id, "host effect has no durable lifecycle owner");
+        return InterruptOutcome::Resolved(ResolveResponse::Cancel);
     };
     let owner = match db.agent_instance(session_id, agent_instance_id).await {
         Ok(Some(owner)) => owner,
@@ -2500,6 +2923,7 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
     // and strand the original tool call. Every failure below drops this guard,
     // which removes the registry entry and leaves no synthetic continuation.
     let pending = interrupts.register(interrupt_id);
+    let pending = pending.with_durable(db, interrupt_session_id);
     let host_operation = decision_subject.host_approval_operation().cloned();
     let host_operation_id = host_operation
         .as_ref()
@@ -2545,6 +2969,10 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                 session_id,
                 agent_instance_id,
                 operation.operation_id,
+                operation.authorization_group_id,
+                operation.tool_call_id.clone(),
+                operation.member_index,
+                operation.concrete_effect_digest.clone(),
                 operation.operation_kind.clone(),
                 operation.canonical_input_json.clone(),
                 operation.input_digest.clone(),
@@ -2655,9 +3083,9 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
     let InterruptOutcome::Resolved(response) = &outcome else {
         return outcome;
     };
-    let Some(operation_id) = host_operation_id else {
+    if host_operation_id.is_none() {
         return outcome;
-    };
+    }
     let Some(operation) = host_operation else {
         return InterruptOutcome::Resolved(ResolveResponse::Cancel);
     };
@@ -2687,7 +3115,7 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
         )
         .await
     {
-        Ok(true)
+        Ok(true) => {
             if register_host_approval_effect_handoff(HostApprovalEffectHandoff::new(
                 db.clone(),
                 authority,
@@ -2695,27 +3123,117 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                 agent_instance_id,
                 interrupt_id,
                 operation.clone(),
-            )) =>
+            )) {
+                outcome
+            } else if let Some(handoff) = adopt_live_host_approval_effect_handoff(
+                db,
+                authority,
+                session_id,
+                agent_instance_id,
+                interrupt_id,
+                &operation,
+            )
+            .await
+            {
+                if !handoff.claimed && register_host_approval_effect_handoff(handoff) {
+                    outcome
+                } else {
+                    let _ = db
+                        .reject_unclaimed_host_approval_final_operation(
+                            db_authority,
+                            interrupt_id,
+                            session_id,
+                            agent_instance_id,
+                            operation.operation_id,
+                            operation.operation_kind,
+                            operation.canonical_input_json,
+                            operation.input_digest,
+                            crate::agent_tree::system_now_unix_ms(),
+                        )
+                        .await;
+                    InterruptOutcome::Resolved(ResolveResponse::Cancel)
+                }
+            } else {
+                let _ = db
+                    .reject_unclaimed_host_approval_final_operation(
+                        db_authority,
+                        interrupt_id,
+                        session_id,
+                        agent_instance_id,
+                        operation.operation_id,
+                        operation.operation_kind,
+                        operation.canonical_input_json,
+                        operation.input_digest,
+                        crate::agent_tree::system_now_unix_ms(),
+                    )
+                    .await;
+                InterruptOutcome::Resolved(ResolveResponse::Cancel)
+            }
+        }
+        Ok(false) => match adopt_live_host_approval_effect_handoff(
+            db,
+            authority,
+            session_id,
+            agent_instance_id,
+            interrupt_id,
+            &operation,
+        )
+        .await
         {
-            outcome
-        }
-        Ok(true) => {
-            let _ = db
-                .reject_unclaimed_host_approval_final_operation(
-                    db_authority,
-                    interrupt_id,
-                    session_id,
-                    agent_instance_id,
-                    operation.operation_id,
-                    operation.operation_kind,
-                    operation.canonical_input_json,
-                    operation.input_digest,
-                    crate::agent_tree::system_now_unix_ms(),
-                )
-                .await;
-            InterruptOutcome::Resolved(ResolveResponse::Cancel)
-        }
-        Ok(false) | Err(_) => InterruptOutcome::Resolved(ResolveResponse::Cancel),
+            Some(handoff) if handoff.claimed => {
+                let _ = db
+                    .mark_host_approval_final_operation_submission_unknown(
+                        db_authority,
+                        interrupt_id,
+                        session_id,
+                        agent_instance_id,
+                        operation.operation_id,
+                        operation.operation_kind,
+                        operation.canonical_input_json,
+                        operation.input_digest,
+                        crate::agent_tree::system_now_unix_ms(),
+                    )
+                    .await;
+                InterruptOutcome::Resolved(ResolveResponse::Cancel)
+            }
+            Some(handoff) => {
+                if register_host_approval_effect_handoff(handoff) {
+                    outcome
+                } else {
+                    let _ = db
+                        .reject_unclaimed_host_approval_final_operation(
+                            db_authority,
+                            interrupt_id,
+                            session_id,
+                            agent_instance_id,
+                            operation.operation_id,
+                            operation.operation_kind,
+                            operation.canonical_input_json,
+                            operation.input_digest,
+                            crate::agent_tree::system_now_unix_ms(),
+                        )
+                        .await;
+                    InterruptOutcome::Resolved(ResolveResponse::Cancel)
+                }
+            }
+            None => {
+                let _ = db
+                    .reject_unclaimed_host_approval_final_operation(
+                        db_authority,
+                        interrupt_id,
+                        session_id,
+                        agent_instance_id,
+                        operation.operation_id,
+                        operation.operation_kind,
+                        operation.canonical_input_json,
+                        operation.input_digest,
+                        crate::agent_tree::system_now_unix_ms(),
+                    )
+                    .await;
+                InterruptOutcome::Resolved(ResolveResponse::Cancel)
+            }
+        },
+        Err(_) => InterruptOutcome::Resolved(ResolveResponse::Cancel),
     }
 }
 
@@ -2764,6 +3282,134 @@ mod tests {
             ),
             receiver,
         )
+    }
+
+    async fn assert_ownerless_host_approval_fails_closed(hub: &InterruptHub) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = std::sync::Arc::new(
+            crate::session::Session::create_for_test(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "builder",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let subjects = [
+            crate::agent_tree::HostDecisionSubject::HostApproval {
+                operation: crate::agent_tree::HostApprovalOperation::new(
+                    "ownerless-test-effect",
+                    serde_json::json!({"command": "printf forbidden"}),
+                )
+                .unwrap(),
+            },
+            crate::agent_tree::HostDecisionSubject::HostCapabilitiesRefresh {
+                operation: crate::agent_tree::HostCapabilitiesRefreshOperation::new(),
+            },
+            crate::agent_tree::HostDecisionSubject::HostEffect(
+                crate::agent_tree::HostEffectClass::LocalMetadataRefresh,
+            ),
+            crate::agent_tree::HostDecisionSubject::HostEffect(
+                crate::agent_tree::HostEffectClass::Credential,
+            ),
+            crate::agent_tree::HostDecisionSubject::HostEffect(
+                crate::agent_tree::HostEffectClass::Authorization,
+            ),
+            crate::agent_tree::HostDecisionSubject::HostEffect(
+                crate::agent_tree::HostEffectClass::Destructive,
+            ),
+            crate::agent_tree::HostDecisionSubject::HostEffect(
+                crate::agent_tree::HostEffectClass::ExternalAction,
+            ),
+            crate::agent_tree::HostDecisionSubject::HostEffect(
+                crate::agent_tree::HostEffectClass::Publish,
+            ),
+            crate::agent_tree::HostDecisionSubject::HostEffect(
+                crate::agent_tree::HostEffectClass::Purchase,
+            ),
+            crate::agent_tree::HostDecisionSubject::HostEffect(
+                crate::agent_tree::HostEffectClass::Production,
+            ),
+        ];
+        for subject in subjects {
+            let outcome = raise_and_wait_with_agent_tree(
+                &db,
+                hub,
+                session.id,
+                "builder",
+                None,
+                "ownerless host effect",
+                question_set(),
+                subject,
+                "ownerless host effect test",
+            )
+            .await;
+
+            assert!(matches!(
+                outcome,
+                InterruptOutcome::Resolved(ResolveResponse::Cancel)
+            ));
+        }
+        assert!(
+            db.list_open_interrupts(session.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "ownerless host effects must not fall back to a legacy prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn ownerless_host_approval_fails_closed_on_detached_hub() {
+        assert_ownerless_host_approval_fails_closed(&InterruptHub::detached()).await;
+    }
+
+    #[tokio::test]
+    async fn ownerless_host_approval_fails_closed_on_constructed_non_daemon_hub() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("project", "/repo", "builder")
+            .await
+            .unwrap();
+        let (events, _events_rx) = tokio::sync::broadcast::channel(4);
+        let hub = InterruptHub::new(
+            events,
+            std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(
+                crate::redact::RedactionTable::empty(),
+            ))),
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            db,
+            session.session_id,
+        );
+        assert_ownerless_host_approval_fails_closed(&hub).await;
+    }
+
+    #[tokio::test]
+    async fn ownerless_host_approval_fails_closed_on_daemon_hub() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = std::sync::Arc::new(
+            crate::session::Session::create_for_test(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "builder",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let (events, _events_rx) = tokio::sync::broadcast::channel(4);
+        let hub = InterruptHub::new(
+            events,
+            std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(
+                crate::redact::RedactionTable::empty(),
+            ))),
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            db,
+            session.id,
+        )
+        .with_live_session(session);
+        assert_ownerless_host_approval_fails_closed(&hub).await;
     }
 
     #[tokio::test]
@@ -2894,6 +3540,10 @@ mod tests {
             String::from_utf8(crate::agent_tree::canonical_json_bytes(&candidate).unwrap())
                 .unwrap();
         let operation_id = operation.operation_id.to_string();
+        let authorization_group_id = operation.authorization_group_id.to_string();
+        let authorization_group_for_operation = authorization_group_id.clone();
+        let tool_call_id = operation.tool_call_id.clone();
+        let concrete_effect_digest = operation.concrete_effect_digest.clone();
         let operation_kind = operation.operation_kind.clone();
         let canonical_input_json = operation.canonical_input_json.clone();
         let input_digest = operation.input_digest.clone();
@@ -2904,13 +3554,28 @@ mod tests {
         let selected_candidate_for_handoff = selected_candidate_json.clone();
         db.write(move |conn| {
             conn.execute(
+                "INSERT INTO agent_host_authorization_groups (
+                     authorization_group_id, tool_call_id, session_id, agent_instance_id,
+                     concrete_effect_digest, state, created_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'collecting', 3)",
+                rusqlite::params![
+                    authorization_group_id.clone(),
+                    tool_call_id,
+                    session_id.to_string(),
+                    agent_instance_id.to_string(),
+                    concrete_effect_digest,
+                ],
+            )?;
+            conn.execute(
                 "INSERT INTO agent_host_approval_operations (
-                     operation_id, session_id, agent_instance_id, operation_kind,
+                     operation_id, authorization_group_id, member_index,
+                     session_id, agent_instance_id, operation_kind,
                      canonical_input_json, input_digest, state, approved_agent_revision,
                      selected_response_json, selected_candidate_json, created_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'approved', ?7, ?8, ?9, 3)",
+                 ) VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, 'approved', ?8, ?9, ?10, 3)",
                 rusqlite::params![
                     operation_id,
+                    authorization_group_for_operation,
                     session_id.to_string(),
                     agent_instance_id.to_string(),
                     operation_kind,
@@ -2959,6 +3624,118 @@ mod tests {
         assert!(
             matches!(got, InterruptOutcome::Resolved(ResolveResponse::Single { selected_id }) if selected_id == "y")
         );
+    }
+
+    #[tokio::test]
+    async fn durable_registration_reconciles_resolution_that_preceded_waiter() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let hub = InterruptHub::detached();
+        let id = db
+            .raise_interrupt_questions(session.session_id, "a", "first", &question_set())
+            .await
+            .unwrap();
+        let response = ResolveResponse::Single {
+            selected_id: "settled-before-register".into(),
+        };
+
+        // This is the legacy race: the durable row settles after raise has
+        // committed but before its in-memory continuation is registered, so
+        // the resolver's hub delivery necessarily observes no waiter.
+        db.resolve_interrupt(id, &response).await.unwrap();
+        assert!(!hub.resolve(id, response.clone()));
+        let pending = hub.register_durable(&db, session.session_id, id);
+
+        assert!(matches!(
+            pending.wait().await,
+            InterruptOutcome::Resolved(ResolveResponse::Single { selected_id })
+                if selected_id == "settled-before-register"
+        ));
+        assert!(!hub.has_waiter(id));
+    }
+
+    #[tokio::test]
+    async fn durable_registration_reconciles_park_that_preceded_waiter() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let hub = InterruptHub::detached();
+        let id = db
+            .raise_interrupt_questions(session.session_id, "a", "first", &question_set())
+            .await
+            .unwrap();
+
+        assert!(db.park_interrupt(id).await.unwrap());
+        let pending = hub.register_durable(&db, session.session_id, id);
+
+        assert!(matches!(pending.wait().await, InterruptOutcome::Parked));
+        assert!(!hub.has_waiter(id));
+    }
+
+    #[tokio::test]
+    async fn durable_registration_parks_when_exact_row_is_missing() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let hub = InterruptHub::detached();
+        let id = Uuid::new_v4();
+
+        let pending = hub.register_durable(&db, session.session_id, id);
+
+        assert!(matches!(pending.wait().await, InterruptOutcome::Parked));
+        assert!(!hub.has_waiter(id));
+    }
+
+    #[tokio::test]
+    async fn durable_registration_parks_when_terminal_row_lacks_response() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let hub = InterruptHub::detached();
+        let id = db
+            .raise_interrupt_questions(session.session_id, "a", "first", &question_set())
+            .await
+            .unwrap();
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE needs_attention
+                    SET state='resolved', resolved_at=1, response_json=NULL
+                  WHERE interrupt_id=?1",
+                [id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let pending = hub.register_durable(&db, session.session_id, id);
+
+        assert!(matches!(pending.wait().await, InterruptOutcome::Parked));
+        assert!(!hub.has_waiter(id));
+    }
+
+    #[tokio::test]
+    async fn durable_registration_parks_when_durable_row_is_malformed() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let hub = InterruptHub::detached();
+        let id = db
+            .raise_interrupt_questions(session.session_id, "a", "first", &question_set())
+            .await
+            .unwrap();
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE needs_attention
+                    SET state='resolved', resolved_at=1, response_json='{}'
+                  WHERE interrupt_id=?1",
+                [id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let pending = hub.register_durable(&db, session.session_id, id);
+
+        assert!(matches!(pending.wait().await, InterruptOutcome::Parked));
+        assert!(!hub.has_waiter(id));
     }
 
     #[test]
@@ -3681,6 +4458,7 @@ mod tests {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/x", "builder").await.unwrap();
         let (hub, mut events) = attached_hub(db.clone(), session.session_id);
+        let mut raised = hub.subscribe_raised();
         let set = question_set();
         let first = db
             .raise_interrupt_questions(session.session_id, "a", "first", &set)
@@ -3694,6 +4472,10 @@ mod tests {
             .unwrap();
         hub.emit_raised(session.session_id, second, "b", "second", set)
             .await;
+
+        assert_eq!(raised.recv().await.unwrap(), first);
+        assert_eq!(raised.recv().await.unwrap(), second);
+        assert!(raised.try_recv().is_err(), "no stale readiness remains");
 
         assert!(matches!(
             events.recv().await.unwrap().event,
@@ -3750,6 +4532,27 @@ mod tests {
             }
                 if interrupt_id == second
         ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_raise_readiness_delivers_both_exact_identities() {
+        let hub = InterruptHub::detached();
+        let mut raised = hub.subscribe_raised();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let questions = question_set();
+
+        tokio::join!(
+            hub.emit_raised(Uuid::nil(), first, "a", "first", questions.clone()),
+            hub.emit_raised(Uuid::nil(), second, "b", "second", questions),
+        );
+
+        let observed = std::collections::BTreeSet::from([
+            raised.recv().await.unwrap(),
+            raised.recv().await.unwrap(),
+        ]);
+        assert_eq!(observed, std::collections::BTreeSet::from([first, second]));
+        assert!(raised.try_recv().is_err(), "no stale readiness remains");
     }
 
     #[tokio::test]
@@ -3859,10 +4662,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn park_all_registered_reports_committed_to_park_commit() {
-        // The real shutdown path: `park_all_registered` on a hub with a
-        // ParkCommit publishes `Committed` once every registered park has
-        // landed durably, which the drain path then observes.
+    async fn runtime_park_does_not_precommit_a_future_shutdown() {
+        // Runtime gate/tool parking uses the same production hub as shutdown.
+        // It must not satisfy the later shutdown durability rendezvous.
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/x", "builder").await.unwrap();
         let (hub, _events) = attached_hub(db.clone(), session.session_id);
@@ -3877,9 +4679,9 @@ mod tests {
         assert_eq!(hub.park_all_registered().await, 1);
         assert_eq!(
             park_commit
-                .await_shutdown_commit(std::time::Duration::from_secs(1))
+                .await_shutdown_commit(std::time::Duration::ZERO)
                 .await,
-            ParkCommitTerminal::Committed
+            ParkCommitTerminal::DeadlineUnresolved
         );
     }
 
@@ -3927,6 +4729,42 @@ mod tests {
         );
 
         // The deferred report (after the driver quiesces) publishes Committed.
+        hub.report_shutdown_commit(true);
+        assert_eq!(
+            park_commit
+                .await_shutdown_commit(std::time::Duration::from_secs(1))
+                .await,
+            ParkCommitTerminal::Committed
+        );
+    }
+
+    #[tokio::test]
+    async fn park_all_registered_collect_commits_before_shutdown_park_report() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let (hub, _events) = attached_hub(db.clone(), session.session_id);
+        let park_commit = ParkCommit::new();
+        let hub = InterruptHub::with_park_commit(hub, park_commit.clone());
+        let interrupt_id = db
+            .raise_interrupt_questions(session.session_id, "a", "park-me", &question_set())
+            .await
+            .unwrap();
+        let pending = hub.register(interrupt_id);
+
+        let sweep = hub.park_all_registered_collect().await;
+        assert_eq!(sweep.count, 1);
+        assert!(sweep.all_committed);
+        assert_eq!(
+            db.get_interrupt(interrupt_id)
+                .await
+                .unwrap()
+                .expect("row")
+                .state,
+            crate::db::needs_attention::InterruptState::Parked,
+            "park must be durably committed before the shutdown park report"
+        );
+        assert!(matches!(pending.wait().await, InterruptOutcome::Parked));
+
         hub.report_shutdown_commit(true);
         assert_eq!(
             park_commit
@@ -3987,18 +4825,26 @@ mod tests {
     #[tokio::test]
     async fn await_startup_reconciled_gates_on_report() {
         let park_commit = ParkCommit::new();
-        let consumer = {
-            let park_commit = park_commit.clone();
-            tokio::spawn(async move {
-                park_commit
-                    .await_startup_reconciled(std::time::Duration::from_secs(5))
-                    .await
-            })
-        };
-        tokio::task::yield_now().await;
-        assert!(!consumer.is_finished());
+        let mut consumer =
+            Box::pin(park_commit.await_startup_reconciled(std::time::Duration::from_secs(5)));
+        assert!(matches!(
+            futures::poll!(&mut consumer),
+            std::task::Poll::Pending
+        ));
         park_commit.report_startup_reconciled();
-        assert!(consumer.await.unwrap());
+        assert_eq!(consumer.await, ParkCommitTerminal::Committed);
+    }
+
+    #[tokio::test]
+    async fn await_startup_reconciled_surfaces_failed_write() {
+        let park_commit = ParkCommit::new();
+        park_commit.report_startup_reconciliation_failed();
+        assert_eq!(
+            park_commit
+                .await_startup_reconciled(std::time::Duration::from_secs(1))
+                .await,
+            ParkCommitTerminal::KnownFailedWrite
+        );
     }
 
     #[tokio::test]
@@ -4050,6 +4896,9 @@ mod tests {
         )
         .unwrap();
         let operation_id = operation.operation_id;
+        let authorization_group_id = operation.authorization_group_id.to_string();
+        let tool_call_id = operation.tool_call_id.clone();
+        let concrete_effect_digest = operation.concrete_effect_digest.clone();
         let operation_kind = operation.operation_kind.clone();
         let canonical_input_json = operation.canonical_input_json.clone();
         let input_digest = operation.input_digest.clone();
@@ -4073,12 +4922,24 @@ mod tests {
         let operation_id_text = operation_id.to_string();
         db.write(move |conn| {
             conn.execute(
+                "INSERT INTO agent_host_authorization_groups (
+                     authorization_group_id, tool_call_id, session_id, agent_instance_id,
+                     concrete_effect_digest, state, created_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'collecting', 3)",
+                rusqlite::params![
+                    authorization_group_id.clone(), tool_call_id, session_id.clone(),
+                    agent_id.clone(), concrete_effect_digest,
+                ],
+            )?;
+            conn.execute(
                 "INSERT INTO agent_host_approval_operations (
-                     operation_id, session_id, agent_instance_id, operation_kind, canonical_input_json, input_digest,
+                     operation_id, authorization_group_id, member_index,
+                     session_id, agent_instance_id, operation_kind, canonical_input_json, input_digest,
                      selected_response_json, selected_candidate_json, state, created_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'dispatching', 3)",
+                 ) VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'dispatching', 3)",
                 rusqlite::params![
                     operation_id_text,
+                    authorization_group_id.clone(),
                     session_id.clone(),
                     agent_id.clone(),
                     operation_kind_for_insert,
@@ -4087,6 +4948,11 @@ mod tests {
                     selected_response_for_insert,
                     selected_candidate_for_insert.clone(),
                 ],
+            )?;
+            conn.execute(
+                "UPDATE agent_host_authorization_groups SET state = 'dispatching'
+                  WHERE authorization_group_id = ?1",
+                [authorization_group_id],
             )?;
             conn.execute(
                 "INSERT INTO agent_host_approval_effect_handoffs (
@@ -4974,6 +5840,9 @@ mod tests {
             String::from_utf8(crate::agent_tree::canonical_json_bytes(&candidate).unwrap())
                 .unwrap();
         let operation_id = operation.operation_id;
+        let authorization_group_id = operation.authorization_group_id.to_string();
+        let tool_call_id = operation.tool_call_id.clone();
+        let concrete_effect_digest = operation.concrete_effect_digest.clone();
         let operation_kind = operation.operation_kind.clone();
         let canonical_input_json = operation.canonical_input_json.clone();
         let input_digest = operation.input_digest.clone();
@@ -4981,13 +5850,28 @@ mod tests {
         let agent_id = agent.agent_instance_id.to_string();
         db.write(move |conn| {
             conn.execute(
+                "INSERT INTO agent_host_authorization_groups (
+                     authorization_group_id, tool_call_id, session_id, agent_instance_id,
+                     concrete_effect_digest, state, created_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'collecting', 3)",
+                rusqlite::params![
+                    authorization_group_id.clone(),
+                    tool_call_id,
+                    session_id.clone(),
+                    agent_id.clone(),
+                    concrete_effect_digest,
+                ],
+            )?;
+            conn.execute(
                 "INSERT INTO agent_host_approval_operations (
-                     operation_id, session_id, agent_instance_id, operation_kind,
+                     operation_id, authorization_group_id, member_index,
+                     session_id, agent_instance_id, operation_kind,
                      canonical_input_json, input_digest, state, approved_agent_revision,
                      selected_response_json, selected_candidate_json, created_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'approved', ?7, ?8, ?9, 3)",
+                 ) VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, 'approved', ?8, ?9, ?10, 3)",
                 rusqlite::params![
                     operation_id.to_string(),
+                    authorization_group_id,
                     session_id.clone(),
                     agent_id.clone(),
                     operation_kind.clone(),
@@ -5168,6 +6052,10 @@ mod tests {
             session.session_id,
             agent.agent_instance_id,
             persisted_operation.operation_id,
+            persisted_operation.authorization_group_id,
+            persisted_operation.tool_call_id.clone(),
+            persisted_operation.member_index,
+            persisted_operation.concrete_effect_digest.clone(),
             persisted_operation.operation_kind.clone(),
             persisted_operation.canonical_input_json.clone(),
             persisted_operation.input_digest.clone(),

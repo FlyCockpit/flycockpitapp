@@ -9,11 +9,11 @@ const SCHEMA: &str = include_str!("../src/db/migrations/0001_initial.sql");
 const EXTENDED_SCHEMA: &str = include_str!("../src/db/migrations/0001_extended_profile.sql");
 const RELATIONSHIP_INVENTORY: &str = include_str!("support/relationship_inventory.tsv");
 const LOCAL_SCHEMA_REVIEW_DIGEST: &str =
-    "9feae8e0a60ae1b4d2a1821787a2b0795c3db85d4dd6eade30c35405a899222d";
+    "9a05c85cf28fe34338d9328be1e3e5b485dcef65b1b2a963be2aabeea17c5d4a";
 const EXTENDED_SCHEMA_REVIEW_DIGEST: &str =
-    "f8035e84b9d6eaf2da107f4b9f6636eafd6b84febd43d60ac42e04f38f097c02";
+    "a6eb995d785afd158764c928429f4e2937aef0f2e309b5e5e547f9f4fa81e2f2";
 const RELATIONSHIP_INVENTORY_REVIEW_DIGEST: &str =
-    "4ed4d21eea3e1fb3bc2a41bb08af1a6b4b60ef5861bb4e78ba7ed35d9dde6aff";
+    "1c858e8763e3bc9a81b2517bd15bc014d643158b59ea4af407b973f48ddbf3a6";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum RelationshipClass {
@@ -1058,12 +1058,12 @@ fn effective_schema_profiles_are_ordered_closed_and_indexed() {
     );
     assert_eq!(
         local.objects.len(),
-        655,
+        702,
         "local ordered object inventory drifted"
     );
     assert_eq!(
         extended.objects.len(),
-        884,
+        933,
         "extended ordered object inventory drifted"
     );
     assert!(
@@ -1483,8 +1483,7 @@ fn scoped_session_relationships_are_database_enforced_and_indexed() {
     for contract in [
         "FOREIGN KEY (parent_session_id, fork_point_turn_id)\n        REFERENCES session_events(session_id, seq)\n        ON DELETE RESTRICT ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED",
         "CREATE INDEX idx_sessions_parent_fork_point ON sessions(parent_session_id, fork_point_turn_id)",
-        "FOREIGN KEY (session_id, parent_call_id)\n        REFERENCES tool_call_events(session_id, call_id)\n        ON DELETE CASCADE ON UPDATE RESTRICT",
-        "CREATE UNIQUE INDEX uq_tce_session_call ON tool_call_events(session_id, call_id)",
+        "CREATE INDEX idx_tce_session_call ON tool_call_events(session_id, call_id)",
         "CREATE INDEX idx_tce_parent     ON tool_call_events (session_id, parent_call_id)",
     ] {
         assert!(
@@ -1499,7 +1498,7 @@ fn intentional_session_soft_relationships_are_classified_in_schema() {
     for classification in [
         "[relationship:foreign] parent_session_id",
         "[relationship:foreign] Optional historical event sequence",
-        "[relationship:foreign] Same-session parent tool call",
+        "[relationship:denormalized] Same-session parent tool call",
         "[relationship:denormalized] Immutable-attribution display snapshots",
         "[relationship:denormalized] Historical assistant label",
         "[relationship:external] Provider-owned opaque wire identifiers",

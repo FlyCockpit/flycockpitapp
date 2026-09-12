@@ -490,7 +490,7 @@ fn is_cockpit_owned_config_dir(path: &Path) -> bool {
         return true;
     }
 
-    crate::config::resolve::cockpit_data_dir()
+    crate::config::resolve::cockpit_data_dir_unchecked()
         .map(|data_dir| path.starts_with(data_dir.join("local-configs")))
         .unwrap_or(false)
 }
@@ -552,44 +552,6 @@ impl ConfigMutationLock {
         file.lock()
             .with_context(|| format!("locking config mutation at {}", display_path.display()))?;
         Ok(Self::enter(Some(file), identity))
-    }
-
-    pub(crate) fn acquire_cancellable(
-        target: &Path,
-        cancelled: &std::sync::atomic::AtomicBool,
-    ) -> Result<Self> {
-        ensure_config_parent_dir(target)?;
-        let target_identity = mutation_lock_identity(target);
-        let (parent, lock_leaf, display_path) = open_mutation_lock_parent(target)?;
-        let identity = mutation_lock_runtime_identity(&parent, &target_identity)?;
-        if Self::is_held_identity(&identity) {
-            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                anyhow::bail!("active-model config mutation was cancelled");
-            }
-            return Ok(Self::enter(None, identity));
-        }
-        let file = open_private_lock_file_at(&parent, &lock_leaf, &display_path)?;
-        loop {
-            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                anyhow::bail!("active-model config mutation was cancelled");
-            }
-            match file.try_lock() {
-                Ok(()) => {
-                    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                        anyhow::bail!("active-model config mutation was cancelled");
-                    }
-                    return Ok(Self::enter(Some(file), identity));
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                Err(std::fs::TryLockError::Error(error)) => {
-                    return Err(error).with_context(|| {
-                        format!("locking config mutation at {}", display_path.display())
-                    });
-                }
-            }
-        }
     }
 
     /// Try to acquire the mutation lock, polling until the deadline. Returns
@@ -727,22 +689,22 @@ impl ConfigMutationLock {
         }
     }
 
-    /// True while this thread already owns the exact target's mutation lock.
-    pub(crate) fn is_held_by_current_thread(target: &Path) -> Result<bool> {
-        let target_identity = mutation_lock_identity(target);
-        match try_open_mutation_lock_parent(target)? {
-            None => Ok(Self::is_held_identity(
-                &missing_parent_mutation_lock_identity(&target_identity),
-            )),
-            Some((parent, _, _)) => {
-                let identity = mutation_lock_runtime_identity(&parent, &target_identity)?;
-                Ok(Self::is_held_identity(&identity))
-            }
-        }
-    }
-
     fn is_held_identity(identity: &str) -> bool {
         MUTATION_LOCK_DEPTHS.with(|depths| depths.borrow().get(identity).copied().unwrap_or(0) > 0)
+    }
+
+    /// Whether this thread currently holds the mutation lock for `target`,
+    /// including vacuous first-write guards taken before the parent exists.
+    #[cfg(test)]
+    pub(crate) fn is_held_by_current_thread(target: &Path) -> Result<bool> {
+        let target_identity = mutation_lock_identity(target);
+        let held = if let Some((parent, _, _)) = try_open_mutation_lock_parent(target)? {
+            let identity = mutation_lock_runtime_identity(&parent, &target_identity)?;
+            Self::is_held_identity(&identity)
+        } else {
+            Self::is_held_identity(&missing_parent_mutation_lock_identity(&target_identity))
+        };
+        Ok(held)
     }
 }
 
@@ -2361,51 +2323,6 @@ fn root_cause_is_not_found(error: &anyhow::Error) -> bool {
         .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
 
-/// Atomically replace `path` with owner-only private content.
-///
-/// This is the one platform file-security abstraction used for the
-/// effective-default rollback snapshot and journal.
-///
-/// **Unix:** the replacement is created `O_NOFOLLOW`/`O_EXCL` at mode `0600`
-/// and re-`fchmod`ded to `0600` after the rename, so the snapshot is
-/// owner-only regardless of umask. This is enforced and asserted in tests.
-///
-/// **Windows:** every path component is opened relative to a retained parent
-/// handle with `FILE_OPEN_REPARSE_POINT`, and any reparse point is rejected —
-/// no junction or symlink can redirect the snapshot outside its config
-/// directory, and a component swapped after preparation cannot redirect the
-/// commit. The file's DACL is **inherited from its parent directory** rather
-/// than being set explicitly: cockpit-owned config directories are created
-/// through [`ensure_private_dir`], but a user-chosen `COCKPIT_CONFIG`
-/// directory keeps whatever ACL it already had. An explicit owner-only
-/// security descriptor is not applied here; treat Windows confidentiality as
-/// "inherits the config directory's ACL", not "owner-only by construction".
-pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
-    prepare_atomic_write(path, contents)?.commit()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let (parent, file_name) = open_parent_directory_nofollow(path)?;
-        let file = open_file_at_nofollow(
-            &parent,
-            &file_name,
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0,
-        )?;
-        chmod_file_private(&file).with_context(|| format!("chmod 0600 {}", path.display()))?;
-        debug_assert_eq!(
-            file.metadata()
-                .with_context(|| format!("stat {}", path.display()))?
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-    }
-    Ok(())
-}
-
 /// fsync a directory so a rename or unlink inside it is durable.
 ///
 /// Unlike the best-effort syncs inside [`PreparedAtomicWrite`], a failure here
@@ -3580,9 +3497,30 @@ pub(crate) fn probe_directory_writable_from_retained_directory(
             Err(error) => return Err(error).with_context(|| format!("creating {display:?}")),
         };
         probe.write_all(b"probe")?;
-        probe.sync_all()?;
         drop(probe);
-        remove_leaf_from_retained_directory(directory, &leaf, &display)?;
+        // This leaf is an ephemeral permission probe, not durable state. Its
+        // create/remove cycle must remain capability-relative, but neither the
+        // file nor its deletion needs a persistence barrier. Durable config
+        // publication continues to fsync its staged file and parent directory.
+        #[cfg(unix)]
+        unlink_file_at(directory, &leaf)
+            .with_context(|| format!("removing writability probe {}", display.display()))?;
+        #[cfg(windows)]
+        {
+            use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
+            use windows_sys::Win32::Storage::FileSystem::{
+                DELETE, FILE_READ_ATTRIBUTES, SYNCHRONIZE,
+            };
+            let file = open_windows_relative_nofollow(
+                directory,
+                &leaf,
+                false,
+                DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                FILE_OPEN,
+            )?;
+            reject_windows_reparse_handle(&file, &display)?;
+            remove_open_file_on_windows(&file)?;
+        }
         return Ok(());
     }
     anyhow::bail!("could not allocate a private retained-directory writability probe")
@@ -3986,7 +3924,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let backup = temp.path().join(".cockpit-active-model.backup");
-        super::write_private_file(&backup, b"prior config bytes").unwrap();
+        cockpit_host::private_fs::write_private_file(&backup, b"prior config bytes").unwrap();
         assert_eq!(std::fs::read(&backup).unwrap(), b"prior config bytes");
         assert_eq!(
             std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
@@ -3998,11 +3936,13 @@ mod tests {
         std::fs::create_dir(&attacker).unwrap();
         let link = temp.path().join("linked-config-dir");
         symlink(&attacker, &link).unwrap();
-        let error =
-            super::write_private_file(&link.join(".cockpit-active-model.backup"), b"secret")
-                .unwrap_err();
+        let error = cockpit_host::private_fs::write_private_file(
+            &link.join(".cockpit-active-model.backup"),
+            b"secret",
+        )
+        .unwrap_err();
         assert!(
-            format!("{error:#}").contains("no-follow directory component"),
+            format!("{error:#}").contains("refused for containment"),
             "{error:#}"
         );
         assert!(!attacker.join(".cockpit-active-model.backup").exists());
@@ -4141,16 +4081,18 @@ mod windows_tests {
         let config_dir = temp.path().join(".cockpit");
         std::fs::create_dir(&config_dir).unwrap();
         let backup = config_dir.join(".cockpit-active-model.backup");
-        super::write_private_file(&backup, b"prior config bytes").unwrap();
+        cockpit_host::private_fs::write_private_file(&backup, b"prior config bytes").unwrap();
         assert_eq!(std::fs::read(&backup).unwrap(), b"prior config bytes");
 
         let attacker = temp.path().join("attacker");
         std::fs::create_dir(&attacker).unwrap();
         let junction = temp.path().join("linked-config-dir");
         symlink_dir(&attacker, &junction).unwrap();
-        let error =
-            super::write_private_file(&junction.join(".cockpit-active-model.backup"), b"secret")
-                .unwrap_err();
+        let error = cockpit_host::private_fs::write_private_file(
+            &junction.join(".cockpit-active-model.backup"),
+            b"secret",
+        )
+        .unwrap_err();
         assert!(format!("{error:#}").contains("reparse-point component"));
         assert!(!attacker.join(".cockpit-active-model.backup").exists());
     }

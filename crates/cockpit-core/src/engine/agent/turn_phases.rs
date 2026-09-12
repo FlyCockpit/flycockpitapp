@@ -5,6 +5,7 @@ use super::*;
 pub(crate) struct InferenceJournalAttempt {
     journal: Arc<crate::external_journal::ExternalJournal>,
     ticket: crate::external_journal::DispatchTicket,
+    dispatch_commit: crate::external_journal::DispatchCommit,
 }
 
 pub(crate) async fn prepare_inference_journal(
@@ -56,7 +57,12 @@ pub(crate) async fn prepare_inference_journal(
         .begin_dispatch(prepared.operation_id, &projection, now)
         .await
         .map_err(|_| anyhow::anyhow!("inference audit dispatching commit failed"))?;
-    Ok(Some(InferenceJournalAttempt { journal, ticket }))
+    let dispatch_commit = ticket.dispatch_commit().clone();
+    Ok(Some(InferenceJournalAttempt {
+        journal,
+        ticket,
+        dispatch_commit,
+    }))
 }
 
 pub(crate) async fn settle_inference_journal_success(
@@ -96,7 +102,7 @@ pub(crate) async fn settle_inference_journal_error(
     if crate::engine::model::is_cancelled(error) {
         if attempt
             .journal
-            .request_cancellation(attempt.ticket.operation_id, now)
+            .request_cancellation(attempt.dispatch_commit.operation_id(), now)
             .await
             .is_err()
         {
@@ -292,6 +298,14 @@ impl DeferredOrdinaryCall {
         self.scheduled.source_index
     }
 
+    pub(crate) fn set_execution_release_sender(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<usize>,
+    ) {
+        self.durable_permit
+            .set_execution_release_sender(self.scheduled.source_index, tx);
+    }
+
     pub(crate) async fn execute(
         self,
     ) -> (
@@ -322,13 +336,15 @@ impl DeferredOrdinaryCall {
         let mut history = Vec::new();
         let result = super::tool_dispatch::with_scheduler_durable_order(
             self.durable_permit,
-            super::tool_dispatch::execute_ordinary_call(
-                &env,
-                &mut history,
-                &self.call,
-                &self.scheduled.resolved_name,
-                self.name_recovery,
-                self.text_recovery_marker,
+            crate::tools::trusted_child_acquisition::scope_inherited_acquisition_runtime(
+                super::tool_dispatch::execute_ordinary_call(
+                    &env,
+                    &mut history,
+                    &self.call,
+                    &self.scheduled.resolved_name,
+                    self.name_recovery,
+                    self.text_recovery_marker,
+                ),
             ),
         )
         .await;
@@ -888,13 +904,15 @@ impl DeferredTurnPlan {
             hooks: config_snapshot.hooks(),
         };
         let result_start = history.len();
-        super::tool_dispatch::execute_ordinary_call(
-            &env,
-            history,
-            tc,
-            &scheduled.resolved_name,
-            self.name_recoveries[scheduled.source_index].clone(),
-            text_recovery_marker,
+        crate::tools::trusted_child_acquisition::scope_inherited_acquisition_runtime(
+            super::tool_dispatch::execute_ordinary_call(
+                &env,
+                history,
+                tc,
+                &scheduled.resolved_name,
+                self.name_recoveries[scheduled.source_index].clone(),
+                text_recovery_marker,
+            ),
         )
         .await?;
         Ok(history[result_start..].to_vec())
@@ -1863,6 +1881,27 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     ));
                 }
                 let mode = args.get("mode").and_then(Value::as_str);
+                let noninteractive = resolve_interactivity(
+                    mode,
+                    &child,
+                    resume_handle.is_some(),
+                    agent.vnext_grant.is_some(),
+                );
+                if agent.vnext_grant.is_some()
+                    && !noninteractive
+                    && (cwd.is_some() || write_scope.is_some() || workspace_lease.is_some())
+                {
+                    return_structural!(task_refusal(
+                        &tc.id,
+                        tc.provider
+                            .as_ref()
+                            .and_then(|provider| provider.item_id.clone()),
+                        tc.provider
+                            .as_ref()
+                            .map(|provider| provider.call_id.clone()),
+                        "an interactive vNext handoff cannot carry cwd, write_scope, or workspace_lease; use subagent mode",
+                    ));
+                }
                 let model = match crate::engine::model_roles::DelegationModelSelector::from_value(
                     args.get("model"),
                 ) {
@@ -1880,13 +1919,6 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         ));
                     }
                 };
-                // A vNext tree uses the structural noninteractive task path.
-                // That path carries the requested cwd and write_scope through
-                // every recursive launch and applies the live grant against
-                // the resolved target.  The legacy interactive handoff loses
-                // those authority inputs, so it is not a vNext runtime path.
-                let noninteractive = agent.vnext_grant.is_some()
-                    || resolve_interactivity(mode, &child, resume_handle.is_some());
                 if context == TaskContext::Fork
                     && let Some(err) = fork_context_refusal(
                         session,
@@ -2323,6 +2355,7 @@ pub(crate) async fn run_turn(
         is_root,
         context_usage,
         history,
+        &prompt,
         &cwd,
         &config,
         redact.clone(),
@@ -3844,24 +3877,45 @@ async fn inject_volatile_context(
     is_root: bool,
     context_usage: crate::engine::tool::ContextUsageSnapshot,
     history: &mut Vec<Message>,
+    prompt: &Message,
     cwd: &std::path::Path,
     config: &crate::daemon::session_worker::SessionConfigHandle,
     redact: Arc<RedactionTable>,
     tx: &mpsc::Sender<TurnEvent>,
 ) -> Result<()> {
-    inject_turn_start_system_messages(session, active_tools, is_root, context_usage, history)
-        .await?;
+    // Build the complete turn-start mutation away from the live history. Some
+    // injectors await fallible database/config work; an error or cancellation
+    // at any of those boundaries must leave the open assistant/result group
+    // attached to its owner. Commit only after every await has succeeded.
+    let mut candidate = history.clone();
+    let trailing_tool_group = take_trailing_tool_group_for_volatile_context(&mut candidate, prompt);
+    inject_turn_start_system_messages(
+        session,
+        active_tools,
+        is_root,
+        context_usage,
+        &mut candidate,
+    )
+    .await?;
     let active_tool_names = active_tools.names();
-    super::inject_available_skills_catalog(history, cwd, config, &active_tool_names);
+    super::inject_available_skills_catalog(&mut candidate, cwd, config, &active_tool_names);
 
-    inject_initial_project_guidance(&agent.name, history, cwd, config, redact.clone(), tx).await;
+    inject_initial_project_guidance(&agent.name, &mut candidate, cwd, config, redact.clone(), tx)
+        .await;
     // Live instructions-file diffs are fresh turn observations, so they stay
     // in history. Knowledge-base reads are explicit cache-stable tool calls;
     // their names/descriptions and frozen `last_dreamed_at` snapshot belong to
     // the spawn-time stable prefix.
     if is_root && let Some(message) = session.guidance_change_injection(cwd).await {
-        inject_live_project_guidance_change(history, cwd, config, redact.clone(), tx, &message)
-            .await;
+        inject_live_project_guidance_change(
+            &mut candidate,
+            cwd,
+            config,
+            redact.clone(),
+            tx,
+            &message,
+        )
+        .await;
     }
     if is_root {
         let listing = session
@@ -3869,12 +3923,54 @@ async fn inject_volatile_context(
             .list_conversation_rules(session.compaction_lineage_root())
             .await;
         crate::conversation_rules::inject_conversation_rules_from_listing(
-            history,
+            &mut candidate,
             listing,
             redact.as_ref(),
         );
     }
+    candidate.extend(trailing_tool_group);
+    *history = candidate;
     Ok(())
+}
+
+/// Detach an open assistant tool-call group while volatile turn-start context
+/// is injected. The final sibling result lives in `prompt`; leaving the group
+/// in history would put new system messages before that result and make the
+/// pairing healer synthesize a duplicate interrupted result.
+fn take_trailing_tool_group_for_volatile_context(
+    history: &mut Vec<Message>,
+    prompt: &Message,
+) -> Vec<Message> {
+    use rig::message::{AssistantContent, UserContent};
+
+    let Some(prompt_call_id) = tool_result_call_id(prompt) else {
+        return Vec::new();
+    };
+    let Some(start) = history.iter().rposition(|message| {
+        matches!(message, Message::Assistant { content, .. } if content.iter().any(|part| {
+            matches!(part, AssistantContent::ToolCall(call) if call.id.as_str() == prompt_call_id)
+        }))
+    }) else {
+        return Vec::new();
+    };
+    let call_ids = match &history[start] {
+        Message::Assistant { content, .. } => content
+            .iter()
+            .filter_map(|part| match part {
+                AssistantContent::ToolCall(call) => Some(call.id.to_string()),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>(),
+        _ => unreachable!("rposition matched an assistant message"),
+    };
+    if !history[start + 1..].iter().all(|message| {
+        matches!(message, Message::User { content } if !content.is_empty() && content.iter().all(|part| {
+            matches!(part, UserContent::ToolResult(result) if call_ids.contains(result.call.as_str()))
+        }))
+    }) {
+        return Vec::new();
+    }
+    history.split_off(start)
 }
 
 #[cfg(test)]
@@ -3940,6 +4036,170 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn volatile_context_stays_before_an_open_tool_result_group() {
+        let call = |id: &str| ToolCall {
+            id: rig::message::ToolCallId::new_or_mint(id.to_string()),
+            provider: rig::message::ProviderCallId::new(format!("provider-{id}")),
+            function: ToolFunction {
+                name: "task".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            signature: None,
+            additional_params: None,
+        };
+        let mut history = vec![
+            Message::user("original input"),
+            Message::Assistant {
+                id: None,
+                content: vec![
+                    crate::engine::message::AssistantContent::ToolCall(call("delegate-a")),
+                    crate::engine::message::AssistantContent::ToolCall(call("delegate-barrier")),
+                ],
+            },
+            crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                "delegate-a",
+                None,
+                None,
+                "task",
+                "first result",
+            ),
+        ];
+        let prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "delegate-barrier",
+            None,
+            None,
+            "task",
+            "barrier result",
+        );
+
+        let trailing = take_trailing_tool_group_for_volatile_context(&mut history, &prompt);
+        history.push(Message::System {
+            content: "volatile capability notice".to_string(),
+        });
+        history.extend(trailing);
+
+        assert!(
+            matches!(&history[1], Message::System { content } if content == "volatile capability notice")
+        );
+        assert!(matches!(&history[2], Message::Assistant { .. }));
+        assert_eq!(
+            tool_result_call_id(&history[3]).as_deref(),
+            Some("delegate-a")
+        );
+        assert_eq!(
+            tool_result_call_id(&prompt).as_deref(),
+            Some("delegate-barrier")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_volatile_context_injection_preserves_open_tool_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let mut session = Session::create_for_test(
+            db.clone(),
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        session.set_knowledge_base_prompt_snapshot_for_test(
+            r#"{"entries":[{"id":"team","name":"Team Notes","description":"Shared decisions","last_dreamed_at_unix_ms":1000,"dream_completion_revision":1}]}"#,
+        );
+        let session = Arc::new(session);
+
+        let (writer_entered_tx, writer_entered_rx) = tokio::sync::oneshot::channel();
+        let (release_writer_tx, release_writer_rx) = std::sync::mpsc::channel();
+        let writer = tokio::spawn(async move {
+            db.transaction(move |_| {
+                let _ = writer_entered_tx.send(());
+                release_writer_rx
+                    .recv()
+                    .map_err(|_| anyhow::anyhow!("writer release sender dropped"))?;
+                Ok(())
+            })
+            .await
+        });
+        writer_entered_rx
+            .await
+            .expect("in-memory writer reaches the deterministic gate");
+
+        let call = |id: &str| ToolCall {
+            id: rig::message::ToolCallId::new_or_mint(id.to_string()),
+            provider: rig::message::ProviderCallId::new(format!("provider-{id}")),
+            function: ToolFunction {
+                name: "task".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            signature: None,
+            additional_params: None,
+        };
+        let mut history = vec![
+            Message::user("original input"),
+            Message::Assistant {
+                id: None,
+                content: vec![
+                    crate::engine::message::AssistantContent::ToolCall(call("delegate-a")),
+                    crate::engine::message::AssistantContent::ToolCall(call("delegate-barrier")),
+                ],
+            },
+            crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                "delegate-a",
+                None,
+                None,
+                "task",
+                "first result",
+            ),
+        ];
+        let original = history.clone();
+        let prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "delegate-barrier",
+            None,
+            None,
+            "task",
+            "barrier result",
+        );
+        let agent = test_agent();
+        let toolbox = ToolBox::new();
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let (tx, _rx) = mpsc::channel(8);
+
+        {
+            let injection = inject_volatile_context(
+                &agent,
+                &session,
+                &toolbox,
+                true,
+                crate::engine::tool::ContextUsageSnapshot::unavailable(),
+                &mut history,
+                &prompt,
+                tmp.path(),
+                &config,
+                Arc::new(RedactionTable::empty()),
+                &tx,
+            );
+            tokio::pin!(injection);
+            tokio::select! {
+                biased;
+                result = &mut injection => panic!("injection passed the blocked database boundary: {result:?}"),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+
+        assert_eq!(
+            history, original,
+            "dropping an in-flight injection must not detach the live assistant/result group"
+        );
+        release_writer_tx
+            .send(())
+            .expect("blocked writer remains available");
+        writer
+            .await
+            .expect("writer task joins")
+            .expect("writer transaction completes");
     }
 
     #[tokio::test]
@@ -4398,6 +4658,116 @@ mod tests {
         assert!(matches!(flow, ControlFlow::Continue(())));
     }
 
+    #[tokio::test]
+    async fn padded_modes_preserve_fresh_authority_rejection_and_resume_precedence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let host = crate::agents::VnextHostPolicy::for_session_config(&config.extended());
+        let mut agent = test_agent();
+        agent.vnext_grant = Some(
+            crate::agents::embedded_default("Build")
+                .and_then(|definition| definition.vnext)
+                .expect("built-in Build has a vNext definition")
+                .resolve_grant(&host)
+                .expect("built-in Build vNext grant resolves"),
+        );
+        let session = test_session(tmp.path());
+        let (tx, _rx) = mpsc::channel(1);
+        let authority = serde_json::json!({
+            "agent": "builder",
+            "prompt": "continue the prior task",
+            "mode": "  subagent_interactive  ",
+            "cwd": "child",
+            "write_scope": "child/src",
+            "workspace_lease": "01993f80-81f4-7000-8000-000000000009"
+        });
+
+        let fresh = phase_10_dispatch_one_call(
+            &agent,
+            &session,
+            &config,
+            &tx,
+            &identified_task_call(
+                "fresh-interactive",
+                "fn-fresh-interactive",
+                serde_json::json!({ "intent": "delegate", "payload": authority.clone() }),
+            ),
+            "task",
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                fresh,
+                ControlFlow::Break(TurnOutcome::ToolResult { ref body, .. })
+                    if body.contains("interactive vNext handoff cannot carry")
+            ),
+            "a fresh explicit interactive handoff must still reject authority fields: {fresh:?}"
+        );
+
+        let mut noninteractive_authority = authority.clone();
+        noninteractive_authority["mode"] = serde_json::json!("  subagent  ");
+        let fresh_noninteractive = phase_10_dispatch_one_call(
+            &agent,
+            &session,
+            &config,
+            &tx,
+            &identified_task_call(
+                "fresh-noninteractive",
+                "fn-fresh-noninteractive",
+                serde_json::json!({ "intent": "delegate", "payload": noninteractive_authority }),
+            ),
+            "task",
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                fresh_noninteractive,
+                ControlFlow::Break(TurnOutcome::SpawnNoninteractive { .. })
+            ),
+            "a padded explicit subagent mode must use noninteractive dispatch: {fresh_noninteractive:?}"
+        );
+
+        let mut resumed_authority = authority;
+        resumed_authority["resume_handle"] = serde_json::json!("resume-build-9");
+        let resumed = phase_10_dispatch_one_call(
+            &agent,
+            &session,
+            &config,
+            &tx,
+            &identified_task_call(
+                "resumed-interactive",
+                "fn-resumed-interactive",
+                serde_json::json!({ "intent": "delegate", "payload": resumed_authority }),
+            ),
+            "task",
+        )
+        .await
+        .unwrap();
+
+        match resumed {
+            ControlFlow::Break(TurnOutcome::SpawnNoninteractive {
+                resume_handle,
+                cwd,
+                write_scope,
+                workspace_lease,
+                ..
+            }) => {
+                assert_eq!(resume_handle.as_deref(), Some("resume-build-9"));
+                assert_eq!(cwd.as_deref(), Some("child"));
+                assert_eq!(write_scope.as_deref(), Some("child/src"));
+                assert_eq!(
+                    workspace_lease.as_deref(),
+                    Some("01993f80-81f4-7000-8000-000000000009")
+                );
+            }
+            other => panic!(
+                "resume_handle must outrank stale interactive mode and retain authority fields, got {other:?}"
+            ),
+        }
+    }
+
     fn identified_task_call(call_id: &str, provider_call_id: &str, args: Value) -> ToolCall {
         ToolCall {
             id: rig::message::ToolCallId::new_or_mint(call_id.to_string()),
@@ -4495,27 +4865,6 @@ mod tests {
             session.db.clone(),
             session.id,
         ))
-    }
-
-    async fn park_next_interrupt(
-        db: crate::db::Db,
-        session_id: uuid::Uuid,
-        interrupts: Arc<crate::engine::interrupt::InterruptHub>,
-    ) {
-        for _ in 0..100 {
-            if let Some(row) = db
-                .list_open_interrupts(session_id)
-                .await
-                .unwrap()
-                .into_iter()
-                .next()
-            {
-                assert!(interrupts.park(row.interrupt_id).await);
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
-        panic!("timed out waiting for interrupt to park");
     }
 
     async fn deferred_plan_for_tests(
@@ -5746,11 +6095,14 @@ mod tests {
         plan.attach_parkable_interrupt_hub_for_tests(interrupts.clone(), Some(approver));
 
         let mut history = Vec::new();
-        let parker = tokio::spawn(park_next_interrupt(
-            session.db.clone(),
-            session.id,
-            interrupts,
-        ));
+        let mut raised = interrupts.subscribe_raised();
+        let parker = tokio::spawn(async move {
+            let interrupt_id = raised
+                .recv()
+                .await
+                .expect("interrupt raise publisher remains live");
+            assert!(interrupts.park(interrupt_id).await);
+        });
         let err = plan
             .advance_for_driver(&agent, &mut history)
             .await
@@ -5985,10 +6337,23 @@ mod tests {
 
         let record = session
             .db
-            .external_operation(attempt.ticket.operation_id)
+            .external_operation(attempt.dispatch_commit.operation_id())
             .await
             .unwrap()
             .expect("durable journal record exists after the barrier");
+        assert_eq!(
+            attempt.dispatch_commit.operation_id(),
+            attempt.ticket.operation_id
+        );
+        assert_eq!(
+            attempt.dispatch_commit.journal_version(),
+            attempt.ticket.version()
+        );
+        assert_eq!(
+            attempt.dispatch_commit.state(),
+            crate::db::external_journal::ExternalJournalState::Dispatching
+        );
+        assert!(attempt.dispatch_commit.sequence() >= 1);
         assert_eq!(
             record.state,
             crate::db::external_journal::ExternalJournalState::Dispatching,

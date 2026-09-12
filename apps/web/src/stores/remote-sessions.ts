@@ -1588,7 +1588,7 @@ export function reduceRemoteSessionEvent(
     };
   }
 
-  if (event.event === "interrupt_resolved") {
+  if (event.event === "interrupt_resolved" || event.event === "interrupt_interrupted") {
     if (!sessionId || !data) return { state: existing, warningKind: event.event };
     const interruptId = stringField(data, "interrupt_id");
     if (!interruptId) return { state: existing, warningKind: event.event };

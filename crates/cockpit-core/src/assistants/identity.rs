@@ -839,6 +839,30 @@ mod tests {
         .unwrap()
         .unwrap();
         session.set_sandbox_enabled(false);
+        let owner = db
+            .ensure_session_root_agent(
+                session.id,
+                None,
+                crate::agent_tree::workspace_ref_for_host_path(project).unwrap(),
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap();
+        let owner = match db
+            .transition_agent_instance(
+                session.id,
+                owner.agent_instance_id,
+                owner.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                r#"{"state":"running"}"#,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap()
+        {
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(owner) => owner,
+            outcome => panic!("assistant identity fixture root did not start: {outcome:?}"),
+        };
         let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
         let redact = Arc::new(
             crate::redact::RedactionTable::build(
@@ -854,7 +878,7 @@ mod tests {
                 executing_model_trusted: false,
                 knowledge_access_trusted: false,
                 caller_model: None,
-                agent_instance_id: None,
+                agent_instance_id: Some(owner.agent_instance_id),
                 lock_identity: "helper".to_string().clone(),
                 write_scope: None,
                 dream_read_scope: std::sync::Arc::new(std::sync::RwLock::new(None)),
@@ -902,6 +926,20 @@ mod tests {
             home,
             env,
         )
+    }
+
+    async fn settle_identity_approval(
+        db: &Db,
+        session_id: uuid::Uuid,
+        hub: &crate::engine::interrupt::InterruptHub,
+        raised: &mut tokio::sync::mpsc::UnboundedReceiver<uuid::Uuid>,
+        response: crate::daemon::proto::ResolveResponse,
+    ) {
+        crate::engine::interrupt::test_support::settle_published_host_approval(
+            db, session_id, hub, raised, response,
+        )
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -1093,6 +1131,20 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let (mut ctx, _, home, _env) =
             assistant_tool_ctx(project.path(), SoulEditMode::ApproveProposals).await;
+        let (events, _event_rx) = tokio::sync::broadcast::channel(8);
+        let redaction = Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::redact::RedactionTable::empty(),
+        )));
+        ctx.interrupts = Arc::new(
+            crate::engine::interrupt::InterruptHub::new(
+                events,
+                redaction,
+                Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+                ctx.session.db.clone(),
+                ctx.session.id,
+            )
+            .with_live_session(ctx.session.clone()),
+        );
         let store = crate::approval::store::GrantStore::new(
             ctx.session.db.clone(),
             ctx.session.id,
@@ -1107,48 +1159,41 @@ mod tests {
             ctx.interrupts.clone(),
         ));
         ctx.approver = Some(approver);
-        crate::tools::read::ReadTool
-            .call(
+        crate::engine::interrupt::with_host_approval_effect_scope(
+            "identity_user_read_test",
+            tokio_util::sync::CancellationToken::new(),
+            crate::tools::read::ReadTool.call(
                 serde_json::json!({"path": user_path(&home).display().to_string()}),
                 &ctx,
-            )
-            .await
-            .unwrap();
+            ),
+            |_| Some(true),
+        )
+        .await
+        .unwrap();
         let db = ctx.session.db.clone();
         let session_id = ctx.session.id;
         let hub = ctx.interrupts.clone();
+        let mut raised = hub.subscribe_raised();
         let resolver = tokio::spawn(async move {
-            let iid = loop {
-                let open = db.list_open_interrupts(session_id).await.unwrap();
-                if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
-                    break row.interrupt_id;
-                }
-                tokio::task::yield_now().await;
-            };
             let response = crate::daemon::proto::ResolveResponse::Single {
                 selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
             };
-            db.resolve_interrupt(iid, &response).await.unwrap();
-            assert!(hub.resolve(iid, response));
+            settle_identity_approval(&db, session_id, &hub, &mut raised, response).await;
         });
-        crate::tools::read::ReadTool
-            .call(
-                serde_json::json!({"path": user_path(&home).display().to_string()}),
-                &ctx,
-            )
-            .await
-            .unwrap();
-
-        let out = crate::tools::write::WriteTool
-            .call(
+        let out = crate::engine::interrupt::with_host_approval_effect_scope(
+            "identity_user_write_test",
+            tokio_util::sync::CancellationToken::new(),
+            crate::tools::write::WriteTool.call(
                 serde_json::json!({
                     "path": user_path(&home).display().to_string(),
                     "content": "approved user context\n"
                 }),
                 &ctx,
-            )
-            .await
-            .unwrap();
+            ),
+            |output| Some(!output.content.contains("approval auto-denied")),
+        )
+        .await
+        .unwrap();
         resolver.await.unwrap();
 
         assert!(
@@ -1180,6 +1225,20 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let (mut ctx, _, home, _env) =
             assistant_tool_ctx(project.path(), SoulEditMode::Autonomous).await;
+        let (events, _event_rx) = tokio::sync::broadcast::channel(8);
+        let redaction = Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::redact::RedactionTable::empty(),
+        )));
+        ctx.interrupts = Arc::new(
+            crate::engine::interrupt::InterruptHub::new(
+                events,
+                redaction,
+                Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+                ctx.session.db.clone(),
+                ctx.session.id,
+            )
+            .with_live_session(ctx.session.clone()),
+        );
         let store = crate::approval::store::GrantStore::new(
             ctx.session.db.clone(),
             ctx.session.id,
@@ -1193,41 +1252,41 @@ mod tests {
             "helper",
             ctx.interrupts.clone(),
         )));
+        crate::engine::interrupt::with_host_approval_effect_scope(
+            "identity_soul_read_test",
+            tokio_util::sync::CancellationToken::new(),
+            crate::tools::read::ReadTool.call(
+                serde_json::json!({"path": soul_path(&home).display().to_string()}),
+                &ctx,
+            ),
+            |_| Some(true),
+        )
+        .await
+        .unwrap();
         let db = ctx.session.db.clone();
         let session_id = ctx.session.id;
         let hub = ctx.interrupts.clone();
+        let mut raised = hub.subscribe_raised();
         let resolver = tokio::spawn(async move {
-            let iid = loop {
-                let open = db.list_open_interrupts(session_id).await.unwrap();
-                if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
-                    break row.interrupt_id;
-                }
-                tokio::task::yield_now().await;
-            };
             let response = crate::daemon::proto::ResolveResponse::Single {
                 selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
             };
-            db.resolve_interrupt(iid, &response).await.unwrap();
-            assert!(hub.resolve(iid, response));
+            settle_identity_approval(&db, session_id, &hub, &mut raised, response).await;
         });
-        crate::tools::read::ReadTool
-            .call(
-                serde_json::json!({"path": soul_path(&home).display().to_string()}),
-                &ctx,
-            )
-            .await
-            .unwrap();
-
-        let out = crate::tools::write::WriteTool
-            .call(
+        let out = crate::engine::interrupt::with_host_approval_effect_scope(
+            "identity_soul_write_test",
+            tokio_util::sync::CancellationToken::new(),
+            crate::tools::write::WriteTool.call(
                 serde_json::json!({
                     "path": soul_path(&home).display().to_string(),
                     "content": "model rewrite\n"
                 }),
                 &ctx,
-            )
-            .await
-            .unwrap();
+            ),
+            |output| Some(!output.content.contains("approval auto-denied")),
+        )
+        .await
+        .unwrap();
         resolver.await.unwrap();
 
         assert!(

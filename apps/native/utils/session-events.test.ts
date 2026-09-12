@@ -954,7 +954,7 @@ describe("native session event helpers", () => {
     ).toBe(false);
   });
 
-  it("adds and resolves interrupt events", () => {
+  it("adds and terminalizes resolved and interrupted events", () => {
     const raised = reduceNativeSessionEvent(initialState, {
       v: PROTOCOL_VERSION,
       kind: "evt",
@@ -988,6 +988,17 @@ describe("native session event helpers", () => {
       data: { session_id: sessionId, interrupt_id: interruptId },
     });
     expect(resolved.state.history[0]).toMatchObject({
+      kind: "interrupt",
+      interrupt: { interruptId, resolved: true },
+    });
+
+    const interrupted = reduceNativeSessionEvent(raised.state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "interrupt_interrupted",
+      data: { session_id: sessionId, interrupt_id: interruptId },
+    });
+    expect(interrupted.state.history[0]).toMatchObject({
       kind: "interrupt",
       interrupt: { interruptId, resolved: true },
     });

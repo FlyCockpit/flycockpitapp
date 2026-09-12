@@ -130,21 +130,17 @@ pub mod workspace_trust;
 pub mod write_scope_leases;
 
 use std::any::Any;
-use std::io::Seek as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use sha2::{Digest, Sha256};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const MIGRATION_BACKUP_LIMIT: usize = 3;
-const UNTRUSTED_MIGRATION_BACKUP_LIMIT: usize = 2;
-const UNTRUSTED_MIGRATION_BACKUP_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 thread_local! {
     static OPEN_DEFAULT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -224,8 +220,8 @@ struct Writer {
 }
 
 /// Shared writer lifetime. `Db` declares its `writer` field before its owner
-/// lock, so the final clone joins this thread (including its final checkpoint)
-/// before releasing exclusive database ownership.
+/// lock, so the final clone drains and joins this thread before releasing
+/// exclusive database ownership.
 struct WriterInner {
     tx: Mutex<Option<mpsc::SyncSender<WriteRequest>>>,
     join: Mutex<Option<std::thread::JoinHandle<Result<()>>>>,
@@ -249,30 +245,11 @@ impl Drop for WriterInner {
 }
 
 impl Writer {
-    fn start(path: PathBuf) -> Result<Self> {
+    fn start(conn: Connection) -> Result<Self> {
         let (tx, rx) = mpsc::sync_channel::<WriteRequest>(1024);
-        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let join = std::thread::Builder::new()
             .name("cockpit-db-writer".into())
             .spawn(move || -> Result<()> {
-                let conn = match Connection::open(&path)
-                    .with_context(|| format!("opening sqlite writer at {}", path.display()))
-                    .and_then(|conn| {
-                        apply_connection_pragmas(&conn, true).with_context(|| {
-                            format!("setting writer pragmas on {}", path.display())
-                        })?;
-                        Ok(conn)
-                    }) {
-                    Ok(conn) => {
-                        let _ = ready_tx.send(Ok(()));
-                        conn
-                    }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e.to_string()));
-                        return Err(e);
-                    }
-                };
-
                 while let Ok(request) = rx.recv() {
                     let result = catch_unwind(AssertUnwindSafe(|| (request.job)(&conn)))
                         .map_err(|_| anyhow::anyhow!("db writer job panicked"))
@@ -290,27 +267,22 @@ impl Writer {
                         ));
                     }
                 }
-                // The last database owner performs an explicit truncating
-                // checkpoint before SQLite closes the writer. This bounds
-                // WAL growth and makes the durable shutdown boundary
-                // independent of SQLite's build-time autocheckpoint defaults.
-                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-                    .context("checkpointing SQLite WAL during writer shutdown")?;
+                // Closing the final writer connection preserves every
+                // synchronous=FULL WAL commit. Do not put a truncating
+                // checkpoint on daemon process teardown: the kernel flush can
+                // block indefinitely, retaining the exclusive boot lock past
+                // the bounded stop/restart release contract. Runtime WAL
+                // growth remains bounded by our explicit wal_autocheckpoint.
+                drop(conn);
                 Ok(())
             })
             .context("spawning db writer thread")?;
-        match ready_rx.recv().context("waiting for db writer startup")? {
-            Ok(()) => Ok(Self {
-                inner: Arc::new(WriterInner {
-                    tx: Mutex::new(Some(tx)),
-                    join: Mutex::new(Some(join)),
-                }),
+        Ok(Self {
+            inner: Arc::new(WriterInner {
+                tx: Mutex::new(Some(tx)),
+                join: Mutex::new(Some(join)),
             }),
-            Err(e) => {
-                let _ = join.join();
-                anyhow::bail!(e)
-            }
-        }
+        })
     }
 
     fn submit<F, T>(&self, f: F) -> Result<mpsc::Receiver<Result<Box<dyn Any + Send>>>>
@@ -468,6 +440,10 @@ pub struct Db {
     read_pool: Option<Arc<ReadPool>>,
     /// `None` for in-memory databases (tests).
     path: Option<PathBuf>,
+    /// Process-lifetime installation authority for file-vault placement.
+    /// Kept on the clone-shared DB handle so DB-only production consumers
+    /// cannot silently reconstruct a database-relative default after boot.
+    secret_vault_dir: Arc<OnceLock<PathBuf>>,
     /// Kernel-backed exclusive ownership retained by every clone until the
     /// final file-backed daemon handle is dropped.
     _owner_lock: Option<Arc<files::DatabaseOwnerLock>>,
@@ -680,13 +656,17 @@ impl Db {
         reconcile_interrupted_sealed_value_acquisitions(&conn)?;
         timer.phase("migrate");
 
-        drop(conn);
-        let writer = Writer::start(path.to_path_buf())?;
+        // The migrated, pragma-configured connection becomes the writer's
+        // connection. Reopening and reapplying pragmas in a newly scheduled
+        // thread adds no readiness guarantee and can indefinitely delay boot
+        // under CPU contention before the daemon publishes its endpoint.
+        let writer = Writer::start(conn)?;
         let db = Self {
             memory: None,
             writer: Some(writer),
             read_pool: Some(Arc::new(ReadPool::new(path.to_path_buf()))),
             path: Some(path.to_path_buf()),
+            secret_vault_dir: Arc::new(OnceLock::new()),
             _owner_lock: owner_lock,
             _diagnostic_lock: None,
             read_only: false,
@@ -710,6 +690,7 @@ impl Db {
             writer: None,
             read_pool: None,
             path: None,
+            secret_vault_dir: Arc::new(OnceLock::new()),
             _owner_lock: None,
             _diagnostic_lock: None,
             read_only: false,
@@ -806,6 +787,7 @@ impl Db {
             writer: None,
             read_pool: None,
             path: Some(path),
+            secret_vault_dir: Arc::new(OnceLock::new()),
             _owner_lock: None,
             _diagnostic_lock: diagnostic_lock,
             read_only: true,
@@ -825,6 +807,33 @@ impl Db {
     /// File path the database is backed by, or `None` for in-memory.
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    /// Publish the installation's effective file-vault directory once.
+    /// Re-publishing the identical authority is harmless; a conflict fails
+    /// closed instead of leaving clone-dependent placement.
+    pub fn configure_secret_vault_dir(&self, path: PathBuf) -> Result<()> {
+        if let Some(existing) = self.secret_vault_dir.get() {
+            anyhow::ensure!(
+                existing == &path,
+                "conflicting secret-vault directory authority: {} versus {}",
+                existing.display(),
+                path.display()
+            );
+            return Ok(());
+        }
+        match self.secret_vault_dir.set(path.clone()) {
+            Ok(()) => Ok(()),
+            Err(_) if self.secret_vault_dir.get() == Some(&path) => Ok(()),
+            Err(_) => anyhow::bail!(
+                "secret-vault directory authority raced with a conflicting publication: {}",
+                path.display()
+            ),
+        }
+    }
+
+    pub fn secret_vault_dir(&self) -> Option<&Path> {
+        self.secret_vault_dir.get().map(PathBuf::as_path)
     }
 
     /// Acquire the shared history-disclosure fence. The permit must be held
@@ -3342,6 +3351,11 @@ mod tests {
             // deleting a session must not erase spend or unblock its scopes.
             // Sidecar intents outlive the session row so boot can delete
             // files that the cascading payload delete can no longer see.
+            // Text-artifact blob cleanup intents follow the same contract:
+            // every blob identity is preserved before the cascade so replayed
+            // filesystem cleanup work survives the session delete.
+            // Sealed action/value audit rows deliberately carry no FKs:
+            // retiring an action or deleting a session must not erase evidence.
             // Guidance proposal receipts are content-free audit rows that
             // may outlive the session during retention (session_id is not a FK).
             // Image-sidecar grants are project-owned; session_id is an optional
@@ -3353,6 +3367,9 @@ mod tests {
                 || name == "image_spend_reservations"
                 || name == "task_delegation_sidecar_cleanup_intents"
                 || name == "task_delegation_sidecar_prepare_intents"
+                || name == "text_artifact_blob_cleanup_intents"
+                || name == "sealed_action_invocation_audit"
+                || name == "sealed_value_acquisition_audit"
                 || name == "guidance_proposal_receipts"
                 || name == "image_sidecar_grants"
                 || name == "tool_media_authorization_epochs"

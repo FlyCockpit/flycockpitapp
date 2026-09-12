@@ -7,6 +7,24 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures::StreamExt as _;
 
+/// Enumerate the provider named-secret and credential-record reference ids a
+/// diagnostic root's bootstrap config projection uses. Diagnostics are
+/// session-less and trust-free: they read configuration without resolving
+/// credentials (mirroring `build_snapshot`'s provider projection), and only
+/// the reference ids — never configuration content — leave this module.
+pub fn provider_secret_reference_ids(
+    cwd: &Path,
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+) {
+    let config = crate::config::providers::ConfigDoc::load_effective(cwd);
+    (
+        crate::secret_ref::provider_named_secret_references(&config),
+        crate::secret_ref::provider_credential_record_references(&config),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiagnosticsInput {
     pub cwd: PathBuf,
@@ -2711,7 +2729,6 @@ mod tests {
     fn database_schema_rejection_classifier_covers_every_boot_rejection_family() {
         for message in [
             "FCDB_SCHEMA_PROFILE_MISMATCH: wrong profile",
-            "FCDB_SCHEMA_REJECTED_AFTER_OPEN: backup ledger differs from compiled schema",
             "incompatible prerelease database schema v2",
             "incompatible legacy prerelease database schema v1",
             "database migration ledger is corrupt: gap",

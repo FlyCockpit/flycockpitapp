@@ -650,7 +650,7 @@ describe("remote session reducers", () => {
     );
   });
 
-  it("adds and resolves interrupts through daemon question shapes", () => {
+  it("adds and terminalizes resolved and interrupted daemon questions", () => {
     const raised = applyLiveEvent(
       withDetail(),
       event("interrupt_raised", {
@@ -673,6 +673,18 @@ describe("remote session reducers", () => {
       event("interrupt_resolved", { session_id: sessionId, interrupt_id: interruptId, seq: 8 }),
     );
     expect(resolved.detailsBySession[sessionId].history).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "interrupt",
+          interrupt: expect.objectContaining({ interruptId, resolved: true }),
+        }),
+      ]),
+    );
+    const interrupted = applyLiveEvent(
+      raised,
+      event("interrupt_interrupted", { session_id: sessionId, interrupt_id: interruptId }),
+    );
+    expect(interrupted.detailsBySession[sessionId].history).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           kind: "interrupt",

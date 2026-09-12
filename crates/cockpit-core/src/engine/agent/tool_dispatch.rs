@@ -64,35 +64,6 @@ fn capability_guard_denial_output(denial: Value) -> Result<ToolOutput> {
     .context("capability guard denial must form a canonical tool result")
 }
 
-/// The sole ordinary-tool host-effect boundary. Verification may select
-/// original or revised arguments (including a parked replay), but every
-/// authorized selection reaches this helper before any toolbox `Tool::call`.
-async fn dispatch_authorized_tool(
-    env: &DispatchEnv<'_>,
-    resolved_name: &str,
-    args: Value,
-    call_id: &str,
-) -> (Result<ToolOutput>, u64) {
-    if resolved_name == "acquire_sealed_value" {
-        let started = std::time::Instant::now();
-        let result =
-            crate::engine::trusted_child_acquisition_coordinator::run_parent_acquisition_tool(
-                env, &args,
-            )
-            .await;
-        (result, started.elapsed().as_millis() as u64)
-    } else {
-        dispatch_one_timed(
-            env.active_tools,
-            resolved_name,
-            args,
-            env.ctx,
-            Some(call_id),
-        )
-        .await
-    }
-}
-
 fn ordinary_ledger_args(env: &DispatchEnv<'_>, resolved_name: &str, args: &Value) -> Value {
     crate::tools::knowledge_sealed::ledger_args_for_sensitive_tool(resolved_name, args)
         .or_else(|| {
@@ -173,6 +144,8 @@ pub(crate) struct SchedulerDurablePermit {
     order: Arc<SchedulerDurableOrder>,
     ordinal: usize,
     started_released: bool,
+    execution_release: Option<(usize, tokio::sync::mpsc::UnboundedSender<usize>)>,
+    execution_released: bool,
 }
 
 impl SchedulerDurablePermit {
@@ -181,6 +154,25 @@ impl SchedulerDurablePermit {
             order,
             ordinal,
             started_released: false,
+            execution_release: None,
+            execution_released: false,
+        }
+    }
+
+    pub(crate) fn set_execution_release_sender(
+        &mut self,
+        source_index: usize,
+        tx: tokio::sync::mpsc::UnboundedSender<usize>,
+    ) {
+        self.execution_release = Some((source_index, tx));
+    }
+
+    fn release_execution(&mut self) {
+        if !self.execution_released {
+            self.execution_released = true;
+            if let Some((source_index, tx)) = &self.execution_release {
+                let _ = tx.send(*source_index);
+            }
         }
     }
 
@@ -201,6 +193,10 @@ impl SchedulerDurablePermit {
     }
 
     pub(crate) async fn await_commit(&mut self) {
+        // Execution capacity and durable source ordering are distinct. Once
+        // the tool has finished producing its result, release its scheduler
+        // slot before waiting for an earlier source ordinal to commit.
+        self.release_execution();
         SchedulerDurableOrder::wait_for(&self.order.next_commit, self.ordinal, &self.order.notify)
             .await;
     }
@@ -209,6 +205,7 @@ impl SchedulerDurablePermit {
 impl Drop for SchedulerDurablePermit {
     fn drop(&mut self) {
         self.release_started();
+        self.release_execution();
         // An error can leave before the common durable-commit boundary. Mark
         // that ordinal released as well so later completed calls never deadlock
         // behind a cancelled predecessor.
@@ -951,18 +948,21 @@ pub(crate) async fn execute_ordinary_call(
     // actual `ToolOutput` outcome below; the inner scope owns approvals raised
     // from within the tool itself. Without this enclosing scope a gate could
     // consume a host approval before any effect boundary existed to own it.
-    crate::engine::interrupt::with_host_approval_effect_scope(
-        "ordinary_tool_dispatch_gate",
-        env.ctx.cancel.clone(),
-        Box::pin(execute_ordinary_call_unscoped(
-            env,
-            history,
-            tc,
-            resolved_name,
-            name_recovery,
-            text_recovery_marker,
-        )),
-        |_| None,
+    crate::tools::trusted_child_acquisition::scope_inherited_acquisition_runtime(
+        crate::engine::interrupt::with_host_approval_effect_scope_for_tool(
+            "ordinary_tool_dispatch_gate",
+            &tc.id,
+            env.ctx.cancel.clone(),
+            Box::pin(execute_ordinary_call_unscoped(
+                env,
+                history,
+                tc,
+                resolved_name,
+                name_recovery,
+                text_recovery_marker,
+            )),
+            |_| None,
+        ),
     )
     .await
 }
@@ -2300,35 +2300,36 @@ async fn execute_ordinary_call_unscoped(
             )
         })
     });
-    let mut artifact_captures = (!hard_fail && canonical_result_is_text_only)
-        .then(|| {
-            let mut captures = result
-                .as_ref()
-                .ok()
-                .map(|output| output.text_artifact_captures.clone())
-                .unwrap_or_default();
+    let has_explicit_text_artifact = result
+        .as_ref()
+        .ok()
+        .is_some_and(|output| output.text_artifact_capture.is_some());
+    let mut artifact_captures =
+        if !hard_fail && (canonical_result_is_text_only || has_explicit_text_artifact) {
+            let mut captures = if canonical_result_is_text_only {
+                result
+                    .as_ref()
+                    .ok()
+                    .map(|output| output.text_artifact_captures.clone())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             if let Some(capture) = result
                 .as_ref()
                 .ok()
                 .and_then(|output| output.text_artifact_capture.clone())
             {
                 captures.push(crate::engine::tool::ToolTextArtifactCapture {
-                    lane: if result
-                        .as_ref()
-                        .ok()
-                        .is_some_and(|output| output.text_artifact_model_ephemeral)
-                    {
-                        crate::engine::tool::ToolArtifactLane::Display
-                    } else {
-                        crate::engine::tool::ToolArtifactLane::Model
-                    },
+                    lane: crate::engine::tool::ToolArtifactLane::Model,
                     capture,
                     explicit: true,
                 });
             }
             captures
-        })
-        .unwrap_or_default();
+        } else {
+            Vec::new()
+        };
     // Artifacts are durable and retrievable, so every lane crosses the
     // outbound redaction boundary before admission. A replacement that grows
     // the body fails closed rather than corrupting host capture accounting.
@@ -2471,7 +2472,7 @@ async fn execute_ordinary_call_unscoped(
     let ledger_original = ordinary_ledger_args(env, resolved_name, &original);
     let ledger_wire = model_history_args(env, resolved_name, &args);
     scheduler_await_commit().await;
-    if let Err(e) = env
+    let tool_audit_committed = match env
         .session
         .record_tool_call_journaled(
             ToolCallRow {
@@ -2515,29 +2516,41 @@ async fn execute_ordinary_call_unscoped(
         )
         .await
     {
-        // Auditing must not break the live conversation. Log and
-        // continue — the model still sees the tool result.
-        tracing::warn!(error = %e, tool = %resolved_name, "persisting tool_call_event failed");
-    }
+        Ok(()) => true,
+        Err(e) => {
+            // Auditing must not break the live conversation. Log and
+            // continue — the model still sees the tool result.
+            tracing::warn!(error = %e, tool = %resolved_name, "persisting tool_call_event failed");
+            false
+        }
+    };
 
-    let canonical_history_output = result.as_ref().ok().and_then(|output| {
+    let event_canonical_output = result.as_ref().ok().and_then(|output| {
         (!hard_fail
             && output.content.has_non_text_content()
             && output
                 .content
                 .parts()
                 .iter()
-                .all(|part| !part.is_media_reference())
-            && output_str == output.content.model_text())
-        .then(|| {
-            serde_json::to_value(
-                model_result_contents
-                    .as_ref()
-                    .unwrap_or(&output.content)
-                    .parts(),
-            )
-        })
+                .all(|part| !part.is_media_reference()))
+        .then(|| serde_json::to_value(output.content.parts()))
     });
+    let canonical_history_output = model_result_contents.as_ref().and_then(|projected| {
+        (!hard_fail
+            && projected.has_non_text_content()
+            && projected
+                .parts()
+                .iter()
+                .all(|part| !part.is_media_reference()))
+        .then(|| serde_json::to_value(projected.parts()))
+    });
+    let event_canonical_output = match event_canonical_output.transpose() {
+        Ok(output) => output,
+        Err(error) => {
+            release_tool_media_handoffs(&mut resolved_media_handoffs).await;
+            return Err(error.into());
+        }
+    };
     let canonical_history_output = match canonical_history_output.transpose() {
         Ok(output) => output,
         Err(error) => {
@@ -2573,11 +2586,14 @@ async fn execute_ordinary_call_unscoped(
         "truncated": truncated,
         "duration_ms": duration_ms,
     });
-    if let Some(canonical_output) = &canonical_history_output {
+    if let Some(canonical_output) = &event_canonical_output {
         event_data["canonical_output"] = canonical_output.clone();
     }
     if let Some(canonical_output_text) = &canonical_history_text {
         event_data["canonical_output_text"] = canonical_output_text.clone().into();
+    }
+    if let Some(model_canonical_output) = &canonical_history_output {
+        event_data["model_canonical_output"] = model_canonical_output.clone();
     }
     if result.as_ref().ok().is_some_and(|output| {
         output.display_content.is_some()
@@ -2631,6 +2647,10 @@ async fn execute_ordinary_call_unscoped(
     }
     let mut model_artifact_frame = None;
     let mut human_artifact_notes = Vec::new();
+    let suppress_model_artifact_frame = result
+        .as_ref()
+        .ok()
+        .is_some_and(|output| output.text_artifact_model_ephemeral);
     let tool_call_seq = if !artifact_captures.is_empty() {
         let mut display_slot = 0_i64;
         let mut attachment_slot = 0_i64;
@@ -2662,28 +2682,48 @@ async fn execute_ordinary_call_unscoped(
                 }
             };
             let staged_at = chrono::Utc::now().timestamp_millis();
-            let staged_blob_path = crate::text_artifact_blob::new_path(env.session.id);
-            env.session
-                .db
-                .stage_text_artifact_blob_cleanup_intent(
-                    staged_blob_path.clone(),
-                    env.session.id,
-                    staged_at,
-                )
-                .await
-                .context("staging tool artifact blob cleanup")?;
-            let blob_path =
-                crate::text_artifact_blob::write_at(&staged_blob_path, &retained.capture.content)
+            let (provenance_json, blob_cleanup_path) =
+                if suppress_model_artifact_frame && retained.explicit {
+                    (
+                        serde_json::json!({
+                            "agent_id": &env.agent.name,
+                            "tool": resolved_name,
+                            "call_id": &tc.id,
+                            "source": "tool_result",
+                            "preview_lines": artifact_preview_lines,
+                        })
+                        .to_string(),
+                        None,
+                    )
+                } else {
+                    let staged_blob_path = crate::text_artifact_blob::new_path(env.session.id);
+                    env.session
+                        .db
+                        .stage_text_artifact_blob_cleanup_intent(
+                            staged_blob_path.clone(),
+                            env.session.id,
+                            staged_at,
+                        )
+                        .await
+                        .context("staging tool artifact blob cleanup")?;
+                    let blob_path = crate::text_artifact_blob::write_at(
+                        &staged_blob_path,
+                        &retained.capture.content,
+                    )
                     .with_context(|| format!("spilling tool result for {resolved_name}"))?;
-            let provenance_json = serde_json::json!({
-                "agent_id": &env.agent.name,
-                "tool": resolved_name,
-                "call_id": &tc.id,
-                "source": "tool_result",
-                "preview_lines": artifact_preview_lines,
-                "blob_path": blob_path,
-            })
-            .to_string();
+                    (
+                        serde_json::json!({
+                            "agent_id": &env.agent.name,
+                            "tool": resolved_name,
+                            "call_id": &tc.id,
+                            "source": "tool_result",
+                            "preview_lines": artifact_preview_lines,
+                            "blob_path": blob_path,
+                        })
+                        .to_string(),
+                        Some(staged_blob_path),
+                    )
+                };
             staged.push((
                 crate::db::text_artifacts::TextArtifactCandidate {
                     relation,
@@ -2698,14 +2738,14 @@ async fn execute_ordinary_call_unscoped(
                     provenance_json,
                     created_at: chrono::Utc::now().timestamp_millis(),
                 },
-                staged_blob_path,
+                blob_cleanup_path,
             ));
         }
         let candidates = staged
             .iter()
             .map(|(candidate, _)| candidate.clone())
             .collect();
-        let staged_blob_paths = staged.iter().map(|(_, path)| path.clone()).collect();
+        let staged_blob_paths = staged.iter().filter_map(|(_, path)| path.clone()).collect();
         let event = crate::db::text_artifacts::TextArtifactEventInput {
             session_id: env.session.id,
             kind: crate::db::session_log::SessionEventKind::ToolCall,
@@ -2744,6 +2784,7 @@ async fn execute_ordinary_call_unscoped(
                             }
                             if candidate.relation
                                 == crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult
+                                && !suppress_model_artifact_frame
                             {
                                 let preview_head = crate::engine::text_artifact_frame::utf8_preview_lines(
                                     &candidate.content,
@@ -2779,7 +2820,9 @@ async fn execute_ordinary_call_unscoped(
                             }
                         }
                         admission => {
-                            if let Err(error) = crate::text_artifact_blob::remove(&blob_path) {
+                            if let Some(ref blob_path) = blob_path
+                                && let Err(error) = crate::text_artifact_blob::remove(blob_path)
+                            {
                                 tracing::error!(%error, %blob_path, "rejected tool artifact blob cleanup failed");
                             }
                             let reason = match admission {
@@ -2820,7 +2863,9 @@ async fn execute_ordinary_call_unscoped(
             }
             Err(error) => {
                 for (candidate, blob_path) in staged {
-                    if let Err(cleanup_error) = crate::text_artifact_blob::remove(&blob_path) {
+                    if let Some(ref blob_path) = blob_path
+                        && let Err(cleanup_error) = crate::text_artifact_blob::remove(blob_path)
+                    {
                         tracing::error!(%cleanup_error, %blob_path, "failed tool artifact blob cleanup after database error");
                     }
                     match candidate.relation {
@@ -2946,7 +2991,10 @@ async fn execute_ordinary_call_unscoped(
                 tool: resolved_name.to_string(),
                 error: event_data["output"].as_str().unwrap_or("").to_string(),
                 kind: fail_kind.unwrap_or(crate::engine::tool::ToolFailKind::Execution),
-                seq: tool_call_seq,
+                // A sequenced terminal is also the completion witness for the
+                // ordinary audit row. Keep display-only delivery on audit
+                // failure, but never claim durable completion with `seq`.
+                seq: tool_call_seq.filter(|_| tool_audit_committed),
             })
             .await;
     } else {
@@ -2958,7 +3006,9 @@ async fn execute_ordinary_call_unscoped(
                 tool: resolved_name.to_string(),
                 output: event_data["output"].as_str().unwrap_or("").to_string(),
                 truncated,
-                seq: tool_call_seq,
+                // See the ToolError branch above: `Some(seq)` proves both the
+                // audit row and its session timeline row committed.
+                seq: tool_call_seq.filter(|_| tool_audit_committed),
                 hint: bash_hint.as_ref().map(|h| h.user_chip.text.clone()),
             })
             .await;
@@ -2996,7 +3046,7 @@ async fn execute_ordinary_call_unscoped(
             "truncated": truncated,
             "duration_ms": duration_ms,
         });
-        if let Some(canonical_output) = &canonical_history_output {
+        if let Some(canonical_output) = &event_canonical_output {
             completed_data["canonical_output"] = canonical_output.clone();
         } else if let Ok(output) = &result
             && output
@@ -3019,6 +3069,9 @@ async fn execute_ordinary_call_unscoped(
         }
         if let Some(canonical_output_text) = &canonical_history_text {
             completed_data["canonical_output_text"] = canonical_output_text.clone().into();
+        }
+        if let Some(model_canonical_output) = &canonical_history_output {
+            completed_data["model_canonical_output"] = model_canonical_output.clone();
         }
         if let Some(completed_data) = completed_data.as_object_mut() {
             completed_data.extend(result_metadata.clone());
@@ -3124,6 +3177,12 @@ async fn execute_ordinary_call_unscoped(
             wire_output.push('\n');
         }
         wire_output.push_str(&format!("\n--- hint({}): {}\n", hint.kind, hint.wire_text));
+    }
+    if let Some(disclosure) = &verification_disclosure {
+        if !wire_output.ends_with('\n') {
+            wire_output.push('\n');
+        }
+        wire_output.push_str(disclosure);
     }
     // A typed artifact projection replaces the entire model body.  Resume
     // rebuilds the same tool result from the durable frame alone; appending a
@@ -3306,25 +3365,36 @@ async fn execute_ordinary_call_unscoped(
             }
         }
     } else {
-        let wire_contents = match &result {
-            Ok(output)
-                if !hard_fail
-                    && wire_output
-                        == model_result_contents
-                            .as_ref()
-                            .unwrap_or(&output.content)
-                            .model_text()
-                    && model_result_contents
-                        .as_ref()
-                        .unwrap_or(&output.content)
-                        .parts()
-                        .iter()
-                        .all(|part| !part.is_media_reference()) =>
-            {
-                model_result_contents
-                    .as_ref()
-                    .unwrap_or(&output.content)
-                    .to_rig_contents()?
+        let wire_contents = match result.as_ref() {
+            Ok(output) if !hard_fail => {
+                let structured = model_result_contents.as_ref().unwrap_or(&output.content);
+                if structured
+                    .parts()
+                    .iter()
+                    .all(|part| !part.is_media_reference())
+                {
+                    if structured.has_non_text_content() {
+                        let mut contents = structured.to_rig_contents()?;
+                        let base = structured.model_text();
+                        if wire_output.starts_with(base) {
+                            let suffix = &wire_output[base.len()..];
+                            if !suffix.is_empty() {
+                                contents.push(rig::message::ToolResultContent::text(
+                                    suffix.to_string(),
+                                ));
+                            }
+                        } else if wire_output != base {
+                            contents = vec![rig::message::ToolResultContent::text(wire_output)];
+                        }
+                        contents
+                    } else if wire_output == structured.model_text() {
+                        structured.to_rig_contents()?
+                    } else {
+                        vec![rig::message::ToolResultContent::text(wire_output)]
+                    }
+                } else {
+                    vec![rig::message::ToolResultContent::text(wire_output)]
+                }
             }
             _ => vec![rig::message::ToolResultContent::text(wire_output)],
         };
@@ -3346,8 +3416,37 @@ async fn execute_ordinary_call_unscoped(
     // live projection is pure and must not make a completed filesystem effect
     // depend on a best-effort audit read. The latest assistant message is
     // always left intact until a later turn settles it.
-    crate::engine::write_edit_arg_elision::elide_applied_write_edit_args(history);
+    crate::engine::write_edit_arg_elision::elide_applied_write_edit_args_deferring_signed(history);
     Ok(())
+}
+
+/// The sole ordinary-tool host-effect boundary. Verification may select
+/// original or revised arguments (including a parked replay), but every
+/// authorized selection reaches this helper before any toolbox `Tool::call`.
+async fn dispatch_authorized_tool(
+    env: &DispatchEnv<'_>,
+    resolved_name: &str,
+    args: Value,
+    call_id: &str,
+) -> (Result<ToolOutput>, u64) {
+    if resolved_name == "acquire_sealed_value" {
+        let started = std::time::Instant::now();
+        let result =
+            crate::engine::trusted_child_acquisition_coordinator::run_parent_acquisition_tool(
+                env, &args,
+            )
+            .await;
+        (result, started.elapsed().as_millis() as u64)
+    } else {
+        dispatch_one_timed(
+            env.active_tools,
+            resolved_name,
+            args,
+            env.ctx,
+            Some(call_id),
+        )
+        .await
+    }
 }
 
 fn render_unavailable_tool_artifact_frame(
@@ -3393,6 +3492,39 @@ mod tests {
             atomic::{AtomicBool, Ordering},
         },
     };
+
+    #[tokio::test]
+    async fn cancelling_before_commit_releases_execution_slot_and_durable_ordinal() {
+        let order = SchedulerDurableOrder::new();
+        let (slot_tx, mut slot_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut cancelled = SchedulerDurablePermit::new(order.clone(), 0);
+        cancelled.set_execution_release_sender(7, slot_tx);
+
+        let task = tokio::spawn(with_scheduler_durable_order(
+            cancelled,
+            std::future::pending::<()>(),
+        ));
+        tokio::task::yield_now().await;
+        task.abort();
+        let join_error = task
+            .await
+            .expect_err("aborted scheduler member is cancelled");
+        assert!(join_error.is_cancelled());
+        assert_eq!(
+            slot_rx.recv().await,
+            Some(7),
+            "cancellation before commit returns the member's execution slot"
+        );
+
+        let mut successor = SchedulerDurablePermit::new(order, 1);
+        successor.await_started().await;
+        successor.await_commit().await;
+        assert_eq!(
+            slot_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected),
+            "a permit without a driver slot sender emits no synthetic release"
+        );
+    }
 
     #[test]
     fn acquisition_parent_dispatch_has_one_authoritative_effect_seam() {
@@ -4504,27 +4636,6 @@ mod tests {
             }),
             _ => false,
         })
-    }
-
-    async fn park_next_interrupt(
-        db: crate::db::Db,
-        session_id: Uuid,
-        interrupts: Arc<crate::engine::interrupt::InterruptHub>,
-    ) {
-        for _ in 0..100 {
-            if let Some(row) = db
-                .list_open_interrupts(session_id)
-                .await
-                .unwrap()
-                .into_iter()
-                .next()
-            {
-                assert!(interrupts.park(row.interrupt_id).await);
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
-        panic!("timed out waiting for interrupt to park");
     }
 
     async fn assert_parked_call_has_no_result(
@@ -5968,11 +6079,14 @@ mod tests {
         let call = tool_call("interrupt_wait", serde_json::json!({}));
         let mut history = Vec::new();
         push_assistant_call(&mut history, &call);
-        let parker = tokio::spawn(park_next_interrupt(
-            session.db.clone(),
-            session.id,
-            interrupts,
-        ));
+        let mut raised = interrupts.subscribe_raised();
+        let parker = tokio::spawn(async move {
+            let interrupt_id = raised
+                .recv()
+                .await
+                .expect("interrupt raise publisher remains live");
+            assert!(interrupts.park(interrupt_id).await);
+        });
 
         let err = execute_ordinary_call(
             &env,
@@ -6071,11 +6185,14 @@ mod tests {
         );
         let mut history = Vec::new();
         push_assistant_call(&mut history, &call);
-        let parker = tokio::spawn(park_next_interrupt(
-            session.db.clone(),
-            session.id,
-            interrupts,
-        ));
+        let mut raised = interrupts.subscribe_raised();
+        let parker = tokio::spawn(async move {
+            let interrupt_id = raised
+                .recv()
+                .await
+                .expect("interrupt raise publisher remains live");
+            assert!(interrupts.park(interrupt_id).await);
+        });
 
         let err =
             execute_ordinary_call(&env, &mut history, &call, "question", Recovery::Clean, None)
@@ -6155,11 +6272,14 @@ mod tests {
         let mut history = Vec::new();
         push_assistant_call(&mut history, &call);
         let _gate = set_safety_gate_test_override(GateOutcome::Run { recheck: true });
-        let parker = tokio::spawn(park_next_interrupt(
-            session.db.clone(),
-            session.id,
-            interrupts,
-        ));
+        let mut raised = interrupts.subscribe_raised();
+        let parker = tokio::spawn(async move {
+            let interrupt_id = raised
+                .recv()
+                .await
+                .expect("interrupt raise publisher remains live");
+            assert!(interrupts.park(interrupt_id).await);
+        });
 
         let err = execute_ordinary_call(&env, &mut history, &call, "bash", Recovery::Clean, None)
             .await
@@ -6920,9 +7040,14 @@ mod tests {
         assert!(
             matches!(rx.recv().await, Some(TurnEvent::ToolStart { tool, .. }) if tool == "fail")
         );
-        assert!(
-            matches!(rx.recv().await, Some(TurnEvent::ToolError { error, .. }) if error.contains("intentional failure"))
-        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(TurnEvent::ToolError {
+                error,
+                seq: Some(_),
+                ..
+            }) if error.contains("intentional failure")
+        ));
         let row = session
             .db
             .list_tool_calls_for_session(session.id)
@@ -6933,6 +7058,82 @@ mod tests {
         assert_eq!(row.tool, "fail");
         assert!(row.hard_fail);
         assert!(row.output.contains("intentional failure"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_tool_terminal_seq_requires_committed_audit_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(FailTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, mut rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        session
+            .db
+            .write(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_ordinary_tool_audit
+                     BEFORE INSERT ON tool_call_events
+                     BEGIN
+                         SELECT RAISE(FAIL, 'forced ordinary tool audit failure');
+                     END;",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let call = tool_call("fail", serde_json::json!({}));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(&env, &mut history, &call, "fail", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(TurnEvent::ToolStart { tool, .. }) if tool == "fail"
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(TurnEvent::ToolError {
+                tool,
+                seq: None,
+                ..
+            }) if tool == "fail"
+        ));
+        assert!(
+            session
+                .db
+                .list_tool_calls_for_session(session.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "audit failure must not be presented as sequenced durable completion"
+        );
+        assert!(
+            session
+                .db
+                .list_session_events(session.id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "tool_call"),
+            "the distinguishing edge is an audit failure after timeline persistence succeeds"
+        );
     }
 
     #[tokio::test]

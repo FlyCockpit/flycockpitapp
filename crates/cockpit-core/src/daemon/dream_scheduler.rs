@@ -262,7 +262,9 @@ pub(crate) async fn run_knowledge_dream(
     scheduled: bool,
 ) -> Result<DreamRunResult> {
     let project_root = CanonicalDreamProjectRoot::from_session_path(workspace_root)?;
+    let diag_t0 = std::time::Instant::now();
     let run_fence = crate::session::DreamRunFence::acquire(&project_root, &knowledge_base.id).await;
+    eprintln!("DREAM-STEP fence acquired in {:?}", diag_t0.elapsed());
     // Source selection and post-turn verification use the same
     // installation-scoped ledger partition under one execution fence.
     let consumer = db.ensure_installation_identity().await?;
@@ -274,6 +276,11 @@ pub(crate) async fn run_knowledge_dream(
             caller_trust,
         )
         .await?;
+    eprintln!(
+        "DREAM-STEP sources={} in {:?}",
+        sources.len(),
+        diag_t0.elapsed()
+    );
     if sources.is_empty() {
         record_dream_run_timestamp(
             db,
@@ -305,6 +312,10 @@ pub(crate) async fn run_knowledge_dream(
         )
         .await
         .context("starting Dream session")?;
+    eprintln!(
+        "DREAM-STEP dream session attached in {:?}",
+        diag_t0.elapsed()
+    );
     let (agent_settled_tx, agent_settled_rx) = oneshot::channel();
     handle
         .send_work(SessionWork::SetAgent {
@@ -851,7 +862,11 @@ mod tests {
         .expect("detached empty-fire task should persist its cursor");
     }
 
+    // `@hourly`/`@daily` custom cron schedules require the opt-in extended
+    // local capability profile; without it `is_due` fails closed and the
+    // knowledge base is skipped (the same gating as the `is_due` unit tests).
     #[tokio::test]
+    #[cfg(feature = "extended")]
     async fn independently_scheduled_knowledge_bases_fire_only_when_their_own_cursor_is_due() {
         let db = Db::open_in_memory().unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -917,7 +932,10 @@ mod tests {
         .expect("the due hourly KB should fire while its not-due daily sibling does not");
     }
 
+    // `@hourly` custom cron schedules require the opt-in extended local
+    // capability profile (same gating as the `is_due` unit tests).
     #[tokio::test]
+    #[cfg(feature = "extended")]
     async fn durable_schedule_cursor_catches_up_after_daemon_restart() {
         let state_dir = tempfile::tempdir().unwrap();
         let database_path = state_dir.path().join("cockpit.sqlite3");
@@ -1067,7 +1085,8 @@ mod tests {
             let workspace_root = root.path().to_path_buf();
             let entry = entry.clone();
             async move {
-                run_knowledge_dream(
+                let started = std::time::Instant::now();
+                let result = run_knowledge_dream(
                     &db,
                     &registry,
                     &workspace_root,
@@ -1077,11 +1096,20 @@ mod tests {
                     false,
                     false,
                 )
-                .await
+                .await;
+                eprintln!(
+                    "DREAM-RUN-DIAG finished in {:?}: {:?}",
+                    started.elapsed(),
+                    result
+                        .as_ref()
+                        .map(|r| r.disposition)
+                        .map_err(|e| e.to_string())
+                );
+                result
             }
         });
 
-        let dream_id = tokio::time::timeout(Duration::from_secs(1), async {
+        let dream_id = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if let Some(row) = db
                     .list_sessions(true, 10)
@@ -1092,7 +1120,14 @@ mod tests {
                 {
                     break row.session_id;
                 }
-                tokio::task::yield_now().await;
+                // The durable row is the completion signal; poll it with a
+                // bounded sleep instead of yield_now()-spinning so this
+                // waiter never competes for the CPU the registry attach
+                // needs to persist the row. The fuse stays generous: under
+                // full-suite load the real attach legitimately takes well
+                // over the previous 1s bound, and the row is guaranteed
+                // before the worker can receive the turn.
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await

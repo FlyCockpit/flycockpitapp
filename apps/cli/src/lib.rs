@@ -28,9 +28,10 @@ pub mod test_env {
 pub(crate) mod daemon {
     pub(crate) use cockpit_core::daemon::{
         DaemonPaths, DaemonProbe, DaemonStatus, EventSender, SharedRedactionTable, caffeinate,
-        daemon_pid, derive_restart_no_sandbox, discover, proto, restart_release_timeout,
-        run_foreground, run_foreground_with_resume, send_current_event, server, session_worker,
-        spawn_detached_with_resume, stop, terminal, wait_for_restart_release,
+        capture_restart_release, daemon_pid, derive_restart_no_sandbox, discover, proto,
+        restart_release_timeout, run_foreground, run_foreground_with_resume, send_current_event,
+        server, session_worker, spawn_detached_with_resume, stop, stop_with_timeout, terminal,
+        wait_for_restart_release,
     };
     pub(crate) mod client {
         pub(crate) use cockpit_core::daemon::client::{
@@ -66,7 +67,7 @@ use anyhow::Context;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 
 pub use crate::cli::public_v0_1_command;
@@ -178,12 +179,20 @@ pub mod integration {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum DaemonEvent {
+        UserMessageRecorded {
+            session_id: Uuid,
+            seq: i64,
+        },
         InterruptRaised {
             session_id: Uuid,
             interrupt_id: Uuid,
             reason: &'static str,
         },
         InterruptResolved {
+            session_id: Uuid,
+            interrupt_id: Uuid,
+        },
+        InterruptInterrupted {
             session_id: Uuid,
             interrupt_id: Uuid,
         },
@@ -208,6 +217,12 @@ pub mod integration {
         ToolEnd {
             session_id: Uuid,
             call_id: String,
+            seq: Option<i64>,
+        },
+        ToolError {
+            session_id: Uuid,
+            call_id: String,
+            seq: Option<i64>,
         },
         AssistantText {
             session_id: Uuid,
@@ -326,6 +341,30 @@ pub mod integration {
                 .lock()
                 .map_err(|_| anyhow!("attached session state is unavailable"))?
                 .ok_or_else(|| anyhow!("send_user_message requires an attached session"))?;
+            let text = text.into();
+            let tag_expansions: Vec<_> = tag_expansions
+                .into_iter()
+                .map(|(tool, path, detail, ok)| {
+                    crate::daemon::proto::send_user_message_v2::MessageTagExpansion {
+                        tool,
+                        path,
+                        detail,
+                        ok,
+                    }
+                })
+                .collect();
+            let invocation_nonce = Uuid::now_v7();
+            let client_submission_id = cockpit_client::submission::derive_client_submission_id(
+                invocation_nonce,
+                &cockpit_client::submission::ClientUserSubmission {
+                    origin: cockpit_client::submission::SubmissionOrigin::ExternalRoot,
+                    text: text.clone(),
+                    display_text: display_text.clone(),
+                    tag_expansions: tag_expansions.iter().cloned().map(Into::into).collect(),
+                    ..Default::default()
+                }
+                .client_fingerprint(),
+            );
             match self
                 .inner
                 .request_ok(crate::daemon::proto::Request::SendUserMessageV2 {
@@ -337,21 +376,11 @@ pub mod integration {
                             None,
                             None,
                             crate::daemon::proto::send_user_message_v2::SendUserMessageV2 {
-                                client_submission_id: Uuid::now_v7(),
+                                client_submission_id,
                                 origin: Default::default(),
-                                text: text.into(),
+                                text,
                                 display_text,
-                                tag_expansions: tag_expansions
-                                    .into_iter()
-                                    .map(|(tool, path, detail, ok)| {
-                                        crate::daemon::proto::send_user_message_v2::MessageTagExpansion {
-                                            tool,
-                                            path,
-                                            detail,
-                                            ok,
-                                        }
-                                    })
-                                    .collect(),
+                                tag_expansions,
                                 forced_skill: None,
                                 delivery_class_override: None,
                                 resolved_delivery_class: None,
@@ -374,6 +403,19 @@ pub mod integration {
                 crate::daemon::proto::ResolveResponse::Single {
                     selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
                 },
+            )
+            .await
+        }
+
+        /// Answer an interrupt with an option ID from its public wire payload.
+        pub async fn answer_interrupt_option(
+            &self,
+            interrupt_id: Uuid,
+            selected_id: String,
+        ) -> Result<()> {
+            self.resolve_interrupt(
+                interrupt_id,
+                crate::daemon::proto::ResolveResponse::Single { selected_id },
             )
             .await
         }
@@ -498,12 +540,46 @@ pub mod integration {
             }
         }
 
+        pub async fn next_caffeinate_state_unbounded(&self) -> Result<CaffeinateState> {
+            loop {
+                let event = self
+                    .inner
+                    .next_event()
+                    .await
+                    .ok_or_else(|| anyhow!("daemon event stream closed"))?;
+                if let crate::daemon::proto::Event::CaffeinateState {
+                    active,
+                    lid_close_guaranteed,
+                    message,
+                } = event
+                {
+                    return Ok(CaffeinateState {
+                        active,
+                        lid_close_guaranteed,
+                        message,
+                    });
+                }
+            }
+        }
+
         pub async fn next_event(&self, timeout: Duration) -> Result<DaemonEvent> {
             let event = tokio::time::timeout(timeout, self.inner.next_event())
                 .await
                 .map_err(|_| anyhow!("timed out waiting for daemon event"))?
                 .ok_or_else(|| anyhow!("daemon event stream closed"))?;
             Ok(map_event(event))
+        }
+
+        /// Receive the next daemon event without imposing a second wall-clock
+        /// completion budget. Integration tests that await durable completion
+        /// use nextest's per-test timeout as their hang guard and still fail
+        /// immediately if the socket event stream disconnects.
+        pub async fn next_event_unbounded(&self) -> Result<DaemonEvent> {
+            self.inner
+                .next_event()
+                .await
+                .map(map_event)
+                .ok_or_else(|| anyhow!("daemon event stream closed"))
         }
 
         pub fn is_socket_backed(&self) -> bool {
@@ -513,6 +589,9 @@ pub mod integration {
 
     fn map_event(event: crate::daemon::proto::Event) -> DaemonEvent {
         match event {
+            crate::daemon::proto::Event::UserMessageRecorded {
+                session_id, seq, ..
+            } => DaemonEvent::UserMessageRecorded { session_id, seq },
             crate::daemon::proto::Event::InterruptRaised {
                 session_id,
                 interrupt_id,
@@ -532,6 +611,13 @@ pub mod integration {
                 interrupt_id,
                 ..
             } => DaemonEvent::InterruptResolved {
+                session_id,
+                interrupt_id,
+            },
+            crate::daemon::proto::Event::InterruptInterrupted {
+                session_id,
+                interrupt_id,
+            } => DaemonEvent::InterruptInterrupted {
                 session_id,
                 interrupt_id,
             },
@@ -571,10 +657,22 @@ pub mod integration {
             crate::daemon::proto::Event::ToolEnd {
                 session_id,
                 call_id,
+                seq,
                 ..
             } => DaemonEvent::ToolEnd {
                 session_id,
                 call_id,
+                seq,
+            },
+            crate::daemon::proto::Event::ToolError {
+                session_id,
+                call_id,
+                seq,
+                ..
+            } => DaemonEvent::ToolError {
+                session_id,
+                call_id,
+                seq,
             },
             crate::daemon::proto::Event::AssistantText {
                 session_id, text, ..
@@ -654,6 +752,10 @@ pub fn main_entry() -> ExitCode {
     // install the PATH-prepend alias BEFORE the tokio runtime starts.
     tools::shell_sandbox::init();
     terminal_host::install_factory();
+    if let Err(error) = cockpit_host::process::start_pinned_spawner() {
+        eprintln!("Error: starting protected process spawner: {error}");
+        return ExitCode::FAILURE;
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -661,7 +763,17 @@ pub fn main_entry() -> ExitCode {
         .max_blocking_threads(16)
         .build();
     let result = match runtime {
-        Ok(runtime) => runtime.block_on(async_main(launch_start)),
+        Ok(runtime) => {
+            let result = runtime.block_on(async_main(launch_start));
+            // Command completion is the ownership boundary: foreground daemon
+            // shutdown has already aborted and joined every task that may own
+            // durable state, child processes, or lifecycle metadata. Do not
+            // add Tokio's unbounded blocking-pool Drop wait after that proven
+            // boundary; a leftover best-effort blocking task must not retain
+            // the process-wide daemon lifetime lock past successful shutdown.
+            runtime.shutdown_background();
+            result
+        }
         Err(err) => Err(anyhow::Error::new(err)),
     };
     match result {
@@ -821,7 +933,14 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         crate::cli::PublicCli::from_arg_matches(&crate::cli::public_v0_1_command().get_matches())?
             .into();
 
-    init_tracing(cli.log_level.as_deref(), cli.print_logs);
+    // File-backed tracing must never put filesystem latency on the daemon's
+    // boot/publication path. Keep the worker guard alive for the whole command
+    // so shutdown can drain the bounded queue before the process exits.
+    let _log_worker = init_tracing(
+        cli.log_level.as_deref(),
+        cli.print_logs,
+        drain_logs_on_exit(cli.command.as_ref()),
+    );
 
     if cli.debug_last_message {
         match std::env::current_dir() {
@@ -956,7 +1075,21 @@ fn tui_mode_for_command(command: Option<&Command>) -> Option<commands::tui::Sess
     }
 }
 
-fn init_tracing(level: Option<&str>, print_logs: bool) {
+/// A daemon-start process must never wait for cache-backed tracing teardown.
+/// This covers both the long-lived foreground child and the short-lived
+/// detached launcher; either can have its writer blocked opening the cache.
+fn drain_logs_on_exit(command: Option<&Command>) -> bool {
+    !matches!(
+        command,
+        Some(Command::Daemon(crate::cli::DaemonCommand::Start { .. }))
+    )
+}
+
+fn init_tracing(
+    level: Option<&str>,
+    print_logs: bool,
+    drain_logs_on_exit: bool,
+) -> Option<LogWorkerGuard> {
     use tracing_subscriber::{EnvFilter, fmt};
 
     let filter = match level {
@@ -969,22 +1102,29 @@ fn init_tracing(level: Option<&str>, print_logs: bool) {
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
             .init();
-        return;
+        return None;
     }
 
-    match open_log_file() {
-        Some(file) => {
+    match dirs::cache_dir().map(|dir| dir.join("cockpit")) {
+        Some(log_dir) => {
+            // Directory validation, file open/metadata, rotation, and all
+            // subsequent writes belong to the log worker. In particular, a
+            // slow cache filesystem cannot delay daemon boot or endpoint
+            // publication before the first trace event has even been queued.
+            let (writer, guard) = NonBlockingLog::start(log_dir, drain_logs_on_exit)?;
             fmt()
                 .with_env_filter(filter)
                 .with_ansi(false)
-                .with_writer(file)
+                .with_writer(writer)
                 .init();
+            Some(guard)
         }
         None => {
             fmt()
                 .with_env_filter(filter)
                 .with_writer(std::io::sink)
                 .init();
+            None
         }
     }
 }
@@ -1003,6 +1143,118 @@ struct RotatingLogState {
 }
 struct RotatingLogWriter {
     state: Arc<Mutex<RotatingLogState>>,
+}
+
+const LOG_QUEUE_CAPACITY: usize = 4096;
+
+#[derive(Clone)]
+struct NonBlockingLog {
+    sender: mpsc::SyncSender<Vec<u8>>,
+}
+
+struct NonBlockingLogWriter {
+    sender: mpsc::SyncSender<Vec<u8>>,
+    bytes: Vec<u8>,
+}
+
+struct LogWorkerGuard {
+    shutdown: mpsc::Sender<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    drain_on_drop: bool,
+}
+
+impl NonBlockingLog {
+    fn start(log_dir: PathBuf, drain_on_drop: bool) -> Option<(Self, LogWorkerGuard)> {
+        let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(LOG_QUEUE_CAPACITY);
+        let (shutdown, shutdown_rx) = mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("cockpit-log-writer".into())
+            .spawn(move || {
+                // Opening the sink can involve directory walks, metadata, and
+                // host filesystem I/O. Keep all of it off the caller/boot
+                // thread. Failure leaves a functional bounded queue whose
+                // consumer intentionally discards records.
+                let mut writer =
+                    open_log_file_at(log_dir).map(|sink| RotatingLogWriter { state: sink.state });
+                loop {
+                    if shutdown_rx.try_recv().is_ok() {
+                        for bytes in receiver.try_iter() {
+                            if let Some(writer) = writer.as_mut() {
+                                let _ = writer.write_all(&bytes);
+                            }
+                        }
+                        if let Some(writer) = writer.as_mut() {
+                            let _ = writer.flush();
+                        }
+                        break;
+                    }
+                    match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+                        Ok(bytes) => {
+                            if let Some(writer) = writer.as_mut() {
+                                let _ = writer.write_all(&bytes);
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            if let Some(writer) = writer.as_mut() {
+                                let _ = writer.flush();
+                            }
+                            break;
+                        }
+                    }
+                }
+            })
+            .ok()?;
+        Some((
+            Self { sender },
+            LogWorkerGuard {
+                shutdown,
+                worker: Some(worker),
+                drain_on_drop,
+            },
+        ))
+    }
+}
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for NonBlockingLog {
+    type Writer = NonBlockingLogWriter;
+
+    fn make_writer(&self) -> Self::Writer {
+        NonBlockingLogWriter {
+            sender: self.sender.clone(),
+            bytes: Vec::new(),
+        }
+    }
+}
+
+impl Write for NonBlockingLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for NonBlockingLogWriter {
+    fn drop(&mut self) {
+        if !self.bytes.is_empty() {
+            let _ = self.sender.try_send(std::mem::take(&mut self.bytes));
+        }
+    }
+}
+
+impl Drop for LogWorkerGuard {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(());
+        if self.drain_on_drop
+            && let Some(worker) = self.worker.take()
+        {
+            let _ = worker.join();
+        }
+    }
 }
 
 impl tracing_subscriber::fmt::MakeWriter<'_> for RotatingLog {
@@ -1048,9 +1300,6 @@ impl Write for RotatingLogWriter {
     }
 }
 
-fn open_log_file() -> Option<RotatingLog> {
-    open_log_file_at(dirs::cache_dir()?.join("cockpit"))
-}
 fn open_log_file_at(dir: PathBuf) -> Option<RotatingLog> {
     // Logging stays non-fatal: an insecure cache directory disables logging
     // rather than aborting the CLI, but the typed error is logged, not
@@ -1457,6 +1706,71 @@ mod tests {
             })
             .sum();
         assert!(total <= LOG_FILE_MAX_BYTES * (LOG_BACKUP_COUNT as u64 + 1));
+    }
+
+    #[test]
+    fn nonblocking_log_worker_queues_before_sink_setup() {
+        let root = tempfile::tempdir().unwrap();
+        let log_dir = root.path().join("not-created-on-caller").join("cockpit");
+        assert!(!log_dir.exists());
+
+        let (log, guard) = NonBlockingLog::start(log_dir.clone(), true).unwrap();
+        let mut writer = tracing_subscriber::fmt::MakeWriter::make_writer(&log);
+        writer.write_all(b"queued before sink setup\n").unwrap();
+        drop(writer);
+        drop(guard);
+
+        assert_eq!(
+            std::fs::read(log_dir.join("cockpit.log")).unwrap(),
+            b"queued before sink setup\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_draining_log_guard_does_not_join_worker_blocked_opening_sink() {
+        let root = tempfile::tempdir().unwrap();
+        let log_dir = root.path().join("cockpit");
+        std::fs::create_dir(&log_dir).unwrap();
+        let fifo = log_dir.join("cockpit.log");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        let (log, guard) = NonBlockingLog::start(log_dir, false).unwrap();
+        let mut writer = tracing_subscriber::fmt::MakeWriter::make_writer(&log);
+        writer
+            .write_all(b"queued while sink open is blocked\n")
+            .unwrap();
+        drop(writer);
+
+        // No reader exists yet, so the worker's FIFO open cannot complete.
+        // Launcher teardown must only signal it, never join it.
+        drop(guard);
+
+        // Release the blocked open. The private-file verifier then rejects the
+        // FIFO as non-regular; the blocking reader rendezvous is the
+        // deterministic barrier proving setup had not completed earlier.
+        let mut reader = std::fs::File::open(&fifo).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
+        assert!(bytes.is_empty(), "a non-regular log sink must be rejected");
+    }
+
+    #[test]
+    fn daemon_start_never_drains_cache_log_worker_on_exit() {
+        for detach in [false, true] {
+            let command = Command::Daemon(crate::cli::DaemonCommand::Start {
+                foreground: !detach,
+                detach,
+                no_sandbox: false,
+                resume_all_sessions: false,
+            });
+            assert!(
+                !drain_logs_on_exit(Some(&command)),
+                "daemon start mode detach={detach} must not join a cache-blocked log worker"
+            );
+        }
+        assert!(drain_logs_on_exit(None));
     }
 
     // FINDING B: rotation is fd-anchored. Given a held directory fd, the shift

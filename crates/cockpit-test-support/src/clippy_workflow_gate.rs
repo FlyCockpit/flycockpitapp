@@ -131,6 +131,15 @@ fn normalize_tests_core(tokens: &[String]) -> BTreeSet<String> {
             i += 2;
             continue;
         }
+        // CI deliberately lints the no-default-features compile matrix in
+        // the same --tests gate (review-loop(#196): close Grok OAuth
+        // feature-gate gaps), on top of the plain documented core. Like
+        // `--target`, the feature dimension normalizes away so docs, Linux
+        // CI, and Windows CI still compare to one canonical argv core.
+        if t == "--no-default-features" {
+            i += 1;
+            continue;
+        }
         if t == "--exclude=tenant-authority" {
             i += 1;
             continue;

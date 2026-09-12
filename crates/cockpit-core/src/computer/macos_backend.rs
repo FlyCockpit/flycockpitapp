@@ -1342,8 +1342,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an interactive macOS login plus Screen Recording and Accessibility grants"]
+    #[ignore = "requires an interactive macOS login plus Screen Recording and Accessibility grants; set COCKPIT_TEST_ALLOW_REAL_HOME=1"]
     fn constructs_and_captures_real_desktop_when_tcc_granted() {
+        let env = cockpit_test_support::TestEnvGuard::blocking_lock();
+        env.set_var(
+            cockpit_test_support::home_isolation::COCKPIT_TEST_ALLOW_REAL_HOME_ENV,
+            "1",
+        );
         let grant = RealDesktopGrantStore::for_cockpit_data_dir().expect("grant store");
         let mut backend = MacOsComputerBackend::construct(DisplayTarget::RealDesktop, Some(&grant))
             .expect("construct macOS backend");

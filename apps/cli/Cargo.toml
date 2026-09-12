@@ -303,7 +303,7 @@ vt100 = "0.16"
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
-cockpit-config = { path = "../../crates/cockpit-config" }
+cockpit-config = { path = "../../crates/cockpit-config", features = ["test-support"] }
 cockpit-db = { path = "../../crates/cockpit-db", features = ["test-support"] }
 syn = { version = "2", features = ["full", "parsing", "visit"] }
 quote = "1"

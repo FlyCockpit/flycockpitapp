@@ -775,16 +775,6 @@ impl Approver {
             return Ok(decision);
         }
 
-        if self.yolo_mode()
-            || self
-                .auto_allows(
-                    crate::agent_tree::HostEffectClass::ExternalAction,
-                    &grant_target,
-                )
-                .await
-        {
-            return Ok(Decision::Allow { scope: Scope::Once });
-        }
         let prompt = if agent_bound {
             format!(
                 "`{tool}` on MCP server `{server}` wants to run for agent `{requesting_agent}` using credential profile `{profile}`. This server is external to cockpit."
@@ -1039,6 +1029,22 @@ impl Approver {
         }
         if let Some(scope) = self.store.mcp_tool_grant_scope_for_key(&target).await? {
             let decision = Decision::Allow { scope };
+            self.record_permission_decision(
+                "mcp_server_connect",
+                &target,
+                &offered,
+                decision,
+                DecisionSource::AlreadyGranted,
+            )
+            .await;
+            return Ok(decision);
+        }
+        if self
+            .store
+            .any_mcp_tool_allow_for_server(agent, profile, server)
+            .await?
+        {
+            let decision = Decision::Allow { scope: Scope::Once };
             self.record_permission_decision(
                 "mcp_server_connect",
                 &target,
@@ -2016,13 +2022,19 @@ mod approval_mode_tests {
             approver.approval_mode(),
             crate::config::extended::ApprovalMode::Yolo
         );
+        // External MCP tool invokes deliberately require an explicit durable
+        // approval even in Yolo mode ("Require approval for external MCP
+        // tools", pinned by `external_mcp_invoke_prompts_in_yolo_mode` in
+        // `mcp::sandbox`). The custom-tool gate still follows the approval
+        // ladder, so it is the observable that proves the shared mode has an
+        // effect on this approver.
         assert_eq!(
             approver
-                .approve_mcp_tool(
-                    "untrusted",
-                    "run",
+                .approve_custom_tool_inner(
+                    "webfetch",
+                    "curl",
                     &serde_json::json!({"query": "x"}),
-                    &serde_json::json!({"endpoint": "https://example.invalid/mcp"}),
+                    tmp.path(),
                 )
                 .await
                 .unwrap(),

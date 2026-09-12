@@ -56,6 +56,7 @@ pub struct HostCapabilityProbeInputs {
     pub catalog: CatalogProbeSource,
     pub platform: HostPlatform,
     pub cwd: PathBuf,
+    pub container_probe_paths: crate::config::extended::DaemonContainerProbePaths,
 }
 
 #[derive(Clone)]
@@ -75,8 +76,9 @@ pub enum SandboxProbeSource {
 
 #[derive(Clone)]
 pub enum ContainerProbeSource {
-    /// Reuse [`crate::container::availability_snapshot`] (boot: one detect already ran).
-    ReuseSnapshot,
+    /// Reuse the immutable manager snapshot captured by daemon composition
+    /// (boot: one detect already ran).
+    ReuseSnapshot(ContainerAvailability),
     /// Call [`crate::container::detect_runtime`] once (refresh).
     DetectOnce,
     Injected {
@@ -96,10 +98,11 @@ impl HostCapabilityProbeInputs {
         Self {
             keyring: KeyringProbeSource::Production,
             sandbox: SandboxProbeSource::Production,
-            container: ContainerProbeSource::ReuseSnapshot,
+            container: ContainerProbeSource::DetectOnce,
             catalog: CatalogProbeSource::Production,
             platform: detect_host_platform(),
             cwd,
+            container_probe_paths: crate::config::extended::DaemonContainerProbePaths::default(),
         }
     }
 
@@ -135,12 +138,13 @@ impl HostCapabilityProbeInputs {
             )),
             platform: detect_host_platform(),
             cwd,
+            container_probe_paths: crate::config::extended::DaemonContainerProbePaths::default(),
         }
     }
 
     pub fn for_refresh(&self) -> Self {
         let mut next = self.clone();
-        if matches!(next.container, ContainerProbeSource::ReuseSnapshot) {
+        if matches!(next.container, ContainerProbeSource::ReuseSnapshot(_)) {
             next.container = ContainerProbeSource::DetectOnce;
         }
         next
@@ -521,8 +525,10 @@ pub async fn collect_shared_host_probes(
         SandboxProbeSource::Injected(availability) => availability.clone(),
     };
     let container = match &inputs.container {
-        ContainerProbeSource::ReuseSnapshot => crate::container::availability_snapshot(),
-        ContainerProbeSource::DetectOnce => crate::container::detect_runtime().1,
+        ContainerProbeSource::ReuseSnapshot(availability) => availability.clone(),
+        ContainerProbeSource::DetectOnce => {
+            crate::container::detect_runtime_with_probe_paths(&inputs.container_probe_paths).1
+        }
         ContainerProbeSource::Injected {
             availability,
             detect_calls,

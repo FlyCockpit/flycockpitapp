@@ -490,6 +490,15 @@ pub(crate) async fn generate_session_metadata_fork(
         return;
     }
 
+    // The fork's one-shot call skeleton routes its metadata write through the
+    // native `mcp` tool: the metadata function lives solely behind the fork's
+    // Monty host catalog, so a foreground surface without that tool can never
+    // fulfill the skeleton. Dispatching would only spend provider calls on
+    // prose replies plus a guaranteed retry, so skip the fork entirely.
+    if !tools.iter().any(|tool| tool.name == "mcp") {
+        return;
+    }
+
     // Revocation has to race the synchronous Monty host call in the durable
     // SQLite serialization domain, not merely cancel this async task. The
     // conditional generation advance makes a cancellation/drain win over any

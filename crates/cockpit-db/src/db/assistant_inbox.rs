@@ -333,9 +333,10 @@ impl Db {
     /// Mark exactly the inbox items the human opened as read. This does not
     /// change agent-delivery state, so immediate/deferred work remains safely
     /// retryable and notify-only entries can clear the human-visible badge.
-    /// The operation is idempotent and rejects a cross-session identity rather
-    /// than silently acknowledging an item the caller was not authorized to
-    /// view.
+    /// The operation is idempotent — acknowledging an already-read item, or an
+    /// id that never existed or was already pruned, is a durable no-op Ack —
+    /// while an id owned by a different main session is a cross-session
+    /// identity and fails closed instead of being silently acknowledged.
     pub async fn acknowledge_assistant_inbox_human_read(
         &self,
         main_session_id: Uuid,
@@ -353,10 +354,22 @@ impl Db {
                      WHERE inbox_item_id = ?2 AND main_session_id = ?3",
                     params![now, inbox_item_id.to_string(), main_session_id.to_string()],
                 )?;
-                ensure!(
-                    matched == 1,
-                    "assistant inbox human-read acknowledgement target missing"
-                );
+                if matched == 0 {
+                    // Distinguish an unknown id (idempotent acknowledgement)
+                    // from an item the caller was not authorized to view.
+                    let owner: Option<String> = conn
+                        .query_row(
+                            "SELECT main_session_id FROM assistant_inbox_items
+                              WHERE inbox_item_id = ?1",
+                            params![inbox_item_id.to_string()],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    ensure!(
+                        owner.is_none(),
+                        "assistant inbox human-read acknowledgement targets another main session"
+                    );
+                }
             }
             Ok(())
         })

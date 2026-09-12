@@ -89,6 +89,12 @@ fn truncate(redact: &crate::redact::RedactionTable, s: &str, cap: usize) -> Stri
     // scrub can match. Elide the retained head's back margin before appending
     // the marker (no-op for an empty table). Issue #294.
     let safe = crate::tools::common::drop_back_margin(redact, kept);
+    if safe.is_empty() {
+        return "…".to_string();
+    }
+    if safe.len() < kept.len() {
+        return format!("{safe}…");
+    }
     format!("{safe}{TRUNCATED_MARK}")
 }
 

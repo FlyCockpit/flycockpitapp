@@ -120,6 +120,29 @@ pub async fn run_envelope_with_host(
     cfg: &McpConfig,
     host: &HostContext,
 ) -> Result<ProjectionEnvelope> {
+    if let Some(ctx) = host.native_tool_ctx.as_ref()
+        && let Some(denial) = crate::knowledge::configured_mcp_host_access_denial(ctx)
+    {
+        return Err(anyhow::anyhow!(denial));
+    }
+    if let Some(ctx) = host.native_tool_ctx.as_ref() {
+        let cancel = ctx.cancel.clone();
+        return crate::engine::interrupt::with_host_approval_effect_scope(
+            "monty_sandbox",
+            cancel,
+            Box::pin(run_envelope_with_host_inner(script, cfg, host)),
+            |_| Some(true),
+        )
+        .await;
+    }
+    run_envelope_with_host_inner(script, cfg, host).await
+}
+
+async fn run_envelope_with_host_inner(
+    script: &str,
+    cfg: &McpConfig,
+    host: &HostContext,
+) -> Result<ProjectionEnvelope> {
     let requests_enabled = host
         .effective_network_capability()
         .await
@@ -278,32 +301,13 @@ pub async fn run_envelope_with_host(
 }
 
 fn host_module_namespace(name: &str) -> MontyObject {
-    let functions: &[&str] = match name {
-        "csv" => &["reader", "writer"],
-        "statistics" => &["mean", "median"],
-        "textwrap" => &["wrap", "fill", "dedent"],
-        "base64" => &["b64encode", "b64decode"],
-        "hashlib" => &["sha256", "sha512"],
-        "requests" => &["request", "get", "post", "put", "patch", "delete"],
-        _ => &[],
-    };
+    // Mirror the `mcp` namespace: an empty frozen dataclass so `csv.reader`
+    // and `requests.post` miss attrs and dispatch to the host as method calls.
     MontyObject::Dataclass {
         name: name.to_string(),
         type_id: u64::MAX - 1,
         field_names: vec![],
-        attrs: functions
-            .iter()
-            .map(|function| {
-                (
-                    MontyObject::String((*function).to_string()),
-                    MontyObject::Function {
-                        name: (*function).to_string(),
-                        docstring: Some(format!("governed {name}.{function}")),
-                    },
-                )
-            })
-            .collect::<Vec<_>>()
-            .into(),
+        attrs: DictPairs::from(vec![]),
         frozen: true,
     }
 }
@@ -676,7 +680,8 @@ async fn dispatch_raw(
                             "mcp.invoke",
                             super::catalog::connect_context(host)
                                 .with_profile(entry.profile.clone())
-                                .with_agent_bound(entry.agent_bound),
+                                .with_agent_bound(entry.agent_bound)
+                                .for_discovery(),
                             entry.source(),
                             &entry.profile,
                             entry.agent_bound,
@@ -1913,28 +1918,28 @@ mod tests {
             install,
             crate::db::agent_installations::InstallAgentOutcome::Installed(_)
         ));
-        let agent = db
-            .create_agent_instance(
-                crate::db::agent_tree_decisions::NewAgentInstance {
-                    session_id,
-                    parent_agent_instance_id: None,
-                    task_delegation_job_id: None,
-                    task_delegation_child_uuid: None,
-                    resolved_profile_snapshot_id: None,
-                    workspace_ref: None,
-                    auto_answer_enabled: false,
-                },
-                1,
+        let agent_instance_id = if let Some(agent_instance_id) = ctx.agent_instance_id {
+            agent_instance_id
+        } else {
+            let workspace_ref =
+                crate::agent_tree::workspace_ref_for_host_path(&ctx.cwd).expect("workspace ref");
+            db.ensure_session_root_agent(
+                session_id,
+                None,
+                workspace_ref,
+                crate::agent_tree::system_now_unix_ms(),
             )
             .await
-            .unwrap();
+            .expect("session root agent")
+            .agent_instance_id
+        };
         db.write(move |conn| {
             let changed = conn.execute(
                 "UPDATE agent_instances SET resolved_installation_id=?1 WHERE session_id=?2 AND agent_instance_id=?3",
                 rusqlite::params![
                     installation_id.to_string(),
                     session_id.to_string(),
-                    agent.agent_instance_id.to_string(),
+                    agent_instance_id.to_string(),
                 ],
             )?;
             anyhow::ensure!(changed == 1, "network test agent disappeared");
@@ -1942,17 +1947,32 @@ mod tests {
         })
         .await
         .unwrap();
-        ctx.agent_instance_id = Some(agent.agent_instance_id);
-        (agent.agent_instance_id, installation_id)
+        ctx.agent_instance_id = Some(agent_instance_id);
+        (agent_instance_id, installation_id)
     }
     use crate::session::Session;
     use std::collections::BTreeMap;
+    use std::collections::HashMap;
     use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
+    use std::sync::LazyLock;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::mpsc;
+
+    static SANDBOX_APPROVAL_RESOLVER_QUEUES: LazyLock<
+        std::sync::Mutex<HashMap<uuid::Uuid, Arc<(AtomicUsize, AtomicUsize)>>>,
+    > = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+    fn approval_resolver_queue(session_id: uuid::Uuid) -> Arc<(AtomicUsize, AtomicUsize)> {
+        SANDBOX_APPROVAL_RESOLVER_QUEUES
+            .lock()
+            .unwrap()
+            .entry(session_id)
+            .or_insert_with(|| Arc::new((AtomicUsize::new(0), AtomicUsize::new(0))))
+            .clone()
+    }
 
     fn test_builtin_host(open: bool) -> (HostContext, Arc<AtomicBool>) {
         let gate = Arc::new(AtomicBool::new(open));
@@ -2076,37 +2096,181 @@ mod tests {
         ));
         ctx.interrupts = hub.clone();
         ctx.approver = Some(approver);
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
         (ctx, db, hub)
     }
 
-    async fn resolve_next_interrupt(
-        db: &crate::db::Db,
+    async fn approvable_ctx_with_root(
+        root: &std::path::Path,
+    ) -> (
+        crate::engine::tool::ToolCtx,
+        crate::db::Db,
+        Arc<crate::engine::interrupt::InterruptHub>,
+    ) {
+        let (mut ctx, db, hub) = approvable_ctx(root);
+        let workspace_ref =
+            crate::agent_tree::workspace_ref_for_host_path(root).expect("test workspace ref");
+        let root_agent = db
+            .ensure_session_root_agent(
+                ctx.session.id,
+                None,
+                workspace_ref,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .expect("session root agent");
+        match db
+            .transition_agent_instance(
+                ctx.session.id,
+                root_agent.agent_instance_id,
+                root_agent.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                "{}",
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .expect("session root transition")
+        {
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(row) => {
+                ctx.agent_instance_id = Some(row.agent_instance_id);
+            }
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::AlreadyTerminal(_) => {
+                ctx.agent_instance_id = Some(root_agent.agent_instance_id);
+            }
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::RevisionConflict => {
+                panic!("session root transition raced");
+            }
+        }
+        (ctx, db, hub)
+    }
+
+    fn interrupt_question_set(
+        row: &crate::db::needs_attention::NeedsAttentionRow,
+    ) -> Option<crate::daemon::proto::InterruptQuestionSet> {
+        row.questions.clone().or_else(|| {
+            row.question
+                .clone()
+                .map(|question| crate::daemon::proto::InterruptQuestionSet {
+                    questions: vec![question],
+                })
+        })
+    }
+
+    fn resolve_next_interrupt(
+        db: crate::db::Db,
         session_id: uuid::Uuid,
-        hub: &crate::engine::interrupt::InterruptHub,
+        hub: Arc<crate::engine::interrupt::InterruptHub>,
         response: crate::daemon::proto::ResolveResponse,
-    ) -> crate::db::needs_attention::NeedsAttentionRow {
-        let row = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    ) -> tokio::task::JoinHandle<crate::db::needs_attention::NeedsAttentionRow> {
+        let queue = approval_resolver_queue(session_id);
+        let resolver_slot = queue.0.fetch_add(1, Ordering::SeqCst);
+        tokio::spawn(async move {
             loop {
-                if let Some(row) = db
-                    .list_open_interrupts(session_id)
+                while queue.1.load(Ordering::SeqCst) != resolver_slot {
+                    tokio::task::yield_now().await;
+                }
+                let row = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                    loop {
+                        let open = db.list_open_interrupts(session_id).await.unwrap();
+                        if let Some(row) = open
+                            .iter()
+                            .find(|row| hub.has_waiter(row.interrupt_id))
+                            .cloned()
+                            && db
+                                .decision_request_for_interrupt(session_id, row.interrupt_id)
+                                .await
+                                .unwrap()
+                                .is_some()
+                        {
+                            return row;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("approval prompt must be raised");
+
+                let interrupt_id = row.interrupt_id;
+                let interrupt = db
+                    .get_interrupt(interrupt_id)
                     .await
                     .unwrap()
-                    .first()
-                    .cloned()
-                {
+                    .expect("open interrupt remains available for lifecycle settlement");
+                let decision = db
+                    .decision_request_for_interrupt(session_id, interrupt_id)
+                    .await
+                    .unwrap()
+                    .expect("host approval interrupt has a bound lifecycle decision");
+                let offered = interrupt_question_set(&interrupt);
+                let effective_response = offered
+                    .as_ref()
+                    .map(|offered| {
+                        crate::approval::normalize_host_approval_response(&response, offered)
+                    })
+                    .unwrap_or(response.clone());
+                let response_json = serde_json::to_string(&effective_response).unwrap();
+                let lifecycle = crate::agent_tree::AgentTreeLifecycle::new(db.clone());
+                if offered.as_ref().is_some_and(|offered| {
+                    crate::approval::host_approval_response_allows(&effective_response, offered)
+                }) {
+                    let authority =
+                        crate::agent_tree::HostApprovalAuthority::for_durable_interrupt_binding(
+                            session_id, &decision, &interrupt,
+                        )
+                        .expect("host approval response retains its durable interrupt binding");
+                    match lifecycle
+                        .resolve_host_approval(
+                            session_id,
+                            decision.decision_request_id,
+                            interrupt_id,
+                            &response_json,
+                            authority,
+                            crate::agent_tree::system_now_unix_ms(),
+                        )
+                        .await
+                        .unwrap()
+                    {
+                        crate::agent_tree::DecisionSettlement::Resolved(_)
+                        | crate::agent_tree::DecisionSettlement::AlreadyTerminal(_) => {}
+                        crate::agent_tree::DecisionSettlement::Steered { .. }
+                        | crate::agent_tree::DecisionSettlement::Retry => {}
+                    }
+                } else {
+                    match lifecycle
+                        .cancel_host_approval(
+                            session_id,
+                            decision.decision_request_id,
+                            interrupt_id,
+                            &response_json,
+                            crate::agent_tree::system_now_unix_ms(),
+                        )
+                        .await
+                        .unwrap()
+                    {
+                        crate::agent_tree::DecisionSettlement::Resolved(_)
+                        | crate::agent_tree::DecisionSettlement::AlreadyTerminal(_) => {}
+                        crate::agent_tree::DecisionSettlement::Steered { .. }
+                        | crate::agent_tree::DecisionSettlement::Retry => {}
+                    }
+                }
+                if hub.resolve(interrupt_id, effective_response) {
+                    queue.1.fetch_add(1, Ordering::SeqCst);
                     return row;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                let still_open =
+                    db.get_interrupt(interrupt_id)
+                        .await
+                        .unwrap()
+                        .is_some_and(|interrupt| {
+                            interrupt.state == crate::db::needs_attention::InterruptState::Open
+                        });
+                if !still_open {
+                    queue.1.fetch_add(1, Ordering::SeqCst);
+                    return row;
+                }
             }
         })
-        .await
-        .expect("approval prompt must be raised");
-
-        db.resolve_interrupt(row.interrupt_id, &response)
-            .await
-            .unwrap();
-        assert!(hub.resolve(row.interrupt_id, response));
-        row
     }
 
     async fn child_rows(
@@ -2446,7 +2610,7 @@ mod tests {
     async fn external_invoke_emits_child_event_marked_non_builtin() {
         let cfg = configured_external_stub_cfg();
         let tmp = tempfile::tempdir().unwrap();
-        let (mut ctx, db, _hub) = approvable_ctx(tmp.path());
+        let (mut ctx, db, _hub) = approvable_ctx_with_root(tmp.path()).await;
         ctx.current_tool_call_id = Some("outer-ext".to_string());
         let (tx, mut rx) = mpsc::channel(32);
         ctx.events = Some(tx);
@@ -2491,7 +2655,7 @@ mod tests {
     async fn external_mcp_invoke_prompts_when_ungranted() {
         let cfg = configured_external_stub_cfg();
         let tmp = tempfile::tempdir().unwrap();
-        let (mut ctx, db, hub) = approvable_ctx(tmp.path());
+        let (mut ctx, db, hub) = approvable_ctx_with_root(tmp.path()).await;
         ctx.current_tool_call_id = Some("outer-awaiting-approval".to_string());
         let session = ctx.session.clone();
         let session_id = ctx.session.id;
@@ -2513,6 +2677,14 @@ mod tests {
             move |_server, _tool| approval_entered.notify_one()
         });
 
+        let row = resolve_next_interrupt(
+            db.clone(),
+            session_id,
+            hub.clone(),
+            crate::daemon::proto::ResolveResponse::Single {
+                selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
+            },
+        );
         let script = tokio::spawn(async move {
             run_with_host("mcp.invoke('external', 'echo', {'x': 1})", &cfg, &host).await
         });
@@ -2523,15 +2695,7 @@ mod tests {
                 .is_empty(),
             "approval/preparation must not be covered by a started child span"
         );
-        let row = resolve_next_interrupt(
-            &db,
-            session_id,
-            &hub,
-            crate::daemon::proto::ResolveResponse::Single {
-                selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
-            },
-        )
-        .await;
+        let row = row.await.unwrap();
         assert!(row.description.contains("external"), "{}", row.description);
         assert!(row.description.contains("echo"), "{}", row.description);
 
@@ -2549,7 +2713,7 @@ mod tests {
     async fn external_mcp_invoke_denied_returns_structured_refusal() {
         let cfg = configured_external_stub_cfg();
         let tmp = tempfile::tempdir().unwrap();
-        let (ctx, db, hub) = approvable_ctx(tmp.path());
+        let (ctx, db, hub) = approvable_ctx_with_root(tmp.path()).await;
         let session_id = ctx.session.id;
         let calls = Arc::new(AtomicUsize::new(0));
         let host = HostContext::from_tool_ctx(&ctx).with_test_external_invoke({
@@ -2560,16 +2724,17 @@ mod tests {
             }
         });
 
+        let resolver = resolve_next_interrupt(
+            db.clone(),
+            session_id,
+            hub.clone(),
+            crate::daemon::proto::ResolveResponse::Cancel,
+        );
+
         let script = tokio::spawn(async move {
             run_with_host("mcp.invoke('external', 'echo', {'x': 1})", &cfg, &host).await
         });
-        resolve_next_interrupt(
-            &db,
-            session_id,
-            &hub,
-            crate::daemon::proto::ResolveResponse::Cancel,
-        )
-        .await;
+        resolver.await.unwrap();
 
         let out = script.await.unwrap().unwrap();
         let value: Value = serde_json::from_str(&out).unwrap();
@@ -2643,7 +2808,7 @@ mod tests {
     async fn external_mcp_invoke_noninteractive_denied_returns_structured_refusal() {
         let cfg = configured_external_stub_cfg();
         let tmp = tempfile::tempdir().unwrap();
-        let (ctx, db, hub) = approvable_ctx(tmp.path());
+        let (ctx, db, hub) = approvable_ctx_with_root(tmp.path()).await;
         let session_id = ctx.session.id;
         let calls = Arc::new(AtomicUsize::new(0));
         let host = HostContext::from_tool_ctx(&ctx).with_test_external_invoke({
@@ -2654,18 +2819,19 @@ mod tests {
             }
         });
 
-        let script = tokio::spawn(async move {
-            run_with_host("mcp.invoke('external', 'echo', {'x': 1})", &cfg, &host).await
-        });
-        resolve_next_interrupt(
-            &db,
+        let resolver = resolve_next_interrupt(
+            db.clone(),
             session_id,
-            &hub,
+            hub.clone(),
             crate::daemon::proto::ResolveResponse::Freetext {
                 text: crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string(),
             },
-        )
-        .await;
+        );
+
+        let script = tokio::spawn(async move {
+            run_with_host("mcp.invoke('external', 'echo', {'x': 1})", &cfg, &host).await
+        });
+        resolver.await.unwrap();
 
         let out = script.await.unwrap().unwrap();
         let value: Value = serde_json::from_str(&out).unwrap();
@@ -2679,7 +2845,7 @@ mod tests {
     async fn external_mcp_invoke_session_grant_silences_same_tool_only() {
         let cfg = configured_external_stub_cfg();
         let tmp = tempfile::tempdir().unwrap();
-        let (ctx, db, hub) = approvable_ctx(tmp.path());
+        let (ctx, db, hub) = approvable_ctx_with_root(tmp.path()).await;
         let session_id = ctx.session.id;
         let calls = Arc::new(AtomicUsize::new(0));
         let host = HostContext::from_tool_ctx(&ctx).with_test_external_invoke({
@@ -2694,20 +2860,20 @@ mod tests {
             }
         });
 
+        let resolver = resolve_next_interrupt(
+            db.clone(),
+            session_id,
+            hub.clone(),
+            crate::daemon::proto::ResolveResponse::Single {
+                selected_id: crate::approval::ID_APPROVE_SESSION.to_string(),
+            },
+        );
         let script = tokio::spawn({
             let cfg = cfg.clone();
             let host = host.clone();
             async move { run_with_host("mcp.invoke('external', 'echo', {'x': 1})", &cfg, &host).await }
         });
-        resolve_next_interrupt(
-            &db,
-            session_id,
-            &hub,
-            crate::daemon::proto::ResolveResponse::Single {
-                selected_id: crate::approval::ID_APPROVE_SESSION.to_string(),
-            },
-        )
-        .await;
+        resolver.await.unwrap();
         let out = script.await.unwrap().unwrap();
         assert!(out.contains("\"tool\":\"echo\""), "{out}");
 
@@ -2723,18 +2889,18 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
 
+        let resolver = resolve_next_interrupt(
+            db.clone(),
+            session_id,
+            hub.clone(),
+            crate::daemon::proto::ResolveResponse::Cancel,
+        );
         let script = tokio::spawn({
             let cfg = cfg.clone();
             let host = host.clone();
             async move { run_with_host("mcp.invoke('external', 'other', {'x': 3})", &cfg, &host).await }
         });
-        resolve_next_interrupt(
-            &db,
-            session_id,
-            &hub,
-            crate::daemon::proto::ResolveResponse::Cancel,
-        )
-        .await;
+        resolver.await.unwrap();
         let out = script.await.unwrap().unwrap();
         let value: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(value["kind"], "approval_denied");
@@ -2746,7 +2912,7 @@ mod tests {
     async fn external_mcp_invoke_once_scope_persists_nothing() {
         let cfg = configured_external_stub_cfg();
         let tmp = tempfile::tempdir().unwrap();
-        let (ctx, db, hub) = approvable_ctx(tmp.path());
+        let (ctx, db, hub) = approvable_ctx_with_root(tmp.path()).await;
         let session_id = ctx.session.id;
         let host =
             HostContext::from_tool_ctx(&ctx).with_test_external_invoke(|server, tool, args| {
@@ -2757,20 +2923,20 @@ mod tests {
                 }))
             });
 
+        let resolver = resolve_next_interrupt(
+            db.clone(),
+            session_id,
+            hub.clone(),
+            crate::daemon::proto::ResolveResponse::Single {
+                selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
+            },
+        );
         let script = tokio::spawn({
             let cfg = cfg.clone();
             let host = host.clone();
             async move { run_with_host("mcp.invoke('external', 'echo', {'x': 1})", &cfg, &host).await }
         });
-        resolve_next_interrupt(
-            &db,
-            session_id,
-            &hub,
-            crate::daemon::proto::ResolveResponse::Single {
-                selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
-            },
-        )
-        .await;
+        resolver.await.unwrap();
         script.await.unwrap().unwrap();
 
         let store = crate::approval::store::GrantStore::new(
@@ -2787,18 +2953,18 @@ mod tests {
                 .is_none()
         );
 
+        let resolver = resolve_next_interrupt(
+            db.clone(),
+            session_id,
+            hub.clone(),
+            crate::daemon::proto::ResolveResponse::Cancel,
+        );
         let script = tokio::spawn({
             let cfg = cfg.clone();
             let host = host.clone();
             async move { run_with_host("mcp.invoke('external', 'echo', {'x': 2})", &cfg, &host).await }
         });
-        resolve_next_interrupt(
-            &db,
-            session_id,
-            &hub,
-            crate::daemon::proto::ResolveResponse::Cancel,
-        )
-        .await;
+        resolver.await.unwrap();
         let out = script.await.unwrap().unwrap();
         let value: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(value["kind"], "approval_denied");
@@ -2808,7 +2974,7 @@ mod tests {
     async fn external_mcp_invoke_prompts_in_yolo_mode() {
         let cfg = configured_external_stub_cfg();
         let tmp = tempfile::tempdir().unwrap();
-        let (ctx, db, hub) = approvable_ctx(tmp.path());
+        let (ctx, db, hub) = approvable_ctx_with_root(tmp.path()).await;
         ctx.session
             .set_approval_mode(crate::config::extended::ApprovalMode::Yolo);
         let session_id = ctx.session.id;
@@ -2821,18 +2987,18 @@ mod tests {
                 }))
             });
 
-        let script = tokio::spawn(async move {
-            run_with_host("mcp.invoke('external', 'echo', {'x': 1})", &cfg, &host).await
-        });
-        let row = resolve_next_interrupt(
-            &db,
+        let resolver = resolve_next_interrupt(
+            db.clone(),
             session_id,
-            &hub,
+            hub.clone(),
             crate::daemon::proto::ResolveResponse::Single {
                 selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
             },
-        )
-        .await;
+        );
+        let script = tokio::spawn(async move {
+            run_with_host("mcp.invoke('external', 'echo', {'x': 1})", &cfg, &host).await
+        });
+        let row = resolver.await.unwrap();
         assert!(row.description.contains("external"), "{}", row.description);
         let out = script.await.unwrap().unwrap();
         assert!(out.contains("\"tool\":\"echo\""), "{out}");
@@ -2858,7 +3024,7 @@ mod tests {
     async fn mcp_describe_is_not_gated() {
         let cfg = configured_external_stub_cfg();
         let tmp = tempfile::tempdir().unwrap();
-        let (ctx, db, _hub) = approvable_ctx(tmp.path());
+        let (ctx, db, _hub) = approvable_ctx_with_root(tmp.path()).await;
         let session_id = ctx.session.id;
         let host = HostContext::from_tool_ctx(&ctx);
 
@@ -3222,11 +3388,35 @@ mod tests {
     async fn network_configuration_is_an_approved_owner_action_for_the_live_executor() {
         let cfg = McpConfig::default();
         let tmp = tempfile::tempdir().unwrap();
-        let (mut ctx, db, hub) = approvable_ctx(tmp.path());
+        let (mut ctx, db, hub) = approvable_ctx_with_root(tmp.path()).await;
         let (_, installation_id) = network_test_identity(&mut ctx).await;
         let session_id = ctx.session.id;
         let host = HostContext::from_tool_ctx(&ctx);
 
+        let first = resolve_next_interrupt(
+            db.clone(),
+            session_id,
+            hub.clone(),
+            crate::daemon::proto::ResolveResponse::Single {
+                selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
+            },
+        );
+        let second = resolve_next_interrupt(
+            db.clone(),
+            session_id,
+            hub.clone(),
+            crate::daemon::proto::ResolveResponse::Single {
+                selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
+            },
+        );
+        let third = resolve_next_interrupt(
+            db.clone(),
+            session_id,
+            hub.clone(),
+            crate::daemon::proto::ResolveResponse::Single {
+                selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
+            },
+        );
         let task = tokio::spawn(async move {
             run_with_host(
                 "durable = mcp.network_configure('grant_host', 'api.example.test')\ngranted = mcp.network_configure('grant_session_host', 'api.example.test')\nrevoked = mcp.network_configure('revoke_session_host', 'api.example.test')\n[\n  'api.example.test' in durable['hosts'],\n  'api.example.test' in granted['hosts'],\n  'api.example.test' in granted['session_hosts'],\n  granted['generation']['session'],\n  'api.example.test' in revoked['hosts'],\n  'api.example.test' in revoked['session_hosts'],\n  revoked['generation']['session'],\n]",
@@ -3235,15 +3425,7 @@ mod tests {
             )
             .await
         });
-        let first = resolve_next_interrupt(
-            &db,
-            session_id,
-            &hub,
-            crate::daemon::proto::ResolveResponse::Single {
-                selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
-            },
-        )
-        .await;
+        let first = first.await.unwrap();
         assert!(first.description.contains("Grant Monty network host"));
         assert!(
             db.interrupt_is_owner_network_configuration(session_id, first.interrupt_id)
@@ -3267,25 +3449,9 @@ mod tests {
             ),
             "owner-network authority must not be auto-approvable as command"
         );
-        let second = resolve_next_interrupt(
-            &db,
-            session_id,
-            &hub,
-            crate::daemon::proto::ResolveResponse::Single {
-                selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
-            },
-        )
-        .await;
+        let second = second.await.unwrap();
         assert!(second.description.contains("api.example.test"));
-        let third = resolve_next_interrupt(
-            &db,
-            session_id,
-            &hub,
-            crate::daemon::proto::ResolveResponse::Single {
-                selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
-            },
-        )
-        .await;
+        let third = third.await.unwrap();
         assert!(third.description.contains("Revoke Monty network host"));
         let output = task.await.unwrap().unwrap();
 
@@ -3304,25 +3470,25 @@ mod tests {
     async fn network_configuration_prompts_even_in_yolo_mode() {
         let cfg = McpConfig::default();
         let tmp = tempfile::tempdir().unwrap();
-        let (mut ctx, db, hub) = approvable_ctx(tmp.path());
+        let (mut ctx, db, hub) = approvable_ctx_with_root(tmp.path()).await;
         let (_, installation_id) = network_test_identity(&mut ctx).await;
         ctx.session
             .set_approval_mode(crate::config::extended::ApprovalMode::Yolo);
         let session_id = ctx.session.id;
         let host = HostContext::from_tool_ctx(&ctx);
 
-        let task = tokio::spawn(async move {
-            run_with_host("mcp.network_configure('enable_requests')", &cfg, &host).await
-        });
         let prompt = resolve_next_interrupt(
-            &db,
+            db.clone(),
             session_id,
-            &hub,
+            hub.clone(),
             crate::daemon::proto::ResolveResponse::Single {
                 selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
             },
-        )
-        .await;
+        );
+        let task = tokio::spawn(async move {
+            run_with_host("mcp.network_configure('enable_requests')", &cfg, &host).await
+        });
+        let prompt = prompt.await.unwrap();
         assert!(prompt.description.contains("Enable governed requests"));
         task.await.unwrap().unwrap();
 
@@ -3762,7 +3928,7 @@ for line in sys.stdin:
         let script = tmp.path().join("fake-mcp.py");
         let cfg = monty_stdio_cfg(script.to_str().unwrap());
         let root = tempfile::tempdir().unwrap();
-        let (ctx, db, _hub) = approvable_ctx(root.path());
+        let (ctx, db, _hub) = approvable_ctx_with_root(root.path()).await;
         crate::approval::store::GrantStore::new(
             db,
             ctx.session.id,
@@ -3910,7 +4076,7 @@ f()",
             },
         );
         let root = tempfile::tempdir().unwrap();
-        let (ctx, db, _hub) = approvable_ctx(root.path());
+        let (ctx, db, _hub) = approvable_ctx_with_root(root.path()).await;
         crate::approval::store::GrantStore::new(
             db,
             ctx.session.id,
@@ -3993,7 +4159,7 @@ f()",
             },
         );
         let root = tempfile::tempdir().unwrap();
-        let (mut ctx, db, _hub) = approvable_ctx(root.path());
+        let (mut ctx, db, _hub) = approvable_ctx_with_root(root.path()).await;
         crate::approval::store::GrantStore::new(
             db,
             ctx.session.id,

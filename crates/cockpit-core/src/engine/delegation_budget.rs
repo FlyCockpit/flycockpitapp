@@ -853,7 +853,7 @@ fn would_exceed(ceiling: ResolvedDelegationBudget, spent: BudgetSpend) -> Option
 }
 
 fn unpriced_cost_blocked(ceiling: ResolvedDelegationBudget) -> bool {
-    ceiling.max_cost_microusd.is_some()
+    ceiling.cost_ceiling_configured && ceiling.max_cost_microusd.is_some()
 }
 
 /// Partial-result prefix used at every exhaustion seam.
@@ -1189,6 +1189,7 @@ mod tests {
     fn unpriced_token_usage_exhausts_finite_cost_ceiling() {
         let pool = BudgetPool::new(ResolvedDelegationBudget {
             max_cost_microusd: Some(10_000_000),
+            cost_ceiling_configured: true,
             ..ResolvedDelegationBudget::unlimited()
         });
         let err = pool
@@ -1202,6 +1203,20 @@ mod tests {
         assert_eq!(err.dimension, BudgetDimension::Cost);
         assert_eq!(pool.snapshot().spent.cost_microusd, 0);
         assert_eq!(pool.snapshot().spent.input_tokens, 0);
+    }
+
+    #[test]
+    fn unpriced_usage_allowed_under_compiled_default_cost_ceiling() {
+        let pool = BudgetPool::new(ResolvedDelegationBudget::defaults());
+        pool.charge_usage(TokenUsage {
+            input_tokens: 8,
+            output_tokens: 2,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        })
+        .unwrap();
+        assert_eq!(pool.snapshot().spent.input_tokens, 8);
+        assert_eq!(pool.snapshot().spent.output_tokens, 2);
     }
 
     #[test]
@@ -1241,6 +1256,7 @@ mod tests {
     fn mixed_priced_and_unpriced_usage_fails_closed() {
         let pool = BudgetPool::new(ResolvedDelegationBudget {
             max_cost_microusd: Some(10_000_000),
+            cost_ceiling_configured: true,
             ..ResolvedDelegationBudget::unlimited()
         });
         let mut charge = BudgetCharge::from_usage(TokenUsage {

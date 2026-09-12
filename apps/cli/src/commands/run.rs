@@ -162,6 +162,7 @@ async fn resolve_requested_session_via_daemon(
                 parent_session_id: None,
                 assistant_id: None,
                 compaction_lineage_root_id: None,
+                include_archived: true,
             })
             .await
             .context("looking up --session via daemon")?
@@ -211,6 +212,7 @@ async fn resolve_requested_session_via_daemon(
             parent_session_id: None,
             assistant_id: None,
             compaction_lineage_root_id: None,
+            include_archived: false,
         })
         .await
         .context("listing sessions for --continue via daemon")?

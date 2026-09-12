@@ -627,7 +627,10 @@ mod tests {
                 .all(|item| item.human_read_at_unix_ms.is_none())
         );
         let unread_after_delivery = db
-            .list_session_summaries(Some("project"), None, 10)
+            .list_session_summaries(crate::db::sessions::SessionListQuery::project(
+                Some("project"),
+                10,
+            ))
             .await
             .unwrap()
             .into_iter()
@@ -655,7 +658,10 @@ mod tests {
             item.inbox_item_id == notify.inbox_item_id && item.delivered_at_unix_ms.is_none()
         }));
         let unread_after_human_read = db
-            .list_session_summaries(Some("project"), None, 10)
+            .list_session_summaries(crate::db::sessions::SessionListQuery::project(
+                Some("project"),
+                10,
+            ))
             .await
             .unwrap()
             .into_iter()

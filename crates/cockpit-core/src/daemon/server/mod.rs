@@ -481,6 +481,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
                 scrub_session_summary(session, redact);
             }
         }
+        proto::Response::SessionFavoriteApplied { .. } => {}
         proto::Response::SessionMessages {
             session_id: _,
             messages,
@@ -1844,6 +1845,7 @@ fn scrub_session_summary(summary: &mut proto::SessionSummary, redact: &Redaction
         open_interrupts: _,
         activity_state: _,
         archived_at_unix_ms: _,
+        favorite: _,
         pin_count: _,
         assistant_inbox_unread: _,
         assistant_inbox_latest_source_session_id: _,

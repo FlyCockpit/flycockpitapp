@@ -4,7 +4,7 @@
 //! FCOR identities, remote replay/outbox state, and transactional remote
 //! mutation composition for sessions.
 
-use super::authz::ClientPrincipal;
+use super::authz::{ClientPrincipal, session_access_for_row};
 use super::sessions::{
     btw_info_to_proto, detach_if_attached_to_discard_lineage, stop_ephemeral_discard_lineage,
     stop_subtree,
@@ -14,6 +14,14 @@ use super::*;
 #[derive(Debug, thiserror::Error)]
 #[error("unknown session {0}")]
 struct UnknownRemoteSession(Uuid);
+
+#[derive(Debug, thiserror::Error)]
+#[error("remote principal has read-only access to this session")]
+struct SessionFavoriteReadOnly;
+
+#[derive(Debug, thiserror::Error)]
+#[error("remote principal cannot access this session")]
+struct SessionFavoriteUnauthorized;
 
 fn require_mutated(existed: bool, session_id: Uuid) -> anyhow::Result<()> {
     if existed {
@@ -29,6 +37,20 @@ fn remote_mutation_error(error: anyhow::Error) -> ErrorPayload {
             code: ErrorCode::UnknownSession,
             message: unknown.to_string(),
         }
+    } else if let Some(unknown) =
+        error.downcast_ref::<crate::db::sessions::SessionFavoriteUnknown>()
+    {
+        ErrorPayload {
+            code: ErrorCode::UnknownSession,
+            message: format!("unknown session {}", unknown.0),
+        }
+    } else if error.downcast_ref::<SessionFavoriteReadOnly>().is_some() {
+        read_only_error("remote principal has read-only access to this session")
+    } else if error
+        .downcast_ref::<SessionFavoriteUnauthorized>()
+        .is_some()
+    {
+        authorization_error("remote principal cannot access this session")
     } else {
         internal(error)
     }
@@ -385,6 +407,36 @@ pub(super) async fn unarchive_session(
         let existed = crate::db::Db::unarchive_existing_session_conn(conn, session_id)?;
         require_mutated(existed, session_id)?;
         Ok(Response::Ack)
+    })
+    .await
+}
+
+pub(super) async fn set_session_favorite(
+    ctx: &DaemonContext,
+    principal: &ClientPrincipal,
+    session_id: Uuid,
+    favorite: bool,
+    ledger: &RemoteSessionLedger,
+) -> Result<Response, ErrorPayload> {
+    if let Some(cached) = ledger.committed_replay(ctx).await? {
+        return Ok(cached);
+    }
+    let principal = principal.clone();
+    commit_session_remote_mutation(ctx, ledger, "set_session_favorite", move |conn| {
+        let Some(row) = crate::db::Db::get_session_conn(conn, session_id)? else {
+            return Err(UnknownRemoteSession(session_id).into());
+        };
+        match session_access_for_row(&principal, &row) {
+            SessionAccess::Owner | SessionAccess::Writer => {}
+            SessionAccess::Readonly => return Err(SessionFavoriteReadOnly.into()),
+            SessionAccess::None => return Err(SessionFavoriteUnauthorized.into()),
+        }
+        let applied = crate::db::Db::set_session_favorite_conn(conn, session_id, favorite)?;
+        Ok(Response::SessionFavoriteApplied {
+            session_id: applied.session_id,
+            lineage_root_id: applied.lineage_root_id,
+            favorite: applied.favorite,
+        })
     })
     .await
 }

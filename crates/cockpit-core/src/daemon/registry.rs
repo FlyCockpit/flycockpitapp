@@ -5549,7 +5549,7 @@ mod tests {
         let summaries = reg
             .inner
             .db
-            .list_session_summaries(None, None, 100)
+            .list_session_summaries(crate::db::sessions::SessionListQuery::default())
             .await
             .unwrap();
         let summary = summaries
@@ -5660,7 +5660,7 @@ mod tests {
         let summaries = reg
             .inner
             .db
-            .list_session_summaries(None, None, 100)
+            .list_session_summaries(crate::db::sessions::SessionListQuery::default())
             .await
             .unwrap();
         let summary = summaries

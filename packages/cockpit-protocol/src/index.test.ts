@@ -832,8 +832,8 @@ describe("cockpit-proto daemon wire schemas", () => {
     );
   });
 
-  it("config_refreshed_typescript_mirror_is_v22", () => {
-    expect(PROTOCOL_VERSION).toBe(22);
+  it("config_refreshed_typescript_mirror_is_v23", () => {
+    expect(PROTOCOL_VERSION).toBe(23);
     expect(responseEnvelopeSchema.parse(responsesFixture.config_refreshed)).toEqual(
       responsesFixture.config_refreshed,
     );
@@ -841,6 +841,73 @@ describe("cockpit-proto daemon wire schemas", () => {
       responseEnvelopeSchema.safeParse({
         ...responsesFixture.config_refreshed,
         data: { ...responsesFixture.config_refreshed.data, extra: true },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("mirrors non-optional session favorite on list and applied receipts", () => {
+    expect(PROTOCOL_VERSION).toBe(23);
+    const request = {
+      v: PROTOCOL_VERSION,
+      kind: "req" as const,
+      id: "11111111-1111-4111-8111-111111111111",
+      request: "set_session_favorite" as const,
+      params: {
+        session_id: "11111111-1111-4111-8111-111111111111",
+        favorite: true,
+      },
+    };
+    expect(clientEnvelopeSchema.parse(request)).toEqual(request);
+    expect(
+      clientEnvelopeSchema.safeParse({
+        ...request,
+        params: { session_id: request.params.session_id },
+      }).success,
+    ).toBe(false);
+
+    const applied = {
+      v: PROTOCOL_VERSION,
+      kind: "res" as const,
+      id: "11111111-1111-4111-8111-111111111111",
+      response: "session_favorite_applied" as const,
+      data: {
+        session_id: "11111111-1111-4111-8111-111111111111",
+        lineage_root_id: "11111111-1111-4111-8111-111111111111",
+        favorite: true,
+      },
+    };
+    expect(responseEnvelopeSchema.parse(applied)).toEqual(applied);
+    expect(
+      responseEnvelopeSchema.safeParse({
+        ...applied,
+        data: { ...applied.data, extra: true },
+      }).success,
+    ).toBe(false);
+
+    const summary = {
+      session_id: "11111111-1111-4111-8111-111111111111",
+      session_entry_mode: "code",
+      project_root: "/tmp/project",
+      project_id: "proj",
+      started_at_unix_ms: 1,
+      last_active_at_unix_ms: 1,
+      turns: 0,
+      active_agent: "Build",
+      favorite: true,
+    };
+    const sessions = {
+      v: PROTOCOL_VERSION,
+      kind: "res" as const,
+      id: "11111111-1111-4111-8111-111111111111",
+      response: "sessions" as const,
+      data: { sessions: [summary] },
+    };
+    expect(responseEnvelopeSchema.safeParse(sessions).success).toBe(true);
+    const { favorite: _favorite, ...withoutFavorite } = summary;
+    expect(
+      responseEnvelopeSchema.safeParse({
+        ...sessions,
+        data: { sessions: [withoutFavorite] },
       }).success,
     ).toBe(false);
   });

@@ -169,9 +169,11 @@ fn is_unread(summary: &SessionSummary) -> bool {
     }
 }
 
-/// Sort `(summary, live)` pairs into display order: by tier ascending,
-/// then `last_active_at` descending within a tier. Returns the classified
-/// tier alongside each summary so the renderer doesn't re-classify.
+/// Sort `(summary, live)` pairs into display order: favorite first, then
+/// live tier, then durable activity/recency descending, then UUID
+/// ascending. The database never supplies a live tier; this comparator is
+/// the rail's complete display order. Returns the classified tier
+/// alongside each summary so the renderer doesn't re-classify.
 pub fn tier_sort(
     mut items: Vec<(SessionSummary, Option<(bool, bool)>)>,
 ) -> Vec<(SessionSummary, Tier)> {
@@ -183,8 +185,11 @@ pub fn tier_sort(
         })
         .collect();
     classified.sort_by(|a, b| {
-        a.1.cmp(&b.1)
+        b.0.favorite
+            .cmp(&a.0.favorite)
+            .then(a.1.cmp(&b.1))
             .then(b.0.last_active_at_unix_ms.cmp(&a.0.last_active_at_unix_ms))
+            .then(a.0.session_id.cmp(&b.0.session_id))
     });
     classified
 }
@@ -604,6 +609,10 @@ impl SessionsPane {
         }
         self.mark_disconnected_unavailable();
         self.levels = vec![Level::empty(None)];
+    }
+
+    pub fn include_archived(&self) -> bool {
+        self.show_archived
     }
 
     pub fn root_request(&self) -> (Option<String>, Option<Uuid>, Option<Uuid>) {
@@ -2387,6 +2396,7 @@ mod tests {
             open_interrupts: 0,
             activity_state: None,
             archived_at_unix_ms: None,
+            favorite: false,
             created_by_principal: None,
             shared_with_collaborators: false,
             pin_count: 0,
@@ -2469,6 +2479,63 @@ mod tests {
         assert_eq!(sorted[0].0.session_id, unread.session_id);
         assert_eq!(sorted[1].0.session_id, idle_new.session_id);
         assert_eq!(sorted[2].0.session_id, idle_old.session_id);
+    }
+
+    #[test]
+    fn tier_sort_orders_favorite_before_live_tier() {
+        let mut idle_fav = summary(Uuid::from_u128(1), 10);
+        idle_fav.favorite = true;
+        let mut live_unfav = summary(Uuid::from_u128(2), 90);
+        live_unfav.activity_state = Some(cockpit_proto::SessionActivityState::ToolRunning);
+
+        let sorted = tier_sort(vec![
+            (live_unfav.clone(), Some((false, true))),
+            (idle_fav.clone(), None),
+        ]);
+        assert!(sorted[0].0.favorite);
+        assert_eq!(sorted[0].0.session_id, idle_fav.session_id);
+        assert!(!sorted[1].0.favorite);
+        assert_eq!(sorted[1].1, Tier::ToolRunning);
+    }
+
+    #[test]
+    fn tier_sort_live_status_changes_inside_both_favorite_groups() {
+        let mut fav_idle = summary(Uuid::from_u128(10), 40);
+        fav_idle.favorite = true;
+        let mut fav_live = summary(Uuid::from_u128(11), 30);
+        fav_live.favorite = true;
+        let unfav_idle = summary(Uuid::from_u128(20), 90);
+        let unfav_live = summary(Uuid::from_u128(21), 80);
+
+        let sorted = tier_sort(vec![
+            (unfav_idle.clone(), None),
+            (fav_idle.clone(), None),
+            (unfav_live.clone(), Some((false, true))),
+            (fav_live.clone(), Some((false, true))),
+        ]);
+        assert_eq!(
+            sorted.iter().map(|(s, _)| s.session_id).collect::<Vec<_>>(),
+            vec![
+                fav_live.session_id,
+                fav_idle.session_id,
+                unfav_live.session_id,
+                unfav_idle.session_id,
+            ]
+        );
+        assert_eq!(sorted[0].1, Tier::Processing);
+        assert_eq!(sorted[1].1, Tier::Idle);
+        assert_eq!(sorted[2].1, Tier::Processing);
+        assert_eq!(sorted[3].1, Tier::Idle);
+        assert!(sorted.iter().all(|(s, _)| s.activity_state.is_none()));
+    }
+
+    #[test]
+    fn tier_sort_equal_activity_orders_uuid_ascending() {
+        let a = summary(Uuid::from_u128(2), 50);
+        let b = summary(Uuid::from_u128(1), 50);
+        let sorted = tier_sort(vec![(a.clone(), None), (b.clone(), None)]);
+        assert_eq!(sorted[0].0.session_id, b.session_id);
+        assert_eq!(sorted[1].0.session_id, a.session_id);
     }
 
     #[test]

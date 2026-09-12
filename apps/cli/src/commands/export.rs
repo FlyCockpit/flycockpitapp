@@ -144,6 +144,7 @@ async fn resolve_target_session(
             parent_session_id: None,
             assistant_id: None,
             compaction_lineage_root_id: None,
+            include_archived: false,
         })
         .await
         .context("requesting session list from daemon")?;
@@ -274,6 +275,7 @@ mod tests {
             "turns": 0,
             "active_agent": "builder",
             "is_assistant_thread": false,
+            "favorite": false,
         }))
         .expect("minimal session summary deserializes")
     }

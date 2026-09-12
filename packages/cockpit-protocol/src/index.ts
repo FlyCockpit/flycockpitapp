@@ -15,7 +15,7 @@ export * from "./remote-websocket-fallback";
 export * from "./remote-wire-magic-registry";
 export * from "./send-user-message-v2";
 
-export const PROTOCOL_VERSION = 22 as const;
+export const PROTOCOL_VERSION = 23 as const;
 
 /** Immutable daemon-owned session setup metadata; never an authority grant. */
 export const sessionEntryModeSchema = z.enum(["code", "assistant", "computer"]);
@@ -1083,6 +1083,13 @@ const requestParamSchemas = {
       parent_session_id: optionalUuidSchema,
       assistant_id: z.string().nullable().optional(),
       compaction_lineage_root_id: optionalUuidSchema,
+      include_archived: z.boolean().optional(),
+    })
+    .strict(),
+  set_session_favorite: z
+    .object({
+      session_id: uuidSchema,
+      favorite: z.boolean(),
     })
     .strict(),
   read_history_page: z
@@ -1477,6 +1484,7 @@ const clientRequestVariants = [
   requestVariantNoParams("get_guidance_enablement_trace"),
   requestVariant("review_guidance_proposal", requestParamSchemas.review_guidance_proposal),
   requestVariant("list_sessions", requestParamSchemas.list_sessions),
+  requestVariant("set_session_favorite", requestParamSchemas.set_session_favorite),
   requestVariant("read_history_page", requestParamSchemas.read_history_page),
   requestVariant("read_assistant_inbox", requestParamSchemas.read_assistant_inbox),
   requestVariant(
@@ -1665,6 +1673,7 @@ export const responseNameSchema = z.enum([
   "storage_cleanup_preview",
   "storage_cleanup_completed",
   "sessions",
+  "session_favorite_applied",
   "stats_rollup",
   "startup_disclosures",
   "subagent_history_page",
@@ -1833,6 +1842,7 @@ const sessionSummaryWireSchema = z
     last_active_at_unix_ms: safeI64NumberSchema,
     turns: safeU64NumberSchema,
     active_agent: z.string(),
+    favorite: z.boolean(),
   })
   .passthrough();
 const fsEntryWireSchema = z
@@ -2299,6 +2309,16 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
   responseVariant(
     "sessions",
     z.object({ sessions: z.array(sessionSummaryWireSchema) }).passthrough(),
+  ),
+  responseVariant(
+    "session_favorite_applied",
+    z
+      .object({
+        session_id: uuidSchema,
+        lineage_root_id: uuidSchema,
+        favorite: z.boolean(),
+      })
+      .strict(),
   ),
   responseVariant(
     "session_messages",
@@ -3196,6 +3216,7 @@ export const sessionSummarySchema = z
     compaction_predecessor_session_id: optionalUuidSchema,
     compaction_lineage_root_id: optionalUuidSchema,
     lineage_window_count: safeU64NumberSchema.optional(),
+    favorite: z.boolean(),
   })
   .passthrough();
 export type SessionSummary = z.infer<typeof sessionSummarySchema>;
@@ -3219,6 +3240,13 @@ export type FsEntry = z.infer<typeof fsEntrySchema>;
 export const listSessionsResultSchema = z
   .object({ sessions: z.array(sessionSummarySchema) })
   .passthrough();
+export const sessionFavoriteAppliedResultSchema = z
+  .object({
+    session_id: uuidSchema,
+    lineage_root_id: uuidSchema,
+    favorite: z.boolean(),
+  })
+  .strict();
 export const attachResultSchema = attachedDataSchema;
 export const ackResultSchema = z.unknown();
 export const sessionMessagesResultSchema = z
@@ -3273,6 +3301,7 @@ export const sessionLiveStatusResultSchema = z
 export type AttachResult = z.infer<typeof attachResultSchema>;
 export type AckResult = z.infer<typeof ackResultSchema>;
 export type ListSessionsResult = z.infer<typeof listSessionsResultSchema>;
+export type SessionFavoriteAppliedResult = z.infer<typeof sessionFavoriteAppliedResultSchema>;
 export type SessionMessagesResult = z.infer<typeof sessionMessagesResultSchema>;
 export type HistoryPageResult = z.infer<typeof historyPageResultSchema>;
 export type SubagentHistoryPageResult = z.infer<typeof subagentHistoryPageResultSchema>;
@@ -3289,6 +3318,9 @@ export type StorageCleanupCompletedResult = z.infer<typeof storageCleanupComplet
 
 export function parseListSessionsResult(value: unknown) {
   return listSessionsResultSchema.parse(value);
+}
+export function parseSessionFavoriteAppliedResult(value: unknown) {
+  return sessionFavoriteAppliedResultSchema.parse(value);
 }
 export function parseAttachResult(value: unknown) {
   return attachResultSchema.parse(value);

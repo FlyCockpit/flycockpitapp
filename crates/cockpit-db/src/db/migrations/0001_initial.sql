@@ -187,6 +187,10 @@ CREATE TABLE sessions (
     -- subtree app-side (src/db/sessions.rs).
     last_viewed_at_unix_ms INTEGER,
     archived_at_unix_ms    INTEGER,
+    -- One durable navigation favorite per compaction lineage. Stored only on
+    -- the canonical lineage-root row; every window in that lineage projects
+    -- this bit. Forks mint a new root and inherit no favorite.
+    favorite INTEGER NOT NULL DEFAULT 0 CHECK (favorite IN (0, 1)),
 
     -- Dream orchestrator/worker transcripts are retained for auditing, but
     -- are process noise: default history recall and future dream runs must
@@ -250,9 +254,10 @@ CREATE TABLE sessions (
     -- one context window, and this edge links windows into a conversation
     -- lineage. Forks keep their own lineage root.
     compaction_predecessor_session_id TEXT,
-    -- Stable conversation id. Roots and forks use their own session_id
-    -- (filled by sessions_lineage_root_fill when omitted). Compaction
-    -- successors copy the predecessor's lineage root.
+    -- Stable conversation id. NULL is the canonical representation that this
+    -- row itself is the lineage root (resolved to session_id, not a legacy
+    -- fallback). Forks mint a new root. Compaction successors copy the
+    -- predecessor's resolved root and must set the column explicitly.
     compaction_lineage_root_id TEXT,
 
     -- persisted auto-title progress (GOALS §17d): running cl100k_base
@@ -322,6 +327,12 @@ CREATE TABLE sessions (
     CHECK (
         compaction_predecessor_session_id IS NULL
         OR compaction_lineage_root_id IS NOT NULL
+    ),
+    -- Favorite is stored only on the canonical lineage-root row. Compaction
+    -- successors project that root bit and must not copy a per-window value.
+    CHECK (
+        compaction_predecessor_session_id IS NULL
+        OR favorite = 0
     ),
     CHECK (
         compaction_lineage_root_id IS NULL OR (
@@ -446,8 +457,9 @@ BEGIN
 END;
 
 -- Roots and forks omitted from compaction_lineage_root_id are their own
--- conversation. Compaction successors must set the column explicitly
--- (CHECK above) so this backstop cannot mint a new lineage for a window.
+-- conversation (NULL means self-root; the fill stores session_id for
+-- index/FK convenience). Compaction successors must set the column
+-- explicitly (CHECK above) so this backstop cannot mint a new lineage.
 CREATE TRIGGER sessions_lineage_root_fill
 AFTER INSERT ON sessions
 FOR EACH ROW

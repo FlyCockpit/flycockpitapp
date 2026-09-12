@@ -38,6 +38,127 @@ impl std::fmt::Display for SessionForkRefusedSealed {
 
 impl std::error::Error for SessionForkRefusedSealed {}
 
+/// The requested session (or its resolved lineage root) was missing when the
+/// favorite mutation revalidated the target. Downcastable so the daemon can
+/// map it to `UnknownSession` without parsing display copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionFavoriteUnknown(pub Uuid);
+
+impl std::fmt::Display for SessionFavoriteUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown session {}", self.0)
+    }
+}
+
+impl std::error::Error for SessionFavoriteUnknown {}
+
+fn session_list_select_sql(query: &SessionListQuery) -> (String, Vec<SqlValue>) {
+    let mut sql = String::from("SELECT s.* FROM sessions s WHERE s.ephemeral = 0");
+    let mut params = Vec::new();
+
+    if !query.include_archived {
+        sql.push_str(" AND s.archived_at_unix_ms IS NULL");
+    }
+    if let Some(assistant) = query.assistant_id.as_deref() {
+        sql.push_str(" AND s.assistant_name = ?");
+        params.push(SqlValue::Text(assistant.to_string()));
+    }
+    match &query.visibility {
+        SessionListVisibility::Unrestricted => {}
+        SessionListVisibility::Restricted {
+            principal_tag,
+            project_roots,
+        } => {
+            sql.push_str(" AND (s.created_by_principal = ? OR s.shared_with_collaborators = 1)");
+            params.push(SqlValue::Text(principal_tag.clone()));
+            match project_roots {
+                None => {}
+                Some(roots) if roots.is_empty() => sql.push_str(" AND 0"),
+                Some(roots) => {
+                    sql.push_str(" AND s.project_root IN (");
+                    for (index, root) in roots.iter().enumerate() {
+                        if index > 0 {
+                            sql.push(',');
+                        }
+                        sql.push('?');
+                        params.push(SqlValue::Text(root.clone()));
+                    }
+                    sql.push(')');
+                }
+            }
+        }
+    }
+
+    let tip_predicate = " AND NOT EXISTS (
+                    SELECT 1 FROM sessions nxt
+                     WHERE nxt.compaction_predecessor_session_id = s.session_id
+                )";
+    match (
+        query.compaction_lineage_root_id,
+        query.parent_session_id,
+        query.project_id.as_deref(),
+    ) {
+        (Some(root), _, _) => {
+            sql.push_str(" AND COALESCE(s.compaction_lineage_root_id, s.session_id) = ?");
+            params.push(SqlValue::Text(root.to_string()));
+        }
+        (None, Some(parent), _) => {
+            sql.push_str(
+                " AND COALESCE(s.compaction_lineage_root_id, s.session_id) IN (
+                    SELECT child.session_id FROM sessions child
+                     WHERE child.parent_session_id IN (
+                         SELECT w.session_id FROM sessions w
+                          WHERE COALESCE(w.compaction_lineage_root_id, w.session_id) = (
+                              SELECT COALESCE(compaction_lineage_root_id, session_id)
+                                FROM sessions
+                               WHERE session_id = ?
+                          )
+                     )
+                       AND child.ephemeral = 0
+                )",
+            );
+            params.push(SqlValue::Text(parent.to_string()));
+            sql.push_str(tip_predicate);
+        }
+        (None, None, Some(project_id)) => {
+            sql.push_str(
+                " AND COALESCE(s.compaction_lineage_root_id, s.session_id) IN (
+                    SELECT session_id FROM sessions
+                     WHERE project_id = ?
+                       AND parent_session_id IS NULL
+                       AND ephemeral = 0
+                       AND compaction_predecessor_session_id IS NULL
+                )",
+            );
+            params.push(SqlValue::Text(project_id.to_string()));
+            sql.push_str(tip_predicate);
+        }
+        (None, None, None) => {
+            sql.push_str(
+                " AND COALESCE(s.compaction_lineage_root_id, s.session_id) IN (
+                    SELECT session_id FROM sessions
+                     WHERE parent_session_id IS NULL
+                       AND ephemeral = 0
+                       AND compaction_predecessor_session_id IS NULL
+                )",
+            );
+            sql.push_str(tip_predicate);
+        }
+    }
+
+    sql.push_str(
+        " ORDER BY (
+                SELECT root.favorite FROM sessions root
+                 WHERE root.session_id = COALESCE(s.compaction_lineage_root_id, s.session_id)
+            ) DESC,
+            s.last_active_at_unix_ms DESC,
+            s.session_id ASC
+         LIMIT ?",
+    );
+    params.push(SqlValue::Integer(i64::from(query.limit)));
+    (sql, params)
+}
+
 /// A visible `sessions` row was refused because it has no `redaction_table`
 /// vault item.
 ///
@@ -261,6 +382,9 @@ pub struct SessionRow {
     /// migration 0010). `None` = live. Archived sessions are hidden from
     /// the browser by default.
     pub archived_at_unix_ms: Option<i64>,
+    /// Durable navigation favorite stored only on the canonical lineage-root
+    /// row. Compaction successors keep this `false` and project the root bit.
+    pub favorite: bool,
     /// `true` for a knowledge-dream transcript. These remain auditable by
     /// explicit session address, but are excluded from default recall and
     /// future dream source selection.
@@ -282,8 +406,8 @@ pub struct SessionRow {
     /// for the first window of a lineage (roots and forks).
     pub compaction_predecessor_session_id: Option<Uuid>,
     /// Stable conversation id shared by every window in a compaction
-    /// lineage. Forks mint their own root (their `session_id`). `None`
-    /// only for rows that have not yet been filled by the insert trigger.
+    /// lineage. Forks mint their own root (their `session_id`). `None` is
+    /// the canonical representation that this row itself is the lineage root.
     pub compaction_lineage_root_id: Option<Uuid>,
     /// Running cl100k_base estimate of RAW typed user content
     /// (pre-skill-injection) this session. Migration 0037.
@@ -399,6 +523,7 @@ impl SessionRow {
             user_renamed: user_renamed != 0,
             last_viewed_at_unix_ms: row.get("last_viewed_at_unix_ms")?,
             archived_at_unix_ms: row.get("archived_at_unix_ms")?,
+            favorite: row.get::<_, i64>("favorite")? != 0,
             is_dream_session: row.get::<_, i64>("is_dream_session")? != 0,
             ephemeral: row.get::<_, i64>("ephemeral")? != 0,
             btw_parent_session_id,
@@ -429,11 +554,95 @@ impl SessionRow {
         })
     }
 
-    /// Conversation identity for this window. Falls back to `session_id`
-    /// when the insert trigger has not yet filled the column.
+    /// Conversation identity for this window. `compaction_lineage_root_id IS NULL`
+    /// is the canonical representation that this row itself is the lineage root.
     pub fn compaction_lineage_root(&self) -> Uuid {
         self.compaction_lineage_root_id.unwrap_or(self.session_id)
     }
+}
+
+/// Principal visibility applied as a list eligibility predicate, before
+/// favorite grouping, durable ordering, or the card cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionListVisibility {
+    /// Owner-level: every session matching the other predicates is eligible.
+    Unrestricted,
+    /// Restricted peer: must own or be shared, and `project_root` must be in
+    /// the allowlist. `project_roots = None` is a wildcard grant (any root).
+    /// `project_roots = Some(empty)` matches nothing.
+    Restricted {
+        principal_tag: String,
+        project_roots: Option<Vec<String>>,
+    },
+}
+
+impl Default for SessionListVisibility {
+    fn default() -> Self {
+        Self::Unrestricted
+    }
+}
+
+/// One bounded `ListSessions` query. Eligibility (scope, archive policy,
+/// assistant, principal visibility) is composed first; resolved-root favorite,
+/// durable activity descending, and UUID ascending order next; the 100-card
+/// cap last.
+#[derive(Debug, Clone)]
+pub struct SessionListQuery {
+    pub project_id: Option<String>,
+    pub parent_session_id: Option<Uuid>,
+    pub compaction_lineage_root_id: Option<Uuid>,
+    pub assistant_id: Option<String>,
+    pub include_archived: bool,
+    pub visibility: SessionListVisibility,
+    pub limit: u32,
+}
+
+impl Default for SessionListQuery {
+    fn default() -> Self {
+        Self {
+            project_id: None,
+            parent_session_id: None,
+            compaction_lineage_root_id: None,
+            assistant_id: None,
+            include_archived: false,
+            visibility: SessionListVisibility::Unrestricted,
+            limit: 100,
+        }
+    }
+}
+
+impl SessionListQuery {
+    pub fn project(project_id: Option<&str>, limit: u32) -> Self {
+        Self {
+            project_id: project_id.map(str::to_string),
+            limit,
+            ..Self::default()
+        }
+    }
+
+    pub fn forks(parent_session_id: Uuid, limit: u32) -> Self {
+        Self {
+            parent_session_id: Some(parent_session_id),
+            limit,
+            ..Self::default()
+        }
+    }
+
+    pub fn lineage(compaction_lineage_root_id: Uuid, limit: u32) -> Self {
+        Self {
+            compaction_lineage_root_id: Some(compaction_lineage_root_id),
+            limit,
+            ..Self::default()
+        }
+    }
+}
+
+/// Applied acknowledgement for a canonical-root favorite mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionFavoriteApplied {
+    pub session_id: Uuid,
+    pub lineage_root_id: Uuid,
+    pub favorite: bool,
 }
 
 /// Resolved model identity for generated session-description content. A
@@ -836,6 +1045,7 @@ fn build_session_row(
         user_renamed: false,
         last_viewed_at_unix_ms: None,
         archived_at_unix_ms: None,
+        favorite: false,
         is_dream_session: false,
         ephemeral: false,
         btw_parent_session_id: None,
@@ -2159,6 +2369,7 @@ impl Db {
             user_renamed: false,
             last_viewed_at_unix_ms: None,
             archived_at_unix_ms: None,
+            favorite: false,
             is_dream_session: false,
             ephemeral: true,
             btw_parent_session_id: Some(parent_session_id),
@@ -2378,6 +2589,7 @@ impl Db {
             user_renamed: false,
             last_viewed_at_unix_ms: None,
             archived_at_unix_ms: None,
+            favorite: false,
             is_dream_session: parent.is_dream_session,
             ephemeral,
             btw_parent_session_id: None,
@@ -2570,6 +2782,7 @@ impl Db {
             user_renamed: predecessor.user_renamed,
             last_viewed_at_unix_ms: None,
             archived_at_unix_ms: None,
+            favorite: false,
             is_dream_session: predecessor.is_dream_session,
             ephemeral: predecessor.ephemeral,
             btw_parent_session_id: None,
@@ -4319,38 +4532,19 @@ impl Db {
 
     /// Assemble the `/sessions` browser rows for one level, the single
     /// source of truth shared by the daemon's `ListSessions` handler and
-    /// the TUI's daemonless direct-DB fallback. The level selection
-    /// mirrors the RPC contract:
-    ///
-    /// - `parent_session_id = Some(p)` → the direct forks of `p`
-    ///   (project scope is implied by the parent and ignored).
-    /// - `project_id = Some(pid)`, no parent → root sessions in `pid`.
-    /// - both `None` → every open session across projects.
-    ///
-    /// Each row carries the DB-derived fork counts, read/unread inputs
-    /// (`latest_activity_at`), and open-interrupt count. Live-only fields
-    /// (running/processing) are *not* part of this method — callers
-    /// attach them separately (the daemon from its registry, the TUI
-    /// daemonless path not at all). A per-row auxiliary-query miss
-    /// degrades that field to its empty default rather than failing the
-    /// whole list, matching the daemon handler's best-effort behavior.
+    /// the TUI's daemonless direct-DB fallback. Eligibility (scope, archive
+    /// policy, assistant, principal visibility) is applied before resolved-root
+    /// favorite grouping, durable activity descending, UUID ascending, and the
+    /// card cap. Live-only fields (running/processing) are *not* part of this
+    /// method — callers attach them separately. A per-row auxiliary-query miss
+    /// degrades that field to its empty default rather than failing the whole
+    /// list, matching the daemon handler's best-effort behavior.
     pub async fn list_session_summaries(
         &self,
-        project_id: Option<&str>,
-        parent_session_id: Option<Uuid>,
-        limit: u32,
+        query: SessionListQuery,
     ) -> Result<Vec<crate::db::wire::SessionSummary>> {
-        let project_id = project_id.map(str::to_string);
-        self.read(move |conn| {
-            Self::list_session_summaries_conn(
-                conn,
-                project_id.as_deref(),
-                parent_session_id,
-                None,
-                limit,
-            )
-        })
-        .await
+        self.read(move |conn| Self::list_session_summaries_conn(conn, &query))
+            .await
     }
 
     pub fn list_compaction_lineage_windows_conn(
@@ -4388,22 +4582,93 @@ impl Db {
         Ok(count.max(0) as u32)
     }
 
+    fn resolved_root_favorite_conn(conn: &Connection, row: &SessionRow) -> Result<bool> {
+        let root_id = row.compaction_lineage_root();
+        if row.session_id == root_id {
+            return Ok(row.favorite);
+        }
+        let favorite: i64 = conn
+            .query_row(
+                "SELECT favorite FROM sessions WHERE session_id = ?1",
+                [root_id.to_string()],
+                |record| record.get(0),
+            )
+            .with_context(|| format!("reading canonical lineage-root favorite for {root_id}"))?;
+        Ok(favorite != 0)
+    }
+
+    fn list_session_rows_for_query_conn(
+        conn: &Connection,
+        query: &SessionListQuery,
+    ) -> Result<Vec<SessionRow>> {
+        let (sql, params) = session_list_select_sql(query);
+        let mut stmt = conn
+            .prepare(&sql)
+            .context("preparing bounded session list")?;
+        let rows = stmt
+            .query_map(params_from_iter(params.iter()), SessionRow::from_row)
+            .context("querying bounded session list")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("decoding session list row")?);
+        }
+        Ok(out)
+    }
+
+    /// Atomically resolve `session_id` to its canonical lineage root and write
+    /// the favorite bit on that root only. Idempotent after a durable re-read.
+    pub async fn set_session_favorite(
+        &self,
+        session_id: Uuid,
+        favorite: bool,
+    ) -> Result<SessionFavoriteApplied> {
+        self.transaction(move |conn| Self::set_session_favorite_conn(conn, session_id, favorite))
+            .await
+    }
+
+    pub fn set_session_favorite_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        favorite: bool,
+    ) -> Result<SessionFavoriteApplied> {
+        let target =
+            get_session_inner(conn, session_id)?.ok_or(SessionFavoriteUnknown(session_id))?;
+        let lineage_root_id = target.compaction_lineage_root();
+        if get_session_inner(conn, lineage_root_id)?.is_none() {
+            return Err(SessionFavoriteUnknown(lineage_root_id).into());
+        }
+        let changed = conn
+            .execute(
+                "UPDATE sessions SET favorite = ?1 WHERE session_id = ?2",
+                params![i64::from(favorite), lineage_root_id.to_string()],
+            )
+            .context("writing canonical lineage-root favorite")?;
+        if changed == 0 {
+            return Err(SessionFavoriteUnknown(lineage_root_id).into());
+        }
+        let applied: i64 = conn
+            .query_row(
+                "SELECT favorite FROM sessions WHERE session_id = ?1",
+                [lineage_root_id.to_string()],
+                |record| record.get(0),
+            )
+            .context("re-reading canonical lineage-root favorite")?;
+        Ok(SessionFavoriteApplied {
+            session_id,
+            lineage_root_id,
+            favorite: applied != 0,
+        })
+    }
+
     pub fn list_session_summaries_conn(
         conn: &Connection,
-        project_id: Option<&str>,
-        parent_session_id: Option<Uuid>,
-        compaction_lineage_root_id: Option<Uuid>,
-        limit: u32,
+        query: &SessionListQuery,
     ) -> Result<Vec<crate::db::wire::SessionSummary>> {
-        let rows = match (compaction_lineage_root_id, parent_session_id, project_id) {
-            (Some(root), _, _) => Self::list_compaction_lineage_windows_conn(conn, root)?,
-            (None, Some(parent), _) => Self::list_forks_conn(conn, parent)?,
-            (None, None, Some(pid)) => Self::list_root_sessions_conn(conn, pid, limit)?,
-            (None, None, None) => Self::list_sessions_conn(conn, true, limit)?,
-        };
+        let rows = Self::list_session_rows_for_query_conn(conn, query)?;
         let mut summaries = Vec::with_capacity(rows.len());
         for row in rows {
             let lineage_root = row.compaction_lineage_root();
+            let favorite = Self::resolved_root_favorite_conn(conn, &row)?;
             let fork_count = summary_count_or_zero(
                 lineage_root,
                 "fork_count",
@@ -4486,6 +4751,7 @@ impl Db {
                 open_interrupts,
                 activity_state,
                 archived_at_unix_ms: row.archived_at_unix_ms,
+                favorite,
                 created_by_principal: row.created_by_principal,
                 shared_with_collaborators: row.shared_with_collaborators,
                 pin_count,
@@ -6362,7 +6628,9 @@ mod tests {
         assert_eq!(also_from_tip.len(), 1);
         assert_eq!(also_from_tip[0].session_id, fork.session_id);
         let summaries = db
-            .read(move |conn| Db::list_session_summaries_conn(conn, Some("p"), None, None, 100))
+            .read(move |conn| {
+                Db::list_session_summaries_conn(conn, &SessionListQuery::project(Some("p"), 100))
+            })
             .await
             .unwrap();
         let tip = summaries
@@ -6780,7 +7048,7 @@ mod tests {
 
         // Project-scoped roots: only `pid` roots, newest (`root_b`) first.
         let roots = db
-            .list_session_summaries(Some("pid"), None, 100)
+            .list_session_summaries(SessionListQuery::project(Some("pid"), 100))
             .await
             .unwrap();
         let root_ids: Vec<_> = roots.iter().map(|s| s.session_id).collect();
@@ -6796,7 +7064,7 @@ mod tests {
 
         // Fork grouping: parent = root_a → its direct forks only.
         let forks = db
-            .list_session_summaries(None, Some(root_a.session_id), 100)
+            .list_session_summaries(SessionListQuery::forks(root_a.session_id, 100))
             .await
             .unwrap();
         assert_eq!(forks.len(), 1);
@@ -6804,7 +7072,10 @@ mod tests {
         assert_eq!(forks[0].parent_session_id, Some(root_a.session_id));
 
         // All-projects fallback (both args None) spans every project.
-        let all = db.list_session_summaries(None, None, 100).await.unwrap();
+        let all = db
+            .list_session_summaries(SessionListQuery::default())
+            .await
+            .unwrap();
         let project_ids: std::collections::HashSet<_> =
             all.iter().map(|s| s.project_id.as_str()).collect();
         assert!(project_ids.contains("pid"));
@@ -6818,11 +7089,13 @@ mod tests {
         let _fork = db.create_fork(root.session_id, None).await.unwrap();
 
         let wrapped = db
-            .list_session_summaries(Some("pid"), None, 100)
+            .list_session_summaries(SessionListQuery::project(Some("pid"), 100))
             .await
             .unwrap();
         let direct = db
-            .read(|conn| Db::list_session_summaries_conn(conn, Some("pid"), None, None, 100))
+            .read(|conn| {
+                Db::list_session_summaries_conn(conn, &SessionListQuery::project(Some("pid"), 100))
+            })
             .await
             .unwrap();
 
@@ -6888,7 +7161,7 @@ mod tests {
         db.mark_interrupt_interrupted(interrupted_id).await.unwrap();
 
         let summaries = db
-            .list_session_summaries(Some("pid"), None, 100)
+            .list_session_summaries(SessionListQuery::project(Some("pid"), 100))
             .await
             .unwrap();
         let pending_summary = summaries
@@ -6941,7 +7214,7 @@ mod tests {
         .unwrap();
 
         let summaries = db
-            .list_session_summaries(Some("pid"), None, 100)
+            .list_session_summaries(SessionListQuery::project(Some("pid"), 100))
             .await
             .unwrap();
         let summary = summaries
@@ -7114,7 +7387,7 @@ mod tests {
 
         // Browser summaries (the daemon + daemonless shared path).
         let summaries = db
-            .list_session_summaries(Some("p"), None, 100)
+            .list_session_summaries(SessionListQuery::project(Some("p"), 100))
             .await
             .unwrap();
         assert_eq!(summaries.len(), 1);
@@ -7811,5 +8084,464 @@ mod tests {
             "/btw insert must fail closed on the custody probe: {err:#}"
         );
         assert!(db.get_session(child_id).await.unwrap().is_none());
+    }
+
+    async fn set_last_active(db: &Db, session_id: Uuid, last_active_at_unix_ms: i64) {
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE sessions
+                    SET started_at_unix_ms = MIN(started_at_unix_ms, ?1),
+                        last_active_at_unix_ms = ?1
+                  WHERE session_id = ?2",
+                params![last_active_at_unix_ms, session_id.to_string()],
+            )
+            .context("setting last_active_at")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn set_created_by(db: &Db, session_id: Uuid, principal: &str) {
+        let principal = principal.to_string();
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET created_by_principal = ?1 WHERE session_id = ?2",
+                params![principal, session_id.to_string()],
+            )
+            .context("setting created_by_principal")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn set_assistant(db: &Db, session_id: Uuid, assistant: &str) {
+        let assistant = assistant.to_string();
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET assistant_name = ?1 WHERE session_id = ?2",
+                params![assistant, session_id.to_string()],
+            )
+            .context("setting assistant_name")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    fn ids(summaries: &[crate::db::wire::SessionSummary]) -> Vec<Uuid> {
+        summaries.iter().map(|s| s.session_id).collect()
+    }
+
+    #[tokio::test]
+    async fn null_lineage_root_resolves_to_self_as_canonical_root() {
+        let db = Db::open_in_memory().unwrap();
+        let root = db.create_session("pid", "/proj", "Build").await.unwrap();
+        db.write({
+            let session_id = root.session_id;
+            move |conn| {
+                conn.execute(
+                    "UPDATE sessions SET compaction_lineage_root_id = NULL WHERE session_id = ?1",
+                    [session_id.to_string()],
+                )
+                .context("clearing lineage root to canonical NULL")?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+        let applied = db
+            .set_session_favorite(root.session_id, true)
+            .await
+            .unwrap();
+        assert_eq!(applied.session_id, root.session_id);
+        assert_eq!(applied.lineage_root_id, root.session_id);
+        assert!(applied.favorite);
+        let row = db.get_session(root.session_id).await.unwrap().unwrap();
+        assert!(
+            row.compaction_lineage_root_id.is_none(),
+            "NULL remains the canonical self-root representation"
+        );
+        assert!(row.favorite);
+        assert_eq!(row.compaction_lineage_root(), root.session_id);
+        let listed = db
+            .list_session_summaries(SessionListQuery::project(Some("pid"), 100))
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].favorite);
+        assert_eq!(listed[0].compaction_lineage_root_id, Some(root.session_id));
+    }
+
+    #[tokio::test]
+    async fn favorite_lives_only_on_canonical_root_and_projects_through_compaction() {
+        let db = Db::open_in_memory().unwrap();
+        let predecessor = db.create_session("pid", "/proj", "Build").await.unwrap();
+        db.set_session_favorite(predecessor.session_id, true)
+            .await
+            .unwrap();
+        let successor = db
+            .create_compaction_successor(predecessor.session_id)
+            .await
+            .unwrap();
+        assert_eq!(successor.compaction_lineage_root(), predecessor.session_id);
+        assert!(
+            !successor.favorite,
+            "successor must not copy a per-window favorite bit"
+        );
+        let pred_row = db
+            .get_session(predecessor.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(pred_row.favorite);
+        let listed = db
+            .list_session_summaries(SessionListQuery::lineage(predecessor.session_id, 100))
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|summary| summary.favorite));
+        let from_successor = db
+            .set_session_favorite(successor.session_id, true)
+            .await
+            .unwrap();
+        assert_eq!(from_successor.lineage_root_id, predecessor.session_id);
+        assert_eq!(
+            db.get_session(successor.session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .favorite,
+            false
+        );
+        db.set_session_favorite(successor.session_id, false)
+            .await
+            .unwrap();
+        assert!(
+            !db.get_session(predecessor.session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .favorite
+        );
+        assert!(
+            !db.get_session(successor.session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .favorite
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_mints_independent_unfavorited_root() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("pid", "/proj", "Build").await.unwrap();
+        db.set_session_favorite(parent.session_id, true)
+            .await
+            .unwrap();
+        let fork = db.create_fork(parent.session_id, None).await.unwrap();
+        assert_ne!(
+            fork.compaction_lineage_root(),
+            parent.compaction_lineage_root()
+        );
+        assert_eq!(fork.compaction_lineage_root(), fork.session_id);
+        assert!(!fork.favorite);
+        let listed = db
+            .list_session_summaries(SessionListQuery::forks(parent.session_id, 100))
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(!listed[0].favorite);
+        assert!(
+            db.get_session(parent.session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .favorite
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_preserves_root_favorite_and_active_scope_hides_it() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("pid", "/proj", "Build").await.unwrap();
+        db.set_session_favorite(session.session_id, true)
+            .await
+            .unwrap();
+        db.archive_session(session.session_id, false).await.unwrap();
+        let active = db
+            .list_session_summaries(SessionListQuery::project(Some("pid"), 100))
+            .await
+            .unwrap();
+        assert!(active.is_empty());
+        let mut archived_query = SessionListQuery::project(Some("pid"), 100);
+        archived_query.include_archived = true;
+        let archived = db.list_session_summaries(archived_query).await.unwrap();
+        assert_eq!(archived.len(), 1);
+        assert!(archived[0].favorite);
+        assert!(archived[0].archived_at_unix_ms.is_some());
+        db.unarchive_session(session.session_id).await.unwrap();
+        let restored = db
+            .list_session_summaries(SessionListQuery::project(Some("pid"), 100))
+            .await
+            .unwrap();
+        assert_eq!(restored.len(), 1);
+        assert!(restored[0].favorite);
+        assert!(restored[0].archived_at_unix_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_removes_root_favorite_state() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("pid", "/proj", "Build").await.unwrap();
+        db.set_session_favorite(session.session_id, true)
+            .await
+            .unwrap();
+        db.delete_session(session.session_id).await.unwrap();
+        let err = db
+            .set_session_favorite(session.session_id, true)
+            .await
+            .expect_err("deleted session cannot be favorited");
+        assert!(err.downcast_ref::<SessionFavoriteUnknown>().is_some());
+        let listed = db
+            .list_session_summaries(SessionListQuery::project(Some("pid"), 100))
+            .await
+            .unwrap();
+        assert!(listed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn favorite_does_not_change_pins_archive_activity_or_other_lineage() {
+        let db = Db::open_in_memory().unwrap();
+        let a = db.create_session("pid", "/proj", "Build").await.unwrap();
+        let b = db.create_session("pid", "/proj", "Build").await.unwrap();
+        db.set_session_favorite(b.session_id, true).await.unwrap();
+        let before_a = db.get_session(a.session_id).await.unwrap().unwrap();
+        let before_b = db.get_session(b.session_id).await.unwrap().unwrap();
+        db.set_session_favorite(a.session_id, true).await.unwrap();
+        let after_a = db.get_session(a.session_id).await.unwrap().unwrap();
+        let after_b = db.get_session(b.session_id).await.unwrap().unwrap();
+        assert!(after_a.favorite);
+        assert_eq!(after_a.archived_at_unix_ms, before_a.archived_at_unix_ms);
+        assert_eq!(
+            after_a.last_active_at_unix_ms,
+            before_a.last_active_at_unix_ms
+        );
+        assert_eq!(after_b.favorite, before_b.favorite);
+        assert_eq!(
+            after_b.last_active_at_unix_ms,
+            before_b.last_active_at_unix_ms
+        );
+        let pin_count = db
+            .read(move |conn| Db::pin_count_conn(conn, a.session_id))
+            .await
+            .unwrap();
+        assert_eq!(pin_count, 0);
+    }
+
+    #[tokio::test]
+    async fn list_orders_favorite_then_activity_then_uuid() {
+        let db = Db::open_in_memory().unwrap();
+        let older_fav = db.create_session("pid", "/proj", "Build").await.unwrap();
+        let newer = db.create_session("pid", "/proj", "Build").await.unwrap();
+        let older = db.create_session("pid", "/proj", "Build").await.unwrap();
+        set_last_active(&db, older_fav.session_id, 10).await;
+        set_last_active(&db, older.session_id, 20).await;
+        set_last_active(&db, newer.session_id, 30).await;
+        db.set_session_favorite(older_fav.session_id, true)
+            .await
+            .unwrap();
+        let listed = db
+            .list_session_summaries(SessionListQuery::project(Some("pid"), 100))
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&listed),
+            vec![older_fav.session_id, newer.session_id, older.session_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn equal_activity_orders_by_uuid_ascending() {
+        let db = Db::open_in_memory().unwrap();
+        let first = db.create_session("pid", "/proj", "Build").await.unwrap();
+        let second = db.create_session("pid", "/proj", "Build").await.unwrap();
+        set_last_active(&db, first.session_id, 50).await;
+        set_last_active(&db, second.session_id, 50).await;
+        let listed = db
+            .list_session_summaries(SessionListQuery::project(Some("pid"), 100))
+            .await
+            .unwrap();
+        let mut expected = vec![first.session_id, second.session_id];
+        expected.sort();
+        assert_eq!(ids(&listed), expected);
+    }
+
+    #[tokio::test]
+    async fn assistant_filtered_favorite_survives_beyond_former_cap() {
+        let db = Db::open_in_memory().unwrap();
+        for i in 0..100 {
+            let session = db.create_session("pid", "/proj", "Build").await.unwrap();
+            set_assistant(&db, session.session_id, "other-bot").await;
+            set_last_active(&db, session.session_id, 1_000 + i).await;
+        }
+        let favorite = db.create_session("pid", "/proj", "Build").await.unwrap();
+        set_assistant(&db, favorite.session_id, "helper-bot").await;
+        set_last_active(&db, favorite.session_id, 1).await;
+        db.set_session_favorite(favorite.session_id, true)
+            .await
+            .unwrap();
+        let mut query = SessionListQuery::project(Some("pid"), 100);
+        query.assistant_id = Some("helper-bot".into());
+        let listed = db.list_session_summaries(query).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, favorite.session_id);
+        assert!(listed[0].favorite);
+    }
+
+    #[tokio::test]
+    async fn restricted_peer_visible_favorite_survives_beyond_former_cap() {
+        let db = Db::open_in_memory().unwrap();
+        for i in 0..100 {
+            let session = db.create_session("pid", "/proj", "Build").await.unwrap();
+            set_created_by(&db, session.session_id, "flycockpit:other").await;
+            set_last_active(&db, session.session_id, 1_000 + i).await;
+        }
+        let favorite = db.create_session("pid", "/proj", "Build").await.unwrap();
+        set_created_by(&db, favorite.session_id, "flycockpit:peer").await;
+        set_last_active(&db, favorite.session_id, 1).await;
+        db.set_session_favorite(favorite.session_id, true)
+            .await
+            .unwrap();
+        let mut query = SessionListQuery::project(Some("pid"), 100);
+        query.visibility = SessionListVisibility::Restricted {
+            principal_tag: "flycockpit:peer".into(),
+            project_roots: Some(vec!["/proj".into()]),
+        };
+        let listed = db.list_session_summaries(query).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, favorite.session_id);
+        assert!(listed[0].favorite);
+    }
+
+    #[tokio::test]
+    async fn list_scopes_cover_project_all_fork_lineage_and_archived() {
+        let db = Db::open_in_memory().unwrap();
+        let root = db.create_session("pid", "/proj", "Build").await.unwrap();
+        let other = db.create_session("pid2", "/other", "Build").await.unwrap();
+        let fork = db.create_fork(root.session_id, None).await.unwrap();
+        let successor = db
+            .create_compaction_successor(root.session_id)
+            .await
+            .unwrap();
+        db.set_session_favorite(root.session_id, true)
+            .await
+            .unwrap();
+        db.archive_session(other.session_id, false).await.unwrap();
+
+        let project = db
+            .list_session_summaries(SessionListQuery::project(Some("pid"), 100))
+            .await
+            .unwrap();
+        assert_eq!(ids(&project), vec![successor.session_id]);
+        assert!(project[0].favorite);
+
+        let all = db
+            .list_session_summaries(SessionListQuery::default())
+            .await
+            .unwrap();
+        let all_ids = ids(&all);
+        assert!(all_ids.contains(&successor.session_id));
+        assert!(
+            !all_ids.contains(&fork.session_id),
+            "all-project roots exclude fork lineages until drill-in"
+        );
+        assert!(!all_ids.contains(&other.session_id));
+
+        let forks = db
+            .list_session_summaries(SessionListQuery::forks(root.session_id, 100))
+            .await
+            .unwrap();
+        assert_eq!(ids(&forks), vec![fork.session_id]);
+
+        let lineage = db
+            .list_session_summaries(SessionListQuery::lineage(root.session_id, 100))
+            .await
+            .unwrap();
+        assert_eq!(lineage.len(), 2);
+        assert!(lineage.iter().all(|summary| summary.favorite));
+
+        let mut archived = SessionListQuery::default();
+        archived.include_archived = true;
+        let archived = db.list_session_summaries(archived).await.unwrap();
+        assert!(
+            archived
+                .iter()
+                .any(|summary| summary.session_id == other.session_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_favorite_request_is_idempotent_after_reread() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("pid", "/proj", "Build").await.unwrap();
+        let first = db
+            .set_session_favorite(session.session_id, true)
+            .await
+            .unwrap();
+        let second = db
+            .set_session_favorite(session.session_id, true)
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+        assert!(second.favorite);
+    }
+
+    #[test]
+    fn list_query_is_one_bounded_projection_per_scope() {
+        let scopes = [
+            SessionListQuery::default(),
+            SessionListQuery::project(Some("pid"), 100),
+            SessionListQuery::forks(Uuid::nil(), 100),
+            SessionListQuery::lineage(Uuid::nil(), 100),
+            {
+                let mut query = SessionListQuery::default();
+                query.include_archived = true;
+                query
+            },
+            {
+                let mut query = SessionListQuery::project(Some("pid"), 100);
+                query.assistant_id = Some("helper-bot".into());
+                query.visibility = SessionListVisibility::Restricted {
+                    principal_tag: "flycockpit:peer".into(),
+                    project_roots: Some(vec!["/proj".into()]),
+                };
+                query
+            },
+        ];
+        for query in scopes {
+            let (sql, params) = session_list_select_sql(&query);
+            assert!(
+                sql.trim_end().ends_with("LIMIT ?"),
+                "card cap must be last in {sql}"
+            );
+            assert_eq!(
+                sql.matches("LIMIT").count(),
+                1,
+                "exactly one cap, not a capped intersect, in {sql}"
+            );
+            assert!(
+                sql.contains("root.favorite")
+                    && sql.contains("last_active_at_unix_ms DESC")
+                    && sql.contains("session_id ASC"),
+                "favorite then activity then UUID in {sql}"
+            );
+            let Some(SqlValue::Integer(limit)) = params.last() else {
+                panic!("expected integer LIMIT bind, got {params:?}");
+            };
+            assert_eq!(*limit, i64::from(query.limit));
+        }
     }
 }

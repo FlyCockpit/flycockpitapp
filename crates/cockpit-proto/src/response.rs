@@ -304,6 +304,15 @@ pub enum Response {
         sessions: Vec<SessionSummary>,
     },
 
+    /// Applied acknowledgement for `SetSessionFavorite`. Reports the requested
+    /// target, the canonical lineage root that was written, and the durable
+    /// favorite value after authoritative re-read.
+    SessionFavoriteApplied {
+        session_id: Uuid,
+        lineage_root_id: Uuid,
+        favorite: bool,
+    },
+
     SessionMessages {
         session_id: Uuid,
         messages: Vec<SessionMessage>,
@@ -1680,6 +1689,7 @@ macro_rules! response_variants {
             (Response::Attached { .. }, "attached");
             (Response::SubagentTranscript { .. }, "subagent_transcript");
             (Response::Sessions { .. }, "sessions");
+            (Response::SessionFavoriteApplied { .. }, "session_favorite_applied");
             (Response::SessionMessages { .. }, "session_messages");
             (Response::AssistantInbox { .. }, "assistant_inbox");
             (Response::ClientSubmissionReceipt { .. }, "client_submission_receipt");

@@ -1384,6 +1384,11 @@ pub enum Request {
         assistant_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         compaction_lineage_root_id: Option<Uuid>,
+        /// When false, archived sessions are ineligible before favorite
+        /// grouping and the card cap. When true, archive state does not
+        /// exclude a session from the eligible set.
+        #[serde(default)]
+        include_archived: bool,
     },
 
     /// Read a paginated page of plain user/agent messages for a session.
@@ -1499,6 +1504,14 @@ pub enum Request {
     /// Clear a session's archive flag (recover it from the archived view).
     UnarchiveSession {
         session_id: Uuid,
+    },
+
+    /// Set the durable navigation favorite on the canonical lineage root of
+    /// `session_id`. The requested target is authorized as owner/writer; only
+    /// that root record is mutated. Idempotent after a durable re-read.
+    SetSessionFavorite {
+        session_id: Uuid,
+        favorite: bool,
     },
 
     /// Branch a fork off `parent_session_id` at `fork_point_turn_id`
@@ -4554,6 +4567,7 @@ macro_rules! request_variants {
             (Request::SessionLiveStatus { .. }, "session_live_status");
             (Request::ArchiveSession { .. }, "archive_session");
             (Request::UnarchiveSession { .. }, "unarchive_session");
+            (Request::SetSessionFavorite { .. }, "set_session_favorite");
             (Request::ForkSession { .. }, "fork_session");
             (Request::DiscardSession { .. }, "discard_session");
             (Request::CreateBtwFork { .. }, "create_btw_fork");
@@ -4911,7 +4925,7 @@ macro_rules! command {
             (Request::TerminalIngressStatus { terminal_id, binding, operation_id }, "terminal_ingress_status", terminal, none, false, read_only, none, concurrent, none, "terminal_id:Uuid|binding:crate::terminal::TerminalBinding|operation_id:Uuid", [terminal_id: Uuid => terminal, binding: $crate::terminal::TerminalBinding => param, operation_id: Uuid => param]);
             (Request::LspControl { project_root, server_id, action }, "lsp_control", custom(authorize_lsp_control), attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "project_root:String|server_id:String|action:LspControlAction", [project_root: String => project_root, server_id: String => param, action: LspControlAction => param]);
             (Request::ResolveInterrupt { interrupt_id, response }, "resolve_interrupt", session_writer, attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "interrupt_id:Uuid|response:ResolveResponse", [interrupt_id: Uuid => interrupt, response: ResolveResponse => param]);
-            (Request::ListSessions { project_id, parent_session_id, assistant_id, compaction_lineage_root_id }, "list_sessions", public_read, none, false, read_only, none, concurrent, none, "project_id:Option<String>|parent_session_id:Option<Uuid>|assistant_id:Option<String>|compaction_lineage_root_id:Option<Uuid>", [project_id: Option<String> => project, parent_session_id: Option<Uuid> => param, assistant_id: Option<String> => param, compaction_lineage_root_id: Option<Uuid> => param]);
+            (Request::ListSessions { project_id, parent_session_id, assistant_id, compaction_lineage_root_id, include_archived }, "list_sessions", public_read, none, false, read_only, none, concurrent, none, "project_id:Option<String>|parent_session_id:Option<Uuid>|assistant_id:Option<String>|compaction_lineage_root_id:Option<Uuid>|include_archived:bool", [project_id: Option<String> => project, parent_session_id: Option<Uuid> => param, assistant_id: Option<String> => param, compaction_lineage_root_id: Option<Uuid> => param, include_archived: bool => param]);
             (Request::ReadSessionMessages { session_id, before_seq, limit }, "read_session_messages", custom(authorize_read_session_messages), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|before_seq:Option<i64>|limit:u32", [session_id: Uuid => session, before_seq: Option<i64> => param, limit: u32 => param]);
             (Request::ReadAssistantInbox { main_session_id, include_delivered, limit }, "read_assistant_inbox", session_row_reader(main_session_id), field(main_session_id), false, read_only, none, concurrent, none, "main_session_id:Uuid|include_delivered:bool|limit:u32", [main_session_id: Uuid => session, include_delivered: bool => param, limit: u32 => param]);
             (Request::AcknowledgeAssistantInboxHumanRead { main_session_id, inbox_item_ids }, "acknowledge_assistant_inbox_human_read", session_row_writer(main_session_id), field(main_session_id), true, idempotent_adapter_mutation, sql_transaction, serialized, none, "main_session_id:Uuid|inbox_item_ids:Vec<Uuid>", [main_session_id: Uuid => session, inbox_item_ids: Vec<Uuid> => param]);
@@ -4924,6 +4938,7 @@ macro_rules! command {
             (Request::SessionLiveStatus { session_ids }, "session_live_status", public_read, none, false, read_only, none, concurrent, none, "session_ids:Vec<Uuid>", [session_ids: Vec<Uuid> => param]);
             (Request::ArchiveSession { session_id, cascade }, "archive_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|cascade:bool", [session_id: Uuid => session, cascade: bool => param]);
             (Request::UnarchiveSession { session_id }, "unarchive_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
+            (Request::SetSessionFavorite { session_id, favorite }, "set_session_favorite", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|favorite:bool", [session_id: Uuid => session, favorite: bool => param]);
             (Request::ForkSession { parent_session_id, fork_point_turn_id, ephemeral, fresh_thread }, "fork_session", session_row_writer(parent_session_id), field(parent_session_id), true, transactional_mutation, sql_transaction, serialized, none, "parent_session_id:Uuid|fork_point_turn_id:Option<String>|ephemeral:bool|fresh_thread:bool", [parent_session_id: Uuid => param, fork_point_turn_id: Option<String> => param, ephemeral: bool => param, fresh_thread: bool => param]);
             (Request::DiscardSession { session_id }, "discard_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::CreateBtwFork { parent_session_id, tangent }, "btw_create", session_row_writer(parent_session_id), field(parent_session_id), true, transactional_mutation, sql_transaction, serialized, none, "parent_session_id:Uuid|tangent:bool", [parent_session_id: Uuid => param, tangent: bool => param]);

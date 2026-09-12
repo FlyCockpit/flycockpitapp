@@ -9895,10 +9895,10 @@ async fn handle_serialized_request_impl(
                         };
                     let summary = crate::db::Db::list_session_summaries_conn(
                         conn,
-                        Some(&row.project_id),
-                        None,
-                        None,
-                        100,
+                        &crate::db::sessions::SessionListQuery::project(
+                            Some(&row.project_id),
+                            100,
+                        ),
                     )?
                     .into_iter()
                     .find(|summary| summary.session_id == row.session_id)
@@ -12151,6 +12151,7 @@ async fn handle_serialized_request_impl(
             parent_session_id,
             assistant_id,
             compaction_lineage_root_id,
+            include_archived,
         } => {
             list_sessions(
                 ctx,
@@ -12159,6 +12160,7 @@ async fn handle_serialized_request_impl(
                 parent_session_id,
                 assistant_id,
                 compaction_lineage_root_id,
+                include_archived,
             )
             .await
         }
@@ -12456,6 +12458,30 @@ async fn handle_serialized_request_impl(
                 return sessions_remote::unarchive_session(ctx, session_id, &ledger).await;
             }
             unarchive_session(ctx, session_id).await
+        }
+
+        Request::SetSessionFavorite {
+            session_id,
+            favorite,
+        } => {
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation {
+                let request = Request::SetSessionFavorite {
+                    session_id,
+                    favorite,
+                };
+                let ledger =
+                    build_remote_session_ledger(ctx, &authorized_request, &request, operation)?;
+                return sessions_remote::set_session_favorite(
+                    ctx,
+                    &state.principal,
+                    session_id,
+                    favorite,
+                    &ledger,
+                )
+                .await;
+            }
+            set_session_favorite(ctx, &state.principal, session_id, favorite).await
         }
 
         Request::ForkSession {
@@ -20065,6 +20091,7 @@ async fn handle_concurrent_request_impl(
             parent_session_id,
             assistant_id,
             compaction_lineage_root_id,
+            include_archived,
         } => {
             list_sessions(
                 &ctx,
@@ -20073,6 +20100,7 @@ async fn handle_concurrent_request_impl(
                 parent_session_id,
                 assistant_id,
                 compaction_lineage_root_id,
+                include_archived,
             )
             .await
         }

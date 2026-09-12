@@ -1320,14 +1320,16 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v22 includes first-class assistant-thread
-/// creation and durable lineage projections, alongside the V2 tagged ingress envelope,
-/// queued-message delivery classes, local queue controls, MCP credential
-/// profiles, agent-dimensioned MCP scopes on the attached-session and
-/// daemon-owned setup inventory, bounded base64 media previews, the
+/// Current wire schema version. v23 adds durable logical-conversation
+/// favorites (`SetSessionFavorite` / `SessionFavoriteApplied` and the
+/// resolved-root `SessionSummary.favorite` bit) on top of v22's first-class
+/// assistant-thread creation and durable lineage projections, the V2 tagged
+/// ingress envelope, queued-message delivery classes, local queue controls,
+/// MCP credential profiles, agent-dimensioned MCP scopes on the attached-session
+/// and daemon-owned setup inventory, bounded base64 media previews, the
 /// rolling-precompaction resume choice, and knowledge-dream completion
 /// receipts including ordered all-KB runs.
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -4625,6 +4627,7 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "set_agent",
         "set_default_model",
         "set_model_favorite",
+        "set_session_favorite",
         "share_session",
         "stats_rollup",
         "unarchive_session",
@@ -4655,6 +4658,7 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "session_messages",
         "assistant_inbox",
         "sessions",
+        "session_favorite_applied",
         "session_setup_snapshot",
         "guidance_proposals",
         "guidance_enablement_trace",
@@ -7343,6 +7347,7 @@ mod tests {
                     parent_session_id: None,
                     assistant_id: Some("helper-bot".into()),
                     compaction_lineage_root_id: None,
+                    include_archived: false,
                 },
             },
         };
@@ -7412,7 +7417,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v10_request_is_rejected_after_the_current_only_v22_cutover() {
+    async fn v10_request_is_rejected_after_the_current_only_v23_cutover() {
         let (a, b) = duplex(4096);
         let mut sender = ProtoStream::with_version(a, 10);
         let mut receiver = ProtoStream::with_version(b, 10);
@@ -7477,12 +7482,12 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 22);
+        assert_eq!(PROTOCOL_VERSION, 23);
         let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
-                .expect("current v22 config_refreshed fixture")
+                .expect("current v23 config_refreshed fixture")
                 .clone(),
         )
         .unwrap();
@@ -7497,19 +7502,19 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 22);
+        assert_eq!(PROTOCOL_VERSION, 23);
         let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
                 .get(response_name)
-                .unwrap_or_else(|| panic!("current v22 {response_name} fixture"));
+                .unwrap_or_else(|| panic!("current v23 {response_name} fixture"));
             assert_eq!(
                 response["data"]["goal"]["max_verification_attempts"], 4,
-                "current v22 {response_name} must freeze the inclusive verification cap"
+                "current v23 {response_name} must freeze the inclusive verification cap"
             );
             serde_json::from_value::<Response>(response.clone()).unwrap_or_else(|error| {
-                panic!("current v22 {response_name} must deserialize: {error}")
+                panic!("current v23 {response_name} must deserialize: {error}")
             });
         }
     }
@@ -7522,13 +7527,13 @@ mod tests {
                 serde_json::from_value(fixture[response_name]["data"]["assistant"].clone())
                     .unwrap();
             validate_assistant_summary(&summary).unwrap_or_else(|error| {
-                panic!("current v22 {response_name} assistant identity is invalid: {error}")
+                panic!("current v23 {response_name} assistant identity is invalid: {error}")
             });
         }
         let summary: AssistantSummary =
             serde_json::from_value(fixture["assistants"]["data"]["assistants"][0].clone()).unwrap();
         validate_assistant_summary(&summary)
-            .expect("current v22 assistant inventory must carry bounded opaque revisions");
+            .expect("current v23 assistant inventory must carry bounded opaque revisions");
         assert_eq!(fixture["assistants"]["data"]["config_generation"], 7);
         assert_eq!(
             fixture["agent_inventory"]["data"]["config_generation"],
@@ -7614,7 +7619,7 @@ mod tests {
         ] {
             assert!(
                 mcp[field].is_string(),
-                "current v22 MCP CAS fixture must carry {field}"
+                "current v23 MCP CAS fixture must carry {field}"
             );
         }
         assert_eq!(mcp["expected_revision"].as_str().map(str::len), Some(64));
@@ -7664,7 +7669,7 @@ mod tests {
         ] {
             assert!(
                 requests[tag]["params"]["client_operation_id"].is_string(),
-                "current v22 fixture must carry an operation id for {tag}"
+                "current v23 fixture must carry an operation id for {tag}"
             );
         }
         let responses = proto_fixture_files::read_fixture("response.json");

@@ -19260,6 +19260,11 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             observation: "session archived_at is cleared",
         },
         MutatingDispatchCase {
+            kind: "set_session_favorite",
+            effect_class: Durable,
+            observation: "canonical lineage-root favorite is applied",
+        },
+        MutatingDispatchCase {
             kind: "fork_session",
             effect_class: Durable,
             observation: "fork session row references parent session",
@@ -19768,6 +19773,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "read_history_page"
         | "read_subagent_history_page"
         | "unarchive_session"
+        | "set_session_favorite"
         | "fork_session"
         | "btw_create"
         | "btw_end"
@@ -20284,6 +20290,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_reader("read_subagent_history_page"),
         authz_session_writer("archive_session"),
         authz_session_writer("unarchive_session"),
+        authz_session_writer("set_session_favorite"),
         authz_session_writer("fork_session"),
         authz_session_writer("discard_session"),
         authz_session_writer("btw_create"),
@@ -22152,6 +22159,10 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             cascade: false,
         },
         "unarchive_session" => Request::UnarchiveSession { session_id },
+        "set_session_favorite" => Request::SetSessionFavorite {
+            session_id,
+            favorite: true,
+        },
         "fork_session" => Request::ForkSession {
             parent_session_id: session_id,
             fork_point_turn_id: None,
@@ -23141,6 +23152,7 @@ impl ReadonlyDispatchCaseKind {
                         parent_session_id: None,
                         assistant_id: None,
                         compaction_lineage_root_id: None,
+                        include_archived: false,
                     },
                 )
                 .await
@@ -23667,6 +23679,7 @@ impl ReadonlyDispatchCaseKind {
                         parent_session_id: None,
                         assistant_id: None,
                         compaction_lineage_root_id: None,
+                        include_archived: false,
                     },
                 )
                 .await
@@ -24102,6 +24115,7 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         "curator" => assert_curator_mutating_happy().await,
         "archive_session"
         | "unarchive_session"
+        | "set_session_favorite"
         | "fork_session"
         | "discard_session"
         | "btw_create"
@@ -24363,6 +24377,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         }
         "archive_session"
         | "unarchive_session"
+        | "set_session_favorite"
         | "fork_session"
         | "discard_session"
         | "btw_create"
@@ -27547,6 +27562,29 @@ async fn assert_session_db_mutating_happy(kind: &str) {
                     .is_none()
             );
         }
+        "set_session_favorite" => {
+            let response = dispatch_matrix_request(
+                &ctx,
+                Request::SetSessionFavorite {
+                    session_id: session.session_id,
+                    favorite: true,
+                },
+            )
+            .await
+            .expect("set session favorite");
+            assert!(matches!(
+                response,
+                Response::SessionFavoriteApplied { favorite: true, .. }
+            ));
+            assert!(
+                ctx.db
+                    .get_session(session.session_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .favorite
+            );
+        }
         "fork_session" => {
             let response = dispatch_matrix_request(
                 &ctx,
@@ -27735,6 +27773,10 @@ async fn assert_session_db_mutating_malformed(kind: &str) {
         },
         "unarchive_session" => Request::UnarchiveSession {
             session_id: missing,
+        },
+        "set_session_favorite" => Request::SetSessionFavorite {
+            session_id: missing,
+            favorite: true,
         },
         "fork_session" => Request::ForkSession {
             parent_session_id: missing,
@@ -29477,6 +29519,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 parent_session_id: None,
                 assistant_id: None,
                 compaction_lineage_root_id: None,
+                include_archived: false,
             },
             kind: "list_sessions",
             session_id: None,
@@ -29505,6 +29548,16 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase {
             request: Request::UnarchiveSession { session_id },
             kind: "unarchive_session",
+            session_id: Some(session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::SetSessionFavorite {
+                session_id,
+                favorite: true,
+            },
+            kind: "set_session_favorite",
             session_id: Some(session_id),
             audit_path: None,
             mutating: true,
@@ -30908,6 +30961,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         SessionLiveStatus,
         ArchiveSession,
         UnarchiveSession,
+        SetSessionFavorite,
         ForkSession,
         DiscardSession,
         CreateBtwFork,
@@ -37266,6 +37320,7 @@ async fn session_list_assistant_filter_returns_only_matching_sessions() {
             parent_session_id: None,
             assistant_id: Some("helper-bot".into()),
             compaction_lineage_root_id: None,
+            include_archived: false,
         },
         &mut state,
         &ctx,
@@ -37287,6 +37342,7 @@ async fn session_list_assistant_filter_returns_only_matching_sessions() {
             parent_session_id: None,
             assistant_id: None,
             compaction_lineage_root_id: None,
+            include_archived: false,
         },
         &mut state,
         &ctx,
@@ -37298,6 +37354,167 @@ async fn session_list_assistant_filter_returns_only_matching_sessions() {
         other => panic!("expected Sessions, got {other:?}"),
     };
     assert_eq!(sessions.len(), 3);
+}
+
+#[tokio::test]
+async fn set_session_favorite_targets_b_while_a_is_attached() {
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let (mut state, attached_a) = attached_state(&ctx, project.path()).await;
+    let target_b = ctx
+        .db
+        .create_session("p", project.path().to_str().unwrap(), "Build")
+        .await
+        .unwrap();
+    let a_before = ctx.db.get_session(attached_a).await.unwrap().unwrap();
+    let attached_before = state.attached.as_ref().map(|att| att.handle.session_id());
+
+    let response = handle_request(
+        Request::SetSessionFavorite {
+            session_id: target_b.session_id,
+            favorite: true,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("writable B is favorited while A is attached");
+    match response {
+        Response::SessionFavoriteApplied {
+            session_id,
+            lineage_root_id,
+            favorite,
+        } => {
+            assert_eq!(session_id, target_b.session_id);
+            assert_eq!(lineage_root_id, target_b.session_id);
+            assert!(favorite);
+        }
+        other => panic!("expected SessionFavoriteApplied, got {other:?}"),
+    }
+
+    assert_eq!(
+        state.attached.as_ref().map(|att| att.handle.session_id()),
+        attached_before
+    );
+    assert_eq!(
+        state.attached.as_ref().map(|att| att.handle.session_id()),
+        Some(attached_a)
+    );
+    let a_after = ctx.db.get_session(attached_a).await.unwrap().unwrap();
+    assert_eq!(a_after.favorite, a_before.favorite);
+    assert_eq!(
+        a_after.last_active_at_unix_ms,
+        a_before.last_active_at_unix_ms
+    );
+    assert!(
+        !ctx.registry
+            .active_session_ids()
+            .contains(&target_b.session_id)
+    );
+    assert!(
+        ctx.db
+            .get_session(target_b.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .favorite
+    );
+
+    let again = handle_request(
+        Request::SetSessionFavorite {
+            session_id: target_b.session_id,
+            favorite: true,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("matching favorite is an acknowledged no-op");
+    assert!(matches!(
+        again,
+        Response::SessionFavoriteApplied { favorite: true, .. }
+    ));
+}
+
+#[tokio::test]
+async fn set_session_favorite_refuses_unknown_target() {
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let (mut state, attached_a) = attached_state(&ctx, project.path()).await;
+    let missing = Uuid::new_v4();
+    let err = handle_request(
+        Request::SetSessionFavorite {
+            session_id: missing,
+            favorite: true,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("unknown B is a typed miss");
+    assert_eq!(err.code, ErrorCode::UnknownSession);
+    assert_eq!(
+        state.attached.as_ref().map(|att| att.handle.session_id()),
+        Some(attached_a)
+    );
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn set_session_favorite_refuses_readonly_target() {
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let (mut state, _attached_a) = attached_state(&ctx, project.path()).await;
+    let target_b = ctx
+        .db
+        .create_session("p", project.path().to_str().unwrap(), "Build")
+        .await
+        .unwrap();
+    ctx.db
+        .write({
+            let session_id = target_b.session_id;
+            move |conn| {
+                conn.execute(
+                    "UPDATE sessions SET created_by_principal = ?1 WHERE session_id = ?2",
+                    [
+                        "flycockpit:authz-readonly".to_string(),
+                        session_id.to_string(),
+                    ],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    state.principal = ClientPrincipal::Remote(principal::RemotePrincipal {
+        user_id: "authz-readonly".into(),
+        actor_binding: None,
+        authorization: principal::RemoteAuthorization::LegacyRelayScopes(vec![
+            principal::PrincipalGrant {
+                scope: principal::PrincipalScope::AgentReadonly,
+                project_root: Some(project.path().to_string_lossy().into_owned()),
+            },
+        ]),
+    });
+    let err = handle_request(
+        Request::SetSessionFavorite {
+            session_id: target_b.session_id,
+            favorite: true,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("read-only B is refused");
+    assert_eq!(err.code, ErrorCode::ReadOnly);
+    assert!(
+        !ctx.db
+            .get_session(target_b.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .favorite
+    );
 }
 
 #[tokio::test]

@@ -63,6 +63,9 @@ pub struct SessionSummary {
     pub activity_state: Option<SessionActivityState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at_unix_ms: Option<i64>,
+    /// Resolved canonical-root navigation favorite. Every window in a
+    /// compaction lineage projects the same root bit; forks are independent.
+    pub favorite: bool,
     #[serde(default)]
     pub pin_count: u32,
     /// Undelivered assistant-inbox work for this main session. Notify-only

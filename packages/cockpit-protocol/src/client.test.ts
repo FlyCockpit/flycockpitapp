@@ -423,6 +423,33 @@ describe("RemoteSessionClient", () => {
     await expect(request).resolves.toEqual({ sessions: [] });
   });
 
+  it("sets a session favorite and parses the applied acknowledgement", async () => {
+    const { client, socket } = makeClient();
+    const sessionId = "11111111-1111-4111-8111-111111111111";
+    const request = client.setSessionFavorite(sessionId, true);
+    const relay = JSON.parse(socket.sent[0] ?? "{}");
+    expect(relay.payload).toMatchObject({
+      request: "set_session_favorite",
+      params: { session_id: sessionId, favorite: true },
+    });
+    socket.message({
+      v: PROTOCOL_VERSION,
+      kind: "res",
+      id: relay.payload.id,
+      response: "session_favorite_applied",
+      data: {
+        session_id: sessionId,
+        lineage_root_id: sessionId,
+        favorite: true,
+      },
+    });
+    await expect(request).resolves.toEqual({
+      session_id: sessionId,
+      lineage_root_id: sessionId,
+      favorite: true,
+    });
+  });
+
   it("resolves session_live_status responses", async () => {
     const { client, socket } = makeClient();
     const request = client.sessionLiveStatus(["11111111-1111-4111-8111-111111111111"]);

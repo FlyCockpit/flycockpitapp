@@ -319,15 +319,19 @@ impl OnboardingAuthority {
         if current.bootstrap_state == DbBootstrapState::Failed {
             return project(current, host_capabilities, None);
         }
+        let selected_secure_placement = current.selected_secure_placement;
+        let limited_mode = current.limited_mode;
+        let stage = current.stage;
+        let revision = current.revision;
         let (row, _) = self
             .db
             .onboarding_transition(
                 current,
-                format!("ready-construction-failed-{}", current.revision),
-                current.stage,
+                format!("ready-construction-failed-{revision}"),
+                stage,
                 DbBootstrapState::Failed,
-                current.limited_mode,
-                current.selected_secure_placement,
+                limited_mode,
+                selected_secure_placement,
                 stage_entry_config_generation(),
             )
             .await?;
@@ -346,14 +350,18 @@ impl OnboardingAuthority {
         if current.bootstrap_state != DbBootstrapState::Failed {
             return Ok(());
         }
+        let selected_secure_placement = current.selected_secure_placement;
+        let limited_mode = current.limited_mode;
+        let stage = current.stage;
+        let revision = current.revision;
         self.db
             .onboarding_transition(
                 current,
-                format!("ready-construction-recovered-{}", current.revision),
-                current.stage,
+                format!("ready-construction-recovered-{revision}"),
+                stage,
                 DbBootstrapState::Ready,
-                current.limited_mode,
-                current.selected_secure_placement,
+                limited_mode,
+                selected_secure_placement,
                 stage_entry_config_generation(),
             )
             .await?;

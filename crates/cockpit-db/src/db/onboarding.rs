@@ -320,9 +320,16 @@ impl Db {
             conn.query_row(
                 "SELECT stage_entered_at_unix_ms, stage_entry_config_generation FROM onboarding_runs WHERE id = 1",
                 [],
-                |row| Ok((row.get::<_, i64>(0)?, u64::try_from(row.get::<_, i64>(1)?)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        u64::try_from(row.get::<_, i64>(1)?)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    ))
+                },
             )
             .optional()
+            .context("loading onboarding stage fence")
         })
         .await
     }

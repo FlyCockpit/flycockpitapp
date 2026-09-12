@@ -1,6 +1,6 @@
 //! Durable owner/idempotency-key bindings for local daemon mutations.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use rusqlite::{OptionalExtension, params};
 
 use super::Db;
@@ -47,6 +47,7 @@ impl Db {
                 |row| row.get(0),
             )
             .optional()
+            .context("loading local operation started_at")
         })
         .await
     }

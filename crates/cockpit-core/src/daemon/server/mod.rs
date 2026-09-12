@@ -4346,6 +4346,7 @@ pub(crate) fn locked_in_process_endpoint(
         mpsc::channel::<cockpit_client::InProcessSensitiveRequest>(4);
     let ready_for_connections = ready_rx.clone();
     let locked_for_connections = locked.clone();
+    let locked_for_client_connections = locked_for_connections.clone();
     let ready_tx_for_watch = ready_tx.clone();
     tokio::spawn(async move {
         let mut ready_signal = locked_for_connections.ready_signal.subscribe();
@@ -4372,7 +4373,7 @@ pub(crate) fn locked_in_process_endpoint(
             let connection = if let Some(ctx) = ready_for_connections.borrow().clone() {
                 spawn_in_process_client(ctx)
             } else {
-                spawn_locked_in_process_client(locked_for_connections.clone())
+                spawn_locked_in_process_client(locked_for_client_connections.clone())
             };
             let _ = reply.send(Some(connection));
         }
@@ -4732,7 +4733,7 @@ impl Drop for ReadyTransitionPermit {
 
 struct ConstructedReady {
     locked: Arc<LockedServices>,
-    ready: ReadyServices,
+    ready: Option<ReadyServices>,
     permit: ReadyTransitionPermit,
     published: bool,
 }
@@ -4742,21 +4743,25 @@ impl ConstructedReady {
         Self {
             permit: ReadyTransitionPermit::new(locked.clone()),
             locked,
-            ready,
+            ready: Some(ready),
             published: false,
         }
+    }
+
+    fn take_ready(&mut self) -> ReadyServices {
+        self.ready.take().expect("ready services already consumed")
     }
 
     fn publish_stored(mut self) {
         self.published = true;
         self.permit.release();
-        self.locked.store_achieved_ready(self.ready);
+        self.locked.store_achieved_ready(self.take_ready());
     }
 
     fn publish_returned(mut self) -> ReadyServices {
         self.published = true;
         self.permit.release();
-        self.ready
+        self.take_ready()
     }
 
     async fn finalize_sensitive_in_process(
@@ -4764,7 +4769,8 @@ impl ConstructedReady {
         ready_tx: &watch::Sender<Option<Arc<DaemonContext>>>,
         result: cockpit_proto::OnboardingTransitionResult,
     ) -> cockpit_proto::SensitiveOnboardingIntentResponse {
-        let ctx = Arc::new(self.ready.context);
+        let ready = self.take_ready();
+        let ctx = Arc::new(ready.context);
         if recover_before_socket_publish(&ctx).await.is_err() {
             return cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
                 cockpit_proto::SensitiveOnboardingIntentError::ReadyConstructionFailed,
@@ -4937,7 +4943,8 @@ impl LockedServices {
         self.onboarding
             .mark_ready_construction_failed(self.host_capabilities.clone())
             .await
-            .context("recording ready-construction failure")
+            .context("recording ready-construction failure")?;
+        Ok(())
     }
 
     async fn mark_ready_construction_recovered(&self) -> Result<()> {
@@ -5009,7 +5016,10 @@ impl LockedServices {
             drop(constructed);
             error
         })?;
-        Ok((Response::OnboardingBootstrapSnapshot(snapshot), constructed))
+        Ok((
+            Response::OnboardingBootstrapSnapshot(Some(snapshot)),
+            constructed,
+        ))
     }
 
     fn store_achieved_ready(&self, ready: ReadyServices) {

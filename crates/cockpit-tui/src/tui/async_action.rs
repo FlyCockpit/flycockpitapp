@@ -35,7 +35,7 @@ fn test_async_runtime() -> &'static tokio::runtime::Handle {
     })
 }
 
-fn spawn_action_task<F>(future: F) -> JoinHandle<()>
+pub(crate) fn spawn_action_task<F>(future: F) -> JoinHandle<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
@@ -55,7 +55,7 @@ where
     }
 }
 
-fn spawn_blocking_action_task<F>(work: F) -> JoinHandle<()>
+pub(crate) fn spawn_blocking_action_task<F>(work: F) -> JoinHandle<()>
 where
     F: FnOnce() + Send + 'static,
 {
@@ -144,7 +144,13 @@ impl AsyncActionKind {
                 "autocomplete.files"
                 | "doctor.snapshot"
                 | "settings.path-suggest"
-                | "thread-check" => ReadOnly,
+                | "thread-check"
+                // The interactive startup reducer reads this one global
+                // field before it asks the lifecycle host for an owner.  It
+                // is deliberately read-only and cancellable: it must never
+                // become an exit fence merely because a terminal was closed
+                // between the first frame and the policy read.
+                | "startup.lifetime-policy" => ReadOnly,
                 "btw.teardown"
                 | "paste.delivery_receipt"
                 | "queue.edit"
@@ -162,12 +168,14 @@ impl AsyncActionKind {
                 | "history.page"
                 | "inventory.bundle"
                 | "leaks-list"
+                | "onboarding.bootstrap"
                 | "resources.snapshot"
                 | "sessions.list"
                 | "sessions.live"
                 | "sessions.preview"
                 | "sessions.inbox"
                 | "skills.list"
+                | "startup.workspace"
                 | "subagent.history.page"
                 | "session_setup.snapshot" => ReadOnly,
                 "assistant.resolve"
@@ -213,7 +221,12 @@ impl AsyncActionKind {
                 | "pending"
                 | "pins.review"
                 | "shutdown"
+                // Startup cleanup is cancellable. If a blocking worker has
+                // crossed into a secure unlink it may finish, but exit never
+                // waits for or applies its presentation completion.
+                | "startup.clipboard_reconcile"
                 | "startup.dependencies"
+                | "startup.export_recovery"
                 | "startup.guidance.estimate"
                 | "startup.remote_disclosures"
                 | "subagent.history" => ReadOnly,
@@ -533,6 +546,48 @@ pub enum AsyncActionPayload {
     Tools(crate::tui::tools_pane::ToolsCompletion),
     WorkspaceTrust(crate::tui::app::WorkspaceTrustCompletion),
     OnboardingBootstrap(Option<cockpit_proto::OnboardingBootstrapSnapshot>),
+    StartupOnboardingTransition(crate::tui::app::StartupOnboardingCompletion),
+    /// The initial post-paint bootstrap carries the already-selected daemon
+    /// endpoint forward to the trust reducer.  Reusing it is what keeps
+    /// startup to one lifecycle request rather than accidentally resolving a
+    /// second owner while asking for workspace trust.
+    StartupOnboardingBootstrap {
+        generation: u64,
+        request_id: String,
+        receipt: Option<cockpit_proto::OnboardingTransitionReceipt>,
+        snapshot: Option<cockpit_proto::OnboardingBootstrapSnapshot>,
+    },
+    StartupLifecycleResolved {
+        generation: u64,
+        result: Result<crate::tui::agent_runner::SelectedLifecycle, String>,
+    },
+    StartupLifetimePolicy {
+        generation: u64,
+        result: Result<bool, String>,
+    },
+    StartupOnboardingFailed {
+        generation: u64,
+        error: String,
+    },
+    StartupWorkspace(crate::tui::app::StartupWorkspaceCompletion),
+    StartupWorkspaceFailed {
+        generation: u64,
+        snapshot: Option<cockpit_proto::OnboardingBootstrapSnapshot>,
+        error: String,
+    },
+    StartupAssistantSessionResolved {
+        generation: u64,
+        result: Result<uuid::Uuid, String>,
+    },
+    StartupClipboardReconciled {
+        generation: u64,
+        removed: usize,
+        unsafe_entries: usize,
+        failed: bool,
+    },
+    StartupExportRecovery {
+        generation: u64,
+    },
     Sealed(crate::tui::app::slash::SealedCompletion),
     SettingsDaemon(crate::tui::settings::SettingsDaemonEffectCompletion),
     SettingsBlocking(crate::tui::settings::SettingsBlockingEffectCompletion),

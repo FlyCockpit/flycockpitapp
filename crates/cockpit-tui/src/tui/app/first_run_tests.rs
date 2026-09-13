@@ -65,6 +65,19 @@ fn with_untrusted_workspace<T>(cwd: &std::path::Path, f: impl FnOnce() -> T) -> 
     cockpit_config::trust::with_workspace_trust_policy(policy, f)
 }
 
+fn open_startup_trust_modal_from_daemon(app: &mut App, cwd: &std::path::Path) {
+    let root = cockpit_config::trust::resolve_trust_root(cwd).unwrap();
+    app.first_paint_completed = true;
+    app.apply_startup_workspace_completion(super::StartupWorkspaceCompletion {
+        generation: app.startup_background.generation,
+        opened: cwd.to_path_buf(),
+        root,
+        mode: None,
+        config_generation: 0,
+        snapshot: None,
+    });
+}
+
 fn config_with_provider(provider_id: &str, model_id: &str) -> ProvidersConfig {
     let mut cfg = ProvidersConfig::default();
     let mut provider = ProviderEntry {
@@ -134,6 +147,7 @@ fn set_onboarding_stage(app: &mut App, stage: OnboardingStage) {
         app.config_snapshot.generation = 1;
         app.config_snapshot.providers.set_resolution_generation(1);
     }
+    app.startup_background.workspace_ready = true;
     app.apply_onboarding_bootstrap_snapshot(Some(onboarding_snapshot(stage)));
 }
 
@@ -800,12 +814,8 @@ fn provider_engine_escape_never_offers_an_illegal_back() {
 fn stacked_modal_focus_matches_render_order() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-    let root = cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap();
-    let mut app = App::new_with_workspace_trust(
-        Some(tmp.path()),
-        false,
-        StartupWorkspaceTrust::Pending(root),
-    );
+    let mut app = App::new_with_bootstrap_config(Some(tmp.path()), false);
+    open_startup_trust_modal_from_daemon(&mut app, tmp.path());
 
     assert_eq!(
         app.startup_modal_on_top(),
@@ -828,12 +838,8 @@ fn stacked_modal_focus_matches_render_order() {
 async fn keypress_does_not_record_hidden_trust_decision() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
-    let root = cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap();
-    let mut app = App::new_with_workspace_trust(
-        Some(tmp.path()),
-        false,
-        StartupWorkspaceTrust::Pending(root.clone()),
-    );
+    let mut app = App::new_with_bootstrap_config(Some(tmp.path()), false);
+    open_startup_trust_modal_from_daemon(&mut app, tmp.path());
 
     assert_eq!(
         app.startup_modal_on_top(),
@@ -847,12 +853,8 @@ async fn keypress_does_not_record_hidden_trust_decision() {
 async fn onboarding_never_auto_trusts() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
-    let root = cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap();
-    let mut app = App::new_with_workspace_trust(
-        Some(tmp.path()),
-        false,
-        StartupWorkspaceTrust::Pending(root.clone()),
-    );
+    let mut app = App::new_with_bootstrap_config(Some(tmp.path()), false);
+    open_startup_trust_modal_from_daemon(&mut app, tmp.path());
 
     app.service_onboarding_shell();
     assert_eq!(app.dialog.test_page_name(), Some("workspace_trust"));

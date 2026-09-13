@@ -168,6 +168,7 @@ mod image_sidecar_policy {
             trusted_primary_default: Some(sidecar_pair("sidecar", "s-model")),
             untrusted_primary_default: Some(sidecar_pair("sidecar", "s-model")),
             per_primary_override: None,
+            permitted: Vec::new(),
         };
         let resolver = SidecarResolver::new(&providers, &media, &config, 1);
         let res = resolver.resolve("primary", "p-model", false);
@@ -196,6 +197,7 @@ mod image_sidecar_policy {
             trusted_primary_default: Some(sidecar_pair("sidecar", "s-model")),
             untrusted_primary_default: Some(sidecar_pair("sidecar", "s-model")),
             per_primary_override: None,
+            permitted: Vec::new(),
         };
         let resolver = SidecarResolver::new(&providers, &media, &config, 1);
         let res = resolver.resolve("primary", "p-model", true);
@@ -223,6 +225,7 @@ mod image_sidecar_policy {
             trusted_primary_default: Some(sidecar_pair("sidecar", "s-model")),
             untrusted_primary_default: Some(sidecar_pair("sidecar", "s-model")),
             per_primary_override: None,
+            permitted: Vec::new(),
         };
         let resolver = SidecarResolver::new(&providers, &media, &config, 1);
         let res = resolver.resolve("primary", "p-model", false);
@@ -256,6 +259,7 @@ mod image_sidecar_policy {
             trusted_primary_default: Some(sidecar_pair("sidecar", "s-model")),
             untrusted_primary_default: Some(sidecar_pair("sidecar", "s-model")),
             per_primary_override: None,
+            permitted: Vec::new(),
         };
         let resolver = SidecarResolver::new(&providers, &media, &config, 1);
         let res = resolver.resolve("primary", "p-model", true);
@@ -292,6 +296,7 @@ mod image_sidecar_policy {
             trusted_primary_default: Some(sidecar_pair("sidecar", "s-model")),
             untrusted_primary_default: Some(sidecar_pair("sidecar", "s-model")),
             per_primary_override: Some(sidecar_pair("override", "o-model")),
+            permitted: Vec::new(),
         };
         let resolver = SidecarResolver::new(&providers, &media, &config, 1);
         let res = resolver.resolve("primary", "p-model", false);
@@ -303,6 +308,39 @@ mod image_sidecar_policy {
             selected.selection_source,
             SelectionSource::PerPrimaryOverride
         );
+    }
+
+    #[test]
+    fn permitted_declarations_are_the_exclusive_candidate_universe() {
+        let providers = providers_with(
+            (
+                "primary",
+                "p-model",
+                provider_entry_trusted("http://localhost:8080"),
+            ),
+            (
+                "sidecar",
+                "s-model",
+                provider_entry_trusted("http://localhost:9090"),
+            ),
+        );
+        let mut providers = providers;
+        let mut extra = provider_entry_trusted("http://localhost:7070");
+        extra.models.push(image_capable_model("o-model"));
+        providers.providers.insert("override".to_string(), extra);
+        let media = media_policy_default();
+        let config = SidecarSelectionConfig {
+            mode: SidecarMode::Always,
+            trusted_primary_default: Some(sidecar_pair("sidecar", "s-model")),
+            untrusted_primary_default: Some(sidecar_pair("sidecar", "s-model")),
+            per_primary_override: None,
+            permitted: vec![sidecar_pair("override", "o-model")],
+        };
+        let resolver = SidecarResolver::new(&providers, &media, &config, 1);
+        let res = resolver.resolve("primary", "p-model", false);
+        let selected = res.selected.expect("permitted sidecar selected");
+        assert_eq!(selected.provider, "override");
+        assert_eq!(selected.model, "o-model");
     }
 
     #[test]
@@ -332,6 +370,7 @@ mod image_sidecar_policy {
             trusted_primary_default: Some(sidecar_pair("trusted-sidecar", "ts-model")),
             untrusted_primary_default: Some(sidecar_pair("untrusted-sidecar", "us-model")),
             per_primary_override: None,
+            permitted: Vec::new(),
         };
         let resolver = SidecarResolver::new(&providers, &media, &config, 1);
         let res = resolver.resolve("primary", "p-model", false);
@@ -367,6 +406,7 @@ mod image_sidecar_policy {
             trusted_primary_default: Some(sidecar_pair("trusted-sidecar", "ts-model")),
             untrusted_primary_default: Some(sidecar_pair("untrusted-sidecar", "us-model")),
             per_primary_override: None,
+            permitted: Vec::new(),
         };
         let resolver = SidecarResolver::new(&providers, &media, &config, 1);
         let res = resolver.resolve("primary", "p-model", false);
@@ -396,6 +436,7 @@ mod image_sidecar_policy {
             trusted_primary_default: None,
             untrusted_primary_default: None,
             per_primary_override: None,
+            permitted: Vec::new(),
         };
         let resolver = SidecarResolver::new(&providers, &media, &config, 1);
         let res = resolver.resolve("primary", "p-model", true);
@@ -430,6 +471,7 @@ mod image_sidecar_policy {
             trusted_primary_default: None,
             untrusted_primary_default: None,
             per_primary_override: None,
+            permitted: Vec::new(),
         };
         let resolver = SidecarResolver::new(&providers, &media, &config, 1);
         let res = resolver.resolve("primary", "p-model", false);
@@ -467,6 +509,7 @@ mod image_sidecar_policy {
             trusted_primary_default: Some(sidecar_pair("sidecar", "s-model")),
             untrusted_primary_default: None,
             per_primary_override: None,
+            permitted: Vec::new(),
         };
         let resolver = SidecarResolver::new(&providers, &media, &config, 1);
         let res = resolver.resolve("primary", "p-model", false);
@@ -496,6 +539,7 @@ mod image_sidecar_policy {
             trusted_primary_default: Some(sidecar_pair("sidecar", "s-model")),
             untrusted_primary_default: None,
             per_primary_override: None,
+            permitted: Vec::new(),
         };
         let resolver = SidecarResolver::new(&providers, &media, &config, 1);
         let res = resolver.resolve("primary", "p-model", false);
@@ -526,6 +570,7 @@ mod image_sidecar_policy {
             trusted_primary_default: Some(sidecar_pair("sidecar", "s-model")),
             untrusted_primary_default: None,
             per_primary_override: None,
+            permitted: Vec::new(),
         };
         let resolver = SidecarResolver::new(&providers, &media, &config, 1);
         let res = resolver.resolve("primary", "p-model", false);
@@ -542,6 +587,7 @@ mod image_sidecar_policy {
             trusted_primary_default: None,
             untrusted_primary_default: None,
             per_primary_override: None,
+            permitted: Vec::new(),
         };
         // If this compiles, there is no cap field on the config.
         let _ = config;
@@ -567,6 +613,7 @@ mod image_sidecar_policy {
             trusted_primary_default: Some(sidecar_pair("sidecar", "s-model")),
             untrusted_primary_default: None,
             per_primary_override: None,
+            permitted: Vec::new(),
         };
         let resolver = SidecarResolver::new(&providers, &media, &config, 42);
         let res = resolver.resolve("primary", "p-model", false);
@@ -595,6 +642,7 @@ mod image_sidecar_policy {
             trusted_primary_default: Some(sidecar_pair("sidecar", "s-model")),
             untrusted_primary_default: None,
             per_primary_override: None,
+            permitted: Vec::new(),
         };
         let resolver = SidecarResolver::new(&providers, &media, &config, 1);
         let res = resolver.resolve("primary", "p-model", false);
@@ -1514,6 +1562,7 @@ mod fallback {
             trusted_primary_default: None, // no candidate
             untrusted_primary_default: None,
             per_primary_override: None,
+            permitted: Vec::new(),
         };
         let resolver = SidecarResolver::new(&providers, &media, &config, 1);
         let res = resolver.resolve("primary", "p-model", true);
@@ -1549,6 +1598,7 @@ mod fallback {
             trusted_primary_default: None,
             untrusted_primary_default: None,
             per_primary_override: None,
+            permitted: Vec::new(),
         };
         let resolver = SidecarResolver::new(&providers, &media, &config, 1);
         let res = resolver.resolve("primary", "p-model", false);

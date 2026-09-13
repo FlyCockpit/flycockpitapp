@@ -1881,12 +1881,30 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     ));
                 }
                 let mode = args.get("mode").and_then(Value::as_str);
+                let interactive_subagents_permitted = agent
+                    .vnext_grant
+                    .as_ref()
+                    .is_none_or(|grant| grant.interactive_subagents_permitted());
+                let force_noninteractive =
+                    agent.vnext_grant.is_some() && !interactive_subagents_permitted;
                 let noninteractive = resolve_interactivity(
                     mode,
                     &child,
                     resume_handle.is_some(),
-                    agent.vnext_grant.is_some(),
+                    force_noninteractive,
                 );
+                if !noninteractive && !interactive_subagents_permitted {
+                    return_structural!(task_refusal(
+                        &tc.id,
+                        tc.provider
+                            .as_ref()
+                            .and_then(|provider| provider.item_id.clone()),
+                        tc.provider
+                            .as_ref()
+                            .map(|provider| provider.call_id.clone()),
+                        "interactive subagents are disabled for this agent",
+                    ));
+                }
                 if agent.vnext_grant.is_some()
                     && !noninteractive
                     && (cwd.is_some() || write_scope.is_some() || workspace_lease.is_some())
@@ -3620,7 +3638,11 @@ pub(crate) async fn run_turn(
         &resolved_names,
         &active_tools,
         max_parallel,
-        agent.vnext_grant.is_some(),
+        agent.vnext_grant.is_some()
+            && !agent
+                .vnext_grant
+                .as_ref()
+                .is_some_and(|grant| grant.interactive_subagents_permitted()),
     );
 
     // The exportable scheduling event intentionally omits arguments. Persist a

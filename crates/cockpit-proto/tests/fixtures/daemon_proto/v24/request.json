@@ -2438,5 +2438,40 @@
       "selected_choice": "allow_once",
       "attention_id": "22222222-2222-4222-8222-222222222222"
     }
+  },
+  "get_agent_authoring_projection": {
+    "request": "get_agent_authoring_projection"
+  },
+  "apply_authored_agent_package": {
+    "request": "apply_authored_agent_package",
+    "params": {
+      "client_operation_id": "authored-package-apply",
+      "expected_policy_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "package": {
+        "dto_version": 1,
+        "name": "helper",
+        "markdown": "---\nschemaVersion: 1\nagentId: authored/helper\nroles: [code]\ndescription: Helper\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n    models:\n      - providerId: vendor\n        modelId: exact-a\n        default: true\n---\nbody\n",
+        "source": {
+          "kind": "authored",
+          "source_locator": "authored/helper",
+          "third_party_trust_confirmed": false
+        },
+        "policy_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "model_trust_confirmations": [
+          {
+            "provider_id": "vendor",
+            "model_id": "exact-a",
+            "confirmed": true
+          }
+        ],
+        "make_default": true
+      }
+    }
+  },
+  "get_authored_agent_package_receipt": {
+    "request": "get_authored_agent_package_receipt",
+    "params": {
+      "client_operation_id": "authored-package-apply"
+    }
   }
 }

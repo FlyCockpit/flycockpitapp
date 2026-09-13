@@ -370,53 +370,66 @@ async fn validate_onboarding_stage_settlement(
             }
         }
         proto::OnboardingStage::Agent => {
-            let wizard_id = settlement
-                .wizard_id
-                .as_deref()
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    bad_request("agent advance requires a settled setup wizard identity")
-                })?;
-            if wizard_id != crate::wizard::ONBOARDING_AGENT_WIZARD_ID {
-                return Err(bad_request(
-                    "agent onboarding settlement references an invalid setup wizard",
-                ));
+            if settlement.wizard_id.as_deref() == Some(crate::wizard::ONBOARDING_AGENT_WIZARD_ID) {
+                let (identity, response_json) = validate_terminal_local_operation_settlement(
+                    ctx,
+                    owner,
+                    &operation_id,
+                    "apply_setup_wizard",
+                )
+                .await?;
+                validate_settlement_request_hash(&identity)?;
+                let response: Response = serde_json::from_str(&response_json).map_err(internal)?;
+                return match response {
+                    Response::SetupWizardApplied {
+                        wizard_id: committed_wizard_id,
+                        changed,
+                        config_generation,
+                        ..
+                    } if committed_wizard_id == crate::wizard::ONBOARDING_AGENT_WIZARD_ID
+                        && changed
+                        && config_generation == settlement.config_generation =>
+                    {
+                        if ctx
+                            .db
+                            .default_agent_installation()
+                            .await
+                            .map_err(internal)?
+                            .is_some()
+                        {
+                            Ok(())
+                        } else {
+                            Err(bad_request(
+                                "agent onboarding advance requires a committed default installation",
+                            ))
+                        }
+                    }
+                    _ => Err(bad_request(
+                        "agent onboarding settlement does not match the requested advance",
+                    )),
+                };
             }
             let (identity, response_json) = validate_terminal_local_operation_settlement(
                 ctx,
                 owner,
                 &operation_id,
-                "apply_setup_wizard",
+                "apply_authored_agent_package",
             )
             .await?;
             validate_settlement_request_hash(&identity)?;
             let response: Response = serde_json::from_str(&response_json).map_err(internal)?;
             match response {
-                Response::SetupWizardApplied {
-                    wizard_id: committed_wizard_id,
-                    changed,
-                    config_generation,
-                    ..
-                } if committed_wizard_id == wizard_id
-                    && changed
-                    && config_generation == settlement.config_generation =>
+                Response::AuthoredAgentPackage(
+                    cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(receipt),
+                ) if receipt.client_operation_id == operation_id
+                    && receipt.status == cockpit_proto::AuthoredAgentReceiptStatus::Committed
+                    && receipt.default_selected
+                    && receipt.installation_id.is_some() =>
                 {
-                    if ctx
-                        .db
-                        .default_agent_installation()
-                        .await
-                        .map_err(internal)?
-                        .is_some()
-                    {
-                        Ok(())
-                    } else {
-                        Err(bad_request(
-                            "agent onboarding advance requires a committed default installation",
-                        ))
-                    }
+                    Ok(())
                 }
                 _ => Err(bad_request(
-                    "agent onboarding settlement does not match the requested advance",
+                    "agent onboarding settlement does not match the requested authored package",
                 )),
             }
         }
@@ -484,9 +497,16 @@ async fn compensate_onboarding_agent_publication(
     operation_id: uuid::Uuid,
     backup: &std::path::Path,
     previous_default_installation_id: Option<uuid::Uuid>,
+    authored_owner_digest: String,
 ) -> anyhow::Result<()> {
     // Always attempt every inverse operation.  The journal remains intact on
     // any failure, so startup can retry exactly this full compensation.
+    // Invert the nested authored journal first so a later crash cannot
+    // complete-forward an apply this compensation is rolling back.
+    let authored = ctx
+        .db
+        .compensate_authored_agent_package_journal(authored_owner_digest, operation_id.to_string())
+        .await;
     let config = crate::wizard::OnboardingConfigRollback::restore_durable_journal(backup);
     let installation = cleanup_owned_onboarding_installation(ctx, operation_id).await;
     let default = ctx
@@ -496,11 +516,11 @@ async fn compensate_onboarding_agent_publication(
             crate::workspace_lease::now_unix_ms(),
         )
         .await;
-    if let (Ok(()), Ok(()), Ok(())) = (&config, &installation, &default) {
+    if let (Ok(()), Ok(()), Ok(()), Ok(())) = (&config, &installation, &default, &authored) {
         return settle_onboarding_publication_journal(ctx, operation_id, backup).await;
     }
     Err(anyhow::anyhow!(
-        "onboarding publication compensation incomplete; config: {}; installation: {}; prior default: {}",
+        "onboarding publication compensation incomplete; config: {}; installation: {}; prior default: {}; authored journal: {}",
         config
             .err()
             .map_or_else(|| "ok".to_string(), |error| format!("{error:#}")),
@@ -510,30 +530,33 @@ async fn compensate_onboarding_agent_publication(
         default
             .err()
             .map_or_else(|| "ok".to_string(), |error| format!("{error:#}")),
+        authored
+            .err()
+            .map_or_else(|| "ok".to_string(), |error| format!("{error:#}")),
     ))
 }
 
 /// Reconcile an interrupted onboarding publication before the daemon accepts
 /// clients. The intent is created before installation, so restoring its exact
-/// config preimage, prior DB default, and operation-named installation exposes
-/// none of an interrupted plan. A missing/corrupt private journal fails closed
-/// and keeps the socket unpublished.
+/// config preimage, prior DB default, operation-named installation, and nested
+/// authored journal (draft CAS included) exposes none of an interrupted plan.
+/// A missing/corrupt private journal fails closed and keeps the socket unpublished.
 pub(super) async fn recover_onboarding_agent_publication_journals(
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
-    let rows: Vec<(String, String, Option<String>)> = ctx
+    let rows: Vec<(String, String, Option<String>, String)> = ctx
         .db
         .read(|conn| {
             let mut statement = conn.prepare(
-                "SELECT operation_id,backup_path,previous_default_installation_id FROM onboarding_agent_publication_journals ORDER BY created_at_unix_ms",
+                "SELECT operation_id,backup_path,previous_default_installation_id,authored_owner_digest FROM onboarding_agent_publication_journals ORDER BY created_at_unix_ms",
             )?;
             Ok(statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?)
         })
         .await
         .map_err(internal)?;
-    for (operation, backup_path, previous_default) in rows {
+    for (operation, backup_path, previous_default, authored_owner_digest) in rows {
         let operation_id = uuid::Uuid::parse_str(&operation)
             .map_err(|error| internal(anyhow::Error::from(error)))?;
         let backup = std::path::PathBuf::from(backup_path);
@@ -541,9 +564,15 @@ pub(super) async fn recover_onboarding_agent_publication_journals(
             .map(|value| uuid::Uuid::parse_str(&value))
             .transpose()
             .map_err(|error| internal(anyhow::Error::from(error)))?;
-        compensate_onboarding_agent_publication(ctx, operation_id, &backup, previous_default)
-            .await
-            .map_err(internal)?;
+        compensate_onboarding_agent_publication(
+            ctx,
+            operation_id,
+            &backup,
+            previous_default,
+            authored_owner_digest,
+        )
+        .await
+        .map_err(internal)?;
     }
     Ok(())
 }
@@ -8513,30 +8542,32 @@ async fn handle_serialized_request_impl(
                     code: ErrorCode::BadRequest,
                     message: error.to_string(),
                 })?;
-            let policy = crate::agents::effective_goal_supervision_for_agent(
+            let resolved = crate::agents::effective_goal_supervision_with_agent_policy(
                 std::path::Path::new(&session.project_root),
                 &session.active_agent,
                 session_override.as_ref(),
                 extended.goal_supervision,
             );
-            if !policy.enabled {
+            if !resolved.config.enabled {
                 return Err(ErrorPayload {
                     code: ErrorCode::BadRequest,
                     message: "goal supervision is disabled by operator configuration".to_string(),
                 });
             }
-            policy.validate().map_err(|error| ErrorPayload {
+            resolved.config.validate().map_err(|error| ErrorPayload {
                 code: ErrorCode::BadRequest,
                 message: error.to_string(),
             })?;
-            let budget = token_budget.unwrap_or(policy.default_token_budget);
+            let budget = token_budget.unwrap_or(resolved.config.default_token_budget);
             if budget <= 0 {
                 return Err(ErrorPayload {
                     code: ErrorCode::BadRequest,
                     message: "goal budget must be positive".to_string(),
                 });
             }
-            let policy_json = serde_json::to_string(&policy).map_err(internal)?;
+            let policy_json =
+                crate::agents::resolved_goal_policy_json(&resolved.config, resolved.goal_skeptics)
+                    .map_err(internal)?;
             #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::CreateGoal {
@@ -11181,6 +11212,73 @@ async fn handle_serialized_request_impl(
         Request::AgentInstallationInspect(request) => {
             let service = ctx.agent_installation_service().map_err(internal)?;
             Ok(Response::AgentInstallation(service.inspect(request).await))
+        }
+        Request::GetAgentAuthoringProjection => {
+            let projection = crate::daemon::agent_authoring::get_projection(ctx)
+                .await
+                .map_err(internal)?;
+            Ok(Response::AgentAuthoringProjection(projection))
+        }
+        Request::ApplyAuthoredAgentPackage(request) => {
+            let settlement_owner = settings_capability_owner(state);
+            let request_hash = local_operation_request_hash(&request)?;
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &settlement_owner,
+                &request.client_operation_id,
+                "apply_authored_agent_package",
+                request_hash,
+            )
+            .await?
+            {
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
+            let outcome = crate::daemon::agent_authoring::apply_package(
+                ctx,
+                request.clone(),
+                Some(crate::daemon::agent_authoring::AuthoredApplyFence {
+                    owner_digest: settlement_owner.clone(),
+                    request_hash,
+                    fencing_generation,
+                }),
+            )
+            .await;
+            match outcome {
+                Ok(response) => {
+                    let response = Response::AuthoredAgentPackage(response);
+                    finish_local_operation(
+                        ctx,
+                        settlement_owner,
+                        request.client_operation_id.clone(),
+                        request_hash,
+                        fencing_generation,
+                        &response,
+                    )
+                    .await?;
+                    Ok(response)
+                }
+                Err(error) => {
+                    let error = internal(error);
+                    finish_local_operation_error(
+                        ctx,
+                        settlement_owner,
+                        request.client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    Err(error)
+                }
+            }
+        }
+        Request::GetAuthoredAgentPackageReceipt(query) => {
+            let owner = settings_capability_owner(state);
+            let receipt = crate::daemon::agent_authoring::receipt(ctx, &owner, query)
+                .await
+                .map_err(internal)?;
+            Ok(Response::AuthoredAgentPackageReceipt(Some(receipt)))
         }
 
         Request::CreateAssistantSession {
@@ -18343,8 +18441,11 @@ async fn handle_serialized_request_impl(
                     // installation side effect. A daemon death at every later
                     // boundary is recovered before the socket is published.
                     let _publication_rollback =
-                        crate::wizard::capture_onboarding_agent_config(&prepared.plan)
-                            .map_err(internal)?;
+                        crate::wizard::capture_onboarding_agent_config_for_providers(
+                            &prepared.draft,
+                            Some(&prepared.providers),
+                        )
+                        .map_err(internal)?;
                     let previous_default_installation_id = ctx
                         .db
                         .default_agent_installation()
@@ -18357,12 +18458,13 @@ async fn handle_serialized_request_impl(
                     let journal_backup = publication_backup.to_string_lossy().into_owned();
                     let journal_previous_default =
                         previous_default_installation_id.map(|id| id.to_string());
+                    let journal_authored_owner = settlement_owner.clone();
                     if let Err(error) = ctx
                         .db
                         .write(move |conn| {
                             conn.execute(
-                                "INSERT INTO onboarding_agent_publication_journals(operation_id,backup_path,previous_default_installation_id,created_at_unix_ms) VALUES(?1,?2,?3,?4)",
-                                rusqlite::params![journal_operation,journal_backup,journal_previous_default,crate::workspace_lease::now_unix_ms()],
+                                "INSERT INTO onboarding_agent_publication_journals(operation_id,backup_path,previous_default_installation_id,authored_owner_digest,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5)",
+                                rusqlite::params![journal_operation,journal_backup,journal_previous_default,journal_authored_owner,crate::workspace_lease::now_unix_ms()],
                             )?;
                             Ok(())
                         })
@@ -18373,162 +18475,80 @@ async fn handle_serialized_request_impl(
                         );
                         return Err(internal(error));
                     }
-                    let service = match ctx.agent_installation_service() {
-                        Ok(service) => service,
+                    let onboarding =
+                        ctx.db
+                            .onboarding_snapshot()
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|row| {
+                                (row.stage == crate::db::onboarding::OnboardingStage::Agent).then(
+                                    || cockpit_proto::AuthoredAgentOnboardingCorrelation {
+                                        run_id: row.run_id,
+                                        attempt_id: row.attempt_id,
+                                        stage_revision: row.revision,
+                                    },
+                                )
+                            });
+                    let authored_request = cockpit_proto::ApplyAuthoredAgentPackageRequest {
+                        client_operation_id: operation_key.clone(),
+                        expected_policy_revision: prepared.snapshot.policy_revision.clone(),
+                        package: prepared.draft.clone(),
+                        onboarding,
+                    };
+                    let authored_request_hash = local_operation_request_hash(&authored_request)?;
+                    match crate::daemon::agent_authoring::apply_package_under_publication_lock(
+                        ctx,
+                        authored_request,
+                        Some(crate::daemon::agent_authoring::AuthoredApplyFence {
+                            owner_digest: settlement_owner.clone(),
+                            request_hash: authored_request_hash,
+                            fencing_generation,
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(receipt))
+                            if receipt.installation_id.is_some() => {}
+                        Ok(other) => {
+                            let compensation = compensate_onboarding_agent_publication(
+                                ctx,
+                                owned_installation_id,
+                                &publication_backup,
+                                previous_default_installation_id,
+                                settlement_owner.clone(),
+                            )
+                            .await;
+                            return Err(internal(match compensation {
+                                Ok(()) => anyhow::anyhow!(
+                                    "agent onboarding authored package was not committed: {other:?}"
+                                ),
+                                Err(recovery) => anyhow::anyhow!(
+                                    "agent onboarding authored package was not committed ({other:?}); recovery remains pending: {recovery:#}"
+                                ),
+                            }));
+                        }
                         Err(error) => {
                             let compensation = compensate_onboarding_agent_publication(
                                 ctx,
                                 owned_installation_id,
                                 &publication_backup,
                                 previous_default_installation_id,
+                                settlement_owner.clone(),
                             )
                             .await;
                             return Err(internal(match compensation {
                                 Ok(()) => error,
                                 Err(recovery) => anyhow::anyhow!(
-                                    "agent onboarding installation service unavailable ({error:#}); recovery remains pending: {recovery:#}"
+                                    "agent onboarding authored package failed ({error:#}); recovery remains pending: {recovery:#}"
                                 ),
                             }));
                         }
                     };
-                    let install = service
-                        .begin(
-                            cockpit_proto::AgentInstallationBeginV1 {
-                                dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION,
-                                idempotency_key: operation_key.clone(),
-                                operation: cockpit_proto::AgentInstallationOperationKind::Install,
-                                scope: cockpit_proto::AgentInstallationScopeWire::Global,
-                                workspace_path: None,
-                                source_locator: prepared.plan.source_locator.clone(),
-                                target_installation_id: None,
-                                replace_acknowledged: false,
-                                third_party_trust_confirmed: prepared
-                                    .plan
-                                    .third_party_trust_confirmed,
-                                requested_slot: Some("primary".into()),
-                                roles: Vec::new(),
-                                computer_use: false,
-                                primary_slot_id: None,
-                                auto_select_first_exact: false,
-                            },
-                            crate::workspace_lease::now_unix_ms(),
-                        )
-                        .await;
-                    let terminal = match install {
-                        cockpit_proto::AgentInstallationResultV1::NeedsChoice {
-                            continuation_token,
-                            choices,
-                            ..
-                        } => {
-                            let choice = choices
-                                .iter()
-                                .find(|choice| {
-                                    choice.model_id == prepared.plan.default_model.model
-                                        && crate::daemon::agent_installation::resolvable_provider_handle_for_choice(
-                                            &prepared.providers,
-                                            choice,
-                                        )
-                                        .as_deref()
-                                            == Some(prepared.plan.default_model.provider.as_str())
-                                });
-                            let Some(choice) = choice else {
-                                let compensation = compensate_onboarding_agent_publication(
-                                    ctx,
-                                    owned_installation_id,
-                                    &publication_backup,
-                                    previous_default_installation_id,
-                                )
-                                .await;
-                                return match compensation {
-                                    Ok(()) => Err(internal(anyhow::anyhow!(
-                                        "selected onboarding model is absent from daemon binding choices"
-                                    ))),
-                                    Err(recovery) => Err(internal(anyhow::anyhow!(
-                                        "selected onboarding model is absent from daemon binding choices; recovery remains pending: {recovery:#}"
-                                    ))),
-                                };
-                            };
-                            service
-                                .submit_choice(
-                                    cockpit_proto::AgentInstallationSubmitChoiceV1 {
-                                        dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION,
-                                        continuation_token,
-                                        choice_id: Some(choice.choice_id.clone()),
-                                        defer: false,
-                                    },
-                                    crate::workspace_lease::now_unix_ms(),
-                                )
-                                .await
-                        }
-                        result => result,
-                    };
-                    let installed_id = match terminal {
-                        cockpit_proto::AgentInstallationResultV1::Receipt {
-                            status:
-                                cockpit_proto::AgentInstallationReceiptStatusV1::Installed
-                                | cockpit_proto::AgentInstallationReceiptStatusV1::Bound,
-                            installation_id: Some(installation_id),
-                            ..
-                        } => match uuid::Uuid::parse_str(&installation_id) {
-                            Ok(installation_id) => installation_id,
-                            Err(error) => {
-                                let compensation = compensate_onboarding_agent_publication(
-                                    ctx,
-                                    owned_installation_id,
-                                    &publication_backup,
-                                    previous_default_installation_id,
-                                )
-                                .await;
-                                return Err(internal(match compensation {
-                                    Ok(()) => anyhow::Error::from(error),
-                                    Err(recovery) => anyhow::anyhow!(
-                                        "agent onboarding returned an invalid installation identity ({error}); recovery remains pending: {recovery:#}"
-                                    ),
-                                }));
-                            }
-                        },
-                        cockpit_proto::AgentInstallationResultV1::Error { error } => {
-                            let compensation = compensate_onboarding_agent_publication(
-                                ctx,
-                                owned_installation_id,
-                                &publication_backup,
-                                previous_default_installation_id,
-                            )
-                            .await;
-                            return match compensation {
-                                Ok(()) => Err(internal(anyhow::anyhow!(
-                                    "agent onboarding install failed: {}",
-                                    error.message
-                                ))),
-                                Err(recovery) => Err(internal(anyhow::anyhow!(
-                                    "agent onboarding install failed: {}; recovery remains pending: {recovery:#}",
-                                    error.message
-                                ))),
-                            };
-                        }
-                        _ => {
-                            let compensation = compensate_onboarding_agent_publication(
-                                ctx,
-                                owned_installation_id,
-                                &publication_backup,
-                                previous_default_installation_id,
-                            )
-                            .await;
-                            return match compensation {
-                                Ok(()) => Err(internal(anyhow::anyhow!(
-                                    "agent onboarding did not produce a usable primary binding"
-                                ))),
-                                Err(recovery) => Err(internal(anyhow::anyhow!(
-                                    "agent onboarding did not produce a usable primary binding; recovery remains pending: {recovery:#}"
-                                ))),
-                            };
-                        }
-                    };
-                    // Publish config before selecting the DB default. If any
-                    // later participant fails, compensate both authorities
-                    // while the publication gate still excludes other daemon
-                    // writers; onboarding must not leave a visible half-plan.
-                    match crate::wizard::publish_onboarding_agent_plan(&prepared.plan) {
+                    // Trust/default-agent config remains a global policy write.
+                    // Package files, sidecar.json, bindings, and default
+                    // selection are already committed by the authored apply.
+                    match crate::wizard::publish_onboarding_agent_plan(&prepared) {
                         Ok(_) => {}
                         Err(error) => {
                             let compensation = compensate_onboarding_agent_publication(
@@ -18536,6 +18556,7 @@ async fn handle_serialized_request_impl(
                                 owned_installation_id,
                                 &publication_backup,
                                 previous_default_installation_id,
+                                settlement_owner.clone(),
                             )
                             .await;
                             return Err(internal(match compensation {
@@ -18546,29 +18567,6 @@ async fn handle_serialized_request_impl(
                             }));
                         }
                     };
-                    if prepared.plan.make_default
-                        && let Err(error) = ctx
-                            .db
-                            .set_default_agent_installation(
-                                installed_id,
-                                crate::workspace_lease::now_unix_ms(),
-                            )
-                            .await
-                    {
-                        let compensation = compensate_onboarding_agent_publication(
-                            ctx,
-                            owned_installation_id,
-                            &publication_backup,
-                            previous_default_installation_id,
-                        )
-                        .await;
-                        return Err(internal(match compensation {
-                            Ok(()) => error,
-                            Err(recovery) => anyhow::anyhow!(
-                                "agent onboarding default selection failed ({error:#}); recovery remains pending: {recovery:#}"
-                            ),
-                        }));
-                    }
                     // A complete publication is visible only after every
                     // participant succeeds. Release the durable owner before
                     // deleting its private preimage so re-entry can never be
@@ -22637,6 +22635,9 @@ async fn finish_local_operation_error(
                      WHERE owner_digest=?1 AND client_operation_id=?2
                     UNION ALL
                     SELECT 1 FROM assistant_mutation_journals
+                     WHERE owner_digest=?1 AND client_operation_id=?2
+                    UNION ALL
+                    SELECT 1 FROM authored_agent_package_journals
                      WHERE owner_digest=?1 AND client_operation_id=?2
                  )",
                 rusqlite::params![linked_owner, linked_operation],

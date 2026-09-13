@@ -3732,5 +3732,109 @@
   "code_root_interrupt_resolved": {
     "response": "code_root_interrupt_resolved",
     "data": "accepted"
+  },
+  "agent_authoring_projection": {
+    "response": "agent_authoring_projection",
+    "data": {
+      "dto_version": 1,
+      "policy": {
+        "policy_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "routes": [
+          {
+            "provider_id": "vendor",
+            "model_id": "exact-a",
+            "trust": "untrusted",
+            "confirmation_required": true,
+            "trust_is_shared": true,
+            "capabilities": ["text_generation"],
+            "location": "remote",
+            "auto_prune": true,
+            "sidecar_eligible": false,
+            "remote_sidecar_egress_required": false
+          }
+        ],
+        "catalog_origin": "bundled",
+        "catalog_revision": "464140ba6ee9e1669ef1c3f37d82de8c7edd83d7",
+        "bundled_frontier_slug": "frontier-coding"
+      },
+      "sources": [
+        {
+          "kind": "bundled_frontier",
+          "slug": "frontier-coding",
+          "display_name": "Frontier coding",
+          "source_locator": "FlyCockpit/agents@464140ba6ee9e1669ef1c3f37d82de8c7edd83d7:frontier-coding",
+          "compatible_routes": [
+            {
+              "provider_id": "vendor",
+              "model_id": "exact-a"
+            }
+          ]
+        }
+      ],
+      "review_trust_disclosure": "Trust classification is shared global provider/model policy, not a per-agent override."
+    }
+  },
+  "authored_agent_package": {
+    "response": "authored_agent_package",
+    "data": {
+      "outcome": "receipt",
+      "client_operation_id": "authored-package-apply",
+      "receipt_id": "11111111-1111-4111-8111-111111111111",
+      "status": "committed",
+      "package_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "policy_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "installation_id": "22222222-2222-4222-8222-222222222222",
+      "default_selected": true,
+      "review": {
+        "agent_name": "helper",
+        "grants": [
+          {
+            "provider_id": "vendor",
+            "model_id": "exact-a",
+            "is_default": true,
+            "trust": "untrusted",
+            "trust_is_shared": true
+          }
+        ],
+        "tool_tier_preferences": [],
+        "interactive_subagents": false,
+        "goal_skeptics_label": "Goal skeptics off",
+        "children": [],
+        "source": "authored/helper",
+        "trust_is_shared": true,
+        "trust_disclosure": "Trust classification is shared global provider/model policy, not a per-agent override."
+      }
+    }
+  },
+  "authored_agent_package_receipt": {
+    "response": "authored_agent_package_receipt",
+    "data": {
+      "client_operation_id": "authored-package-apply",
+      "receipt_id": "11111111-1111-4111-8111-111111111111",
+      "status": "committed",
+      "package_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "policy_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "installation_id": "22222222-2222-4222-8222-222222222222",
+      "default_selected": true,
+      "review": {
+        "agent_name": "helper",
+        "grants": [
+          {
+            "provider_id": "vendor",
+            "model_id": "exact-a",
+            "is_default": true,
+            "trust": "untrusted",
+            "trust_is_shared": true
+          }
+        ],
+        "tool_tier_preferences": [],
+        "interactive_subagents": false,
+        "goal_skeptics_label": "Goal skeptics off",
+        "children": [],
+        "source": "authored/helper",
+        "trust_is_shared": true,
+        "trust_disclosure": "Trust classification is shared global provider/model policy, not a per-agent override."
+      }
+    }
   }
 }

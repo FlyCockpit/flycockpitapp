@@ -16,6 +16,25 @@ impl App {
     ///   owner's socket may not be bound for a beat, so probing in the
     ///   background lets us wait quietly and attach without blocking a tick.
     pub(super) fn ensure_session_for_display(&mut self) {
+        // `None` is a valid daemon bootstrap projection (for example when
+        // setup is explicitly skipped).  The ordering fence is the accepted
+        // startup workspace/trust result, not the presence of an onboarding
+        // card in the renderer.
+        if !self.first_paint_completed || !self.startup_background.workspace_ready {
+            return;
+        }
+        if let Some(name) = self.startup_assistant_name.clone()
+            && self.launch.session_id.is_none()
+        {
+            if matches!(
+                self.startup_background.retry,
+                Some(StartupRetry::NamedAssistant)
+            ) {
+                return;
+            }
+            self.start_named_assistant_resolution(name);
+            return;
+        }
         // Evaluate the cheap struct-only gates first; the daemon probe is the
         // only costly check, so only start it when everything else already
         // permits an attach (`probe_when` is lazy for exactly this reason).
@@ -27,6 +46,38 @@ impl App {
         if should_probe && self.display_attach_backoff.can_attempt(Instant::now()) {
             self.try_attach_for_display();
         }
+    }
+
+    pub(super) fn start_named_assistant_resolution(&mut self, assistant_id: String) {
+        let generation = self.startup_background.generation;
+        let Some(endpoint) = self
+            .startup_lifecycle
+            .as_ref()
+            .map(|selected| selected.endpoint.clone())
+        else {
+            return;
+        };
+        let project_root = self.launch.cwd.to_string_lossy().into_owned();
+        self.async_actions.start_blocking(
+            AsyncActionKind::DaemonRpc("assistant.resolve"),
+            AsyncActionPolicy::Dedupe(AsyncActionKey::new("startup.assistant.resolve")),
+            move || {
+                let request = cockpit_proto::Request::ResolveAssistantSession {
+                    assistant_id,
+                    project_root,
+                    mode: cockpit_proto::AssistantSessionResolutionMode::MostRecentOrCreate,
+                };
+                let result = agent_runner::daemon_request_at_blocking(&endpoint, request).and_then(
+                    |response| match response {
+                        cockpit_proto::Response::AssistantSessionResolved { session, .. } => {
+                            Ok(session.session_id)
+                        }
+                        _ => Err("unexpected assistant session response".to_string()),
+                    },
+                );
+                Ok(AsyncActionPayload::StartupAssistantSessionResolved { generation, result })
+            },
+        );
     }
 
     #[cfg(test)]
@@ -72,6 +123,9 @@ impl App {
     /// The TUI attaches to the current ledger owner, preferring the selected
     /// lifetime only when it must create that owner.
     pub(super) fn lifecycle_intent(&self) -> cockpit_client::LifecycleIntent {
+        if self.session_mode == Some(SessionMode::Assistant) {
+            return cockpit_client::LifecycleIntent::PromoteToPersistent;
+        }
         if self.ephemeral_preference {
             cockpit_client::LifecycleIntent::AttachOrEphemeral
         } else {
@@ -87,6 +141,9 @@ impl App {
     /// [`Self::try_attach_for_display`] instead, which never latches an
     /// error.
     pub(super) fn ensure_agent_runner(&mut self) {
+        if !self.guard_startup_workspace_effects() {
+            return;
+        }
         #[cfg(feature = "remote")]
         {
             if !self.startup_disclosures_ready {
@@ -113,6 +170,9 @@ impl App {
         latch_error: bool,
         continuation: RunnerAttachContinuation,
     ) {
+        if !self.guard_startup_workspace_effects() {
+            return;
+        }
         if matches!(self.agent_runner, Some(Ok(_))) {
             self.apply_runner_attach_continuation(continuation);
             return;
@@ -137,6 +197,13 @@ impl App {
             }
             return;
         }
+        let Some(selected) = self.startup_lifecycle.clone() else {
+            if latch_error {
+                let error = "startup lifecycle is not ready".to_string();
+                self.apply_runner_attach_failure(&[continuation], &error);
+            }
+            return;
+        };
 
         let initial_model = match &continuation {
             RunnerAttachContinuation::SelectModel { active, .. } => Some(active.clone()),
@@ -144,48 +211,30 @@ impl App {
         };
         let cwd = self.launch.cwd.clone();
         let no_sandbox = self.no_sandbox;
-        let intent = self.lifecycle_intent();
         let lifecycle = self.lifecycle.clone();
+        let startup_generation = Some(self.startup_background.generation);
         let worker_cwd = cwd.clone();
         // Route selection is structural: Code uses the closed Code-root API,
         // while generic attach can represent only Assistant/Computer.
-        let requested_session_entry_mode = Some(self.session_mode.unwrap_or(SessionMode::Code));
+        let requested_session_entry_mode = requested_session_id
+            .is_none()
+            .then_some(self.session_mode.unwrap_or(SessionMode::Code));
         let action_id = self
             .async_actions
             .start(
                 AsyncActionKind::Internal("runner.attach"),
                 AsyncActionPolicy::Replace(AsyncActionKey::new("runner.attach")),
                 async move {
-                    let runner = match initial_model {
-                        Some(model) => {
-                            agent_runner::try_spawn_with_model_and_entry_mode(
-                                &worker_cwd,
-                                requested_session_id,
-                                model,
-                                no_sandbox,
-                                lifecycle,
-                                intent,
-                                requested_session_entry_mode,
-                            )
-                            .await
-                        }
-                        None => match requested_session_id {
-                            Some(session_id) => {
-                                agent_runner::attach_to_session(
-                                    &worker_cwd,
-                                    session_id,
-                                    no_sandbox,
-                                    lifecycle,
-                                    intent,
-                                )
-                                .await
-                            }
-                            None => {
-                                agent_runner::try_spawn(&worker_cwd, no_sandbox, lifecycle, intent)
-                                    .await
-                            }
-                        },
-                    }?;
+                    let runner = agent_runner::attach_to_selected_lifecycle(
+                        &worker_cwd,
+                        requested_session_id,
+                        initial_model,
+                        requested_session_entry_mode,
+                        no_sandbox,
+                        lifecycle,
+                        selected,
+                    )
+                    .await?;
                     Ok(AsyncActionPayload::AgentRunnerAttached(Box::new(runner)))
                 },
             )
@@ -199,6 +248,7 @@ impl App {
             requested_session_id,
             model_state_generation: self.active_model_state_generation,
             config_generation: self.config_snapshot.generation,
+            startup_generation,
             latch_error,
             continuations: vec![continuation],
         });
@@ -213,6 +263,14 @@ impl App {
             return;
         };
         if pending.action_id != action_id {
+            return;
+        }
+        if self.exit_requested
+            || pending
+                .startup_generation
+                .is_some_and(|generation| generation != self.startup_background.generation)
+        {
+            self.pending_runner_attach.take();
             return;
         }
         let identity_matches = pending.cwd == self.launch.cwd
@@ -320,6 +378,9 @@ impl App {
     pub(super) fn adopt_runner(&mut self, runner: Result<AgentRunner, String>) {
         let mut runner = runner;
         if let Ok(r) = &mut runner {
+            if self.mark_startup_trace_milestone("session-ready") {
+                tracing::info!(target: cockpit_core::startup::TARGET, event = "session-ready", "startup");
+            }
             // The daemon, not the CLI parser, is authoritative after Attach.
             self.session_mode = Some(r.session_entry_mode);
             self.start_model_state_epoch(Some(r.session_id()), r.active_model_state.as_ref());
@@ -377,6 +438,11 @@ impl App {
                 self.arm_resume_compaction_confirm(offer);
             }
         }
+        if runner.is_err() {
+            if self.mark_startup_trace_milestone("session-error") {
+                tracing::warn!(target: cockpit_core::startup::TARGET, event = "session-error", "startup");
+            }
+        }
         let refresh_skills = runner.is_ok();
         let attach_ids = runner.as_ref().ok().map(|r| {
             let session_id = *cockpit_core::sync::lock_or_recover(&r.session_id_state);
@@ -386,6 +452,19 @@ impl App {
             (session_id, connection_epoch)
         });
         self.agent_runner = Some(runner);
+        if self
+            .startup_retained_submission_id
+            .is_some_and(|(generation, _)| generation == self.startup_background.generation)
+            && self
+                .agent_runner
+                .as_ref()
+                .is_some_and(|runner| runner.is_ok())
+        {
+            let _ = self.submit_input();
+            if self.startup_retained_submission_id.is_none() {
+                self.clear_model_and_config_chrome_for_empty_session();
+            }
+        }
         if let Some((session_id, connection_epoch)) = attach_ids {
             self.bootstrap_inventory_after_attach(
                 uuid::Uuid::nil(), // single TUI instance
@@ -476,7 +555,12 @@ impl App {
         }
         self.cancel_paste_probes_matching(|probe| probe.owner_fence.is_none());
         self.cancel_model_controls_for_epoch_change(new_session_id);
-        self.clear_model_and_config_chrome_for_empty_session();
+        // A startup-retained composer draft still dispatches against the
+        // bootstrap catalog held before attach. Clearing the snapshot epoch
+        // first would make model readiness fail closed with NeedsProvider.
+        if self.startup_retained_submission_id.is_none() {
+            self.clear_model_and_config_chrome_for_empty_session();
+        }
         if let Some(state) = state {
             self.apply_active_model_state(
                 state.selection.clone(),

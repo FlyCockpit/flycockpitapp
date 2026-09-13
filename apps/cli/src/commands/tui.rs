@@ -68,6 +68,7 @@ pub async fn run(
         launch_start,
         false,
         false,
+        false,
     )
     .await
 }
@@ -83,23 +84,23 @@ pub async fn run_mode(
     launch_start: Option<Instant>,
     skip_setup: bool,
     force_setup: bool,
+    debug_last_message: bool,
 ) -> Result<()> {
     if !stdin().is_terminal() || !stdout().is_terminal() {
         welcome::print(project, !no_sandbox);
         return Ok(());
     }
 
-    let trust = prepare_tui_workspace_trust(project)?;
-
     let (lifecycle, lifecycle_task) = lifecycle_composition();
     let mut app = App::new_composed_with_session_mode(
         project,
         no_sandbox,
         mode,
-        trust,
+        StartupWorkspaceTrust::Decided,
         launch_start,
         lifecycle,
     );
+    app.set_startup_debug_last_message(debug_last_message);
     app.configure_onboarding_launch(skip_setup, force_setup);
     let result = app.run().await;
     drop(app);
@@ -124,13 +125,11 @@ pub async fn run_with_session(
         return Ok(());
     }
 
-    let trust = prepare_tui_workspace_trust(project)?;
-
     let (lifecycle, lifecycle_task) = lifecycle_composition();
     let mut app = App::new_composed_with_session(
         project,
         no_sandbox,
-        trust,
+        StartupWorkspaceTrust::Decided,
         session_id,
         launch_start,
         lifecycle,
@@ -142,23 +141,42 @@ pub async fn run_with_session(
     combine_app_and_lifecycle(result, lifecycle_result)
 }
 
-fn prepare_tui_workspace_trust(project: Option<&Path>) -> Result<StartupWorkspaceTrust> {
-    let opened = match project {
-        Some(path) => path.to_path_buf(),
-        None => std::env::current_dir().context("resolving cwd")?,
-    };
-    let root = crate::config::trust::resolve_trust_root(&opened)?;
-    crate::config::trust::set_runtime_policy(
-        root.clone(),
-        cockpit_config::WorkspaceTrustMode::IgnoreConfig,
+/// `assistants chat NAME` enters the same safe shell as every other
+/// interactive session.  The name is only resolved by the post-paint TUI
+/// reducer after it has acquired the persistent Assistant owner.
+pub async fn run_named_assistant(
+    project: Option<&Path>,
+    no_sandbox: bool,
+    assistant_name: String,
+    launch_start: Option<Instant>,
+    debug_last_message: bool,
+) -> Result<()> {
+    if !stdin().is_terminal() || !stdout().is_terminal() {
+        welcome::print(project, !no_sandbox);
+        return Ok(());
+    }
+
+    let (lifecycle, lifecycle_task) = lifecycle_composition();
+    let mut app = App::new_composed_with_named_assistant(
+        project,
+        no_sandbox,
+        assistant_name,
+        launch_start,
+        lifecycle,
     );
-    Ok(StartupWorkspaceTrust::Pending(root))
+    app.set_startup_debug_last_message(debug_last_message);
+    app.configure_onboarding_launch(false, false);
+    let result = app.run().await;
+    drop(app);
+    let lifecycle_result = finish_lifecycle(lifecycle_task).await;
+    combine_app_and_lifecycle(result, lifecycle_result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::providers::{ConfigDoc, ModelEntry, ProviderEntry, ProvidersConfig};
+    use cockpit_config::providers;
     use cockpit_test_support::TestEnvGuard;
 
     #[tokio::test]
@@ -205,13 +223,48 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_first_run_reaches_prompt() {
+    fn interactive_composition_defers_trust_and_project_config_until_post_draw() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        write_provider_config(tmp.path());
+        providers::reset_load_effective_call_count();
+
+        let (lifecycle, _requests) = cockpit_client::LifecycleClient::channel(1);
+        let app = App::new_composed_with_session_mode(
+            Some(tmp.path()),
+            false,
+            SessionMode::Code,
+            StartupWorkspaceTrust::Decided,
+            None,
+            lifecycle,
+        );
+
+        assert!(!app.dialog_is_workspace_trust_for_tests());
+        assert!(!app.first_paint_completed_for_tests());
+        assert_eq!(providers::load_effective_call_count(), 0);
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    #[test]
+    fn untrusted_first_run_reaches_prompt_without_pre_dispatch_trust() {
         let tmp = tempfile::tempdir().unwrap();
         let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         crate::config::trust::clear_runtime_policy_for_tests();
 
-        let trust = prepare_tui_workspace_trust(Some(tmp.path())).unwrap();
-        assert!(matches!(trust, StartupWorkspaceTrust::Pending(_)));
+        let (lifecycle, _requests) = cockpit_client::LifecycleClient::channel(1);
+        let mut app = App::new_composed_with_session_mode(
+            Some(tmp.path()),
+            false,
+            SessionMode::Code,
+            StartupWorkspaceTrust::Decided,
+            None,
+            lifecycle,
+        );
+
+        assert!(!app.dialog_is_workspace_trust_for_tests());
+        app.set_startup_debug_last_message(true);
+        assert!(cockpit_core::engine::model::debug_last_message_path_for_tests().is_none());
         crate::config::trust::clear_runtime_policy_for_tests();
     }
 
@@ -222,8 +275,6 @@ mod tests {
         crate::config::trust::clear_runtime_policy_for_tests();
         write_provider_config(tmp.path());
 
-        let trust = prepare_tui_workspace_trust(Some(tmp.path())).unwrap();
-        assert!(matches!(trust, StartupWorkspaceTrust::Pending(_)));
         let ignored = ConfigDoc::load_effective(tmp.path());
         assert!(!ignored.providers.contains_key("p"));
 

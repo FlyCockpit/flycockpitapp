@@ -101,6 +101,18 @@ cargo run --locked -- --help
 
 The installed binary is `cockpit`.
 
+### Isolated startup trace harness
+
+The repository-owned startup harness exercises the public safe-shell
+constructor and post-paint scheduler with in-process lifecycle/onboarding/trust
+fakes. It creates one temporary config/data/state/runtime namespace and a
+temporary workspace, does not set `HOME`, does not contact a secret service,
+and cannot start a real daemon. Run it from the repository root with:
+
+```sh
+cargo nextest run -p cockpit-tui -E 'test(startup_trace_harness_orders_default_and_configured_false_without_real_services)'
+```
+
 ## Quick Start
 
 ### Install Cockpit

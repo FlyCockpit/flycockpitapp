@@ -899,6 +899,7 @@ mod grant_tests {
                 max_concurrent_children: Some(1),
                 targets: vec![DelegationTarget::SameRoot],
                 default_child: None,
+                interactive_subagents: false,
             },
             questions: None,
             verification: None,
@@ -919,6 +920,7 @@ mod grant_tests {
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
             default_child: None,
+            interactive_subagents: false,
         };
         // The schema collapse (6a7acbfff, "unify roles capabilities and
         // trust suggestions") removed the authored `executionKind` axis:

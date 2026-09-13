@@ -3697,6 +3697,7 @@ fn image_sidecar_selection_is_a_typed_local_config_field() {
         }),
         untrusted_primary_default: None,
         per_primary_override: None,
+        permitted: Vec::new(),
     };
     let cfg = ExtendedConfig {
         image_sidecar: selection.clone(),
@@ -4216,4 +4217,26 @@ fn extended_config_key_alias_table_matches_serde() {
             "unexpected error for `{alias}` vs `{canonical}`: {error}"
         );
     }
+}
+
+#[test]
+fn daemon_lifetime_policy_is_narrow_default_true_and_fail_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    assert!(load_daemon_lifetime_policy_at(&path).unwrap());
+
+    std::fs::write(
+        &path,
+        r#"{"daemon":{"background_agents":false,"unrelated":{"malformed":true}}}"#,
+    )
+    .unwrap();
+    assert!(!load_daemon_lifetime_policy_at(&path).unwrap());
+
+    std::fs::write(&path, r#"{"daemon":{"background_agents":"false"}}"#).unwrap();
+    let error = load_daemon_lifetime_policy_at(&path).unwrap_err();
+    assert!(error.to_string().contains("must be a boolean"));
+
+    std::fs::write(&path, r#"{"daemon":false}"#).unwrap();
+    let error = load_daemon_lifetime_policy_at(&path).unwrap_err();
+    assert!(error.to_string().contains("daemon must be an object"));
 }

@@ -15,6 +15,9 @@ fn agent_installation_daemon_cli_transport_never_performs_direct_agent_mutation(
     assert!(source.contains("Request::AgentInstallationSubmitChoice"));
     assert!(source.contains("Request::AgentInstallationList"));
     assert!(source.contains("Request::AgentInstallationInspect"));
+    assert!(!source.contains("Request::GetAgentAuthoringProjection"));
+    assert!(!source.contains("Request::ApplyAuthoredAgentPackage"));
+    assert!(!source.contains("Request::GetAuthoredAgentPackageReceipt"));
     assert!(!source.contains("std::fs::write"));
     assert!(!source.contains("std::fs::rename"));
     assert!(!source.contains("CredentialStore"));

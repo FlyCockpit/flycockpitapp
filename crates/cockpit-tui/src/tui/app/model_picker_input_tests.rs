@@ -299,7 +299,8 @@ fn picker_bootstrap_failure_stays_inline_without_false_success() {
     let config_path = cockpit.join("config.json");
     write_config(&config_path);
 
-    let mut app = App::new(Some(tmp.path()), false);
+    let mut app = App::new_with_bootstrap_config(Some(tmp.path()), false);
+    App::prepare_runner_attach_harness(&mut app);
     app.dialog = crate::tui::settings::Dialog::None;
     app.overlay = Overlay::ModelPicker(snapshot_picker(&app));
     let history_len = app.history.len();

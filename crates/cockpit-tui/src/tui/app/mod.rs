@@ -58,6 +58,9 @@ mod side_conversation;
 mod skills_pane_actions;
 pub(super) mod slash;
 mod startup_layout;
+pub(crate) use startup_layout::{
+    StartupOnboardingCompletion, StartupPendingTrust, StartupWorkspaceCompletion,
+};
 mod sticky_header;
 #[cfg(test)]
 mod sticky_header_tests;
@@ -579,6 +582,10 @@ impl App {
         let project_root = root.root.to_string_lossy().into_owned();
         let operation_id = uuid::Uuid::new_v4();
         let expected_generation = self.config_snapshot.generation;
+        let startup_generation = self
+            .startup_pending_trust
+            .as_ref()
+            .map(|pending| pending.generation);
         self.pending_workspace_trust = Some(PendingWorkspaceTrust {
             operation_id,
             root,
@@ -586,14 +593,20 @@ impl App {
             rpc_mode,
             project_root: project_root.clone(),
             expected_generation,
+            startup_generation,
         });
         let lifecycle = self.lifecycle.clone();
+        let selected_endpoint = self
+            .startup_lifecycle
+            .as_ref()
+            .map(|selected| selected.endpoint.clone());
         self.async_actions.start(
             AsyncActionKind::DaemonRpc("workspace-trust.effect"),
             AsyncActionPolicy::Dedupe(AsyncActionKey::new("workspace-trust.effect")),
             async move {
                 let result = set_workspace_trust_async(
                     lifecycle,
+                    selected_endpoint,
                     &project_root,
                     rpc_mode,
                     expected_generation,
@@ -605,6 +618,7 @@ impl App {
                         project_root,
                         mode: rpc_mode,
                         expected_generation,
+                        startup_generation,
                         result,
                     },
                 ))
@@ -615,6 +629,13 @@ impl App {
     }
 
     fn apply_workspace_trust_completion(&mut self, completion: WorkspaceTrustCompletion) {
+        if completion
+            .startup_generation
+            .is_some_and(|generation| generation != self.startup_background.generation)
+            || self.exit_requested
+        {
+            return;
+        }
         let Some(pending) = self.pending_workspace_trust.take() else {
             return;
         };
@@ -622,6 +643,7 @@ impl App {
             || completion.project_root != pending.project_root
             || completion.mode != pending.rpc_mode
             || completion.expected_generation != pending.expected_generation
+            || completion.startup_generation != pending.startup_generation
         {
             self.pending_workspace_trust = Some(pending);
             return;
@@ -661,10 +683,25 @@ impl App {
             self.show_toast(format!("workspace trust failed: {error}"), ToastKind::Error);
             return;
         }
-        if pending.mode == cockpit_config::WorkspaceTrustMode::Trust {
+        self.dialog = Dialog::None;
+        if let Some(startup_generation) = pending.startup_generation {
+            let Some(startup) = self.startup_pending_trust.take() else {
+                return;
+            };
+            if startup.generation != startup_generation
+                || startup.generation != self.startup_background.generation
+            {
+                return;
+            }
+            self.startup_background.workspace_ready = true;
+            if self.mark_startup_trace_milestone("trust-ready") {
+                tracing::info!(target: cockpit_core::startup::TARGET, event = "trust-ready", "startup");
+            }
+            self.apply_onboarding_bootstrap_snapshot(startup.snapshot);
+            self.start_post_trust_cleanup();
+        } else if pending.mode == cockpit_config::WorkspaceTrustMode::Trust {
             self.resync_config_after_local_write();
         }
-        self.dialog = Dialog::None;
     }
 }
 
@@ -676,6 +713,7 @@ struct PendingWorkspaceTrust {
     rpc_mode: cockpit_proto::WorkspaceTrustMode,
     project_root: String,
     expected_generation: u64,
+    startup_generation: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -684,6 +722,7 @@ pub(crate) struct WorkspaceTrustCompletion {
     pub(crate) project_root: String,
     pub(crate) mode: cockpit_proto::WorkspaceTrustMode,
     pub(crate) expected_generation: u64,
+    pub(crate) startup_generation: Option<u64>,
     pub(crate) result: Result<u64, String>,
 }
 
@@ -695,13 +734,19 @@ pub(crate) struct ImageIngressDraftDiscardCompletion {
 
 async fn set_workspace_trust_async(
     lifecycle: cockpit_client::LifecycleClient,
+    selected_endpoint: Option<cockpit_client::ClientEndpoint>,
     project_root: &str,
     mode: cockpit_proto::WorkspaceTrustMode,
     mut expected_generation: u64,
 ) -> Result<u64, String> {
-    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
-        .await
-        .map_err(|error| error.to_string())?;
+    let client = match selected_endpoint {
+        Some(endpoint) => cockpit_client::DaemonClient::connect_endpoint(&endpoint)
+            .await
+            .map_err(|error| error.to_string())?,
+        None => crate::tui::settings::settings_daemon_client(&lifecycle)
+            .await
+            .map_err(|error| error.to_string())?,
+    };
     for attempt in 0..=1 {
         let response = client
             .request(cockpit_proto::Request::SetWorkspaceTrust {
@@ -1465,6 +1510,7 @@ pub(super) struct PendingRunnerAttach {
     requested_session_id: Option<uuid::Uuid>,
     model_state_generation: u64,
     config_generation: u64,
+    startup_generation: Option<u64>,
     latch_error: bool,
     continuations: Vec<RunnerAttachContinuation>,
 }
@@ -1734,6 +1780,22 @@ struct StartupBackground {
     daemon_socket: Option<PathBuf>,
     daemon_endpoint: Option<cockpit_client::ClientEndpoint>,
     started: bool,
+    /// Monotonically fences the post-paint startup reducer.  A completion
+    /// from a shell that has exited or been replaced is presentation-inert.
+    generation: u64,
+    workspace_ready: bool,
+    retry: Option<StartupRetry>,
+    clipboard_reconcile_scheduled: bool,
+    trace_milestones: HashSet<&'static str>,
+}
+
+#[derive(Debug, Clone)]
+enum StartupRetry {
+    LifetimePolicy,
+    Lifecycle,
+    Onboarding,
+    Workspace(Option<cockpit_proto::OnboardingBootstrapSnapshot>),
+    NamedAssistant,
 }
 
 /// Daemon-resolved config the TUI renders from (`tui-config-single-source`).
@@ -1814,12 +1876,28 @@ pub struct App {
     pub(super) session_mode: Option<SessionMode>,
     /// Typed channel to the CLI-owned lifecycle composition task.
     pub(super) lifecycle: cockpit_client::LifecycleClient,
+    /// No lifecycle, root, config, or cleanup work may start until the first
+    /// completed terminal draw has crossed this fence.
+    first_paint_completed: bool,
     pub(super) monotonic_origin: Instant,
     pub(super) paste_client_instance_id: uuid::Uuid,
     pub(super) launch: LaunchInfo,
+    /// A named Assistant resume request. It is consumed only by the
+    /// post-onboarding attach reducer.
+    startup_assistant_name: Option<String>,
+    /// Parsed launch intent only. Its file path is activated after the
+    /// accepted workspace phase, never by the safe shell constructor.
+    startup_debug_last_message: bool,
+    /// Result returned by the one selected lifecycle request. Every startup
+    /// RPC and the initial runner attach reuses this exact owner.
+    startup_lifecycle: Option<crate::tui::agent_runner::SelectedLifecycle>,
     /// Daemon-pushed config the TUI renders from; see [`HeldConfig`].
     pub(super) config_snapshot: HeldConfig,
     pending_workspace_trust: Option<PendingWorkspaceTrust>,
+    /// Daemon onboarding projection held while an unset workspace trust
+    /// decision is presented. The projection cannot become UI/session
+    /// authority until the correlated trust write is accepted.
+    startup_pending_trust: Option<StartupPendingTrust>,
     pending_sealed_operations: HashMap<uuid::Uuid, slash::PendingSealedOperation>,
     /// Originating attached binding for every minted, still-live sealed
     /// capability. Session/epoch replacement must not redirect settlement to
@@ -1916,6 +1994,9 @@ pub struct App {
     /// Exact payloads rejected before the runner dispatcher accepted
     /// ownership. These are safe to retry only on their original session.
     pub(super) retained_pre_dispatch_submissions: Vec<RetainedPreDispatchSubmission>,
+    /// Stable identity reserved when input is submitted before this startup
+    /// generation has an attached session.
+    pub(super) startup_retained_submission_id: Option<(u64, uuid::Uuid)>,
     /// Current queue-routing foreground target. Seeded from the daemon attach
     /// snapshot and kept current by `ForegroundInputTarget` events. `None`
     /// means the client cannot identify an active target; existing per-item
@@ -2094,6 +2175,9 @@ pub struct App {
     pub(super) _export_reaper_guard: crate::tui::async_action::ExportTempReaperGuard,
     pub(super) completed_async_actions: Vec<AsyncActionResult>,
     pub(super) skills_pane_generation: u64,
+    /// Opaque operation IDs issued by this startup generation. Onboarding
+    /// reducers consume an ID exactly once only after its receipt correlates.
+    pending_startup_onboarding_operations: HashMap<crate::tui::async_action::AsyncActionId, String>,
     startup_background: StartupBackground,
     /// Non-blocking projection of the latest complete dependency snapshot.
     /// Startup never probes here; Settings owns background refreshes.
@@ -3347,8 +3431,9 @@ impl StartupFirstPaintTiming {
         let launch_to_first_paint_ms = launch_start.elapsed().as_secs_f64() * 1000.0;
         tracing::info!(
             target: cockpit_core::startup::TARGET,
+            event = "first-paint",
             launch_to_first_paint_ms = format_args!("{launch_to_first_paint_ms:.1}"),
-            "startup first paint"
+            "startup"
         );
         #[cfg(test)]
         STARTUP_FIRST_PAINT_LOG_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -3381,6 +3466,30 @@ pub(crate) fn startup_first_paint_log_count() -> usize {
     STARTUP_FIRST_PAINT_LOG_COUNT.load(Ordering::SeqCst)
 }
 
+fn safe_shell_launch_info(project: Option<&Path>) -> LaunchInfo {
+    // `.` is a presentation placeholder, not a current-directory query. The
+    // parsed project is retained separately and resolved only after paint.
+    let unresolved = project.unwrap_or_else(|| Path::new(".")).to_path_buf();
+    LaunchInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        session_id: None,
+        session_short_id: None,
+        provider_line: "Loading session setup…".to_string(),
+        active_model: None,
+        active_model_diverged: false,
+        active_model_is_favorite: false,
+        active_model_is_trusted: false,
+        active_model_max_context: None,
+        active_model_supports_images: false,
+        cwd_display: unresolved.display().to_string(),
+        cwd: unresolved,
+        repo_status: None,
+        agent_name: "Cockpit".to_string(),
+        user_name: None,
+        banner_enabled: true,
+    }
+}
+
 impl App {
     #[cfg(test)]
     pub fn new(project: Option<&Path>, no_sandbox: bool) -> Self {
@@ -3405,6 +3514,38 @@ impl App {
         // steals a fixture attached-request channel when a test drains.
         app.dialog = Dialog::None;
         app
+    }
+
+    /// Config-seeded harness for unit tests that exercise post-bootstrap
+    /// reducers without running the interactive startup state machine.
+    #[cfg(test)]
+    pub fn new_with_bootstrap_config(project: Option<&Path>, no_sandbox: bool) -> Self {
+        let mut app = Self::new(project, no_sandbox);
+        app.refresh_bootstrap_config_snapshot();
+        app
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stub_startup_lifecycle_for_tests() -> crate::tui::agent_runner::SelectedLifecycle
+    {
+        let (connections, _) = tokio::sync::mpsc::channel(1);
+        let (sensitive, _) = tokio::sync::mpsc::channel(1);
+        crate::tui::agent_runner::SelectedLifecycle {
+            endpoint: cockpit_client::ClientEndpoint::InProcess(
+                cockpit_client::InProcessEndpoint::new(connections, sensitive),
+            ),
+            owns_daemon: true,
+            ephemeral_owner: false,
+            socket: PathBuf::from("test.sock"),
+            startup_notice: None,
+            promoted_from_ephemeral: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_runner_attach_harness(app: &mut Self) {
+        app.startup_background.workspace_ready = true;
+        app.startup_lifecycle = Some(Self::stub_startup_lifecycle_for_tests());
     }
 
     pub fn new_with_workspace_trust(
@@ -3463,7 +3604,7 @@ impl App {
         Self::new_composed_with_session_mode(
             project,
             no_sandbox,
-            SessionMode::Code,
+            session_mode,
             trust,
             launch_start,
             lifecycle,
@@ -3502,12 +3643,34 @@ impl App {
         let mut app = Self::new_inner(
             project,
             no_sandbox,
-            Some(SessionMode::Code),
+            None,
             trust,
             launch_start,
             Some(lifecycle),
         );
         app.launch.session_id = Some(session_id);
+        app
+    }
+
+    /// Construct the safe shell for `assistants chat NAME`.  Resolving NAME's
+    /// session is deliberately deferred until after the first frame and the
+    /// daemon onboarding bootstrap are accepted.
+    pub fn new_composed_with_named_assistant(
+        project: Option<&Path>,
+        no_sandbox: bool,
+        assistant_name: String,
+        launch_start: Option<Instant>,
+        lifecycle: cockpit_client::LifecycleClient,
+    ) -> Self {
+        let mut app = Self::new_inner(
+            project,
+            no_sandbox,
+            Some(SessionMode::Assistant),
+            StartupWorkspaceTrust::Decided,
+            launch_start,
+            Some(lifecycle),
+        );
+        app.startup_assistant_name = Some(assistant_name);
         app
     }
 
@@ -3546,6 +3709,20 @@ impl App {
         }
     }
 
+    pub fn set_startup_debug_last_message(&mut self, enabled: bool) {
+        self.startup_debug_last_message = enabled;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn first_paint_completed_for_tests(&self) -> bool {
+        self.first_paint_completed
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn dialog_is_workspace_trust_for_tests(&self) -> bool {
+        self.dialog.is_workspace_trust()
+    }
+
     fn new_inner(
         project: Option<&Path>,
         no_sandbox: bool,
@@ -3555,27 +3732,18 @@ impl App {
         lifecycle: Option<cockpit_client::LifecycleClient>,
     ) -> Self {
         let mut timer = cockpit_core::startup::PhaseTimer::start("App::new");
-        // Skip the synchronous `git status` here — it can take seconds in a
-        // giant repo and would block the first frame. `spawn_git_refresh`
-        // does an immediate background refresh and the branch pill pops in
-        // a tick later (chrome guards on `repo_status.is_some()`).
-        // Bootstrap resolution (`tui-config-single-source`): resolve only the
-        // `ExtendedConfig` from disk; provider config is projected without
-        // resolving credentials. Provider/credential resolution is daemon-side
-        // — the daemon pushes the resolved snapshot on attach and the held
-        // `config_snapshot` replaces this seed.
-        let LaunchBundle {
-            launch,
-            providers,
-            extended,
-        } = welcome::load_bundle_bootstrap_redacted(project, false);
+        // Interactive construction is a safe shell. It intentionally owns no
+        // current-directory, config, trust, daemon, clipboard, or export I/O.
+        let launch = safe_shell_launch_info(project);
+        let providers = cockpit_config::providers::ProvidersConfig::default();
+        let extended = cockpit_config::extended::ExtendedConfig::default();
         let config_snapshot = HeldConfig::from_view(
             0,
             false,
             extended.clone(),
             cockpit_core::secret_ref::redact_provider_view(&providers),
         );
-        timer.phase("welcome_load");
+        timer.phase("safe_shell");
         let tui_cfg = extended.tui.clone();
         timer.phase("config_load");
         // Skills populate after the first GetInventoryBundle; pre-attach is
@@ -3598,10 +3766,7 @@ impl App {
         let preflight_enabled = extended.preflight.enabled;
         let sandbox_escalation_enabled = extended.sandbox_escalation_enabled;
         let has_no_providers_at_startup = providers.providers.is_empty();
-        let startup_dependency_notice =
-            cockpit_core::external_runtime::current_startup_dependency_policy()
-                .and_then(|policy| policy.summary)
-                .map(|summary| format!("Dependency warning: {summary}"));
+        let startup_dependency_notice = None;
         let vim_setting = tui_cfg.vim_mode;
         let thinking_setting = tui_cfg.thinking;
         let markdown_opts = MarkdownOpts {
@@ -3620,8 +3785,7 @@ impl App {
 
         // The global background-agents setting selects the owner lifetime
         // only if lifecycle acquisition has to spawn a new owner.
-        let ephemeral_preference = !extended.daemon.background_agents;
-        timer.phase("daemon_probe");
+        let ephemeral_preference = false;
         #[cfg(feature = "remote")]
         let org_sync_disclosure = None;
         #[cfg(feature = "remote")]
@@ -3637,18 +3801,11 @@ impl App {
         let sticky_user_message = tui_cfg.sticky_user_message;
         let copy_on_release = tui_cfg.copy_on_release;
         let clipboard_recovery = tui_cfg.clipboard_recovery;
-        // Startup reconciliation (spec: "startup retains newest/removes
-        // older after containment checks"). `Off` never reaches this
-        // branch, so it stays entirely filesystem-free; a reconcile
-        // failure is swallowed (best-effort, never blocks startup) —
-        // `/doctor` still reports the directory's live state independently.
-        if clipboard_recovery == cockpit_config::extended::ClipboardRecovery::PrivateFile
-            && let Ok(dir) = crate::clipboard::recovery::recovery_dir_path()
-        {
-            let _ = crate::clipboard::recovery::reconcile_startup(&dir);
-        }
         let use_emojis = tui_cfg.use_emojis;
-        let file_icons = crate::tui::file_icons::file_icons_resolved(tui_cfg.file_icons);
+        // Auto-detection consults terminal environment. The safe shell uses a
+        // built-in presentation default and applies the configured setting
+        // only after the daemon-backed snapshot is accepted.
+        let file_icons = false;
         let attention = tui_cfg.attention;
         let longcache_supported = launch
             .active_model
@@ -3665,7 +3822,7 @@ impl App {
         let initial_agent_path = vec![launch.agent_name.clone()];
         let terminal_title_pushed_for_cleanup = Arc::new(AtomicBool::new(false));
         let active_model_selection = config_snapshot.providers.active_model.clone();
-        let mut app = Self {
+        let app = Self {
             session_mode,
             lifecycle: lifecycle
                 .map(|lifecycle| {
@@ -3676,11 +3833,16 @@ impl App {
                     })
                 })
                 .unwrap_or_else(cockpit_client::LifecycleClient::disconnected),
+            first_paint_completed: false,
             monotonic_origin: Instant::now(),
             paste_client_instance_id: uuid::Uuid::new_v4(),
             launch,
+            startup_assistant_name: None,
+            startup_debug_last_message: false,
+            startup_lifecycle: None,
             config_snapshot,
             pending_workspace_trust: None,
+            startup_pending_trust: None,
             pending_sealed_operations: HashMap::new(),
             sealed_capability_bindings: HashMap::new(),
             exit_requested: false,
@@ -3721,6 +3883,7 @@ impl App {
             pending_ephemeral_session_switch_intent: None,
             retained_session_switch_submissions: Vec::new(),
             retained_pre_dispatch_submissions: Vec::new(),
+            startup_retained_submission_id: None,
             foreground_input_target: None,
             fresh_queue_ack: FreshQueueAck::None,
             folded_queue_item_ids: HashSet::new(),
@@ -3778,10 +3941,16 @@ impl App {
             _export_reaper_guard: crate::tui::async_action::ExportTempReaperGuard::new(),
             completed_async_actions: Vec::new(),
             skills_pane_generation: 0,
+            pending_startup_onboarding_operations: HashMap::new(),
             startup_background: StartupBackground {
                 daemon_socket: None,
                 daemon_endpoint: None,
                 started: false,
+                generation: 1,
+                workspace_ready: false,
+                retry: None,
+                clipboard_reconcile_scheduled: false,
+                trace_milestones: HashSet::new(),
             },
             startup_dependency_notice,
             chat_area: None,
@@ -4012,24 +4181,14 @@ impl App {
             keys_overlay: None,
             keyboard_enhancement_active: false,
         };
-        // Workspace trust is the only pre-snapshot startup modal. The
-        // onboarding shell activates later, strictly after first paint,
-        // when the post-paint bootstrap fetch applies the authoritative
-        // snapshot (see `start_startup_background_tasks`).
-        match startup_trust {
-            StartupWorkspaceTrust::Pending(root) => {
-                app.dialog = Dialog::open_workspace_trust(root);
-            }
-            StartupWorkspaceTrust::Decided => {}
-        }
+        // Resolving/opening workspace trust belongs to the post-paint
+        // startup reducer. The safe shell may not inspect its root.
+        let _ = startup_trust;
+        tracing::info!(target: cockpit_core::startup::TARGET, event = "shell-constructed", "startup");
         app
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        export_actions::recover_deferred_export_cleanup(
-            &self.launch.cwd.join(".cockpit").join("exports"),
-        )
-        .await;
         // Apply the latest completed dependency policy after startup.
         if let Some(notice) = self.startup_dependency_notice.take() {
             self.show_toast(notice, ToastKind::Warning);
@@ -4087,21 +4246,7 @@ impl App {
             }
         }
 
-        let refresh_handle = spawn_git_refresh(
-            self.launch.cwd.clone(),
-            self.lifecycle.clone(),
-            self.repo_status.clone(),
-        );
-        let worktree_handle = spawn_worktree_root_resolve(
-            self.launch.cwd.clone(),
-            self.lifecycle.clone(),
-            self.worktree_root.clone(),
-        );
-
         let result = self.event_loop(&mut terminal).await;
-
-        refresh_handle.abort();
-        worktree_handle.abort();
 
         // Process-exit cleanup for an open `/side` (no orphaned ephemeral
         // sessions): discard the throwaway fork *before* the daemon guard
@@ -4208,7 +4353,7 @@ impl App {
                 EVENT_LOOP_DRAW_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
                 self.link_registry.begin_frame();
                 terminal.draw(|frame| self.render(frame))?;
-                self.startup_first_paint_timing.log_after_draw();
+                self.after_completed_draw();
                 crate::tui::links::emit_osc8(&self.link_registry, self.hyperlinks)?;
                 self.sync_cursor_shape();
             }
@@ -4351,11 +4496,40 @@ impl App {
         Ok(())
     }
 
+    fn after_completed_draw(&mut self) {
+        self.after_completed_draw_with_policy(async {
+            cockpit_config::extended::load_global_daemon_lifetime_policy()
+                .map_err(|error| error.to_string())
+        });
+    }
+
+    fn after_completed_draw_with_policy<F>(&mut self, policy: F)
+    where
+        F: std::future::Future<Output = Result<bool, String>> + Send + 'static,
+    {
+        cockpit_core::startup::mark_interactive_first_paint();
+        let first_paint = !self.first_paint_completed;
+        self.startup_first_paint_timing.log_after_draw();
+        self.first_paint_completed = true;
+        if first_paint {
+            tracing::info!(target: cockpit_core::startup::TARGET, event = "input-ready", "startup");
+            self.start_startup_background_tasks_with_policy(policy);
+        }
+    }
+
     async fn service_event_loop_wake(
         &mut self,
         terminal: &mut DefaultTerminal,
         terminal_input: &mut TerminalInput,
     ) -> Result<bool> {
+        // The event loop services one wake before its initial draw. Keep that
+        // wake wholly presentation-inert: several services below can attach a
+        // session, inspect the opened repository, or advance onboarding once
+        // their state is populated. The completed draw is the single funnel
+        // that permits all such work.
+        if !self.first_paint_completed {
+            return Ok(false);
+        }
         let mut changed = false;
         self.dialog.set_runtime_sandbox_enabled(!self.no_sandbox);
         self.event_loop_monotonic_now = terminal_input.now();
@@ -4718,7 +4892,7 @@ fn spawn_git_refresh(
     lifecycle: cockpit_client::LifecycleClient,
     shared: Arc<Mutex<Option<RepoStatus>>>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    crate::tui::async_action::spawn_action_task(async move {
         let project_root = cwd.display().to_string();
         let mut interval = tokio::time::interval(GIT_REFRESH_INTERVAL);
         // Do NOT skip the first tick: `App::new` no longer fetches git
@@ -4753,7 +4927,7 @@ fn spawn_worktree_root_resolve(
     lifecycle: cockpit_client::LifecycleClient,
     shared: Arc<Mutex<Option<std::path::PathBuf>>>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    crate::tui::async_action::spawn_action_task(async move {
         let path = cwd.display().to_string();
         if let Some(root) = daemon_find_worktree_root(&lifecycle, &path).await
             && let Ok(mut guard) = shared.lock()

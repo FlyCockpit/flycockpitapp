@@ -52,8 +52,8 @@
   ],
   "counts": {
     "event": 88,
-    "request": 290,
-    "response": 203
+    "request": 293,
+    "response": 206
   },
   "messages": {
     "event": [
@@ -2326,6 +2326,24 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "agent_installation_inspect"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "get_agent_authoring_projection"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "apply_authored_agent_package"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "get_authored_agent_package_receipt"
       }
     ],
     "response": [
@@ -3300,6 +3318,24 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "agent_installation"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "agent_authoring_projection"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "authored_agent_package"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "authored_agent_package_receipt"
       },
       {
         "class": "bounded_request_response",

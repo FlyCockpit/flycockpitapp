@@ -1003,6 +1003,8 @@ impl CompiledVerificationRegion {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompiledVerificationPolicy {
     pub regions: Vec<CompiledVerificationRegion>,
+    /// Snapshotted with the compiled regions so runtime never re-reads YAML.
+    pub goal_skeptics: GoalSkepticsPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1220,6 +1222,7 @@ impl VnextAgentDef {
                 max_concurrent_children: concurrent,
                 targets,
                 default_child: self.delegation.default_child.clone(),
+                interactive_subagents: self.delegation.interactive_subagents,
                 package_children: BTreeMap::new(),
                 package_definitions: PackageDefinitionSnapshot::default(),
             })
@@ -1445,6 +1448,23 @@ impl EffectiveVnextGrant {
         self.computer_delegation_enabled
     }
 
+    /// Whether launch may expose interactive child participation.
+    /// Absent delegation is fail-closed: interactive children are suppressed.
+    pub fn interactive_subagents_permitted(&self) -> bool {
+        self.delegation
+            .as_ref()
+            .is_some_and(|delegation| delegation.interactive_subagents)
+    }
+
+    /// How many goal-skeptic reviews the verification planner should schedule.
+    /// `Off` and a missing verification policy both schedule none.
+    pub fn goal_skeptics_count(&self) -> u8 {
+        self.verification
+            .as_ref()
+            .map(|policy| policy.goal_skeptics.count())
+            .unwrap_or(0)
+    }
+
     pub fn permits_child(&self, child_ref: &AllowedChild, child_kind: ExecutionKind) -> bool {
         self.delegation.as_ref().is_some_and(|delegation| {
             let allowed = delegation.allowed_children.contains(child_ref)
@@ -1573,6 +1593,9 @@ pub struct EffectiveDelegationGrant {
     pub max_concurrent_children: u16,
     pub targets: BTreeSet<DelegationTarget>,
     pub default_child: Option<String>,
+    /// Snapshotted from the definition: when false, launch suppresses
+    /// interactive child participation even if a `task` call requests it.
+    pub interactive_subagents: bool,
     /// Package-private child name → portable agent_id. Private defs win over
     /// a same-named global agent for this parent only.
     pub package_children: BTreeMap<String, String>,
@@ -1952,6 +1975,15 @@ pub struct DelegationPolicy {
         skip_serializing_if = "Option::is_none"
     )]
     pub default_child: Option<String>,
+    /// Whether this agent may spawn interactive children. The explicit
+    /// prerelease default is off: omitted YAML and `Default` both suppress
+    /// interactive child participation.
+    #[serde(
+        rename = "interactiveSubagents",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub interactive_subagents: bool,
 }
 
 impl DelegationPolicy {
@@ -1961,6 +1993,7 @@ impl DelegationPolicy {
             && self.max_concurrent_children.is_none()
             && self.targets.is_empty()
             && self.default_child.is_none()
+            && !self.interactive_subagents
     }
 
     pub fn validate(&self, agent_id: &str, kind: ExecutionKind) -> Result<()> {
@@ -1969,6 +2002,11 @@ impl DelegationPolicy {
         }
         if kind == ExecutionKind::Computer {
             bail!("computer agents cannot declare delegation");
+        }
+        if self.interactive_subagents && self.allowed_children.is_empty() {
+            bail!(
+                "delegation.interactiveSubagents requires a declared child graph; interactive participation cannot stand alone"
+            );
         }
         if self.allowed_children.is_empty() {
             bail!("delegation.allowedChildren must be non-empty when delegation is declared");
@@ -2161,16 +2199,83 @@ impl ProhibitedQuestionClass {
     }
 }
 
+/// Goal-completion skeptic review declared on an agent definition.
+///
+/// The explicit prerelease default is [`Self::Off`]. A count must be 1..=5;
+/// zero is represented by `Off`, never `Count { count: 0 }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum GoalSkepticsPolicy {
+    Off,
+    Count { count: u8 },
+}
+
+impl Default for GoalSkepticsPolicy {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+impl GoalSkepticsPolicy {
+    pub const MAX_COUNT: u8 = 5;
+
+    pub fn is_off(&self) -> bool {
+        matches!(self, Self::Off)
+    }
+
+    pub fn count(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Count { count } => count,
+        }
+    }
+
+    pub fn review_label(self) -> &'static str {
+        match self {
+            Self::Off => "Goal skeptics off",
+            Self::Count { count: 1 } => "1 goal skeptic",
+            Self::Count { count: 2 } => "2 goal skeptics",
+            Self::Count { count: 3 } => "3 goal skeptics",
+            Self::Count { count: 4 } => "4 goal skeptics",
+            Self::Count { count: 5 } => "5 goal skeptics",
+            Self::Count { .. } => "Goal skeptics",
+        }
+    }
+
+    fn validate(self) -> Result<()> {
+        match self {
+            Self::Off => Ok(()),
+            Self::Count { count } if (1..=Self::MAX_COUNT).contains(&count) => Ok(()),
+            Self::Count { count } => {
+                bail!(
+                    "verification.goalSkeptics.count must be between 1 and {} when mode is count, got {count}",
+                    Self::MAX_COUNT
+                )
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerificationPolicy {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<VerificationRule>,
+    #[serde(
+        rename = "goalSkeptics",
+        default,
+        skip_serializing_if = "GoalSkepticsPolicy::is_off"
+    )]
+    pub goal_skeptics: GoalSkepticsPolicy,
 }
 
 impl VerificationPolicy {
     fn validate(&self, slots: &BTreeMap<String, ModelSlot>) -> Result<()> {
-        if self.rules.is_empty() {
-            bail!("verification.rules must be non-empty when verification is declared");
+        self.goal_skeptics.validate()?;
+        if self.rules.is_empty() && self.goal_skeptics.is_off() {
+            bail!(
+                "verification must declare rules or goalSkeptics; omit verification entirely when both are off"
+            );
         }
         for rule in &self.rules {
             rule.validate(slots)?;
@@ -2206,7 +2311,10 @@ impl VerificationPolicy {
             });
             earlier.push(selector);
         }
-        CompiledVerificationPolicy { regions }
+        CompiledVerificationPolicy {
+            regions,
+            goal_skeptics: self.goal_skeptics,
+        }
     }
 }
 
@@ -3045,6 +3153,7 @@ mod tests {
             max_concurrent_children: Some(3),
             targets: vec![DelegationTarget::SameRoot],
             default_child: Some("helper".into()),
+            interactive_subagents: false,
         };
         let mut parent = agent_def("root", parent_vnext);
         parent
@@ -3166,6 +3275,7 @@ mod tests {
     fn agent_vnext_verification_first_match_keeps_off_exclusion() {
         let mut definition = valid();
         definition.verification = Some(VerificationPolicy {
+            goal_skeptics: GoalSkepticsPolicy::Off,
             rules: vec![
                 VerificationRule {
                     selector: VerificationSelector {
@@ -3219,6 +3329,7 @@ mod tests {
     #[test]
     fn agent_vnext_compiled_regions_keep_later_matches_off_after_an_exclusion() {
         let policy = VerificationPolicy {
+            goal_skeptics: GoalSkepticsPolicy::Off,
             rules: vec![
                 VerificationRule {
                     selector: VerificationSelector {
@@ -3338,6 +3449,7 @@ mod tests {
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
             default_child: None,
+            interactive_subagents: false,
         };
         assert!(definition.validate().is_err());
     }
@@ -3353,6 +3465,7 @@ mod tests {
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
             default_child: None,
+            interactive_subagents: false,
         };
         let mut child = valid();
         child.agent_id = "acme/child".into();
@@ -3364,6 +3477,7 @@ mod tests {
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
             default_child: None,
+            interactive_subagents: false,
         };
         let parent_grant = parent.resolve_grant(&host()).unwrap();
         let child_grant = child
@@ -3395,6 +3509,7 @@ mod tests {
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
             default_child: None,
+            interactive_subagents: false,
         };
         let mut child = valid();
         child.agent_id = "acme/child".into();
@@ -3406,6 +3521,7 @@ mod tests {
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
             default_child: None,
+            interactive_subagents: false,
         };
         let mut grandchild = valid();
         grandchild.agent_id = "acme/grandchild".into();
@@ -3417,6 +3533,7 @@ mod tests {
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
             default_child: None,
+            interactive_subagents: false,
         };
         let root_grant = root.resolve_grant(&host).unwrap();
         let child_ref = root_grant.delegation.as_ref().unwrap().allowed_children[0].clone();
@@ -3540,6 +3657,7 @@ mod tests {
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
             default_child: None,
+            interactive_subagents: false,
         };
         let mut child = valid();
         child.agent_id = "acme/child".into();
@@ -3551,6 +3669,7 @@ mod tests {
             max_concurrent_children: Some(2),
             targets: vec![DelegationTarget::SameRoot],
             default_child: None,
+            interactive_subagents: false,
         };
         let mut host = host();
         host.max_concurrent_children = 2;
@@ -3589,6 +3708,7 @@ mod tests {
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::Subdirectory],
             default_child: None,
+            interactive_subagents: false,
         };
         let mut policy = host();
         policy
@@ -3608,6 +3728,7 @@ mod tests {
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
             default_child: Some(SELF_CHILD_REF.to_string()),
+            interactive_subagents: false,
         };
         let grant = definition.resolve_grant(&host()).unwrap();
         assert!(grant.permits_child(
@@ -3646,6 +3767,7 @@ mod tests {
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
             default_child: Some("acme/other".into()),
+            interactive_subagents: false,
         };
         assert!(definition.validate().is_err());
     }
@@ -3669,6 +3791,7 @@ mod tests {
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::ManagedWorktree],
             default_child: None,
+            interactive_subagents: false,
         };
         let mut policy = host();
         policy
@@ -3802,6 +3925,7 @@ mod tests {
     fn agent_vnext_verification_budget_reduces_or_uses_selected_fallback() {
         let mut definition = valid();
         definition.verification = Some(VerificationPolicy {
+            goal_skeptics: GoalSkepticsPolicy::Off,
             rules: vec![VerificationRule {
                 selector: VerificationSelector {
                     all_of: vec![SelectorPredicate::ToolId {
@@ -3871,6 +3995,7 @@ mod tests {
     fn agent_vnext_verification_no_match_is_off_and_default_budget_failure_dispatches_original() {
         let mut definition = valid();
         definition.verification = Some(VerificationPolicy {
+            goal_skeptics: GoalSkepticsPolicy::Off,
             rules: vec![VerificationRule {
                 selector: VerificationSelector {
                     all_of: vec![SelectorPredicate::ToolClass {
@@ -3962,6 +4087,7 @@ mod tests {
     fn agent_vnext_verification_rejects_ceiling_widening_and_off_fields() {
         let mut definition = valid();
         definition.verification = Some(VerificationPolicy {
+            goal_skeptics: GoalSkepticsPolicy::Off,
             rules: vec![VerificationRule {
                 selector: VerificationSelector {
                     all_of: vec![SelectorPredicate::ToolId {
@@ -4008,6 +4134,7 @@ mod tests {
     fn agent_vnext_session_verification_restriction_is_an_explicit_off_mask() {
         let mut definition = valid();
         definition.verification = Some(VerificationPolicy {
+            goal_skeptics: GoalSkepticsPolicy::Off,
             rules: vec![VerificationRule {
                 selector: VerificationSelector {
                     all_of: vec![SelectorPredicate::ToolClass {
@@ -4058,6 +4185,7 @@ mod tests {
     fn verification_profile_self_check_expands_to_inherit_gate() {
         let mut definition = valid();
         definition.verification = Some(VerificationPolicy {
+            goal_skeptics: GoalSkepticsPolicy::Off,
             rules: vec![VerificationRule {
                 selector: VerificationSelector {
                     all_of: vec![SelectorPredicate::ToolClass {
@@ -4085,6 +4213,7 @@ mod tests {
     fn verification_profile_clean_room_and_panel_expand() {
         let mut definition = valid();
         definition.verification = Some(VerificationPolicy {
+            goal_skeptics: GoalSkepticsPolicy::Off,
             rules: vec![VerificationRule {
                 selector: VerificationSelector {
                     all_of: vec![SelectorPredicate::ToolId {
@@ -4112,6 +4241,7 @@ mod tests {
 
         let mut clean = valid();
         clean.verification = Some(VerificationPolicy {
+            goal_skeptics: GoalSkepticsPolicy::Off,
             rules: vec![VerificationRule {
                 selector: VerificationSelector {
                     all_of: vec![SelectorPredicate::ToolId {
@@ -4147,6 +4277,7 @@ mod tests {
     fn verification_explicit_fields_win_over_profile_and_empty_generators_are_valid() {
         let mut definition = valid();
         definition.verification = Some(VerificationPolicy {
+            goal_skeptics: GoalSkepticsPolicy::Off,
             rules: vec![VerificationRule {
                 selector: VerificationSelector {
                     all_of: vec![SelectorPredicate::ToolId {
@@ -4176,6 +4307,7 @@ mod tests {
 
         let mut adjudicator_only = valid();
         adjudicator_only.verification = Some(VerificationPolicy {
+            goal_skeptics: GoalSkepticsPolicy::Off,
             rules: vec![VerificationRule {
                 selector: VerificationSelector {
                     all_of: vec![SelectorPredicate::ToolId {
@@ -4195,6 +4327,7 @@ mod tests {
     fn verification_rejects_unknown_slot_and_excessive_turns() {
         let mut definition = valid();
         definition.verification = Some(VerificationPolicy {
+            goal_skeptics: GoalSkepticsPolicy::Off,
             rules: vec![VerificationRule {
                 selector: VerificationSelector {
                     all_of: vec![SelectorPredicate::ToolId {
@@ -4223,6 +4356,7 @@ mod tests {
     fn verification_rejects_generators_beyond_effective_candidate_limit() {
         let mut definition = valid();
         definition.verification = Some(VerificationPolicy {
+            goal_skeptics: GoalSkepticsPolicy::Off,
             rules: vec![VerificationRule {
                 selector: VerificationSelector {
                     all_of: vec![SelectorPredicate::ToolId {
@@ -4347,5 +4481,150 @@ candidate_dispatch: warm_then_fanout
             warm_rule.resolved_candidate_dispatch(),
             VerificationCandidateDispatch::WarmThenFanout
         );
+    }
+
+    #[test]
+    fn interactive_subagents_defaults_off_and_round_trips() {
+        let omitted: DelegationPolicy = serde_yaml::from_str(
+            r#"
+allowedChildren:
+  - kind: portable_ref
+    ref: acme/helper
+maxDescendantDepth: 1
+maxConcurrentChildren: 1
+targets: [same_root]
+"#,
+        )
+        .unwrap();
+        assert!(!omitted.interactive_subagents);
+        omitted
+            .validate("acme/root", ExecutionKind::Coding)
+            .unwrap();
+
+        let enabled: DelegationPolicy = serde_yaml::from_str(
+            r#"
+allowedChildren:
+  - kind: portable_ref
+    ref: acme/helper
+maxDescendantDepth: 1
+maxConcurrentChildren: 1
+targets: [same_root]
+interactiveSubagents: true
+"#,
+        )
+        .unwrap();
+        assert!(enabled.interactive_subagents);
+        enabled
+            .validate("acme/root", ExecutionKind::Coding)
+            .unwrap();
+        let rendered = serde_yaml::to_string(&enabled).unwrap();
+        assert!(rendered.contains("interactiveSubagents: true"));
+        let decoded: DelegationPolicy = serde_yaml::from_str(&rendered).unwrap();
+        assert_eq!(decoded, enabled);
+    }
+
+    #[test]
+    fn interactive_subagents_without_children_is_rejected() {
+        let policy = DelegationPolicy {
+            allowed_children: vec![],
+            max_descendant_depth: None,
+            max_concurrent_children: None,
+            targets: vec![],
+            default_child: None,
+            interactive_subagents: true,
+        };
+        let err = policy
+            .validate("acme/root", ExecutionKind::Coding)
+            .expect_err("interactive flag cannot stand alone")
+            .to_string();
+        assert!(err.contains("interactiveSubagents"));
+    }
+
+    #[test]
+    fn goal_skeptics_defaults_off_and_round_trips() {
+        let omitted: VerificationPolicy = serde_yaml::from_str(
+            r#"
+rules:
+  - selector:
+      allOf:
+        - toolClass: artifact_write
+    action: off
+"#,
+        )
+        .unwrap();
+        assert_eq!(omitted.goal_skeptics, GoalSkepticsPolicy::Off);
+        omitted.validate(&BTreeMap::new()).unwrap();
+
+        let enabled: VerificationPolicy = serde_yaml::from_str(
+            r#"
+goalSkeptics:
+  mode: count
+  count: 2
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            enabled.goal_skeptics,
+            GoalSkepticsPolicy::Count { count: 2 }
+        );
+        assert_eq!(enabled.goal_skeptics.review_label(), "2 goal skeptics");
+        enabled.validate(&BTreeMap::new()).unwrap();
+        let rendered = serde_yaml::to_string(&enabled).unwrap();
+        assert!(rendered.contains("goalSkeptics"));
+        assert!(rendered.contains("count: 2"));
+        let decoded: VerificationPolicy = serde_yaml::from_str(&rendered).unwrap();
+        assert_eq!(decoded, enabled);
+    }
+
+    #[test]
+    fn goal_skeptics_rejects_zero_count_and_empty_verification() {
+        let zero: Result<VerificationPolicy, _> = serde_yaml::from_str(
+            r#"
+goalSkeptics:
+  mode: count
+  count: 0
+"#,
+        );
+        let policy = zero.expect("serde accepts the shape; schema validation rejects it");
+        let err = policy
+            .validate(&BTreeMap::new())
+            .expect_err("count 0 is not a legal Count")
+            .to_string();
+        assert!(err.contains("goalSkeptics"));
+
+        let empty = VerificationPolicy {
+            rules: vec![],
+            goal_skeptics: GoalSkepticsPolicy::Off,
+        };
+        let err = empty
+            .validate(&BTreeMap::new())
+            .expect_err("empty verification is not a declaration")
+            .to_string();
+        assert!(err.contains("omit verification"));
+    }
+
+    #[test]
+    fn grant_exposes_interactive_subagents_and_goal_skeptics() {
+        let mut definition = valid();
+        definition.delegation = DelegationPolicy {
+            allowed_children: vec![AllowedChild::portable_ref("acme/helper")],
+            max_descendant_depth: Some(1),
+            max_concurrent_children: Some(1),
+            targets: vec![DelegationTarget::SameRoot],
+            default_child: None,
+            interactive_subagents: true,
+        };
+        definition.verification = Some(VerificationPolicy {
+            goal_skeptics: GoalSkepticsPolicy::Count { count: 3 },
+            rules: vec![],
+        });
+        let grant = definition.resolve_grant(&host()).unwrap();
+        assert!(grant.interactive_subagents_permitted());
+        assert_eq!(grant.goal_skeptics_count(), 3);
+
+        let muted = valid();
+        let muted_grant = muted.resolve_grant(&host()).unwrap();
+        assert!(!muted_grant.interactive_subagents_permitted());
+        assert_eq!(muted_grant.goal_skeptics_count(), 0);
     }
 }

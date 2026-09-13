@@ -14,10 +14,11 @@ pub use apply::{
     ModelAnswersOutcome, OnboardingConfigRollback, PreparedOnboardingAgent, apply_model_answers,
     apply_security_answers, apply_security_answers_with_caps, apply_setup_wizard_answers,
     apply_setup_wizard_answers_authoritative, capture_onboarding_agent_config,
-    compose_wizard_host_capabilities, descriptor_for_cwd, descriptor_for_cwd_with_caps,
-    model_descriptor_for_cwd, onboarding_model_descriptor_for_cwd,
-    prepare_onboarding_agent_answers, prepare_onboarding_agent_answers_for_catalog,
-    publish_onboarding_agent_plan, security_config_path,
+    capture_onboarding_agent_config_for_providers, compose_wizard_host_capabilities,
+    descriptor_for_cwd, descriptor_for_cwd_with_caps, model_descriptor_for_cwd,
+    onboarding_model_descriptor_for_cwd, prepare_onboarding_agent_answers,
+    prepare_onboarding_agent_answers_for_catalog, publish_onboarding_agent_plan,
+    security_config_path,
 };
 
 pub const PROVIDER_WIZARD_ID: &str = "provider";
@@ -679,13 +680,8 @@ pub fn onboarding_agent_descriptor(
                 crate::agents::ranked_compatible_offerings(primary, &offerings, providers)
                     .into_iter()
                     .map(|offering| SelectOption {
-                        id: format!("{}/{}", offering.provider_profile_handle, offering.model_id)
-                            .into(),
-                        label: format!(
-                            "{}/{}",
-                            offering.provider_profile_handle, offering.model_id
-                        )
-                        .into(),
+                        id: format!("{}/{}", offering.provider_id, offering.model_id).into(),
+                        label: format!("{}/{}", offering.provider_id, offering.model_id).into(),
                         description: "Compatible with the selected agent".into(),
                     })
                     .collect();
@@ -706,8 +702,8 @@ pub fn onboarding_agent_descriptor(
         offerings
             .iter()
             .map(|offering| SelectOption {
-                id: format!("{}/{}", offering.provider_profile_handle, offering.model_id).into(),
-                label: format!("{}/{}", offering.provider_profile_handle, offering.model_id).into(),
+                id: format!("{}/{}", offering.provider_id, offering.model_id).into(),
+                label: format!("{}/{}", offering.provider_id, offering.model_id).into(),
                 description: "Compatibility is verified from the fetched pinned definition".into(),
             })
             .collect(),
@@ -717,34 +713,32 @@ pub fn onboarding_agent_descriptor(
         label: "Disable image sidecar".into(),
         description: "Screenshots will not be sent to a separate vision model".into(),
     }];
-    for (provider_id, provider) in &providers.providers {
-        for model in &provider.models {
-            if !providers
-                .resolve_effective_model_capabilities(
-                    provider_id,
-                    &model.id,
-                    providers.resolution_generation,
-                )
-                .supports_image_input()
-            {
-                continue;
-            }
-            let self_hosted = matches!(
-                providers.resolve_location(provider_id, &model.id),
-                Some(crate::config::providers::ModelLocation::Local)
-                    | Some(crate::config::providers::ModelLocation::PrivateRemote)
-            );
-            let locality = if self_hosted { "local" } else { "remote" };
-            sidecar_options.push(SelectOption {
-                id: format!("{locality}:{provider_id}/{}", model.id).into(),
-                label: format!("{provider_id}/{}", model.id).into(),
-                description: if self_hosted {
-                    "Local/self-hosted vision model (preferred)".into()
-                } else {
-                    "Remote vision model; screenshots and image content leave this machine".into()
-                },
-            });
+    for offering in crate::daemon::agent_installation::setup_offerings(providers) {
+        if !providers
+            .resolve_effective_model_capabilities(
+                &offering.provider_profile_handle,
+                &offering.model_id,
+                providers.resolution_generation,
+            )
+            .supports_image_input()
+        {
+            continue;
         }
+        let self_hosted = matches!(
+            providers.resolve_location(&offering.provider_profile_handle, &offering.model_id),
+            Some(crate::config::providers::ModelLocation::Local)
+                | Some(crate::config::providers::ModelLocation::PrivateRemote)
+        );
+        let locality = if self_hosted { "local" } else { "remote" };
+        sidecar_options.push(SelectOption {
+            id: format!("{locality}:{}/{}", offering.provider_id, offering.model_id).into(),
+            label: format!("{}/{}", offering.provider_id, offering.model_id).into(),
+            description: if self_hosted {
+                "Local/self-hosted vision model (preferred)".into()
+            } else {
+                "Remote vision model; screenshots and image content leave this machine".into()
+            },
+        });
     }
     let sidecar_default = crate::onboarding_agent::preferred_self_hosted_sidecar(providers)
         .map(|sidecar| {
@@ -753,8 +747,8 @@ pub fn onboarding_agent_descriptor(
         .unwrap_or_else(|| WizardAnswer::Select("disabled".into()));
     WizardDescriptor {
         id: ONBOARDING_AGENT_WIZARD_ID,
-        title: "Install your coding agent",
-        description: "Choose an agent, confirm model trust, configure tools, and select an image sidecar",
+        title: "Create your coding agent",
+        description: "Author a real agent definition with model grants, trust confirmation, tools, and sidecar",
         write_policy: WritePolicy::CommitAtEnd,
         model_context: None,
         onboarding_agent_models,
@@ -1029,19 +1023,17 @@ fn onboarding_sidecar_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'s
 pub fn onboarding_agent_answers(
     run: &WizardRun,
     catalog_revision: String,
-) -> Result<(String, crate::onboarding_agent::OnboardingAgentAnswers)> {
-    use crate::onboarding_agent::{
-        OnboardingAgentAnswers, OnboardingModelTrust, OnboardingSidecarSelection,
-        OnboardingToolConfiguration, OnboardingToolMode,
-    };
+) -> Result<crate::onboarding_agent::WizardAuthoringSelection> {
     let agent = match run.answer("agent") {
         Some(WizardAnswer::Select(value)) => value.clone(),
         _ => return Err(anyhow!("agent selection is required")),
     };
     let model_trust = match run.answer("model-trust") {
-        Some(WizardAnswer::Select(value)) if value == "trusted" => OnboardingModelTrust::Trusted,
+        Some(WizardAnswer::Select(value)) if value == "trusted" => {
+            crate::config::providers::ModelTrust::Trusted
+        }
         Some(WizardAnswer::Select(value)) if value == "untrusted" => {
-            OnboardingModelTrust::Untrusted
+            crate::config::providers::ModelTrust::Untrusted
         }
         _ => return Err(anyhow!("model trust selection is required")),
     };
@@ -1067,50 +1059,19 @@ pub fn onboarding_agent_answers(
             .context("default model selection omitted provider or model")?,
         _ => return Err(anyhow!("default model selection is required")),
     };
-    let tools = match run.answer("tool-configuration") {
-        Some(WizardAnswer::Select(value)) if value == "author-defaults" => {
-            OnboardingToolConfiguration::AuthorDefaults
-        }
+    let tool_tiers = match run.answer("tool-configuration") {
+        Some(WizardAnswer::Select(value)) if value == "author-defaults" => BTreeMap::new(),
         Some(WizardAnswer::Select(value)) if value == "advanced" => {
             let selection = match run.answer("advanced-tools") {
                 Some(WizardAnswer::ToolSurface(selection)) => selection,
                 _ => return Err(anyhow!("advanced tool configuration is required")),
             };
-            let mut modes = BTreeMap::new();
-            for tool in crate::agents::known_tool_names() {
-                let selected = selection.tools.iter().any(|selected| selected == tool);
-                let tier = if selected {
-                    Some(
-                        selection
-                            .tool_tiers
-                            .get(*tool)
-                            .copied()
-                            .unwrap_or(crate::agents::ToolTier::Enabled),
-                    )
-                } else {
-                    crate::agents::legal_tool_tiers(tool)
-                        .contains(&crate::agents::ToolTier::Disabled)
-                        .then_some(crate::agents::ToolTier::Disabled)
-                };
-                if let Some(tier) = tier {
-                    modes.insert(
-                        (*tool).to_string(),
-                        match tier {
-                            crate::agents::ToolTier::Enabled => OnboardingToolMode::Enabled,
-                            crate::agents::ToolTier::Discoverable => OnboardingToolMode::MontyOnly,
-                            crate::agents::ToolTier::Disabled => OnboardingToolMode::Disabled,
-                        },
-                    );
-                }
-            }
-            OnboardingToolConfiguration::Advanced(modes)
+            selection.tool_tiers.clone()
         }
         _ => return Err(anyhow!("tool configuration selection is required")),
     };
     let sidecar = match run.answer("sidecar") {
-        Some(WizardAnswer::Select(value)) if value == "disabled" => {
-            OnboardingSidecarSelection::Disabled
-        }
+        Some(WizardAnswer::Select(value)) if value == "disabled" => None,
         Some(WizardAnswer::Select(value)) => {
             let selector = if let Some(selector) = value.strip_prefix("local:") {
                 selector
@@ -1122,38 +1083,33 @@ pub fn onboarding_agent_answers(
             let (provider, model) = selector
                 .split_once('/')
                 .context("sidecar selection omitted provider or model")?;
-            OnboardingSidecarSelection::Model {
-                provider: provider.to_string(),
-                model: model.to_string(),
-                // Locality labels are presentation-only. The authoritative
-                // resolver derives locality from the configured model; this
-                // bit is exclusively the user's explicit confirmation.
+            Some(cockpit_proto::AuthoredSidecarDeclaration {
+                provider_id: provider.to_string(),
+                model_id: model.to_string(),
                 remote_image_egress_confirmed: matches!(
                     run.answer("sidecar-egress-confirm"),
                     Some(WizardAnswer::Confirm(true))
                 ),
-            }
+            })
         }
         _ => return Err(anyhow!("sidecar selection is required")),
     };
-    Ok((
-        agent,
-        OnboardingAgentAnswers {
-            catalog_revision,
-            default_model_provider,
-            default_model,
-            model_trust,
-            model_trust_confirmed,
-            third_party_source,
-            third_party_trust_confirmed,
-            tools,
-            sidecar,
-            make_default: matches!(
-                run.answer("make-default"),
-                Some(WizardAnswer::Confirm(true))
-            ),
-        },
-    ))
+    Ok(crate::onboarding_agent::WizardAuthoringSelection {
+        slug: agent,
+        catalog_revision,
+        default_model_provider,
+        default_model,
+        model_trust,
+        model_trust_confirmed,
+        third_party_source,
+        third_party_trust_confirmed,
+        tool_tiers,
+        sidecar,
+        make_default: matches!(
+            run.answer("make-default"),
+            Some(WizardAnswer::Confirm(true))
+        ),
+    })
 }
 
 /// Extract the descriptor-bound catalog revision before a daemon reconstructs

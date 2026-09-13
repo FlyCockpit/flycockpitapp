@@ -4987,6 +4987,33 @@
       "tag": "agent_installation_inspect"
     },
     {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
+      "tag": "get_agent_authoring_projection"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
+      "tag": "apply_authored_agent_package"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
+      "tag": "get_authored_agent_package_receipt"
+    },
+    {
       "class": "rejected",
       "evidence": null,
       "fcorCanonicalSchema": "-",

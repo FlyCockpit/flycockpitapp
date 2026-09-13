@@ -113,6 +113,13 @@ impl App {
 
     pub(super) fn open_default_model_picker_from_settings(&mut self) {
         self.default_model_picker_mode = true;
+        if self.config_snapshot.providers.providers.is_empty() {
+            // First-paint startup can show attached runner chrome before the
+            // daemon provider catalog lands in `config_snapshot`. Read the
+            // bootstrap layer so the default-model picker can open immediately
+            // after settings closes instead of waiting for a later push.
+            self.refresh_bootstrap_config_snapshot();
+        }
         let current = self.config_snapshot.providers.active_model.clone();
         self.open_model_picker_highlighting(current.as_ref());
         self.push_plain(

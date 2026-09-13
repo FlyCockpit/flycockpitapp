@@ -242,9 +242,9 @@ pub fn encoding_for_model_id(model_id: &str) -> Option<TokenizerStrategy> {
 mod tests {
     use super::*;
     use crate::agents::{
-        ExecutionKind, ModelCapability, ModelLocality, ModelSlot, OnBudgetExceeded,
-        SelectorPredicate, ToolClass, VerificationAction, VerificationDispatch, VerificationPolicy,
-        VerificationRule, VerificationSelector, VnextAgentDef, VnextHostPolicy,
+        ExecutionKind, GoalSkepticsPolicy, ModelCapability, ModelLocality, ModelSlot,
+        OnBudgetExceeded, SelectorPredicate, ToolClass, VerificationAction, VerificationDispatch,
+        VerificationPolicy, VerificationRule, VerificationSelector, VnextAgentDef, VnextHostPolicy,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -347,6 +347,7 @@ mod tests {
             delegation: crate::agents::DelegationPolicy::default(),
             questions: None,
             verification: Some(VerificationPolicy {
+                goal_skeptics: GoalSkepticsPolicy::Off,
                 rules: vec![VerificationRule {
                     selector: VerificationSelector {
                         all_of: vec![SelectorPredicate::ToolClass {

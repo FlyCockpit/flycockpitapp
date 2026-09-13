@@ -549,16 +549,37 @@ impl<'a> SidecarResolver<'a> {
 
         // 2. per-primary override is the only candidate
         // 3. otherwise the trust-class default
-        let candidate = self.config.per_primary_override.clone().or_else(|| {
-            let trust = self
-                .providers
-                .resolve_trust(primary_provider, primary_model);
-            let default = match trust {
-                ModelTrust::Trusted => &self.config.trusted_primary_default,
-                ModelTrust::Untrusted => &self.config.untrusted_primary_default,
-            };
-            default.clone()
-        });
+        // Authored packages publish `permitted` as the exclusive universe.
+        let candidate = if !self.config.permitted.is_empty() {
+            self.config
+                .per_primary_override
+                .clone()
+                .filter(|candidate| self.config.permitted.iter().any(|entry| entry == candidate))
+                .or_else(|| {
+                    let trust = self
+                        .providers
+                        .resolve_trust(primary_provider, primary_model);
+                    let default = match trust {
+                        ModelTrust::Trusted => &self.config.trusted_primary_default,
+                        ModelTrust::Untrusted => &self.config.untrusted_primary_default,
+                    };
+                    default.clone().filter(|candidate| {
+                        self.config.permitted.iter().any(|entry| entry == candidate)
+                    })
+                })
+                .or_else(|| self.config.permitted.first().cloned())
+        } else {
+            self.config.per_primary_override.clone().or_else(|| {
+                let trust = self
+                    .providers
+                    .resolve_trust(primary_provider, primary_model);
+                let default = match trust {
+                    ModelTrust::Trusted => &self.config.trusted_primary_default,
+                    ModelTrust::Untrusted => &self.config.untrusted_primary_default,
+                };
+                default.clone()
+            })
+        };
 
         let Some(candidate) = candidate else {
             // No candidate configured. Fallback only to a capable primary.

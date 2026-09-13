@@ -15207,6 +15207,7 @@ fn authority_recovery_precedes_both_socket_binds() {
         "recover_extended_config_patch_journals",
         "recover_image_config_mutation_journals",
         "recover_agent_mutation_journals",
+        "recover_authored_agent_package_journals",
         "recover_committed_oauth_settlements",
         "recover_assistant_mutation_journals",
         "settle_interrupted_local_operations",
@@ -20230,7 +20231,10 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         "agent_installation_begin"
         | "agent_installation_submit_choice"
         | "agent_installation_list"
-        | "agent_installation_inspect" => AuthzAllowedOutcome::Response,
+        | "agent_installation_inspect"
+        | "get_agent_authoring_projection"
+        | "apply_authored_agent_package"
+        | "get_authored_agent_package_receipt" => AuthzAllowedOutcome::Response,
         // Code-root capability probes deliberately use fresh, unknown opaque
         // authorities. The owner reaches the handler, which rejects the
         // forged authority after the central owner gate.
@@ -20495,6 +20499,9 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("agent_installation_submit_choice"),
         authz_owner_only("agent_installation_list"),
         authz_owner_only("agent_installation_inspect"),
+        authz_owner_only("get_agent_authoring_projection"),
+        authz_owner_only("apply_authored_agent_package"),
+        authz_owner_only("get_authored_agent_package_receipt"),
         authz_owner_only("list_secret_inventory"),
         authz_owner_only("put_named_secret"),
         authz_owner_only("put_subscription_ack"),
@@ -23104,6 +23111,37 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 installation_id: Some(Uuid::new_v4().to_string()),
             })
         }
+        "get_agent_authoring_projection" => Request::GetAgentAuthoringProjection,
+        "apply_authored_agent_package" => {
+            Request::ApplyAuthoredAgentPackage(cockpit_proto::ApplyAuthoredAgentPackageRequest {
+                client_operation_id: "authz-authored-package".into(),
+                expected_policy_revision: "aa".repeat(32),
+                package: cockpit_proto::AuthoredAgentPackageDraft {
+                    dto_version: cockpit_proto::AGENT_AUTHORING_DTO_VERSION,
+                    name: "helper".into(),
+                    markdown: "---\ndescription: helper\n---\nbody\n".into(),
+                    source: cockpit_proto::AuthoredAgentSource {
+                        kind: cockpit_proto::AgentAuthoringSourceKind::Authored,
+                        source_locator: "authored/helper".into(),
+                        pin: None,
+                        third_party_trust_confirmed: false,
+                    },
+                    children: vec![],
+                    mcp_json: None,
+                    sidecars: vec![],
+                    policy_revision: "aa".repeat(32),
+                    model_trust_confirmations: vec![],
+                    make_default: true,
+                    draft_revision: None,
+                },
+                onboarding: None,
+            })
+        }
+        "get_authored_agent_package_receipt" => Request::GetAuthoredAgentPackageReceipt(
+            cockpit_proto::AuthoredAgentPackageReceiptQuery {
+                client_operation_id: "authz-authored-package".into(),
+            },
+        ),
         "save_assistant_definition" => Request::SaveAssistantDefinition {
             client_operation_id: "authz-matrix-probe".into(),
             mutation_intent_hash: "00".repeat(32),
@@ -30972,6 +31010,9 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::AgentInstallationSubmitChoice(cockpit_proto::AgentInstallationSubmitChoiceV1 { dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION, continuation_token: Uuid::new_v4().to_string(), choice_id: Some("choice-a".into()), defer: false }), kind: "agent_installation_submit_choice", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::AgentInstallationList(cockpit_proto::AgentInstallationReadV1 { dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION, scope: cockpit_proto::AgentInstallationScopeWire::Global, workspace_path: None, installation_id: None }), kind: "agent_installation_list", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::AgentInstallationInspect(cockpit_proto::AgentInstallationReadV1 { dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION, scope: cockpit_proto::AgentInstallationScopeWire::Global, workspace_path: None, installation_id: Some(Uuid::new_v4().to_string()) }), kind: "agent_installation_inspect", session_id: None, audit_path: None, mutating: false },
+        CommandMetadataCase { request: Request::GetAgentAuthoringProjection, kind: "get_agent_authoring_projection", session_id: None, audit_path: None, mutating: false },
+        CommandMetadataCase { request: Request::ApplyAuthoredAgentPackage(cockpit_proto::ApplyAuthoredAgentPackageRequest { client_operation_id: "authored-package-apply".into(), expected_policy_revision: "aa".repeat(32), package: cockpit_proto::AuthoredAgentPackageDraft { dto_version: cockpit_proto::AGENT_AUTHORING_DTO_VERSION, name: "helper".into(), markdown: "---\ndescription: helper\n---\nbody\n".into(), source: cockpit_proto::AuthoredAgentSource { kind: cockpit_proto::AgentAuthoringSourceKind::Authored, source_locator: "authored/helper".into(), pin: None, third_party_trust_confirmed: false }, children: vec![], mcp_json: None, sidecars: vec![], policy_revision: "aa".repeat(32), model_trust_confirmations: vec![], make_default: true, draft_revision: None }, onboarding: None }), kind: "apply_authored_agent_package", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::GetAuthoredAgentPackageReceipt(cockpit_proto::AuthoredAgentPackageReceiptQuery { client_operation_id: "authored-package-apply".into() }), kind: "get_authored_agent_package_receipt", session_id: None, audit_path: None, mutating: false },
     ]);
 
     // Drift-proof exhaustiveness (`daemon-trust-test-isolation.md`): the
@@ -30999,6 +31040,9 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                         Request::AgentInstallationSubmitChoice(..) => "AgentInstallationSubmitChoice",
                         Request::AgentInstallationList(..) => "AgentInstallationList",
                         Request::AgentInstallationInspect(..) => "AgentInstallationInspect",
+                        Request::GetAgentAuthoringProjection => "GetAgentAuthoringProjection",
+                        Request::ApplyAuthoredAgentPackage(..) => "ApplyAuthoredAgentPackage",
+                        Request::GetAuthoredAgentPackageReceipt(..) => "GetAuthoredAgentPackageReceipt",
                         #[cfg(feature = "remote")]
                         Request::OperationStatus { .. } => "OperationStatus",
                         $($(#[$variant_attr])* Request::$variant { .. } => stringify!($variant),)*
@@ -31012,6 +31056,8 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                     "FinalizeMediaUpload", "DiscardUnreferencedMediaAttachment",
                     "AgentInstallationBegin", "AgentInstallationSubmitChoice",
                     "AgentInstallationList", "AgentInstallationInspect",
+                    "GetAgentAuthoringProjection", "ApplyAuthoredAgentPackage",
+                    "GetAuthoredAgentPackageReceipt",
                     #[cfg(feature = "remote")]
                     "OperationStatus",
                     $($(#[$variant_attr])* stringify!($variant)),*, "Unknown"

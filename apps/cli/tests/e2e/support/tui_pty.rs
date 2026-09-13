@@ -190,21 +190,30 @@ impl ScreenSnapshot {
         if needle.is_empty() {
             return None;
         }
-        let chars: Vec<char> = needle.chars().collect();
-        let last = u16::try_from(chars.len().saturating_sub(1)).ok()?;
+        let needle_chars: Vec<char> = needle.chars().collect();
+        let last = u16::try_from(needle_chars.len().saturating_sub(1)).ok()?;
         for row in 0..self.rows {
-            let mut col = 0u16;
-            while col < self.cols {
-                if self.row_matches(row, col, &chars) {
+            // `row_text` pads empty cells as spaces, so wide punctuation (for
+            // example the model-picker title em dash) stays contiguous even
+            // when the PTY grid stores it across two columns.
+            let row_chars: Vec<char> = self.row_text(row).chars().collect();
+            for start in 0..row_chars.len() {
+                if start + needle_chars.len() > row_chars.len() {
+                    break;
+                }
+                if row_chars[start..start + needle_chars.len()] == needle_chars[..] {
+                    let start_col = u16::try_from(start).ok()?;
                     return Some((
-                        CellPos { row, col },
                         CellPos {
                             row,
-                            col: col.saturating_add(last),
+                            col: start_col,
+                        },
+                        CellPos {
+                            row,
+                            col: start_col.saturating_add(last),
                         },
                     ));
                 }
-                col = col.saturating_add(1);
             }
         }
         None
@@ -236,24 +245,6 @@ impl ScreenSnapshot {
             last = Some(pos);
         }
         Some((first?, last?))
-    }
-
-    fn row_matches(&self, row: u16, start_col: u16, needle: &[char]) -> bool {
-        let mut col = start_col;
-        for expected in needle {
-            let Some(cell) = self.cell_at(row, col) else {
-                return false;
-            };
-            let mut chars = cell.text.chars();
-            let Some(got) = chars.next() else {
-                return false;
-            };
-            if got != *expected || chars.next().is_some() {
-                return false;
-            }
-            col = col.saturating_add(1);
-        }
-        true
     }
 
     fn cell_at(&self, row: u16, col: u16) -> Option<&SnapshotCell> {

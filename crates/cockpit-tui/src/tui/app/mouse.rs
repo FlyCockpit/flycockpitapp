@@ -27,6 +27,7 @@ impl App {
     /// - left-drag → extend the active drag-select;
     /// - left-up → finalize drag-select (selection persists for copy).
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
+        self.dialog.bind_lifecycle(self.lifecycle.clone());
         // Toast dismissal on "meaningful" mouse events — clicks and
         // wheels count, motion-only / drag-continuation / release
         // don't (those are part of an in-flight gesture and the
@@ -220,6 +221,15 @@ impl App {
             return;
         }
         if self.mouse_capture
+            && self
+                .dialog
+                .settings_pointer_contains(mouse.column, mouse.row)
+            && let Some(outcome) = self.dialog.handle_settings_pointer(mouse)
+        {
+            self.apply_settings_pointer_outcome(outcome);
+            return;
+        }
+        if self.mouse_capture
             && let Some(outcome) = self.button_registry.handle_mouse(mouse)
         {
             let consumed = matches!(
@@ -242,25 +252,7 @@ impl App {
         if self.mouse_capture
             && let Some(outcome) = self.dialog.handle_settings_pointer(mouse)
         {
-            if matches!(outcome, crate::tui::settings::SettingsPointerOutcome::Close) {
-                let open_default_model_picker = self.dialog.take_pending_default_model_picker();
-                self.capture_response_metrics_tokenizer_dirty_from_dialog();
-                if let Some(provider) = self.reopen_model_picker_after_settings.take() {
-                    self.dialog = crate::tui::settings::Dialog::None;
-                    self.invalidate_primary_paste();
-                    self.sync_mouse_capture_from_dialog();
-                    self.resync_config_after_local_write();
-                    self.open_model_picker_for_provider(&provider);
-                } else {
-                    self.dialog = crate::tui::settings::Dialog::None;
-                    self.invalidate_primary_paste();
-                    self.sync_mouse_capture_from_dialog();
-                    self.resync_config_after_local_write();
-                }
-                if open_default_model_picker {
-                    self.open_default_model_picker_from_settings();
-                }
-            }
+            self.apply_settings_pointer_outcome(outcome);
             return;
         }
         if self.mouse_capture
@@ -731,6 +723,32 @@ impl App {
             return;
         }
         self.dispatch_chat_gesture(mouse);
+    }
+
+    fn apply_settings_pointer_outcome(
+        &mut self,
+        outcome: crate::tui::settings::SettingsPointerOutcome,
+    ) {
+        if matches!(outcome, crate::tui::settings::SettingsPointerOutcome::Close) {
+            let open_default_model_picker = self.dialog.take_pending_default_model_picker();
+            self.capture_response_metrics_tokenizer_dirty_from_dialog();
+            self.dialog = crate::tui::settings::Dialog::None;
+            self.invalidate_primary_paste();
+            self.sync_mouse_capture_from_dialog();
+            self.resync_config_after_local_write();
+            if let Some(provider) = self.reopen_model_picker_after_settings.take() {
+                self.open_model_picker_for_provider(&provider);
+                if let (Some(draft), Overlay::ModelPicker(picker)) = (
+                    self.reopen_model_picker_draft_after_settings.take(),
+                    &mut self.overlay,
+                ) {
+                    picker.restore_requested_selection(&draft);
+                }
+                self.refresh_reopened_model_picker_after_settings = Some(provider);
+            } else if open_default_model_picker {
+                self.open_default_model_picker_from_settings();
+            }
+        }
     }
 
     pub(super) fn dispatch_button(&mut self, dispatch: crate::tui::button::ButtonDispatch) {

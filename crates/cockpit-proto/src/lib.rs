@@ -25,6 +25,7 @@
 //! refuse envelopes whose `v` is outside the supported range.
 
 pub mod acp;
+pub mod agent_authoring;
 pub mod agent_installation;
 pub mod agent_management;
 pub mod capability_ceiling;
@@ -47,6 +48,16 @@ pub use acp::{
     ReadCodeRootDeliveriesV1Request, ReadCodeRootDeliveriesV1Result, ReadCodeRootV1Request,
     ReadCodeRootV1Result, ResolveCodeRootInterruptResultV1, ResolveCodeRootInterruptV1,
     attach_existing_code_root_v1_request, create_code_root_v1_request,
+};
+pub use agent_authoring::{
+    AGENT_AUTHORING_DTO_VERSION, AgentAuthoringCatalogOrigin, AgentAuthoringCompatibleRoute,
+    AgentAuthoringProjection, AgentAuthoringSource, AgentAuthoringSourceKind, AgentPolicyRoute,
+    AgentPolicySnapshot, AgentPolicyTrustClassification, ApplyAuthoredAgentPackageOutcome,
+    ApplyAuthoredAgentPackageReceipt, ApplyAuthoredAgentPackageRequest, AuthoredAgentChild,
+    AuthoredAgentOnboardingCorrelation, AuthoredAgentPackageDraft,
+    AuthoredAgentPackageReceiptQuery, AuthoredAgentReceiptStatus, AuthoredAgentRejectReason,
+    AuthoredAgentReview, AuthoredAgentReviewGrant, AuthoredAgentSource, AuthoredSidecarDeclaration,
+    ModelTrustConfirmation,
 };
 pub use agent_installation::{
     AGENT_INSTALLATION_DTO_VERSION, AgentInstallationBeginV1, AgentInstallationBindingOutcomeV1,
@@ -1334,9 +1345,11 @@ impl fmt::Debug for StoredFlycockpitCredential {
 
 /// Current wire schema version. v24 makes the daemon-authoritative
 /// `SetupWizardApplied.config_generation` a required field carrying the
-/// apply's post-commit published generation, so wizard onboarding
-/// settlements prove stage advancement against the receipt itself (no
-/// compatibility window for daemons predating the field). On top of v23's
+/// apply's post-commit published generation (wizard onboarding settlements
+/// prove stage advancement against the receipt itself, with no compatibility
+/// window for daemons predating the field), and adds the onboarding-facing
+/// agent authoring projection with the atomic authored-package
+/// apply/receipt family. On top of v23's
 /// durable logical-conversation favorites and daemon-authoritative
 /// onboarding bootstrap transitions, first-class assistant-thread creation,
 /// durable lineage projections, the V2 tagged ingress envelope,
@@ -7441,7 +7454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v10_request_is_rejected_after_the_current_only_v23_cutover() {
+    async fn v10_request_is_rejected_after_the_current_only_v24_cutover() {
         let (a, b) = duplex(4096);
         let mut sender = ProtoStream::with_version(a, 10);
         let mut receiver = ProtoStream::with_version(b, 10);

@@ -169,6 +169,9 @@ pub(crate) async fn rebuild_model_for_credentials(
         .map_err(|error| anyhow::anyhow!("reading redaction vault revision: {error}"))?;
     let session_id = session.id;
     let env_snapshot_for_capture = environment.clone();
+    let publish_vault = session.secret_vault().clone();
+    let publish_db = session.db.clone();
+    let publish_command_cache = command_cache.clone();
     let admission = authority
         .acquire(
             coverage_key,
@@ -187,13 +190,24 @@ pub(crate) async fn rebuild_model_for_credentials(
                     override_revision: 0,
                     redact_config: &capture_config,
                 };
-                crate::redact::coverage_authority::CoverageBuild::capture(
+                let build = crate::redact::coverage_authority::CoverageBuild::capture(
                     &capture_config,
                     &capture_root,
                     &capture_env,
                     &capture_store,
                     &sealed,
                     &capture_inputs,
+                )?;
+                Ok(
+                    build.with_publish_fence(
+                        crate::redact::coverage_bindings::SessionCoveragePublishContext::from_session_inputs(
+                            &capture_inputs,
+                            publish_vault,
+                            publish_db,
+                            publish_command_cache,
+                        )
+                        .publish_fence(),
+                    ),
                 )
             },
         )
@@ -251,20 +265,10 @@ mod tests {
         })
     }
 
-    #[test]
-    fn retry_reacquires_bound_coverage() {
-        let source = include_str!("credentials_rejected_rebuild.rs");
-        let rebuild = source
-            .split("pub(crate) async fn rebuild_model_for_credentials(")
-            .nth(1)
-            .and_then(|body| body.split("\n#[cfg(test)]\nmod tests").next())
-            .expect("credential retry implementation");
-        assert!(rebuild.contains("authority.invalidate_key(&coverage_key)"));
-        assert!(rebuild.contains("CoverageScope::CredentialRetry"));
-        assert!(rebuild.contains("CoverageBuild::capture"));
-        assert!(rebuild.contains("into_bound_table"));
-        assert!(!rebuild.contains("RedactionTable::build"));
-        assert!(!rebuild.contains("RedactionTable::empty"));
+    #[tokio::test]
+    async fn retry_reacquires_bound_coverage() {
+        crate::redact::coverage_route_behavior::tests::assert_derived_tables_preserve_binding()
+            .await;
     }
 
     #[test]

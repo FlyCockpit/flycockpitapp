@@ -1,0 +1,166 @@
+//! Behavioral invariants shared by production coverage route tests.
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use anyhow::Result;
+
+    use super::super::coverage_authority::{CoverageBinding, RedactionCoverageKey};
+    use super::super::{
+        RedactionTable,
+        coverage_authority::{
+            COVERAGE_LIMITS, CoverageBuild, CoverageError, CoverageOwnerMode, CoverageScope,
+            RedactionCoverageAuthority,
+        },
+        coverage_bindings::OwnedSourceRevisions,
+    };
+
+    const REDACTED: &str = "**REDACTED BY COCKPIT - DO NOT TRY TO OBTAIN BY WORKAROUND**";
+
+    fn binding(value: u8) -> CoverageBinding {
+        CoverageBinding::from_daemon_bytes([value; 16])
+    }
+
+    fn key(parts: [u8; 10]) -> RedactionCoverageKey {
+        RedactionCoverageKey::session(
+            binding(parts[0]),
+            binding(parts[1]),
+            binding(parts[2]),
+            binding(parts[3]),
+            binding(parts[4]),
+            binding(parts[5]),
+            binding(parts[6]),
+            binding(parts[7]),
+            binding(parts[8]),
+            binding(parts[9]),
+        )
+    }
+
+    fn boundary_for(parts: [u8; 10]) -> OwnedSourceRevisions {
+        OwnedSourceRevisions {
+            environment: binding(parts[4]),
+            credential_vault: binding(parts[5]),
+            policy: binding(parts[6]),
+            sealed: binding(parts[7]),
+            override_revision: binding(parts[8]),
+            machine_sources: binding(parts[9]),
+        }
+    }
+
+    fn capture(
+        counter: Arc<AtomicUsize>,
+        parts: [u8; 10],
+    ) -> impl FnOnce() -> Result<CoverageBuild> + Send + 'static {
+        let boundary = boundary_for(parts);
+        move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let table = RedactionTable::empty().with_forced_literal(
+                "coverage-canary-secret".to_string(),
+                "$test:coverage".to_string(),
+            )?;
+            Ok(CoverageBuild::from_complete_table(table, boundary))
+        }
+    }
+
+    pub(crate) async fn assert_derived_tables_preserve_binding() {
+        let authority = RedactionCoverageAuthority::default();
+        let captures = Arc::new(AtomicUsize::new(0));
+        let base = [8, 8, 8, 8, 8, 8, 8, 8, 8, 8];
+        let bound = authority
+            .acquire(
+                key(base),
+                CoverageScope::SessionStart,
+                capture(captures.clone(), base),
+            )
+            .await
+            .expect("session-start style bound table")
+            .into_bound_table()
+            .expect("live current binding install");
+        let forced = bound
+            .as_ref()
+            .clone()
+            .with_forced_literal("provider-auth-extra".into(), "$provider:auth".into())
+            .expect("provider guard extension");
+        assert_eq!(forced.scrub("coverage-canary-secret"), REDACTED);
+
+        let refreshed = authority
+            .acquire(
+                key(base),
+                CoverageScope::SessionSubmission,
+                capture(captures.clone(), base),
+            )
+            .await
+            .expect("submission refresh capture")
+            .into_bound_table()
+            .expect("refreshed bound table");
+        let unioned = bound.union(refreshed.as_ref()).expect("accumulated union");
+        assert_eq!(unioned.scrub("coverage-canary-secret"), REDACTED);
+
+        let sealed_derived = unioned.with_sealed_replacements(&Default::default());
+        assert_eq!(sealed_derived.scrub("coverage-canary-secret"), REDACTED);
+
+        authority.invalidate();
+        assert_eq!(unioned.scrub("coverage-canary-secret"), REDACTED);
+    }
+
+    pub(crate) async fn assert_live_current_binding_survives_lru() {
+        let authority = RedactionCoverageAuthority::new(CoverageOwnerMode::InProcess);
+        let captures = Arc::new(AtomicUsize::new(0));
+        let pinned = [7, 7, 7, 7, 7, 7, 7, 7, 7, 7];
+        let bound = authority
+            .acquire(
+                key(pinned),
+                CoverageScope::SessionStart,
+                capture(captures.clone(), pinned),
+            )
+            .await
+            .expect("pinned generation")
+            .into_bound_table()
+            .expect("live current binding");
+        for index in 0..COVERAGE_LIMITS.resident_generations {
+            let eviction_parts = [70 + index as u8; 10];
+            authority
+                .acquire(
+                    key(eviction_parts),
+                    CoverageScope::DriverTurn,
+                    capture(captures.clone(), eviction_parts),
+                )
+                .await
+                .expect("LRU insertion")
+                .use_at_sink(|_| Ok(()))
+                .expect("one-shot sink");
+        }
+        assert_eq!(bound.scrub("coverage-canary-secret"), REDACTED);
+    }
+
+    pub(crate) async fn assert_publish_fence_rejects_stale_owned_revisions() {
+        let authority = RedactionCoverageAuthority::default();
+        let captures = Arc::new(AtomicUsize::new(0));
+        let base = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9];
+        let boundary = boundary_for(base);
+        let mismatched = OwnedSourceRevisions {
+            environment: binding(99),
+            credential_vault: boundary.credential_vault,
+            policy: boundary.policy,
+            sealed: boundary.sealed,
+            override_revision: boundary.override_revision,
+            machine_sources: boundary.machine_sources,
+        };
+        let result = authority
+            .acquire(key(base), CoverageScope::SessionSubmission, move || {
+                captures.fetch_add(1, Ordering::SeqCst);
+                let table = RedactionTable::empty().with_forced_literal(
+                    "coverage-canary-secret".to_string(),
+                    "$test:coverage".to_string(),
+                )?;
+                Ok(CoverageBuild::from_complete_table(table, boundary)
+                    .with_publish_fence(Box::new(|_| mismatched.clone())))
+            })
+            .await;
+        assert!(matches!(result, Err(CoverageError::Invalidated)));
+    }
+}

@@ -1428,7 +1428,8 @@ async fn patterns_match_cwd_downward_across_subdirs() {
         root,
         &crate::config::extended::default_dotenv_patterns(),
         &[],
-    );
+    )
+    .unwrap();
     assert!(paths.iter().any(|p| p.ends_with(".env")));
     assert!(paths.iter().any(|p| p.ends_with("a/.env.local")));
     assert!(paths.iter().any(|p| p.ends_with("a/b/.env")));
@@ -1463,7 +1464,8 @@ fn git_object_store_not_descended() {
         root,
         &crate::config::extended::default_dotenv_patterns(),
         &[],
-    );
+    )
+    .unwrap();
     assert!(paths.iter().any(|p| p.ends_with(".env")));
     assert!(
         !paths.iter().any(|p| p.to_string_lossy().contains(".git")),
@@ -1494,7 +1496,8 @@ fn dotenv_scan_refuses_filesystem_root_but_honors_explicit_extra_paths() {
         Path::new("/"),
         &crate::config::extended::default_dotenv_patterns(),
         std::slice::from_ref(&extra),
-    );
+    )
+    .unwrap();
 
     assert_eq!(paths, vec![extra]);
 }

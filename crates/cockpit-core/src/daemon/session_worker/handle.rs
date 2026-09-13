@@ -1959,6 +1959,9 @@ impl SessionWorkerHandle {
         let sealed = self.session.machine_scoped_sealed_redactions().await?;
         let env = environment.vars().clone();
         let env_snapshot_for_capture = environment.clone();
+        let publish_vault = self.session.secret_vault().clone();
+        let publish_db = self.session.db.clone();
+        let publish_command_cache = command_cache.clone();
         authority
             .acquire(key, purpose, move || {
                 let capture_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
@@ -1974,13 +1977,24 @@ impl SessionWorkerHandle {
                     override_revision: 0,
                     redact_config: &config,
                 };
-                crate::redact::coverage_authority::CoverageBuild::capture(
+                let build = crate::redact::coverage_authority::CoverageBuild::capture(
                     &config,
                     &root,
                     &env,
                     &store,
                     &sealed,
                     &capture_inputs,
+                )?;
+                Ok(
+                    build.with_publish_fence(
+                        crate::redact::coverage_bindings::SessionCoveragePublishContext::from_session_inputs(
+                            &capture_inputs,
+                            publish_vault,
+                            publish_db,
+                            publish_command_cache,
+                        )
+                        .publish_fence(),
+                    ),
                 )
             })
             .await

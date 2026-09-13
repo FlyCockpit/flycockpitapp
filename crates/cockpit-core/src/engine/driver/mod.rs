@@ -3532,6 +3532,9 @@ impl Driver {
         };
         let session_id = self.session.id;
         let env_snapshot_for_capture = environment.clone();
+        let publish_vault = self.session.secret_vault().clone();
+        let publish_db = self.session.db.clone();
+        let publish_command_cache = command_cache.clone();
         match authority
             .acquire(
                 coverage_key,
@@ -3550,13 +3553,24 @@ impl Driver {
                         override_revision: 0,
                         redact_config: &cfg,
                     };
-                    crate::redact::coverage_authority::CoverageBuild::capture(
+                    let build = crate::redact::coverage_authority::CoverageBuild::capture(
                         &cfg,
                         &cwd,
                         &session_env,
                         &store,
                         &sealed,
                         &capture_inputs,
+                    )?;
+                    Ok(
+                        build.with_publish_fence(
+                            crate::redact::coverage_bindings::SessionCoveragePublishContext::from_session_inputs(
+                                &capture_inputs,
+                                publish_vault,
+                                publish_db,
+                                publish_command_cache,
+                            )
+                            .publish_fence(),
+                        ),
                     )
                 },
             )

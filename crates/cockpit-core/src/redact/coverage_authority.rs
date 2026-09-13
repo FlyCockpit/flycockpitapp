@@ -240,14 +240,41 @@ impl fmt::Display for CoverageError {
 
 impl std::error::Error for CoverageError {}
 
+struct LiveCurrentBindingGuard {
+    generation: Arc<RedactionCoverageGeneration>,
+}
+
+impl Drop for LiveCurrentBindingGuard {
+    fn drop(&mut self) {
+        self.generation
+            .live_current_bindings
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// Generation-bound egress proof carried on [`RedactionTable`] scrub paths.
-#[derive(Clone)]
+/// When installed by [`CoverageAdmission::into_bound_table`], dropping the
+/// binding releases the generation's live-current retention pin.
 pub(crate) struct CoverageTableBinding {
     authority: Weak<Inner>,
     generation_id: Uuid,
     epoch: u64,
     key_revision: u64,
     key: RedactionCoverageKey,
+    live_binding: Option<LiveCurrentBindingGuard>,
+}
+
+impl Clone for CoverageTableBinding {
+    fn clone(&self) -> Self {
+        Self {
+            authority: self.authority.clone(),
+            generation_id: self.generation_id,
+            epoch: self.epoch,
+            key_revision: self.key_revision,
+            key: self.key.clone(),
+            live_binding: None,
+        }
+    }
 }
 
 impl CoverageTableBinding {
@@ -269,12 +296,18 @@ impl CoverageTableBinding {
     }
 }
 
+/// Rereads owned source revisions at publication time. Runs on the authority's
+/// blocking pool so callers may consult live owners that are not async-safe.
+pub(crate) type CoveragePublishFence =
+    Box<dyn Fn(&RedactionTable) -> super::coverage_bindings::OwnedSourceRevisions + Send>;
+
 /// Complete, in-memory-only result of a source capture. `artifact_bytes` is
 /// supplied by the capture owner after measuring private parsed artifacts.
 pub(crate) struct CoverageBuild {
     table: Arc<RedactionTable>,
     artifact_bytes: usize,
     boundary_revisions: super::coverage_bindings::OwnedSourceRevisions,
+    publish_fence: Option<CoveragePublishFence>,
 }
 
 impl CoverageBuild {
@@ -282,7 +315,7 @@ impl CoverageBuild {
         table: RedactionTable,
         boundary_revisions: super::coverage_bindings::OwnedSourceRevisions,
     ) -> Self {
-        let artifact_bytes = table.estimated_immutable_artifact_bytes();
+        let artifact_bytes = table.measured_immutable_artifact_bytes();
         Self::from_complete_table_and_artifact_bytes(table, artifact_bytes, boundary_revisions)
     }
 
@@ -297,7 +330,13 @@ impl CoverageBuild {
             table: Arc::new(table),
             artifact_bytes,
             boundary_revisions,
+            publish_fence: None,
         }
+    }
+
+    pub(crate) fn with_publish_fence(mut self, fence: CoveragePublishFence) -> Self {
+        self.publish_fence = Some(fence);
+        self
     }
 
     /// Production-private complete capture funnel. Callers supply immutable
@@ -355,6 +394,7 @@ pub(crate) struct RedactionCoverageGeneration {
     table: Arc<RedactionTable>,
     artifact_bytes: usize,
     active_admissions: std::sync::atomic::AtomicUsize,
+    live_current_bindings: std::sync::atomic::AtomicUsize,
 }
 
 impl fmt::Debug for RedactionCoverageGeneration {
@@ -377,6 +417,7 @@ impl RedactionCoverageGeneration {
             table: build.table,
             artifact_bytes: build.artifact_bytes,
             active_admissions: std::sync::atomic::AtomicUsize::new(0),
+            live_current_bindings: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -619,7 +660,22 @@ impl RedactionCoverageAuthority {
                     // losing its final waiter makes the result inert. Fence
                     // publication again after the completed-capture boundary
                     // so zero-interest running work never enters the cache.
-                    self.publish(key.clone(), flight.epoch, flight.key_revision, build)
+                    let publish_fence = build.publish_fence.take();
+                    let publish_revisions = if let Some(fence) = publish_fence {
+                        let table = build.table.clone();
+                        tokio::task::spawn_blocking(move || fence(&table))
+                            .await
+                            .unwrap_or(build.boundary_revisions.clone())
+                    } else {
+                        build.boundary_revisions.clone()
+                    };
+                    self.publish(
+                        key.clone(),
+                        flight.epoch,
+                        flight.key_revision,
+                        build,
+                        publish_revisions,
+                    )
                 }
                 Ok(Ok(_)) => Err(CoverageError::Unavailable),
                 Ok(Err(_)) | Err(_) => Err(CoverageError::Unavailable),
@@ -658,6 +714,7 @@ impl RedactionCoverageAuthority {
         flight_epoch: u64,
         flight_key_revision: u64,
         build: CoverageBuild,
+        publish_revisions: super::coverage_bindings::OwnedSourceRevisions,
     ) -> std::result::Result<Arc<RedactionCoverageGeneration>, CoverageError> {
         if build.artifact_bytes > COVERAGE_ARTIFACT_BYTES_PER_GENERATION {
             return Err(CoverageError::Unavailable);
@@ -667,6 +724,7 @@ impl RedactionCoverageAuthority {
             || state.epoch != flight_epoch
             || state.key_revisions.get(&key).copied().unwrap_or(0) != flight_key_revision
             || !key.matches_owned_revisions(&build.boundary_revisions)
+            || !key.matches_owned_revisions(&publish_revisions)
         {
             return Err(CoverageError::Invalidated);
         }
@@ -710,6 +768,11 @@ impl RedactionCoverageAuthority {
                     .active_admissions
                     .load(std::sync::atomic::Ordering::Acquire)
                     == 0
+                    && resident
+                        .generation
+                        .live_current_bindings
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        == 0
             });
             if evictable {
                 if let Some(resident) = state.residents.remove(&key) {
@@ -913,8 +976,10 @@ impl Drop for WaiterLease {
     }
 }
 
-/// A one-operation lease. It cannot be cloned or converted into a table; the
-/// sink closure is the single funnel that observes the enforced table.
+/// A one-operation lease. It cannot be cloned. [`Self::use_at_sink`] consumes
+/// the lease at one immediate sink; [`Self::into_bound_table`] transfers the
+/// acquisition into a generation-pinned live current binding that revalidates
+/// on every scrub until the binding is dropped.
 pub(crate) struct CoverageAdmission {
     inner: Weak<Inner>,
     generation: Arc<RedactionCoverageGeneration>,
@@ -957,14 +1022,40 @@ impl CoverageAdmission {
     pub(crate) fn into_bound_table(
         self,
     ) -> std::result::Result<std::sync::Arc<RedactionTable>, CoverageError> {
+        let Some(inner) = self.inner.upgrade() else {
+            return Err(CoverageError::Unavailable);
+        };
+        {
+            let state = lock(&inner.state);
+            let current = !state.closed
+                && state.epoch == self.generation.epoch
+                && state
+                    .key_revisions
+                    .get(&self.generation.key)
+                    .copied()
+                    .unwrap_or(0)
+                    == self.generation.key_revision
+                && state
+                    .residents
+                    .get(&self.generation.key)
+                    .is_some_and(|resident| resident.generation.id == self.generation.id);
+            if !current {
+                return Err(CoverageError::Invalidated);
+            }
+        }
+        self.generation
+            .live_current_bindings
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let binding = CoverageTableBinding {
             authority: self.inner.clone(),
             generation_id: self.generation.id,
             epoch: self.generation.epoch,
             key_revision: self.generation.key_revision,
             key: self.generation.key.clone(),
+            live_binding: Some(LiveCurrentBindingGuard {
+                generation: self.generation.clone(),
+            }),
         };
-        binding.validate()?;
         let table = self
             .generation
             .table
@@ -1006,6 +1097,7 @@ impl CoverageAdmission {
             epoch: self.generation.epoch,
             key_revision: self.generation.key_revision,
             key: self.generation.key.clone(),
+            live_binding: None,
         };
         let table = self
             .generation

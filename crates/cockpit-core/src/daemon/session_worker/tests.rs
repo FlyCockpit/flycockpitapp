@@ -351,21 +351,11 @@ fn coverage_map_has_no_unclassified_builder_refresh_or_empty_admission() {
     assert!(export.contains("redacted export requires bound coverage"));
 }
 
-#[test]
-fn toggle_redaction_reacquires_bound_coverage() {
-    let source = include_str!("run.rs");
-    let toggle = source
-        .split("// `/toggle-redaction`: mutate the session's in-memory")
-        .nth(1)
-        .and_then(|body| body.split("// `/toggle-preflight`").next())
-        .expect("toggle redaction command");
-    assert!(toggle.contains("authority.invalidate_key(&coverage_key)"));
-    assert!(toggle.contains("CoverageScope::RedactionOverride"));
-    assert!(toggle.contains("CoverageBuild::capture"));
-    assert!(toggle.contains(".and_then(|admission|"));
-    assert!(toggle.contains("into_bound_table"));
-    assert!(!toggle.contains("RedactionTable::build"));
-    assert!(!toggle.contains("RedactionTable::empty"));
+#[tokio::test]
+async fn toggle_redaction_reacquires_bound_coverage() {
+    crate::redact::coverage_route_behavior::tests::assert_derived_tables_preserve_binding().await;
+    crate::redact::coverage_route_behavior::tests::assert_publish_fence_rejects_stale_owned_revisions()
+        .await;
 }
 
 #[tokio::test]

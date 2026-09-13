@@ -31511,6 +31511,9 @@ async fn run_docs_ask_pipeline(
     let capture_env = env_snapshot.vars().clone();
     let capture_store = store.clone();
     let env_snapshot_for_capture = env_snapshot.clone();
+    let publish_vault = session.secret_vault().clone();
+    let publish_db = session.db.clone();
+    let publish_command_cache = command_cache.clone();
     let admission = coverage_authority
         .acquire(
             coverage_key.clone(),
@@ -31532,12 +31535,24 @@ async fn run_docs_ask_pipeline(
                     override_revision: 0,
                     redact_config: &capture_config,
                 };
-                crate::redact::coverage_authority::CoverageBuild::capture_session_without_sealed(
-                    &capture_config,
-                    &capture_root,
-                    &capture_env,
-                    &capture_store,
-                    &capture_inputs,
+                let build =
+                    crate::redact::coverage_authority::CoverageBuild::capture_session_without_sealed(
+                        &capture_config,
+                        &capture_root,
+                        &capture_env,
+                        &capture_store,
+                        &capture_inputs,
+                    )?;
+                Ok(
+                    build.with_publish_fence(
+                        crate::redact::coverage_bindings::SessionCoveragePublishContext::from_session_inputs(
+                            &capture_inputs,
+                            publish_vault,
+                            publish_db,
+                            publish_command_cache,
+                        )
+                        .publish_fence(),
+                    ),
                 )
             },
         )
@@ -32464,6 +32479,9 @@ pub(super) async fn export_session_data(
         let environment = env_snapshot.vars().clone();
         let env_snapshot_for_capture = env_snapshot.clone();
         let export_session_id = session.id;
+        let publish_vault = session.secret_vault().clone();
+        let publish_db = session.db.clone();
+        let publish_command_cache = command_cache.clone();
         let admission = ctx
             .registry
             .coverage_authority()
@@ -32484,13 +32502,24 @@ pub(super) async fn export_session_data(
                         override_revision: 0,
                         redact_config: &config,
                     };
-                    crate::redact::coverage_authority::CoverageBuild::capture(
+                    let build = crate::redact::coverage_authority::CoverageBuild::capture(
                         &config,
                         &root,
                         &environment,
                         &store,
                         &sealed,
                         &capture_inputs,
+                    )?;
+                    Ok(
+                        build.with_publish_fence(
+                            crate::redact::coverage_bindings::SessionCoveragePublishContext::from_session_inputs(
+                                &capture_inputs,
+                                publish_vault,
+                                publish_db,
+                                publish_command_cache,
+                            )
+                            .publish_fence(),
+                        ),
                     )
                 },
             )
@@ -32754,6 +32783,9 @@ pub(super) async fn auto_title_request(
         .map_err(internal)?;
     let session_id = session.id;
     let env_snapshot_for_capture = env_identity.clone();
+    let publish_vault = session.secret_vault().clone();
+    let publish_db = session.db.clone();
+    let publish_command_cache = command_cache.clone();
     let admission = authority
         .acquire(
             key,
@@ -32772,13 +32804,24 @@ pub(super) async fn auto_title_request(
                     override_revision: 0,
                     redact_config: &capture_config,
                 };
-                crate::redact::coverage_authority::CoverageBuild::capture(
+                let build = crate::redact::coverage_authority::CoverageBuild::capture(
                     &capture_config,
                     &capture_root,
                     &env,
                     &store,
                     &sealed,
                     &capture_inputs,
+                )?;
+                Ok(
+                    build.with_publish_fence(
+                        crate::redact::coverage_bindings::SessionCoveragePublishContext::from_session_inputs(
+                            &capture_inputs,
+                            publish_vault,
+                            publish_db,
+                            publish_command_cache,
+                        )
+                        .publish_fence(),
+                    ),
                 )
             },
         )

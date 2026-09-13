@@ -705,3 +705,19 @@ async fn external_mutation_before_completed_scan_boundary_retries_or_refuses() {
         .expect("fresh post-mutation admission");
     assert_eq!(captures.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn derived_tables_preserve_admitted_generation_binding() {
+    crate::redact::coverage_route_behavior::tests::assert_derived_tables_preserve_binding().await;
+}
+
+#[tokio::test]
+async fn live_current_binding_survives_lru_eviction() {
+    crate::redact::coverage_route_behavior::tests::assert_live_current_binding_survives_lru().await;
+}
+
+#[tokio::test]
+async fn publish_fence_rejects_stale_owned_revisions() {
+    crate::redact::coverage_route_behavior::tests::assert_publish_fence_rejects_stale_owned_revisions()
+        .await;
+}

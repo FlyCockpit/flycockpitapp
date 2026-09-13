@@ -28,7 +28,7 @@ pub(super) fn matched_dotenv_paths(
     cwd: &Path,
     patterns: &[String],
     extra: &[PathBuf],
-) -> Vec<PathBuf> {
+) -> Result<Vec<PathBuf>> {
     use ignore::WalkBuilder;
     use ignore::overrides::OverrideBuilder;
 
@@ -40,14 +40,10 @@ pub(super) fn matched_dotenv_paths(
             cwd = %cwd.display(),
             "redaction `.env` walk skipped from unbounded filesystem start; explicit extra dotenv paths are still honored"
         );
-        for p in extra {
-            if p.is_file() {
-                out.push(p.clone());
-            }
-        }
+        collect_explicit_dotenv_paths(extra, &mut out)?;
         out.sort();
         out.dedup();
-        return out;
+        return Ok(out);
     }
 
     // Bound the walk only outside a git repo: inside one we keep the
@@ -84,22 +80,36 @@ pub(super) fn matched_dotenv_paths(
                 // Never descend into the git object store.
                 !(entry.file_type().is_some_and(|t| t.is_dir()) && entry.file_name() == ".git")
             });
-        for entry in builder.build().flatten() {
+        for entry in builder.build() {
+            let entry = entry.map_err(|error| {
+                anyhow::anyhow!("dotenv discovery failed during capture: {error}")
+            })?;
             if entry.file_type().is_some_and(|t| t.is_file()) {
                 out.push(entry.into_path());
             }
         }
     }
 
-    for p in extra {
-        if p.is_file() {
-            out.push(p.clone());
-        }
-    }
+    collect_explicit_dotenv_paths(extra, &mut out)?;
 
     out.sort();
     out.dedup();
-    out
+    Ok(out)
+}
+
+fn collect_explicit_dotenv_paths(extra: &[PathBuf], out: &mut Vec<PathBuf>) -> Result<()> {
+    for path in extra {
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => out.push(path.clone()),
+            Ok(_) => {}
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "configured dotenv source is unavailable during capture: {error}"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn dotenv_scan_start_is_unbounded(cwd: &Path) -> bool {
@@ -454,6 +464,21 @@ mod case_variant_tests {
         assert_eq!(table.scrub("CASETOKENVALUE123"), cfg.placeholder);
         // Capitalized (Title-case first letter of the lowercased form) echo.
         assert_eq!(table.scrub("Casetokenvalue123"), cfg.placeholder);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unreadable_extra_dotenv_path_fails_discovery() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let secret = dir.path().join("blocked.env");
+        std::fs::write(&secret, "X=blocked-secret-value\n").unwrap();
+        let mut perms = std::fs::metadata(&secret).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&secret, perms).unwrap();
+        let result = super::matched_dotenv_paths(dir.path(), &[], std::slice::from_ref(&secret));
+        assert!(result.is_err());
     }
 
     // The narrow `length_exempt` floor is untouched: a short value under a

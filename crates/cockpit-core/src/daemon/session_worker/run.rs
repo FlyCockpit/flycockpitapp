@@ -13559,6 +13559,9 @@ pub(super) async fn run_worker(
                                         })?;
                                     let env = session_env.clone();
                                     let env_snapshot_for_capture = environment.clone();
+                                    let publish_vault = session.secret_vault().clone();
+                                    let publish_db = session.db.clone();
+                                    let publish_command_cache = command_cache.clone();
                                     authority
                                         .acquire(
                                             coverage_key,
@@ -13578,13 +13581,25 @@ pub(super) async fn run_worker(
                                                         override_revision: 0,
                                                         redact_config: &capture_redact,
                                                     };
-                                                crate::redact::coverage_authority::CoverageBuild::capture(
-                                                    &capture_redact,
-                                                    &root,
-                                                    &env,
-                                                    &store,
-                                                    &sealed,
-                                                    &capture_inputs,
+                                                let build =
+                                                    crate::redact::coverage_authority::CoverageBuild::capture(
+                                                        &capture_redact,
+                                                        &root,
+                                                        &env,
+                                                        &store,
+                                                        &sealed,
+                                                        &capture_inputs,
+                                                    )?;
+                                                Ok(
+                                                    build.with_publish_fence(
+                                                        crate::redact::coverage_bindings::SessionCoveragePublishContext::from_session_inputs(
+                                                            &capture_inputs,
+                                                            publish_vault,
+                                                            publish_db,
+                                                            publish_command_cache,
+                                                        )
+                                                        .publish_fence(),
+                                                    ),
                                                 )
                                             },
                                         )

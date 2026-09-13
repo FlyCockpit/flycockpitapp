@@ -2504,6 +2504,9 @@ impl SessionRegistry {
         };
         let coverage_key = coverage_inputs.coverage_key();
         let env_snapshot_for_capture = env_snapshot.clone();
+        let publish_vault = session.secret_vault().clone();
+        let publish_db = session.db.clone();
+        let publish_command_cache = command_cache.clone();
         let admission = self
             .coverage_authority()
             .acquire(
@@ -2523,13 +2526,24 @@ impl SessionRegistry {
                         override_revision: 0,
                         redact_config: &config,
                     };
-                    crate::redact::coverage_authority::CoverageBuild::capture(
+                    let build = crate::redact::coverage_authority::CoverageBuild::capture(
                         &config,
                         &root,
                         &env,
                         &store,
                         &sealed,
                         &capture_inputs,
+                    )?;
+                    Ok(
+                        build.with_publish_fence(
+                            crate::redact::coverage_bindings::SessionCoveragePublishContext::from_session_inputs(
+                                &capture_inputs,
+                                publish_vault,
+                                publish_db,
+                                publish_command_cache,
+                            )
+                            .publish_fence(),
+                        ),
                     )
                 },
             )
@@ -3612,28 +3626,14 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn session_start_acquires_bound_coverage() {
-        let source = include_str!("registry.rs");
-        let start = source
-            .split("async fn start_worker(")
-            .nth(1)
-            .and_then(|body| {
-                body.split("// Build the model from providers config.")
-                    .next()
-            })
-            .expect("session-start coverage section");
-        assert!(start.contains("RedactionCoverageKey::session"));
-        assert!(start.contains("CoverageScope::SessionStart"));
-        assert!(start.contains("CoverageBuild::capture"));
-        assert!(start.contains("into_bound_table"));
-        assert!(start.contains("set_redaction_coverage"));
-        assert!(!start.contains("RedactionTable::build"));
-        assert!(!start.contains("RedactionTable::empty"));
-        assert!(
-            start.find("into_bound_table").expect("admission sink")
-                < start.find("Build the model").unwrap_or(start.len())
-        );
+    #[tokio::test]
+    async fn session_start_acquires_bound_coverage() {
+        crate::redact::coverage_route_behavior::tests::assert_derived_tables_preserve_binding()
+            .await;
+        crate::redact::coverage_route_behavior::tests::assert_live_current_binding_survives_lru()
+            .await;
+        crate::redact::coverage_route_behavior::tests::assert_publish_fence_rejects_stale_owned_revisions()
+            .await;
     }
 
     fn test_registry_with_config_source(

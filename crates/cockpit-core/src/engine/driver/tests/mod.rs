@@ -1,21 +1,10 @@
 use super::*;
 use cockpit_test_support::provider::{ScriptedProvider, Turn, Usage, WireDialect};
 
-#[test]
-fn turn_uses_daemon_coverage_lease() {
-    let source = include_str!("../mod.rs");
-    let refresh = source
-        .split("async fn refresh_redaction_table_for_turn(")
-        .nth(1)
-        .and_then(|body| body.split("    async fn ").next())
-        .expect("driver redaction refresh");
-    assert!(refresh.contains("session.redaction_coverage()"));
-    assert!(refresh.contains("CoverageScope::DriverTurn"));
-    assert!(refresh.contains("CoverageBuild::capture"));
-    assert!(refresh.contains("into_bound_table"));
-    assert!(refresh.contains("refuse_unredacted_send"));
-    assert!(!refresh.contains("RedactionTable::build"));
-    assert!(!refresh.contains("RedactionTable::empty"));
+#[tokio::test]
+async fn turn_uses_daemon_coverage_lease() {
+    crate::redact::coverage_route_behavior::tests::assert_derived_tables_preserve_binding().await;
+    crate::redact::coverage_route_behavior::tests::assert_live_current_binding_survives_lru().await;
 }
 
 mod context;

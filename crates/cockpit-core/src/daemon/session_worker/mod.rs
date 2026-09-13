@@ -451,6 +451,9 @@ async fn refresh_redaction_for_turn(
         .current_inventory_generation()
         .map_err(|error| anyhow::anyhow!("reading redaction vault revision: {error}"))?;
     let env_snapshot_for_capture = environment.clone();
+    let publish_vault = session.secret_vault().clone();
+    let publish_db = session.db.clone();
+    let publish_command_cache = command_cache.clone();
     let new_table = authority
         .acquire(
             coverage_key,
@@ -469,13 +472,24 @@ async fn refresh_redaction_for_turn(
                     override_revision: 0,
                     redact_config: &cfg,
                 };
-                crate::redact::coverage_authority::CoverageBuild::capture(
+                let build = crate::redact::coverage_authority::CoverageBuild::capture(
                     &cfg,
                     &root,
                     &env,
                     &store,
                     &sealed,
                     &capture_inputs,
+                )?;
+                Ok(
+                    build.with_publish_fence(
+                        crate::redact::coverage_bindings::SessionCoveragePublishContext::from_session_inputs(
+                            &capture_inputs,
+                            publish_vault,
+                            publish_db,
+                            publish_command_cache,
+                        )
+                        .publish_fence(),
+                    ),
                 )
             },
         )

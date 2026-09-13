@@ -1236,7 +1236,7 @@ impl RedactionTable {
 
         if cfg.scan_dotenv {
             let discovered =
-                matched_dotenv_paths(cwd, &cfg.dotenv_patterns, &cfg.extra_dotenv_paths);
+                matched_dotenv_paths(cwd, &cfg.dotenv_patterns, &cfg.extra_dotenv_paths)?;
             for path in &discovered {
                 match collect_env_file_candidates(path, &cfg.allowlist) {
                     EnvFileScan::Candidates(file_entries) => {
@@ -1261,7 +1261,7 @@ impl RedactionTable {
             // capture must refuse this generation rather than publish coverage
             // for only one side of the mutable directory view.
             if discovered
-                != matched_dotenv_paths(cwd, &cfg.dotenv_patterns, &cfg.extra_dotenv_paths)
+                != matched_dotenv_paths(cwd, &cfg.dotenv_patterns, &cfg.extra_dotenv_paths)?
             {
                 return Err(RedactionSourceChangedError.into());
             }
@@ -1509,7 +1509,11 @@ impl RedactionTable {
             unsupported_files,
             protected,
         )?;
-        merged.coverage_binding = self.coverage_binding.clone();
+        merged.coverage_binding = match (&other.coverage_binding, &self.coverage_binding) {
+            (Some(right), _) => Some(right.clone()),
+            (None, Some(left)) => Some(left.clone()),
+            (None, None) => None,
+        };
         Ok(merged)
     }
 
@@ -1525,13 +1529,15 @@ impl RedactionTable {
             origin,
             OrdinarySource::ContainedLeak,
         ));
-        Self::from_redaction_entries(
+        let mut table = Self::from_redaction_entries(
             entries,
             self.placeholder.clone(),
             self.disabled,
             self.unsupported_files.clone(),
             self.protected.clone(),
-        )
+        )?;
+        table.coverage_binding = self.coverage_binding.clone();
+        Ok(table)
     }
 
     /// Add one caller-supplied **sealed** literal, carrying its canonical typed
@@ -1545,13 +1551,15 @@ impl RedactionTable {
     ) -> Result<Self> {
         let mut entries = self.entries.clone();
         entries.push(RedactionEntry::sealed(value, identity));
-        Self::from_redaction_entries(
+        let mut table = Self::from_redaction_entries(
             entries,
             self.placeholder.clone(),
             self.disabled,
             self.unsupported_files.clone(),
             self.protected.clone(),
-        )
+        )?;
+        table.coverage_binding = self.coverage_binding.clone();
+        Ok(table)
     }
 
     /// Produce an egress-time derived table where sealed entries whose typed
@@ -1625,6 +1633,7 @@ impl RedactionTable {
             unsupported_files: self.unsupported_files.clone(),
             protected: self.protected.clone(),
             protected_path_conflicts: self.protected_path_conflicts.clone(),
+            coverage_binding: self.coverage_binding.clone(),
             #[cfg(test)]
             fail_enforced_view: self.fail_enforced_view,
         }
@@ -1885,29 +1894,30 @@ impl RedactionTable {
         self.disabled || self.matcher.is_none()
     }
 
-    /// Conservative private heap accounting for one immutable authority
-    /// artifact. This value never leaves the daemon and is not a source or
-    /// candidate fingerprint.
-    pub(super) fn estimated_immutable_artifact_bytes(&self) -> usize {
+    /// Measured private heap accounting for one immutable authority artifact.
+    /// Uses the entry heap plus each automaton's library-reported
+    /// [`aho_corasick::AhoCorasick::memory_usage`]. This value never leaves the
+    /// daemon and is not a source or candidate fingerprint.
+    pub(super) fn measured_immutable_artifact_bytes(&self) -> usize {
         let entry_bytes = self.entries.iter().fold(0usize, |total, entry| {
             total
                 .saturating_add(entry.value.capacity())
                 .saturating_add(entry.class.origin_display().len())
                 .saturating_add(std::mem::size_of::<RedactionEntry>())
         });
-        // Both automatons are compiled from the same pattern vector. Charge each
-        // pattern byte multiple times to cover transition tables, state vectors,
-        // and allocator overhead that are not reflected in the entry strings.
-        let pattern_bytes = self
-            .entries
-            .iter()
-            .map(|entry| entry.value.len())
-            .sum::<usize>();
-        let automaton_bytes = pattern_bytes
-            .saturating_mul(8)
-            .saturating_add(self.entries.len().saturating_mul(512));
+        let automaton_bytes = self
+            .matcher
+            .as_ref()
+            .map(|matcher| matcher.memory_usage())
+            .unwrap_or(0)
+            .saturating_add(
+                self.overlap_matcher
+                    .as_ref()
+                    .map(|matcher| matcher.memory_usage())
+                    .unwrap_or(0),
+            );
         entry_bytes
-            .saturating_add(automaton_bytes.saturating_mul(2))
+            .saturating_add(automaton_bytes)
             .saturating_add(self.unsupported_files.capacity() * std::mem::size_of::<PathBuf>())
             .saturating_add(
                 self.protected_path_conflicts.capacity() * std::mem::size_of::<String>(),
@@ -3176,6 +3186,9 @@ mod sec_f3_case_and_hex_tests {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod coverage_route_behavior;
 
 #[cfg(test)]
 mod tests;

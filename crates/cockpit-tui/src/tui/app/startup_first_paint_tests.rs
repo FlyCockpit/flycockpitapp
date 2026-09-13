@@ -886,7 +886,7 @@ fn pre_session_submission_retains_one_id_and_replacement_cannot_consume_it() {
 #[test]
 fn retained_submission_dispatches_exactly_once_after_runner_attach() {
     use crate::tui::agent_runner::AgentRunner;
-    use std::sync::mpsc;
+    use tokio::sync::mpsc;
 
     let tmp = tempfile::tempdir().unwrap();
     let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
@@ -922,7 +922,7 @@ fn retained_submission_dispatches_exactly_once_after_runner_attach() {
     assert_eq!(generation, app.startup_background.generation);
 
     app.startup_background.workspace_ready = true;
-    let (control_tx, _control_rx) = mpsc::channel();
+    let (control_tx, _control_rx) = mpsc::channel(4);
     app.adopt_runner(Ok(AgentRunner::stub_with_control_tx(control_tx)));
 
     assert!(app.startup_retained_submission_id.is_none());
@@ -940,7 +940,7 @@ fn retained_submission_dispatches_exactly_once_after_runner_attach() {
         1
     );
 
-    let (control_tx, _control_rx) = mpsc::channel();
+    let (control_tx, _control_rx) = mpsc::channel(4);
     app.adopt_runner(Ok(AgentRunner::stub_with_control_tx(control_tx)));
     assert_eq!(
         app.history

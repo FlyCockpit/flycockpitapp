@@ -3675,6 +3675,16 @@ impl App {
         self.startup_debug_last_message = enabled;
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn first_paint_completed_for_tests(&self) -> bool {
+        self.first_paint_completed
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn dialog_is_workspace_trust_for_tests(&self) -> bool {
+        self.dialog.is_workspace_trust()
+    }
+
     fn new_inner(
         project: Option<&Path>,
         no_sandbox: bool,

@@ -240,8 +240,8 @@ mod tests {
             lifecycle,
         );
 
-        assert!(!app.dialog.is_workspace_trust());
-        assert!(!app.first_paint_completed);
+        assert!(!app.dialog_is_workspace_trust_for_tests());
+        assert!(!app.first_paint_completed_for_tests());
         assert_eq!(providers::load_effective_call_count(), 0);
         crate::config::trust::clear_runtime_policy_for_tests();
     }
@@ -262,7 +262,7 @@ mod tests {
             lifecycle,
         );
 
-        assert!(!app.dialog.is_workspace_trust());
+        assert!(!app.dialog_is_workspace_trust_for_tests());
         app.set_startup_debug_last_message(true);
         assert!(cockpit_core::engine::model::debug_last_message_path_for_tests().is_none());
         crate::config::trust::clear_runtime_policy_for_tests();

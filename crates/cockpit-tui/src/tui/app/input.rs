@@ -2511,11 +2511,11 @@ impl App {
             }
             return false;
         }
-        if let Some(query) = self.slash_query() {
+        if let Some(query) = self.slash_query().map(str::to_owned) {
             if !self.guard_startup_workspace_effects() {
                 return false;
             }
-            if let Some(command) = super::hidden_slash_alias(query) {
+            if let Some(command) = super::hidden_slash_alias(&query) {
                 return self.execute_slash(command);
             }
             // Run whatever is highlighted. The default highlight is the

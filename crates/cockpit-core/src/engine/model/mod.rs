@@ -213,7 +213,7 @@ pub fn enable_debug_last_message(path: PathBuf) {
     let _ = DEBUG_LAST_MESSAGE_PATH.set(path);
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn debug_last_message_path_for_tests() -> Option<&'static Path> {
     debug_last_message_path()
 }

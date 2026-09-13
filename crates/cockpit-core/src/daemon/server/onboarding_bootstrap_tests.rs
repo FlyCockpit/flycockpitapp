@@ -356,14 +356,14 @@ async fn locked_bootstrap_settles_only_the_onboarding_profile_wizard_apply() {
     // gate inside the admission.
     let back = match handle_locked_in_process_request(
         &locked,
-        Request::ApplyOnboardingTransition {
+        Request::ApplyOnboardingTransition(ApplyOnboardingTransition {
             run_id: secure.run_id,
             attempt_id: secure.attempt_id,
             expected_revision: secure.revision,
             client_operation_id: "back-from-secure-store".into(),
             transition: OnboardingTransitionKind::Back,
             settlement: None,
-        },
+        }),
     )
     .await
     .expect("Back from the secure-store choice is admissible while locked")

@@ -577,11 +577,13 @@ fn real_daemon_rejects_stale_revision_transitions() {
             .await
             .expect("revision fixture daemon client");
         let begin = match client
-            .request(cockpit_proto::Request::BeginOrReopenOnboarding {
-                expected_revision: None,
-                client_operation_id: uuid::Uuid::new_v4().to_string(),
-                reentry: false,
-            })
+            .request(cockpit_proto::Request::BeginOrReopenOnboarding(
+                cockpit_proto::BeginOrReopenOnboarding {
+                    expected_revision: None,
+                    client_operation_id: uuid::Uuid::new_v4().to_string(),
+                    reentry: false,
+                },
+            ))
             .await
             .expect("revision fixture begin transport")
             .expect("revision fixture begin response")
@@ -592,14 +594,16 @@ fn real_daemon_rejects_stale_revision_transitions() {
         assert_eq!(begin.stage, OnboardingStage::Welcome);
 
         let transition = |expected_revision, run_id, attempt_id| {
-            cockpit_proto::Request::ApplyOnboardingTransition {
-                run_id,
-                attempt_id,
-                expected_revision,
-                client_operation_id: uuid::Uuid::new_v4().to_string(),
-                transition: cockpit_proto::OnboardingTransitionKind::Advance,
-                settlement: None,
-            }
+            cockpit_proto::Request::ApplyOnboardingTransition(
+                cockpit_proto::ApplyOnboardingTransition {
+                    run_id,
+                    attempt_id,
+                    expected_revision,
+                    client_operation_id: uuid::Uuid::new_v4().to_string(),
+                    transition: cockpit_proto::OnboardingTransitionKind::Advance,
+                    settlement: None,
+                },
+            )
         };
 
         // The first advance with the current revision commits.
@@ -662,14 +666,16 @@ fn concurrent_client_defer_is_followed_by_the_read_only_refresh() {
         };
         assert_eq!(snapshot.stage, OnboardingStage::Provider);
         match client
-            .request(cockpit_proto::Request::ApplyOnboardingTransition {
-                run_id: snapshot.run_id,
-                attempt_id: snapshot.attempt_id,
-                expected_revision: snapshot.revision,
-                client_operation_id: uuid::Uuid::new_v4().to_string(),
-                transition: cockpit_proto::OnboardingTransitionKind::DeferProvider,
-                settlement: None,
-            })
+            .request(cockpit_proto::Request::ApplyOnboardingTransition(
+                cockpit_proto::ApplyOnboardingTransition {
+                    run_id: snapshot.run_id,
+                    attempt_id: snapshot.attempt_id,
+                    expected_revision: snapshot.revision,
+                    client_operation_id: uuid::Uuid::new_v4().to_string(),
+                    transition: cockpit_proto::OnboardingTransitionKind::DeferProvider,
+                    settlement: None,
+                },
+            ))
             .await
             .expect("defer fixture transition transport")
             .expect("defer fixture transition response")

@@ -2488,6 +2488,9 @@ impl App {
         // Shell mode: a leading `!` runs the rest as a one-shot local
         // command (GOALS §1k). Never reaches the agent or the wire.
         if self.composer.text().starts_with('!') {
+            if !self.guard_startup_workspace_effects() {
+                return false;
+            }
             let cmd = self.composer.text()[1..].to_string();
             self.clear_composer_buffer();
             self.run_shell_command(&cmd);
@@ -2500,6 +2503,9 @@ impl App {
             return false;
         }
         if let Some(query) = self.slash_query() {
+            if !self.guard_startup_workspace_effects() {
+                return false;
+            }
             if let Some(command) = super::hidden_slash_alias(query) {
                 return self.execute_slash(command);
             }

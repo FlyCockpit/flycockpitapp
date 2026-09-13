@@ -1158,14 +1158,23 @@ impl App {
                         self.apply_onboarding_bootstrap_snapshot(completion.snapshot);
                     }
                     Ok(AsyncActionPayload::StartupOnboardingTransition(_)) => {}
-                    Err(error) => self.show_toast(
-                        format!("Onboarding transition unavailable: {error}"),
-                        crate::tui::app::ToastKind::Error,
-                    ),
-                    Ok(_) => self.show_toast(
-                        "Onboarding authority returned an invalid projection",
-                        crate::tui::app::ToastKind::Error,
-                    ),
+                    Err(error) if !self.exit_requested && pending_request_id.is_some() => {
+                        self.startup_background.retry = Some(StartupRetry::Onboarding);
+                        if self.mark_startup_trace_milestone("onboarding-error") {
+                            tracing::warn!(target: cockpit_core::startup::TARGET, event = "onboarding-error", "startup");
+                        }
+                        self.show_toast(
+                            format!("Onboarding transition unavailable: {error}"),
+                            crate::tui::app::ToastKind::Error,
+                        );
+                    }
+                    Ok(_) if !self.exit_requested && pending_request_id.is_some() => {
+                        self.show_toast(
+                            "Onboarding authority returned an invalid projection",
+                            crate::tui::app::ToastKind::Error,
+                        );
+                    }
+                    Ok(_) | Err(_) => {}
                 }
             }
             AsyncActionKind::DaemonRpc("startup.workspace") => match result.payload {
@@ -1186,10 +1195,16 @@ impl App {
                         crate::tui::app::ToastKind::Error,
                     );
                 }
-                Ok(_) if !self.exit_requested => self.show_toast(
-                    "Workspace trust returned an invalid projection",
-                    crate::tui::app::ToastKind::Error,
-                ),
+                Ok(_)
+                    if !self.exit_requested
+                        && self.startup_background.started
+                        && !self.startup_background.workspace_ready =>
+                {
+                    self.show_toast(
+                        "Workspace trust returned an invalid projection",
+                        crate::tui::app::ToastKind::Error,
+                    );
+                }
                 Ok(_) | Err(_) => {}
             },
             AsyncActionKind::DaemonRpc("sealed.effect") => {
@@ -1599,6 +1614,8 @@ impl App {
             AsyncActionKind::Internal("startup.dependencies") => {
                 if let Ok(AsyncActionPayload::StartupDependencyProjection(projection)) =
                     result.payload
+                    && !self.exit_requested
+                    && self.startup_background.workspace_ready
                     && let Some(summary) =
                         cockpit_core::external_runtime::startup_dependency_policy(&projection)
                             .summary

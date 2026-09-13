@@ -176,6 +176,7 @@ pub async fn run_named_assistant(
 mod tests {
     use super::*;
     use crate::config::providers::{ConfigDoc, ModelEntry, ProviderEntry, ProvidersConfig};
+    use cockpit_config::providers;
     use cockpit_test_support::TestEnvGuard;
 
     #[tokio::test]
@@ -222,13 +223,48 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_first_run_reaches_prompt() {
+    fn interactive_composition_defers_trust_and_project_config_until_post_draw() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        write_provider_config(tmp.path());
+        providers::reset_load_effective_call_count();
+
+        let (lifecycle, _requests) = cockpit_client::LifecycleClient::channel(1);
+        let app = App::new_composed_with_session_mode(
+            Some(tmp.path()),
+            false,
+            SessionMode::Code,
+            StartupWorkspaceTrust::Decided,
+            None,
+            lifecycle,
+        );
+
+        assert!(!app.dialog.is_workspace_trust());
+        assert!(!app.first_paint_completed);
+        assert_eq!(providers::load_effective_call_count(), 0);
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    #[test]
+    fn untrusted_first_run_reaches_prompt_without_pre_dispatch_trust() {
         let tmp = tempfile::tempdir().unwrap();
         let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         crate::config::trust::clear_runtime_policy_for_tests();
 
-        let trust = StartupWorkspaceTrust::Decided;
-        assert!(matches!(trust, StartupWorkspaceTrust::Decided));
+        let (lifecycle, _requests) = cockpit_client::LifecycleClient::channel(1);
+        let mut app = App::new_composed_with_session_mode(
+            Some(tmp.path()),
+            false,
+            SessionMode::Code,
+            StartupWorkspaceTrust::Decided,
+            None,
+            lifecycle,
+        );
+
+        assert!(!app.dialog.is_workspace_trust());
+        app.set_startup_debug_last_message(true);
+        assert!(cockpit_core::engine::model::debug_last_message_path_for_tests().is_none());
         crate::config::trust::clear_runtime_policy_for_tests();
     }
 
@@ -239,8 +275,6 @@ mod tests {
         crate::config::trust::clear_runtime_policy_for_tests();
         write_provider_config(tmp.path());
 
-        let trust = StartupWorkspaceTrust::Decided;
-        assert!(matches!(trust, StartupWorkspaceTrust::Decided));
         let ignored = ConfigDoc::load_effective(tmp.path());
         assert!(!ignored.providers.contains_key("p"));
 

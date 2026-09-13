@@ -141,6 +141,9 @@ impl App {
     /// [`Self::try_attach_for_display`] instead, which never latches an
     /// error.
     pub(super) fn ensure_agent_runner(&mut self) {
+        if !self.guard_startup_workspace_effects() {
+            return;
+        }
         #[cfg(feature = "remote")]
         {
             if !self.startup_disclosures_ready {
@@ -167,10 +170,21 @@ impl App {
         latch_error: bool,
         continuation: RunnerAttachContinuation,
     ) {
+        if !self.guard_startup_workspace_effects() {
+            return;
+        }
         if matches!(self.agent_runner, Some(Ok(_))) {
             self.apply_runner_attach_continuation(continuation);
             return;
         }
+        let Some(selected) = self.startup_lifecycle.clone() else {
+            if latch_error {
+                let error = "startup lifecycle is not ready".to_string();
+                self.adopt_runner(Err(error.clone()));
+                self.apply_runner_attach_failure(&[continuation], &error);
+            }
+            return;
+        };
         let requested_session_id = self.launch.session_id;
         if let Some(pending) = self.pending_runner_attach.as_mut()
             && pending.cwd == self.launch.cwd
@@ -198,12 +212,8 @@ impl App {
         };
         let cwd = self.launch.cwd.clone();
         let no_sandbox = self.no_sandbox;
-        let intent = self.lifecycle_intent();
         let lifecycle = self.lifecycle.clone();
-        let selected = self.startup_lifecycle.clone();
-        let startup_generation = selected
-            .as_ref()
-            .map(|_| self.startup_background.generation);
+        let startup_generation = Some(self.startup_background.generation);
         let worker_cwd = cwd.clone();
         // Route selection is structural: Code uses the closed Code-root API,
         // while generic attach can represent only Assistant/Computer.
@@ -216,54 +226,16 @@ impl App {
                 AsyncActionKind::Internal("runner.attach"),
                 AsyncActionPolicy::Replace(AsyncActionKey::new("runner.attach")),
                 async move {
-                    let runner = if let Some(selected) = selected {
-                        agent_runner::attach_to_selected_lifecycle(
-                            &worker_cwd,
-                            requested_session_id,
-                            initial_model,
-                            requested_session_entry_mode,
-                            no_sandbox,
-                            lifecycle,
-                            selected,
-                        )
-                        .await
-                    } else {
-                        match initial_model {
-                            Some(model) => {
-                                agent_runner::try_spawn_with_model_and_entry_mode(
-                                    &worker_cwd,
-                                    requested_session_id,
-                                    model,
-                                    no_sandbox,
-                                    lifecycle,
-                                    intent,
-                                    requested_session_entry_mode,
-                                )
-                                .await
-                            }
-                            None => match requested_session_id {
-                                Some(session_id) => {
-                                    agent_runner::attach_to_session(
-                                        &worker_cwd,
-                                        session_id,
-                                        no_sandbox,
-                                        lifecycle,
-                                        intent,
-                                    )
-                                    .await
-                                }
-                                None => {
-                                    agent_runner::try_spawn(
-                                        &worker_cwd,
-                                        no_sandbox,
-                                        lifecycle,
-                                        intent,
-                                    )
-                                    .await
-                                }
-                            },
-                        }
-                    }?;
+                    let runner = agent_runner::attach_to_selected_lifecycle(
+                        &worker_cwd,
+                        requested_session_id,
+                        initial_model,
+                        requested_session_entry_mode,
+                        no_sandbox,
+                        lifecycle,
+                        selected,
+                    )
+                    .await?;
                     Ok(AsyncActionPayload::AgentRunnerAttached(Box::new(runner)))
                 },
             )

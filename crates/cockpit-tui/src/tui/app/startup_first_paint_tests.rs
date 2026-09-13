@@ -734,6 +734,18 @@ fn exit_rejects_every_late_startup_stage_completion() {
     assert!(app.launch.session_id.is_none());
     assert!(app.toast.is_none());
     assert!(lifecycle_requests.try_recv().is_err());
+
+    app.pending_startup_onboarding_operations.insert(
+        AsyncActionId::from_raw_for_test(96),
+        "late-onboarding".into(),
+    );
+    app.apply_async_action_result(AsyncActionResult {
+        id: AsyncActionId::from_raw_for_test(96),
+        kind: AsyncActionKind::DaemonRpc("onboarding.transition"),
+        presentation_stale: false,
+        payload: Err("late onboarding failure".to_string()),
+    });
+    assert!(app.toast.is_none());
 }
 
 #[test]
@@ -869,6 +881,141 @@ fn pre_session_submission_retains_one_id_and_replacement_cannot_consume_it() {
     assert_ne!(first.1, replacement.1);
     assert_eq!(app.composer.display_text(), "keep this draft");
     assert!(app.agent_runner.is_none());
+}
+
+#[test]
+fn retained_submission_dispatches_exactly_once_after_runner_attach() {
+    use crate::tui::agent_runner::AgentRunner;
+    use std::sync::mpsc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let cockpit = tmp.path().join(".cockpit");
+    std::fs::create_dir_all(&cockpit).unwrap();
+    std::fs::write(cockpit.join("config.json"), "{}").unwrap();
+    let provider_dir = cockpit.join("providers");
+    std::fs::create_dir(&provider_dir).unwrap();
+    std::fs::write(
+        provider_dir.join("p.json"),
+        r#"{"url":"https://example.test","models":[{"id":"m"}]}"#,
+    )
+    .unwrap();
+
+    let mut app = App::new(Some(tmp.path()), false);
+    app.first_paint_completed = true;
+    app.startup_background.started = true;
+    app.launch.active_model = Some(("p".to_string(), "m".to_string()));
+    app.config_snapshot.providers.providers.insert(
+        "p".to_string(),
+        cockpit_config::providers::ProviderEntry {
+            url: "https://example.test".to_string(),
+            models: vec![cockpit_config::providers::ModelEntry {
+                id: "m".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    app.composer.insert_str("keep this draft");
+    assert!(!app.submit_input());
+    let (generation, retained_id) = app.startup_retained_submission_id.unwrap();
+    assert_eq!(generation, app.startup_background.generation);
+
+    app.startup_background.workspace_ready = true;
+    let (control_tx, _control_rx) = mpsc::channel();
+    app.adopt_runner(Ok(AgentRunner::stub_with_control_tx(control_tx)));
+
+    assert!(app.startup_retained_submission_id.is_none());
+    assert_eq!(
+        app.history
+            .iter()
+            .filter(|entry| matches!(
+                entry,
+                super::HistoryEntry::User {
+                    optimistic_submission_id: Some(id),
+                    ..
+                } if *id == retained_id
+            ))
+            .count(),
+        1
+    );
+
+    let (control_tx, _control_rx) = mpsc::channel();
+    app.adopt_runner(Ok(AgentRunner::stub_with_control_tx(control_tx)));
+    assert_eq!(
+        app.history
+            .iter()
+            .filter(|entry| matches!(
+                entry,
+                super::HistoryEntry::User {
+                    optimistic_submission_id: Some(id),
+                    ..
+                } if *id == retained_id
+            ))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn sibling_runner_and_slash_paths_block_before_workspace_ready() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    app.first_paint_completed = true;
+    app.startup_background.started = true;
+
+    app.composer.set("/init".to_string());
+    assert!(!app.complete_or_submit());
+    assert!(app.agent_runner.is_none());
+    assert_eq!(app.composer.text(), "/init");
+
+    app.composer.set("/compact".to_string());
+    assert!(!app.complete_or_submit());
+    assert!(app.agent_runner.is_none());
+    assert!(app.pending_runner_attach.is_none());
+
+    app.composer.set("/assistant demo".to_string());
+    assert!(!app.complete_or_submit());
+    assert!(app.async_actions.pending_count() == 0);
+
+    app.composer.set("!pwd".to_string());
+    assert!(!app.complete_or_submit());
+    assert!(app.async_actions.pending_count() == 0);
+}
+
+#[test]
+fn debug_last_message_defers_activation_until_trust_ready() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    app.set_startup_debug_last_message(true);
+    app.first_paint_completed = true;
+    let unset_before = cockpit_core::engine::model::debug_last_message_path_for_tests().is_none();
+    let snapshot = startup_snapshot(3);
+    let root = cockpit_config::trust::TrustRoot {
+        opened_path: tmp.path().to_path_buf(),
+        root: tmp.path().to_path_buf(),
+        kind: cockpit_config::trust::TrustRootKind::Directory,
+    };
+
+    app.apply_startup_workspace_completion(super::StartupWorkspaceCompletion {
+        generation: app.startup_background.generation,
+        opened: tmp.path().to_path_buf(),
+        root,
+        mode: Some(cockpit_proto::WorkspaceTrustMode::Trust),
+        config_generation: 1,
+        snapshot: Some(snapshot),
+    });
+
+    assert!(app.startup_background.workspace_ready);
+    if unset_before {
+        assert_eq!(
+            cockpit_core::engine::model::debug_last_message_path_for_tests(),
+            Some(tmp.path().join(".lastmessage").as_path())
+        );
+    } else {
+        assert!(cockpit_core::engine::model::debug_last_message_path_for_tests().is_some());
+    }
+    cockpit_config::trust::clear_runtime_policy_for_tests();
 }
 
 #[test]

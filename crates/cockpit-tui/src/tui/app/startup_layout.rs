@@ -459,6 +459,13 @@ impl App {
             },
         );
 
+        let lifecycle = self.lifecycle.clone();
+        let cwd = self.launch.cwd.clone();
+        let repo_status = Arc::clone(&self.repo_status);
+        let _git_refresh = super::spawn_git_refresh(cwd.clone(), lifecycle.clone(), repo_status);
+        let worktree_root = Arc::clone(&self.worktree_root);
+        let _worktree_resolve = super::spawn_worktree_root_resolve(cwd, lifecycle, worktree_root);
+
         #[cfg(feature = "remote")]
         self.start_startup_disclosures_fetch();
     }
@@ -1053,6 +1060,28 @@ impl App {
                 )
             },
         );
+    }
+
+    /// True while the post-paint startup machine has not yet accepted a workspace.
+    /// Composer input stays live, but runner/session effects and project I/O must
+    /// remain blocked until this clears.
+    pub(super) fn blocks_startup_workspace_effects(&self) -> bool {
+        (self.first_paint_completed || self.startup_background.started)
+            && !self.startup_background.workspace_ready
+    }
+
+    /// Gate runner attach, slash/`!` dispatch, and other project-touching paths
+    /// behind the accepted-workspace fence. Returns `false` when blocked.
+    pub(super) fn guard_startup_workspace_effects(&mut self) -> bool {
+        if !self.blocks_startup_workspace_effects() {
+            return true;
+        }
+        self.show_toast(
+            "Command unavailable until startup accepts the workspace",
+            ToastKind::Info,
+        );
+        self.retry_startup_background();
+        false
     }
 
     pub(super) fn retry_startup_background(&mut self) {

@@ -57,6 +57,17 @@ impl App {
         {
             self.toast = None;
         }
+        // The header `more` popover closes on any left press outside its
+        // rect and outside the header rows that own it — regardless of what
+        // the press then hits. This must run BEFORE every owner that may
+        // consume the press and return (the rail, registered buttons, the
+        // settings pointer, pickers): a press on any of those is still an
+        // outside press for this floating chrome. The press itself keeps
+        // routing to whatever it hit; presses inside the popover (its rows
+        // are registered buttons) and inside the header are exempt.
+        if self.mouse_capture && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.close_chat_header_popover_on_outside_press(mouse.column, mouse.row);
+        }
         // The full-screen onboarding shell owns the whole screen while
         // active: its native surfaces consume their events, engine screens
         // route pointer input to the embedded settings dialog, and nothing
@@ -761,6 +772,14 @@ impl App {
                         crate::tui::chrome::FooterControl::Model => self.open_model_picker(),
                     }
                 }
+            }
+            crate::tui::button::ButtonDispatch::HeaderPill(kind) => {
+                self.cancel_mouse_gesture(self.event_loop_monotonic_now);
+                self.activate_header_pill(kind);
+            }
+            crate::tui::button::ButtonDispatch::HeaderMore => {
+                self.cancel_mouse_gesture(self.event_loop_monotonic_now);
+                self.toggle_chat_header_more();
             }
             crate::tui::button::ButtonDispatch::PersistentNoticeCopy => {
                 self.copy_persistent_notice_fix_command();

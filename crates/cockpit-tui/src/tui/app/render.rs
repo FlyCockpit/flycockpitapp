@@ -1397,6 +1397,9 @@ impl App {
 
     pub(super) fn render(&mut self, frame: &mut ratatui::Frame) {
         let geom = self.geometry();
+        // The chat header records its layout when it renders this frame;
+        // reset first so pill activation cannot target a stale frame.
+        self.chat_header_layout = None;
         let frame_key = (
             frame.area().width,
             frame.area().height,
@@ -1427,12 +1430,13 @@ impl App {
             // the embedded settings dialog.
             shell.render(frame, frame.area(), &self.dialog, &mut self.link_registry);
         } else if self.question_dialog.is_some() {
-            // Answering dialog (GOALS §3b): a compact, bottom-anchored
+            // Answering dialog (GOALS §3b): a compact, Bottom-anchored
             // overlay above the status row. History stays visible above
             // it (codex bottom-pane style), so render the chat into `body`
             // and the dialog into the `compact` slot. The dialog owns the
             // cursor while it's open.
-            self.render_chat_history_pane(frame, rects.body);
+            let body = self.render_chat_header(frame, rects.body);
+            self.render_chat_history_pane(frame, body);
             self.paint_transcript_control_buttons(frame);
             if let Some(dialog) = self.question_dialog.as_mut() {
                 // Sync both body regions' scroll viewports to the real
@@ -1550,6 +1554,7 @@ impl App {
                     let chat_rect = self.render_pane(frame, chat_body);
                     match chat_rect {
                         Some(chat) => {
+                            let chat = self.render_chat_header(frame, chat);
                             self.render_chat_history_pane(frame, chat);
                             self.paint_transcript_control_buttons(frame);
                         }
@@ -1608,6 +1613,9 @@ impl App {
                 }
             }
         }
+        // The collapsed-pill `more` popover floats over the transcript,
+        // above the status row. Painted only when the header rendered.
+        self.paint_chat_header_more_popover(frame);
         self.render_status(frame, rects.status);
 
         // Toast sits on top of the status line. Rendered before the
@@ -4547,19 +4555,24 @@ impl App {
     pub(super) fn render_status(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         // Caffeination glyph (☕) leads the right-hand chrome while active,
         // driven by the daemon-broadcast state (GOALS §1a). Additive to the
-        // fixed cwd + branch chrome — never displaces it.
+        // right-hand transient stack — never displaces another slot.
         // Side-conversation indicator (`/side`) leads the right-hand chrome
         // while a throwaway side conversation is open, ahead of the ☕ glyph.
-        // Additive to the fixed cwd + branch chrome — never displaces it.
+        // Additive to the right-hand transient stack — never displaces
+        // another slot.
         // Plan-status indicator (`plan-status-chrome-and-resolver.md`) leads
         // the right-hand chrome when this project has unfinished plans, driven
-        // by daemon-broadcast state. Additive to the fixed cwd + branch chrome
-        // (GOALS §1a) — never displaces it, the same pattern as the ☕ glyph.
+        // by daemon-broadcast state. Additive to the right-hand transient
+        // stack (GOALS §1a) — never displaces another slot, the same pattern
+        // as the ☕ glyph.
         // Transient "waiting for lock" indicator
         // (`readlock-wait-and-lock-expiry.md` historical prompt slug) leads
         // the right-hand chrome
         // while a write/edit implicit acquire is blocked on a contended lock. Additive — never
         // displaces a fixed slot, the same pattern as the ☕ glyph.
+        // The path/git summary and the async-schedule strip moved to the
+        // three-row chat header (`chat_header`): the footer no longer
+        // duplicates them.
         let mut right = chrome::waiting_for_lock_spans(self.waiting_for_lock.as_ref());
         right.extend(chrome::side_glyph_spans(self.side_conversation.is_some()));
         #[cfg(feature = "remote")]
@@ -4568,7 +4581,6 @@ impl App {
             right.extend(chrome::connector_spans(self.connector_disclosure.as_ref()));
         }
         right.extend(chrome::caffeinate_glyph_spans(self.caffeinate_active));
-        right.extend(chrome::status_line_spans(&self.launch));
         let status = chrome::left_status(
             &self.launch,
             &self.agent_path,
@@ -4590,17 +4602,9 @@ impl App {
             setup_label,
             Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
         ));
-        // Transient async-schedule strip (GOALS §22): only when ≥1 scheduled
-        // task is active, appended to the bottom-left so the fixed chrome
-        // (model/agent) is undisturbed.
-        if !self.active_schedules.is_empty() {
-            let scheduled: Vec<(String, String, u64)> = self
-                .active_schedules
-                .values()
-                .map(|j| (j.kind.clone(), j.label.clone(), j.iteration))
-                .collect();
-            left.extend(chrome::schedule_strip_spans(&scheduled));
-        }
+        // The transient async-schedule strip (GOALS §22) moved to the chat
+        // header's task/timer activity pills; `/schedule`, `/ps`, and
+        // `/stop` remain the authoritative task/timer surfaces.
         if let Some(hint) = self.copy_pick_target_hint() {
             left.push(Span::styled(" · ", Style::default().fg(DIVIDER_DIM)));
             left.push(Span::styled(
@@ -6826,10 +6830,12 @@ mod render_history_spacing_tests {
 
     fn banner_top_row(buffer: &ratatui::buffer::Buffer, chat: ratatui::layout::Rect) -> usize {
         // The session rail also uses a rounded box. The launch banner lives
-        // in the chat pane, not on the rail's left-edge border.
+        // in the chat pane, not on the rail's left-edge border. The row is
+        // pane-relative: the three-row chat header sits above the pane, so
+        // the pane no longer starts at the body's top row.
         (chat.y..chat.bottom())
             .find(|&y| (chat.x..chat.right()).any(|x| buffer[(x, y)].symbol() == "╭"))
-            .map(usize::from)
+            .map(|y| usize::from(y - chat.y))
             .expect("launch banner top border")
     }
 
@@ -6941,7 +6947,9 @@ mod render_history_spacing_tests {
         let rects = app.geometry().layout(Rect::new(0, 0, WIDTH, HEIGHT));
 
         assert_eq!(top, chat.height as usize - banner_height);
-        assert!(top + banner_height <= rects.suggestions.y as usize);
+        // `top` is pane-relative; compare the banner's absolute bottom
+        // against the suggestions popup's absolute top row.
+        assert!(chat.y as usize + top + banner_height <= rects.suggestions.y as usize);
     }
 
     #[test]

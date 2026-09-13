@@ -17,6 +17,9 @@ mod attach_lifecycle;
 mod attention;
 mod blocking_operations;
 mod btw_pane;
+mod chat_header;
+#[cfg(test)]
+mod chat_header_tests;
 mod config_reload;
 mod copy_actions;
 mod events;
@@ -2521,6 +2524,16 @@ pub struct App {
     pub(super) config_drift: Option<ConfigDriftState>,
     /// Root primary plus active interactive subagent path for footer chrome.
     pub(super) agent_path: Vec<String>,
+    /// Header activity pill selected (by mouse click or ←/→ while a pill is
+    /// selected); Enter activates its authoritative surface, Esc clears.
+    pub(super) header_pill_selection: Option<crate::tui::chat_header::HeaderPillKind>,
+    /// Planned three-row chat-header layout recorded by the last render.
+    /// `None` when the header did not render this frame.
+    pub(super) chat_header_layout: Option<crate::tui::chat_header::ChatHeaderLayout>,
+    /// Whether the collapsed-pill `more` popover is open.
+    pub(super) chat_header_more_open: bool,
+    /// Absolute rect of the open `more` popover (for outside-click close).
+    pub(super) chat_header_more_rect: Option<ratatui::layout::Rect>,
     /// Footer control selected by mouse; arrow/enter keys operate on it until
     /// Esc or ordinary typing clears it.
     pub(super) footer_selection: Option<crate::tui::chrome::FooterControl>,
@@ -4050,6 +4063,10 @@ impl App {
             cache_cold: true,
             config_drift: None,
             agent_path: initial_agent_path,
+            header_pill_selection: None,
+            chat_header_layout: None,
+            chat_header_more_open: false,
+            chat_header_more_rect: None,
             footer_selection: None,
             hovered_footer_control: None,
             footer_hit_areas: Vec::new(),

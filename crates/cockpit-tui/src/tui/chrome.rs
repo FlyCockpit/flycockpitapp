@@ -1,12 +1,9 @@
 //! TUI status line / chrome.
 //!
-//! Per `the design notes` §1a, the chrome **always** shows:
-//!   - The current working directory (abbreviated if it overflows).
-//!   - The git branch (with a leading `` glyph) when the cwd is in a
-//!     git repo. When not in a repo, no slot — no placeholder text.
-//!
-//! Other slots (active agent, model, token count, …) compose around
-//! these two.
+//! The fixed path/git chrome and the async-schedule strip moved to the
+//! three-row chat header (`crate::tui::chat_header`); this module keeps the
+//! footer's remaining controls (agent/model picker slots, sandbox label)
+//! and the additive transient indicators.
 
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
@@ -14,57 +11,13 @@ use ratatui::text::Span;
 #[cfg(feature = "remote")]
 use crate::tui::theme::PLAN_YELLOW;
 use crate::tui::theme::{
-    FAVORITE_MODEL, MUTED_COLOR_INDEX, STATUS_BRANCH_BADGE, WARNING_TEXT, button_focus_style,
-    button_hover_style, button_idle_style,
+    FAVORITE_MODEL, MUTED_COLOR_INDEX, WARNING_TEXT, button_focus_style, button_hover_style,
+    button_idle_style,
 };
 use cockpit_config::sandbox_mode::SandboxMode;
+use cockpit_proto::LaunchInfo;
 #[cfg(feature = "remote")]
 use cockpit_proto::{ConnectorDisclosure, OrgSyncDisclosure};
-use cockpit_proto::{LaunchInfo, RepoStatus};
-
-pub fn status_line_spans(info: &LaunchInfo) -> Vec<Span<'static>> {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let mut spans = vec![Span::styled(info.cwd_display.clone(), muted)];
-
-    if let Some(repo) = &info.repo_status {
-        // Pill-shaped badge: `▐ branch counts ▌` where the edge
-        // glyphs (▐ ▌) are yellow-on-terminal-default and the body is
-        // black-on-yellow. The half-block edges produce a "rounded"
-        // visual without needing Nerd Fonts (which a true Powerline
-        // semicircle would require).
-        let badge = Style::default().fg(Color::Black).bg(STATUS_BRANCH_BADGE);
-        let edge = Style::default().fg(STATUS_BRANCH_BADGE);
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled("▐", edge));
-        spans.push(Span::styled(format!(" {} ", repo.branch), badge));
-        let counts = repo_counts(repo);
-        if !counts.is_empty() {
-            spans.push(Span::styled(format!("{counts} "), badge));
-        }
-        spans.push(Span::styled("▌", edge));
-    }
-
-    spans
-}
-
-/// Presentation-only exception: this is a pure formatter over
-/// `cockpit_proto::RepoStatus` (no I/O), so it lives in the TUI rather than
-/// crossing a daemon RPC. It mirrors the core `repo_counts` formatter (in the
-/// `cockpit_core` git module), which stays in core for the startup welcome
-/// text; keep the two in sync.
-fn repo_counts(repo: &RepoStatus) -> String {
-    let mut parts = Vec::new();
-    if repo.staged > 0 {
-        parts.push(format!("+{}", repo.staged));
-    }
-    if repo.unstaged > 0 {
-        parts.push(format!("~{}", repo.unstaged));
-    }
-    if repo.unpushed > 0 {
-        parts.push(format!("^{}", repo.unpushed));
-    }
-    parts.join(" ")
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FooterControl {
@@ -229,38 +182,6 @@ fn footer_button_style(idle: Style, selected: bool) -> Style {
 
 pub fn footer_hover_style() -> Style {
     button_hover_style()
-}
-
-/// Transient async-schedule strip (GOALS §22). Rendered **only** when ≥1
-/// scheduled task is active — additive to the fixed chrome, never a permanent
-/// slot. Each gets a glyph by kind: `⟳` loop, `⏲` timer, `⤓` background. The
-/// caller passes `(kind, label, iteration)` tuples; this returns
-/// the spans to append to the bottom-left status line, prefixed with a
-/// separator. Returns an empty vec when there is nothing scheduled.
-pub fn schedule_strip_spans(scheduled: &[(String, String, u64)]) -> Vec<Span<'static>> {
-    if scheduled.is_empty() {
-        return Vec::new();
-    }
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let active = Style::default().fg(Color::Cyan);
-    let mut spans: Vec<Span<'static>> = vec![Span::styled("  ".to_string(), muted)];
-    for (i, (kind, label, iteration)) in scheduled.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" · ".to_string(), muted));
-        }
-        let glyph = match kind.as_str() {
-            "timer" => "⏲",
-            "background" => "⤓",
-            _ => "⟳",
-        };
-        let detail = if kind == "background" {
-            label.clone()
-        } else {
-            format!("{label} {iteration}")
-        };
-        spans.push(Span::styled(format!("{glyph} {detail}"), active));
-    }
-    spans
 }
 
 /// Persistent enterprise session-log sync disclosure. Rendered only while an

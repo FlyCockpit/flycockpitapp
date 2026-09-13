@@ -15,7 +15,9 @@ mod registry;
 pub(crate) use dispatch::{ButtonDispatch, ButtonPointerOutcome, RowDispatch};
 pub(crate) use id::{ButtonId, ButtonKind, ButtonSpec, RowControlId};
 pub(crate) use inventory::button_inventory;
-pub(crate) use paint::{bracketed_label, first_bracketed_label};
+pub(crate) use paint::{
+    bracketed_label, clip_to_display_width, display_width, first_bracketed_label,
+};
 pub(crate) use registry::{ButtonRegistry, RowControlRegistry, RowTarget};
 
 // Re-exports consumed only by the crate's `#[cfg(test)]` modules (button
@@ -25,8 +27,6 @@ pub(crate) use registry::{ButtonRegistry, RowControlRegistry, RowTarget};
 pub(crate) use id::{ControlKind, OverlaySurface};
 #[cfg(test)]
 pub(crate) use inventory::{InventoryMember, settings_pointer_control_kind};
-#[cfg(test)]
-pub(crate) use paint::{clip_to_display_width, display_width};
 #[cfg(test)]
 pub(crate) use registry::RegisteredButton;
 

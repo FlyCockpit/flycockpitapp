@@ -610,6 +610,9 @@ fn classify_highlight_role(rel: &str, line: &str) -> String {
     if rel.contains("chrome.rs") && line.contains("Color::Black") {
         return "chrome branch badge black-on-yellow → noninteractive status".into();
     }
+    if rel == "chat_header.rs" && line.contains("Color::Black") {
+        return "chat_header branch badge black-on-status → noninteractive status".into();
+    }
     if rel.contains("history/") && line.contains("UNDERLINED") {
         return "history DIM|UNDERLINED metadata → static status exception".into();
     }

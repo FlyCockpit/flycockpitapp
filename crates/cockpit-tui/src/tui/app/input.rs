@@ -716,6 +716,16 @@ impl App {
             return false;
         }
 
+        // Header activity pills: ←/→ cycle, Enter opens the pill's
+        // authoritative surface, Esc clears. Selection is set by a pill
+        // click; any other ordinary key falls through to the composer.
+        // Internally gated on `header_chrome_interactive` — while a
+        // body-owning modal/overlay is on top (or the header did not
+        // render), keys fall through to that surface instead.
+        if self.handle_header_pill_key(&key) {
+            return false;
+        }
+
         // Escape with an active selection: clear the selection and
         // swallow the key. Ordering: ahead of dialog routing because
         // the selection lives on App-state and isn't visible to the
@@ -4414,7 +4424,7 @@ fn find_spec(till: bool, forward: bool) -> FindSpec {
     }
 }
 
-fn is_modifier_only(key: &KeyEvent) -> bool {
+pub(super) fn is_modifier_only(key: &KeyEvent) -> bool {
     matches!(
         key.code,
         KeyCode::Modifier(_) | KeyCode::CapsLock | KeyCode::NumLock | KeyCode::ScrollLock

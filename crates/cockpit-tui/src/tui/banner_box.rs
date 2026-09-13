@@ -14,7 +14,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::banner;
-use crate::tui::chrome;
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
 use cockpit_core::welcome::APP_NAME;
 use cockpit_proto::LaunchInfo;
@@ -131,9 +130,14 @@ fn content_lines(info: &LaunchInfo) -> Vec<Line<'static>> {
         info.provider_line.clone(),
         Style::default().fg(GREY),
     )];
-    // cwd + git-branch badge — identical to the persistent chrome's
-    // status line, so the box matches it exactly.
-    let path = chrome::status_line_spans(info);
+    // cwd + git-branch badge — built by the same span builder the chat
+    // header's meta row uses, so the box matches the shell exactly.
+    let git_facts = info
+        .repo_status
+        .as_ref()
+        .map(crate::tui::chat_header::launch_git_facts);
+    let path =
+        crate::tui::chat_header::launch_path_spans(&info.cwd_display, git_facts.as_ref(), u16::MAX);
 
     let texts: Vec<Option<Vec<Span<'static>>>> = match info.user_name.as_deref() {
         Some(name) if !name.is_empty() => {

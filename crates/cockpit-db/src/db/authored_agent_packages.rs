@@ -437,45 +437,304 @@ fn decode_journal(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthoredAgentPack
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn journal_compensation_restores_draft_under_composite_identity() {
-        let source = include_str!("authored_agent_packages.rs");
-        let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production accessors");
+    use super::*;
+    use crate::db::Db;
+
+    fn hex_digest(byte: u8) -> String {
+        format!("{byte:02x}").repeat(32)
+    }
+
+    fn pending_journal(
+        owner: &str,
+        operation: &str,
+        agent: &str,
+        digest: &str,
+        expected: Option<&str>,
+        created_at: i64,
+        hash_fill: u8,
+    ) -> AuthoredAgentPackageJournalRow {
+        AuthoredAgentPackageJournalRow {
+            owner_digest: owner.to_owned(),
+            client_operation_id: operation.to_owned(),
+            request_hash: vec![hash_fill; 32],
+            fencing_generation: 1,
+            policy_revision: "policy".to_owned(),
+            package_digest: digest.to_owned(),
+            draft_revision: digest.to_owned(),
+            expected_draft_revision: expected.map(str::to_owned),
+            agent_name: agent.to_owned(),
+            source_locator: format!("authored/{agent}"),
+            source_pin: None,
+            require_third_party: false,
+            third_party_trust_confirmed: false,
+            make_default: false,
+            sidecar_intent_json: "{}".to_owned(),
+            package_files_json: "{}".to_owned(),
+            review_json: "{}".to_owned(),
+            installation_id: None,
+            default_selected: false,
+            onboarding_run_id: None,
+            onboarding_attempt_id: None,
+            onboarding_stage_revision: None,
+            settlement_phase: AUTHORED_PACKAGE_SETTLEMENT_PENDING.to_owned(),
+            terminal_response_json: None,
+            created_at_unix_ms: created_at,
+        }
+    }
+
+    async fn assert_draft(db: &Db, agent: &str, digest: &str) {
+        let row = db
+            .authored_agent_package_draft(agent.to_owned())
+            .await
+            .unwrap()
+            .expect("authored draft row");
+        assert_eq!(row.agent_name, agent);
+        assert_eq!(row.draft_revision, digest, "draft revision for {agent}");
+        assert_eq!(row.package_digest, digest, "package digest for {agent}");
+    }
+
+    #[tokio::test]
+    async fn compensation_deletes_a_first_submit_draft_and_preserves_a_colliding_journal() {
+        let db = Db::open_in_memory_async().await.unwrap();
+        let operation = "shared-operation";
+        let owner = "owner-a";
+        let peer = "owner-b";
+        let agent = "first-agent";
+        let peer_agent = "peer-agent";
+        let advanced = hex_digest(0x11);
+        db.begin_authored_agent_package_journal(pending_journal(
+            owner, operation, agent, &advanced, None, 1, 0x01,
+        ))
+        .await
+        .unwrap();
+        let colliding = db
+            .begin_authored_agent_package_journal(pending_journal(
+                peer, operation, peer_agent, &advanced, None, 2, 0x02,
+            ))
+            .await
+            .unwrap();
+        // Same digest as the compensated first-submit so a name-free DELETE
+        // would also drop the peer draft.
         assert!(
-            !production.contains("delete_authored_agent_package_journals_by_client_operation"),
-            "authored journals must not be deleted by client_operation_id alone"
+            db.cas_authored_agent_package_draft(
+                agent.to_owned(),
+                None,
+                advanced.clone(),
+                advanced.clone(),
+                10,
+            )
+            .await
+            .unwrap()
         );
-        let compensate = production
-            .split("pub async fn compensate_authored_agent_package_journal")
-            .nth(1)
-            .and_then(|tail| {
-                tail.split("pub async fn authored_agent_package_draft")
-                    .next()
-            })
-            .expect("authored journal compensation");
-        assert!(compensate.contains("owner_digest=?1 AND client_operation_id=?2"));
         assert!(
-            !compensate.contains("WHERE client_operation_id=?1"),
-            "authored journal writes must include owner_digest"
+            db.cas_authored_agent_package_draft(
+                peer_agent.to_owned(),
+                None,
+                advanced.clone(),
+                advanced.clone(),
+                11,
+            )
+            .await
+            .unwrap()
         );
-        assert!(compensate.contains("restore_authored_agent_package_draft_conn"));
+
+        db.compensate_authored_agent_package_journal(owner.to_owned(), operation.to_owned())
+            .await
+            .unwrap();
+
         assert!(
-            compensate.contains("expected_draft_revision"),
-            "compensation must invert draft CAS from the journal's prior revision"
+            db.authored_agent_package_journal(owner.to_owned(), operation.to_owned())
+                .await
+                .unwrap()
+                .is_none()
         );
-        let restore = production
-            .split("fn restore_authored_agent_package_draft_conn")
-            .nth(1)
-            .and_then(|tail| tail.split("fn json_valid_len").next())
-            .expect("draft CAS inverse");
-        assert!(restore.contains("DELETE FROM authored_agent_package_drafts"));
-        assert!(restore.contains("UPDATE authored_agent_package_drafts"));
+        assert_eq!(
+            db.authored_agent_package_journal(peer.to_owned(), operation.to_owned())
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(&colliding)
+        );
         assert!(
-            restore.contains("WHERE agent_name=?1 AND draft_revision="),
-            "draft inverse must be CAS-predicated on the revision this journal advanced"
+            db.authored_agent_package_draft(agent.to_owned())
+                .await
+                .unwrap()
+                .is_none(),
+            "first-submit compensation must delete the draft this journal inserted"
+        );
+        assert_draft(&db, peer_agent, &advanced).await;
+    }
+
+    #[tokio::test]
+    async fn compensation_restores_an_edited_draft_and_preserves_a_colliding_journal() {
+        let db = Db::open_in_memory_async().await.unwrap();
+        let operation = "shared-operation";
+        let owner = "owner-a";
+        let peer = "owner-b";
+        let agent = "edited-agent";
+        let peer_agent = "peer-agent";
+        let prior = hex_digest(0xaa);
+        let advanced = hex_digest(0xbb);
+        assert!(
+            db.cas_authored_agent_package_draft(
+                agent.to_owned(),
+                None,
+                prior.clone(),
+                prior.clone(),
+                10,
+            )
+            .await
+            .unwrap()
+        );
+        // Peer draft sits at the compensated journal's advanced revision so a
+        // revision-only UPDATE would revert the wrong agent.
+        assert!(
+            db.cas_authored_agent_package_draft(
+                peer_agent.to_owned(),
+                None,
+                advanced.clone(),
+                advanced.clone(),
+                11,
+            )
+            .await
+            .unwrap()
+        );
+        db.begin_authored_agent_package_journal(pending_journal(
+            owner,
+            operation,
+            agent,
+            &advanced,
+            Some(&prior),
+            1,
+            0x01,
+        ))
+        .await
+        .unwrap();
+        let colliding = db
+            .begin_authored_agent_package_journal(pending_journal(
+                peer, operation, peer_agent, &advanced, None, 2, 0x02,
+            ))
+            .await
+            .unwrap();
+        assert!(
+            db.cas_authored_agent_package_draft(
+                agent.to_owned(),
+                Some(prior.clone()),
+                advanced.clone(),
+                advanced.clone(),
+                20,
+            )
+            .await
+            .unwrap()
+        );
+        assert_draft(&db, agent, &advanced).await;
+
+        db.compensate_authored_agent_package_journal(owner.to_owned(), operation.to_owned())
+            .await
+            .unwrap();
+
+        assert!(
+            db.authored_agent_package_journal(owner.to_owned(), operation.to_owned())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            db.authored_agent_package_journal(peer.to_owned(), operation.to_owned())
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(&colliding)
+        );
+        assert_draft(&db, agent, &prior).await;
+        assert_draft(&db, peer_agent, &advanced).await;
+    }
+
+    #[tokio::test]
+    async fn compensation_is_idempotent_and_leaves_a_pre_cas_draft_in_place() {
+        let db = Db::open_in_memory_async().await.unwrap();
+        db.compensate_authored_agent_package_journal(
+            "missing-owner".to_owned(),
+            "missing-operation".to_owned(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.list_authored_agent_package_journals()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let operation = "shared-operation";
+        let owner = "owner-a";
+        let peer = "owner-b";
+        let agent = "held-agent";
+        let prior = hex_digest(0xa0);
+        let advanced = hex_digest(0xa1);
+        assert!(
+            db.cas_authored_agent_package_draft(
+                agent.to_owned(),
+                None,
+                prior.clone(),
+                prior.clone(),
+                10,
+            )
+            .await
+            .unwrap()
+        );
+        db.begin_authored_agent_package_journal(pending_journal(
+            owner,
+            operation,
+            agent,
+            &advanced,
+            Some(&prior),
+            1,
+            0x01,
+        ))
+        .await
+        .unwrap();
+        let colliding = db
+            .begin_authored_agent_package_journal(pending_journal(
+                peer,
+                operation,
+                "peer-agent",
+                &hex_digest(0xee),
+                None,
+                2,
+                0x02,
+            ))
+            .await
+            .unwrap();
+
+        db.compensate_authored_agent_package_journal(owner.to_owned(), operation.to_owned())
+            .await
+            .unwrap();
+        assert_draft(&db, agent, &prior).await;
+        assert!(
+            db.authored_agent_package_journal(owner.to_owned(), operation.to_owned())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            db.authored_agent_package_journal(peer.to_owned(), operation.to_owned())
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(&colliding)
+        );
+
+        db.compensate_authored_agent_package_journal(owner.to_owned(), operation.to_owned())
+            .await
+            .unwrap();
+        assert_draft(&db, agent, &prior).await;
+        assert_eq!(
+            db.authored_agent_package_journal(peer.to_owned(), operation.to_owned())
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(&colliding)
         );
     }
 }

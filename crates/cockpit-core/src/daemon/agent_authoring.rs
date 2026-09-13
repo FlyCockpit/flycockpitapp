@@ -643,11 +643,11 @@ mod tests {
             .expect("onboarding compensation");
         assert!(
             compensate.contains("compensate_authored_agent_package_journal"),
-            "compensation must invert the nested authored journal object, including draft CAS"
+            "onboarding compensation must invoke the composite authored-journal inverse"
         );
         assert!(
             compensate.contains("authored_owner_digest"),
-            "compensation must address the authored journal by owner identity"
+            "onboarding compensation must pass the persisted authored owner, not a suffix-only operation id"
         );
         assert!(
             !compensate.contains("delete_authored_agent_package_journals_by_client_operation"),

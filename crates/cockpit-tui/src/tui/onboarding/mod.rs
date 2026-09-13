@@ -643,7 +643,7 @@ impl OnboardingShell {
             }
             return menu.handle_key(key).map(|choice| {
                 self.escape = None;
-                choice.action()
+                self.apply_escape_choice(choice)
             });
         }
 
@@ -747,6 +747,18 @@ impl OnboardingShell {
         self.escape = EscapeMenu::open(self.stage, authority_pending, self.completion_detour);
     }
 
+    /// Translate a confirmed escape-menu choice. Shell-local navigation
+    /// (returning to the stored completion summary) is applied here — the
+    /// same as entering the detour — so the shell's own state always
+    /// reflects the confirmed choice; the returned action still reaches the
+    /// app so it can unmount the detour's engine dialog.
+    fn apply_escape_choice(&mut self, choice: EscapeChoice) -> OnboardingShellAction {
+        if matches!(choice, EscapeChoice::ReturnToSummary) {
+            self.return_to_completion();
+        }
+        choice.action()
+    }
+
     /// Pointer routing for the shell's own chrome and native screens. The
     /// escape menu is modal; otherwise only native list surfaces consume
     /// events, so engine pointer routing keeps flowing through the app's
@@ -759,7 +771,7 @@ impl OnboardingShell {
             return match menu.handle_mouse(mouse) {
                 Some(choice) => {
                     self.escape = None;
-                    PointerOutcome::acted(choice.action())
+                    PointerOutcome::acted(self.apply_escape_choice(choice))
                 }
                 // The menu is modal: clicks that miss its rows dismiss it
                 // without effect, and other events stop here.

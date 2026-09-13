@@ -87,10 +87,22 @@ fn pump_once(app: &mut App) {
 }
 
 fn pump_onboarding(app: &mut App, mut ready: impl FnMut(&App) -> bool, context: &str) {
-    for _ in 0..900 {
+    for i in 0..900 {
         pump_once(app);
         if ready(app) {
             return;
+        }
+        if i % 100 == 99 {
+            eprintln!(
+                "PROBE pump {i}: retry={:?} snapshot={:?} shell={:?} pending_onboarding={} dialog={:?}",
+                app.startup_background.retry,
+                app.onboarding_snapshot
+                    .as_ref()
+                    .map(|s| (s.run_id, s.revision, s.stage)),
+                app.onboarding_shell.is_some(),
+                app.pending_startup_onboarding_operations.len(),
+                app.dialog.test_page_name(),
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }

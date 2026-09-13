@@ -392,7 +392,11 @@ where
         if request.is_cancelled() || request.reply.is_closed() {
             continue;
         }
+        #[cfg(any(test, feature = "test-support"))]
+        eprintln!("PROBE lifecycle: resolving request");
         let resolved = resolve(&request).await;
+        #[cfg(any(test, feature = "test-support"))]
+        eprintln!("PROBE lifecycle: resolved {:?}", resolved.as_ref().err());
         match resolved {
             Ok(resolution) => {
                 let _ = request.reply.send(Ok(resolution));
@@ -1207,7 +1211,11 @@ async fn probe_or_spawn_with_spawn_authorization(
         // slot holds that owner for the test lifetime; this client does not.
         #[cfg(any(test, feature = "test-support"))]
         if crate::daemon::in_process_auto_promote_enabled() {
+            #[cfg(any(test, feature = "test-support"))]
+            eprintln!("PROBE promote: entering auto_promote_in_process_persistent");
             let pid = crate::daemon::auto_promote_in_process_persistent().await?;
+            #[cfg(any(test, feature = "test-support"))]
+            eprintln!("PROBE promote: promoted pid={pid}, connecting local daemon");
             if let Some(permit) = spawn_permit.as_mut() {
                 permit.owner_created();
             }
@@ -1224,6 +1232,8 @@ async fn probe_or_spawn_with_spawn_authorization(
                         canonical.socket.display()
                     )
                 })?;
+            #[cfg(any(test, feature = "test-support"))]
+            eprintln!("PROBE promote: local daemon connected");
             return Ok(ConnectedDaemon {
                 endpoint: local_daemon_endpoint(&canonical.socket),
                 client,

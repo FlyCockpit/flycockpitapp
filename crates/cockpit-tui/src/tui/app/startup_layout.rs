@@ -5,10 +5,31 @@ fn onboarding_ready_construction_retry_required(error: &cockpit_proto::ErrorPayl
         && error.message.contains("retry ready construction")
 }
 
+/// Resolve the daemon endpoint for an onboarding authority operation. The
+/// startup machine's resolved lifecycle endpoint is used when present;
+/// otherwise the app's lifecycle client resolves it — the same funnel the
+/// settings surfaces use. An onboarding request is never silently dropped
+/// because the startup machine has not pinned its selection yet.
+async fn onboarding_authority_endpoint(
+    lifecycle: &cockpit_client::LifecycleClient,
+    selected_endpoint: Option<&cockpit_client::ClientEndpoint>,
+) -> Result<cockpit_client::ClientEndpoint, String> {
+    match selected_endpoint {
+        Some(endpoint) => Ok(endpoint.clone()),
+        None => lifecycle
+            .resolve_default()
+            .await
+            .map(|resolved| resolved.endpoint)
+            .map_err(|error| error.to_string()),
+    }
+}
+
 async fn retry_onboarding_ready_construction_snapshot(
-    endpoint: &cockpit_client::ClientEndpoint,
+    lifecycle: &cockpit_client::LifecycleClient,
+    selected_endpoint: Option<&cockpit_client::ClientEndpoint>,
 ) -> Result<Option<cockpit_proto::OnboardingBootstrapSnapshot>, String> {
-    let client = cockpit_client::DaemonClient::connect_endpoint(endpoint)
+    let endpoint = onboarding_authority_endpoint(lifecycle, selected_endpoint).await?;
+    let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
         .await
         .map_err(|error| error.to_string())?;
     match client
@@ -22,7 +43,8 @@ async fn retry_onboarding_ready_construction_snapshot(
 }
 
 async fn onboarding_snapshot_after_secure_intent(
-    endpoint: &cockpit_client::ClientEndpoint,
+    lifecycle: &cockpit_client::LifecycleClient,
+    selected_endpoint: Option<&cockpit_client::ClientEndpoint>,
     request: cockpit_proto::ApplyOnboardingSecureIntent,
 ) -> Result<
     (
@@ -31,7 +53,8 @@ async fn onboarding_snapshot_after_secure_intent(
     ),
     String,
 > {
-    let client = cockpit_client::DaemonClient::connect_endpoint(endpoint)
+    let endpoint = onboarding_authority_endpoint(lifecycle, selected_endpoint).await?;
+    let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
         .await
         .map_err(|error| error.to_string())?;
     let receipt_query = cockpit_proto::OnboardingReceiptQuery {
@@ -40,13 +63,14 @@ async fn onboarding_snapshot_after_secure_intent(
         client_operation_id: request.client_operation_id.clone(),
     };
     match client
-        .apply_onboarding_secure_intent(endpoint, request)
+        .apply_onboarding_secure_intent(&endpoint, request)
         .await
         .map_err(|error| error.to_string())?
     {
         Ok(result) => Ok((Some(result.snapshot), Some(result.receipt))),
         Err(error) if onboarding_ready_construction_retry_required(&error) => {
-            let snapshot = retry_onboarding_ready_construction_snapshot(endpoint).await?;
+            let snapshot =
+                retry_onboarding_ready_construction_snapshot(lifecycle, selected_endpoint).await?;
             let receipt = match client
                 .request(cockpit_proto::Request::GetOnboardingTransitionReceipt(
                     receipt_query,
@@ -108,9 +132,11 @@ impl App {
         let generation = self.startup_background.generation;
         let force = self.onboarding_force;
         let skip = self.onboarding_skip;
-        let Some(selected) = self.startup_lifecycle.clone() else {
-            return;
-        };
+        let lifecycle = self.lifecycle.clone();
+        let selected_endpoint = self
+            .startup_lifecycle
+            .as_ref()
+            .map(|selected| selected.endpoint.clone());
         let request_id = uuid::Uuid::new_v4().to_string();
         let pending_request_id = request_id.clone();
         let started = self.async_actions.start(
@@ -120,16 +146,39 @@ impl App {
             ),
             async move {
                 let bootstrap_request_id = request_id.clone();
-                let endpoint = selected.endpoint.clone();
+                #[cfg(test)]
+                eprintln!("PROBE fetch: resolving endpoint (pinned={})", selected_endpoint.is_some());
+                let endpoint =
+                    match onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref())
+                        .await
+                    {
+                        Ok(endpoint) => endpoint,
+                        Err(error) => {
+                            #[cfg(test)]
+                            eprintln!("PROBE fetch: endpoint resolve failed: {error}");
+                            return Ok(
+                                crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
+                                    generation,
+                                    error,
+                                },
+                            );
+                        }
+                    };
+                #[cfg(test)]
+                eprintln!("PROBE fetch: endpoint resolved, connecting");
                 let client = match cockpit_client::DaemonClient::connect_endpoint(&endpoint).await {
                     Ok(client) => client,
                     Err(error) => {
+                        #[cfg(test)]
+                        eprintln!("PROBE fetch: connect failed: {error}");
                         return Ok(crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
                             generation,
                             error: error.to_string(),
                         });
                     }
                 };
+                #[cfg(test)]
+                eprintln!("PROBE fetch: connected, requesting snapshot");
                 let current = match client
                     .request(cockpit_proto::Request::GetOnboardingBootstrapSnapshot)
                     .await
@@ -157,7 +206,12 @@ impl App {
                 if current.as_ref().is_some_and(|snapshot| {
                     snapshot.bootstrap_state == cockpit_proto::OnboardingBootstrapState::Failed
                 }) {
-                    return match retry_onboarding_ready_construction_snapshot(&endpoint).await {
+                    return match retry_onboarding_ready_construction_snapshot(
+                        &lifecycle,
+                        selected_endpoint.as_ref(),
+                    )
+                    .await
+                    {
                         Ok(snapshot) => Ok(
                             crate::tui::async_action::AsyncActionPayload::StartupOnboardingBootstrap {
                                 generation,
@@ -226,13 +280,29 @@ impl App {
         &mut self,
         snapshot: Option<cockpit_proto::OnboardingBootstrapSnapshot>,
     ) {
-        // A bootstrap projection is global authority only.  The workspace is
-        // intentionally still unresolved at this point.  Resolve its root
-        // and its daemon-owned trust decision before exposing the projection
-        // to the session-attach reducer; otherwise an eager attach can read a
-        // project config under the safe shell's `.` placeholder.
+        // A bootstrap projection is global authority only, so it is recorded
+        // and presented immediately: the ordered onboarding screens
+        // (Welcome/Profile/SecureStore) deliberately run while the daemon is
+        // still locked and no vault exists, before any workspace trust has
+        // been decided. The workspace ride-along below still resolves the
+        // project root and its daemon-owned trust decision — the
+        // session-attach reducer and every project-touching path stay fenced
+        // behind `workspace_ready` until that lands, so an eager attach can
+        // never read a project config under the safe shell's `.` placeholder.
         if !self.startup_background.workspace_ready {
-            self.start_workspace_resolution(snapshot);
+            self.start_workspace_resolution(snapshot.clone());
+        }
+        if let Some(incoming) = snapshot.as_ref()
+            && let Some(recorded) = self.onboarding_snapshot.as_ref()
+            && incoming.run_id == recorded.run_id
+            && incoming.attempt_id == recorded.attempt_id
+            && incoming.revision < recorded.revision
+        {
+            // The workspace ride-along carries the projection the first
+            // fetch observed; by the time it lands, transitions may have
+            // advanced the same run past it. Authority application is
+            // monotonic: a same-run stale projection never regresses the
+            // recorded one.
             return;
         }
         if snapshot.as_ref().is_some_and(|current| {
@@ -349,17 +419,18 @@ impl App {
             return;
         }
         let lifecycle = self.lifecycle.clone();
+        let selected_endpoint = self
+            .startup_lifecycle
+            .as_ref()
+            .map(|selected| selected.endpoint.clone());
         self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.bootstrap_refresh"),
             crate::tui::async_action::AsyncActionPolicy::Dedupe(
                 crate::tui::async_action::AsyncActionKey::new("onboarding.bootstrap_refresh"),
             ),
             async move {
-                let resolved = lifecycle
-                    .resolve_default()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let endpoint = resolved.endpoint.clone();
+                let endpoint =
+                    onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref()).await?;
                 let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
                     .await
                     .map_err(|error| error.to_string())?;
@@ -375,9 +446,12 @@ impl App {
                 if current.as_ref().is_some_and(|snapshot| {
                     snapshot.bootstrap_state == cockpit_proto::OnboardingBootstrapState::Failed
                 }) {
-                    return retry_onboarding_ready_construction_snapshot(&endpoint)
-                        .await
-                        .map(crate::tui::async_action::AsyncActionPayload::OnboardingBootstrap);
+                    return retry_onboarding_ready_construction_snapshot(
+                        &lifecycle,
+                        selected_endpoint.as_ref(),
+                    )
+                    .await
+                    .map(crate::tui::async_action::AsyncActionPayload::OnboardingBootstrap);
                 }
                 Ok(crate::tui::async_action::AsyncActionPayload::OnboardingBootstrap(current))
             },
@@ -768,13 +842,11 @@ impl App {
         let (run_id, attempt_id, expected_revision) =
             (current.run_id, current.attempt_id, current.revision);
         let request_id = uuid::Uuid::new_v4().to_string();
-        let Some(endpoint) = self
+        let lifecycle = self.lifecycle.clone();
+        let selected_endpoint = self
             .startup_lifecycle
             .as_ref()
-            .map(|selected| selected.endpoint.clone())
-        else {
-            return;
-        };
+            .map(|selected| selected.endpoint.clone());
         let pending_request_id = request_id.clone();
         let started = self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.ready_retry"),
@@ -782,7 +854,7 @@ impl App {
                 crate::tui::async_action::AsyncActionKey::new("onboarding.ready_retry"),
             ),
             async move {
-                retry_onboarding_ready_construction_snapshot(&endpoint)
+                retry_onboarding_ready_construction_snapshot(&lifecycle, selected_endpoint.as_ref())
                     .await
                     .map(|snapshot| {
                         crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
@@ -822,17 +894,17 @@ impl App {
         let attempt_id = snapshot.attempt_id;
         let expected_revision = snapshot.revision;
         let request_id = uuid::Uuid::new_v4().to_string();
-        let Some(endpoint) = self
+        let lifecycle = self.lifecycle.clone();
+        let selected_endpoint = self
             .startup_lifecycle
             .as_ref()
-            .map(|selected| selected.endpoint.clone())
-        else {
-            return;
-        };
+            .map(|selected| selected.endpoint.clone());
         // Latch the in-flight transition on the shell so a duplicate stage
         // completion cannot request a second advance before the
-        // authoritative revision lands. The latch is only taken once the
-        // fenced request is actually dispatchable.
+        // authoritative revision lands. The latch belongs to the settled
+        // stage, not to the transport: it is taken whenever the authority
+        // checkpoint exists, and the action below resolves the daemon
+        // through the pinned startup endpoint or the app's lifecycle funnel.
         if let Some(shell) = self.onboarding_shell.as_mut() {
             shell.latch_transition(snapshot.revision, transition);
         }
@@ -848,6 +920,8 @@ impl App {
                 crate::tui::async_action::AsyncActionKey::new("onboarding.transition"),
             ),
             async move {
+                let endpoint =
+                    onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref()).await?;
                 let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
                     .await
                     .map_err(|error| error.to_string())?;
@@ -976,13 +1050,11 @@ impl App {
         let attempt_id = snapshot.attempt_id;
         let expected_revision = snapshot.revision;
         let request_id = request.client_operation_id.clone();
-        let Some(endpoint) = self
+        let lifecycle = self.lifecycle.clone();
+        let selected_endpoint = self
             .startup_lifecycle
             .as_ref()
-            .map(|selected| selected.endpoint.clone())
-        else {
-            return;
-        };
+            .map(|selected| selected.endpoint.clone());
         let pending_request_id = request_id.clone();
         let started = self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.secure_intent"),
@@ -994,21 +1066,25 @@ impl App {
                 crate::tui::async_action::AsyncActionKey::new("onboarding.secure_intent"),
             ),
             async move {
-                onboarding_snapshot_after_secure_intent(&endpoint, request)
-                    .await
-                    .map(|(snapshot, receipt)| {
-                        crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
-                            StartupOnboardingCompletion {
-                                generation,
-                                run_id,
-                                attempt_id,
-                                expected_revision,
-                                request_id,
-                                receipt,
-                                snapshot,
-                            },
-                        )
-                    })
+                onboarding_snapshot_after_secure_intent(
+                    &lifecycle,
+                    selected_endpoint.as_ref(),
+                    request,
+                )
+                .await
+                .map(|(snapshot, receipt)| {
+                    crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
+                        StartupOnboardingCompletion {
+                            generation,
+                            run_id,
+                            attempt_id,
+                            expected_revision,
+                            request_id,
+                            receipt,
+                            snapshot,
+                        },
+                    )
+                })
             },
         );
         if let crate::tui::async_action::AsyncActionStart::Started(id) = started {

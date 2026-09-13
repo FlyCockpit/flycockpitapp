@@ -2,6 +2,8 @@ use super::*;
 use std::path::Path;
 use tempfile::TempDir;
 
+mod coverage_authority_tests;
+
 fn enabled_cfg() -> RedactConfig {
     RedactConfig {
         enabled: true,

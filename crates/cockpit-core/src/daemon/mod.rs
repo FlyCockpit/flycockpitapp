@@ -2121,10 +2121,11 @@ async fn boot_test_persistent_daemon_with_source(
 /// and — while no vault authority exists — the locked bootstrap allowlist.
 /// The secure-store intent materializes a real vault through the locked
 /// admission path and hands the owner off to its ready context, exactly like
-/// a fresh install. Real-daemon onboarding tests use this so the one RPC
-/// that must commit before any vault exists (the sensitive secure-store
-/// intent) has a daemon on which it is committable; tests that merely need
-/// an immediately-ready daemon keep
+/// a fresh install. Real-daemon onboarding tests use this so the RPCs that
+/// must commit before any vault exists (the sensitive secure-store intent
+/// and the locked-scoped onboarding profile settlement) have a daemon on
+/// which they are committable; tests that merely need an immediately-ready
+/// daemon keep
 /// [`enable_in_process_auto_promote_with_production_config`].
 #[cfg(any(test, feature = "test-support"))]
 async fn boot_production_first_run_test_persistent_daemon() -> Result<TestPersistentDaemon> {

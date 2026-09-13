@@ -5,27 +5,29 @@
 //! end through the production first-run boot: a fresh home boots the locked
 //! bootstrap (no vault authority), the bootstrap fetch runs
 //! `BeginOrReopenOnboarding` against the locked allowlist, Welcome advances
-//! through a real locked `ApplyOnboardingTransition`, and the secure-store
-//! choice is the real sensitive intent that materializes a real vault and
-//! hands the daemon off to its ready services. From Provider onward every
-//! stage change is a real `ApplyOnboardingTransition` against the real
-//! revision CAS, and the model / agent / lifetime settlements are real
-//! `ApplySetupWizard` operations whose receipts — including the published
-//! config generation — the daemon validates before the stage may advance.
-//! The provider stage runs the real offline path: the save is a real
-//! `apply_provider_mutation`, the validation probe really fails against an
-//! unreachable endpoint, and the explicit manual-model key commits the
-//! failed-validation checkpoint that the settled advance is validated
-//! against.
+//! through a real locked `ApplyOnboardingTransition`, the profile wizard's
+//! save settles through the locked bootstrap's one scoped config admission,
+//! and the secure-store choice is the real sensitive intent that
+//! materializes a real vault and hands the daemon off to its ready services.
+//! From Provider onward every stage change is a real
+//! `ApplyOnboardingTransition` against the real revision CAS, and the
+//! model / agent / lifetime settlements are real `ApplySetupWizard`
+//! operations whose receipts — including the published config generation —
+//! the daemon validates before the stage may advance. The provider stage
+//! runs the real offline path: the save is a real `apply_provider_mutation`,
+//! the validation probe really fails against an unreachable endpoint, and
+//! the explicit manual-model key commits the failed-validation checkpoint
+//! that the settled advance is validated against.
 //!
-//! One stage crossing is driven outside the keystroke path, deliberately.
-//! The profile wizard's save is an ordinary config mutation, and the locked
-//! bootstrap allowlist (#388) rejects every ordinary config mutation until a
-//! vault exists — the test proves that denial, then commits the
-//! Profile→SecureStore crossing through the same locked-admitted
-//! `ApplyOnboardingTransition` the shell's settled advance issues, and the
-//! app follows the committed authority through the read-only refresh
-//! exactly as it follows the daemon-global broadcast on the ready path.
+//! Every stage crossing is driven by the shell's own keystroke path. The
+//! profile wizard's save is the one config mutation the locked bootstrap
+//! admits: the ordered screens put Profile before the secure-store choice
+//! (#391), so the settlement RPC would otherwise have no legal moment, and
+//! the locked allowlist scopes it to the onboarding profile wizard at the
+//! Profile stage (#388 deny-by-default otherwise) under the same
+//! publication gates the ready daemon enforces. The receipt settles the
+//! wizard, the shell's service poll issues the locked-admitted Advance, and
+//! the name is durable in the global config before the vault exists.
 //! Workspace trust is likewise a ready-service RPC, so the fixture seeds it
 //! only after the secure-store handoff.
 //!
@@ -103,6 +105,11 @@ struct RealDaemonOnboarding {
 
 fn real_daemon_onboarding(cwd: &std::path::Path) -> RealDaemonOnboarding {
     let env = TestEnvGuard::isolate_cockpit_home_at(cwd);
+    // The profile wizard prefills its name field from USER/USERNAME; clear
+    // both so the typed "Ada" is exactly the committed name (the guard
+    // snapshots and restores them on drop).
+    env.remove_var("USER");
+    env.remove_var("USERNAME");
     let daemon = cockpit_core::daemon::enable_in_process_auto_promote_production_first_run();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -210,67 +217,10 @@ fn seed_computer_use_catalog_capabilities() {
         .expect("seeding catalog capability metadata onto the provider file");
 }
 
-/// Commit the Profile stage through the same locked-admitted
-/// `ApplyOnboardingTransition` the shell's settled advance issues, then have
-/// the app follow the committed authority through the read-only refresh.
-///
-/// The profile wizard's save is an ordinary config mutation, and the locked
-/// bootstrap allowlist (#388) rejects those until a vault exists — callers
-/// must first prove the wizard's save was denied, so the stage crossing is
-/// committed the way the locked allowlist intends: a plain revision-CAS
-/// advance, exactly the request `request_onboarding_transition` sends once
-/// the wizard settles.
-fn commit_locked_profile_stage(app: &mut App) {
-    let snapshot = app
-        .onboarding_snapshot
-        .clone()
-        .expect("the locked bootstrap snapshot at the Profile stage");
-    assert_eq!(snapshot.stage, OnboardingStage::Profile);
-    let run_id = snapshot.run_id;
-    let attempt_id = snapshot.attempt_id;
-    let expected_revision = snapshot.revision;
-    tokio::runtime::Handle::current().block_on(async {
-        let lifecycle = crate::tui::settings::test_lifecycle_client();
-        let client = crate::tui::settings::settings_daemon_client(&lifecycle)
-            .await
-            .expect("locked profile crossing daemon client");
-        match client
-            .request(cockpit_proto::Request::ApplyOnboardingTransition {
-                run_id,
-                attempt_id,
-                expected_revision,
-                client_operation_id: uuid::Uuid::new_v4().to_string(),
-                transition: cockpit_proto::OnboardingTransitionKind::Advance,
-                settlement: None,
-            })
-            .await
-            .expect("locked profile crossing transport")
-            .expect("the locked-admitted Profile→SecureStore advance")
-        {
-            cockpit_proto::Response::OnboardingTransition(result) => {
-                assert_eq!(result.snapshot.stage, OnboardingStage::SecureStore);
-            }
-            other => panic!("unexpected locked profile crossing: {other:?}"),
-        }
-    });
-    // Follow the committed authority exactly as the live event loop follows
-    // the daemon-global broadcast: the read-only refresh, never a reopen.
-    app.refresh_onboarding_bootstrap_snapshot();
-    pump_onboarding(
-        app,
-        |app| {
-            stage(app) == Some(OnboardingStage::SecureStore)
-                && shell_kind(app)
-                    == Some(crate::tui::onboarding::OnboardingScreenKind::SecureStore)
-        },
-        "the committed Profile→SecureStore crossing through the read-only refresh",
-    );
-}
-
 /// Drive the real first run from the bootstrap fetch to the searchable
 /// provider catalog: Welcome key → real locked advance → the profile stage
-/// (its wizard save denied by the locked allowlist, the crossing committed
-/// through the same locked transition the settled advance issues) → the real
+/// (its wizard save settled by the locked bootstrap's one scoped config
+/// admission, the shell's own service poll advancing the stage) → the real
 /// sensitive secure-store intent that materializes the vault and hands the
 /// daemon off to ready services → the Provider stage's catalog.
 fn advance_real_first_run_to_provider(app: &mut App, root: &std::path::Path) {
@@ -292,10 +242,11 @@ fn advance_real_first_run_to_provider(app: &mut App, root: &std::path::Path) {
     );
 
     // Profile: type a name and submit the wizard's daemon save. The daemon
-    // is still locked — no vault authority exists yet — so the ordinary
-    // config mutation is denied and the wizard cannot settle. That denial is
-    // the designed locked-bootstrap behavior; the stage crossing below
-    // commits through the locked-admitted transition instead.
+    // is still locked — no vault authority exists yet — and the profile
+    // settlement is the one config mutation the locked bootstrap admits
+    // (scoped to this wizard at this stage): the receipt settles the wizard,
+    // the shell's service poll issues the locked-admitted Advance, and the
+    // whole crossing happens on the keystroke path.
     for ch in "Ada".chars() {
         shell_key(app, KeyCode::Char(ch));
     }
@@ -309,23 +260,58 @@ fn advance_real_first_run_to_provider(app: &mut App, root: &std::path::Path) {
     pump_onboarding(
         app,
         |app| {
-            app.dialog
-                .test_setup_wizard_status()
-                .is_some_and(|status| status.contains("bootstrap is locked"))
+            stage(app) == Some(OnboardingStage::SecureStore)
+                && shell_kind(app)
+                    == Some(crate::tui::onboarding::OnboardingScreenKind::SecureStore)
         },
-        "the locked daemon to deny the profile wizard's ordinary config mutation",
+        "the locked profile settlement and the shell's own Advance to cross Profile",
     );
-    assert!(
-        !app.dialog
-            .setup_wizard_is_complete(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID),
-        "a denied wizard save must never settle the profile stage"
-    );
+    let profile_config_path = cockpit_config::dirs::global_config_dir()
+        .expect("isolated global config dir")
+        .join(cockpit_config::dirs::CONFIG_FILE);
+    let profile_config = cockpit_config::extended::ExtendedConfigDoc::load(&profile_config_path)
+        .expect("the locked profile settlement wrote the global config")
+        .config();
     assert_eq!(
-        stage(app),
-        Some(OnboardingStage::Profile),
-        "the authority must still hold the Profile stage after the denied save"
+        profile_config.name.as_deref(),
+        Some("Ada"),
+        "the locked-admitted profile settlement must publish the name before the vault exists"
     );
-    commit_locked_profile_stage(app);
+
+    // Escape on the secure-store choice offers Back (AC5). The crossing is a
+    // real locked transition back to Profile; the return trip re-saves the
+    // name through the same admitted settlement and advances again, proving
+    // both directions of the pre-vault stage are completable by keystroke.
+    shell_key(app, KeyCode::Esc);
+    shell_key(app, KeyCode::Enter);
+    pump_onboarding(
+        app,
+        |app| {
+            stage(app) == Some(OnboardingStage::Profile)
+                && app.dialog.test_page_name()
+                    == Some(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID)
+        },
+        "the locked Back transition from the secure-store choice to remount the profile engine",
+    );
+    for ch in "Ada".chars() {
+        shell_key(app, KeyCode::Char(ch));
+    }
+    shell_key(app, KeyCode::Enter);
+    assert_eq!(
+        app.dialog.test_setup_step(),
+        Some("profile-save"),
+        "the remounted profile wizard must reach its daemon-save action step"
+    );
+    shell_key(app, KeyCode::Enter);
+    pump_onboarding(
+        app,
+        |app| {
+            stage(app) == Some(OnboardingStage::SecureStore)
+                && shell_kind(app)
+                    == Some(crate::tui::onboarding::OnboardingScreenKind::SecureStore)
+        },
+        "the re-settled profile save to return to the secure-store choice",
+    );
 
     // Secure store: choose a placement the daemon actually reports as
     // available (keyring availability is host-dependent). Prefer the

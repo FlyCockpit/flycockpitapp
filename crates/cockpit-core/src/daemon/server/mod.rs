@@ -4233,9 +4233,21 @@ impl Drop for ClientGuard {
     }
 }
 
-struct RegisteredInProcessContext {
-    ctx: std::sync::Weak<DaemonContext>,
-    endpoint: cockpit_client::InProcessEndpoint,
+/// One canonical-socket entry in the in-process registry. A `Ready` entry
+/// self-cleans once its context drains (the weak reference dies); a `Locked`
+/// entry has no context to observe, so the booting in-process daemon owner
+/// must explicitly unregister it — when its ready context replaces the entry
+/// and again on owner shutdown — or the locked endpoint's service tasks,
+/// which hold the locked services and their DB writer alive, would leak for
+/// the process life.
+enum RegisteredInProcessContext {
+    Ready {
+        ctx: std::sync::Weak<DaemonContext>,
+        endpoint: cockpit_client::InProcessEndpoint,
+    },
+    Locked {
+        endpoint: cockpit_client::InProcessEndpoint,
+    },
 }
 
 pub(crate) fn register_in_process_context(
@@ -4251,12 +4263,44 @@ pub(crate) fn register_in_process_context(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     contexts.insert(
         ctx.paths.socket.clone(),
-        RegisteredInProcessContext {
+        RegisteredInProcessContext::Ready {
             ctx: Arc::downgrade(&ctx),
             endpoint: endpoint.clone(),
         },
     );
     endpoint
+}
+
+/// Register a locked-bootstrap endpoint at `socket`. The endpoint serves the
+/// restricted bootstrap allowlist per connection and resolves the ready
+/// context once the secure-store intent materializes the vault, so a client
+/// reconnecting through this registration lands on the ready daemon without
+/// the registration changing hands mid-connection.
+pub(crate) fn register_locked_in_process_context(
+    socket: &Path,
+    endpoint: cockpit_client::InProcessEndpoint,
+) {
+    let contexts = IN_PROCESS_CONTEXTS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut contexts = contexts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    contexts.insert(
+        socket.to_path_buf(),
+        RegisteredInProcessContext::Locked { endpoint },
+    );
+}
+
+/// Remove whatever this socket's in-process daemon owner registered. The
+/// booting owner calls this on shutdown so a locked entry (which cannot
+/// self-clean through a weak context) never outlives it.
+pub(crate) fn unregister_in_process_context(socket: &Path) {
+    let Some(contexts) = IN_PROCESS_CONTEXTS.get() else {
+        return;
+    };
+    let mut contexts = contexts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    contexts.remove(socket);
 }
 
 pub(crate) fn in_process_endpoint(ctx: &Arc<DaemonContext>) -> cockpit_client::InProcessEndpoint {
@@ -4637,12 +4681,17 @@ pub(crate) fn in_process_context(socket: &Path) -> Option<Arc<DaemonContext>> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let registered = contexts.get(socket)?;
-    match registered.ctx.upgrade() {
-        Some(ctx) => Some(ctx),
-        None => {
-            contexts.remove(socket);
-            None
-        }
+    match registered {
+        RegisteredInProcessContext::Ready { ctx, .. } => match ctx.upgrade() {
+            Some(ctx) => Some(ctx),
+            None => {
+                contexts.remove(socket);
+                None
+            }
+        },
+        // A locked bootstrap is a running owner, but it owns no ready
+        // `DaemonContext` yet; only the endpoint registration exists.
+        RegisteredInProcessContext::Locked { .. } => None,
     }
 }
 
@@ -4654,11 +4703,16 @@ pub(crate) fn registered_in_process_endpoint(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let registered = contexts.get(socket)?;
-    if registered.ctx.upgrade().is_some() {
-        Some(registered.endpoint.clone())
-    } else {
-        contexts.remove(socket);
-        None
+    match registered {
+        RegisteredInProcessContext::Ready { ctx, endpoint } => {
+            if ctx.upgrade().is_some() {
+                Some(endpoint.clone())
+            } else {
+                contexts.remove(socket);
+                None
+            }
+        }
+        RegisteredInProcessContext::Locked { endpoint } => Some(endpoint.clone()),
     }
 }
 

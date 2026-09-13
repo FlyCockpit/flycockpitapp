@@ -5970,6 +5970,16 @@ impl Dialog {
         };
         wizard.run.current_step().map(|step| step.id)
     }
+    /// Status line of the onboarding setup wizard (save failures land here),
+    /// for integration tests that prove a wizard's daemon save was denied
+    /// while the bootstrap is locked.
+    #[cfg(test)]
+    pub(crate) fn test_setup_wizard_status(&self) -> Option<&str> {
+        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
+            return None;
+        };
+        wizard.status.as_deref()
+    }
 
     /// Kind name of the current wizard step: one of `select`, `text`,
     /// `confirm`, `info`, `action`, `multi`, `tools`, `secret`.

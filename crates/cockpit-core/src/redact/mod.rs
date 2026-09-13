@@ -85,6 +85,7 @@ impl std::fmt::Display for RedactionTableUnavailable {
 impl std::error::Error for RedactionTableUnavailable {}
 
 mod command_output;
+pub(crate) mod coverage_authority;
 mod dotenv;
 mod protected;
 pub(crate) mod protected_redaction_history;

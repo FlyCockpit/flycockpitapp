@@ -485,11 +485,16 @@ async fn compensate_onboarding_agent_publication(
             crate::workspace_lease::now_unix_ms(),
         )
         .await;
-    if let (Ok(()), Ok(()), Ok(())) = (&config, &installation, &default) {
+    let authored = ctx
+        .db
+        .delete_authored_agent_package_journals_by_client_operation(operation_id.to_string())
+        .await
+        .map(|_| ());
+    if let (Ok(()), Ok(()), Ok(()), Ok(())) = (&config, &installation, &default, &authored) {
         return settle_onboarding_publication_journal(ctx, operation_id, backup).await;
     }
     Err(anyhow::anyhow!(
-        "onboarding publication compensation incomplete; config: {}; installation: {}; prior default: {}",
+        "onboarding publication compensation incomplete; config: {}; installation: {}; prior default: {}; authored journal: {}",
         config
             .err()
             .map_or_else(|| "ok".to_string(), |error| format!("{error:#}")),
@@ -497,6 +502,9 @@ async fn compensate_onboarding_agent_publication(
             .err()
             .map_or_else(|| "ok".to_string(), |error| format!("{error:#}")),
         default
+            .err()
+            .map_or_else(|| "ok".to_string(), |error| format!("{error:#}")),
+        authored
             .err()
             .map_or_else(|| "ok".to_string(), |error| format!("{error:#}")),
     ))
@@ -18441,16 +18449,22 @@ async fn handle_serialized_request_impl(
                                     },
                                 )
                             });
+                    let authored_request = cockpit_proto::ApplyAuthoredAgentPackageRequest {
+                        client_operation_id: operation_key.clone(),
+                        expected_policy_revision: prepared.snapshot.policy_revision.clone(),
+                        package: prepared.draft.clone(),
+                        onboarding,
+                    };
+                    let authored_request_hash = local_operation_request_hash(&authored_request)?;
                     let authored =
                         match crate::daemon::agent_authoring::apply_package_under_publication_lock(
                             ctx,
-                            cockpit_proto::ApplyAuthoredAgentPackageRequest {
-                                client_operation_id: operation_key.clone(),
-                                expected_policy_revision: prepared.snapshot.policy_revision.clone(),
-                                package: prepared.draft.clone(),
-                                onboarding,
-                            },
-                            None,
+                            authored_request,
+                            Some(crate::daemon::agent_authoring::AuthoredApplyFence {
+                                owner_digest: settlement_owner.clone(),
+                                request_hash: authored_request_hash,
+                                fencing_generation,
+                            }),
                         )
                         .await
                         {

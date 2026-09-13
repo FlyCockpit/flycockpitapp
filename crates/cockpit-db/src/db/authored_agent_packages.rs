@@ -1,9 +1,16 @@
 //! Durable authored-package apply journals and draft CAS.
+//!
+//! Intent is inserted before any recoverable publication effect. The terminal
+//! receipt is attached only after installation, sidecar publication, default
+//! selection, and draft CAS have completed.
 
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{OptionalExtension, params};
 
 use super::Db;
+
+pub const AUTHORED_PACKAGE_SETTLEMENT_PENDING: &str = "publication_pending";
+pub const AUTHORED_PACKAGE_SETTLEMENT_TERMINAL: &str = "terminal";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthoredAgentPackageJournalRow {
@@ -14,12 +21,23 @@ pub struct AuthoredAgentPackageJournalRow {
     pub policy_revision: String,
     pub package_digest: String,
     pub draft_revision: String,
+    pub expected_draft_revision: Option<String>,
+    pub agent_name: String,
+    pub source_locator: String,
+    pub source_pin: Option<String>,
+    pub require_third_party: bool,
+    pub third_party_trust_confirmed: bool,
+    pub make_default: bool,
+    pub sidecar_intent_json: String,
+    pub package_files_json: String,
+    pub review_json: String,
     pub installation_id: Option<String>,
     pub default_selected: bool,
     pub onboarding_run_id: Option<String>,
     pub onboarding_attempt_id: Option<String>,
     pub onboarding_stage_revision: Option<i64>,
-    pub terminal_response_json: String,
+    pub settlement_phase: String,
+    pub terminal_response_json: Option<String>,
     pub created_at_unix_ms: i64,
 }
 
@@ -31,6 +49,8 @@ pub struct AuthoredAgentPackageDraftRow {
     pub updated_at_unix_ms: i64,
 }
 
+const JOURNAL_COLUMNS: &str = "owner_digest,client_operation_id,request_hash,fencing_generation,policy_revision,package_digest,draft_revision,expected_draft_revision,agent_name,source_locator,source_pin,require_third_party,third_party_trust_confirmed,make_default,sidecar_intent_json,package_files_json,review_json,installation_id,default_selected,onboarding_run_id,onboarding_attempt_id,onboarding_stage_revision,settlement_phase,terminal_response_json,created_at_unix_ms";
+
 impl Db {
     pub async fn authored_agent_package_journal(
         &self,
@@ -39,8 +59,10 @@ impl Db {
     ) -> Result<Option<AuthoredAgentPackageJournalRow>> {
         self.read(move |conn| {
             conn.query_row(
-                "SELECT owner_digest,client_operation_id,request_hash,fencing_generation,policy_revision,package_digest,draft_revision,installation_id,default_selected,onboarding_run_id,onboarding_attempt_id,onboarding_stage_revision,terminal_response_json,created_at_unix_ms
-                 FROM authored_agent_package_journals WHERE owner_digest=?1 AND client_operation_id=?2",
+                &format!(
+                    "SELECT {JOURNAL_COLUMNS}
+                     FROM authored_agent_package_journals WHERE owner_digest=?1 AND client_operation_id=?2"
+                ),
                 params![owner_digest, client_operation_id],
                 decode_journal,
             )
@@ -54,10 +76,10 @@ impl Db {
         &self,
     ) -> Result<Vec<AuthoredAgentPackageJournalRow>> {
         self.read(|conn| {
-            let mut statement = conn.prepare(
-                "SELECT owner_digest,client_operation_id,request_hash,fencing_generation,policy_revision,package_digest,draft_revision,installation_id,default_selected,onboarding_run_id,onboarding_attempt_id,onboarding_stage_revision,terminal_response_json,created_at_unix_ms
-                 FROM authored_agent_package_journals ORDER BY created_at_unix_ms",
-            )?;
+            let mut statement = conn.prepare(&format!(
+                "SELECT {JOURNAL_COLUMNS}
+                 FROM authored_agent_package_journals ORDER BY created_at_unix_ms"
+            ))?;
             let rows = statement
                 .query_map([], decode_journal)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -66,26 +88,31 @@ impl Db {
         .await
     }
 
-    pub async fn record_authored_agent_package_journal(
+    /// Persist publication intent. Callers must invoke this before any
+    /// installation, sidecar, default-selection, or draft-CAS effect.
+    pub async fn begin_authored_agent_package_journal(
         &self,
         row: AuthoredAgentPackageJournalRow,
-    ) -> Result<()> {
+    ) -> Result<AuthoredAgentPackageJournalRow> {
         self.write(move |conn| {
             ensure!(
                 row.request_hash.len() == 32,
                 "authored package journal request hash must be 32 bytes"
             );
+            ensure!(
+                row.settlement_phase == AUTHORED_PACKAGE_SETTLEMENT_PENDING,
+                "authored package intent must start publication_pending"
+            );
+            ensure!(
+                row.terminal_response_json.is_none() && row.installation_id.is_none(),
+                "authored package intent must not carry a terminal receipt"
+            );
+            let intended = row.clone();
             let changed = conn.execute(
                 "INSERT INTO authored_agent_package_journals(
-                    owner_digest,client_operation_id,request_hash,fencing_generation,policy_revision,package_digest,draft_revision,installation_id,default_selected,onboarding_run_id,onboarding_attempt_id,onboarding_stage_revision,terminal_response_json,created_at_unix_ms
-                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
-                 ON CONFLICT(owner_digest,client_operation_id) DO UPDATE SET
-                    terminal_response_json=excluded.terminal_response_json
-                 WHERE authored_agent_package_journals.request_hash=excluded.request_hash
-                   AND authored_agent_package_journals.fencing_generation=excluded.fencing_generation
-                   AND authored_agent_package_journals.policy_revision=excluded.policy_revision
-                   AND authored_agent_package_journals.package_digest=excluded.package_digest
-                   AND authored_agent_package_journals.draft_revision=excluded.draft_revision",
+                    owner_digest,client_operation_id,request_hash,fencing_generation,policy_revision,package_digest,draft_revision,expected_draft_revision,agent_name,source_locator,source_pin,require_third_party,third_party_trust_confirmed,make_default,sidecar_intent_json,package_files_json,review_json,installation_id,default_selected,onboarding_run_id,onboarding_attempt_id,onboarding_stage_revision,settlement_phase,terminal_response_json,created_at_unix_ms
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)
+                 ON CONFLICT(owner_digest,client_operation_id) DO NOTHING",
                 params![
                     row.owner_digest,
                     row.client_operation_id,
@@ -94,20 +121,129 @@ impl Db {
                     row.policy_revision,
                     row.package_digest,
                     row.draft_revision,
+                    row.expected_draft_revision,
+                    row.agent_name,
+                    row.source_locator,
+                    row.source_pin,
+                    i64::from(row.require_third_party),
+                    i64::from(row.third_party_trust_confirmed),
+                    i64::from(row.make_default),
+                    row.sidecar_intent_json,
+                    row.package_files_json,
+                    row.review_json,
                     row.installation_id,
                     i64::from(row.default_selected),
                     row.onboarding_run_id,
                     row.onboarding_attempt_id,
                     row.onboarding_stage_revision,
+                    row.settlement_phase,
                     row.terminal_response_json,
                     row.created_at_unix_ms,
                 ],
             )?;
+            let stored = conn
+                .query_row(
+                    &format!(
+                        "SELECT {JOURNAL_COLUMNS}
+                         FROM authored_agent_package_journals WHERE owner_digest=?1 AND client_operation_id=?2"
+                    ),
+                    params![intended.owner_digest, intended.client_operation_id],
+                    decode_journal,
+                )
+                .context("loading authored package journal after intent insert")?;
+            if changed == 0 {
+                ensure!(
+                    stored.request_hash == intended.request_hash
+                        && stored.fencing_generation == intended.fencing_generation
+                        && stored.policy_revision == intended.policy_revision
+                        && stored.package_digest == intended.package_digest
+                        && stored.draft_revision == intended.draft_revision
+                        && stored.expected_draft_revision == intended.expected_draft_revision
+                        && stored.agent_name == intended.agent_name
+                        && stored.source_locator == intended.source_locator
+                        && stored.source_pin == intended.source_pin
+                        && stored.require_third_party == intended.require_third_party
+                        && stored.third_party_trust_confirmed
+                            == intended.third_party_trust_confirmed
+                        && stored.make_default == intended.make_default
+                        && stored.sidecar_intent_json == intended.sidecar_intent_json
+                        && stored.package_files_json == intended.package_files_json
+                        && stored.review_json == intended.review_json
+                        && stored.default_selected == intended.default_selected
+                        && stored.onboarding_run_id == intended.onboarding_run_id
+                        && stored.onboarding_attempt_id == intended.onboarding_attempt_id
+                        && stored.onboarding_stage_revision == intended.onboarding_stage_revision,
+                    "authored package journal identity does not match the original request"
+                );
+            }
+            Ok(stored)
+        })
+        .await
+    }
+
+    pub async fn finish_authored_agent_package_journal(
+        &self,
+        owner_digest: String,
+        client_operation_id: String,
+        installation_id: Option<String>,
+        terminal_response_json: String,
+    ) -> Result<()> {
+        self.write(move |conn| {
+            ensure!(
+                json_valid_len(&terminal_response_json, 1_048_576),
+                "authored package terminal receipt is not valid JSON"
+            );
+            let existing: Option<(Option<String>, String, Option<String>)> = conn
+                .query_row(
+                    "SELECT installation_id,settlement_phase,terminal_response_json
+                     FROM authored_agent_package_journals
+                     WHERE owner_digest=?1 AND client_operation_id=?2",
+                    params![owner_digest, client_operation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((current_install, phase, current_terminal)) = existing else {
+                bail!("authored package journal disappeared before terminal settlement");
+            };
+            if phase == AUTHORED_PACKAGE_SETTLEMENT_TERMINAL {
+                ensure!(
+                    current_terminal.as_deref() == Some(terminal_response_json.as_str())
+                        && current_install == installation_id,
+                    "authored package journal terminal receipt does not match"
+                );
+                return Ok(());
+            }
+            let changed = conn.execute(
+                "UPDATE authored_agent_package_journals
+                 SET installation_id=?3,settlement_phase=?4,terminal_response_json=?5
+                 WHERE owner_digest=?1 AND client_operation_id=?2 AND settlement_phase=?6",
+                params![
+                    owner_digest,
+                    client_operation_id,
+                    installation_id,
+                    AUTHORED_PACKAGE_SETTLEMENT_TERMINAL,
+                    terminal_response_json,
+                    AUTHORED_PACKAGE_SETTLEMENT_PENDING,
+                ],
+            )?;
             ensure!(
                 changed == 1,
-                "authored package journal identity does not match the original request"
+                "authored package journal lost its publication_pending claim"
             );
             Ok(())
+        })
+        .await
+    }
+
+    pub async fn delete_authored_agent_package_journals_by_client_operation(
+        &self,
+        client_operation_id: String,
+    ) -> Result<u64> {
+        self.write(move |conn| {
+            Ok(conn.execute(
+                "DELETE FROM authored_agent_package_journals WHERE client_operation_id=?1",
+                params![client_operation_id],
+            )? as u64)
         })
         .await
     }
@@ -187,6 +323,10 @@ impl Db {
     }
 }
 
+fn json_valid_len(value: &str, max_bytes: usize) -> bool {
+    value.len() <= max_bytes && serde_json::from_str::<serde_json::Value>(value).is_ok()
+}
+
 fn decode_journal(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthoredAgentPackageJournalRow> {
     Ok(AuthoredAgentPackageJournalRow {
         owner_digest: row.get(0)?,
@@ -196,12 +336,23 @@ fn decode_journal(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthoredAgentPack
         policy_revision: row.get(4)?,
         package_digest: row.get(5)?,
         draft_revision: row.get(6)?,
-        installation_id: row.get(7)?,
-        default_selected: row.get::<_, i64>(8)? != 0,
-        onboarding_run_id: row.get(9)?,
-        onboarding_attempt_id: row.get(10)?,
-        onboarding_stage_revision: row.get(11)?,
-        terminal_response_json: row.get(12)?,
-        created_at_unix_ms: row.get(13)?,
+        expected_draft_revision: row.get(7)?,
+        agent_name: row.get(8)?,
+        source_locator: row.get(9)?,
+        source_pin: row.get(10)?,
+        require_third_party: row.get::<_, i64>(11)? != 0,
+        third_party_trust_confirmed: row.get::<_, i64>(12)? != 0,
+        make_default: row.get::<_, i64>(13)? != 0,
+        sidecar_intent_json: row.get(14)?,
+        package_files_json: row.get(15)?,
+        review_json: row.get(16)?,
+        installation_id: row.get(17)?,
+        default_selected: row.get::<_, i64>(18)? != 0,
+        onboarding_run_id: row.get(19)?,
+        onboarding_attempt_id: row.get(20)?,
+        onboarding_stage_revision: row.get(21)?,
+        settlement_phase: row.get(22)?,
+        terminal_response_json: row.get(23)?,
+        created_at_unix_ms: row.get(24)?,
     })
 }

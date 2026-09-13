@@ -6074,9 +6074,7 @@ async fn bind_authored_package_primary(
         let offering = offerings
             .iter()
             .find(|offering| {
-                offering.model_id == grant.model_id
-                    && (offering.provider_id == grant.provider_id
-                        || offering.provider_profile_handle == grant.provider_id)
+                offering.model_id == grant.model_id && offering.provider_id == grant.provider_id
             })
             .with_context(|| {
                 format!(
@@ -7050,10 +7048,7 @@ pub(crate) fn resolvable_provider_handle_for_route(
     let offerings = setup_offerings(providers);
     let mut handles = std::collections::BTreeSet::new();
     for offering in &offerings {
-        if offering.model_id == model_id
-            && (offering.provider_id == provider_id
-                || offering.provider_profile_handle == provider_id)
-        {
+        if offering.model_id == model_id && offering.provider_id == provider_id {
             handles.insert(offering.provider_profile_handle.clone());
         }
     }
@@ -7071,15 +7066,9 @@ pub(crate) fn resolvable_provider_handle_for_choice(
     let offerings = setup_offerings(providers);
     let mut handles = std::collections::BTreeSet::new();
     for offering in &offerings {
-        if offering.model_id == choice.model_id
-            && (offering.provider_id == choice.provider_id
-                || offering.provider_profile_handle == choice.provider_id)
-        {
+        if offering.model_id == choice.model_id && offering.provider_id == choice.provider_id {
             handles.insert(offering.provider_profile_handle.clone());
         }
-    }
-    if providers.providers.contains_key(&choice.provider_id) {
-        handles.insert(choice.provider_id.clone());
     }
     if handles.len() == 1 {
         handles.into_iter().next()
@@ -12335,6 +12324,53 @@ mod tests {
             resolvable_provider_handle_for_choice(&providers, &choice).as_deref(),
             Some("profile-secret")
         );
+        assert_eq!(
+            resolvable_provider_handle_for_route(&providers, "profile-secret", "glm"),
+            None
+        );
+        assert_eq!(
+            resolvable_provider_handle_for_route(&providers, "configured-provider-0", "glm")
+                .as_deref(),
+            Some("profile-secret")
+        );
+        let handle_choice = AgentInstallationChoiceV1 {
+            provider_id: "profile-secret".into(),
+            ..choice.clone()
+        };
+        assert_eq!(
+            resolvable_provider_handle_for_choice(&providers, &handle_choice),
+            None
+        );
+    }
+
+    #[test]
+    fn authored_binding_and_route_resolution_accept_only_wire_provider_ids() {
+        let source = include_str!("agent_installation.rs");
+        let bind = source
+            .split("async fn bind_authored_package_primary")
+            .nth(1)
+            .and_then(|tail| tail.split("fn authored_package_stage_dir").next())
+            .expect("authored primary bind");
+        assert!(bind.contains("offering.provider_id == grant.provider_id"));
+        assert!(!bind.contains("provider_profile_handle == grant.provider_id"));
+        let route = source
+            .split("pub(crate) fn resolvable_provider_handle_for_route")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("pub(crate) fn resolvable_provider_handle_for_choice")
+                    .next()
+            })
+            .expect("route resolver");
+        assert!(route.contains("offering.provider_id == provider_id"));
+        assert!(!route.contains("provider_profile_handle == provider_id"));
+        let choice = source
+            .split("pub(crate) fn resolvable_provider_handle_for_choice")
+            .nth(1)
+            .and_then(|tail| tail.split("fn first_exact_author_choice").next())
+            .expect("choice resolver");
+        assert!(choice.contains("offering.provider_id == choice.provider_id"));
+        assert!(!choice.contains("provider_profile_handle == choice.provider_id"));
+        assert!(!choice.contains("providers.providers.contains_key(&choice.provider_id)"));
     }
 
     #[test]

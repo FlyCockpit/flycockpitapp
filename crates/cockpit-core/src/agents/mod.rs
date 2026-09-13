@@ -2318,6 +2318,16 @@ pub(crate) fn parse_package_sidecar_file(bytes: &[u8]) -> Result<AgentPackageSid
     Ok(parsed)
 }
 
+/// Package sidecar.json is the runtime sidecar authority for an authored
+/// agent. `None` means inherit the global selection (no package, or no
+/// sidecar.json). `Some` is the exclusive declaration list from the package.
+pub(crate) fn package_sidecar_authority(def: &AgentDef) -> Option<Vec<AgentPackageSidecarEntry>> {
+    let bytes = def.package_files.as_ref()?.get(PACKAGE_SIDECAR_FILE)?;
+    parse_package_sidecar_file(bytes)
+        .ok()
+        .map(|file| file.sidecars)
+}
+
 pub(crate) fn encode_package_sidecar_file(
     sidecars: &[AgentPackageSidecarEntry],
 ) -> Result<Vec<u8>> {

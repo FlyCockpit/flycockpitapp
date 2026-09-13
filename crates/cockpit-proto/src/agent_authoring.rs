@@ -212,8 +212,8 @@ pub struct AuthoredAgentReview {
     pub interactive_subagents: bool,
     pub goal_skeptics_label: String,
     pub children: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sidecar: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidecars: Vec<String>,
     pub source: String,
     pub trust_is_shared: bool,
     pub trust_disclosure: String,

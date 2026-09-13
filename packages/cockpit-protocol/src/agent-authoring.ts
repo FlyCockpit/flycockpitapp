@@ -173,7 +173,7 @@ export const authoredAgentReviewSchema = z
     interactive_subagents: z.boolean(),
     goal_skeptics_label: z.string(),
     children: z.array(z.string()),
-    sidecar: z.string().optional(),
+    sidecars: z.array(z.string()).optional(),
     source: z.string(),
     trust_is_shared: z.boolean(),
     trust_disclosure: z.string(),

@@ -574,6 +574,7 @@ mod tests {
             trusted_primary_default: Some(pair("trusted", "sidecar-trusted")),
             untrusted_primary_default: Some(pair("untrusted", "sidecar-untrusted")),
             per_primary_override: None,
+            permitted: Vec::new(),
         };
         let resolution = project_resolution(
             &providers(),
@@ -606,6 +607,7 @@ mod tests {
             trusted_primary_default: Some(pair("trusted", "sidecar-trusted")),
             untrusted_primary_default: Some(pair("untrusted", "sidecar-untrusted")),
             per_primary_override: None,
+            permitted: Vec::new(),
         };
         let resolution = project_resolution(
             &providers(),
@@ -646,6 +648,7 @@ mod tests {
             trusted_primary_default: Some(pair("trusted", "sidecar-trusted")),
             untrusted_primary_default: Some(pair("untrusted", "sidecar-untrusted")),
             per_primary_override: None,
+            permitted: Vec::new(),
         };
         let resolution = project_resolution(
             &providers(),

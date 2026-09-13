@@ -224,7 +224,7 @@ pub fn publish_onboarding_agent_plan(
         &grant.provider_id,
         &grant.model_id,
     )
-    .unwrap_or_else(|| grant.provider_id.clone());
+    .context("onboarding grant is not a configured provider route")?;
     let global_config = global_config_file().context("resolving global agent onboarding config")?;
     let model_target =
         crate::config::providers::provider_file_path_for_config(&global_config, &provider_handle)
@@ -283,27 +283,10 @@ pub fn publish_onboarding_agent_plan(
         if prepared.draft.make_default {
             extended.default_agent = Some(prepared.draft.name.clone());
         }
-        if let Some(sidecar) = prepared.draft.sidecars.first() {
-            use crate::config::image_sidecar::{
-                SidecarMode, SidecarProviderModel, SidecarSelectionConfig,
-            };
-            let provider = crate::daemon::agent_installation::resolvable_provider_handle_for_route(
-                &prepared.providers,
-                &sidecar.provider_id,
-                &sidecar.model_id,
-            )
-            .unwrap_or_else(|| sidecar.provider_id.clone());
-            let selected = SidecarProviderModel {
-                provider,
-                model: sidecar.model_id.clone(),
-            };
-            extended.image_sidecar = SidecarSelectionConfig {
-                mode: SidecarMode::Always,
-                trusted_primary_default: Some(selected.clone()),
-                untrusted_primary_default: Some(selected),
-                per_primary_override: None,
-            };
-        }
+        extended.image_sidecar = crate::onboarding_agent::authored_sidecar_selection_config(
+            &prepared.draft.sidecars,
+            &prepared.providers,
+        )?;
         extended_doc.write(&extended)?;
         Ok(())
     })();

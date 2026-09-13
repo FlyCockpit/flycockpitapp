@@ -196,6 +196,7 @@ impl Db {
             let authored_package_journals = conn.execute(
                 "DELETE FROM authored_agent_package_journals
                   WHERE created_at_unix_ms < ?1
+                    AND settlement_phase = 'terminal'
                     AND NOT EXISTS (
                         SELECT 1 FROM local_operation_receipts receipt
                          WHERE receipt.owner_digest=authored_agent_package_journals.owner_digest

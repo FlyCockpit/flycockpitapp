@@ -13,7 +13,7 @@ use ratatui::style::Style;
 use ratatui::widgets::{Block, BorderType, Borders, Clear};
 
 use crate::tui::chat_header::{
-    CHAT_HEADER_HEIGHT, ChatHeaderLayout, ChatHeaderState, GitFacts, HeaderPill, HeaderPillKind,
+    CHAT_HEADER_HEIGHT, ChatHeaderLayout, ChatHeaderState, HeaderPill, HeaderPillKind,
     HeaderSessionStatus,
 };
 use crate::tui::history::{HistoryEntry, ToolCallState};
@@ -27,10 +27,11 @@ impl App {
             title: self.chat_header_title(),
             status: self.chat_header_status(),
             path: self.launch.cwd_display.clone(),
-            git: self.launch.repo_status.as_ref().map(|repo| GitFacts {
-                branch: repo.branch.clone(),
-                counts: crate::tui::chat_header::repo_counts(repo),
-            }),
+            git: self
+                .launch
+                .repo_status
+                .as_ref()
+                .map(crate::tui::chat_header::launch_git_facts),
             pills: self.chat_header_pills(),
         }
     }
@@ -209,6 +210,7 @@ impl App {
     pub(super) fn render_chat_header(&mut self, frame: &mut Frame, chat: Rect) -> Rect {
         if chat.width == 0 || chat.height <= CHAT_HEADER_HEIGHT {
             self.chat_header_layout = None;
+            self.header_pill_selection = None;
             self.chat_header_more_open = false;
             self.chat_header_more_rect = None;
             return chat;
@@ -243,8 +245,14 @@ impl App {
     /// Paint the collapsed-pill `more` popover over the transcript, below
     /// the header's meta row. Called after history renders so it floats on
     /// top; a no-op unless the header rendered and the popover is open.
+    /// The popover never floats above a body-owning modal: when one is on
+    /// top it closes instead of shadowing that surface.
     pub(super) fn paint_chat_header_more_popover(&mut self, frame: &mut Frame) {
         self.chat_header_more_rect = None;
+        if !self.header_chrome_interactive() {
+            self.chat_header_more_open = false;
+            return;
+        }
         let Some(layout) = self.chat_header_layout.clone() else {
             self.chat_header_more_open = false;
             return;
@@ -335,11 +343,29 @@ impl App {
         false
     }
 
+    /// Whether the header's interactive chrome (pills, the `more` chip and
+    /// popover) may take input this frame: the header must have rendered,
+    /// and no body-owning surface may be on top — the approval question
+    /// dialog, any settings/wizard dialog, or any overlay (an overlay
+    /// holding unsettled local authority also means the header did not
+    /// render, so its pane cannot be dropped by a pill). Header rows still
+    /// render behind a modal — the attention/status summary is exactly
+    /// then most relevant — but they never preempt its keys or clicks.
+    pub(super) fn header_chrome_interactive(&self) -> bool {
+        self.chat_header_layout.is_some()
+            && matches!(self.overlay, Overlay::None)
+            && self.question_dialog.is_none()
+            && !self.dialog.is_active()
+    }
+
     /// Activate one header pill: select it and open its existing
     /// authoritative detail surface. Exactly one funnel for mouse and
-    /// keyboard.
+    /// keyboard. Refused (and any selection released) while a body-owning
+    /// surface is on top.
     pub(super) fn activate_header_pill(&mut self, kind: HeaderPillKind) {
-        if self.chat_header_layout.is_none() {
+        if !self.header_chrome_interactive() {
+            self.header_pill_selection = None;
+            self.chat_header_more_open = false;
             return;
         }
         self.header_pill_selection = Some(kind);
@@ -374,9 +400,11 @@ impl App {
         }
     }
 
-    /// Toggle the collapsed-pill `more` popover (the `[+N]` chip).
+    /// Toggle the collapsed-pill `more` popover (the `[+N]` chip). A no-op
+    /// (and closed) while a body-owning surface is on top.
     pub(super) fn toggle_chat_header_more(&mut self) {
-        if self.chat_header_layout.is_none() {
+        if !self.header_chrome_interactive() {
+            self.chat_header_more_open = false;
             return;
         }
         self.chat_header_more_open = !self.chat_header_more_open;
@@ -385,8 +413,16 @@ impl App {
     /// Keyboard handling for header pills: while a pill is selected, ←/→
     /// cycle through this frame's active pills, Enter activates, Esc clears
     /// (closing an open popover first). Any other ordinary key clears the
-    /// selection and falls through. Returns true when the key was consumed.
+    /// selection and falls through. When the header is not the active
+    /// input surface (a modal/overlay on top, or it did not render), any
+    /// stale selection is released and the key always falls through to the
+    /// surface that owns input. Returns true when the key was consumed.
     pub(super) fn handle_header_pill_key(&mut self, key: &KeyEvent) -> bool {
+        if !self.header_chrome_interactive() {
+            self.header_pill_selection = None;
+            self.chat_header_more_open = false;
+            return false;
+        }
         if self.chat_header_more_open
             && let KeyCode::Esc = key.code
         {

@@ -4550,14 +4550,16 @@ impl App {
     pub(super) fn render_status(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         // Caffeination glyph (☕) leads the right-hand chrome while active,
         // driven by the daemon-broadcast state (GOALS §1a). Additive to the
-        // fixed cwd + branch chrome — never displaces it.
+        // right-hand transient stack — never displaces another slot.
         // Side-conversation indicator (`/side`) leads the right-hand chrome
         // while a throwaway side conversation is open, ahead of the ☕ glyph.
-        // Additive to the fixed cwd + branch chrome — never displaces it.
+        // Additive to the right-hand transient stack — never displaces
+        // another slot.
         // Plan-status indicator (`plan-status-chrome-and-resolver.md`) leads
         // the right-hand chrome when this project has unfinished plans, driven
-        // by daemon-broadcast state. Additive to the fixed cwd + branch chrome
-        // (GOALS §1a) — never displaces it, the same pattern as the ☕ glyph.
+        // by daemon-broadcast state. Additive to the right-hand transient
+        // stack (GOALS §1a) — never displaces another slot, the same pattern
+        // as the ☕ glyph.
         // Transient "waiting for lock" indicator
         // (`readlock-wait-and-lock-expiry.md` historical prompt slug) leads
         // the right-hand chrome

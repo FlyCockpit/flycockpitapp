@@ -20,7 +20,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::tui::button::{ButtonDispatch, ButtonId, ButtonSpec};
+use crate::tui::button::{
+    ButtonDispatch, ButtonId, ButtonSpec, clip_to_display_width, display_width,
+};
 use crate::tui::theme::{DIVIDER_DIM, MUTED_COLOR_INDEX, STATUS_BRANCH_BADGE};
 
 /// Height of the full header: title row, meta row, rule row.
@@ -163,9 +165,10 @@ fn cluster_width(labels: &[&str]) -> u16 {
 /// Returns the visible prefix indices and whether a counted `more` chip is
 /// required. The highest-priority pills stay visible while they fit
 /// (separators and the `more` chip included); the remainder collapse behind
-/// `more`. When even the first pill plus `more` cannot fit, `more` alone
-/// survives so the activity summary stays reachable; when not even that
-/// fits, the cluster is omitted.
+/// `more`. The counted chip is the last-resort activity surface: it survives
+/// alone even when its bracketed form cannot fit — the planner clamps it
+/// into the header row (clipping its label) so active activity stays
+/// visible and clickable at every width the header itself renders.
 fn plan_pill_cluster(pills: &[HeaderPill], budget: u16) -> (Vec<usize>, bool) {
     if pills.is_empty() {
         return (Vec::new(), false);
@@ -186,11 +189,9 @@ fn plan_pill_cluster(pills: &[HeaderPill], budget: u16) -> (Vec<usize>, bool) {
             return ((0..keep).collect(), true);
         }
     }
-    // Only the counted chip fits.
-    if CLUSTER_GAP + pill_width(&format!("+{}", pills.len())) <= budget {
-        return (Vec::new(), true);
-    }
-    (Vec::new(), false)
+    // Not even one pill fits beside the chip: the counted chip alone
+    // carries the summary.
+    (Vec::new(), true)
 }
 
 /// Plan the whole header. Pure: same state + area ⇒ same layout.
@@ -207,19 +208,26 @@ pub(crate) fn plan_chat_header(state: &ChatHeaderState, area: Rect) -> ChatHeade
 
     // Right-align: walk from the right edge leftward, placing the `more`
     // chip first (rightmost) and then the visible pills so the
-    // highest-priority pill ends up leftmost of the cluster.
+    // highest-priority pill ends up leftmost of the cluster. The chip
+    // never leaves the header row: when its bracketed form is wider than
+    // the row, it clamps to the row's left edge and its label clips —
+    // the counted summary stays visible and clickable instead of
+    // vanishing (and the meta-row path budget saturates to zero, so
+    // nothing is overlapped).
     let meta_y = area.y.saturating_add(1);
     let mut x = area.right();
     if more {
         let collapsed = state.pills.len() - visible.len();
         let w = pill_width(&format!("+{collapsed}"));
-        x = x.saturating_sub(w);
+        let chip_x = x.saturating_sub(w).max(area.x);
+        let chip_w = w.min(area.width);
+        x = chip_x;
         layout.more_button = Some((
             collapsed,
             Rect {
-                x,
+                x: chip_x,
                 y: meta_y,
-                width: w,
+                width: chip_w,
                 height: 1,
             },
         ));
@@ -268,7 +276,7 @@ pub(crate) fn paint_chat_header(
         ..area
     };
     let status_label = state.status.label();
-    let status_w = status_label.chars().count() as u16;
+    let status_w = display_width(status_label);
     let title_budget = title_row.width.saturating_sub(status_w + CLUSTER_GAP);
     let title_text = state
         .title
@@ -369,14 +377,18 @@ pub(crate) fn paint_chat_header(
 /// The left meta-row spans: display path plus, when the repo snapshot has
 /// resolved, the branch badge with dirty counts. This is the same span
 /// shape the footer status line drew before the header became its one
-/// home ([`repo_counts`] moved with it); the launch banner box reuses the
-/// builder so the two stay identical.
+/// home; the launch banner box reuses the builder so the two stay
+/// identical.
 fn path_git_spans(state: &ChatHeaderState, budget: u16) -> Vec<Span<'static>> {
     launch_path_spans(&state.path, state.git.as_ref(), budget)
 }
 
-/// The one path + git badge span builder. `budget` caps the total width
-/// (path truncates first); pass `u16::MAX` for unbounded measurement.
+/// The one path + git badge span builder. `budget` caps the total width in
+/// display columns; degradation order is path, then branch name, then
+/// dirty counts. Pass `u16::MAX` for unbounded measurement. All
+/// measurements are display width — the same unit [`pill_width`] budgets
+/// the right-hand cluster with — so wide glyphs can never make the two
+/// clusters disagree about what a column is.
 pub(crate) fn launch_path_spans(
     path: &str,
     git: Option<&GitFacts>,
@@ -399,12 +411,25 @@ pub(crate) fn launch_path_spans(
     } else {
         format!("{} ", git.counts)
     };
-    let badge_w = 2 + git.branch.chars().count() as u16 + counts.chars().count() as u16 + 1;
+    let mut counts_w = display_width(&counts);
+    // The badge frame is `▐` + ` branch ` + counts + `▌`: four columns of
+    // chrome plus the branch and counts. Degrade in order: the path
+    // truncates first, then the branch name truncates, and the dirty
+    // counts drop when the frame cannot host them beside any branch — so
+    // the badge never spills past the reserved pill cluster.
+    let mut branch_budget = budget.saturating_sub(4 + counts_w);
+    if branch_budget == 0 {
+        counts_w = 0;
+        branch_budget = budget.saturating_sub(4);
+    }
+    let branch = truncate_to_width(&git.branch, branch_budget as usize);
+    let counts = if counts_w == 0 { String::new() } else { counts };
+    let badge_w = 4 + display_width(&branch) + counts_w;
     if budget <= badge_w + 1 {
         // The path degrades first; keep the branch visible when it fits.
         let mut spans = vec![
             Span::styled("▐", edge),
-            Span::styled(format!(" {} ", git.branch), badge),
+            Span::styled(format!(" {} ", branch), badge),
         ];
         if !counts.is_empty() {
             spans.push(Span::styled(counts.clone(), badge));
@@ -417,7 +442,7 @@ pub(crate) fn launch_path_spans(
         Span::styled(truncate_to_width(path, path_budget), muted),
         Span::raw(" "),
         Span::styled("▐", edge),
-        Span::styled(format!(" {} ", git.branch), badge),
+        Span::styled(format!(" {} ", branch), badge),
         Span::styled(counts, badge),
         Span::styled("▌", edge),
     ]
@@ -425,48 +450,39 @@ pub(crate) fn launch_path_spans(
 
 /// Git facts for a launch snapshot — the bridge the banner box uses to
 /// reuse [`launch_path_spans`] without constructing a full header state.
+/// Dirty counts come from the core formatter so the header, banner, and
+/// startup welcome text can never drift apart.
 pub(crate) fn launch_git_facts(repo: &cockpit_proto::RepoStatus) -> GitFacts {
     GitFacts {
         branch: repo.branch.clone(),
-        counts: repo_counts(repo),
+        counts: cockpit_core::git::repo_counts(repo),
     }
 }
 
-/// Display-width-aware truncation with an ellipsis. Pure.
+/// Display-width-aware truncation with an ellipsis. Pure. Measures in
+/// columns, not chars: wide glyphs cost their real width, matching every
+/// other budget in this module.
 fn truncate_to_width(text: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
-    if text.chars().count() <= max {
+    if display_width(text) as usize <= max {
         return text.to_string();
     }
     if max == 1 {
         return "…".to_string();
     }
-    let cut: String = text.chars().take(max - 1).collect();
+    let cut = clip_to_display_width(text, (max - 1) as u16);
     format!("{cut}…")
-}
-
-/// Dirty-count suffix (`+staged ~unstaged ^unpushed`) over the daemon's
-/// `RepoStatus`. Presentation-only formatter (no I/O); it mirrors the core
-/// `repo_counts` formatter that startup welcome text uses — keep the two in
-/// sync.
-pub(crate) fn repo_counts(repo: &cockpit_proto::RepoStatus) -> String {
-    let mut parts = Vec::new();
-    if repo.staged > 0 {
-        parts.push(format!("+{}", repo.staged));
-    }
-    if repo.unstaged > 0 {
-        parts.push(format!("~{}", repo.unstaged));
-    }
-    if repo.unpushed > 0 {
-        parts.push(format!("^{}", repo.unpushed));
-    }
-    parts.join(" ")
 }
 
 /// Named capability-parity rows: every header/footer control this issue
 /// moved names its retained surface and the test that proves the parity.
+/// A `proof` must be a declared `#[test]` in the app-level behavior suite
+/// (`tui/app/chat_header_tests.rs`) — a test that builds the real App and
+/// renders — not a layout unit test: the proof must exercise the mapped
+/// control's replacement end to end. The ratchet in that suite enforces
+/// the declaration mechanically; the mapping itself is reviewed content.
 pub struct HeaderParityRow {
     pub control: &'static str,
     pub surface: &'static str,
@@ -488,7 +504,7 @@ pub fn capability_parity_table() -> &'static [HeaderParityRow] {
         HeaderParityRow {
             control: "footer async-schedule strip",
             surface: "header task/timer pills → /schedule listing",
-            proof: "pills_render_only_known_activity_and_omit_the_rest",
+            proof: "header_pills_draw_only_from_real_state",
         },
         HeaderParityRow {
             control: "agent/subagent activity summary",
@@ -523,7 +539,7 @@ pub fn capability_parity_table() -> &'static [HeaderParityRow] {
         HeaderParityRow {
             control: "session title/status",
             surface: "chat header title row",
-            proof: "title_and_status_render_real_values_only",
+            proof: "header_session_status_tracks_real_state",
         },
     ]
 }
@@ -742,21 +758,101 @@ mod tests {
     }
 
     #[test]
-    fn repo_counts_formatter_matches_core_spelling() {
+    fn git_facts_use_the_core_counts_formatter() {
+        // The dirty-count spelling is the shared core symbol, so header,
+        // banner, and startup welcome text cannot drift apart.
         let dirty = cockpit_proto::RepoStatus {
             branch: "main".into(),
             staged: 1,
             unstaged: 2,
             unpushed: 3,
         };
-        assert_eq!(repo_counts(&dirty), "+1 ~2 ^3");
+        assert_eq!(
+            launch_git_facts(&dirty).counts,
+            cockpit_core::git::repo_counts(&dirty)
+        );
+        assert_eq!(launch_git_facts(&dirty).counts, "+1 ~2 ^3");
         let clean = cockpit_proto::RepoStatus {
             branch: "main".into(),
             staged: 0,
             unstaged: 0,
             unpushed: 0,
         };
-        assert_eq!(repo_counts(&clean), "");
+        assert_eq!(launch_git_facts(&clean).counts, "");
+    }
+
+    #[test]
+    fn truncation_measures_display_width_not_chars() {
+        // Three wide glyphs: six columns, three chars.
+        let wide = "中文啊";
+        assert_eq!(display_width(wide), 6);
+        assert_eq!(truncate_to_width(wide, 6), "中文啊");
+        assert_eq!(truncate_to_width(wide, 5), "中文…");
+        assert_eq!(truncate_to_width(wide, 3), "中…");
+        assert_eq!(truncate_to_width(wide, 1), "…");
+        assert_eq!(truncate_to_width(wide, 0), "");
+        // Mixed content truncates on the column budget.
+        assert_eq!(truncate_to_width("a中文b", 4), "a中…");
+    }
+
+    #[test]
+    fn meta_row_spans_respect_display_width_budget() {
+        let wide_path = "路径路径路径路径"; // 16 columns, 8 chars
+        let git = GitFacts {
+            branch: "main".to_string(),
+            counts: "+1 ~2".to_string(),
+        };
+        for budget in 6u16..40 {
+            let spans = launch_path_spans(wide_path, Some(&git), budget);
+            let total: u16 = spans
+                .iter()
+                .map(|span| display_width(span.content.as_ref()))
+                .sum();
+            assert!(
+                total <= budget,
+                "spans ({total} cols) must fit the {budget}-column budget"
+            );
+        }
+        // No git: the wide path truncates by columns, so a 7-column budget
+        // keeps three wide glyphs plus the ellipsis.
+        let spans = launch_path_spans(wide_path, None, 7);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "路径路…");
+        // A wide-glyph branch name truncates too instead of spilling past
+        // the reserved pill cluster.
+        let wide_branch = GitFacts {
+            branch: "分支分支分支".to_string(),
+            counts: String::new(),
+        };
+        let spans = launch_path_spans("/p", Some(&wide_branch), 10);
+        let total: u16 = spans
+            .iter()
+            .map(|span| display_width(span.content.as_ref()))
+            .sum();
+        assert!(total <= 10, "wide branch badge fits: {total} cols");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains('…'), "truncated visibly: {text:?}");
+    }
+
+    #[test]
+    fn activity_summary_survives_ultra_narrow_widths() {
+        let state = full_state(); // six active pills
+        for width in 1u16..6 {
+            let layout = plan_chat_header(&state, area(width));
+            let (_, chip) = layout
+                .more_button
+                .expect("the counted chip survives every header width");
+            assert!(
+                chip.x >= layout.area.x && chip.right() <= layout.area.right(),
+                "chip clamped inside the {width}-column header row"
+            );
+            assert_eq!(layout.collapsed.len(), state.pills.len());
+            assert_eq!(
+                layout.active_kinds().len(),
+                state.pills.len(),
+                "collapsed pills stay reachable through cycling and the popover"
+            );
+        }
     }
 
     #[test]

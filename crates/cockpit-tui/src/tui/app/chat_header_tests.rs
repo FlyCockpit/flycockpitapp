@@ -6,7 +6,7 @@ use super::{
     App, AttentionInterruptKind, AttentionInterruptState, HistoryEntry, Overlay,
     StartupWorkspaceTrust,
 };
-use crate::tui::chat_header::{HEADER_COLLAPSE_PROBE_WIDTHS, HeaderPillKind};
+use crate::tui::chat_header::{CHAT_HEADER_HEIGHT, HEADER_COLLAPSE_PROBE_WIDTHS, HeaderPillKind};
 use cockpit_proto::RepoStatus;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
@@ -589,35 +589,259 @@ fn header_and_transcript_hold_reserved_columns_at_probe_widths() {
             let text = row_text(&buf, y);
             assert!(text.chars().count() <= width as usize, "row {y} overflows");
         }
+
+        // Pin/fork controls keep their reserved columns beside the entries
+        // they belong to: every recorded hit region parses back to exactly
+        // its control glyphs (body text never renders under them), and each
+        // fixture entry retains its controls after the header carve.
+        let mut user_control_rows = 0usize;
+        let mut agent_control_rows = 0usize;
+        for (row, meta) in app.chat_row_meta.iter().enumerate() {
+            let y = chat.y + row as u16;
+            let region = |start: u16, end: u16| -> String {
+                (start..end)
+                    .map(|col| buf[(chat.x + col, y)].symbol().to_string())
+                    .collect()
+            };
+            if let Some(hit) = meta.fork_hit {
+                assert_eq!(
+                    region(hit.col_start, hit.col_end),
+                    "[fork]",
+                    "fork columns reserved at {width}"
+                );
+            }
+            if let Some(hit) = meta.pin_hit {
+                let text = region(hit.col_start, hit.col_end);
+                assert!(
+                    text == "[pin]" || text == "[unpin]",
+                    "pin columns reserved at {width}: {text:?}"
+                );
+            }
+            match meta.history_index {
+                Some(0) if meta.pin_hit.is_some() => user_control_rows += 1,
+                Some(1) if meta.pin_hit.is_some() || meta.fork_hit.is_some() => {
+                    agent_control_rows += 1
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            user_control_rows >= 1,
+            "user entry retains its pin/fork columns at {width}"
+        );
+        assert!(
+            agent_control_rows >= 1,
+            "agent entry retains its pin/fork columns at {width}"
+        );
     }
 }
 
-/// Every moved control names its retained surface and proof; the proofs
-/// exist as named tests.
+/// Every moved control names its retained surface and a proof that is a
+/// declared `#[test]` in this module — the app-level behavior suite that
+/// builds the real App and renders — so a row cannot point at an unrelated
+/// helper or a layout unit test that never exercises the replacement.
 #[test]
 fn header_parity_table_names_retained_surfaces_and_proofs() {
-    let proofs = format!(
-        "{}\n{}",
-        include_str!("chat_header_tests.rs"),
-        include_str!("../chat_header.rs"),
+    let behavior_suite = include_str!("chat_header_tests.rs");
+    let mut declared_tests = std::collections::HashSet::new();
+    let mut lines = behavior_suite.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() != "#[test]" {
+            continue;
+        }
+        // rustfmt keeps the attribute directly above the item; the next
+        // non-empty line is the `fn name(` declaration.
+        let Some(declaration) = lines.by_ref().find(|l| !l.trim().is_empty()) else {
+            break;
+        };
+        if let Some(name) = declaration.trim().strip_prefix("fn ")
+            && let Some(name) = name.split('(').next()
+        {
+            declared_tests.insert(name.to_string());
+        }
+    }
+    assert!(
+        !declared_tests.is_empty(),
+        "the behavior-suite scan must find the tests it validates"
     );
     for row in crate::tui::chat_header::capability_parity_table() {
         assert!(
-            proofs.contains(&format!("fn {}(", row.proof)),
-            "missing named proof {} for {}",
+            declared_tests.contains(row.proof),
+            "parity proof {} for {} must be a declared #[test] in the app behavior suite",
             row.proof,
             row.control
         );
     }
 }
 
-/// A too-short chat pane skips the header rather than crowding out history.
+/// A too-short chat pane skips the header rather than crowding out
+/// history — the pane passes through unchanged, no layout is recorded (so
+/// nothing in the header is activatable), and stale selection/popover
+/// state is released.
 #[test]
 fn header_skips_when_pane_cannot_hold_history() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app(&tmp);
-    let buf = render(&mut app, 60, 8);
-    assert!(app.chat_header_layout.is_some());
-    assert!(app.chat_area.expect("history").height > 0);
-    let _ = buf;
+    let backend = TestBackend::new(60, 8);
+    let mut terminal = Terminal::new(backend).expect("test backend");
+    schedule(&mut app, "t1", "timer");
+
+    terminal
+        .draw(|frame| {
+            let pane = ratatui::layout::Rect::new(0, 0, 60, CHAT_HEADER_HEIGHT);
+            let rest = app.render_chat_header(frame, pane);
+            assert_eq!(rest, pane, "an unholdable pane passes through unchanged");
+        })
+        .expect("draw");
+    assert!(app.chat_header_layout.is_none());
+    assert!(!app.chat_header_more_open);
+    assert!(app.chat_header_more_rect.is_none());
+
+    // Stale selection/popover state from a previous frame is released.
+    app.header_pill_selection = Some(HeaderPillKind::Timer);
+    app.chat_header_more_open = true;
+    terminal
+        .draw(|frame| {
+            let pane = ratatui::layout::Rect::new(0, 0, 60, CHAT_HEADER_HEIGHT);
+            let _ = app.render_chat_header(frame, pane);
+        })
+        .expect("draw");
+    assert_eq!(app.header_pill_selection, None);
+    assert!(!app.chat_header_more_open);
+
+    // A pane that can hold history renders the header and carves it.
+    terminal
+        .draw(|frame| {
+            let pane = ratatui::layout::Rect::new(0, 0, 60, 8);
+            let rest = app.render_chat_header(frame, pane);
+            assert_eq!(rest, ratatui::layout::Rect::new(0, 3, 60, 5));
+            assert!(app.chat_header_layout.is_some());
+        })
+        .expect("draw");
+}
+
+/// Header chrome never preempts a body-owning modal: with the approval
+/// question dialog on top, pill keys reach the dialog, pill activation is
+/// refused, and the collapsed-pill popover closes instead of floating
+/// above the dialog's compact slot.
+#[test]
+fn header_pills_yield_to_the_question_dialog() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    app.attention_interrupt = Some(AttentionInterruptState {
+        interrupt_id: Uuid::new_v4(),
+        kind: AttentionInterruptKind::Question,
+        pending: true,
+        pending_count: 1,
+        next_renudge_at: Instant::now(),
+    });
+    schedule(&mut app, "t1", "timer");
+    let _ = render(&mut app, 100, 30);
+    assert!(
+        app.chat_header_layout.is_some(),
+        "the header renders behind the dialog"
+    );
+
+    app.question_dialog = Some(question_dialog());
+    app.header_pill_selection = Some(HeaderPillKind::Timer);
+    app.chat_header_more_open = true;
+
+    // The mouse funnel (a pill click) is refused while the modal is up.
+    app.activate_header_pill(HeaderPillKind::Attention);
+    assert!(
+        matches!(app.overlay, Overlay::None),
+        "no surface opens over the dialog"
+    );
+    assert_eq!(app.header_pill_selection, None);
+
+    // The popover closes instead of floating above the dialog.
+    app.chat_header_more_open = true;
+    let _ = render(&mut app, 100, 30);
+    assert!(!app.chat_header_more_open);
+    assert!(app.chat_header_more_rect.is_none());
+
+    // Arrow keys cycle only when the header owns input; here they must
+    // pass through to the dialog and release the stale selection.
+    app.header_pill_selection = Some(HeaderPillKind::Timer);
+    app.handle_key(press(KeyCode::Right));
+    assert_eq!(
+        app.header_pill_selection, None,
+        "the dialog owns the key, not the pill cycler"
+    );
+
+    // Enter belongs to the dialog: the pill must not fire /schedule.
+    // (Enter may resolve the dialog; only the pill side is asserted.)
+    app.header_pill_selection = Some(HeaderPillKind::Timer);
+    app.handle_key(press(KeyCode::Enter));
+    assert!(
+        !plain_lines(&app)
+            .iter()
+            .any(|l| l.contains("/schedule: active")),
+        "Enter must reach the question dialog, not the timer pill"
+    );
+    assert_eq!(app.header_pill_selection, None);
+}
+
+/// While an overlay owns the body (the header did not render that frame),
+/// a stale pill selection never swallows the overlay's keys.
+#[test]
+fn header_pill_selection_releases_keys_to_open_overlays() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    app.history.push(HistoryEntry::SkillAutoInjected {
+        name: "firecrawl".to_string(),
+        reason: None,
+    });
+    let _ = render(&mut app, 100, 30);
+    app.activate_header_pill(HeaderPillKind::Skill);
+    assert!(matches!(app.overlay, Overlay::Skills(_)));
+
+    app.header_pill_selection = Some(HeaderPillKind::Skill);
+    assert!(
+        !app.handle_header_pill_key(&press(KeyCode::Enter)),
+        "the key falls through to the overlay"
+    );
+    assert_eq!(app.header_pill_selection, None);
+
+    // Full key path: Esc reaches the skills pane and closes it instead of
+    // being eaten by the pill selection handler.
+    app.header_pill_selection = Some(HeaderPillKind::Skill);
+    app.handle_key(press(KeyCode::Esc));
+    assert!(
+        matches!(app.overlay, Overlay::None),
+        "Esc closes the skills pane"
+    );
+}
+
+fn question_dialog() -> crate::tui::dialog::question::QuestionDialog {
+    use cockpit_proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
+    crate::tui::dialog::question::QuestionDialog::new(
+        Uuid::new_v4(),
+        String::new(),
+        InterruptQuestionSet {
+            questions: vec![InterruptQuestion::Single {
+                prompt: "Proceed?".to_string(),
+                options: vec![
+                    InterruptOption {
+                        id: "yes".to_string(),
+                        label: "Yes".to_string(),
+                        description: None,
+                        secondary: false,
+                    },
+                    InterruptOption {
+                        id: "no".to_string(),
+                        label: "No".to_string(),
+                        description: None,
+                        secondary: false,
+                    },
+                ],
+                allow_freetext: false,
+                command_detail: None,
+                permission: false,
+                approval_class: None,
+                sandbox_escalation: None,
+            }],
+        },
+        std::time::Duration::ZERO,
+    )
 }

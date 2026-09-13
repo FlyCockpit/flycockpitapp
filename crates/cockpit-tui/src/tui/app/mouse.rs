@@ -266,15 +266,6 @@ impl App {
         if self.mouse_capture && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             self.close_chat_header_popover_on_outside_press(mouse.column, mouse.row);
         }
-        #[cfg(test)]
-        if self.mouse_capture && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            eprintln!(
-                "DBG close-check ran: open={} rect={:?} layout={:?}",
-                self.chat_header_more_open,
-                self.chat_header_more_rect,
-                self.chat_header_layout.as_ref().map(|l| l.area)
-            );
-        }
         if self.mouse_capture
             && let Some(outcome) = self.dialog.handle_settings_pointer(mouse)
         {

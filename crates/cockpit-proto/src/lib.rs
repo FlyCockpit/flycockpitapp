@@ -1332,18 +1332,20 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v23 adds durable logical-conversation
-/// favorites (`SetSessionFavorite` / `SessionFavoriteApplied` and the
-/// resolved-root `SessionSummary.favorite` bit) and daemon-authoritative
-/// onboarding (`BeginOrReopenOnboarding` / `ApplyOnboardingTransition` and
-/// bootstrap snapshots) on top of v22's first-class assistant-thread
-/// creation and durable lineage projections, the V2 tagged ingress envelope,
+/// Current wire schema version. v24 makes the daemon-authoritative
+/// `SetupWizardApplied.config_generation` a required field carrying the
+/// apply's post-commit published generation, so wizard onboarding
+/// settlements prove stage advancement against the receipt itself (no
+/// compatibility window for daemons predating the field). On top of v23's
+/// durable logical-conversation favorites and daemon-authoritative
+/// onboarding bootstrap transitions, first-class assistant-thread creation,
+/// durable lineage projections, the V2 tagged ingress envelope,
 /// queued-message delivery classes, local queue controls, MCP credential
 /// profiles, agent-dimensioned MCP scopes on the attached-session and
 /// daemon-owned setup inventory, bounded base64 media previews, the
 /// rolling-precompaction resume choice, and knowledge-dream completion
 /// receipts including ordered all-KB runs.
-pub const PROTOCOL_VERSION: u32 = 23;
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -7504,12 +7506,12 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 23);
+        assert_eq!(PROTOCOL_VERSION, 24);
         let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
-                .expect("current v23 config_refreshed fixture")
+                .expect("current v24 config_refreshed fixture")
                 .clone(),
         )
         .unwrap();
@@ -7524,19 +7526,19 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 23);
+        assert_eq!(PROTOCOL_VERSION, 24);
         let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
                 .get(response_name)
-                .unwrap_or_else(|| panic!("current v23 {response_name} fixture"));
+                .unwrap_or_else(|| panic!("current v24 {response_name} fixture"));
             assert_eq!(
                 response["data"]["goal"]["max_verification_attempts"], 4,
-                "current v23 {response_name} must freeze the inclusive verification cap"
+                "current v24 {response_name} must freeze the inclusive verification cap"
             );
             serde_json::from_value::<Response>(response.clone()).unwrap_or_else(|error| {
-                panic!("current v23 {response_name} must deserialize: {error}")
+                panic!("current v24 {response_name} must deserialize: {error}")
             });
         }
     }
@@ -7549,13 +7551,13 @@ mod tests {
                 serde_json::from_value(fixture[response_name]["data"]["assistant"].clone())
                     .unwrap();
             validate_assistant_summary(&summary).unwrap_or_else(|error| {
-                panic!("current v23 {response_name} assistant identity is invalid: {error}")
+                panic!("current v24 {response_name} assistant identity is invalid: {error}")
             });
         }
         let summary: AssistantSummary =
             serde_json::from_value(fixture["assistants"]["data"]["assistants"][0].clone()).unwrap();
         validate_assistant_summary(&summary)
-            .expect("current v23 assistant inventory must carry bounded opaque revisions");
+            .expect("current v24 assistant inventory must carry bounded opaque revisions");
         assert_eq!(fixture["assistants"]["data"]["config_generation"], 7);
         assert_eq!(
             fixture["agent_inventory"]["data"]["config_generation"],
@@ -7641,7 +7643,7 @@ mod tests {
         ] {
             assert!(
                 mcp[field].is_string(),
-                "current v23 MCP CAS fixture must carry {field}"
+                "current v24 MCP CAS fixture must carry {field}"
             );
         }
         assert_eq!(mcp["expected_revision"].as_str().map(str::len), Some(64));
@@ -7691,7 +7693,7 @@ mod tests {
         ] {
             assert!(
                 requests[tag]["params"]["client_operation_id"].is_string(),
-                "current v23 fixture must carry an operation id for {tag}"
+                "current v24 fixture must carry an operation id for {tag}"
             );
         }
         let responses = proto_fixture_files::read_fixture("response.json");

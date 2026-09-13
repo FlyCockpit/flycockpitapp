@@ -473,7 +473,12 @@ impl OnboardingShell {
 
     /// Adopt an authoritative `Complete` revision without rebuilding the
     /// native screen: the completion surface is presented from the summary
-    /// recorded when the lifetime stage settled.
+    /// recorded when the lifetime stage settled. The local "add another
+    /// provider" detour is occupancy on top of the completion stage — the
+    /// same class of fence as a user dismissal — so an authority refresh
+    /// (including the daemon-global broadcast from a concurrent client)
+    /// updates the correlation fields but never unmounts an in-flight
+    /// detour; the detour ends only through its own local return path.
     pub(crate) fn note_authoritative_complete(
         &mut self,
         snapshot: &OnboardingBootstrapSnapshot,
@@ -485,6 +490,10 @@ impl OnboardingShell {
         self.limited_mode = snapshot.limited_mode;
         self.bootstrap_state = snapshot.bootstrap_state;
         self.pending_transition = None;
+        if self.completion_detour {
+            // Authority fields adopted; the detour keeps screen occupancy.
+            return false;
+        }
         self.escape = None;
         if matches!(self.screen, OnboardingScreen::Complete { .. }) {
             return false;

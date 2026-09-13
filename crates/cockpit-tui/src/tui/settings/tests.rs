@@ -7081,7 +7081,7 @@ fn onboarding_profile_save_completes_after_daemon_apply() {
             changed,
             model_file_written,
             default_scope,
-            config_generation: 0,
+            config_generation: 9,
         }),
         authoritative_rejection: false,
         committed_refresh_needed: None,

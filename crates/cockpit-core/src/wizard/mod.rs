@@ -2811,6 +2811,9 @@ fn model_system_prompt_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'
 fn model_configuration_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'static str> {
     Some(match answer {
         WizardAnswer::Select(value) if value == "advanced" => "trust",
+        // The smart path implies `make_default` at apply time (see
+        // `model_make_default_answer`), so the onboarding default-model
+        // commitment is satisfied without presenting the confirm step.
         _ => "model-save",
     })
 }

@@ -401,6 +401,74 @@ fn first_run_completes_under_an_untrusted_workspace() {
 }
 
 #[test]
+fn complete_authority_refresh_preserves_the_local_provider_detour() {
+    // Detour occupancy gates the Complete-snapshot apply the same way a
+    // user dismissal gates reopen: a concurrent client's committed
+    // transition (or any read-only refresh of the same authority) must
+    // never unmount an in-flight "add another provider" engine.
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    write_config(tmp.path(), &ProvidersConfig::default());
+    let mut app = App::new(Some(tmp.path()), false);
+    advance_through_secure_store(&mut app, tmp.path());
+    select_provider_template(&mut app, "openai");
+    write_global_config(&config_with_provider("p", "m"));
+    app.dialog.test_mark_provider_add_done("p");
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    set_onboarding_stage(&mut app, OnboardingStage::Model);
+    app.dialog.test_mark_setup_complete("model-save");
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    set_onboarding_stage(&mut app, OnboardingStage::Agent);
+    app.dialog.test_mark_setup_complete("agent-install");
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    set_onboarding_stage(&mut app, OnboardingStage::Lifetime);
+    app.dialog.test_mark_setup_complete("lifetime-save");
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    set_onboarding_stage(&mut app, OnboardingStage::Complete);
+
+    // Open the detour and mount its provider engine.
+    shell_key(&mut app, KeyCode::Up);
+    shell_key(&mut app, KeyCode::Enter);
+    select_provider_template(&mut app, "compat");
+    assert!(
+        app.dialog.is_provider_add(),
+        "the detour's provider engine must be mounted"
+    );
+
+    // A Complete authority refresh landing mid-detour (the daemon-global
+    // broadcast from a concurrent client, or this client's own refresh)
+    // adopts the correlation fields but keeps the detour's occupancy: the
+    // engine stays mounted and the stored summary is not re-presented.
+    let mut refreshed = onboarding_snapshot(OnboardingStage::Complete);
+    refreshed.revision += 1;
+    app.apply_onboarding_bootstrap_snapshot(Some(refreshed));
+    assert_ne!(
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::Complete),
+        "a Complete refresh must not re-present the summary over the detour"
+    );
+    assert!(
+        app.dialog.is_provider_add(),
+        "the detour's engine must survive the Complete refresh"
+    );
+    assert!(
+        app.onboarding_shell
+            .as_ref()
+            .is_some_and(|shell| shell.completion_detour_active())
+    );
+
+    // The detour still ends through its own local path: once the added
+    // provider settles, the stored summary is presented again.
+    app.dialog.test_mark_provider_add_done("p2");
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    assert_eq!(
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::Complete)
+    );
+    assert!(!app.dialog.is_active());
+}
+
+#[test]
 fn first_run_configuration_queues_held_draft_behind_selected_model() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());

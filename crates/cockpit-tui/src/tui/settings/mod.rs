@@ -5935,6 +5935,11 @@ impl Dialog {
             .submit(cockpit_core::wizard::WizardAnswer::Acknowledged)
             .expect("setup completion step accepts acknowledgement");
         wizard.settled_operation_id = Some(uuid::Uuid::now_v7());
+        // A completed onboarding wizard is backed by a committed daemon
+        // apply whose published generation the settlement fence proves
+        // against. Stamp one so the synthesized path constructs the same
+        // settlement the production receipt path does.
+        wizard.settled_config_generation = Some(1);
     }
 
     #[cfg(test)]
@@ -5993,6 +5998,22 @@ impl Dialog {
             return 0;
         };
         wizard.run.select_options().len()
+    }
+
+    /// Select-option ids of the wizard's focused Select step, so tests pick
+    /// rendered rows (including authority-resolved agent/model offerings)
+    /// instead of hardcoding cursor positions.
+    #[cfg(test)]
+    pub(crate) fn test_setup_step_option_ids(&self) -> Vec<String> {
+        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
+            return Vec::new();
+        };
+        wizard
+            .run
+            .select_options()
+            .iter()
+            .map(|option| option.id.to_string())
+            .collect()
     }
 
     /// Current text-buffer contents of the wizard's focused Text step.
@@ -6329,7 +6350,6 @@ impl Dialog {
     pub fn onboarding_wizard_settlement(
         &self,
         wizard_id: &str,
-        config_generation: u64,
         run_id: uuid::Uuid,
         attempt_id: uuid::Uuid,
         stage_revision: u64,
@@ -6341,19 +6361,14 @@ impl Dialog {
             return None;
         }
         let operation_id = wizard.settled_operation_id?.to_string();
-        // The daemon's fence compares the claimed generation against its
-        // current authority. The settled receipt's own generation is the
-        // one value guaranteed to match it; the caller-supplied (disk
-        // derived) generation is a fallback for receipts predating the
-        // field. Both must be non-zero to name a checkpoint past stage
-        // entry.
+        // The settlement's generation authority is the apply receipt itself:
+        // the daemon published that generation as part of the apply's durable
+        // commit and proves the stage advance against it. A wizard that
+        // completed without a daemon receipt has no settlement to claim, so
+        // the stage cannot advance on local state alone.
         let config_generation = wizard
             .settled_config_generation
-            .filter(|generation| *generation > 0)
-            .unwrap_or(config_generation);
-        if config_generation == 0 {
-            return None;
-        }
+            .filter(|generation| *generation > 0)?;
         Some(cockpit_proto::OnboardingStageSettlement {
             run_id,
             attempt_id,
@@ -10042,11 +10057,9 @@ fn apply_setup_wizard_daemon_completion(
             config_generation,
         }) => {
             // The receipt's generation is the settlement's generation
-            // authority (see `settled_config_generation`); a zero means a
-            // daemon older than the field and keeps the caller's fallback.
-            if config_generation > 0 {
-                wizard.settled_config_generation = Some(config_generation);
-            }
+            // authority (see `settled_config_generation`); the daemon
+            // publishes it with the apply, so every receipt carries it.
+            wizard.settled_config_generation = Some(config_generation);
             if let Err(error) = wizard
                 .run
                 .submit(cockpit_core::wizard::WizardAnswer::Acknowledged)

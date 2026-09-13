@@ -168,8 +168,10 @@ impl App {
             // launch. A shell that is still open just committed its own
             // terminal transition: present the completion screen from the
             // summary recorded when the lifetime stage settled. "Add
-            // another provider" is a local detour on top of that screen and
-            // never reaches this branch.
+            // another provider" is a local detour on top of that screen;
+            // `note_authoritative_complete` treats detour occupancy like
+            // dismissal occupancy and never unmounts it for an authority
+            // refresh.
             if let Some(shell) = self.onboarding_shell.as_mut() {
                 if shell.note_authoritative_complete(snapshot) {
                     self.dialog = crate::tui::settings::Dialog::None;
@@ -632,10 +634,8 @@ impl App {
                     return false;
                 }
                 self.refresh_bootstrap_config_snapshot();
-                let config_generation = self.config_snapshot.providers.resolution_generation;
                 let settlement = self.dialog.onboarding_wizard_settlement(
                     cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID,
-                    config_generation,
                     snapshot.run_id,
                     snapshot.attempt_id,
                     snapshot.revision,
@@ -658,10 +658,8 @@ impl App {
                     return false;
                 }
                 self.refresh_bootstrap_config_snapshot();
-                let config_generation = self.config_snapshot.providers.resolution_generation;
                 let settlement = self.dialog.onboarding_wizard_settlement(
                     cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID,
-                    config_generation,
                     snapshot.run_id,
                     snapshot.attempt_id,
                     snapshot.revision,

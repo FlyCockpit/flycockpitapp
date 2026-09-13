@@ -4,23 +4,28 @@
 //! reducers. These tests instead drive the *real* in-process daemon end to
 //! end: the bootstrap fetch runs `BeginOrReopenOnboarding`, every stage
 //! change is a real `ApplyOnboardingTransition` against the real revision
-//! CAS, and the profile / model settlements are real `ApplySetupWizard`
-//! operations whose receipts the daemon validates before the stage may
-//! advance. The provider stage runs the real offline path: the save is a
-//! real `apply_provider_mutation`, the validation probe really fails
-//! against an unreachable endpoint, and the explicit manual-model key
-//! commits the failed-validation checkpoint that the settled advance is
-//! validated against.
+//! CAS, and the profile / model / agent / lifetime settlements are real
+//! `ApplySetupWizard` operations whose receipts — including the published
+//! config generation — the daemon validates before the stage may advance.
+//! The provider stage runs the real offline path: the save is a real
+//! `apply_provider_mutation`, the validation probe really fails against an
+//! unreachable endpoint, and the explicit manual-model key commits the
+//! failed-validation checkpoint that the settled advance is validated
+//! against.
 //!
-//! The chain stops at the agent stage's first screen: installing an agent
-//! offline requires a bundled agent whose hard model-slot requirements
-//! (a host-issued computer-use contract) a manually entered model cannot
-//! satisfy, and a live install fetches a pinned third-party source. That
-//! boundary is asserted, not papered over with a fixture.
+//! The agent settlement crosses the real bundled-catalog install (catalog
+//! resolution, installation service, publication journal, default
+//! selection). One fixture substitution is deliberate: the provider and
+//! validation flows cannot mint computer-use contract evidence by design
+//! (a configured concrete route must carry a host-issued contract before an
+//! authored hard requirement can select it), so the test seeds that catalog
+//! capability metadata onto the committed provider's model — the same way
+//! `first_run_tests` seeds provider configs — and every later authority
+//! operation (model apply, agent apply, settlement fences) runs for real.
 //!
-//! The only test-side substitution is the event-loop pump, which drains
-//! async actions, ticks the dialog, and services the onboarding shell in
-//! the same order as `service_event_loop_wake`.
+//! The only test-side substitution beyond that seed is the event-loop pump,
+//! which drains async actions, ticks the dialog, and services the onboarding
+//! shell in the same order as `service_event_loop_wake`.
 
 use super::*;
 use cockpit_config::providers::{ConfigDoc, ProvidersConfig};
@@ -142,6 +147,51 @@ fn real_first_run_app(cwd: &std::path::Path) -> App {
     );
     app.start_onboarding_bootstrap_fetch();
     app
+}
+
+/// Seed the committed provider's manual model with the catalog capability
+/// metadata a real computer-use-capable catalog entry carries (context
+/// window, tool calling, a host-issued computer-use contract, and the
+/// frontier agent's remote locality). The provider/validation flows
+/// deliberately cannot mint contract evidence themselves, so this stands in
+/// for that authority the same way the other fixtures seed provider config;
+/// every later daemon operation still runs for real.
+fn seed_computer_use_catalog_capabilities() {
+    use cockpit_config::providers::{
+        CapabilityStatus, ComputerUseCapability, ComputerUseContract, ModelCapabilities,
+        ModelEntry, ModelLocation,
+    };
+    let global = cockpit_config::dirs::global_config_file().expect("isolated global config path");
+    let model_target =
+        cockpit_config::providers::provider_file_path_for_config(&global, "localtest")
+            .expect("committed provider file path");
+    let mut doc = ConfigDoc::load(&model_target).expect("committed provider config file");
+    let mut providers = doc.providers();
+    let entry = providers
+        .providers
+        .get_mut("localtest")
+        .expect("the committed provider owns its model file");
+    assert!(
+        entry.models.iter().all(|model| model.id != "manual-model"),
+        "the fixture seeds catalog capability metadata onto a fresh model entry"
+    );
+    entry.models.push(ModelEntry {
+        id: "manual-model".to_string(),
+        manual: true,
+        location: Some(ModelLocation::Remote),
+        capabilities: ModelCapabilities {
+            context_tokens: Some(200_000),
+            tool_calling: CapabilityStatus::Supported,
+            computer_use: Some(ComputerUseCapability {
+                contract: Some(ComputerUseContract::OpenAiResponses),
+                ..ComputerUseCapability::default()
+            }),
+            ..ModelCapabilities::default()
+        },
+        ..ModelEntry::default()
+    });
+    doc.write(&providers)
+        .expect("seeding catalog capability metadata onto the provider file");
 }
 
 /// Drive the real first run from the bootstrap fetch to the searchable
@@ -317,8 +367,15 @@ fn first_run_settles_stages_against_the_real_daemon_offline() {
         "the daemon-committed provider must be visible in the refreshed config"
     );
 
+    // Seed the committed provider's model with the catalog capability
+    // metadata (context window, tool calling, host-issued computer-use
+    // contract) that the offline provider flow cannot mint itself; the
+    // model and agent settlements below still run entirely through the
+    // daemon's real ApplySetupWizard + settlement fences.
+    seed_computer_use_catalog_capabilities();
+
     // Model wizard, manual path: the only configured provider, a fresh
-    // model id, smart defaults (which skip the advanced steps).
+    // model id, smart defaults (which imply the default-model commitment).
     assert_eq!(app.dialog.test_setup_step(), Some("provider"));
     shell_key(&mut app, KeyCode::Enter);
     assert_eq!(app.dialog.test_setup_step(), Some("model"));
@@ -343,6 +400,93 @@ fn first_run_settles_stages_against_the_real_daemon_offline() {
     // The real catalog discovery (live fetch with the bundled offline
     // snapshot as fallback) mounts the agent wizard on its first step.
     assert_eq!(app.dialog.test_setup_step(), Some("agent"));
+
+    // A bundled catalog agent whose primary slot the seeded model satisfies
+    // is offered; third-party requires a pinned network fetch, so it can
+    // never be the only offline option once a contract-capable model exists.
+    let agent_options = app.dialog.test_setup_step_option_ids();
+    let agent_index = agent_options
+        .iter()
+        .position(|id| id != "third-party")
+        .expect("a bundled catalog agent compatible with the seeded model");
+    for _ in 0..agent_index {
+        shell_key(&mut app, KeyCode::Down);
+    }
+    shell_key(&mut app, KeyCode::Enter);
+    // Model trust (untrusted), the compatible default model, explicit trust
+    // confirmation, author tool tiers, the monty-package notice, no image
+    // sidecar, and make-default so the settlement's default installation
+    // lands.
+    assert_eq!(app.dialog.test_setup_step(), Some("model-trust"));
+    shell_key(&mut app, KeyCode::Enter);
+    assert_eq!(app.dialog.test_setup_step(), Some("default-model"));
+    assert_eq!(app.dialog.test_setup_step_options(), 1);
+    shell_key(&mut app, KeyCode::Enter);
+    assert_eq!(app.dialog.test_setup_step(), Some("model-trust-confirm"));
+    shell_key(&mut app, KeyCode::Char('y'));
+    assert_eq!(app.dialog.test_setup_step(), Some("tool-configuration"));
+    shell_key(&mut app, KeyCode::Enter);
+    assert_eq!(app.dialog.test_setup_step(), Some("monty-packages"));
+    shell_key(&mut app, KeyCode::Enter);
+    assert_eq!(app.dialog.test_setup_step(), Some("sidecar"));
+    shell_key(&mut app, KeyCode::Enter);
+    assert_eq!(app.dialog.test_setup_step(), Some("make-default"));
+    shell_key(&mut app, KeyCode::Char('y'));
+    assert_eq!(app.dialog.test_setup_step(), Some("agent-install"));
+    shell_key(&mut app, KeyCode::Enter);
+
+    // The real agent apply: bundled catalog resolution, the installation
+    // service, the publication journal, and the settlement fence that
+    // proves the receipt's published generation advances the stage.
+    pump_onboarding(
+        &mut app,
+        |app| {
+            stage(app) == Some(OnboardingStage::Lifetime)
+                && app.dialog.test_page_name()
+                    == Some(cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID)
+        },
+        "the settled Agent→Lifetime advance through the real installation",
+    );
+
+    // Lifetime: commit an explicit choice through the real apply; the
+    // terminal Complete transition is requested once the stage settles.
+    assert_eq!(app.dialog.test_setup_step(), Some("background-agents"));
+    shell_key(&mut app, KeyCode::Enter);
+    assert_eq!(app.dialog.test_setup_step(), Some("lifetime-save"));
+    shell_key(&mut app, KeyCode::Enter);
+    pump_onboarding(
+        &mut app,
+        |app| {
+            stage(app) == Some(OnboardingStage::Complete)
+                && app
+                    .onboarding_shell
+                    .as_ref()
+                    .is_some_and(|shell| shell.screen_is_complete())
+        },
+        "the authoritative Complete revision to present the summary",
+    );
+
+    // "Start coding" is a local close: the terminal transition committed,
+    // so the summary's action just closes the shell behind the occupancy
+    // fence.
+    shell_key(&mut app, KeyCode::Enter);
+    assert!(app.onboarding_shell.is_none());
+    assert!(app.onboarding_dismissed);
+
+    // Ready session: a fresh launch at the completed authority never opens
+    // the onboarding surface and lands on the ordinary composer.
+    let mut ready = real_first_run_app(tmp.path());
+    pump_onboarding(
+        &mut ready,
+        |app| {
+            app.onboarding_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.stage == OnboardingStage::Complete)
+                && app.onboarding_shell.is_none()
+                && !app.dialog.is_active()
+        },
+        "a fresh launch at the completed authority to reach the ready session",
+    );
 }
 
 #[test]
@@ -428,7 +572,7 @@ fn concurrent_client_defer_is_followed_by_the_read_only_refresh() {
     advance_real_first_run_to_provider(&mut app);
 
     // A second client defers onboarding directly through the daemon.
-    tokio::runtime::Handle::current().block_on(async {
+    let deferred_authority = tokio::runtime::Handle::current().block_on(async {
         let lifecycle = crate::tui::settings::test_lifecycle_client();
         let client = crate::tui::settings::settings_daemon_client(&lifecycle)
             .await
@@ -458,14 +602,31 @@ fn concurrent_client_defer_is_followed_by_the_read_only_refresh() {
         {
             cockpit_proto::Response::OnboardingTransition(result) => {
                 assert!(result.snapshot.limited_mode);
+                (
+                    result.snapshot.run_id,
+                    result.snapshot.attempt_id,
+                    result.snapshot.revision,
+                )
             }
             other => panic!("unexpected defer fixture transition: {other:?}"),
         }
     });
 
-    // The app under test never receives BeginOrReopen here: the read-only
-    // refresh re-reads the authority and the shell follows the deferral.
-    app.refresh_onboarding_bootstrap_snapshot();
+    // The app under test never receives BeginOrReopen here: it follows the
+    // daemon-global OnboardingBootstrap broadcast exactly as the live event
+    // loop would (proto event → turn event → the read-only refresh), and
+    // the shell then follows the deferral.
+    let (run_id, attempt_id, revision) = deferred_authority;
+    let broadcast =
+        cockpit_proto::Event::OnboardingBootstrap(cockpit_proto::OnboardingBootstrapEvent {
+            run_id,
+            attempt_id,
+            revision,
+            state: cockpit_proto::OnboardingBootstrapState::Ready,
+        });
+    let turn_event = crate::tui::agent_runner::proto_event_to_turn_event(broadcast)
+        .expect("the daemon-global onboarding broadcast maps to the refresh turn event");
+    app.apply_event(turn_event);
     pump_onboarding(
         &mut app,
         |app| {
@@ -474,6 +635,6 @@ fn concurrent_client_defer_is_followed_by_the_read_only_refresh() {
                 .is_some_and(|snapshot| snapshot.limited_mode)
                 && app.onboarding_shell.is_none()
         },
-        "the deferred authority through the read-only refresh",
+        "the deferred authority through the broadcast-driven refresh",
     );
 }

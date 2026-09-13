@@ -1060,11 +1060,11 @@ pub enum Response {
         model_file_written: bool,
         default_scope: Option<String>,
         /// Config generation of the daemon authority AFTER this apply. The
-        /// onboarding wizard settlement fence compares the client's claimed
-        /// generation against the current authority, so the receipt is the
-        /// one trustworthy source for it (a pre-attach client cannot learn
-        /// it from a disk read; `resolution_generation` is runtime-only).
-        #[serde(default)]
+        /// daemon publishes the generation as part of the apply's durable
+        /// commit, so the receipt is the one trustworthy source for it: the
+        /// onboarding settlement fence proves a stage advance against this
+        /// exact value (a pre-attach client cannot learn it from a disk
+        /// read; `resolution_generation` is runtime-only).
         config_generation: u64,
     },
 

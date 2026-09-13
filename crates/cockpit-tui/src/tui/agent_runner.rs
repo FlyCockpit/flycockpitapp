@@ -4418,7 +4418,7 @@ fn acknowledge_event_receipts(
     acknowledge_durable_submissions(awaiting_durable, session_id, ids);
 }
 
-fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
+pub(crate) fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
     use proto::Event::*;
     Some(match event {
         ThinkingStarted { agent, turn_id, .. } => TurnEvent::ThinkingStarted { agent, turn_id },
@@ -5179,8 +5179,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             proto::WorkspaceTrustReconciliationState::Applied
             | proto::WorkspaceTrustReconciliationState::StopRetrying => return None,
         },
-        OnboardingBootstrap(..)
-        | InterruptRaised { .. }
+        InterruptRaised { .. }
         | EventStreamLagged { .. }
         | SessionEnded { .. }
         | TerminalOutput { .. }

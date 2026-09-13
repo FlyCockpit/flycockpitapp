@@ -3,7 +3,7 @@ use crate::tui::async_action::AsyncActionKind;
 use crate::tui::keys_overlay::KeyContext;
 use cockpit_proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet, SessionSummary};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-use ratatui::{Terminal, backend::TestBackend};
+
 use std::fs;
 use std::time::Duration;
 use uuid::Uuid;
@@ -158,60 +158,28 @@ fn single_question_dialog() -> crate::tui::dialog::question::QuestionDialog {
     )
 }
 
-fn app_with_sessions_preview_pane(tmp: &tempfile::TempDir) -> App {
-    let mut app = configured_app(tmp);
-    app_with_sessions_preview_pane_body(tmp, &mut app);
-    app
-}
-
-async fn app_with_sessions_preview_pane_async(tmp: &tempfile::TempDir) -> App {
-    let mut app = configured_app_async(tmp).await;
-    app_with_sessions_preview_pane_body(tmp, &mut app);
-    app
-}
-
-fn app_with_sessions_preview_pane_body(tmp: &tempfile::TempDir, app: &mut App) {
-    let dead_socket = tmp.path().join("no-daemon.sock");
-    app.daemon_connected = true;
-    app.startup_background.daemon_socket = Some(dead_socket.clone());
+fn seed_rail_session(app: &mut App) -> Uuid {
     let session_id = Uuid::new_v4();
-    let mut pane = crate::tui::sessions_pane::SessionsPane::open(
-        None,
-        &app.launch.cwd,
-        true,
-        Some(dead_socket),
-        false,
+    app.session_rail.set_daemon_connected(true);
+    assert!(app.session_rail.begin_list());
+    let generation = app.session_rail.list_generation();
+    let attachment = app.session_rail.attachment_generation();
+    app.session_rail.apply_sessions_result(
+        generation,
+        attachment,
+        Ok(vec![session_summary(
+            session_id,
+            app.launch.cwd.display().to_string(),
+        )]),
     );
-    pane.apply_sessions_result(Ok(vec![session_summary(
-        session_id,
-        app.launch.cwd.display().to_string(),
-    )]));
-    app.overlay = Overlay::Sessions(pane);
-}
-
-async fn drain_async_actions_until_idle(app: &mut App) {
-    for _ in 0..100 {
-        app.drain_async_actions();
-        if app.async_actions.pending_count() == 0 {
-            app.drain_async_actions();
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    panic!("async actions did not finish");
+    session_id
 }
 
 #[test]
-fn question_dialog_shadows_and_resumes_an_open_overlay() {
+fn question_dialog_shadows_and_resumes_rail_focus() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = configured_app(&tmp);
-    app.overlay = Overlay::Sessions(crate::tui::sessions_pane::SessionsPane::open(
-        None,
-        &app.launch.cwd,
-        false,
-        None,
-        false,
-    ));
+    app.session_rail.focus();
 
     assert_eq!(app.key_context(), KeyContext::Sessions);
     app.question_dialog = Some(single_question_dialog());
@@ -219,13 +187,14 @@ fn question_dialog_shadows_and_resumes_an_open_overlay() {
 
     app.question_dialog = None;
     assert_eq!(app.key_context(), KeyContext::Sessions);
-    assert!(matches!(app.overlay, Overlay::Sessions(_)));
+    assert!(app.session_rail.is_focused());
 }
 
 #[test]
-fn sessions_preview_action_enqueued_on_split_render() {
+fn sessions_preview_action_is_generation_fenced_and_replaced() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_sessions_preview_pane(&tmp);
+    let mut app = configured_app(&tmp);
+    let session_id = seed_rail_session(&mut app);
     assert_eq!(app.async_actions.pending_count(), 0);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -233,40 +202,47 @@ fn sessions_preview_action_enqueued_on_split_render() {
         .build()
         .unwrap();
     let _guard = runtime.enter();
-    let backend = TestBackend::new(120, 30);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| app.render(frame)).unwrap();
+    app.session_rail.focus();
+    if let Some((id, before)) = app.session_rail.begin_preview(None) {
+        app.start_sessions_preview_action(id, before);
+    }
     assert_eq!(
         app.async_actions.pending_kinds(),
         vec![AsyncActionKind::DaemonRpc("sessions.preview")]
     );
     let pending_ids = app.async_actions.pending_ids();
     assert_eq!(pending_ids.len(), 1);
+    assert_eq!(session_id, app.session_rail.selected_id().unwrap());
 
-    terminal.draw(|frame| app.render(frame)).unwrap();
+    if let Some((id, before)) = app.session_rail.begin_preview(None) {
+        app.start_sessions_preview_action(id, before);
+    }
     assert_eq!(
         app.async_actions.pending_kinds(),
         vec![AsyncActionKind::DaemonRpc("sessions.preview")]
     );
-    assert_eq!(app.async_actions.pending_ids(), pending_ids);
+    assert_eq!(app.async_actions.pending_count(), 1);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn sessions_preview_rpc_failure_sets_preview_error() {
+#[test]
+fn sessions_preview_injected_failure_sets_preview_error() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_sessions_preview_pane_async(&tmp).await;
-
-    let backend = TestBackend::new(120, 30);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| app.render(frame)).unwrap();
-    drain_async_actions_until_idle(&mut app).await;
-
-    let Overlay::Sessions(pane) = &app.overlay else {
-        panic!("sessions pane should still be open");
-    };
-    let error = pane
+    let mut app = configured_app(&tmp);
+    let session_id = seed_rail_session(&mut app);
+    app.session_rail.focus();
+    let started = app.session_rail.begin_preview(None).expect("preview");
+    assert_eq!(started.0, session_id);
+    app.session_rail.apply_preview_result(
+        app.session_rail.list_generation(),
+        app.session_rail.attachment_generation(),
+        session_id,
+        None,
+        Err("daemon connect refused".into()),
+    );
+    let error = app
+        .session_rail
         .preview_error()
-        .expect("failed preview RPC should set a preview error");
+        .expect("failed preview should set a preview error");
     assert!(
         error.contains("daemon connect"),
         "unexpected preview error: {error}"
@@ -299,24 +275,20 @@ fn leader_in_main_chat_opens_composer_context_and_toggles_closed() {
     );
 }
 
-/// Opening a pane (`/sessions`) makes the leader show that context first.
+/// Focusing the session rail makes the leader show that context first.
 #[test]
-fn leader_with_sessions_pane_open_shows_sessions_context() {
+fn leader_with_session_rail_focused_shows_sessions_context() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = configured_app(&tmp);
 
-    app.overlay = Overlay::Sessions(crate::tui::sessions_pane::SessionsPane::open(
-        None,
-        &app.launch.cwd,
-        false,
-        None,
-        false,
-    ));
+    app.session_rail.focus();
     app.handle_key(ctrl('k'));
-    let overlay = app.keys_overlay.as_ref().expect("leader opens over a pane");
+    let overlay = app
+        .keys_overlay
+        .as_ref()
+        .expect("leader opens over the rail");
     assert_eq!(overlay.context(), KeyContext::Sessions);
-    // The pane stays open underneath (the overlay is on top, not a swap).
-    assert!(matches!(app.overlay, Overlay::Sessions(_)));
+    assert!(app.session_rail.is_focused());
 }
 
 #[test]

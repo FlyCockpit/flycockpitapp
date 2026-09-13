@@ -134,6 +134,59 @@ fn settings_pointer_z_order_matrix() {
 }
 
 #[test]
+fn settings_hover_is_not_stolen_by_session_rail() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let mut app = App::new(Some(tmp.path()), false);
+    app.mouse_capture = true;
+    let backend = TestBackend::new(100, 24);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("chat shell");
+    assert!(
+        app.session_rail.rail_area().is_some(),
+        "wide chat shell paints a persistent rail"
+    );
+
+    app.dialog = Dialog::Settings(Box::new(crate::tui::settings::SettingsDialog::open(
+        tmp.path().join("config.json"),
+    )));
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("settings over shell");
+    assert!(
+        app.session_rail.rail_area().is_none() && app.session_rail.compact_area().is_none(),
+        "a body-owning dialog must drop last-frame rail hit geometry"
+    );
+
+    let target = {
+        let Dialog::Settings(dialog) = &app.dialog else {
+            panic!("settings");
+        };
+        dialog
+            .pointer_test_button_targets()
+            .into_iter()
+            .find(|target| target.rect.x < 28)
+            .map(|target| target.rect)
+            .or_else(|| {
+                dialog
+                    .pointer_test_target_rects()
+                    .into_iter()
+                    .find(|rect| rect.x < 28)
+            })
+            .expect("settings control in former rail columns")
+    };
+    app.handle_mouse(mouse(MouseEventKind::Moved, target.x, target.y));
+    let Dialog::Settings(dialog) = &app.dialog else {
+        panic!("settings");
+    };
+    assert!(
+        dialog.pointer_test_has_hover(),
+        "settings must own hover in the columns the rail occupied last frame"
+    );
+}
+
+#[test]
 fn settings_mouse_default_model_picker_matches_keyboard() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let mut app = App::new(Some(tmp.path()), false);
@@ -273,16 +326,7 @@ pub(crate) fn run_tui_button_pointer_dispatch_matrix() {
             OverlaySurface::Usage,
             Overlay::Usage(crate::tui::usage_pane::UsagePane::open(Vec::new())),
         ),
-        (
-            OverlaySurface::Sessions,
-            Overlay::Sessions(crate::tui::sessions_pane::SessionsPane::open(
-                None,
-                tmp.path(),
-                false,
-                None,
-                false,
-            )),
-        ),
+        (OverlaySurface::Sessions, Overlay::None),
         (
             OverlaySurface::Skills,
             Overlay::Skills(crate::tui::skills_pane::SkillsPane::loading(0)),

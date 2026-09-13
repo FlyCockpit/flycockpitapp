@@ -22,6 +22,23 @@ pub(super) fn point_in(rect: Rect, col: u16, row: u16) -> bool {
 }
 
 impl App {
+    pub(super) fn pointer_over_session_rail(&self, col: u16, row: u16) -> bool {
+        self.session_rail
+            .rail_area()
+            .or(self.session_rail.compact_area())
+            .is_some_and(|area| point_in(area, col, row))
+    }
+
+    /// Rail hits are frame-scoped and sit below every body-owning modal.
+    /// `Overlay::None` is not enough: settings/wizard live on `Dialog`.
+    pub(super) fn session_rail_owns_pointer(&self, col: u16, row: u16) -> bool {
+        self.pointer_over_session_rail(col, row)
+            && matches!(self.overlay, Overlay::None)
+            && !self.dialog.is_active()
+    }
+}
+
+impl App {
     /// - left-down on a chat thinking-chip → toggle reasoning expansion;
     /// - left-down on a non-chip chat row → start drag-select (T8.f);
     /// - left-drag → extend the active drag-select;
@@ -123,6 +140,17 @@ impl App {
             return;
         }
         if matches!(mouse.kind, MouseEventKind::Moved) {
+            if self.session_rail_owns_pointer(mouse.column, mouse.row) {
+                self.link_registry.clear_hover();
+                self.hovered_suggestion = None;
+                self.hovered_control_chip = None;
+                self.hovered_affordance = None;
+                self.hovered_footer_control = None;
+                if self.mouse_capture {
+                    let _ = self.session_rail.handle_mouse(mouse);
+                }
+                return;
+            }
             if self.mouse_capture {
                 let _ = self.button_registry.handle_mouse(mouse);
                 self.update_queue_pointer(mouse);
@@ -159,6 +187,27 @@ impl App {
         if !self.mouse_capture {
             self.link_pointer_gesture.cancel();
             self.pending_link_activation = None;
+        }
+        // Overlay/compact rails paint over the transcript. Hits in that rect
+        // belong to the rail, not to hidden links or pin/fork chips. Body-owning
+        // dialogs (settings/wizard) outrank the rail for every event kind.
+        if self.session_rail_owns_pointer(mouse.column, mouse.row) {
+            self.link_registry.clear_hover();
+            self.link_pointer_gesture.cancel();
+            self.pending_link_activation = None;
+            let pointer = matches!(
+                mouse.kind,
+                MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Moved
+            );
+            let wheel = matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            );
+            if wheel || (self.mouse_capture && pointer) {
+                let outcome = self.session_rail.handle_mouse(mouse);
+                self.apply_session_rail_outcome(outcome);
+            }
+            return;
         }
         let hit_url = self
             .link_registry
@@ -291,57 +340,6 @@ impl App {
             }
             return;
         }
-        if matches!(self.overlay, Overlay::Sessions(_)) {
-            let overlay = std::mem::take(&mut self.overlay);
-            let Overlay::Sessions(mut pane) = overlay else {
-                unreachable!();
-            };
-            let pointer = matches!(
-                mouse.kind,
-                MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Moved
-            );
-            let wheel = matches!(
-                mouse.kind,
-                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-            );
-            let outcome = if wheel || (self.mouse_capture && pointer) {
-                pane.handle_mouse(mouse)
-            } else {
-                None
-            };
-            match outcome {
-                Some(crate::tui::sessions_pane::SessionsOutcome::Close) => {
-                    // The overlay was taken above; leaving it unrestored closes it.
-                }
-                Some(crate::tui::sessions_pane::SessionsOutcome::Resume(session_id)) => {
-                    self.resume_session(session_id);
-                }
-                Some(crate::tui::sessions_pane::SessionsOutcome::LoadList) => {
-                    self.overlay = Overlay::Sessions(pane);
-                    self.start_sessions_list_action();
-                }
-                Some(crate::tui::sessions_pane::SessionsOutcome::LoadPreview {
-                    session_id,
-                    before_seq,
-                }) => {
-                    self.overlay = Overlay::Sessions(pane);
-                    self.start_sessions_preview_action(session_id, before_seq);
-                }
-                Some(crate::tui::sessions_pane::SessionsOutcome::LoadInbox { main_session_id }) => {
-                    self.overlay = Overlay::Sessions(pane);
-                    self.start_sessions_inbox_action(main_session_id);
-                }
-                Some(crate::tui::sessions_pane::SessionsOutcome::Mutate(request)) => {
-                    self.overlay = Overlay::Sessions(pane);
-                    self.start_sessions_mutation_action(request);
-                }
-                None => {
-                    self.overlay = Overlay::Sessions(pane);
-                }
-            }
-            return;
-        }
-
         // The `/sealed` no-echo overlay is modal: a left-click dismisses it,
         // which cancels the pending write and drops the minted capability (or
         // hides a recover reveal). Handled before the `&mut self.overlay` match
@@ -362,7 +360,6 @@ impl App {
                 }
                 return;
             }
-            Overlay::Sessions(_) => return,
             Overlay::Tools(_) => return,
             Overlay::GoalSettings(_) => return,
             Overlay::Skills(pane) => {
@@ -796,9 +793,8 @@ impl App {
             crate::tui::button::ButtonDispatch::SessionsConfirmArchive
             | crate::tui::button::ButtonDispatch::SessionsConfirmDelete
             | crate::tui::button::ButtonDispatch::SessionsConfirmCancel => {
-                if let Overlay::Sessions(pane) = &mut self.overlay {
-                    pane.pointer_activate_confirm(dispatch);
-                }
+                let outcome = self.session_rail.pointer_activate_confirm(dispatch);
+                self.apply_session_rail_outcome(outcome);
             }
             crate::tui::button::ButtonDispatch::ResourcePromote { request_id } => {
                 let outcome = match &mut self.overlay {
@@ -975,7 +971,6 @@ impl App {
             || matches!(
                 self.overlay,
                 Overlay::Stats(_)
-                    | Overlay::Sessions(_)
                     | Overlay::Skills(_)
                     | Overlay::Tools(_)
                     | Overlay::GoalSettings(_)

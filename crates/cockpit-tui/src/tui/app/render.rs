@@ -1411,6 +1411,8 @@ impl App {
         self.button_registry
             .begin_frame(self.mouse_capture, self.button_surface_generation);
         self.row_registry.begin_frame(self.mouse_capture);
+        self.session_rail.set_pointer_capture(self.mouse_capture);
+        self.session_rail.begin_frame();
         let rects = geom.layout(frame.area());
         if self.footer_agent_picker.is_none() {
             self.footer_picker_row_hits.clear();
@@ -1465,25 +1467,6 @@ impl App {
                 Overlay::Usage(mut pane) => {
                     pane.render(frame, rects.body);
                     self.overlay = Overlay::Usage(pane);
-                }
-                Overlay::Sessions(mut pane) => {
-                    pane.set_pointer_capture(self.mouse_capture);
-                    pane.render_with_buttons(frame, rects.body, Some(&mut self.button_registry));
-                    let preview_request = if pane.needs_preview_for_selection() {
-                        match pane.ensure_preview_for_selection() {
-                            Some(crate::tui::sessions_pane::SessionsOutcome::LoadPreview {
-                                session_id,
-                                before_seq,
-                            }) => Some((session_id, before_seq)),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
-                    self.overlay = Overlay::Sessions(pane);
-                    if let Some((session_id, before_seq)) = preview_request {
-                        self.start_sessions_preview_action(session_id, before_seq);
-                    }
                 }
                 Overlay::Skills(mut pane) => {
                     pane.render(frame, rects.body);
@@ -1556,11 +1539,15 @@ impl App {
                     self.overlay = Overlay::Help(pane);
                 }
                 Overlay::None => {
+                    let frame_width = frame.area().width;
+                    let (persistent_rail, chat_body) =
+                        self.session_rail.split_body(rects.body, frame_width);
+                    let overlay_rail = self.session_rail.overlay_rail_rect(chat_body, frame_width);
                     // Carve the body for an embedded pane (GOALS §1i) when one
                     // is open: fullscreen fills the body, splits divide it. The
                     // chat history renders into whatever's left (or nowhere when
                     // fullscreen). Returns the chat rect, or `None` if hidden.
-                    let chat_rect = self.render_pane(frame, rects.body);
+                    let chat_rect = self.render_pane(frame, chat_body);
                     match chat_rect {
                         Some(chat) => {
                             self.render_chat_history_pane(frame, chat);
@@ -1593,6 +1580,14 @@ impl App {
                     if geom.pins > 0 {
                         self.render_pins_indicator(frame, rects.pins);
                     }
+                    self.session_rail.set_pointer_capture(self.mouse_capture);
+                    self.session_rail.render(
+                        frame,
+                        persistent_rail,
+                        overlay_rail,
+                        Some(&mut self.button_registry),
+                        frame_width,
+                    );
                     // Persistent below-input sandbox-down notice (§6.5). Shown while
                     // the shell sandbox can't initialize; geometry gives it rows.
                     // Persistent — it does not time out like a toast.
@@ -6829,11 +6824,18 @@ mod render_history_spacing_tests {
         );
     }
 
-    fn banner_top_row(buffer: &ratatui::buffer::Buffer, width: u16, height: u16) -> usize {
-        (0..height)
-            .find(|&y| (0..width).any(|x| buffer[(x, y)].symbol() == "╭"))
+    fn banner_top_row(buffer: &ratatui::buffer::Buffer, chat: ratatui::layout::Rect) -> usize {
+        // The session rail also uses a rounded box. The launch banner lives
+        // in the chat pane, not on the rail's left-edge border.
+        (chat.y..chat.bottom())
+            .find(|&y| (chat.x..chat.right()).any(|x| buffer[(x, y)].symbol() == "╭"))
             .map(usize::from)
             .expect("launch banner top border")
+    }
+
+    fn render_banner_top_row(app: &mut App, width: u16, height: u16) -> usize {
+        let buffer = render_app_buffer(app, width, height);
+        banner_top_row(&buffer, app.chat_area.expect("chat area"))
     }
 
     fn empty_banner_app(root: &std::path::Path) -> App {
@@ -6856,17 +6858,13 @@ mod render_history_spacing_tests {
         }
 
         let mut idle = empty_banner_app(tmp.path());
-        let expected = banner_top_row(&render_app_buffer(&mut idle, WIDTH, HEIGHT), WIDTH, HEIGHT);
+        let expected = render_banner_top_row(&mut idle, WIDTH, HEIGHT);
 
         let mut slash_full = empty_banner_app(tmp.path());
         slash_full.composer.set("/");
         slash_full.reset_slash_window();
         assert_eq!(
-            banner_top_row(
-                &render_app_buffer(&mut slash_full, WIDTH, HEIGHT),
-                WIDTH,
-                HEIGHT
-            ),
+            render_banner_top_row(&mut slash_full, WIDTH, HEIGHT),
             expected
         );
 
@@ -6874,11 +6872,7 @@ mod render_history_spacing_tests {
         slash_small.composer.set("/help");
         slash_small.reset_slash_window();
         assert_eq!(
-            banner_top_row(
-                &render_app_buffer(&mut slash_small, WIDTH, HEIGHT),
-                WIDTH,
-                HEIGHT
-            ),
+            render_banner_top_row(&mut slash_small, WIDTH, HEIGHT),
             expected
         );
 
@@ -6887,11 +6881,7 @@ mod render_history_spacing_tests {
         at_popup.reset_at_window();
         await_at_suggestions(&mut at_popup).await;
         assert_eq!(
-            banner_top_row(
-                &render_app_buffer(&mut at_popup, WIDTH, HEIGHT),
-                WIDTH,
-                HEIGHT
-            ),
+            render_banner_top_row(&mut at_popup, WIDTH, HEIGHT),
             expected
         );
 
@@ -6900,22 +6890,14 @@ mod render_history_spacing_tests {
         vim_hint.composer.set_vim_enabled(true);
         vim_hint.composer.set_vim_mode(VimMode::Normal);
         assert_eq!(
-            banner_top_row(
-                &render_app_buffer(&mut vim_hint, WIDTH, HEIGHT),
-                WIDTH,
-                HEIGHT
-            ),
+            render_banner_top_row(&mut vim_hint, WIDTH, HEIGHT),
             expected
         );
 
         let mut tall_input = empty_banner_app(tmp.path());
         tall_input.composer.set("one\ntwo\nthree\nfour\nfive\nsix");
         assert_eq!(
-            banner_top_row(
-                &render_app_buffer(&mut tall_input, WIDTH, HEIGHT),
-                WIDTH,
-                HEIGHT
-            ),
+            render_banner_top_row(&mut tall_input, WIDTH, HEIGHT),
             expected
         );
 
@@ -6929,39 +6911,18 @@ mod render_history_spacing_tests {
             delivery_class: Default::default(),
             send_now: false,
         });
-        assert_eq!(
-            banner_top_row(
-                &render_app_buffer(&mut queued, WIDTH, HEIGHT),
-                WIDTH,
-                HEIGHT
-            ),
-            expected
-        );
+        assert_eq!(render_banner_top_row(&mut queued, WIDTH, HEIGHT), expected);
 
         let mut pinned = empty_banner_app(tmp.path());
         pinned.pin_count = 1;
-        assert_eq!(
-            banner_top_row(
-                &render_app_buffer(&mut pinned, WIDTH, HEIGHT),
-                WIDTH,
-                HEIGHT
-            ),
-            expected
-        );
+        assert_eq!(render_banner_top_row(&mut pinned, WIDTH, HEIGHT), expected);
 
         let mut sandbox = empty_banner_app(tmp.path());
         sandbox.sandbox_down_notice = Some(SandboxDownNotice {
             remedy: "enable unprivileged user namespaces".to_string(),
             fix_command: None,
         });
-        assert_eq!(
-            banner_top_row(
-                &render_app_buffer(&mut sandbox, WIDTH, HEIGHT),
-                WIDTH,
-                HEIGHT
-            ),
-            expected
-        );
+        assert_eq!(render_banner_top_row(&mut sandbox, WIDTH, HEIGHT), expected);
     }
 
     #[test]
@@ -6974,9 +6935,9 @@ mod render_history_spacing_tests {
         app.reset_slash_window();
 
         let buffer = render_app_buffer(&mut app, WIDTH, HEIGHT);
-        let top = banner_top_row(&buffer, WIDTH, HEIGHT);
-        let banner_height = app.chat_banner_lines;
         let chat = app.chat_area.expect("chat area");
+        let top = banner_top_row(&buffer, chat);
+        let banner_height = app.chat_banner_lines;
         let rects = app.geometry().layout(Rect::new(0, 0, WIDTH, HEIGHT));
 
         assert_eq!(top, chat.height as usize - banner_height);
@@ -6991,8 +6952,9 @@ mod render_history_spacing_tests {
         let mut app = empty_banner_app(tmp.path());
 
         let buffer = render_app_buffer(&mut app, WIDTH, HEIGHT);
-        let top = banner_top_row(&buffer, WIDTH, HEIGHT);
-        let area_h = app.chat_area.expect("chat area").height as usize;
+        let chat = app.chat_area.expect("chat area");
+        let top = banner_top_row(&buffer, chat);
+        let area_h = chat.height as usize;
 
         assert_eq!(top, (area_h - app.chat_banner_lines) / 2);
     }
@@ -7006,8 +6968,9 @@ mod render_history_spacing_tests {
         app.history.push(user("first message"));
 
         let buffer = render_app_buffer(&mut app, WIDTH, HEIGHT);
-        let top = banner_top_row(&buffer, WIDTH, HEIGHT);
-        let area_h = app.chat_area.expect("chat area").height as usize;
+        let chat = app.chat_area.expect("chat area");
+        let top = banner_top_row(&buffer, chat);
+        let area_h = chat.height as usize;
         let banner_height = app.chat_banner_lines;
         let message_height = app.chat_total_lines - banner_height;
         assert_eq!(

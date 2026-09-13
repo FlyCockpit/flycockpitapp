@@ -328,7 +328,7 @@ fn wait_for_observed_line_inverse(session: &mut HermeticCockpit, row: u16, label
     let mut delay = Duration::from_millis(2);
     loop {
         let snapshot = session.snapshot();
-        if let Some((start, end)) = snapshot.row_content_span(row)
+        if let Some((start, end)) = chat_row_content_span(&snapshot, row)
             && inverse_matches_span(&snapshot, start, end)
         {
             return;
@@ -343,6 +343,16 @@ fn wait_for_observed_line_inverse(session: &mut HermeticCockpit, row: u16, label
         std::thread::sleep(delay);
         delay = (delay * 2).min(Duration::from_millis(50));
     }
+}
+
+/// Left edge of observed transcript text. The session rail occupies columns
+/// to the left; line and gap observations must not include that chrome.
+fn chat_pane_left(screen: &ScreenSnapshot) -> u16 {
+    observed_chat_coord(screen).map(|pos| pos.col).unwrap_or(0)
+}
+
+fn chat_row_content_span(screen: &ScreenSnapshot, row: u16) -> Option<(CellPos, CellPos)> {
+    screen.row_content_span_from(row, chat_pane_left(screen))
 }
 
 fn inverse_matches_span(screen: &ScreenSnapshot, start: CellPos, end: CellPos) -> bool {
@@ -488,6 +498,7 @@ fn find_muted_footer_separator(screen: &ScreenSnapshot) -> CellPos {
 
 fn find_blank_gap(screen: &ScreenSnapshot) -> CellPos {
     let (rows, _) = screen.size();
+    let chat_left = chat_pane_left(screen);
     let composer_row = screen
         .find_text(COMPOSER_PLACEHOLDER)
         .map(|pos| pos.row)
@@ -500,17 +511,21 @@ fn find_blank_gap(screen: &ScreenSnapshot) -> CellPos {
     let (rows, _) = screen.size();
     let limit = composer_row.min(rows);
     for row in 0..limit {
-        if !row_is_blank(screen, row) {
+        if !row_chat_is_blank(screen, row, chat_left) {
             continue;
         }
-        let above = row > 0 && !row_is_blank(screen, row.saturating_sub(1));
-        let below = row + 1 < limit && !row_is_blank(screen, row + 1);
+        let above = row > 0 && !row_chat_is_blank(screen, row.saturating_sub(1), chat_left);
+        let below = row + 1 < limit && !row_chat_is_blank(screen, row + 1, chat_left);
         if above && below {
             let cell = screen
                 .cells()
                 .iter()
-                .find(|cell| cell.row == row && cell.text.chars().all(char::is_whitespace))
-                .expect("blank gap row has an observed empty cell");
+                .find(|cell| {
+                    cell.row == row
+                        && cell.col >= chat_left
+                        && cell.text.chars().all(char::is_whitespace)
+                })
+                .expect("blank gap row has an observed empty chat cell");
             return CellPos {
                 row: cell.row,
                 col: cell.col,
@@ -535,11 +550,13 @@ fn observed_same_row_neighbor(screen: &ScreenSnapshot, origin: CellPos) -> CellP
         .expect("observed neighbor on the same row")
 }
 
-fn row_is_blank(screen: &ScreenSnapshot, row: u16) -> bool {
+fn row_chat_is_blank(screen: &ScreenSnapshot, row: u16, chat_left: u16) -> bool {
     screen
         .row_text(row)
         .chars()
-        .all(|ch| ch.is_whitespace() || ch == '\0')
+        .enumerate()
+        .skip(usize::from(chat_left))
+        .all(|(_, ch)| ch.is_whitespace() || ch == '\0')
 }
 
 fn click_and_checkpoint(session: &mut HermeticCockpit, pos: CellPos) {
@@ -668,9 +685,8 @@ fn tui_mouse_multiclick_pty() {
     session.write_bytes(&triple_click);
     wait_for_observed_line_inverse(&mut session, line_start.row, "triple-click line");
     let snapshot = session.snapshot();
-    let (line_start, line_end) = snapshot
-        .row_content_span(line_start.row)
-        .expect("observed line content");
+    let (line_start, line_end) =
+        chat_row_content_span(&snapshot, line_start.row).expect("observed line content");
     assert_inverse_only_span(&snapshot, line_start, line_end);
     session.reap();
     session.assert_reaped();

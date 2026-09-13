@@ -57,7 +57,7 @@ fn ctrl_t_toggles_all_reasoning_blocks() {
 }
 
 #[test]
-fn ctrl_j_inserts_newline_even_when_reasoning_exists() {
+fn ctrl_j_focuses_rail_even_when_reasoning_exists() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = plain_app(&tmp);
     app.history.push(agent("hidden thought", false));
@@ -65,7 +65,27 @@ fn ctrl_j_inserts_newline_even_when_reasoning_exists() {
 
     app.handle_key(ctrl('j'));
 
+    assert_eq!(app.composer.text(), "line one");
+    assert!(app.session_rail.is_focused());
+    assert!(!reasoning_expanded(&app.history[0]));
+}
+
+#[test]
+fn shift_enter_inserts_newline_even_when_reasoning_exists() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = plain_app(&tmp);
+    app.history.push(agent("hidden thought", false));
+    app.composer.set("line one".to_string());
+
+    app.handle_key(KeyEvent {
+        code: KeyCode::Enter,
+        modifiers: KeyModifiers::SHIFT,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::empty(),
+    });
+
     assert_eq!(app.composer.text(), "line one\n");
+    assert!(!app.session_rail.is_focused());
     assert!(!reasoning_expanded(&app.history[0]));
 }
 

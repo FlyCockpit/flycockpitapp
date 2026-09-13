@@ -80,7 +80,7 @@ fn first_event_loop_wake_is_fenced_before_every_service_and_first_draw() {
         "self.ensure_session_for_display()",
         "self.sync_repo_status()",
         "self.drain_async_actions()",
-        "self.service_first_run_flow()",
+        "self.service_onboarding_shell()",
         "self.maybe_service_new_session(terminal)",
     ] {
         assert!(

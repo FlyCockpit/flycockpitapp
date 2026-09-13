@@ -217,6 +217,8 @@ mod auth_failure_recovery_tests;
 #[cfg(test)]
 mod control_request_tests;
 #[cfg(test)]
+mod first_run_daemon_tests;
+#[cfg(test)]
 mod first_run_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -701,11 +703,8 @@ impl App {
             }
             self.apply_onboarding_bootstrap_snapshot(startup.snapshot);
             self.start_post_trust_cleanup();
-        } else {
-            if pending.mode == cockpit_config::WorkspaceTrustMode::Trust {
-                self.resync_config_after_local_write();
-            }
-            self.maybe_open_add_provider_wizard();
+        } else if pending.mode == cockpit_config::WorkspaceTrustMode::Trust {
+            self.resync_config_after_local_write();
         }
     }
 }
@@ -2835,11 +2834,18 @@ pub struct App {
     pub(super) connector_disclosure: Option<cockpit_proto::ConnectorDisclosure>,
     has_no_providers_at_startup: bool,
     onboarding_snapshot: Option<cockpit_proto::OnboardingBootstrapSnapshot>,
-    /// Presentation-only completion choice. Durable stage ownership remains
-    /// exclusively in `onboarding_snapshot`; this flag never acts as a reducer.
-    onboarding_completion_visible: bool,
+    /// Full-screen onboarding shell. `None` unless the daemon snapshot says
+    /// an onboarding run is in flight; the shell is the only onboarding
+    /// renderer and the snapshot is its exclusive stage authority.
+    pub(super) onboarding_shell: Option<Box<crate::tui::onboarding::OnboardingShell>>,
     onboarding_skip: bool,
     onboarding_force: bool,
+    /// Occupancy fence: the user explicitly closed the shell (Cancel /
+    /// completion exit). Late authority results and concurrent-client
+    /// broadcasts still update [`Self::onboarding_snapshot`] but must not
+    /// reopen the surface; only explicit re-entry (the no-provider send
+    /// guard) clears the flag.
+    pub(super) onboarding_dismissed: bool,
     /// An open `/side` side conversation, or `None` in the main session. While
     /// `Some`, the TUI is bound to an ephemeral throwaway fork: the chrome
     /// shows the side indicator with `/side end` guidance, and the fork is
@@ -4176,9 +4182,10 @@ impl App {
             connector_disclosure,
             has_no_providers_at_startup,
             onboarding_snapshot: None,
-            onboarding_completion_visible: false,
+            onboarding_shell: None,
             onboarding_skip: false,
             onboarding_force: false,
+            onboarding_dismissed: false,
             side_conversation: None,
             daemon_draining: false,
             predict_setting,
@@ -4573,7 +4580,11 @@ impl App {
         changed |= self.tick_ctrl_c_window();
         changed |= self.check_pending_link_activation();
         changed |= self.dialog.tick();
-        changed |= self.service_first_run_flow();
+        changed |= self
+            .onboarding_shell
+            .as_mut()
+            .is_some_and(|shell| shell.tick());
+        changed |= self.service_onboarding_shell();
         // Auto-close the embedded pane when its child has exited
         // (GOALS §1i — e.g. `:q`).
         self.service_pane();

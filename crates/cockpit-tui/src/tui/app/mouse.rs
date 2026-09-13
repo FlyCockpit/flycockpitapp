@@ -57,6 +57,44 @@ impl App {
         {
             self.toast = None;
         }
+        // The full-screen onboarding shell owns the whole screen while
+        // active: its native surfaces consume their events, engine screens
+        // route pointer input to the embedded settings dialog, and nothing
+        // underneath (chat rows, links, footer) reacts.
+        if self.startup_modal_on_top() != Some(StartupModal::WorkspaceTrust)
+            && self.onboarding_shell.is_some()
+        {
+            let outcome = self
+                .onboarding_shell
+                .as_mut()
+                .expect("shell presence checked above")
+                .handle_mouse(mouse);
+            if outcome.consumed {
+                self.apply_onboarding_shell_action(outcome.action);
+                return;
+            }
+            let engine_screen = self.onboarding_shell.as_ref().is_some_and(|shell| {
+                shell.screen_kind() == crate::tui::onboarding::OnboardingScreenKind::Engine
+            });
+            if engine_screen {
+                self.hovered_suggestion = None;
+                self.hovered_control_chip = None;
+                self.hovered_affordance = None;
+                self.hovered_footer_control = None;
+                if matches!(mouse.kind, MouseEventKind::Moved) && !self.mouse_capture {
+                    return;
+                }
+                let _ = self.dialog.handle_settings_pointer(mouse);
+                // Pointer input can navigate the engine off its Add page
+                // (its own Done/Back affordances); apply the same abandon
+                // reconciliation the keyboard path runs so both input
+                // paths share one state machine.
+                if let Some(shell) = self.onboarding_shell.as_mut() {
+                    shell.reconcile_provider_engine(&self.dialog);
+                }
+            }
+            return;
+        }
         // The keys overlay is visually topmost and therefore owns pointer
         // input before links or settings targets underneath it.
         if let Some(overlay) = self.keys_overlay.as_mut() {

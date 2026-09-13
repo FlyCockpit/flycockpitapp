@@ -4241,9 +4241,21 @@ impl Drop for ClientGuard {
     }
 }
 
-struct RegisteredInProcessContext {
-    ctx: std::sync::Weak<DaemonContext>,
-    endpoint: cockpit_client::InProcessEndpoint,
+/// One canonical-socket entry in the in-process registry. A `Ready` entry
+/// self-cleans once its context drains (the weak reference dies); a `Locked`
+/// entry has no context to observe, so the booting in-process daemon owner
+/// must explicitly unregister it — when its ready context replaces the entry
+/// and again on owner shutdown — or the locked endpoint's service tasks,
+/// which hold the locked services and their DB writer alive, would leak for
+/// the process life.
+enum RegisteredInProcessContext {
+    Ready {
+        ctx: std::sync::Weak<DaemonContext>,
+        endpoint: cockpit_client::InProcessEndpoint,
+    },
+    Locked {
+        endpoint: cockpit_client::InProcessEndpoint,
+    },
 }
 
 pub(crate) fn register_in_process_context(
@@ -4259,12 +4271,44 @@ pub(crate) fn register_in_process_context(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     contexts.insert(
         ctx.paths.socket.clone(),
-        RegisteredInProcessContext {
+        RegisteredInProcessContext::Ready {
             ctx: Arc::downgrade(&ctx),
             endpoint: endpoint.clone(),
         },
     );
     endpoint
+}
+
+/// Register a locked-bootstrap endpoint at `socket`. The endpoint serves the
+/// restricted bootstrap allowlist per connection and resolves the ready
+/// context once the secure-store intent materializes the vault, so a client
+/// reconnecting through this registration lands on the ready daemon without
+/// the registration changing hands mid-connection.
+pub(crate) fn register_locked_in_process_context(
+    socket: &Path,
+    endpoint: cockpit_client::InProcessEndpoint,
+) {
+    let contexts = IN_PROCESS_CONTEXTS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut contexts = contexts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    contexts.insert(
+        socket.to_path_buf(),
+        RegisteredInProcessContext::Locked { endpoint },
+    );
+}
+
+/// Remove whatever this socket's in-process daemon owner registered. The
+/// booting owner calls this on shutdown so a locked entry (which cannot
+/// self-clean through a weak context) never outlives it.
+pub(crate) fn unregister_in_process_context(socket: &Path) {
+    let Some(contexts) = IN_PROCESS_CONTEXTS.get() else {
+        return;
+    };
+    let mut contexts = contexts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    contexts.remove(socket);
 }
 
 pub(crate) fn in_process_endpoint(ctx: &Arc<DaemonContext>) -> cockpit_client::InProcessEndpoint {
@@ -4472,6 +4516,71 @@ fn spawn_locked_in_process_client(
     }
 }
 
+/// Settle the onboarding profile wizard's save through the locked bootstrap.
+///
+/// The ordered onboarding screens (#391) put the profile stage before the
+/// secure-store choice, so the profile wizard's settlement RPC is the one
+/// config write whose only success path necessarily arrives while the daemon
+/// still owns no vault. The admission is scoped to exactly that contract —
+/// only the onboarding profile wizard, only while the authoritative stage is
+/// `Profile` — and it runs through the same user-level write gates,
+/// daemon-wide config publication lock, and post-commit generation
+/// publication the ready dispatch enforces. Every other wizard apply (and
+/// this wizard at any other stage) stays on the deny-by-default locked
+/// matrix (#388); callers map those denials to the bounded `BootstrapLocked`
+/// error like every other locked refusal.
+async fn apply_locked_onboarding_profile_wizard(
+    locked: &LockedServices,
+    wizard_id: &str,
+    answers_json: &str,
+) -> Result<Response> {
+    anyhow::ensure!(
+        wizard_id == crate::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+        "bootstrap is locked"
+    );
+    let current = locked
+        .onboarding
+        .snapshot(locked.host_capabilities.clone())
+        .await?
+        .context("onboarding run is absent")?;
+    anyhow::ensure!(
+        current.stage == cockpit_proto::OnboardingStage::Profile,
+        "bootstrap is locked"
+    );
+    let global_config = cockpit_config::config::dirs::global_config_file()
+        .context("resolving the global Cockpit config for the onboarding profile")?;
+    refuse_ephemeral_missing_global_layer(locked.paths.ephemeral, &global_config)?;
+    ensure_authorized_global_layer(&global_config)?;
+    let config_dir = global_config
+        .parent()
+        .map(Path::to_path_buf)
+        .context("the global config file always has a parent directory")?;
+    // Serialized against every other config publication: the write shares
+    // the daemon-wide gate so it cannot interleave with a concurrent
+    // provider or wizard publication on the ready side of the handoff.
+    let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    let result = crate::wizard::apply_setup_wizard_answers_authoritative(
+        &config_dir,
+        wizard_id,
+        answers_json,
+    )
+    .await?;
+    // Publish only when the apply durably changed config: a no-op receipt
+    // keeps the current generation, mirroring the ready dispatch's apply.
+    let config_generation = if result.0 || result.1 {
+        inventory::publish_committed_config_generation()
+    } else {
+        inventory::current_config_generation()
+    };
+    Ok(Response::SetupWizardApplied {
+        wizard_id: wizard_id.to_string(),
+        changed: result.0,
+        model_file_written: result.1,
+        default_scope: result.2,
+        config_generation,
+    })
+}
+
 async fn handle_locked_in_process_request(
     locked: &LockedServices,
     request: Request,
@@ -4521,11 +4630,18 @@ async fn handle_locked_in_process_request(
                         .snapshot(locked.host_capabilities.clone())
                         .await?
                         .context("onboarding run is absent")?;
+                    // Admission covers every pre-vault stage; the authority's
+                    // own legality rules (advances from Welcome/Profile, Back
+                    // from Profile/SecureStore) reject everything else. A
+                    // pre-vault stage must never offer a transition the
+                    // locked matrix denies: that would make the stage
+                    // uncompletable by keystroke.
                     anyhow::ensure!(
                         matches!(
                             current.stage,
                             cockpit_proto::OnboardingStage::Welcome
                                 | cockpit_proto::OnboardingStage::Profile
+                                | cockpit_proto::OnboardingStage::SecureStore
                         ),
                         "bootstrap is locked"
                     );
@@ -4538,6 +4654,19 @@ async fn handle_locked_in_process_request(
                     ))
                 }
                 .await;
+                locked.end_locked_mutation();
+                outcome
+            }
+            Request::ApplySetupWizard {
+                wizard_id,
+                answers_json,
+                ..
+            } => {
+                if !locked.begin_locked_mutation() {
+                    anyhow::bail!("bootstrap is locked");
+                }
+                let outcome =
+                    apply_locked_onboarding_profile_wizard(locked, &wizard_id, &answers_json).await;
                 locked.end_locked_mutation();
                 outcome
             }
@@ -4645,12 +4774,17 @@ pub(crate) fn in_process_context(socket: &Path) -> Option<Arc<DaemonContext>> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let registered = contexts.get(socket)?;
-    match registered.ctx.upgrade() {
-        Some(ctx) => Some(ctx),
-        None => {
-            contexts.remove(socket);
-            None
-        }
+    match registered {
+        RegisteredInProcessContext::Ready { ctx, .. } => match ctx.upgrade() {
+            Some(ctx) => Some(ctx),
+            None => {
+                contexts.remove(socket);
+                None
+            }
+        },
+        // A locked bootstrap is a running owner, but it owns no ready
+        // `DaemonContext` yet; only the endpoint registration exists.
+        RegisteredInProcessContext::Locked { .. } => None,
     }
 }
 
@@ -4662,11 +4796,16 @@ pub(crate) fn registered_in_process_endpoint(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let registered = contexts.get(socket)?;
-    if registered.ctx.upgrade().is_some() {
-        Some(registered.endpoint.clone())
-    } else {
-        contexts.remove(socket);
-        None
+    match registered {
+        RegisteredInProcessContext::Ready { ctx, endpoint } => {
+            if ctx.upgrade().is_some() {
+                Some(endpoint.clone())
+            } else {
+                contexts.remove(socket);
+                None
+            }
+        }
+        RegisteredInProcessContext::Locked { endpoint } => Some(endpoint.clone()),
     }
 }
 
@@ -6420,11 +6559,16 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
                         .snapshot(locked.host_capabilities.clone())
                         .await?
                         .context("onboarding run is absent")?;
+                    // Same pre-vault admission contract as the in-process
+                    // locked handler: every pre-vault stage is admitted and
+                    // the authority's legality rules reject the rest, so no
+                    // pre-vault stage offers an uncompletable transition.
                     anyhow::ensure!(
                         matches!(
                             snapshot.stage,
                             cockpit_proto::OnboardingStage::Welcome
                                 | cockpit_proto::OnboardingStage::Profile
+                                | cockpit_proto::OnboardingStage::SecureStore
                         ),
                         "bootstrap is locked"
                     );
@@ -6437,6 +6581,20 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
                     ))
                 }
                 .await;
+                locked.end_locked_mutation();
+                outcome
+            }
+            Request::ApplySetupWizard {
+                wizard_id,
+                answers_json,
+                ..
+            } => {
+                if !locked.begin_locked_mutation() {
+                    anyhow::bail!("bootstrap is locked");
+                }
+                let outcome =
+                    apply_locked_onboarding_profile_wizard(&locked, &wizard_id, &answers_json)
+                        .await;
                 locked.end_locked_mutation();
                 outcome
             }

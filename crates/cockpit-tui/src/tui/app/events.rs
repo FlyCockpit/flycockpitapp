@@ -267,6 +267,13 @@ impl App {
             self.dialog
                 .apply_host_capabilities(self.host_capabilities.clone(), true);
         }
+        // The onboarding shell's secure-store screen gates placement on the
+        // same live capability rows the settings dialog sees; a bootstrap
+        // snapshot fetched while capabilities were still unpublished must not
+        // strand a stale view.
+        if let Some(shell) = self.onboarding_shell.as_mut() {
+            shell.apply_host_capabilities(&self.host_capabilities);
+        }
     }
 
     pub(super) fn apply_sandbox_state(
@@ -551,6 +558,9 @@ impl App {
             }
             TurnEvent::HostCapabilitiesChanged { snapshot } => {
                 self.apply_event(TurnEvent::HostCapabilitiesChanged { snapshot });
+            }
+            TurnEvent::OnboardingBootstrapChanged => {
+                self.apply_event(TurnEvent::OnboardingBootstrapChanged);
             }
             TurnEvent::CaffeinateState { .. } => {
                 // Prompt policy: provisional globals may update only
@@ -2598,6 +2608,15 @@ impl App {
                         "Subagent `{agent}` autocompacted at {pct} context (window {window_index}; {tokens_before}→{tokens_after} tokens). Consider splitting the task via seed_reads or recursive subagents."
                     ),
                 });
+            }
+            TurnEvent::OnboardingBootstrapChanged => {
+                // Daemon-global onboarding broadcast (a concurrent client or
+                // this client's own committed transition advanced the
+                // authority). The event carries correlation only; re-read the
+                // authoritative snapshot. The apply path's occupancy fence
+                // keeps a user-dismissed shell closed and `sync_snapshot`
+                // drops stale run/attempt/revision projections.
+                self.refresh_onboarding_bootstrap_snapshot();
             }
         }
     }

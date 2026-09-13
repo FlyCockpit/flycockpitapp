@@ -168,17 +168,16 @@ impl App {
             self.dialog = crate::tui::settings::Dialog::None;
             return;
         }
-        let stage_changed =
-            self.onboarding_shell.as_ref().map(|shell| shell.stage()) != Some(snapshot.stage);
-        if let Some(shell) = self.onboarding_shell.as_mut() {
-            shell.sync_snapshot(snapshot);
+        let remount_engine = if let Some(shell) = self.onboarding_shell.as_mut() {
+            shell.sync_snapshot(snapshot)
         } else {
             self.onboarding_shell = Some(Box::new(crate::tui::onboarding::OnboardingShell::new(
                 snapshot,
                 crate::tui::onboarding::reduced_motion_enabled(),
             )));
-        }
-        if stage_changed {
+            true
+        };
+        if remount_engine {
             self.mount_onboarding_engine(snapshot.stage);
         }
     }

@@ -74,11 +74,15 @@ fn progress_index(stage: OnboardingStage) -> usize {
 
 /// Deterministic reduced-motion detection shared by the shell.
 pub(crate) fn reduced_motion_enabled() -> bool {
-    std::env::var_os("NO_COLOR").is_some()
-        || std::env::var("TERM").is_ok_and(|term| term == "dumb")
-        || ["COCKPIT_REDUCE_MOTION", "REDUCE_MOTION"]
-            .into_iter()
-            .any(|name| std::env::var(name).is_ok_and(|value| value != "0"))
+    reduced_motion_for(
+        std::env::var_os("NO_COLOR").is_some(),
+        std::env::var("TERM").ok().as_deref(),
+        ["COCKPIT_REDUCE_MOTION", "REDUCE_MOTION"].map(|name| std::env::var(name).ok()),
+    )
+}
+
+fn reduced_motion_for(no_color: bool, term: Option<&str>, controls: [Option<String>; 2]) -> bool {
+    no_color || term == Some("dumb") || controls.iter().flatten().any(|value| value.as_str() != "0")
 }
 
 /// Which onboarding stage the embedded settings-dialog engine renders.
@@ -298,6 +302,9 @@ impl EscapeMenu {
 
 /// The single onboarding renderer.
 pub struct OnboardingShell {
+    run_id: uuid::Uuid,
+    attempt_id: uuid::Uuid,
+    revision: u64,
     stage: OnboardingStage,
     limited_mode: bool,
     bootstrap_state: OnboardingBootstrapState,
@@ -320,6 +327,9 @@ impl OnboardingShell {
     pub(crate) fn new(snapshot: &OnboardingBootstrapSnapshot, reduced_motion: bool) -> Self {
         let screen = Self::native_screen_for(snapshot);
         Self {
+            run_id: snapshot.run_id,
+            attempt_id: snapshot.attempt_id,
+            revision: snapshot.revision,
             stage: snapshot.stage,
             limited_mode: snapshot.limited_mode,
             bootstrap_state: snapshot.bootstrap_state,
@@ -375,22 +385,32 @@ impl OnboardingShell {
     /// Consume the authoritative snapshot. A stage change rebuilds the
     /// native screen and clears any latched transition whose revision the
     /// daemon has consumed.
-    pub(crate) fn sync_snapshot(&mut self, snapshot: &OnboardingBootstrapSnapshot) {
+    pub(crate) fn sync_snapshot(&mut self, snapshot: &OnboardingBootstrapSnapshot) -> bool {
         let stage_changed = self.stage != snapshot.stage;
+        let authority_changed = self.run_id != snapshot.run_id
+            || self.attempt_id != snapshot.attempt_id
+            || self.revision != snapshot.revision;
         self.limited_mode = snapshot.limited_mode;
         self.bootstrap_state = snapshot.bootstrap_state;
-        if let Some((revision, _)) = self.pending_transition
-            && snapshot.revision > revision
+        if self.run_id != snapshot.run_id
+            || self.attempt_id != snapshot.attempt_id
+            || self
+                .pending_transition
+                .is_some_and(|(revision, _)| snapshot.revision > revision)
         {
             self.pending_transition = None;
         }
-        if !stage_changed {
-            return;
+        if !stage_changed && !authority_changed {
+            return false;
         }
+        self.run_id = snapshot.run_id;
+        self.attempt_id = snapshot.attempt_id;
+        self.revision = snapshot.revision;
         self.stage = snapshot.stage;
         self.escape = None;
         self.frame = 0;
         self.screen = Self::native_screen_for(snapshot);
+        true
     }
 
     /// The app mounts the engine dialog for wizard/provider stages; call
@@ -597,7 +617,12 @@ impl OnboardingShell {
                     let rects = std::mem::take(&mut self.list_row_rects);
                     screen.handle_mouse(mouse, &rects);
                     self.list_row_rects = rects;
-                    PointerOutcome::consumed()
+                    match screen.take_submission() {
+                        Some(submission) => {
+                            PointerOutcome::acted(OnboardingShellAction::SecureIntent(submission))
+                        }
+                        None => PointerOutcome::consumed(),
+                    }
                 }
                 _ => PointerOutcome::ignored(),
             },

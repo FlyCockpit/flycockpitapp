@@ -123,13 +123,13 @@ impl ProviderSearchScreen {
     /// identity is what selection resolves either way.
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Option<&'static ProviderTemplate> {
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 let len = self.filtered().len();
                 self.cursor = crate::tui::nav::wrap_next(self.cursor, len);
                 self.status = None;
                 self.clamp();
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 let len = self.filtered().len();
                 self.cursor = crate::tui::nav::wrap_prev(self.cursor, len);
                 self.status = None;
@@ -186,6 +186,11 @@ impl ProviderSearchScreen {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 self.offset = self.offset.saturating_sub(1);
+                let capacity = self.viewport_capacity.max(1);
+                if self.cursor >= self.offset + capacity {
+                    self.cursor = self.offset + capacity - 1;
+                }
+                self.clamp();
                 None
             }
             MouseEventKind::ScrollDown => {
@@ -195,6 +200,10 @@ impl ProviderSearchScreen {
                 if self.offset < max_offset {
                     self.offset += 1;
                 }
+                if self.cursor < self.offset {
+                    self.cursor = self.offset;
+                }
+                self.clamp();
                 None
             }
             MouseEventKind::Down(MouseButton::Left) => {

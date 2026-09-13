@@ -3252,21 +3252,29 @@ impl App {
         let cfg = self.config_snapshot.providers.clone();
         self.submit_after_model_selection = true;
         if cfg.providers.is_empty() {
-            let onboarding_incomplete = self
-                .onboarding_snapshot
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.stage != cockpit_proto::OnboardingStage::Complete);
-            if onboarding_incomplete {
-                // Surface the full-screen shell at the authoritative
-                // provider stage; the message stays in the composer.
-                let snapshot = self
-                    .onboarding_snapshot
-                    .clone()
-                    .expect("incomplete onboarding snapshot");
-                self.reopen_onboarding_shell(&snapshot);
-            } else {
-                self.dialog =
-                    Dialog::open_providers_add_with_status(&self.launch.cwd, Some(status));
+            match self.onboarding_snapshot.clone() {
+                Some(snapshot) if snapshot.stage != cockpit_proto::OnboardingStage::Complete => {
+                    // Surface the full-screen shell at the authoritative
+                    // stage; the message stays in the composer.
+                    self.reopen_onboarding_shell(&snapshot);
+                }
+                Some(_) | None if self.onboarding_skip => {
+                    self.dialog =
+                        Dialog::open_providers_add_with_status(&self.launch.cwd, Some(status));
+                }
+                None => {
+                    // The post-first-paint authority fetch has not settled.
+                    // Never guess first-run completion by resurrecting the
+                    // generic settings page; preserve the draft and let the
+                    // authoritative snapshot choose the surface.
+                    self.push_plain(
+                        "Waiting for the daemon onboarding checkpoint; your draft is preserved.",
+                    );
+                }
+                Some(_) => {
+                    self.dialog =
+                        Dialog::open_providers_add_with_status(&self.launch.cwd, Some(status));
+                }
             }
             return;
         }

@@ -2674,6 +2674,12 @@ fn pointer_add_auth_method_choices_render_and_dispatch_from_fresh_state() {
         ProvidersAction, SettingsPointerAction, WizardAuthMethod, WizardControlId,
     };
 
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _runtime = runtime.enter();
+
     fn fixture() -> (tempfile::TempDir, SettingsDialog) {
         let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
         let template = templates::template_by_id("anthropic").unwrap();
@@ -2723,9 +2729,24 @@ fn pointer_add_auth_method_choices_render_and_dispatch_from_fresh_state() {
             assert!(matches!(
                 fresh.test_page(),
                 TestPageRef::Providers(ProvidersPage::Add(state))
-                    if state.is_step("auth-method")
-                        && state.error.as_deref().is_some_and(|error| error.contains("no longer available"))
+                    if state.saved_provider_id.as_deref() == Some("anthropic")
             ));
+            let headers = &fresh.config.providers["anthropic"].headers;
+            let credential = headers
+                .iter()
+                .find(|header| header.name.eq_ignore_ascii_case("x-api-key"))
+                .expect("the canonical Anthropic credential header is preserved");
+            assert!(
+                credential.value.starts_with("$secret:")
+                    || super::super::secret_display::is_mask_value(&credential.value),
+                "the daemon fixture must return an opaque credential reference or redacted projection: {credential:?}"
+            );
+            assert!(
+                headers
+                    .iter()
+                    .all(|header| !header.value.contains("DOES_NOT_EXIST")),
+                "credential-source metadata must not be persisted as a header value"
+            );
         } else {
             let expected_step = match method {
                 WizardAuthMethod::PasteKey => "api-key",
@@ -5868,7 +5889,6 @@ fn refetch_result_preserves_staged_favorite() {
             catalog: ProviderModelCatalog::Live,
         }),
     );
-
     let TestPageRef::Providers(ProvidersPage::Edit(state)) = dialog.test_page() else {
         panic!("expected edit page");
     };
@@ -5963,9 +5983,47 @@ fn refetch_result_with_fallback_available_opens_explicit_prompt() {
 }
 
 #[test]
-fn onboarding_validation_with_fallback_available_stays_resumable_and_offers_offline() {
+fn onboarding_live_validation_refreshes_authority_before_final_settlement() {
     let (_tmp, mut dialog) =
         dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Keep)));
+    let mut add = AddState::new_with_onboarding(true);
+    add.saved_provider_id = Some("p".into());
+    add.run.return_to("test-key").unwrap();
+    dialog.set_test_page(Page::Providers(ProvidersPage::Add(add)));
+
+    dialog.apply_fetch_result(
+        "p",
+        Ok(FetchOutcome::Models {
+            models: vec![model("live", false)],
+            catalog: ProviderModelCatalog::Live,
+        }),
+    );
+    dialog.settle_test_effects();
+
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Providers(ProvidersPage::Add(state)) if state.is_step("done")
+    ));
+    assert_eq!(
+        dialog.config.providers["p"]
+            .last_model_fetch
+            .as_ref()
+            .map(|status| status.status),
+        Some(cockpit_config::providers::ModelFetchStatusKind::Live)
+    );
+    assert!(dialog.cx.last_provider_mutation_operation_id.is_some());
+}
+
+#[test]
+fn onboarding_validation_with_fallback_available_stays_resumable_and_offers_offline() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _runtime = runtime.enter();
+    let mut config = one_provider_config(Some(OnUnlistedModelsFetch::Keep));
+    config.providers.get_mut("p").unwrap().model_catalog = ProviderModelCatalog::CodexFallback;
+    let (_tmp, mut dialog) = dialog_with_config(config);
     let mut add = AddState::new_with_onboarding(true);
     add.saved_provider_id = Some("p".into());
     add.run.return_to("test-key").unwrap();
@@ -6001,11 +6059,87 @@ fn onboarding_validation_with_fallback_available_stays_resumable_and_offers_offl
         dialog.test_page(),
         TestPageRef::Providers(ProvidersPage::Add(state))
             if state.onboarding
-                && state.is_step("done")
+                && state.is_step("test-key")
+                && state.fetch.is_some()
                 && state
                     .error
                     .as_deref()
-                    .is_some_and(|message| message.contains("continuing offline"))
+                    .is_some_and(|message| message.contains("Asking the daemon"))
+    ));
+
+    dialog.apply_fetch_result(
+        "p",
+        Ok(FetchOutcome::FallbackAvailable {
+            models: vec![model("fallback", false)],
+            catalog: ProviderModelCatalog::CodexFallback,
+            reason: "offline".into(),
+        }),
+    );
+    dialog.settle_test_effects();
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Providers(ProvidersPage::Add(state)) if state.is_step("done")
+    ));
+    let provider = &dialog.config.providers["p"];
+    assert_eq!(provider.model_catalog, ProviderModelCatalog::CodexFallback);
+    assert_eq!(
+        provider
+            .last_model_fetch
+            .as_ref()
+            .map(|status| status.status),
+        Some(cockpit_config::providers::ModelFetchStatusKind::Fallback)
+    );
+}
+
+#[test]
+fn onboarding_offline_without_fallback_cannot_advance() {
+    let (_tmp, mut dialog) =
+        dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Keep)));
+    let mut add = AddState::new_with_onboarding(true);
+    add.saved_provider_id = Some("p".into());
+    add.run.return_to("test-key").unwrap();
+    dialog.set_test_page(Page::Providers(ProvidersPage::Add(add)));
+
+    dialog.apply_fetch_result("p", Err("network unavailable".into()));
+    dialog.handle_key(press(KeyCode::Char('o')));
+
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Providers(ProvidersPage::Add(state))
+            if state.is_step("test-key")
+                && state.error.as_deref().is_some_and(|message| {
+                    message.contains("requires an existing fallback catalog")
+                })
+    ));
+}
+
+#[test]
+fn onboarding_does_not_offer_unpersisted_builtin_fallback() {
+    let (_tmp, mut dialog) =
+        dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Keep)));
+    let mut add = AddState::new_with_onboarding(true);
+    add.saved_provider_id = Some("p".into());
+    add.run.return_to("test-key").unwrap();
+    dialog.set_test_page(Page::Providers(ProvidersPage::Add(add)));
+
+    dialog.apply_fetch_result(
+        "p",
+        Ok(FetchOutcome::FallbackAvailable {
+            models: vec![model("builtin-only", false)],
+            catalog: ProviderModelCatalog::CodexFallback,
+            reason: "network unavailable".into(),
+        }),
+    );
+    dialog.handle_key(press(KeyCode::Char('o')));
+
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Providers(ProvidersPage::Add(state))
+            if state.is_step("test-key")
+                && state.fetch.is_none()
+                && state.error.as_deref().is_some_and(|message| {
+                    message.contains("requires an existing fallback catalog")
+                })
     ));
 }
 

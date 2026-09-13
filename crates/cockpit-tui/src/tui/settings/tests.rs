@@ -7037,8 +7037,8 @@ fn onboarding_profile_save_completes_after_daemon_apply() {
     d.handle_key(press(KeyCode::Enter));
 
     {
-        let Dialog::SetupWizard(wizard) = &d else {
-            panic!("expected setup wizard");
+        let Dialog::OnboardingWizard(wizard) = &d else {
+            panic!("expected onboarding wizard engine");
         };
         assert_eq!(wizard.run.current_step_id(), Some("profile-save"));
     }
@@ -7086,8 +7086,8 @@ fn onboarding_profile_save_completes_after_daemon_apply() {
         committed_refresh_needed: None,
     });
 
-    let Dialog::SetupWizard(wizard) = &d else {
-        panic!("expected setup wizard");
+    let Dialog::OnboardingWizard(wizard) = &d else {
+        panic!("expected onboarding wizard engine");
     };
     assert!(
         wizard.run.is_complete(),

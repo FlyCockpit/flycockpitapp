@@ -970,7 +970,14 @@ pub(super) struct AddState {
     pub(super) copilot_auth: Option<CopilotSetupState>,
     pub(super) oauth_auth: Option<Box<OAuthFlowState>>,
     pub(super) detected_env_offer: Option<String>,
+    /// Eligibility marker set only when the daemon-returned fallback identity
+    /// matches a catalog already persisted for this provider.
+    fallback_offer: Option<FallbackOffer>,
+    fallback_commit_pending: bool,
+    validation_failure: Option<String>,
 }
+
+struct FallbackOffer;
 
 pub(super) struct EditState {
     pub(super) provider_id: String,
@@ -1015,6 +1022,9 @@ impl AddState {
             copilot_auth: None,
             oauth_auth: None,
             detected_env_offer: None,
+            fallback_offer: None,
+            fallback_commit_pending: false,
+            validation_failure: None,
         };
         state.restore_non_secret_inputs();
         state
@@ -1222,63 +1232,78 @@ impl SettingsDialog {
                             && state.saved_provider_id.as_deref() == Some(provider_id)
                 )
             });
-        let live_validation_succeeded = matches!(
-            &result,
-            Ok(FetchOutcome::Models { .. } | FetchOutcome::Unsupported)
+        let live_validation_succeeded = matches!(&result, Ok(FetchOutcome::Unsupported))
+            || (!onboarding_validation && matches!(&result, Ok(FetchOutcome::Models { .. })));
+        let fallback_commit_pending = self.page.downcast_ref::<ProvidersPage>().is_some_and(
+            |page| matches!(page, ProvidersPage::Add(state) if state.fallback_commit_pending),
         );
         let mut message = String::new();
+        let mut fallback_offer = None;
+        let mut validation_failure = None;
         if let Ok(FetchOutcome::Models { models, catalog }) = result {
-            let Some(pre_fetch_models) = self
-                .config
-                .providers
-                .get(provider_id)
-                .map(|entry| entry.models.clone())
-            else {
-                return;
-            };
-            let unlisted = compute_unlisted_for_models(&pre_fetch_models, &models);
-            let stored = self.config.on_unlisted_models_fetch;
-            if matches!(stored, None | Some(OnUnlistedModelsFetch::Ask))
-                && !unlisted.is_empty()
-                && !onboarding_validation
-            {
-                self.clear_fetch_handle(provider_id);
-                self.page =
-                    super::providers_page(ProvidersPage::FetchOnePrompt(FetchOnePromptState {
+            if onboarding_validation {
+                // FetchProviderModels has already persisted the daemon-owned
+                // catalog. Refresh its edit capability before writing the
+                // final validation status, so the settlement receipt is for
+                // the current generation rather than the pre-fetch save.
+                self.pending_onboarding_validation_commit =
+                    Some(super::PendingOnboardingValidationCommit::Live {
                         provider_id: provider_id.to_string(),
-                        remote: models,
                         catalog,
-                        pre_fetch_models,
-                        unlisted,
-                        cursor: 0,
-                        dont_ask_again: false,
-                    }));
-                return;
-            }
-            let policy = match stored.unwrap_or(OnUnlistedModelsFetch::Keep) {
-                OnUnlistedModelsFetch::Remove => ModelMergePolicy::RemoveUnlisted,
-                OnUnlistedModelsFetch::Ask | OnUnlistedModelsFetch::Keep => {
-                    ModelMergePolicy::KeepUnlisted
-                }
-            };
-            if let Some(entry) = self.config.providers.get_mut(provider_id) {
-                entry.models = merge_fetched_models_with_policy(
-                    entry.effective_template(provider_id),
-                    &pre_fetch_models,
-                    models,
-                    policy,
-                );
-                entry.models_fetched_at = Some(Utc::now());
-                entry.model_catalog = catalog;
-                entry.mark_model_fetch_success(catalog);
-                let count = entry.models.len();
-                message = match self.save_config() {
-                    Ok(()) => format!(
-                        "{}; saving provider catalog…",
-                        fetch_success_message(count, catalog)
-                    ),
-                    Err(e) => format!("save failed: {e}"),
+                    });
+                message = "Provider validated; refreshing its authoritative catalog before committing the onboarding checkpoint…".into();
+                self.queue_provider_catalog(Some(provider_id.to_string()));
+            } else {
+                let Some(pre_fetch_models) = self
+                    .config
+                    .providers
+                    .get(provider_id)
+                    .map(|entry| entry.models.clone())
+                else {
+                    return;
                 };
+                let unlisted = compute_unlisted_for_models(&pre_fetch_models, &models);
+                let stored = self.config.on_unlisted_models_fetch;
+                if matches!(stored, None | Some(OnUnlistedModelsFetch::Ask)) && !unlisted.is_empty()
+                {
+                    self.clear_fetch_handle(provider_id);
+                    self.page =
+                        super::providers_page(ProvidersPage::FetchOnePrompt(FetchOnePromptState {
+                            provider_id: provider_id.to_string(),
+                            remote: models,
+                            catalog,
+                            pre_fetch_models,
+                            unlisted,
+                            cursor: 0,
+                            dont_ask_again: false,
+                        }));
+                    return;
+                }
+                let policy = match stored.unwrap_or(OnUnlistedModelsFetch::Keep) {
+                    OnUnlistedModelsFetch::Remove => ModelMergePolicy::RemoveUnlisted,
+                    OnUnlistedModelsFetch::Ask | OnUnlistedModelsFetch::Keep => {
+                        ModelMergePolicy::KeepUnlisted
+                    }
+                };
+                if let Some(entry) = self.config.providers.get_mut(provider_id) {
+                    entry.models = merge_fetched_models_with_policy(
+                        entry.effective_template(provider_id),
+                        &pre_fetch_models,
+                        models,
+                        policy,
+                    );
+                    entry.models_fetched_at = Some(Utc::now());
+                    entry.model_catalog = catalog;
+                    entry.mark_model_fetch_success(catalog);
+                    let count = entry.models.len();
+                    message = match self.save_config() {
+                        Ok(()) => format!(
+                            "{}; saving provider catalog…",
+                            fetch_success_message(count, catalog)
+                        ),
+                        Err(e) => format!("save failed: {e}"),
+                    };
+                }
             }
         } else if let Ok(FetchOutcome::FallbackAvailable {
             models,
@@ -1288,8 +1313,30 @@ impl SettingsDialog {
         {
             if self.config.providers.contains_key(provider_id) {
                 let reason = redact_model_fetch_reason(reason);
-                if onboarding_validation {
-                    message = format!("live validation unavailable: {reason}");
+                if onboarding_validation && fallback_commit_pending {
+                    self.pending_onboarding_validation_commit =
+                        Some(super::PendingOnboardingValidationCommit::Fallback {
+                            provider_id: provider_id.to_string(),
+                            reason,
+                        });
+                    message = "Fallback catalog committed by the daemon; refreshing its authority before finalizing onboarding…".into();
+                    self.queue_provider_catalog(Some(provider_id.to_string()));
+                } else if onboarding_validation {
+                    let eligible = self.config.providers.get(provider_id).is_some_and(|entry| {
+                        entry.model_catalog == catalog && !entry.models.is_empty()
+                    });
+                    message = if eligible {
+                        fallback_offer = Some(FallbackOffer);
+                        format!(
+                            "live validation unavailable: {reason}. A persisted fallback catalog is available."
+                        )
+                    } else {
+                        format!(
+                            "live validation unavailable: {reason}. No persisted fallback catalog is eligible."
+                        )
+                    };
+                    validation_failure = Some(reason);
+                    self.queue_provider_catalog(Some(provider_id.to_string()));
                 } else {
                     self.clear_fetch_handle(provider_id);
                     self.page = super::providers_page(ProvidersPage::FetchFallbackPrompt(
@@ -1352,6 +1399,11 @@ impl SettingsDialog {
                 ProvidersPage::Add(s) => {
                     s.error = Some(message);
                     s.fetch = None;
+                    s.fallback_commit_pending = false;
+                    s.fallback_offer = fallback_offer;
+                    if validation_failure.is_some() {
+                        s.validation_failure = validation_failure;
+                    }
                     if s.is_step("fetching") {
                         let _ = s.run.submit(WizardAnswer::Acknowledged);
                     } else if s.is_step("test-key") && live_validation_succeeded {
@@ -1901,39 +1953,25 @@ impl SettingsCx {
                                 .to_string();
                             let template = s.template.expect("template chosen");
                             let id = s.id_field.text().trim().to_string();
-                            // This process detected the variable, so it owns
-                            // the fallback copy. Asking the daemon to read it
-                            // again would make this option useless precisely
-                            // when a long-lived daemon cannot see a shell-local
-                            // export. Keep the bytes zeroizing while building
-                            // the same staged-secret mutation as a pasted key.
-                            //
-                            // The read is deliberately before the wizard
-                            // transition: CopyDetectedEnv is non-interactive,
-                            // so a missing value must leave this attempt at
-                            // AuthMethod where the user can choose another
-                            // credential source.
-                            let value = match std::env::var(&env_var) {
-                                Ok(value) if !value.trim().is_empty() => {
-                                    zeroize::Zeroizing::new(value)
-                                }
-                                _ => {
-                                    s.error = Some(format!(
-                                        "${env_var} is no longer available in this process; paste the key instead"
-                                    ));
-                                    return Nav::Stay;
-                                }
-                            };
                             if let Err(error) =
                                 s.run.submit(WizardAnswer::Select(choice.to_string()))
                             {
                                 s.error = Some(error);
                                 return Nav::Stay;
                             }
-                            let headers =
-                                templates::headers_for_pasted_key(template, value.as_str());
+                            // The UI sends source metadata only. The daemon
+                            // resolves the value at the sensitive mutation
+                            // boundary, validates that the variable belongs
+                            // to this template, and moves it into the vault.
+                            let headers = templates::headers_for_pasted_key(template, "");
                             let entry = provider_entry_from_add(s, template, headers);
-                            self.save_and_fetch_provider(s, id, entry, template);
+                            self.save_and_fetch_provider_with_detected_env(
+                                s,
+                                id,
+                                entry,
+                                template,
+                                Some(env_var),
+                            );
                             return Nav::Stay;
                         }
                         if let Err(error) = s.run.submit(WizardAnswer::Select(choice.to_string())) {
@@ -2087,15 +2125,117 @@ impl SettingsCx {
             // A failed probe is explicit evidence that this setup is offline
             // or otherwise unable to validate now. First-run onboarding may
             // continue through the manual model path in that limited state.
-            Some("test-key") if s.fetch.is_none() => {
-                if matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')) {
-                    s.error = Some(
-                        "Live validation was attempted but setup is continuing offline; validate before first use."
-                            .into(),
-                    );
-                    let _ = s.run.submit(WizardAnswer::Acknowledged);
+            Some("test-key") if s.fetch.is_none() => match key.code {
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    let Some(provider_id) = s.saved_provider_id.clone() else {
+                        s.error = Some(
+                            "Saved provider identity is unavailable; go back and save again."
+                                .into(),
+                        );
+                        return Nav::Stay;
+                    };
+                    let Some(entry) = self.config.providers.get(&provider_id).cloned() else {
+                        s.error = Some(
+                            "The saved provider no longer exists; go back and save again.".into(),
+                        );
+                        return Nav::Stay;
+                    };
+                    s.fallback_offer = None;
+                    s.validation_failure = None;
+                    s.error = Some("Retrying live provider validation…".into());
+                    s.fetch = Some(FetchHandle::spawn(
+                        self.lifecycle.clone(),
+                        provider_id,
+                        entry,
+                        self.provider_fetch_root(),
+                    ));
                 }
-            }
+                KeyCode::Char('o') | KeyCode::Char('O') => {
+                    if self.pending_settings.values().any(|pending| {
+                        matches!(
+                            pending,
+                            super::PendingSettingsOperation::ProviderCatalog { .. }
+                        )
+                    }) {
+                        s.error = Some(
+                            "Wait for the daemon catalog refresh before continuing offline.".into(),
+                        );
+                        return Nav::Stay;
+                    }
+                    let Some(offer) = s.fallback_offer.take() else {
+                        s.error = Some(
+                                "Offline continuation requires an existing fallback catalog; retry, enter a manual model, go back, or defer provider setup."
+                                    .into(),
+                            );
+                        return Nav::Stay;
+                    };
+                    let Some(provider_id) = s.saved_provider_id.clone() else {
+                        s.fallback_offer = Some(offer);
+                        s.error = Some(
+                            "Saved provider identity is unavailable; go back and save again."
+                                .into(),
+                        );
+                        return Nav::Stay;
+                    };
+                    let Some(entry) = self.config.providers.get(&provider_id).cloned() else {
+                        s.fallback_offer = Some(offer);
+                        s.error = Some(
+                            "The saved provider no longer exists; go back and save again.".into(),
+                        );
+                        return Nav::Stay;
+                    };
+                    s.fallback_commit_pending = true;
+                    s.error =
+                        Some("Asking the daemon to commit the existing fallback catalog…".into());
+                    s.fetch = Some(FetchHandle::spawn_allowing_fallback(
+                        self.lifecycle.clone(),
+                        provider_id,
+                        entry,
+                        self.provider_fetch_root(),
+                    ));
+                }
+                KeyCode::Char('m') | KeyCode::Char('M') => {
+                    if self.pending_settings.values().any(|pending| {
+                        matches!(
+                            pending,
+                            super::PendingSettingsOperation::ProviderMutation { .. }
+                                | super::PendingSettingsOperation::ProviderCatalog { .. }
+                        )
+                    }) {
+                        s.error = Some(
+                            "Wait for the provider authority refresh before entering a manual model."
+                                .into(),
+                        );
+                    } else {
+                        let Some(reason) = s.validation_failure.clone() else {
+                            s.error = Some(
+                                    "Manual model entry is available only after a completed provider validation attempt."
+                                        .into(),
+                                );
+                            return Nav::Stay;
+                        };
+                        let Some(provider_id) = s.saved_provider_id.clone() else {
+                            s.error = Some(
+                                "Saved provider identity is unavailable; go back and save again."
+                                    .into(),
+                            );
+                            return Nav::Stay;
+                        };
+                        self.pending_onboarding_validation_commit = Some(
+                            super::PendingOnboardingValidationCommit::FailedKeptExisting {
+                                provider_id,
+                                reason,
+                            },
+                        );
+                        self.commit_onboarding_validation_after_catalog_refresh();
+                        s.error = Some(
+                                "Committing the failed-validation checkpoint before explicit manual model entry…"
+                                    .into(),
+                            );
+                    }
+                }
+                _ => {}
+            },
             Some("saving" | "fetching") => {
                 // Disable input while in-flight, except Esc (handled above).
             }
@@ -3829,7 +3969,11 @@ impl SettingsCx {
                 )));
                 if s.is_step("test-key") && s.fetch.is_none() {
                     lines.push(Line::from(Span::styled(
-                        "Validation failed or the network is offline. Press o to continue with manual model setup, or Esc to cancel and resume later.",
+                        if s.fallback_offer.is_some() {
+                            "Validation failed. o: persist fallback catalog offline  r: retry  m: manual model  esc: options"
+                        } else {
+                            "Validation failed. r: retry  m: manual model  esc: back/defer/cancel (offline needs an existing fallback catalog)"
+                        },
                         muted,
                     )));
                 }

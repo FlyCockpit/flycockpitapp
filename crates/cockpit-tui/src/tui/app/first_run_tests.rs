@@ -329,6 +329,9 @@ fn first_run_configuration_queues_held_draft_behind_selected_model() {
     app.composer.set("draft from first run".to_string());
 
     assert!(!app.submit_input());
+    assert_eq!(app.composer.text(), "draft from first run");
+    assert!(matches!(app.dialog, Dialog::None));
+    set_onboarding_stage(&mut app, OnboardingStage::Provider);
     assert_eq!(
         shell_screen_kind(&app),
         Some(crate::tui::onboarding::OnboardingScreenKind::ProviderSearch)
@@ -381,6 +384,7 @@ fn no_provider_status_is_surfaced_and_draft_preserved() {
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
     let mut app = App::new(Some(tmp.path()), false);
+    set_onboarding_stage(&mut app, OnboardingStage::Provider);
     app.composer.set("draft message".to_string());
 
     assert!(!app.submit_input());
@@ -412,6 +416,32 @@ fn no_provider_status_is_surfaced_and_draft_preserved() {
 }
 
 #[test]
+fn send_before_onboarding_projection_never_opens_the_legacy_provider_modal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    write_config(tmp.path(), &ProvidersConfig::default());
+    let mut app = App::new(Some(tmp.path()), false);
+    app.composer.set("early draft".to_string());
+
+    assert!(!app.submit_input());
+    assert_eq!(app.composer.text(), "early draft");
+    assert!(app.onboarding_shell.is_none());
+    assert!(!app.dialog.is_active());
+    assert!(app.history.iter().any(|item| matches!(
+        item,
+        HistoryEntry::Plain { line }
+            if line.contains("Waiting for the daemon onboarding checkpoint")
+    )));
+
+    set_onboarding_stage(&mut app, OnboardingStage::Provider);
+    assert_eq!(
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::ProviderSearch)
+    );
+    assert_eq!(app.composer.text(), "early draft");
+}
+
+#[test]
 fn defer_provider_closes_shell_and_limited_resume_reopens_it() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
@@ -422,7 +452,6 @@ fn defer_provider_closes_shell_and_limited_resume_reopens_it() {
     // Escape → Defer: an explicit, visible choice — never a silent
     // key-to-defer mapping.
     shell_key(&mut app, KeyCode::Esc);
-    shell_key(&mut app, KeyCode::Down);
     shell_key(&mut app, KeyCode::Down);
     shell_key(&mut app, KeyCode::Enter);
 

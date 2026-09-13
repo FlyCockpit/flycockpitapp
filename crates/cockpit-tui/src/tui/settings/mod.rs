@@ -653,6 +653,31 @@ struct PendingProviderAdd {
     onboarding: bool,
 }
 
+enum PendingOnboardingValidationCommit {
+    Live {
+        provider_id: String,
+        catalog: cockpit_config::providers::ProviderModelCatalog,
+    },
+    Fallback {
+        provider_id: String,
+        reason: String,
+    },
+    FailedKeptExisting {
+        provider_id: String,
+        reason: String,
+    },
+}
+
+impl PendingOnboardingValidationCommit {
+    fn provider_id(&self) -> &str {
+        match self {
+            Self::Live { provider_id, .. }
+            | Self::Fallback { provider_id, .. }
+            | Self::FailedKeptExisting { provider_id, .. } => provider_id,
+        }
+    }
+}
+
 impl std::fmt::Debug for ProviderMutationPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProviderMutationPlan")
@@ -2588,6 +2613,10 @@ pub enum Dialog {
         cursor: usize,
     },
     SetupWizard(Box<SetupWizardDialog>),
+    /// Wizard engine hosted exclusively by the full-screen onboarding shell.
+    /// Keeping it distinct prevents first-run routing from entering the
+    /// generic settings/setup dialog path.
+    OnboardingWizard(Box<SetupWizardDialog>),
     /// Boxed because [`SettingsDialog`] dwarfs the other variants
     /// (~1.1KB vs <100 bytes), which would otherwise bloat every
     /// [`Dialog`] on the stack.
@@ -2750,6 +2779,7 @@ fn setup_wizard_dialog(
     cwd: &std::path::Path,
     descriptor: cockpit_core::wizard::WizardDescriptor,
     status: Option<String>,
+    onboarding: bool,
 ) -> Result<Dialog, String> {
     let run = cockpit_core::wizard::WizardRun::new(descriptor).map_err(|e| e.to_string())?;
     let mut cursor = 0;
@@ -2769,7 +2799,7 @@ fn setup_wizard_dialog(
             tool_surface_touched: &mut tool_surface_touched,
         },
     );
-    Ok(Dialog::SetupWizard(Box::new(SetupWizardDialog {
+    let wizard = Box::new(SetupWizardDialog {
         run,
         cursor,
         text,
@@ -2783,7 +2813,12 @@ fn setup_wizard_dialog(
         queued_daemon_effect: None,
         pending_operation_id: None,
         settled_operation_id: None,
-    })))
+    });
+    Ok(if onboarding {
+        Dialog::OnboardingWizard(wizard)
+    } else {
+        Dialog::SetupWizard(wizard)
+    })
 }
 
 impl Deref for SettingsDialog {
@@ -3132,6 +3167,7 @@ pub struct SettingsCx {
     completed_web_credential: Option<(String, Result<(), String>)>,
     completed_provider_auth: Option<CompletedProviderAuthMutation>,
     pending_provider_add: Option<PendingProviderAdd>,
+    pending_onboarding_validation_commit: Option<PendingOnboardingValidationCommit>,
     completed_provider_add: Option<Result<(String, ProviderEntry, bool), String>>,
     completed_provider_mutation: Option<Result<(), String>>,
     pending_provider_mutation_navigation: Option<ProviderMutationNavigation>,
@@ -3853,6 +3889,43 @@ impl SettingsCx {
         self.queue_provider_catalog_for(provider_id, None);
     }
 
+    fn commit_onboarding_validation_after_catalog_refresh(&mut self) {
+        let Some(pending) = self.pending_onboarding_validation_commit.take() else {
+            return;
+        };
+        let provider_id = pending.provider_id().to_string();
+        let Some(entry) = self.config.providers.get_mut(&provider_id) else {
+            self.completed_provider_add = Some(Err(
+                "validated provider disappeared from the authoritative catalog".into(),
+            ));
+            return;
+        };
+        match pending {
+            PendingOnboardingValidationCommit::Live { catalog, .. } => {
+                entry.mark_model_fetch_success(catalog);
+            }
+            PendingOnboardingValidationCommit::Fallback { reason, .. } => {
+                entry.mark_model_fetch_fallback(reason);
+            }
+            PendingOnboardingValidationCommit::FailedKeptExisting { reason, .. } => {
+                entry.mark_model_fetch_failed_kept_existing(reason);
+            }
+        }
+        let entry = entry.clone();
+        self.pending_provider_add = Some(PendingProviderAdd {
+            id: provider_id,
+            entry,
+            supports_models_endpoint: true,
+            detected_environment_copy: None,
+            onboarding: true,
+        });
+        if let Err(error) = self.save_config() {
+            self.reject_pending_provider_add(format!(
+                "could not commit the validated provider checkpoint: {error}"
+            ));
+        }
+    }
+
     fn queue_provider_catalog_for(
         &mut self,
         provider_id: Option<String>,
@@ -4323,6 +4396,15 @@ impl SettingsCx {
                             base_revision,
                             config_generation,
                         });
+                        if self
+                            .pending_onboarding_validation_commit
+                            .as_ref()
+                            .is_some_and(|pending| {
+                                provider_id.as_deref() == Some(pending.provider_id())
+                            })
+                        {
+                            self.commit_onboarding_validation_after_catalog_refresh();
+                        }
                         if let Some(navigation) = navigation {
                             self.completed_provider_navigation =
                                 Some((navigation, self.config.clone()));
@@ -4381,9 +4463,21 @@ impl SettingsCx {
                         }
                     }
                     Ok(other) => {
-                        tracing::warn!(response = ?other, "unexpected async provider catalog response")
+                        tracing::warn!(response = ?other, "unexpected async provider catalog response");
+                        if self.pending_onboarding_validation_commit.take().is_some() {
+                            self.completed_provider_add = Some(Err(
+                                "daemon returned an unexpected provider catalog refresh response"
+                                    .into(),
+                            ));
+                        }
                     }
-                    Err(error) => tracing::warn!(%error, "async provider catalog load failed"),
+                    Err(error) => {
+                        tracing::warn!(%error, "async provider catalog load failed");
+                        if self.pending_onboarding_validation_commit.take().is_some() {
+                            self.completed_provider_add =
+                                Some(Err(format!("provider catalog refresh failed: {error}")));
+                        }
+                    }
                 }
             }
             PendingSettingsOperation::ExtendedSave {
@@ -5636,7 +5730,11 @@ impl Dialog {
     }
     pub(crate) fn has_unsettled_local_authority(&self) -> bool {
         matches!(self, Dialog::Settings(settings) if settings.authority_operation_pending())
-            || matches!(self, Dialog::SetupWizard(wizard) if wizard.pending_operation_id.is_some())
+            || matches!(
+                self,
+                Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)
+                    if wizard.pending_operation_id.is_some()
+            )
     }
 
     pub(crate) fn handle_settings_pointer(
@@ -5696,7 +5794,9 @@ impl Dialog {
             Dialog::Settings(settings) => Some(settings.page.test_name()),
             Dialog::WorkspaceTrust { .. } => Some("workspace_trust"),
             Dialog::WizardMenu { .. } => Some("wizard_menu"),
-            Dialog::SetupWizard(wizard) => Some(wizard.run.descriptor().id),
+            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard) => {
+                Some(wizard.run.descriptor().id)
+            }
             _ => None,
         }
     }
@@ -5765,7 +5865,7 @@ impl Dialog {
 
     #[cfg(test)]
     pub(crate) fn test_mark_setup_complete(&mut self, step_id: &str) {
-        let Dialog::SetupWizard(wizard) = self else {
+        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
             panic!("expected setup wizard");
         };
         wizard
@@ -5784,7 +5884,7 @@ impl Dialog {
         &self,
         step_id: &str,
     ) -> Option<cockpit_core::wizard::WizardAnswer> {
-        let Dialog::SetupWizard(wizard) = self else {
+        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
             return None;
         };
         wizard.run.answer(step_id).cloned()
@@ -5792,7 +5892,7 @@ impl Dialog {
 
     #[cfg(test)]
     pub(crate) fn test_setup_prefill(&self) -> Option<cockpit_core::wizard::WizardAnswer> {
-        let Dialog::SetupWizard(wizard) = self else {
+        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
             return None;
         };
         wizard.run.prefill()
@@ -5993,7 +6093,7 @@ impl Dialog {
             cockpit_core::wizard::SECURITY_WIZARD_ID | cockpit_core::wizard::MODEL_WIZARD_ID => {
                 let descriptor = cockpit_core::wizard::descriptor_for_cwd(wizard_id, &global_root)
                     .ok_or_else(|| format!("unknown setup wizard `{wizard_id}`"))?;
-                setup_wizard_dialog(&global_root, descriptor, None)
+                setup_wizard_dialog(&global_root, descriptor, None, false)
             }
             other => Err(format!("unknown setup wizard `{other}`")),
         }
@@ -6030,7 +6130,7 @@ impl Dialog {
             other => return Err(format!("unknown onboarding wizard `{other}`")),
         }
         .ok_or_else(|| format!("could not build onboarding wizard `{wizard_id}`"))?;
-        setup_wizard_dialog(&global_root, descriptor, status)
+        setup_wizard_dialog(&global_root, descriptor, status, true)
     }
 
     pub fn open_model_setup_preselected(
@@ -6044,7 +6144,7 @@ impl Dialog {
             &global_root,
             Some((provider_id, model_id)),
         );
-        setup_wizard_dialog(&global_root, descriptor, status)
+        setup_wizard_dialog(&global_root, descriptor, status, false)
     }
 
     pub fn open_model_setup_choice(
@@ -6084,6 +6184,14 @@ impl Dialog {
         let Dialog::Settings(settings) = self else {
             return None;
         };
+        if settings
+            .cx
+            .pending_settings
+            .values()
+            .any(|pending| matches!(pending, PendingSettingsOperation::ProviderMutation { .. }))
+        {
+            return None;
+        }
         let operation_id = settings
             .cx
             .last_provider_mutation_operation_id
@@ -6120,7 +6228,7 @@ impl Dialog {
         attempt_id: uuid::Uuid,
         stage_revision: u64,
     ) -> Option<cockpit_proto::OnboardingStageSettlement> {
-        let Dialog::SetupWizard(wizard) = self else {
+        let Dialog::OnboardingWizard(wizard) = self else {
             return None;
         };
         if wizard.run.descriptor().id != wizard_id || config_generation == 0 {
@@ -6142,7 +6250,7 @@ impl Dialog {
     pub fn setup_wizard_is_complete(&self, wizard_id: &str) -> bool {
         matches!(
             self,
-            Dialog::SetupWizard(wizard)
+            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)
                 if wizard.run.descriptor().id == wizard_id && wizard.run.is_complete()
         )
     }
@@ -6150,13 +6258,17 @@ impl Dialog {
     pub fn setup_wizard_is_complete_any(&self, wizard_ids: &[&str]) -> bool {
         matches!(
             self,
-            Dialog::SetupWizard(wizard)
+            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)
                 if wizard_ids.contains(&wizard.run.descriptor().id) && wizard.run.is_complete()
         )
     }
 
     pub fn setup_wizard_is_active(&self, wizard_id: &str) -> bool {
-        matches!(self, Dialog::SetupWizard(wizard) if wizard.run.descriptor().id == wizard_id)
+        matches!(
+            self,
+            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)
+                if wizard.run.descriptor().id == wizard_id
+        )
     }
 
     /// Open directly on one configured provider. OAuth-expired failures for a
@@ -6449,7 +6561,9 @@ impl Dialog {
                     }
                 }
             }
-            Dialog::SetupWizard(wizard) => handle_setup_wizard_key(wizard, key),
+            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard) => {
+                handle_setup_wizard_key(wizard, key)
+            }
             Dialog::Settings(s) => {
                 let close = s.handle_key(key);
                 if close
@@ -6492,7 +6606,9 @@ impl Dialog {
     pub(crate) fn take_settings_daemon_effect(&mut self) -> Option<SettingsDaemonEffectRequest> {
         match self {
             Dialog::Settings(settings) => settings.cx.take_daemon_effect(),
-            Dialog::SetupWizard(wizard) => wizard.queued_daemon_effect.take(),
+            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard) => {
+                wizard.queued_daemon_effect.take()
+            }
             _ => None,
         }
     }
@@ -6523,7 +6639,9 @@ impl Dialog {
         completion: SettingsDaemonEffectCompletion,
     ) {
         match self {
-            Dialog::SetupWizard(wizard) if completion.dialog_id == wizard.dialog_id => {
+            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)
+                if completion.dialog_id == wizard.dialog_id =>
+            {
                 apply_setup_wizard_daemon_completion(wizard, completion);
             }
             Dialog::Settings(settings) if completion.dialog_id == settings.cx.dialog_id => {
@@ -6766,7 +6884,9 @@ impl Dialog {
                 pending.as_ref(),
                 *cursor,
             ),
-            Dialog::SetupWizard(wizard) => render_setup_wizard(frame, area, wizard),
+            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard) => {
+                render_setup_wizard(frame, area, wizard)
+            }
             Dialog::Settings(s) => s.render(frame, area, links),
         }
     }
@@ -7496,6 +7616,7 @@ impl SettingsDialog {
                 completed_web_credential: None,
                 completed_provider_auth: None,
                 pending_provider_add: None,
+                pending_onboarding_validation_commit: None,
                 completed_provider_add: None,
                 completed_provider_mutation: None,
                 pending_provider_mutation_navigation: None,

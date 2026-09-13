@@ -147,6 +147,26 @@ fn reduced_motion_welcome_is_deterministic_and_static() {
     assert!(first.contains("✈"));
 }
 
+#[test]
+fn reduced_motion_controls_cover_no_color_dumb_terminal_and_explicit_flags() {
+    assert!(reduced_motion_for(false, Some("dumb"), [None, None]));
+    assert!(reduced_motion_for(
+        true,
+        Some("xterm-256color"),
+        [None, None]
+    ));
+    assert!(reduced_motion_for(
+        false,
+        Some("xterm-256color"),
+        [Some("1".into()), None]
+    ));
+    assert!(!reduced_motion_for(
+        false,
+        Some("xterm-256color"),
+        [Some("0".into()), Some("0".into())]
+    ));
+}
+
 // ── Escape semantics ─────────────────────────────────────────────────────
 
 #[test]
@@ -258,7 +278,8 @@ fn escape_menu_pointer_selection_chooses_the_clicked_row() {
     // Render first so the menu records its row rects.
     let rendered = render_string(&mut shell, 100, 30, &engine);
     assert!(rendered.contains("Defer provider setup"));
-    let outcome = shell.handle_mouse(click(50, 16));
+    let defer_row = shell.escape.as_ref().unwrap().row_rects[1];
+    let outcome = shell.handle_mouse(click(defer_row.x, defer_row.y));
     assert!(outcome.consumed);
     assert!(matches!(
         outcome.action,
@@ -334,6 +355,10 @@ fn passphrase_secure_store_requires_matching_confirmation() {
     for ch in "first-canary".chars() {
         shell.handle_key(key(KeyCode::Char(ch)), &mut engine);
     }
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    for ch in "first-canary".chars() {
+        shell.handle_key(key(KeyCode::Char(ch)), &mut engine);
+    }
     match shell.handle_key(key(KeyCode::Enter), &mut engine) {
         Some(OnboardingShellAction::SecureIntent(submission)) => {
             assert_eq!(
@@ -370,6 +395,26 @@ fn secure_store_pointer_selects_placement_row() {
     }
 }
 
+#[test]
+fn secure_store_pointer_activation_emits_the_selected_daemon_intent() {
+    let mut snapshot = snapshot(OnboardingStage::SecureStore);
+    snapshot.host_capabilities =
+        secure_store_capabilities(cockpit_proto::FeatureCapabilityState::Available);
+    let mut shell = OnboardingShell::new(&snapshot, true);
+    let engine = Dialog::None;
+    let _ = render_string(&mut shell, 100, 24, &engine);
+
+    let outcome = shell.handle_mouse(click(5, 5));
+    assert!(outcome.consumed);
+    assert!(matches!(
+        outcome.action,
+        Some(OnboardingShellAction::SecureIntent(SecureStoreSubmission {
+            placement: cockpit_proto::OnboardingSecurePlacement::Automatic,
+            passphrase: None,
+        }))
+    ));
+}
+
 // ── Provider search ──────────────────────────────────────────────────────
 
 #[test]
@@ -388,12 +433,12 @@ fn search_filters_by_label_and_id_case_insensitively() {
 fn search_unicode_query_and_cursor_edits_round_trip() {
     let mut shell = shell_at(OnboardingStage::Provider);
     let mut engine = Dialog::None;
-    for ch in "gro".chars() {
+    for ch in "grk".chars() {
         shell.handle_key(key(KeyCode::Char(ch)), &mut engine);
     }
     // Cursor edit in the middle of the query with a wide character.
     shell.handle_key(key(KeyCode::Left), &mut engine);
-    shell.handle_key(key(KeyCode::Char('k')), &mut engine);
+    shell.handle_key(key(KeyCode::Char('o')), &mut engine);
     let query = match &shell.screen {
         OnboardingScreen::ProviderSearch(screen) => screen.query().to_string(),
         _other => panic!("expected search screen, got {_other:?}"),
@@ -421,6 +466,16 @@ fn search_unicode_query_and_cursor_edits_round_trip() {
 }
 
 #[test]
+fn search_text_field_accepts_j_and_k_instead_of_treating_them_as_navigation() {
+    let mut screen = ProviderSearchScreen::new();
+    for ch in "j-k".chars() {
+        screen.handle_key(key(KeyCode::Char(ch)));
+    }
+    assert_eq!(screen.query(), "j-k");
+    assert!(screen.filtered().is_empty());
+}
+
+#[test]
 fn search_disabled_template_surfaces_reason_and_blocks_selection() {
     let mut shell = shell_at(OnboardingStage::Provider);
     let mut engine = Dialog::None;
@@ -441,8 +496,14 @@ fn search_disabled_template_surfaces_reason_and_blocks_selection() {
         action.is_none(),
         "a disabled template must never produce a selection"
     );
+    let reason = disabled.disabled_reason().unwrap();
+    let visible_prefix = reason
+        .split_whitespace()
+        .take(6)
+        .collect::<Vec<_>>()
+        .join(" ");
     let rendered = render_string(&mut shell, 100, 30, &engine);
-    assert!(rendered.contains("unavailable in this build"));
+    assert!(rendered.contains(&visible_prefix), "{rendered}");
 }
 
 #[test]
@@ -499,12 +560,16 @@ fn search_pointer_hit_selects_the_clicked_row() {
     for ch in "openai".chars() {
         shell.handle_key(key(KeyCode::Char(ch)), &mut engine);
     }
+    let expected_id = match &shell.screen {
+        OnboardingScreen::ProviderSearch(screen) => screen.filtered()[0].id,
+        _ => unreachable!(),
+    };
     render_string(&mut shell, 80, 24, &engine);
-    // border(1) + progress(1) + query(1) + blank(1) = row 4 is row 0.
-    let outcome = shell.handle_mouse(click(6, 4));
+    let first_row = shell.list_row_rects[0];
+    let outcome = shell.handle_mouse(click(first_row.x, first_row.y));
     match outcome.action {
         Some(OnboardingShellAction::SelectTemplate(template)) => {
-            assert_eq!(template.id, "openai");
+            assert_eq!(template.id, expected_id);
         }
         other => panic!("expected pointer selection, got {other:?}"),
     }
@@ -644,11 +709,11 @@ fn sync_snapshot_rebuilds_native_screens_on_stage_change() {
     let mut next = snapshot(OnboardingStage::SecureStore);
     next.host_capabilities =
         secure_store_capabilities(cockpit_proto::FeatureCapabilityState::Available);
-    shell.sync_snapshot(&next);
+    assert!(shell.sync_snapshot(&next));
     assert!(matches!(shell.screen, OnboardingScreen::SecureStore(_)));
 
     let provider = snapshot(OnboardingStage::Provider);
-    shell.sync_snapshot(&provider);
+    assert!(shell.sync_snapshot(&provider));
     assert!(matches!(shell.screen, OnboardingScreen::ProviderSearch(_)));
 }
 
@@ -659,13 +724,29 @@ fn latched_transition_clears_only_when_revision_advances() {
     assert!(shell.transition_pending());
     // Same revision: still latched (duplicate snapshot refresh).
     let same = snapshot(OnboardingStage::Welcome);
-    shell.sync_snapshot(&same);
+    assert!(!shell.sync_snapshot(&same));
     assert!(shell.transition_pending());
     // Advanced revision: the latch clears.
     let mut advanced = snapshot(OnboardingStage::Profile);
     advanced.revision = 4;
-    shell.sync_snapshot(&advanced);
+    assert!(shell.sync_snapshot(&advanced));
     assert!(!shell.transition_pending());
+}
+
+#[test]
+fn superseding_same_stage_revision_discards_stale_local_search_state() {
+    let mut shell = shell_at(OnboardingStage::Provider);
+    shell.paste("openai");
+    let engine = Dialog::None;
+    assert!(render_string(&mut shell, 90, 24, &engine).contains("openai│"));
+
+    let mut superseding = snapshot(OnboardingStage::Provider);
+    superseding.revision += 1;
+    assert!(shell.sync_snapshot(&superseding));
+
+    let rendered = render_string(&mut shell, 90, 24, &engine);
+    assert!(rendered.contains("Search providers: │"), "{rendered}");
+    assert!(!rendered.contains("openai│"), "{rendered}");
 }
 
 // ── Chrome ───────────────────────────────────────────────────────────────
@@ -689,6 +770,57 @@ fn chrome_shows_progress_and_limited_mode_at_both_sizes() {
             limited_rendered.contains("limited mode"),
             "{width}x{height} must show the limited-mode badge"
         );
+    }
+}
+
+#[test]
+fn provider_auth_engine_renders_inside_full_screen_chrome_at_narrow_and_wide_sizes() {
+    let home = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(home.path());
+    let template = cockpit_core::providers::template_by_id("openai").unwrap();
+    let mut engine = Dialog::onboarding_provider_engine(home.path(), None);
+    engine.seed_provider_template(template);
+    let mut shell = shell_at(OnboardingStage::Provider);
+    shell.present_engine(EngineStage::Provider);
+
+    for (width, height) in [(48, 18), (110, 32)] {
+        let rendered = render_string(&mut shell, width, height, &engine);
+        assert!(rendered.contains("Cockpit setup"), "{rendered}");
+        assert!(rendered.contains("Template: OpenAI"), "{rendered}");
+        assert!(rendered.contains("Provider"), "{rendered}");
+        assert!(rendered.contains("esc: options"), "{rendered}");
+    }
+}
+
+#[test]
+fn setup_engine_stages_share_shell_chrome_at_narrow_and_wide_sizes() {
+    let home = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(home.path());
+    let cases = [
+        (
+            OnboardingStage::Profile,
+            cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+        ),
+        (
+            OnboardingStage::Agent,
+            cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID,
+        ),
+        (
+            OnboardingStage::Lifetime,
+            cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
+        ),
+    ];
+
+    for (stage, wizard_id) in cases {
+        let engine = Dialog::onboarding_wizard_engine(wizard_id, None, None).unwrap();
+        let mut shell = shell_at(stage);
+        shell.present_engine(EngineStage::for_stage(stage).unwrap());
+        for (width, height) in [(48, 18), (110, 32)] {
+            let rendered = render_string(&mut shell, width, height, &engine);
+            assert!(rendered.contains("Cockpit setup"), "{rendered}");
+            assert!(rendered.contains("Setup —"), "{rendered}");
+            assert!(rendered.contains("esc: options"), "{rendered}");
+        }
     }
 }
 

@@ -2857,6 +2857,10 @@ impl SessionRegistry {
         grace: Duration,
         park_commit_deadline: Duration,
     ) -> DrainOutcome {
+        // Close redaction acquisition before asking session workers to stop.
+        // Existing admissions are revoked immediately; already-running source
+        // captures are joined only by this daemon teardown coordinator below.
+        self.inner.coverage_authority.shutdown();
         // Snapshot + take the join handles. Taking them out of the map means
         // a worker that exits on its own mid-drain (and calls `forget`)
         // can't race us for its handle.
@@ -3032,6 +3036,7 @@ impl SessionRegistry {
         // finding 1) is a forced shutdown, not a clean drain.
         let running_work_clean = phase2_clean && !any_wedged;
         self.forget_generations(drained_generations);
+        self.inner.coverage_authority.shutdown_and_wait().await;
         DrainOutcome {
             running_work_clean,
             park_commit,

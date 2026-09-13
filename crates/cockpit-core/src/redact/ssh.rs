@@ -48,15 +48,37 @@ pub(super) fn collect_ssh_key_candidates_with_fence(
         }
     };
 
-    let Ok(read_dir) = std::fs::read_dir(&dir) else {
-        // Missing / unreadable `~/.ssh` → skip silently.
+    let discover = || -> Result<Option<Vec<PathBuf>>> {
+        let read_dir = match std::fs::read_dir(&dir) {
+            Ok(read_dir) => read_dir,
+            // A configured directory may legitimately not exist yet. Absence
+            // is a stable empty source view; unreadable existing directories
+            // still fail closed because they may contain configured material.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "configured SSH source is unavailable during capture: {error}"
+                ));
+            }
+        };
+        let mut paths = read_dir
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        Ok(Some(paths))
+    };
+    let Some(discovered) = discover()? else {
         return Ok(Vec::new());
     };
 
     let mut out: Vec<(String, String)> = Vec::new();
-    for entry in read_dir.flatten() {
-        let path = entry.path();
-        let file_name = entry.file_name();
+    for path in &discovered {
+        let Some(file_name) = path.file_name() else {
+            continue;
+        };
         let name = file_name.to_string_lossy();
         if is_ssh_non_key_name(&name) {
             continue;
@@ -106,6 +128,9 @@ pub(super) fn collect_ssh_key_candidates_with_fence(
             }
             out.push((trimmed, origin));
         }
+    }
+    if discover()?.as_deref() != Some(discovered.as_slice()) {
+        anyhow::bail!("configured SSH source set changed during capture");
     }
     Ok(out)
 }

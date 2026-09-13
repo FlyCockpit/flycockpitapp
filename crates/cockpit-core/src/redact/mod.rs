@@ -1229,22 +1229,33 @@ impl RedactionTable {
         }
 
         if cfg.scan_dotenv {
-            for path in matched_dotenv_paths(cwd, &cfg.dotenv_patterns, &cfg.extra_dotenv_paths) {
-                match collect_env_file_candidates(&path, &cfg.allowlist) {
+            let discovered =
+                matched_dotenv_paths(cwd, &cfg.dotenv_patterns, &cfg.extra_dotenv_paths);
+            for path in &discovered {
+                match collect_env_file_candidates(path, &cfg.allowlist) {
                     EnvFileScan::Candidates(file_entries) => {
                         for entry in file_entries {
                             candidates.push(entry);
                         }
                     }
-                    EnvFileScan::Unsupported => unsupported_files.push(path),
+                    EnvFileScan::Unsupported => unsupported_files.push(path.clone()),
                     EnvFileScan::Unreadable => {}
                     EnvFileScan::OverLimit => {
-                        return Err(EnvFileOverLimitError { path }.into());
+                        return Err(EnvFileOverLimitError { path: path.clone() }.into());
                     }
                     EnvFileScan::Changed => {
                         return Err(RedactionSourceChangedError.into());
                     }
                 }
+            }
+            // Re-enumerate after every discovered source has been read and
+            // confirmed. A matching source created, removed, or renamed during
+            // capture must refuse this generation rather than publish coverage
+            // for only one side of the mutable directory view.
+            if discovered
+                != matched_dotenv_paths(cwd, &cfg.dotenv_patterns, &cfg.extra_dotenv_paths)
+            {
+                return Err(RedactionSourceChangedError.into());
             }
         }
 

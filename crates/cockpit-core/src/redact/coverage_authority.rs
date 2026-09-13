@@ -359,6 +359,7 @@ struct State {
 struct Inner {
     state: Mutex<State>,
     workers: Arc<Semaphore>,
+    flight_completed: Notify,
     owner_mode: CoverageOwnerMode,
 }
 
@@ -395,6 +396,7 @@ impl RedactionCoverageAuthority {
                     key_revisions: HashMap::new(),
                 }),
                 workers: Arc::new(Semaphore::new(COVERAGE_WORKERS)),
+                flight_completed: Notify::new(),
                 owner_mode,
             }),
         }
@@ -547,9 +549,14 @@ impl RedactionCoverageAuthority {
         let cancelled = flight.waiters.load(std::sync::atomic::Ordering::Acquire) == 0;
         let result = match permit {
             Some(_permit) if !cancelled => match tokio::task::spawn_blocking(capture).await {
-                Ok(Ok(build)) => {
+                Ok(Ok(build)) if flight.waiters.load(std::sync::atomic::Ordering::Acquire) > 0 => {
+                    // A blocking capture cannot be force-aborted safely, but
+                    // losing its final waiter makes the result inert. Fence
+                    // publication again after the completed-capture boundary
+                    // so zero-interest running work never enters the cache.
                     self.publish(key.clone(), flight.epoch, flight.key_revision, build)
                 }
+                Ok(Ok(_)) => Err(CoverageError::Unavailable),
                 Ok(Err(_)) | Err(_) => Err(CoverageError::Unavailable),
             },
             Some(_) | None => Err(CoverageError::Unavailable),
@@ -576,6 +583,8 @@ impl RedactionCoverageAuthority {
         {
             state.flights.remove(&key);
         }
+        drop(state);
+        self.inner.flight_completed.notify_waiters();
     }
 
     fn publish(
@@ -777,6 +786,21 @@ impl RedactionCoverageAuthority {
         for flight in flights {
             *lock(&flight.result) = Some(Err(CoverageError::Unavailable));
             flight.ready.notify_waiters();
+        }
+    }
+
+    /// Shutdown coordination fence. Acquisition closes immediately; only the
+    /// daemon teardown coordinator awaits blocking captures that were already
+    /// running. Registering the notification before observing occupancy avoids
+    /// a completion/check race without polling or a fixed wait budget.
+    pub(crate) async fn shutdown_and_wait(&self) {
+        self.shutdown();
+        loop {
+            let completed = self.inner.flight_completed.notified();
+            if lock(&self.inner.state).allocated_flights == 0 {
+                return;
+            }
+            completed.await;
         }
     }
 }

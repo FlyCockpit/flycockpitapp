@@ -296,7 +296,47 @@ async fn coverage_limits_are_identical_in_persistent_ephemeral_and_inprocess_mod
             })
             .expect("active generation is not evicted");
 
-        authority.shutdown();
+        // A running flight whose final waiter disconnects is allowed to finish
+        // only cleanup. Shutdown revokes it immediately and the daemon-owned
+        // coordination future remains pending until the blocking capture has
+        // actually returned; its late result cannot reopen acquisition.
+        let late_key = key([4, 4, 4, 4, 4, 4, 4, 4, 4, 4]);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let worker_release = release.clone();
+        let late_authority = authority.clone();
+        let late = tokio::spawn(async move {
+            late_authority
+                .acquire(late_key, CoverageScope::SessionSubmission, move || {
+                    entered_tx.send(()).expect("running flight entry signal");
+                    let (lock, wake) = &*worker_release;
+                    let mut released = lock.lock().expect("running flight barrier");
+                    while !*released {
+                        released = wake.wait(released).expect("running flight wake");
+                    }
+                    Ok(CoverageBuild::from_complete_table(
+                        RedactionTable::empty().with_forced_literal(
+                            "late-cancelled-coverage-canary".to_string(),
+                            "$test:late-cancelled".to_string(),
+                        )?,
+                    ))
+                })
+                .await
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv().expect("running flight entered"))
+            .await
+            .expect("running flight entry waiter");
+        late.abort();
+        assert!(matches!(late.await, Err(error) if error.is_cancelled()));
+
+        let mut shutdown = Box::pin(authority.shutdown_and_wait());
+        assert!(futures::poll!(&mut shutdown).is_pending());
+        {
+            let (lock, wake) = &*release;
+            *lock.lock().expect("release running flight") = true;
+            wake.notify_all();
+        }
+        shutdown.await;
         assert!(matches!(
             authority
                 .acquire(
@@ -541,6 +581,21 @@ async fn external_mutation_before_completed_scan_boundary_retries_or_refuses() {
     assert!(
         ssh_result.is_err(),
         "retargeted SSH input must refuse capture"
+    );
+
+    let changing_ssh_dir = sources.path().join("changing-ssh-inventory");
+    std::fs::create_dir(&changing_ssh_dir).expect("changing SSH source root");
+    std::fs::write(changing_ssh_dir.join("id_first"), pem("inventory-first"))
+        .expect("first inventory key");
+    let added_key = changing_ssh_dir.join("id_added");
+    let inventory_result =
+        super::super::ssh::collect_ssh_key_candidates_with_fence(Some(&changing_ssh_dir), |_| {
+            std::fs::write(&added_key, pem("inventory-added"))
+                .expect("add SSH source during capture");
+        });
+    assert!(
+        inventory_result.is_err(),
+        "a changed SSH discovery set must refuse capture"
     );
 
     let authority = RedactionCoverageAuthority::default();

@@ -1575,11 +1575,11 @@ pub struct AgentDefinitionFrontmatter {
     pub roles: Vec<AgentRole>,
     #[serde(rename = "modelSlots")]
     pub model_slots: BTreeMap<String, ModelSlot>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation: Option<DelegationPolicy>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub questions: Option<QuestionPolicy>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<VerificationPolicy>,
     #[serde(rename = "allowedKnowledgeBases", default)]
     pub allowed_knowledge_bases: Option<BTreeSet<String>>,

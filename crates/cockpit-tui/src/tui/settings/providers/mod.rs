@@ -1721,7 +1721,9 @@ impl SettingsCx {
                 // the completed OAuth confirmation actionable until the
                 // daemon receipt happens to arrive. The completion reducer
                 // advances from `saving` to the fetch/test terminal path.
-                let _ = s.run.submit(WizardAnswer::Acknowledged);
+                if !s.is_step("saving") {
+                    let _ = s.run.submit(WizardAnswer::Acknowledged);
+                }
                 s.error = Some("saving provider…".into());
             }
             Err(e) => {
@@ -1751,12 +1753,22 @@ impl SettingsCx {
         };
         s.saved_provider_id = Some(id.clone());
         let notice = self.last_secret_notice.take();
+        if s.is_step("test-key") && entry.last_model_fetch.is_some() {
+            let _ = s.run.submit(WizardAnswer::Acknowledged);
+            s.error = Some(match notice {
+                Some(notice) => format!("saved. {notice}"),
+                None => "saved.".into(),
+            });
+            return;
+        }
         if !s.is_step("saving") {
-            let _ = s.run.submit(WizardAnswer::Acknowledged);
+            s.error = Some(
+                "Provider saved, but its wizard is no longer awaiting the save receipt. Go back and review the provider before continuing."
+                    .into(),
+            );
+            return;
         }
-        if s.is_step("saving") {
-            let _ = s.run.submit(WizardAnswer::Acknowledged);
-        }
+        let _ = s.run.submit(WizardAnswer::Acknowledged);
         if s.is_step("fetching") {
             s.error = Some(match notice {
                 Some(notice) => format!("saved. {notice} Fetching /models…"),

@@ -2131,42 +2131,30 @@ async fn boot_test_persistent_daemon_with_source(
 #[cfg(any(test, feature = "test-support"))]
 async fn boot_production_first_run_test_persistent_daemon() -> Result<TestPersistentDaemon> {
     let paths = DaemonPaths::resolve_canonical()?;
-    #[cfg(any(test, feature = "test-support"))]
-    eprintln!("PROBE boot: canonical socket {}", paths.socket.display());
     if let Some(ctx) = server::in_process_context(&paths.socket) {
         return Ok(TestPersistentDaemon {
             ctx: Some(ctx),
             _owner: None,
         });
     }
-    #[cfg(any(test, feature = "test-support"))]
-    eprintln!("PROBE boot: no ready ctx; checking registered endpoint");
     if server::registered_in_process_endpoint(&paths.socket).is_some() {
         // A daemon this fixture already booted is registered at the canonical
         // socket — either still locked or already ready. Reconnect to it
         // rather than booting a second owner over the same home.
-        #[cfg(any(test, feature = "test-support"))]
-        eprintln!("PROBE boot: registered endpoint found; reusing");
         return Ok(TestPersistentDaemon {
             ctx: None,
             _owner: None,
         });
     }
-    #[cfg(any(test, feature = "test-support"))]
-    eprintln!("PROBE boot: spawning owner thread");
     let (boot, shutdown, completion, supervisor) =
         spawn_owned_production_first_run_test_daemon(paths.clone())?;
     let mut pending = PendingInProcessBoot {
         shutdown: Some(shutdown),
         supervisor: Some(supervisor),
     };
-    #[cfg(any(test, feature = "test-support"))]
-    eprintln!("PROBE boot: awaiting boot completion");
     let ready = boot
         .await
         .context("in-process production first-run daemon owner stopped during boot")??;
-    #[cfg(any(test, feature = "test-support"))]
-    eprintln!("PROBE boot: owner booted");
     Ok(TestPersistentDaemon {
         ctx: ready.ctx,
         _owner: Some(InProcessDaemonGuard {
@@ -2365,14 +2353,10 @@ pub(crate) fn in_process_auto_promote_enabled() -> bool {
 
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn auto_promote_in_process_persistent() -> Result<u32> {
-    #[cfg(any(test, feature = "test-support"))]
-    eprintln!("PROBE boot: entering auto_promote_in_process_persistent");
     let daemon = if IN_PROCESS_AUTO_PROMOTE_PRODUCTION_FIRST_RUN
         .load(std::sync::atomic::Ordering::SeqCst)
     {
         let booted = boot_production_first_run_test_persistent_daemon().await?;
-        #[cfg(any(test, feature = "test-support"))]
-        eprintln!("PROBE boot: production first-run daemon booted");
         booted
     } else if IN_PROCESS_AUTO_PROMOTE_PRODUCTION_CONFIG.load(std::sync::atomic::Ordering::SeqCst) {
         boot_test_persistent_daemon_with_source(config_source::ConfigSource::production()).await?

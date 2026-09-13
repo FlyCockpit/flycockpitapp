@@ -1208,7 +1208,7 @@ pub(crate) struct SettingsBlockingEffectMetadata {
 /// client and tests feed responses through the same snapshot/patch/receipt
 /// validation below; a test double may replace only transport, never config
 /// loading or persistence.
-trait SettingsDaemonEffect: Send + Sync {
+pub(crate) trait SettingsDaemonEffect: Send + Sync {
     fn request(&self, request: Request) -> Result<Response, String>;
 }
 
@@ -5979,6 +5979,14 @@ impl Dialog {
         };
         wizard.run.current_step().map(|step| step.id)
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_setup_status(&self) -> Option<&str> {
+        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
+            return None;
+        };
+        wizard.status.as_deref()
+    }
     /// Kind name of the current wizard step: one of `select`, `text`,
     /// `confirm`, `info`, `action`, `multi`, `tools`, `secret`.
     #[cfg(test)]
@@ -6303,7 +6311,11 @@ impl Dialog {
         let ProvidersPage::Add(add) = page else {
             return None;
         };
-        if add.run.is_complete() || add.is_step("done") {
+        // The descriptor completes before the daemon-backed save, validation,
+        // and checkpoint publication finish. Only the terminal presentation
+        // step proves the provider mutation has a settlement the onboarding
+        // authority may consume.
+        if add.is_step("done") {
             return add.saved_provider_id.clone();
         }
         None

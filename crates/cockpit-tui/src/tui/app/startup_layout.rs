@@ -146,16 +146,12 @@ impl App {
             ),
             async move {
                 let bootstrap_request_id = request_id.clone();
-                #[cfg(test)]
-                eprintln!("PROBE fetch: resolving endpoint (pinned={})", selected_endpoint.is_some());
                 let endpoint =
                     match onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref())
                         .await
                     {
                         Ok(endpoint) => endpoint,
                         Err(error) => {
-                            #[cfg(test)]
-                            eprintln!("PROBE fetch: endpoint resolve failed: {error}");
                             return Ok(
                                 crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
                                     generation,
@@ -164,21 +160,15 @@ impl App {
                             );
                         }
                     };
-                #[cfg(test)]
-                eprintln!("PROBE fetch: endpoint resolved, connecting");
                 let client = match cockpit_client::DaemonClient::connect_endpoint(&endpoint).await {
                     Ok(client) => client,
                     Err(error) => {
-                        #[cfg(test)]
-                        eprintln!("PROBE fetch: connect failed: {error}");
                         return Ok(crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
                             generation,
                             error: error.to_string(),
                         });
                     }
                 };
-                #[cfg(test)]
-                eprintln!("PROBE fetch: connected, requesting snapshot");
                 let current = match client
                     .request(cockpit_proto::Request::GetOnboardingBootstrapSnapshot)
                     .await

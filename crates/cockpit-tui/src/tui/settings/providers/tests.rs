@@ -2674,12 +2674,14 @@ fn pointer_add_auth_method_choices_render_and_dispatch_from_fresh_state() {
         ProvidersAction, SettingsPointerAction, WizardAuthMethod, WizardControlId,
     };
 
-    // No private runtime: under the regression matrix this helper runs
-    // inside the matrix's fixture + multi-thread runtime, and a nested
-    // current-thread runtime entered on this thread would shadow the
-    // ambient handle for the fixture's daemon transport
-    // (`trust_provider_project`), leaving its RPCs on a runtime nothing
-    // drives. Standalone, no fixture is active and the body is synchronous.
+    let runtime = tokio::runtime::Handle::try_current().is_err().then(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("provider auth-method test runtime")
+    });
+    let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
     fn fixture() -> (tempfile::TempDir, SettingsDialog) {
         let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
         let template = templates::template_by_id("anthropic").unwrap();
@@ -6016,10 +6018,14 @@ fn onboarding_live_validation_refreshes_authority_before_final_settlement() {
 
 #[test]
 fn onboarding_validation_with_fallback_available_stays_resumable_and_offers_offline() {
-    // No private runtime — see the note in
-    // `pointer_add_auth_method_choices_render_and_dispatch_from_fresh_state`;
-    // a nested current-thread runtime would strand the matrix fixture's
-    // daemon transport on an undriven runtime.
+    let runtime = tokio::runtime::Handle::try_current().is_err().then(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("provider offline-validation test runtime")
+    });
+    let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
     let mut config = one_provider_config(Some(OnUnlistedModelsFetch::Keep));
     config.providers.get_mut("p").unwrap().model_catalog = ProviderModelCatalog::CodexFallback;
     let (_tmp, mut dialog) = dialog_with_config(config);

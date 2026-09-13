@@ -2176,6 +2176,9 @@ pub struct App {
     pub(super) _export_reaper_guard: crate::tui::async_action::ExportTempReaperGuard,
     pub(super) completed_async_actions: Vec<AsyncActionResult>,
     pub(super) skills_pane_generation: u64,
+    /// Opaque operation IDs issued by this startup generation. Onboarding
+    /// reducers consume an ID exactly once only after its receipt correlates.
+    pending_startup_onboarding_operations: HashMap<crate::tui::async_action::AsyncActionId, String>,
     startup_background: StartupBackground,
     /// Non-blocking projection of the latest complete dependency snapshot.
     /// Startup never probes here; Settings owns background refreshes.
@@ -3890,6 +3893,7 @@ impl App {
             _export_reaper_guard: crate::tui::async_action::ExportTempReaperGuard::new(),
             completed_async_actions: Vec::new(),
             skills_pane_generation: 0,
+            pending_startup_onboarding_operations: HashMap::new(),
             startup_background: StartupBackground {
                 daemon_socket: None,
                 daemon_endpoint: None,

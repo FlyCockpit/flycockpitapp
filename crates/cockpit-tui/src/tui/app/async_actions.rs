@@ -1077,58 +1077,97 @@ impl App {
                     self.apply_workspace_trust_completion(completion);
                 }
             }
-            AsyncActionKind::DaemonRpc("onboarding.bootstrap") => match result.payload {
-                Ok(AsyncActionPayload::StartupOnboardingBootstrap {
-                    generation,
-                    snapshot,
-                }) => {
-                    if self.exit_requested || generation != self.startup_background.generation {
-                        return;
+            AsyncActionKind::DaemonRpc("onboarding.bootstrap") => {
+                let pending_request_id = self
+                    .pending_startup_onboarding_operations
+                    .remove(&result.id);
+                match result.payload {
+                    Ok(AsyncActionPayload::StartupOnboardingBootstrap {
+                        generation,
+                        request_id,
+                        receipt,
+                        snapshot,
+                    }) => {
+                        if self.exit_requested || generation != self.startup_background.generation {
+                            return;
+                        }
+                        let receipt_matches = receipt.as_ref().is_none_or(|receipt| {
+                            receipt.status == cockpit_proto::OnboardingReceiptStatus::Committed
+                                && snapshot.as_ref().is_some_and(|snapshot| {
+                                    receipt.run_id == snapshot.run_id
+                                        && receipt.attempt_id == snapshot.attempt_id
+                                        && snapshot.last_receipt.as_ref() == Some(receipt)
+                                })
+                        });
+                        if !receipt_matches || pending_request_id.as_deref() != Some(&request_id) {
+                            return;
+                        }
+                        self.startup_background.retry = None;
+                        if self.mark_startup_trace_milestone("onboarding-ready") {
+                            tracing::info!(target: cockpit_core::startup::TARGET, event = "onboarding-ready", "startup");
+                        }
+                        self.apply_onboarding_bootstrap_snapshot(snapshot);
                     }
-                    self.startup_background.retry = None;
-                    if self.mark_startup_trace_milestone("onboarding-ready") {
-                        tracing::info!(target: cockpit_core::startup::TARGET, event = "onboarding-ready", "startup");
+                    Ok(AsyncActionPayload::StartupOnboardingFailed { generation, error })
+                        if generation == self.startup_background.generation
+                            && !self.exit_requested =>
+                    {
+                        self.startup_background.retry = Some(StartupRetry::Onboarding);
+                        if self.mark_startup_trace_milestone("onboarding-error") {
+                            tracing::warn!(target: cockpit_core::startup::TARGET, event = "onboarding-error", "startup");
+                        }
+                        self.show_toast(
+                            format!("Onboarding authority unavailable: {error}"),
+                            crate::tui::app::ToastKind::Error,
+                        );
                     }
-                    self.apply_onboarding_bootstrap_snapshot(snapshot);
+                    Ok(_) | Err(_) => {}
                 }
-                Ok(AsyncActionPayload::StartupOnboardingFailed { generation, error })
-                    if generation == self.startup_background.generation && !self.exit_requested =>
-                {
-                    self.startup_background.retry = Some(StartupRetry::Onboarding);
-                    if self.mark_startup_trace_milestone("onboarding-error") {
-                        tracing::warn!(target: cockpit_core::startup::TARGET, event = "onboarding-error", "startup");
-                    }
-                    self.show_toast(
-                        format!("Onboarding authority unavailable: {error}"),
-                        crate::tui::app::ToastKind::Error,
-                    );
-                }
-                Ok(_) | Err(_) => {}
-            },
+            }
             AsyncActionKind::DaemonRpc(
-                "onboarding.transition" | "onboarding.secure_intent" | "onboarding.ready_retry",
-            ) => match result.payload {
-                Ok(AsyncActionPayload::StartupOnboardingTransition(completion))
-                    if completion.generation == self.startup_background.generation
-                        && !self.exit_requested
-                        && self.onboarding_snapshot.as_ref().is_some_and(|current| {
-                            current.run_id == completion.run_id
-                                && current.attempt_id == completion.attempt_id
-                                && current.revision == completion.expected_revision
-                        }) =>
-                {
-                    self.apply_onboarding_bootstrap_snapshot(completion.snapshot);
+                label @ ("onboarding.transition"
+                | "onboarding.secure_intent"
+                | "onboarding.ready_retry"),
+            ) => {
+                let pending_request_id = self
+                    .pending_startup_onboarding_operations
+                    .remove(&result.id);
+                match result.payload {
+                    Ok(AsyncActionPayload::StartupOnboardingTransition(completion))
+                        if completion.generation == self.startup_background.generation
+                            && !self.exit_requested
+                            && self.onboarding_snapshot.as_ref().is_some_and(|current| {
+                                current.run_id == completion.run_id
+                                    && current.attempt_id == completion.attempt_id
+                                    && current.revision == completion.expected_revision
+                            })
+                            && pending_request_id.as_deref() == Some(&completion.request_id)
+                            && (label == "onboarding.ready_retry"
+                                || completion.receipt.is_some())
+                            && completion.receipt.as_ref().is_none_or(|receipt| {
+                                receipt.status == cockpit_proto::OnboardingReceiptStatus::Committed
+                                    && receipt.run_id == completion.run_id
+                                    && receipt.attempt_id == completion.attempt_id
+                                    && receipt.consumed_revision == completion.expected_revision
+                                    && (label == "onboarding.secure_intent"
+                                        || completion.snapshot.as_ref().is_some_and(|snapshot| {
+                                            snapshot.last_receipt.as_ref() == Some(receipt)
+                                        }))
+                            }) =>
+                    {
+                        self.apply_onboarding_bootstrap_snapshot(completion.snapshot);
+                    }
+                    Ok(AsyncActionPayload::StartupOnboardingTransition(_)) => {}
+                    Err(error) => self.show_toast(
+                        format!("Onboarding transition unavailable: {error}"),
+                        crate::tui::app::ToastKind::Error,
+                    ),
+                    Ok(_) => self.show_toast(
+                        "Onboarding authority returned an invalid projection",
+                        crate::tui::app::ToastKind::Error,
+                    ),
                 }
-                Ok(AsyncActionPayload::StartupOnboardingTransition(_)) => {}
-                Err(error) => self.show_toast(
-                    format!("Onboarding transition unavailable: {error}"),
-                    crate::tui::app::ToastKind::Error,
-                ),
-                Ok(_) => self.show_toast(
-                    "Onboarding authority returned an invalid projection",
-                    crate::tui::app::ToastKind::Error,
-                ),
-            },
+            }
             AsyncActionKind::DaemonRpc("startup.workspace") => match result.payload {
                 Ok(AsyncActionPayload::StartupWorkspace(completion)) => {
                     self.apply_startup_workspace_completion(completion);

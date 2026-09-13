@@ -696,6 +696,8 @@ fn exit_rejects_every_late_startup_stage_completion() {
         AsyncActionKind::DaemonRpc("onboarding.bootstrap"),
         AsyncActionPayload::StartupOnboardingBootstrap {
             generation,
+            request_id: "late-bootstrap".into(),
+            receipt: None,
             snapshot: Some(startup_snapshot(2)),
         },
     ));
@@ -735,7 +737,7 @@ fn exit_rejects_every_late_startup_stage_completion() {
 }
 
 #[test]
-fn onboarding_completion_requires_matching_generation_run_and_revision() {
+fn onboarding_completion_requires_matching_generation_operation_and_receipt() {
     use crate::tui::async_action::{
         AsyncActionId, AsyncActionKind, AsyncActionPayload, AsyncActionResult,
     };
@@ -744,28 +746,108 @@ fn onboarding_completion_requires_matching_generation_run_and_revision() {
     app.startup_background.workspace_ready = true;
     app.onboarding_skip = true;
     app.onboarding_snapshot = Some(startup_snapshot(1));
-    let completion = |generation, expected_revision, snapshot| AsyncActionResult {
-        id: AsyncActionId::from_raw_for_test(1),
-        kind: AsyncActionKind::DaemonRpc("onboarding.transition"),
-        presentation_stale: false,
-        payload: Ok(AsyncActionPayload::StartupOnboardingTransition(
-            super::StartupOnboardingCompletion {
-                generation,
-                run_id: uuid::Uuid::from_u128(11),
-                attempt_id: uuid::Uuid::from_u128(12),
-                expected_revision,
-                snapshot: Some(snapshot),
-            },
-        )),
+    let receipt = cockpit_proto::OnboardingTransitionReceipt {
+        run_id: uuid::Uuid::from_u128(11),
+        attempt_id: uuid::Uuid::from_u128(12),
+        consumed_revision: 1,
+        receipt_id: uuid::Uuid::from_u128(13),
+        status: cockpit_proto::OnboardingReceiptStatus::Committed,
+    };
+    let mut next = startup_snapshot(2);
+    next.last_receipt = Some(receipt.clone());
+    let completion = |generation,
+                      expected_revision,
+                      request_id: &str,
+                      receipt: Option<cockpit_proto::OnboardingTransitionReceipt>,
+                      snapshot|
+     -> AsyncActionResult {
+        AsyncActionResult {
+            id: AsyncActionId::from_raw_for_test(1),
+            kind: AsyncActionKind::DaemonRpc("onboarding.transition"),
+            presentation_stale: false,
+            payload: Ok(AsyncActionPayload::StartupOnboardingTransition(
+                super::StartupOnboardingCompletion {
+                    generation,
+                    run_id: uuid::Uuid::from_u128(11),
+                    attempt_id: uuid::Uuid::from_u128(12),
+                    expected_revision,
+                    request_id: request_id.into(),
+                    receipt,
+                    snapshot: Some(snapshot),
+                },
+            )),
+        }
     };
 
-    app.apply_async_action_result(completion(99, 1, startup_snapshot(2)));
+    app.pending_startup_onboarding_operations.insert(
+        AsyncActionId::from_raw_for_test(1),
+        "expected-operation".into(),
+    );
+    app.apply_async_action_result(completion(
+        99,
+        1,
+        "expected-operation",
+        Some(receipt.clone()),
+        next.clone(),
+    ));
     assert_eq!(app.onboarding_snapshot.as_ref().unwrap().revision, 1);
-    app.apply_async_action_result(completion(1, 0, startup_snapshot(2)));
+    app.pending_startup_onboarding_operations.insert(
+        AsyncActionId::from_raw_for_test(1),
+        "expected-operation".into(),
+    );
+    app.apply_async_action_result(completion(
+        1,
+        0,
+        "expected-operation",
+        Some(receipt.clone()),
+        next.clone(),
+    ));
     assert_eq!(app.onboarding_snapshot.as_ref().unwrap().revision, 1);
-    app.apply_async_action_result(completion(1, 1, startup_snapshot(2)));
+    app.pending_startup_onboarding_operations.insert(
+        AsyncActionId::from_raw_for_test(1),
+        "expected-operation".into(),
+    );
+    app.apply_async_action_result(completion(
+        1,
+        1,
+        "different-operation",
+        Some(receipt.clone()),
+        next.clone(),
+    ));
+    assert_eq!(app.onboarding_snapshot.as_ref().unwrap().revision, 1);
+    let mut wrong_receipt_snapshot = next.clone();
+    wrong_receipt_snapshot.last_receipt = None;
+    app.pending_startup_onboarding_operations.insert(
+        AsyncActionId::from_raw_for_test(1),
+        "expected-operation".into(),
+    );
+    app.apply_async_action_result(completion(
+        1,
+        1,
+        "expected-operation",
+        Some(receipt.clone()),
+        wrong_receipt_snapshot,
+    ));
+    assert_eq!(app.onboarding_snapshot.as_ref().unwrap().revision, 1);
+    app.pending_startup_onboarding_operations.insert(
+        AsyncActionId::from_raw_for_test(1),
+        "expected-operation".into(),
+    );
+    app.apply_async_action_result(completion(
+        1,
+        1,
+        "expected-operation",
+        Some(receipt.clone()),
+        next,
+    ));
     assert_eq!(app.onboarding_snapshot.as_ref().unwrap().revision, 2);
-    app.apply_async_action_result(completion(1, 1, startup_snapshot(3)));
+    app.apply_async_action_result(completion(
+        1,
+        1,
+        "expected-operation",
+        Some(receipt),
+        startup_snapshot(3),
+    ));
     assert_eq!(app.onboarding_snapshot.as_ref().unwrap().revision, 2);
 }
 

@@ -553,6 +553,8 @@ pub enum AsyncActionPayload {
     /// second owner while asking for workspace trust.
     StartupOnboardingBootstrap {
         generation: u64,
+        request_id: String,
+        receipt: Option<cockpit_proto::OnboardingTransitionReceipt>,
         snapshot: Option<cockpit_proto::OnboardingBootstrapSnapshot>,
     },
     StartupLifecycleResolved {

@@ -24,18 +24,46 @@ async fn retry_onboarding_ready_construction_snapshot(
 async fn onboarding_snapshot_after_secure_intent(
     endpoint: &cockpit_client::ClientEndpoint,
     request: cockpit_proto::ApplyOnboardingSecureIntent,
-) -> Result<Option<cockpit_proto::OnboardingBootstrapSnapshot>, String> {
+) -> Result<
+    (
+        Option<cockpit_proto::OnboardingBootstrapSnapshot>,
+        Option<cockpit_proto::OnboardingTransitionReceipt>,
+    ),
+    String,
+> {
     let client = cockpit_client::DaemonClient::connect_endpoint(endpoint)
         .await
         .map_err(|error| error.to_string())?;
+    let receipt_query = cockpit_proto::OnboardingReceiptQuery {
+        run_id: request.run_id,
+        attempt_id: request.attempt_id,
+        client_operation_id: request.client_operation_id.clone(),
+    };
     match client
         .apply_onboarding_secure_intent(endpoint, request)
         .await
         .map_err(|error| error.to_string())?
     {
-        Ok(result) => Ok(Some(result.snapshot)),
+        Ok(result) => Ok((Some(result.snapshot), Some(result.receipt))),
         Err(error) if onboarding_ready_construction_retry_required(&error) => {
-            retry_onboarding_ready_construction_snapshot(endpoint).await
+            let snapshot = retry_onboarding_ready_construction_snapshot(endpoint).await?;
+            let receipt = match client
+                .request(cockpit_proto::Request::GetOnboardingTransitionReceipt(
+                    receipt_query,
+                ))
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                Ok(cockpit_proto::Response::OnboardingTransitionReceipt(Some(receipt))) => receipt,
+                Ok(cockpit_proto::Response::OnboardingTransitionReceipt(None)) => {
+                    return Err("secure onboarding receipt is unavailable".to_string());
+                }
+                Ok(other) => {
+                    return Err(format!("unexpected onboarding receipt response: {other:?}"));
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            Ok((snapshot, Some(receipt)))
         }
         Err(error) => Err(error.to_string()),
     }
@@ -83,12 +111,15 @@ impl App {
         let Some(selected) = self.startup_lifecycle.clone() else {
             return;
         };
-        self.async_actions.start(
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let pending_request_id = request_id.clone();
+        let started = self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.bootstrap"),
             crate::tui::async_action::AsyncActionPolicy::Dedupe(
                 crate::tui::async_action::AsyncActionKey::new("onboarding.bootstrap"),
             ),
             async move {
+                let bootstrap_request_id = request_id.clone();
                 let endpoint = selected.endpoint.clone();
                 let client = match cockpit_client::DaemonClient::connect_endpoint(&endpoint).await {
                     Ok(client) => client,
@@ -130,6 +161,8 @@ impl App {
                         Ok(snapshot) => Ok(
                             crate::tui::async_action::AsyncActionPayload::StartupOnboardingBootstrap {
                                 generation,
+                                request_id,
+                                receipt: None,
                                 snapshot,
                             },
                         ),
@@ -148,20 +181,24 @@ impl App {
                     return Ok(
                         crate::tui::async_action::AsyncActionPayload::StartupOnboardingBootstrap {
                             generation,
+                            request_id,
+                            receipt: None,
                             snapshot: current,
                         },
                     );
                 }
                 let request = cockpit_proto::BeginOrReopenOnboarding {
                     expected_revision: current.as_ref().map(|snapshot| snapshot.revision),
-                    client_operation_id: uuid::Uuid::new_v4().to_string(),
+                    client_operation_id: bootstrap_request_id,
                     reentry: force || current.is_some(),
                 };
                 match client.request(cockpit_proto::Request::BeginOrReopenOnboarding(request)).await {
                     Ok(Ok(cockpit_proto::Response::OnboardingTransition(result))) => Ok(
-                        crate::tui::async_action::AsyncActionPayload::StartupOnboardingBootstrap {
-                            generation,
-                            snapshot: Some(result.snapshot),
+                            crate::tui::async_action::AsyncActionPayload::StartupOnboardingBootstrap {
+                                generation,
+                                request_id,
+                                receipt: Some(result.receipt),
+                                snapshot: Some(result.snapshot),
                         },
                     ),
                     Ok(Ok(other)) => Ok(crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
@@ -179,6 +216,10 @@ impl App {
                 }
             },
         );
+        if let crate::tui::async_action::AsyncActionStart::Started(id) = started {
+            self.pending_startup_onboarding_operations
+                .insert(id, pending_request_id);
+        }
     }
 
     pub(super) fn apply_onboarding_bootstrap_snapshot(
@@ -466,6 +507,8 @@ pub(crate) struct StartupOnboardingCompletion {
     pub(crate) run_id: uuid::Uuid,
     pub(crate) attempt_id: uuid::Uuid,
     pub(crate) expected_revision: u64,
+    pub(crate) request_id: String,
+    pub(crate) receipt: Option<cockpit_proto::OnboardingTransitionReceipt>,
     pub(crate) snapshot: Option<cockpit_proto::OnboardingBootstrapSnapshot>,
 }
 
@@ -477,6 +520,7 @@ impl App {
         };
         let (run_id, attempt_id, expected_revision) =
             (current.run_id, current.attempt_id, current.revision);
+        let request_id = uuid::Uuid::new_v4().to_string();
         let Some(endpoint) = self
             .startup_lifecycle
             .as_ref()
@@ -484,7 +528,8 @@ impl App {
         else {
             return;
         };
-        self.async_actions.start(
+        let pending_request_id = request_id.clone();
+        let started = self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.ready_retry"),
             crate::tui::async_action::AsyncActionPolicy::Dedupe(
                 crate::tui::async_action::AsyncActionKey::new("onboarding.ready_retry"),
@@ -499,12 +544,18 @@ impl App {
                                 run_id,
                                 attempt_id,
                                 expected_revision,
+                                request_id,
+                                receipt: None,
                                 snapshot,
                             },
                         )
                     })
             },
         );
+        if let crate::tui::async_action::AsyncActionStart::Started(id) = started {
+            self.pending_startup_onboarding_operations
+                .insert(id, pending_request_id);
+        }
     }
 
     fn request_onboarding_transition(
@@ -523,6 +574,7 @@ impl App {
         let run_id = snapshot.run_id;
         let attempt_id = snapshot.attempt_id;
         let expected_revision = snapshot.revision;
+        let request_id = uuid::Uuid::new_v4().to_string();
         let Some(endpoint) = self
             .startup_lifecycle
             .as_ref()
@@ -530,7 +582,8 @@ impl App {
         else {
             return;
         };
-        self.async_actions.start(
+        let pending_request_id = request_id.clone();
+        let started = self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.transition"),
             crate::tui::async_action::AsyncActionPolicy::Dedupe(
                 crate::tui::async_action::AsyncActionKey::new("onboarding.transition"),
@@ -543,7 +596,7 @@ impl App {
                     run_id: snapshot.run_id,
                     attempt_id: snapshot.attempt_id,
                     expected_revision: snapshot.revision,
-                    client_operation_id: uuid::Uuid::new_v4().to_string(),
+                    client_operation_id: request_id.clone(),
                     transition,
                     settlement,
                 };
@@ -559,6 +612,8 @@ impl App {
                                 run_id,
                                 attempt_id,
                                 expected_revision,
+                                request_id,
+                                receipt: Some(result.receipt),
                                 snapshot: Some(result.snapshot),
                             },
                         ),
@@ -568,6 +623,10 @@ impl App {
                 }
             },
         );
+        if let crate::tui::async_action::AsyncActionStart::Started(id) = started {
+            self.pending_startup_onboarding_operations
+                .insert(id, pending_request_id);
+        }
     }
 
     /// If the user has no providers configured in the active config
@@ -738,6 +797,7 @@ impl App {
                 let run_id = snapshot.run_id;
                 let attempt_id = snapshot.attempt_id;
                 let expected_revision = snapshot.revision;
+                let request_id = request.client_operation_id.clone();
                 let Some(endpoint) = self
                     .startup_lifecycle
                     .as_ref()
@@ -745,7 +805,8 @@ impl App {
                 else {
                     return false;
                 };
-                self.async_actions.start(
+                let pending_request_id = request_id.clone();
+                let started = self.async_actions.start(
                     crate::tui::async_action::AsyncActionKind::DaemonRpc(
                         "onboarding.secure_intent",
                     ),
@@ -755,19 +816,25 @@ impl App {
                     async move {
                         onboarding_snapshot_after_secure_intent(&endpoint, request)
                             .await
-                            .map(|snapshot| {
+                            .map(|(snapshot, receipt)| {
                                 crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
                                     StartupOnboardingCompletion {
                                         generation,
                                         run_id,
                                         attempt_id,
                                         expected_revision,
+                                        request_id,
+                                        receipt,
                                         snapshot,
                                     },
                                 )
                             })
                     },
                 );
+                if let crate::tui::async_action::AsyncActionStart::Started(id) = started {
+                    self.pending_startup_onboarding_operations
+                        .insert(id, pending_request_id);
+                }
                 true
             }
             cockpit_proto::OnboardingStage::Provider => {

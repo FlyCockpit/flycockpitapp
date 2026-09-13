@@ -97,9 +97,9 @@ pub use host_capabilities::{
 pub use launch::{LaunchBundle, LaunchInfo, RepoStatus};
 pub use onboarding::{
     ApplyOnboardingSecureIntent, ApplyOnboardingTransition, BeginOrReopenOnboarding,
-    LockedBootstrapHello, OnboardingBootstrapEvent, OnboardingBootstrapSnapshot,
-    OnboardingBootstrapState, OnboardingReceiptQuery, OnboardingReceiptStatus,
-    OnboardingSecurePlacement, OnboardingStage, OnboardingStageSettlement,
+    LockedBootstrapHello, MAX_SENSITIVE_ONBOARDING_PASSPHRASE_BYTES, OnboardingBootstrapEvent,
+    OnboardingBootstrapSnapshot, OnboardingBootstrapState, OnboardingReceiptQuery,
+    OnboardingReceiptStatus, OnboardingSecurePlacement, OnboardingStage, OnboardingStageSettlement,
     OnboardingTransitionKind, OnboardingTransitionReceipt, OnboardingTransitionResult,
     SensitiveOnboardingIntentError, SensitiveOnboardingIntentFrame,
     SensitiveOnboardingIntentResponse, SensitiveOnboardingPassphrase,

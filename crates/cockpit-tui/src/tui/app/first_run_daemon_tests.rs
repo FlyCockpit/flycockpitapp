@@ -205,10 +205,10 @@ fn seed_computer_use_catalog_capabilities() {
         capabilities: ModelCapabilities {
             context_tokens: Some(200_000),
             tool_calling: CapabilityStatus::Supported,
-            computer_use: Some(ComputerUseCapability {
+            computer_use: ComputerUseCapability {
                 contract: Some(ComputerUseContract::OpenAiResponses),
                 ..ComputerUseCapability::default()
-            }),
+            },
             ..ModelCapabilities::default()
         },
         ..ModelEntry::default()

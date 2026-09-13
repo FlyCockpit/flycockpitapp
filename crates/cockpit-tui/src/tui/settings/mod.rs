@@ -9800,6 +9800,7 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
         queued_daemon_effect,
         pending_operation_id,
         settled_operation_id: _,
+        settled_config_generation: _,
     } = wizard;
     if pending_operation_id.is_some() {
         return false;

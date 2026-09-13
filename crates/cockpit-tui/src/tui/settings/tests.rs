@@ -7214,6 +7214,7 @@ fn model_wizard_tui_advances_through_multitoggle_steps() {
         queued_daemon_effect: None,
         pending_operation_id: None,
         settled_operation_id: None,
+        settled_config_generation: None,
     }));
     for expected in [
         "provider",

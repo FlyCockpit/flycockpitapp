@@ -332,7 +332,8 @@ fn toggle_redaction_reacquires_bound_coverage() {
     assert!(toggle.contains("authority.invalidate_key(&coverage_key)"));
     assert!(toggle.contains("CoverageScope::RedactionOverride"));
     assert!(toggle.contains("CoverageBuild::capture"));
-    assert!(toggle.contains("admission.use_at_sink"));
+    assert!(toggle.contains(".and_then(|admission|"));
+    assert!(toggle.contains(".use_at_sink"));
     assert!(!toggle.contains("RedactionTable::build"));
     assert!(!toggle.contains("RedactionTable::empty"));
 }

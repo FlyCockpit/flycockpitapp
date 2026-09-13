@@ -1845,8 +1845,12 @@ mod vault_unification_tests {
         ] {
             assert!(!custody.contains(forbidden));
         }
+        let production_lifecycle = lifecycle
+            .split("mod vault_unification_tests")
+            .next()
+            .expect("production lifecycle source");
         assert_eq!(
-            lifecycle
+            production_lifecycle
                 .matches("persist_empty_redaction_table_on_conn(")
                 .count(),
             2,

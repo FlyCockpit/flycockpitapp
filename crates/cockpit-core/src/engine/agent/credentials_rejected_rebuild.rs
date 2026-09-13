@@ -237,9 +237,8 @@ pub(crate) async fn rebuild_model_for_credentials(
         )
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let refreshed = admission.consume_at_sink(|refreshed_secrets| {
-        Ok(Arc::new(redact.union(refreshed_secrets.as_ref())?))
-    })?;
+    let refreshed = admission
+        .consume_at_sink(|refreshed_secrets| Ok(Arc::new(redact.union(refreshed_secrets)?)))?;
     // (c) Rebuild a fresh client from the owner-scoped store under the refreshed
     // table. Same construction funnel as the model-swap path.
     let env_overlay = env_overlay.clone();

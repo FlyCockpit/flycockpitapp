@@ -77,10 +77,9 @@ pub(crate) mod tests {
             )
             .await
             .expect("session-start capture")
-            .consume_at_sink(|table| Ok(table))
+            .install_table()
             .expect("install session table at sink");
         let forced = base_table
-            .as_ref()
             .clone()
             .with_forced_literal("provider-auth-extra".into(), "$provider:auth".into())
             .expect("provider guard extension");
@@ -94,13 +93,12 @@ pub(crate) mod tests {
             )
             .await
             .expect("submission refresh capture")
-            .consume_at_sink(|table| Ok(table))
+            .install_table()
             .expect("refreshed table at sink");
         let unioned = base_table
-            .as_ref()
             .clone()
-            .union(refreshed.as_ref())
-            .expect("same-binding union of unbound tables");
+            .union(&refreshed)
+            .expect("same-binding union of generation-bound tables");
         assert_eq!(unioned.scrub(CANARY), REDACTED);
 
         let sealed_derived = unioned.with_sealed_replacements(&Default::default());
@@ -220,7 +218,7 @@ pub(crate) mod tests {
             )
             .await
             .expect("left capture")
-            .consume_at_sink(|table| Ok(table.as_ref().clone()))
+            .install_table()
             .expect("left sink");
         let right = authority
             .acquire(
@@ -230,7 +228,7 @@ pub(crate) mod tests {
             )
             .await
             .expect("right capture")
-            .consume_at_sink(|table| Ok(table.as_ref().clone()))
+            .install_table()
             .expect("right sink");
         assert!(left.union(&right).is_err());
     }

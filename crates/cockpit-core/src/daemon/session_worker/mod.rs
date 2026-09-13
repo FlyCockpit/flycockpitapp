@@ -433,23 +433,17 @@ pub(super) fn worker_coverage_publish_owners(
                 ))
             }),
             policy_digest: std::sync::Arc::new({
-                let session = session.clone();
                 let config_snapshot = config_snapshot.clone();
                 let overrides = overrides.clone();
                 move || {
-                    session
-                        .redaction_coverage()
-                        .map(|(_, _, digest)| digest)
-                        .unwrap_or_else(|| {
-                            let mut cfg = config_snapshot
-                                .read()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .extended
-                                .redact
-                                .clone();
-                            overrides.apply_to(&mut cfg);
-                            crate::redact::coverage_bindings::redact_config_digest(&cfg)
-                        })
+                    let mut cfg = config_snapshot
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .extended
+                        .redact
+                        .clone();
+                    overrides.apply_to(&mut cfg);
+                    crate::redact::coverage_bindings::redact_config_digest(&cfg)
                 }
             }),
             override_revision: std::sync::Arc::new(|| 0),
@@ -582,7 +576,7 @@ async fn refresh_redaction_for_turn(
                     // adoption. The guard is released before the driver `.await` below.
                     let _redaction_guard = interrupts.lock_redaction_table_write().await;
                     let base = current_redaction(&accumulated_redact);
-                    match base.union(new_table.as_ref()) {
+                    match base.union(new_table) {
                         Ok(unioned) => {
                             let unioned = std::sync::Arc::new(unioned);
                             match session.persist_redaction_table(&unioned) {
@@ -603,25 +597,6 @@ async fn refresh_redaction_for_turn(
     };
     match refresh_result {
         Ok(table) => {
-            let table = match table {
-                Ok(table) => table,
-                Err(error) => {
-                    tracing::warn!(error = %error, %session_id, "refreshing redaction table failed; refusing to send unredacted");
-                    send_current_session_event(
-                        session,
-                        event_tx,
-                        accumulated_redact,
-                        proto::Event::Notice {
-                            session_id,
-                            text: format!(
-                                "Redaction refresh failed; refusing to send unredacted: {error:#}"
-                            ),
-                        },
-                        NoticeSource::DaemonDirect,
-                    );
-                    return RedactionRefreshOutcome::Refused(error.to_string());
-                }
-            };
             for path in table.unsupported_files() {
                 if unsupported_notified.insert(path.clone()) {
                     send_session_event(

@@ -6568,7 +6568,7 @@ async fn handle_serialized_request_impl(
                         mode,
                         &snapshot.extended,
                         &snapshot.providers,
-                        table.clone(),
+                        std::sync::Arc::new(table.clone()),
                     )
                 })
                 .await
@@ -31592,7 +31592,7 @@ async fn run_docs_ask_pipeline(
             .consume_at_sink(|redact| {
                 crate::engine::model::Model::from_config_with_store(
                     &providers,
-                    redact.clone(),
+                    std::sync::Arc::new(redact.clone()),
                     |name| {
                         env_live_for_model
                             .read()
@@ -32610,7 +32610,7 @@ pub(super) async fn export_session_data(
                                 &secret_vault,
                                 resolver,
                                 env,
-                                export_redactor,
+                                std::sync::Arc::new(export_redactor.clone()),
                             )
                             .await
                             .map_err(internal)
@@ -32650,7 +32650,7 @@ pub(super) async fn export_session_data(
                                 &secret_vault,
                                 resolver,
                                 env,
-                                export_redactor,
+                                std::sync::Arc::new(export_redactor.clone()),
                             )
                             .await
                             .map_err(internal)
@@ -32936,7 +32936,7 @@ pub(super) async fn auto_title_request(
                 &session,
                 extended,
                 providers,
-                table.clone(),
+                std::sync::Arc::new(table.clone()),
                 String::new(),
                 crate::session::TitleAction::Explicit,
             )

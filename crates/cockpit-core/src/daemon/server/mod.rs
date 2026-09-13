@@ -213,7 +213,8 @@ async fn acquire_daemon_redaction_table(
         })
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?
-        .consume_at_sink(|table| Ok(table))
+        .install_table()
+        .map(|table| Arc::new(table))
         .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
@@ -5684,7 +5685,8 @@ pub(crate) async fn boot_ready_with_db(
         )
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?
-        .consume_at_sink(|table| Ok(table))
+        .install_table()
+        .map(|table| Arc::new(table))
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     timer.phase("redaction_table");
     let mut ctx = DaemonContext::new_with_boot_authority(

@@ -221,6 +221,13 @@ pub enum Replacement {
 }
 
 impl Replacement {
+    fn retained_allocation_bytes(&self) -> usize {
+        match self {
+            Self::Generic => 0,
+            Self::Sealed { value_id } => value_id.capacity(),
+        }
+    }
+
     /// Resolve this descriptor to its replacement text against a placeholder.
     fn render(&self, placeholder: &str) -> String {
         match self {
@@ -311,6 +318,25 @@ impl EntryClass {
         match self {
             EntryClass::Ordinary { origin, .. } => origin.clone(),
             EntryClass::Sealed(identity) => sealed_identity_origin(identity),
+        }
+    }
+
+    fn retained_origin_allocation_bytes(&self) -> usize {
+        match self {
+            EntryClass::Ordinary { origin, .. } => origin.capacity(),
+            EntryClass::Sealed(identity) => identity
+                .name
+                .as_str()
+                .len()
+                .saturating_add(
+                    identity
+                        .record_id
+                        .map(|record_id| record_id.as_str().len())
+                        .unwrap_or(0),
+                )
+                .saturating_add(std::mem::size_of::<
+                    crate::sealed::identity::SealedRedactionIdentity,
+                >()),
         }
     }
 
@@ -1511,7 +1537,9 @@ impl RedactionTable {
         )?;
         merged.coverage_binding = match (&self.coverage_binding, &other.coverage_binding) {
             (Some(left), Some(right)) if left.same_generation(right) => Some(left.clone()),
-            (Some(binding), None) | (None, Some(binding)) => Some(binding.clone()),
+            (Some(_left), Some(right)) => Some(right.clone()),
+            (Some(binding), None) if other.is_union_identity_operand() => Some(binding.clone()),
+            (None, Some(binding)) if self.is_union_identity_operand() => Some(binding.clone()),
             (None, None)
                 if self.is_union_identity_operand() && other.is_union_identity_operand() =>
             {
@@ -1913,8 +1941,8 @@ impl RedactionTable {
             .saturating_add(self.entries.iter().fold(0usize, |total, entry| {
                 total
                     .saturating_add(entry.value.capacity())
-                    .saturating_add(entry.class.origin_display().capacity())
-                    .saturating_add(std::mem::size_of::<RedactionEntry>())
+                    .saturating_add(entry.class.retained_origin_allocation_bytes())
+                    .saturating_add(entry.replacement.retained_allocation_bytes())
             }));
         let automaton_bytes = self
             .matcher
@@ -1934,11 +1962,7 @@ impl RedactionTable {
             .saturating_add(
                 self.unsupported_files
                     .iter()
-                    .map(|path| {
-                        path.as_os_str()
-                            .len()
-                            .saturating_add(std::mem::size_of::<PathBuf>())
-                    })
+                    .map(|path| path.as_os_str().len())
                     .sum::<usize>(),
             );
         let conflict_string_bytes = self

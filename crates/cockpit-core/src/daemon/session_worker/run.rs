@@ -13573,7 +13573,7 @@ pub(super) async fn run_worker(
                                         publish_command_cache.clone(),
                                     )
                                     .publish_fence();
-                                    authority
+                                    match authority
                                         .acquire(
                                             coverage_key,
                                             crate::redact::coverage_authority::CoverageScope::RedactionOverride,
@@ -13605,9 +13605,9 @@ pub(super) async fn run_worker(
                                             },
                                         )
                                         .await
-                                        .map_err(|error| anyhow::anyhow!(error.to_string()))
-                                        .and_then(|admission| {
-                                            admission.consume_at_async_sink(|new_table| {
+                                    {
+                                        Ok(admission) => admission
+                                            .consume_at_async_sink(|new_table| {
                                                 let session = session.clone();
                                                 let redaction = redaction.clone();
                                                 let interrupts = interrupts.clone();
@@ -13615,16 +13615,17 @@ pub(super) async fn run_worker(
                                                     let _redaction_guard =
                                                         interrupts.lock_redaction_table_write().await;
                                                     let base = current_redaction(&redaction);
-                                                    let unioned = base.union(new_table.as_ref())?;
+                                                    let unioned = base.union(new_table)?;
                                                     let unioned = Arc::new(unioned);
                                                     session.persist_redaction_table(&unioned)?;
                                                     set_current_redaction(&redaction, unioned.clone());
                                                     Ok(unioned)
                                                 }
                                             })
-                                        })
-                                        .await
-                                        .map_err(|error| anyhow::anyhow!(error.to_string()))
+                                            .await
+                                            .map_err(|error| anyhow::anyhow!(error.to_string())),
+                                        Err(error) => Err(anyhow::anyhow!(error.to_string())),
+                                    }
                                 }
                                 Err(error) => Err(error),
                             },

@@ -3554,17 +3554,22 @@ impl Driver {
                     ))
                 }),
                 policy_digest: std::sync::Arc::new({
-                    let session_for_publish = session_for_publish.clone();
                     let config_for_publish = config_for_publish.clone();
+                    let scan_environment_override = scan_environment_override;
+                    let scan_dotenv_override = scan_dotenv_override;
+                    let scan_ssh_keys_override = scan_ssh_keys_override;
                     move || {
-                        session_for_publish
-                            .redaction_coverage()
-                            .map(|(_, _, digest)| digest)
-                            .unwrap_or_else(|| {
-                                crate::redact::coverage_bindings::redact_config_digest(
-                                    &config_for_publish.extended().redact,
-                                )
-                            })
+                        let mut live_cfg = config_for_publish.extended().redact;
+                        if let Some(v) = scan_environment_override {
+                            live_cfg.scan_environment = v;
+                        }
+                        if let Some(v) = scan_dotenv_override {
+                            live_cfg.scan_dotenv = v;
+                        }
+                        if let Some(v) = scan_ssh_keys_override {
+                            live_cfg.scan_ssh_keys = v;
+                        }
+                        crate::redact::coverage_bindings::redact_config_digest(&live_cfg)
                     }
                 }),
                 override_revision: std::sync::Arc::new(|| 0),
@@ -3627,12 +3632,12 @@ impl Driver {
                         let redact = self.redact.clone();
                         async move {
                             match interrupts
-                                .refresh_union_redaction(&session, new_table.as_ref())
+                                .refresh_union_redaction(&session, new_table)
                                 .await
                             {
                                 Ok(Some(table)) => Ok(table),
                                 Ok(None) => {
-                                    let table = redact.union(new_table.as_ref())?;
+                                    let table = redact.union(new_table)?;
                                     let table = Arc::new(table);
                                     session.persist_redaction_table(&table)?;
                                     Ok(table)

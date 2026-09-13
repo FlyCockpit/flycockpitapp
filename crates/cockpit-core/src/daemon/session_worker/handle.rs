@@ -1946,21 +1946,15 @@ impl SessionWorkerHandle {
                     ))
                 }),
                 policy_digest: std::sync::Arc::new({
-                    let session = session.clone();
                     let config_snapshot = config_snapshot.clone();
                     move || {
-                        session
-                            .redaction_coverage()
-                            .map(|(_, _, digest)| digest)
-                            .unwrap_or_else(|| {
-                                crate::redact::coverage_bindings::redact_config_digest(
-                                    &config_snapshot
-                                        .read()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                        .extended
-                                        .redact,
-                                )
-                            })
+                        crate::redact::coverage_bindings::redact_config_digest(
+                            &config_snapshot
+                                .read()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .extended
+                                .redact,
+                        )
                     }
                 }),
                 override_revision: std::sync::Arc::new(|| 0),

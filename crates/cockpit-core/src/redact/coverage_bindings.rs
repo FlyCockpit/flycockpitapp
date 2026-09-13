@@ -395,14 +395,8 @@ pub(crate) fn session_publish_owners_for_session(
         SessionCoveragePublishLive {
             environment,
             policy_digest: std::sync::Arc::new({
-                let session = session.clone();
                 let redact_config = redact_config.clone();
-                move || {
-                    session
-                        .redaction_coverage()
-                        .map(|(_, _, digest)| digest)
-                        .unwrap_or_else(|| redact_config_digest(&redact_config()))
-                }
+                move || redact_config_digest(&redact_config())
             }),
             override_revision,
             redact_config,

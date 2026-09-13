@@ -1062,14 +1062,46 @@ impl CoverageAdmission {
         }
     }
 
+    fn coverage_binding_for_sink(&self) -> CoverageTableBinding {
+        CoverageTableBinding {
+            authority: self.inner.clone(),
+            generation_id: self.generation.id,
+            epoch: self.generation.epoch,
+            key_revision: self.generation.key_revision,
+            key: self.generation.key.clone(),
+            live_binding: None,
+        }
+    }
+
+    fn bound_table_for_sink(&self) -> std::result::Result<RedactionTable, CoverageError> {
+        self.validate_current()?;
+        Ok(self
+            .generation
+            .table
+            .enforced()
+            .clone()
+            .with_coverage_binding(self.coverage_binding_for_sink()))
+    }
+
+    /// Install the admitted generation table with durable provenance binding.
+    /// The raw generation [`Arc`] cannot escape; only this bound table may be
+    /// persisted or installed for later historical folds.
+    pub(crate) fn install_table(self) -> std::result::Result<RedactionTable, CoverageError> {
+        let table = self.bound_table_for_sink()?;
+        self.validate_current()?;
+        Ok(table)
+    }
+
     /// Run one immediate sink against the admitted generation table. The lease
-    /// is consumed before the sink returns; the table cannot be retained.
+    /// is consumed before the sink returns; only a bound sink view is exposed.
     pub(crate) fn consume_at_sink<T>(
         self,
-        sink: impl FnOnce(std::sync::Arc<RedactionTable>) -> Result<T>,
+        sink: impl FnOnce(&RedactionTable) -> Result<T>,
     ) -> std::result::Result<T, CoverageError> {
+        let table = self.bound_table_for_sink()?;
+        let result = sink(&table).map_err(|_| CoverageError::Unavailable)?;
         self.validate_current()?;
-        sink(self.generation.table.clone()).map_err(|_| CoverageError::Unavailable)
+        Ok(result)
     }
 
     /// Async variant of [`Self::consume_at_sink`]. The lease stays active until
@@ -1079,34 +1111,23 @@ impl CoverageAdmission {
         sink: F,
     ) -> std::result::Result<T, CoverageError>
     where
-        F: FnOnce(std::sync::Arc<RedactionTable>) -> Fut,
+        F: FnOnce(&RedactionTable) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
+        let table = self.bound_table_for_sink()?;
+        let result = sink(&table).await.map_err(|_| CoverageError::Unavailable)?;
         self.validate_current()?;
-        sink(self.generation.table.clone())
-            .await
-            .map_err(|_| CoverageError::Unavailable)
+        Ok(result)
     }
 
     pub(crate) fn use_at_sink<T>(
         self,
         sink: impl FnOnce(&RedactionTable) -> Result<T>,
     ) -> std::result::Result<T, CoverageError> {
+        let table = self.bound_table_for_sink()?;
+        let result = sink(&table).map_err(|_| CoverageError::Unavailable)?;
         self.validate_current()?;
-        let binding = CoverageTableBinding {
-            authority: self.inner.clone(),
-            generation_id: self.generation.id,
-            epoch: self.generation.epoch,
-            key_revision: self.generation.key_revision,
-            key: self.generation.key.clone(),
-            live_binding: None,
-        };
-        let table = self
-            .generation
-            .table
-            .enforced()
-            .with_coverage_binding(binding);
-        sink(&table).map_err(|_| CoverageError::Unavailable)
+        Ok(result)
     }
 
     pub(crate) fn purpose(&self) -> CoverageScope {

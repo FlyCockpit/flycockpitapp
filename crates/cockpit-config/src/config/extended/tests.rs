@@ -3697,6 +3697,7 @@ fn image_sidecar_selection_is_a_typed_local_config_field() {
         }),
         untrusted_primary_default: None,
         per_primary_override: None,
+        permitted: Vec::new(),
     };
     let cfg = ExtendedConfig {
         image_sidecar: selection.clone(),

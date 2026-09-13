@@ -8284,17 +8284,129 @@ CREATE TABLE installation_operations (
 
 -- Cross-authority onboarding publication intent. Config preimages remain in
 -- a daemon-private journal file; this row is the durable recovery owner that
--- restores those bytes, restores the prior default selection, and removes
--- only the installation named by operation.  The row and private preimage are
--- one recovery authority: neither is discarded while compensation remains.
+-- restores those bytes, restores the prior default selection, removes only
+-- the installation named by operation, and inverts the nested authored
+-- journal addressed by (authored_owner_digest, operation_id).  The row and
+-- private preimage are one recovery authority: neither is discarded while
+-- compensation remains.
 CREATE TABLE onboarding_agent_publication_journals (
     operation_id                 TEXT PRIMARY KEY,
     backup_path                  TEXT NOT NULL,
     previous_default_installation_id TEXT REFERENCES agent_installations(installation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    authored_owner_digest        TEXT NOT NULL CHECK (length(trim(authored_owner_digest)) > 0),
     created_at_unix_ms           INTEGER NOT NULL
 );
 CREATE INDEX idx_onboarding_agent_publication_journals_previous
     ON onboarding_agent_publication_journals (previous_default_installation_id);
+
+-- Durable authored-package publication intent. Inserted before any
+-- installation, sidecar, default-selection, or draft-CAS effect. Crash
+-- recovery completes the remaining effects from this row without
+-- re-validating live policy or onboarding identity, then finishes a
+-- matching local operation from the terminal receipt. Onboarding callers
+-- journal here too; the row is not tied to local_operation_receipts so a
+-- nested wizard apply can still record intent. package_files_json stores
+-- hex-encoded canonical package files (4 MiB raw, doubled by hex, plus JSON
+-- wrapping); its 10 MiB cap must remain derived from that package contract.
+CREATE TABLE authored_agent_package_journals (
+    owner_digest           TEXT NOT NULL,
+    client_operation_id    TEXT NOT NULL,
+    request_hash           BLOB NOT NULL CHECK (typeof(request_hash) = 'blob' AND length(request_hash) = 32),
+    fencing_generation     INTEGER NOT NULL CHECK (fencing_generation > 0),
+    policy_revision        TEXT NOT NULL CHECK (length(trim(policy_revision)) > 0),
+    package_digest         TEXT NOT NULL CHECK (length(trim(package_digest)) = 64 AND package_digest = lower(package_digest)),
+    draft_revision         TEXT NOT NULL CHECK (length(trim(draft_revision)) > 0),
+    expected_draft_revision TEXT CHECK (
+        expected_draft_revision IS NULL
+        OR (length(trim(expected_draft_revision)) > 0)
+    ),
+    agent_name             TEXT NOT NULL CHECK (length(trim(agent_name)) > 0),
+    source_locator         TEXT NOT NULL CHECK (length(trim(source_locator)) > 0),
+    source_pin             TEXT,
+    require_third_party    INTEGER NOT NULL CHECK (require_third_party IN (0, 1)),
+    third_party_trust_confirmed INTEGER NOT NULL CHECK (third_party_trust_confirmed IN (0, 1)),
+    make_default           INTEGER NOT NULL CHECK (make_default IN (0, 1)),
+    sidecar_intent_json    TEXT NOT NULL CHECK (
+        json_valid(sidecar_intent_json)
+        AND json_type(sidecar_intent_json) = 'object'
+        AND length(CAST(sidecar_intent_json AS BLOB)) <= 65536
+    ),
+    package_files_json     TEXT NOT NULL CHECK (
+        json_valid(package_files_json)
+        AND json_type(package_files_json) = 'object'
+        AND length(CAST(package_files_json AS BLOB)) <= 10485760
+    ),
+    review_json            TEXT NOT NULL CHECK (
+        json_valid(review_json)
+        AND json_type(review_json) = 'object'
+        AND length(CAST(review_json AS BLOB)) <= 1048576
+    ),
+    installation_id        TEXT,
+    default_selected       INTEGER NOT NULL CHECK (default_selected IN (0, 1)),
+    onboarding_run_id      TEXT,
+    onboarding_attempt_id  TEXT,
+    onboarding_stage_revision INTEGER,
+    settlement_phase       TEXT NOT NULL CHECK (settlement_phase IN ('publication_pending', 'terminal')),
+    terminal_response_json TEXT CHECK (
+        terminal_response_json IS NULL OR (
+            json_valid(terminal_response_json)
+            AND length(CAST(terminal_response_json AS BLOB)) <= 1048576
+        )
+    ),
+    created_at_unix_ms     INTEGER NOT NULL,
+    PRIMARY KEY (owner_digest, client_operation_id),
+    CHECK (length(trim(owner_digest)) > 0),
+    CHECK (length(trim(client_operation_id)) > 0),
+    CHECK ((settlement_phase = 'terminal') = (terminal_response_json IS NOT NULL))
+);
+CREATE INDEX authored_agent_package_journals_created
+ON authored_agent_package_journals(created_at_unix_ms);
+CREATE INDEX authored_agent_package_journals_pending
+ON authored_agent_package_journals(settlement_phase, created_at_unix_ms)
+WHERE settlement_phase = 'publication_pending';
+CREATE TRIGGER authored_agent_package_journals_identity_immutable
+BEFORE UPDATE ON authored_agent_package_journals
+WHEN NEW.owner_digest <> OLD.owner_digest
+  OR NEW.client_operation_id <> OLD.client_operation_id
+  OR NEW.request_hash <> OLD.request_hash
+  OR NEW.fencing_generation <> OLD.fencing_generation
+  OR NEW.policy_revision <> OLD.policy_revision
+  OR NEW.package_digest <> OLD.package_digest
+  OR NEW.draft_revision <> OLD.draft_revision
+  OR NEW.expected_draft_revision IS NOT OLD.expected_draft_revision
+  OR NEW.agent_name <> OLD.agent_name
+  OR NEW.source_locator <> OLD.source_locator
+  OR NEW.source_pin IS NOT OLD.source_pin
+  OR NEW.require_third_party <> OLD.require_third_party
+  OR NEW.third_party_trust_confirmed <> OLD.third_party_trust_confirmed
+  OR NEW.make_default <> OLD.make_default
+  OR NEW.sidecar_intent_json <> OLD.sidecar_intent_json
+  OR NEW.package_files_json <> OLD.package_files_json
+  OR NEW.review_json <> OLD.review_json
+  OR NEW.default_selected <> OLD.default_selected
+  OR NEW.onboarding_run_id IS NOT OLD.onboarding_run_id
+  OR NEW.onboarding_attempt_id IS NOT OLD.onboarding_attempt_id
+  OR NEW.onboarding_stage_revision IS NOT OLD.onboarding_stage_revision
+  OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
+  OR (OLD.installation_id IS NOT NULL AND NEW.installation_id IS NOT OLD.installation_id)
+  OR (OLD.terminal_response_json IS NOT NULL AND NEW.terminal_response_json IS NOT OLD.terminal_response_json)
+  OR (OLD.settlement_phase = 'terminal' AND NEW.settlement_phase <> OLD.settlement_phase)
+BEGIN
+    SELECT RAISE(ABORT, 'authored agent package journal identity is immutable');
+END;
+
+-- Last authoritative in-progress authored draft per agent name. Edit/retry
+-- CAS compares draft_revision; a failed child must not advance this row.
+-- Compensation of a failed outer publication restores expected_draft_revision
+-- (deleting the row when that prior state was None) before dropping the
+-- nested authored journal.
+CREATE TABLE authored_agent_package_drafts (
+    agent_name         TEXT PRIMARY KEY,
+    draft_revision     TEXT NOT NULL CHECK (length(trim(draft_revision)) > 0),
+    package_digest     TEXT NOT NULL CHECK (length(trim(package_digest)) = 64 AND package_digest = lower(package_digest)),
+    updated_at_unix_ms INTEGER NOT NULL,
+    CHECK (length(trim(agent_name)) > 0)
+);
 
 CREATE TABLE installation_continuations (
     continuation_token           TEXT PRIMARY KEY,

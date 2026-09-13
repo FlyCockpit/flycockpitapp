@@ -87,6 +87,9 @@ pub(crate) enum VerificationOutcome {
 pub(crate) struct VerificationDispatchPlan {
     pub operation_id: Uuid,
     pub attempt_revision: i64,
+    /// Number of goal-skeptic reviews the compiled policy scheduled for this
+    /// intercept. Zero means the planner did not schedule skeptics.
+    pub goal_skeptics: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -232,6 +235,7 @@ pub(crate) async fn intercept_ordinary_call(input: InterceptInput<'_>) -> Verifi
                     plan: VerificationDispatchPlan {
                         operation_id: memo.operation_id,
                         attempt_revision: memo.dispatch_attempt_revision,
+                        goal_skeptics: memo.goal_skeptics,
                     },
                 }
             }
@@ -250,6 +254,7 @@ pub(crate) async fn intercept_ordinary_call(input: InterceptInput<'_>) -> Verifi
                 plan: VerificationDispatchPlan {
                     operation_id: memo.operation_id,
                     attempt_revision: memo.dispatch_attempt_revision,
+                    goal_skeptics: memo.goal_skeptics,
                 },
             },
         };
@@ -1030,6 +1035,12 @@ async fn reserve_dispatch(
     Ok(VerificationDispatchPlan {
         operation_id,
         attempt_revision: attempt.revision,
+        goal_skeptics: input
+            .agent
+            .vnext_grant
+            .as_ref()
+            .map(|grant| grant.goal_skeptics_count())
+            .unwrap_or(0),
     })
 }
 
@@ -1221,10 +1232,11 @@ mod tests {
     use super::*;
     use crate::{
         agents::{
-            EffectiveVnextGrant, ExecutionKind, GeneratorSpec, ModelCapability, ModelLocality,
-            ModelSlot, OnAdjudicationFailure, OnBudgetExceeded, SelectorPredicate, ToolClass,
-            VerificationAction, VerificationMode, VerificationPolicy, VerificationRecipe,
-            VerificationRule, VerificationSelector, VnextAgentDef, VnextHostPolicy,
+            EffectiveVnextGrant, ExecutionKind, GeneratorSpec, GoalSkepticsPolicy, ModelCapability,
+            ModelLocality, ModelSlot, OnAdjudicationFailure, OnBudgetExceeded, SelectorPredicate,
+            ToolClass, VerificationAction, VerificationMode, VerificationPolicy,
+            VerificationRecipe, VerificationRule, VerificationSelector, VnextAgentDef,
+            VnextHostPolicy,
         },
         db::{
             agent_tree_decisions::NewAgentInstance,
@@ -1535,6 +1547,7 @@ mod tests {
             delegation: crate::agents::DelegationPolicy::default(),
             questions: None,
             verification: Some(VerificationPolicy {
+                goal_skeptics: GoalSkepticsPolicy::Off,
                 rules: vec![VerificationRule {
                     selector: VerificationSelector {
                         all_of: vec![SelectorPredicate::ToolClass {
@@ -1896,6 +1909,7 @@ mod tests {
             delegation: crate::agents::DelegationPolicy::default(),
             questions: None,
             verification: Some(VerificationPolicy {
+                goal_skeptics: GoalSkepticsPolicy::Off,
                 rules: vec![VerificationRule {
                     selector: VerificationSelector {
                         all_of: vec![SelectorPredicate::ToolClass {
@@ -1989,6 +2003,7 @@ mod tests {
             delegation: crate::agents::DelegationPolicy::default(),
             questions: None,
             verification: Some(VerificationPolicy {
+                goal_skeptics: GoalSkepticsPolicy::Off,
                 rules: vec![VerificationRule {
                     selector: VerificationSelector {
                         all_of: vec![SelectorPredicate::ToolClass {
@@ -2020,6 +2035,7 @@ mod tests {
             delegation: crate::agents::DelegationPolicy::default(),
             questions: None,
             verification: Some(VerificationPolicy {
+                goal_skeptics: GoalSkepticsPolicy::Off,
                 rules: vec![VerificationRule {
                     selector: VerificationSelector {
                         all_of: vec![SelectorPredicate::ToolClass {

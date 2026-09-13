@@ -56,7 +56,7 @@ pub(crate) fn is_package_child_installation(row: &AgentInstallationRow) -> bool 
 }
 
 const MAX_AGENT_MARKDOWN_BYTES: usize = 1024 * 1024;
-const MAX_AGENT_PACKAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_AGENT_PACKAGE_BYTES: usize = crate::agents::MAX_PACKAGE_BYTES as usize;
 /// Hook files share the bounded retained-workspace config policy.  Keep this
 /// explicit at the acquisition boundary: parser errors may be warnings, but
 /// an oversized capability-backed source is not safe to read or publish.
@@ -4610,6 +4610,257 @@ impl AgentInstallationService {
         Ok(receipt)
     }
 
+    /// Persist a canonical authored package through the installation journal.
+    /// The complete file map is staged and published before the installation
+    /// row becomes visible; a failed child never leaves a partial parent.
+    pub(crate) async fn commit_authored_package(
+        &self,
+        idempotency_key: String,
+        name: &str,
+        source_locator: String,
+        source_revision: Option<String>,
+        require_third_party_confirmation: bool,
+        third_party_trust_confirmed: bool,
+        files: BTreeMap<String, Vec<u8>>,
+        package_digest: String,
+        now: i64,
+    ) -> AgentInstallationResultV1 {
+        match self
+            .commit_authored_package_inner(
+                idempotency_key,
+                name,
+                source_locator,
+                source_revision,
+                require_third_party_confirmation,
+                third_party_trust_confirmed,
+                files,
+                package_digest,
+                now,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => redacted_error(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_authored_package_inner(
+        &self,
+        idempotency_key: String,
+        name: &str,
+        source_locator: String,
+        source_revision: Option<String>,
+        require_third_party_confirmation: bool,
+        third_party_trust_confirmed: bool,
+        files: BTreeMap<String, Vec<u8>>,
+        package_digest: String,
+        now: i64,
+    ) -> Result<AgentInstallationResultV1> {
+        ensure!(
+            !name.is_empty()
+                && !name.contains('/')
+                && !name.contains('\\')
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
+            "authored agent name is invalid"
+        );
+        ensure!(
+            !crate::agents::is_builtin_agent(name),
+            "daemon authoring may not overwrite a protected builtin agent"
+        );
+        validate_idempotency_key(&idempotency_key)?;
+        ensure!(
+            files.contains_key(crate::agents::PACKAGE_ROOT_FILE),
+            "authored package is missing agent.md"
+        );
+        for path in files.keys() {
+            crate::agents::validate_package_relative_path(path)?;
+        }
+        if require_third_party_confirmation {
+            ensure!(
+                third_party_trust_confirmed,
+                "third-party agent installation requires explicit security confirmation"
+            );
+        }
+        let mut fingerprint_hasher = Sha256::new();
+        fingerprint_hasher.update(b"authored-package-v1\0");
+        fingerprint_hasher.update(name.as_bytes());
+        fingerprint_hasher.update([0]);
+        fingerprint_hasher.update(source_locator.as_bytes());
+        fingerprint_hasher.update([0]);
+        fingerprint_hasher.update(package_digest.as_bytes());
+        let fingerprint = crate::intel::hex_lower(&fingerprint_hasher.finalize());
+        let begun = self
+            .db
+            .begin_installation_operation_with_staged_journal(
+                idempotency_key.clone(),
+                fingerprint.clone(),
+                InstallationOperationKind::Create,
+                None,
+                serde_json::json!({
+                    "target_name": name,
+                    "digest": package_digest,
+                    "files": files.keys().cloned().collect::<Vec<_>>(),
+                })
+                .to_string(),
+                package_digest.clone(),
+                now,
+            )
+            .await?;
+        let operation = match begun {
+            BeginInstallationOperation::KeyConflict => {
+                bail!("idempotency key was previously used for a different request")
+            }
+            BeginInstallationOperation::Replay(operation) => {
+                if operation.terminal_receipt_json.is_some() {
+                    return replay_operation(operation.terminal_receipt_json.as_deref());
+                }
+                operation
+            }
+            BeginInstallationOperation::Created(operation) => operation,
+        };
+        let prior_journal = self.db.installation_journal(operation.operation_id).await?;
+        let package_dir = self.daemon_agents_dir.join(name);
+        let flat_target = owned_path(
+            &self.daemon_agents_dir,
+            None,
+            AgentInstallationScopeWire::Global,
+            name,
+        )?;
+        ensure_no_reparse_components(
+            flat_target
+                .parent()
+                .context("owned authored package missing parent")?,
+        )?;
+        let journal = prior_journal.unwrap_or(InstallationJournalRow {
+            journal_id: Uuid::new_v4(),
+            operation_id: operation.operation_id,
+            checkpoint: InstallationJournalCheckpoint::Staged,
+            staged_file_metadata_json: Some(
+                serde_json::json!({"target_name": name, "digest": package_digest}).to_string(),
+            ),
+            prior_file_metadata_json: None,
+            expected_digest: package_digest.clone(),
+        });
+        ensure!(
+            journal.expected_digest == package_digest,
+            "recovery package digest changed for the original authored request"
+        );
+        if journal.checkpoint == InstallationJournalCheckpoint::Staged {
+            std::fs::create_dir_all(&self.daemon_agents_dir)
+                .context("creating daemon-owned authored package directory")?;
+            stage_authored_package_files(
+                &self.daemon_agents_dir,
+                name,
+                operation.operation_id,
+                &files,
+            )?;
+            self.db
+                .record_installation_journal(journal.clone(), now)
+                .await?;
+        }
+        let outcome = self
+            .db
+            .install_agent(AgentInstallationInput {
+                installation_id: operation.operation_id,
+                scope: AgentInstallationScope::Global,
+                canonical_workspace_id: None,
+                source_agent_id: format!("authored/{name}"),
+                source_identity: source_locator,
+                source_revision,
+                source_digest: package_digest.clone(),
+                fetched_at_unix_ms: now,
+            })
+            .await?;
+        let installation = match outcome {
+            InstallAgentOutcome::Installed(row) | InstallAgentOutcome::AlreadyInstalled(row) => row,
+            InstallAgentOutcome::Conflict => {
+                rollback_authored_package_stage(
+                    &self.daemon_agents_dir,
+                    name,
+                    operation.operation_id,
+                );
+                bail!("agent create collision")
+            }
+        };
+        bind_authored_package_primary(
+            &self.db,
+            &self.providers,
+            name,
+            &files,
+            &package_digest,
+            installation.installation_id,
+            &operation.operation_id.to_string(),
+            &fingerprint,
+            now,
+        )
+        .await?;
+        if checkpoint_rank(journal.checkpoint)
+            < checkpoint_rank(InstallationJournalCheckpoint::DbCommitted)
+        {
+            self.db
+                .record_installation_journal(
+                    InstallationJournalRow {
+                        checkpoint: InstallationJournalCheckpoint::DbCommitted,
+                        ..journal.clone()
+                    },
+                    now,
+                )
+                .await?;
+        }
+        if checkpoint_rank(journal.checkpoint)
+            < checkpoint_rank(InstallationJournalCheckpoint::FileRenamed)
+        {
+            publish_authored_package_files(
+                &self.daemon_agents_dir,
+                name,
+                operation.operation_id,
+                &files,
+                &package_digest,
+            )?;
+            self.db
+                .record_installation_journal(
+                    InstallationJournalRow {
+                        checkpoint: InstallationJournalCheckpoint::FileRenamed,
+                        ..journal.clone()
+                    },
+                    now,
+                )
+                .await?;
+        } else {
+            ensure!(
+                authored_package_digest_matches(&package_dir, &flat_target, &package_digest)?,
+                "published authored package digest changed during recovery"
+            );
+        }
+        let receipt = receipt(
+            operation.operation_id,
+            AgentInstallationReceiptStatusV1::Created,
+            Some(installation.installation_id.to_string()),
+            None,
+        );
+        self.db
+            .record_installation_journal(
+                InstallationJournalRow {
+                    checkpoint: InstallationJournalCheckpoint::Complete,
+                    ..journal
+                },
+                now,
+            )
+            .await?;
+        self.db
+            .finish_installation_operation(
+                operation.operation_id,
+                serde_json::to_string(&receipt)?,
+                now,
+            )
+            .await?;
+        discard_authored_package_prior(&self.daemon_agents_dir, name, operation.operation_id)?;
+        Ok(receipt)
+    }
+
     async fn resolve_scope(
         &self,
         scope: AgentInstallationScopeWire,
@@ -5796,6 +6047,210 @@ fn remove_owned_file(path: &Path) -> Result<()> {
     ensure!(owned_file_exists(path, false)?, "owned file disappeared");
     std::fs::remove_file(path).context("removing owned agent file")
 }
+async fn bind_authored_package_primary(
+    db: &Db,
+    providers: &ProvidersConfig,
+    name: &str,
+    files: &BTreeMap<String, Vec<u8>>,
+    package_digest: &str,
+    installation_id: Uuid,
+    idempotency_key: &str,
+    request_fingerprint: &str,
+    now: i64,
+) -> Result<()> {
+    let definition = crate::agents::load_workspace_package_from_files(name, files.clone())
+        .context("loading authored package for primary binding")?;
+    let Some(primary) = definition
+        .definition_frontmatter()
+        .as_ref()
+        .and_then(|frontmatter| frontmatter.model_slots.get("primary"))
+        .cloned()
+    else {
+        bail!("authored package is missing a primary model slot");
+    };
+    let offerings = setup_offerings(providers);
+    let mut bindings = Vec::new();
+    for grant in &primary.models {
+        let offering = offerings
+            .iter()
+            .find(|offering| {
+                offering.model_id == grant.model_id && offering.provider_id == grant.provider_id
+            })
+            .with_context(|| {
+                format!(
+                    "authored grant {}/{} is not a configured provider route",
+                    grant.provider_id, grant.model_id
+                )
+            })?;
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "slot": "primary",
+            "provider": offering.provider_id,
+            "model": grant.model_id,
+        }))?;
+        bindings.push(cockpit_db::db::agent_installations::AgentBindingInput {
+            slot_id: "primary".into(),
+            provider_profile_handle: offering.provider_profile_handle.clone(),
+            model_id: grant.model_id.clone(),
+            provenance_digest: sha256_hex(&payload),
+            provenance_payload: payload,
+            hard_capability_verified: true,
+            is_default: grant.default,
+        });
+    }
+    ensure!(
+        bindings.iter().filter(|binding| binding.is_default).count() == 1,
+        "authored package must bind exactly one default primary route"
+    );
+    let observation = db
+        .agent_observation(installation_id)
+        .await?
+        .context("authored installation is missing its observation")?;
+    let outcome = db
+        .bind_agent_slot_set(cockpit_db::db::agent_installations::AgentBindSlotSetInput {
+            installation_id,
+            expected_observation_revision: observation.observation_revision,
+            expected_definition_digest: package_digest.to_string(),
+            expected_binding_revision: None,
+            idempotency_key: idempotency_key.to_string(),
+            request_fingerprint: request_fingerprint.to_string(),
+            bindings,
+            now_unix_ms: now,
+        })
+        .await?;
+    match outcome {
+        cockpit_db::db::agent_installations::BindAgentOutcome::Bound(_)
+        | cockpit_db::db::agent_installations::BindAgentOutcome::AlreadyBound(_) => Ok(()),
+        other => bail!("authored package primary bind failed: {other:?}"),
+    }
+}
+
+fn authored_package_stage_dir(global: &Path, name: &str, operation: Uuid) -> PathBuf {
+    global.join(format!(".{name}.{operation}.staged-pkg"))
+}
+
+fn authored_package_target_dir(global: &Path, name: &str) -> PathBuf {
+    global.join(name)
+}
+
+fn write_relative_package_files(root: &Path, files: &BTreeMap<String, Vec<u8>>) -> Result<()> {
+    std::fs::create_dir_all(root).context("creating authored package staging directory")?;
+    for (relative, bytes) in files {
+        crate::agents::validate_package_relative_path(relative)?;
+        ensure!(
+            !std::path::Path::new(relative).is_absolute(),
+            "authored package path must be relative"
+        );
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating authored package parent for {relative}"))?;
+        }
+        crate::config::config::files::atomic_write(&path, bytes)
+            .with_context(|| format!("writing authored package file {relative}"))?;
+    }
+    Ok(())
+}
+
+fn stage_authored_package_files(
+    global: &Path,
+    name: &str,
+    operation: Uuid,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<()> {
+    let staged = authored_package_stage_dir(global, name, operation);
+    if staged.exists() {
+        if let Ok(existing) = collect_package_tree(&staged)
+            && &existing == files
+        {
+            return Ok(());
+        }
+        let _ = std::fs::remove_dir_all(&staged);
+    }
+    write_relative_package_files(&staged, files)
+}
+
+fn publish_authored_package_files(
+    global: &Path,
+    name: &str,
+    operation: Uuid,
+    files: &BTreeMap<String, Vec<u8>>,
+    digest: &str,
+) -> Result<()> {
+    let staged = authored_package_stage_dir(global, name, operation);
+    let target = authored_package_target_dir(global, name);
+    let staged_files = collect_package_tree(&staged)?;
+    ensure!(
+        sha256_hex(&crate::agents::package_digest_preimage(&staged_files)) == digest,
+        "staged authored package digest changed before publish"
+    );
+    ensure!(
+        &staged_files == files,
+        "staged authored package files changed before publish"
+    );
+    if target.exists() {
+        let current = collect_package_tree(&target)?;
+        if sha256_hex(&crate::agents::package_digest_preimage(&current)) == digest {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Ok(());
+        }
+        bail!("owned authored package became dirty/collided before publish");
+    }
+    std::fs::rename(&staged, &target).context("publishing authored package directory")?;
+    Ok(())
+}
+
+fn rollback_authored_package_stage(global: &Path, name: &str, operation: Uuid) {
+    let staged = authored_package_stage_dir(global, name, operation);
+    let _ = std::fs::remove_dir_all(staged);
+}
+
+fn discard_authored_package_prior(global: &Path, name: &str, operation: Uuid) -> Result<()> {
+    let staged = authored_package_stage_dir(global, name, operation);
+    if staged.exists() {
+        std::fs::remove_dir_all(&staged)
+            .context("discarding leftover authored package staging directory")?;
+    }
+    Ok(())
+}
+
+fn authored_package_digest_matches(
+    package_dir: &Path,
+    flat_target: &Path,
+    digest: &str,
+) -> Result<bool> {
+    if package_dir.is_dir() {
+        let files = collect_package_tree(package_dir)?;
+        return Ok(sha256_hex(&crate::agents::package_digest_preimage(&files)) == digest);
+    }
+    if owned_file_exists(flat_target, false)? {
+        let bytes = read_owned_file(flat_target, "reading published authored definition")?;
+        let mut files = BTreeMap::new();
+        files.insert(crate::agents::PACKAGE_ROOT_FILE.to_string(), bytes);
+        return Ok(sha256_hex(&crate::agents::package_digest_preimage(&files)) == digest);
+    }
+    Ok(false)
+}
+
+fn collect_package_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+    #[cfg(any(unix, windows))]
+    {
+        return cockpit_host::private_fs::read_nofollow_directory_tree(
+            root,
+            MAX_AGENT_MARKDOWN_BYTES as u64,
+            MAX_AGENT_PACKAGE_BYTES as u64,
+        )
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("reading authored package {}", root.display()));
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        bail!(
+            "authored package traversal is unavailable on this platform; refusing pathname-based fallback for {}",
+            root.display()
+        )
+    }
+}
+
 fn rollback_stage(target: &Path, operation: Uuid) {
     if let Ok(staged) = stage_path(target, operation) {
         let _ = remove_owned_file(&staged);
@@ -6582,6 +7037,24 @@ pub(crate) fn wire_provider_id_for_profile_route(
         .flatten()
 }
 
+/// Map a redacted wire provider id plus model back to the daemon-local
+/// credential-route handle. Display tokens (`configured-provider-{index}`)
+/// never persist as live config-map keys.
+pub(crate) fn resolvable_provider_handle_for_route(
+    providers: &ProvidersConfig,
+    provider_id: &str,
+    model_id: &str,
+) -> Option<String> {
+    let offerings = setup_offerings(providers);
+    let mut handles = std::collections::BTreeSet::new();
+    for offering in &offerings {
+        if offering.model_id == model_id && offering.provider_id == provider_id {
+            handles.insert(offering.provider_profile_handle.clone());
+        }
+    }
+    (handles.len() == 1).then(|| handles.into_iter().next().expect("unique provider handle"))
+}
+
 /// Map a session-setup / installation wire choice back to the config-map key
 /// `Model::for_provider` can look up. The wire `provider_id` is a display
 /// token for custom providers (`configured-provider-{index}`) and must never
@@ -6593,15 +7066,9 @@ pub(crate) fn resolvable_provider_handle_for_choice(
     let offerings = setup_offerings(providers);
     let mut handles = std::collections::BTreeSet::new();
     for offering in &offerings {
-        if offering.model_id == choice.model_id
-            && (offering.provider_id == choice.provider_id
-                || offering.provider_profile_handle == choice.provider_id)
-        {
+        if offering.model_id == choice.model_id && offering.provider_id == choice.provider_id {
             handles.insert(offering.provider_profile_handle.clone());
         }
-    }
-    if providers.providers.contains_key(&choice.provider_id) {
-        handles.insert(choice.provider_id.clone());
     }
     if handles.len() == 1 {
         handles.into_iter().next()
@@ -6918,7 +7385,7 @@ fn redacted_error(error: anyhow::Error) -> AgentInstallationResultV1 {
         AgentInstallationErrorCodeV1::IdempotencyConflict
     } else if text.contains("workspace authorization") {
         AgentInstallationErrorCodeV1::UnauthorizedWorkspace
-    } else if text.contains("authorization") || text.contains("private") {
+    } else if text.contains("authorization") {
         AgentInstallationErrorCodeV1::PrivateSourceUnauthorized
     } else if text.contains("unknown installation choice") {
         AgentInstallationErrorCodeV1::UnknownChoice
@@ -6940,6 +7407,8 @@ fn redacted_error(error: anyhow::Error) -> AgentInstallationResultV1 {
     } else if text.contains("vNext")
         || text.contains("invalid fetched AgentDef")
         || text.contains("fetched agent Markdown")
+        || text.contains("loading authored package")
+        || text.contains("private subagent")
     {
         AgentInstallationErrorCodeV1::InvalidDefinition
     } else if text.contains("fetch") {
@@ -7927,6 +8396,78 @@ mod tests {
             panic!("same scope authored identity must not overwrite")
         };
         assert_eq!(error.code, AgentInstallationErrorCodeV1::Collision);
+    }
+
+    #[tokio::test]
+    async fn authored_package_commit_is_atomic_and_idempotent() {
+        let harness = ServiceHarness::with_providers(
+            FetchReply::Failure("authoring does not fetch".into()),
+            binding_providers(),
+        );
+        let markdown = b"---\nschemaVersion: 1\nagentId: authored/helper\nroles: [code]\ndescription: helper\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n    models:\n      - providerId: vendor\n        modelId: exact-a\n        default: true\n---\nbody\n".to_vec();
+        let child = b"---\nschemaVersion: 1\nagentId: authored/reviewer\nroles: [code]\ndescription: reviewer\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n    models:\n      - providerId: vendor\n        modelId: exact-a\n        default: true\n---\nbody\n".to_vec();
+        let mut files = BTreeMap::new();
+        files.insert("agent.md".into(), markdown);
+        files.insert("subagents/reviewer.md".into(), child);
+        files.insert("mcp.json".into(), b"{\"mcpServers\":{}}".to_vec());
+        let digest = crate::intel::hex_lower(&Sha256::digest(
+            &crate::agents::package_digest_preimage(&files),
+        ));
+        let first = harness
+            .service
+            .commit_authored_package(
+                "authored-package-once".into(),
+                "helper",
+                "authored/helper".into(),
+                None,
+                false,
+                false,
+                files.clone(),
+                digest.clone(),
+                1,
+            )
+            .await;
+        let AgentInstallationResultV1::Receipt {
+            installation_id: Some(installation_id),
+            status: AgentInstallationReceiptStatusV1::Created,
+            ..
+        } = first
+        else {
+            panic!("authored package must install once: {first:?}")
+        };
+        let replay = harness
+            .service
+            .commit_authored_package(
+                "authored-package-once".into(),
+                "helper",
+                "authored/helper".into(),
+                None,
+                false,
+                false,
+                files.clone(),
+                digest.clone(),
+                2,
+            )
+            .await;
+        let AgentInstallationResultV1::Receipt {
+            installation_id: Some(replay_id),
+            ..
+        } = replay
+        else {
+            panic!("same operation must replay the exact install: {replay:?}")
+        };
+        assert_eq!(installation_id, replay_id);
+        assert_eq!(harness.fetcher.calls.load(Ordering::SeqCst), 0);
+        let package = harness._root.path().join("daemon-agents/helper");
+        assert!(package.join("agent.md").is_file());
+        assert!(package.join("subagents/reviewer.md").is_file());
+        assert!(package.join("mcp.json").is_file());
+        let listed = harness
+            .db
+            .list_agent_installations(AgentInstallationScope::Global, None)
+            .await
+            .expect("list installations");
+        assert_eq!(listed.len(), 1);
     }
 
     #[tokio::test]
@@ -11785,6 +12326,53 @@ mod tests {
             resolvable_provider_handle_for_choice(&providers, &choice).as_deref(),
             Some("profile-secret")
         );
+        assert_eq!(
+            resolvable_provider_handle_for_route(&providers, "profile-secret", "glm"),
+            None
+        );
+        assert_eq!(
+            resolvable_provider_handle_for_route(&providers, "configured-provider-0", "glm")
+                .as_deref(),
+            Some("profile-secret")
+        );
+        let handle_choice = AgentInstallationChoiceV1 {
+            provider_id: "profile-secret".into(),
+            ..choice.clone()
+        };
+        assert_eq!(
+            resolvable_provider_handle_for_choice(&providers, &handle_choice),
+            None
+        );
+    }
+
+    #[test]
+    fn authored_binding_and_route_resolution_accept_only_wire_provider_ids() {
+        let source = include_str!("agent_installation.rs");
+        let bind = source
+            .split("async fn bind_authored_package_primary")
+            .nth(1)
+            .and_then(|tail| tail.split("fn authored_package_stage_dir").next())
+            .expect("authored primary bind");
+        assert!(bind.contains("offering.provider_id == grant.provider_id"));
+        assert!(!bind.contains("provider_profile_handle == grant.provider_id"));
+        let route = source
+            .split("pub(crate) fn resolvable_provider_handle_for_route")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("pub(crate) fn resolvable_provider_handle_for_choice")
+                    .next()
+            })
+            .expect("route resolver");
+        assert!(route.contains("offering.provider_id == provider_id"));
+        assert!(!route.contains("provider_profile_handle == provider_id"));
+        let choice = source
+            .split("pub(crate) fn resolvable_provider_handle_for_choice")
+            .nth(1)
+            .and_then(|tail| tail.split("fn first_exact_author_choice").next())
+            .expect("choice resolver");
+        assert!(choice.contains("offering.provider_id == choice.provider_id"));
+        assert!(!choice.contains("provider_profile_handle == choice.provider_id"));
+        assert!(!choice.contains("providers.providers.contains_key(&choice.provider_id)"));
     }
 
     #[test]

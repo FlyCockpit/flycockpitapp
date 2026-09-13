@@ -954,6 +954,28 @@ fn goal_settings_effective_resolution_session_over_agent_over_global() {
 }
 
 #[test]
+fn resolved_goal_policy_json_snapshots_agent_goal_skeptics() {
+    let config = crate::config::extended::GoalSupervisionConfig {
+        enabled: true,
+        cold_skeptic_count: 3,
+        ..Default::default()
+    };
+    let encoded = super::resolved_goal_policy_json(
+        &config,
+        Some(crate::agents::GoalSkepticsPolicy::Count { count: 2 }),
+    )
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(value["goalSkeptics"]["mode"], "count");
+    assert_eq!(value["goalSkeptics"]["count"], 2);
+    let encoded_off =
+        super::resolved_goal_policy_json(&config, Some(crate::agents::GoalSkepticsPolicy::Off))
+            .unwrap();
+    let off: serde_json::Value = serde_json::from_str(&encoded_off).unwrap();
+    assert_eq!(off["goalSkeptics"]["mode"], "off");
+}
+
+#[test]
 fn goal_settings_override_rejects_invalid_values() {
     assert!(
         GoalSettingsOverride {

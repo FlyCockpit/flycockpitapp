@@ -2094,6 +2094,7 @@ mod tests {
                 max_concurrent_children: Some(2),
                 targets,
                 default_child: None,
+                interactive_subagents: false,
             },
             questions: None,
             verification: None,

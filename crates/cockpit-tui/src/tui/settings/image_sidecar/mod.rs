@@ -597,6 +597,7 @@ impl SidecarFormState {
             trusted_primary_default: self.trusted_default.as_ref().map(to_pair),
             untrusted_primary_default: self.untrusted_default.as_ref().map(to_pair),
             per_primary_override: self.override_pair.as_ref().map(to_pair),
+            permitted: Vec::new(),
         }
     }
 

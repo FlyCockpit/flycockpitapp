@@ -1390,6 +1390,10 @@ pub enum Response {
     /// Typed, redacted daemon-owned agent installation operation outcome.
     AgentInstallation(crate::AgentInstallationResultV1),
 
+    AgentAuthoringProjection(crate::AgentAuthoringProjection),
+    AuthoredAgentPackage(crate::ApplyAuthoredAgentPackageOutcome),
+    AuthoredAgentPackageReceipt(Option<crate::ApplyAuthoredAgentPackageReceipt>),
+
     #[serde(other)]
     Unknown,
 }
@@ -1883,6 +1887,9 @@ macro_rules! response_variants {
             (Response::DoctorSnapshot { .. }, "doctor_snapshot");
             (Response::DocsAnswer { .. }, "docs_answer");
             (Response::AgentInstallation(..), "agent_installation");
+            (Response::AgentAuthoringProjection(..), "agent_authoring_projection");
+            (Response::AuthoredAgentPackage(..), "authored_agent_package");
+            (Response::AuthoredAgentPackageReceipt(..), "authored_agent_package_receipt");
             (Response::Unknown, "__unknown");
         ] }
     };

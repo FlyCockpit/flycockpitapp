@@ -44,6 +44,11 @@ pub struct SidecarSelectionConfig {
     pub untrusted_primary_default: Option<SidecarProviderModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_primary_override: Option<SidecarProviderModel>,
+    /// Exclusive authored-package candidate universe. When non-empty, only
+    /// these destinations may be selected. Empty means the trust-class
+    /// defaults and override above are the full configuration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permitted: Vec<SidecarProviderModel>,
 }
 
 #[cfg(test)]
@@ -63,6 +68,7 @@ mod tests {
                 model: "vision".into(),
             }),
             per_primary_override: None,
+            permitted: Vec::new(),
         };
 
         let value = serde_json::to_value(&config).expect("selection config serializes");

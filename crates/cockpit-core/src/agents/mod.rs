@@ -66,7 +66,7 @@ pub(crate) use vnext::author_slot;
 pub use vnext::{
     AgentRole, AllowedChild, AutoAnswer, CompiledVerificationPolicy, CompiledVerificationRegion,
     DEFAULT_CLEAN_ROOM_LAST_N_READS, DelegationPolicy, DelegationTarget, EffectiveDelegationGrant,
-    EffectiveQuestionPolicy, EffectiveVnextGrant, ExecutionKind, GeneratorSpec,
+    EffectiveQuestionPolicy, EffectiveVnextGrant, ExecutionKind, GeneratorSpec, GoalSkepticsPolicy,
     LocalInstallationIdentity, LocalInstallationResolver, MAX_GENERATOR_TURNS,
     MAX_VERIFICATION_CANDIDATES, ModelCapability, ModelLocality, ModelRecommendation, ModelSlot,
     ModelTrustSuggestion, OnAdjudicationFailure, OnBudgetExceeded, PROFILE_CLEAN_ROOM,
@@ -81,14 +81,17 @@ pub use vnext::{
 
 const MAX_MARKDOWN_BYTES: u64 = 1024 * 1024;
 /// Whole-tree cap for an agent definition package (`agents/<name>/`).
-const MAX_PACKAGE_BYTES: u64 = 4 * 1024 * 1024;
+/// Durable authored-package journals must be able to store this payload after
+/// hex encoding; keep `cockpit_db` `MAX_CANONICAL_AGENT_PACKAGE_BYTES` equal.
+pub(crate) const MAX_PACKAGE_BYTES: u64 = 4 * 1024 * 1024;
 pub(crate) const MAX_PACKAGE_ENTRIES: usize =
     cockpit_host::private_fs::MAX_NOFOLLOW_DIRECTORY_TREE_ENTRIES;
 pub(crate) const MAX_PACKAGE_DEPTH: usize =
     cockpit_host::private_fs::MAX_NOFOLLOW_DIRECTORY_TREE_DEPTH;
 pub(crate) const PACKAGE_ROOT_FILE: &str = "agent.md";
 pub(crate) const PACKAGE_SUBAGENTS_DIR: &str = "subagents";
-const PACKAGE_MCP_FILE: &str = "mcp.json";
+pub(crate) const PACKAGE_MCP_FILE: &str = "mcp.json";
+pub(crate) const PACKAGE_SIDECAR_FILE: &str = "sidecar.json";
 
 /// Unified per-agent capabilities. The four issue-#75 tool-posture grants and
 /// the computer-use declaration share one closed set; host policy still
@@ -730,17 +733,57 @@ pub fn resolve_goal_supervision_config(
     resolved
 }
 
+pub struct ResolvedGoalSupervision {
+    pub config: crate::config::extended::GoalSupervisionConfig,
+    /// Present when the selected agent compiled a verification policy. `Off`
+    /// is an explicit zero; absent means host `coldSkepticCount` remains the
+    /// scheduler authority for legacy agents.
+    pub goal_skeptics: Option<crate::agents::GoalSkepticsPolicy>,
+}
+
 pub fn effective_goal_supervision_for_agent(
     cwd: &Path,
     agent_name: &str,
     session: Option<&GoalSettingsOverride>,
     global: crate::config::extended::GoalSupervisionConfig,
 ) -> crate::config::extended::GoalSupervisionConfig {
-    let agent_override = resolve(cwd, agent_name)
-        .ok()
-        .flatten()
-        .map(|def| def.goal_supervision);
-    resolve_goal_supervision_config(session, agent_override.as_ref(), global)
+    effective_goal_supervision_with_agent_policy(cwd, agent_name, session, global).config
+}
+
+pub fn effective_goal_supervision_with_agent_policy(
+    cwd: &Path,
+    agent_name: &str,
+    session: Option<&GoalSettingsOverride>,
+    global: crate::config::extended::GoalSupervisionConfig,
+) -> ResolvedGoalSupervision {
+    let def = resolve(cwd, agent_name).ok().flatten();
+    let agent_override = def.as_ref().map(|def| def.goal_supervision.clone());
+    let config = resolve_goal_supervision_config(session, agent_override.as_ref(), global);
+    let goal_skeptics = def
+        .as_ref()
+        .and_then(|def| def.vnext.as_ref())
+        .and_then(|vnext| vnext.verification.as_ref())
+        .map(|policy| policy.goal_skeptics);
+    ResolvedGoalSupervision {
+        config,
+        goal_skeptics,
+    }
+}
+
+pub fn resolved_goal_policy_json(
+    config: &crate::config::extended::GoalSupervisionConfig,
+    goal_skeptics: Option<crate::agents::GoalSkepticsPolicy>,
+) -> Result<String> {
+    let mut value = serde_json::to_value(config).context("encoding resolved goal supervision")?;
+    if let Some(skeptics) = goal_skeptics {
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "goalSkeptics".into(),
+                serde_json::to_value(skeptics).context("encoding goal skeptics policy")?,
+            );
+        }
+    }
+    serde_json::to_string(&value).context("serializing resolved goal policy")
 }
 
 pub fn parse_goal_settings_override_json(raw: &str) -> Result<GoalSettingsOverride> {
@@ -2130,7 +2173,7 @@ fn load_package_from_files(
     let mut overrides = BTreeMap::new();
     let mut private_subagents = BTreeMap::new();
     for (rel, bytes) in &files {
-        if rel == PACKAGE_ROOT_FILE || rel == PACKAGE_MCP_FILE {
+        if rel == PACKAGE_ROOT_FILE || rel == PACKAGE_MCP_FILE || rel == PACKAGE_SIDECAR_FILE {
             continue;
         }
         if let Some(child) = rel
@@ -2225,8 +2268,102 @@ fn load_package_from_files(
             )
         })?;
     }
+    if let Some(bytes) = base
+        .package_files
+        .as_ref()
+        .and_then(|files| files.get(PACKAGE_SIDECAR_FILE))
+    {
+        parse_package_sidecar_file(bytes).with_context(|| {
+            format!(
+                "agent package `{name}` ({}) {PACKAGE_SIDECAR_FILE}",
+                agent_dir.display()
+            )
+        })?;
+    }
     validate_invariants(&base)?;
     Ok(base)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct AgentPackageSidecarFile {
+    pub schema_version: u8,
+    pub sidecars: Vec<AgentPackageSidecarEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct AgentPackageSidecarEntry {
+    pub provider_id: String,
+    pub model_id: String,
+    pub remote_image_egress_confirmed: bool,
+}
+
+pub(crate) fn parse_package_sidecar_file(bytes: &[u8]) -> Result<AgentPackageSidecarFile> {
+    let parsed: AgentPackageSidecarFile = serde_json::from_slice(bytes)
+        .context("sidecar.json is not a canonical sidecar declaration")?;
+    ensure!(
+        parsed.schema_version == 1,
+        "sidecar.json schemaVersion must be 1"
+    );
+    let mut seen = BTreeSet::new();
+    for sidecar in &parsed.sidecars {
+        ensure!(
+            !sidecar.provider_id.is_empty() && !sidecar.model_id.is_empty(),
+            "sidecar.json entries require providerId and modelId"
+        );
+        ensure!(
+            seen.insert((sidecar.provider_id.as_str(), sidecar.model_id.as_str())),
+            "sidecar.json contains a duplicate provider/model declaration"
+        );
+    }
+    Ok(parsed)
+}
+
+/// Package sidecar.json is the runtime sidecar authority for an authored
+/// agent. `None` means inherit the global selection (no package, or no
+/// sidecar.json). `Some` is the exclusive declaration list from the package.
+pub(crate) fn package_sidecar_authority(def: &AgentDef) -> Option<Vec<AgentPackageSidecarEntry>> {
+    let bytes = def.package_files.as_ref()?.get(PACKAGE_SIDECAR_FILE)?;
+    parse_package_sidecar_file(bytes)
+        .ok()
+        .map(|file| file.sidecars)
+}
+
+pub(crate) fn encode_package_sidecar_file(
+    sidecars: &[AgentPackageSidecarEntry],
+) -> Result<Vec<u8>> {
+    let mut ordered = sidecars.to_vec();
+    ordered.sort_by(|left, right| {
+        left.provider_id
+            .cmp(&right.provider_id)
+            .then(left.model_id.cmp(&right.model_id))
+    });
+    serde_json::to_vec(&AgentPackageSidecarFile {
+        schema_version: 1,
+        sidecars: ordered,
+    })
+    .context("encoding sidecar.json")
+}
+
+/// Closed relative-path namespace for a canonical agent package. Write
+/// boundaries must use this even if an upper layer already filtered the map.
+pub(crate) fn validate_package_relative_path(path: &str) -> Result<()> {
+    if path == PACKAGE_ROOT_FILE || path == PACKAGE_MCP_FILE || path == PACKAGE_SIDECAR_FILE {
+        return Ok(());
+    }
+    let valid = path.starts_with(&format!("{PACKAGE_SUBAGENTS_DIR}/"))
+        && path.ends_with(".md")
+        && !path.contains('\\')
+        && !path.contains('\0')
+        && !path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..");
+    ensure!(
+        valid,
+        "package path `{path}` is outside the canonical agent package namespace"
+    );
+    Ok(())
 }
 
 fn collect_package_files(agent_dir: &Path) -> Result<BTreeMap<String, Vec<u8>>> {

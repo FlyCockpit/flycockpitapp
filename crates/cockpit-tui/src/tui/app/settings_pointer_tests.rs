@@ -273,16 +273,7 @@ pub(crate) fn run_tui_button_pointer_dispatch_matrix() {
             OverlaySurface::Usage,
             Overlay::Usage(crate::tui::usage_pane::UsagePane::open(Vec::new())),
         ),
-        (
-            OverlaySurface::Sessions,
-            Overlay::Sessions(crate::tui::sessions_pane::SessionsPane::open(
-                None,
-                tmp.path(),
-                false,
-                None,
-                false,
-            )),
-        ),
+        (OverlaySurface::Sessions, Overlay::None),
         (
             OverlaySurface::Skills,
             Overlay::Skills(crate::tui::skills_pane::SkillsPane::loading(0)),

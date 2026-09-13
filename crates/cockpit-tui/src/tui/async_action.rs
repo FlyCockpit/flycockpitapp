@@ -204,6 +204,7 @@ impl AsyncActionKind {
                 | "sealed"
                 | "sealed.effect"
                 | "sessions.mutation"
+                | "sessions.favorite"
                 | "settings.effect"
                 | "subagent.steer"
                 | "tools.effect"
@@ -286,9 +287,27 @@ pub enum AsyncActionPayload {
     Bool(bool),
     #[allow(dead_code)]
     DaemonResponse(Box<cockpit_proto::Response>),
-    Sessions(Vec<cockpit_proto::SessionSummary>),
-    SessionsMutation(crate::tui::sessions_pane::SessionsMutationCompletion),
+    Sessions {
+        generation: u64,
+        attachment_generation: u64,
+        sessions: Vec<cockpit_proto::SessionSummary>,
+    },
+    SessionLiveStatusFenced {
+        generation: u64,
+        attachment_generation: u64,
+        live: std::collections::HashMap<uuid::Uuid, (bool, bool)>,
+    },
+    SessionsMutation(crate::tui::session_rail::SessionsMutationCompletion),
+    SessionFavorite {
+        generation: u64,
+        attachment_generation: u64,
+        canonical_root: uuid::Uuid,
+        session_id: uuid::Uuid,
+        result: Result<(uuid::Uuid, bool), String>,
+    },
     SessionMessages {
+        generation: u64,
+        attachment_generation: u64,
         session_id: uuid::Uuid,
         before_seq: Option<i64>,
         messages: Vec<cockpit_proto::SessionMessage>,

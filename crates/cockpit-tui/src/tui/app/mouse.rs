@@ -253,11 +253,12 @@ impl App {
             }
             return;
         }
-        if matches!(self.overlay, Overlay::Sessions(_)) {
-            let overlay = std::mem::take(&mut self.overlay);
-            let Overlay::Sessions(mut pane) = overlay else {
-                unreachable!();
-            };
+        let over_rail = self
+            .session_rail
+            .rail_area()
+            .or(self.session_rail.compact_area())
+            .is_some_and(|area| point_in(area, mouse.column, mouse.row));
+        if over_rail && matches!(self.overlay, Overlay::None) {
             let pointer = matches!(
                 mouse.kind,
                 MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Moved
@@ -266,40 +267,9 @@ impl App {
                 mouse.kind,
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
             );
-            let outcome = if wheel || (self.mouse_capture && pointer) {
-                pane.handle_mouse(mouse)
-            } else {
-                None
-            };
-            match outcome {
-                Some(crate::tui::sessions_pane::SessionsOutcome::Close) => {
-                    // The overlay was taken above; leaving it unrestored closes it.
-                }
-                Some(crate::tui::sessions_pane::SessionsOutcome::Resume(session_id)) => {
-                    self.resume_session(session_id);
-                }
-                Some(crate::tui::sessions_pane::SessionsOutcome::LoadList) => {
-                    self.overlay = Overlay::Sessions(pane);
-                    self.start_sessions_list_action();
-                }
-                Some(crate::tui::sessions_pane::SessionsOutcome::LoadPreview {
-                    session_id,
-                    before_seq,
-                }) => {
-                    self.overlay = Overlay::Sessions(pane);
-                    self.start_sessions_preview_action(session_id, before_seq);
-                }
-                Some(crate::tui::sessions_pane::SessionsOutcome::LoadInbox { main_session_id }) => {
-                    self.overlay = Overlay::Sessions(pane);
-                    self.start_sessions_inbox_action(main_session_id);
-                }
-                Some(crate::tui::sessions_pane::SessionsOutcome::Mutate(request)) => {
-                    self.overlay = Overlay::Sessions(pane);
-                    self.start_sessions_mutation_action(request);
-                }
-                None => {
-                    self.overlay = Overlay::Sessions(pane);
-                }
+            if wheel || (self.mouse_capture && pointer) {
+                let outcome = self.session_rail.handle_mouse(mouse);
+                self.apply_session_rail_outcome(outcome);
             }
             return;
         }
@@ -324,7 +294,6 @@ impl App {
                 }
                 return;
             }
-            Overlay::Sessions(_) => return,
             Overlay::Tools(_) => return,
             Overlay::GoalSettings(_) => return,
             Overlay::Skills(pane) => {
@@ -758,9 +727,8 @@ impl App {
             crate::tui::button::ButtonDispatch::SessionsConfirmArchive
             | crate::tui::button::ButtonDispatch::SessionsConfirmDelete
             | crate::tui::button::ButtonDispatch::SessionsConfirmCancel => {
-                if let Overlay::Sessions(pane) = &mut self.overlay {
-                    pane.pointer_activate_confirm(dispatch);
-                }
+                let outcome = self.session_rail.pointer_activate_confirm(dispatch);
+                self.apply_session_rail_outcome(outcome);
             }
             crate::tui::button::ButtonDispatch::ResourcePromote { request_id } => {
                 let outcome = match &mut self.overlay {
@@ -937,7 +905,6 @@ impl App {
             || matches!(
                 self.overlay,
                 Overlay::Stats(_)
-                    | Overlay::Sessions(_)
                     | Overlay::Skills(_)
                     | Overlay::Tools(_)
                     | Overlay::GoalSettings(_)

@@ -310,6 +310,8 @@ impl App {
             }
         } else if self.dialog.is_active() {
             KeyContext::Settings
+        } else if self.session_rail.is_focused() {
+            KeyContext::Sessions
         } else if let Some(context) = self.overlay.key_context() {
             context
         } else if self.rules_review.is_some() {

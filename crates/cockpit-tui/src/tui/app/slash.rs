@@ -672,7 +672,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "resume",
-        description: "Browse and resume previous sessions (alias of /sessions)",
+        description: "Focus the session rail search (alias of /sessions)",
         takes_args: false,
         run: run_sessions,
         available: available_always,
@@ -696,7 +696,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "sessions",
-        description: "Browse and resume previous sessions",
+        description: "Focus the session rail and search",
         takes_args: false,
         run: run_sessions,
         available: available_always,
@@ -1194,20 +1194,7 @@ fn run_diff(app: &mut App, args: &str) -> bool {
 }
 
 fn run_sessions(app: &mut App, _: &str) -> bool {
-    let daemon_socket = app
-        .sessions_daemon_socket()
-        .map(std::path::Path::to_path_buf);
-    let worktree_root = app.resolved_worktree_root();
-    app.overlay = Overlay::Sessions(crate::tui::sessions_pane::SessionsPane::open(
-        worktree_root.as_deref(),
-        &app.launch.cwd,
-        app.daemon_connected,
-        daemon_socket,
-        app.config_snapshot.extended.tui.use_emojis,
-    ));
-    if app.daemon_connected {
-        app.start_sessions_list_action();
-    }
+    app.focus_session_rail_search();
     false
 }
 

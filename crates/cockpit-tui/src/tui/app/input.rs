@@ -941,39 +941,6 @@ impl App {
                 }
                 return false;
             }
-            Overlay::Sessions(mut pane) => {
-                match pane.handle_key(key) {
-                    Some(crate::tui::sessions_pane::SessionsOutcome::Close) => {}
-                    Some(crate::tui::sessions_pane::SessionsOutcome::Resume(session_id)) => {
-                        self.resume_session(session_id);
-                    }
-                    Some(crate::tui::sessions_pane::SessionsOutcome::LoadList) => {
-                        self.overlay = Overlay::Sessions(pane);
-                        self.start_sessions_list_action();
-                    }
-                    Some(crate::tui::sessions_pane::SessionsOutcome::LoadPreview {
-                        session_id,
-                        before_seq,
-                    }) => {
-                        self.overlay = Overlay::Sessions(pane);
-                        self.start_sessions_preview_action(session_id, before_seq);
-                    }
-                    Some(crate::tui::sessions_pane::SessionsOutcome::LoadInbox {
-                        main_session_id,
-                    }) => {
-                        self.overlay = Overlay::Sessions(pane);
-                        self.start_sessions_inbox_action(main_session_id);
-                    }
-                    Some(crate::tui::sessions_pane::SessionsOutcome::Mutate(request)) => {
-                        self.overlay = Overlay::Sessions(pane);
-                        self.start_sessions_mutation_action(request);
-                    }
-                    None => {
-                        self.overlay = Overlay::Sessions(pane);
-                    }
-                }
-                return false;
-            }
             Overlay::Skills(mut pane) => {
                 if !pane.handle_key(key) {
                     self.overlay = Overlay::Skills(pane);
@@ -1184,6 +1151,23 @@ impl App {
 
         if self.transcript_find.is_some() {
             self.handle_transcript_find_key(key);
+            return false;
+        }
+
+        if Self::is_session_rail_focus_chord(&key)
+            && self.question_dialog.is_none()
+            && !self.dialog.is_active()
+            && matches!(self.overlay, Overlay::None)
+            && self.keys_overlay.is_none()
+        {
+            self.session_rail.focus();
+            if let Some(pane) = self.btw_pane.as_mut() {
+                pane.focused = false;
+            }
+            return false;
+        }
+
+        if self.handle_session_rail_key(key) {
             return false;
         }
 
@@ -3780,7 +3764,6 @@ impl App {
             self.overlay,
             Overlay::Stats(_)
                 | Overlay::Usage(_)
-                | Overlay::Sessions(_)
                 | Overlay::Skills(_)
                 | Overlay::Tools(_)
                 | Overlay::GoalSettings(_)
@@ -4031,7 +4014,6 @@ impl App {
                 self.overlay,
                 Overlay::Stats(_)
                     | Overlay::Usage(_)
-                    | Overlay::Sessions(_)
                     | Overlay::Skills(_)
                     | Overlay::Tools(_)
                     | Overlay::GoalSettings(_)

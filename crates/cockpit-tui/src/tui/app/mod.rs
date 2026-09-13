@@ -53,6 +53,7 @@ pub(crate) mod response_performance_e2e;
 mod resume;
 mod rules;
 mod scrollback_page_in;
+mod session_rail;
 mod session_services;
 mod side_conversation;
 mod skills_pane_actions;
@@ -1282,7 +1283,7 @@ pub(super) enum Overlay {
     Multireview(crate::tui::multireview_dialog::MultireviewDialog),
     Stats(crate::tui::stats_pane::StatsPane),
     Usage(crate::tui::usage_pane::UsagePane),
-    Sessions(crate::tui::sessions_pane::SessionsPane),
+
     Skills(crate::tui::skills_pane::SkillsPane),
     Tools(crate::tui::tools_pane::ToolsPane),
     GoalSettings(crate::tui::goal_settings_pane::GoalSettingsPane),
@@ -1303,7 +1304,6 @@ pub(super) enum Overlay {
 impl Overlay {
     pub(super) fn has_unsettled_local_authority(&self) -> bool {
         match self {
-            Self::Sessions(pane) => pane.has_unsettled_local_authority(),
             Self::Tools(pane) => pane.has_unsettled_local_authority(),
             Self::GoalSettings(pane) => pane.has_unsettled_local_authority(),
             Self::Sealed(overlay) => overlay.has_unsettled_local_authority(),
@@ -1330,7 +1330,6 @@ impl Overlay {
             Self::None => None,
             Self::ModelPicker(_) => Some(KeyContext::ModelPicker),
             Self::Multireview(_) => Some(KeyContext::Settings),
-            Self::Sessions(_) => Some(KeyContext::Sessions),
             Self::Permissions(_) => Some(KeyContext::Permissions),
             Self::Resources(_) => Some(KeyContext::Resources),
             Self::Quick(_) => Some(KeyContext::QuickSettings),
@@ -2106,6 +2105,9 @@ pub struct App {
     /// User-opened modal/pane overlays. Required question dialogs stay separate so they can shadow and resume this
     /// state without destroying the user's underlying overlay.
     pub(super) overlay: Overlay,
+    /// Persistent daemon-backed session rail. Visible in the ordinary chat
+    /// shell; never a fullscreen transcript browser.
+    pub(super) session_rail: crate::tui::session_rail::SessionRail,
     /// Inline session-setup panel below the banner on a fresh session.
     /// Distinct from [`Overlay::SessionSetup`] so `/session-setup` can reopen
     /// after first-message collapse without losing current values.
@@ -3816,6 +3818,7 @@ impl App {
         let initial_agent_path = vec![launch.agent_name.clone()];
         let terminal_title_pushed_for_cleanup = Arc::new(AtomicBool::new(false));
         let active_model_selection = config_snapshot.providers.active_model.clone();
+        let launch_cwd = launch.cwd.clone();
         let app = Self {
             session_mode,
             lifecycle: lifecycle
@@ -3907,6 +3910,12 @@ impl App {
             worktree_root,
             dialog: Dialog::None,
             overlay: Overlay::None,
+            session_rail: crate::tui::session_rail::SessionRail::new(
+                None,
+                &launch_cwd,
+                false,
+                use_emojis,
+            ),
             session_setup_inline: Some(
                 crate::tui::session_setup::SessionSetupPane::loading_inline(true),
             ),
@@ -4533,6 +4542,7 @@ impl App {
         changed |= self.drain_fetch_progress();
         changed |= self.drain_agent_events();
         changed |= self.drain_async_actions();
+        self.maybe_start_session_rail_list();
         changed |= self.drain_leak_reveal();
         changed |= self.retry_pending_session_switch_submissions();
         changed |= self.retry_retained_pre_dispatch_submissions();

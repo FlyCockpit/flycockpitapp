@@ -851,9 +851,9 @@ impl App {
 
     pub(super) fn start_sessions_mutation_action(
         &mut self,
-        effect: crate::tui::sessions_pane::SessionsMutationEffect,
+        effect: crate::tui::session_rail::SessionsMutationEffect,
     ) {
-        let pane_id = effect.pane_id;
+        let rail_id = effect.rail_id;
         let operation_id = effect.operation_id;
         let target = effect.target;
         let request = effect.request;
@@ -874,13 +874,61 @@ impl App {
                 }
                 .await;
                 Ok(AsyncActionPayload::SessionsMutation(
-                    crate::tui::sessions_pane::SessionsMutationCompletion {
-                        pane_id,
+                    crate::tui::session_rail::SessionsMutationCompletion {
+                        rail_id,
                         operation_id,
                         target,
                         response,
                     },
                 ))
+            },
+        );
+    }
+
+    pub(super) fn start_sessions_favorite_action(
+        &mut self,
+        session_id: uuid::Uuid,
+        favorite: bool,
+        canonical_root: uuid::Uuid,
+    ) {
+        let generation = self.session_rail.list_generation();
+        let attachment_generation = self.session_rail.attachment_generation();
+        let lifecycle = self.lifecycle.clone();
+        self.async_actions.start(
+            AsyncActionKind::DaemonRpc("sessions.favorite"),
+            AsyncActionPolicy::Dedupe(AsyncActionKey::new(format!(
+                "sessions.favorite:{canonical_root}"
+            ))),
+            async move {
+                let result = async {
+                    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    match client
+                        .request(cockpit_proto::Request::SetSessionFavorite {
+                            session_id,
+                            favorite,
+                        })
+                        .await
+                        .map_err(|error| error.to_string())?
+                    {
+                        Ok(cockpit_proto::Response::SessionFavoriteApplied {
+                            lineage_root_id,
+                            favorite: applied,
+                            ..
+                        }) => Ok((lineage_root_id, applied)),
+                        Ok(other) => Err(format!("unexpected favorite receipt: {other:?}")),
+                        Err(error) => Err(error.to_string()),
+                    }
+                }
+                .await;
+                Ok(AsyncActionPayload::SessionFavorite {
+                    generation,
+                    attachment_generation,
+                    canonical_root,
+                    session_id,
+                    result,
+                })
             },
         );
     }
@@ -1039,13 +1087,31 @@ impl App {
             }
             AsyncActionKind::DaemonRpc("sessions.mutation") => {
                 let mut reload = false;
-                if let Ok(AsyncActionPayload::SessionsMutation(completion)) = result.payload
-                    && let Overlay::Sessions(pane) = &mut self.overlay
-                {
-                    reload = pane.apply_mutation_completion(completion);
+                if let Ok(AsyncActionPayload::SessionsMutation(completion)) = result.payload {
+                    reload = self.session_rail.apply_mutation_completion(completion);
                 }
                 if reload {
                     self.start_sessions_list_action();
+                }
+            }
+            AsyncActionKind::DaemonRpc("sessions.favorite") => {
+                if let Ok(AsyncActionPayload::SessionFavorite {
+                    generation,
+                    attachment_generation,
+                    canonical_root,
+                    session_id,
+                    result,
+                }) = result.payload
+                    && let Some((session_id, canonical_root, favorite)) =
+                        self.session_rail.apply_favorite_result(
+                            generation,
+                            attachment_generation,
+                            canonical_root,
+                            session_id,
+                            result,
+                        )
+                {
+                    self.start_sessions_favorite_action(session_id, favorite, canonical_root);
                 }
             }
             AsyncActionKind::DaemonRpc("goal-settings.effect") => {
@@ -1251,84 +1317,96 @@ impl App {
                 Err(error) => self.push_plain(format!("question: {error}")),
             },
             AsyncActionKind::DaemonRpc("sessions.list") => {
-                let mut live_ids = None;
-                let mut preview_request = None;
-                if let Overlay::Sessions(pane) = &mut self.overlay {
-                    let payload = match result.payload {
-                        Ok(AsyncActionPayload::Sessions(sessions)) => Ok(sessions),
-                        Ok(_) => Err("unexpected daemon response".to_string()),
-                        Err(e) => Err(e),
-                    };
-                    let ids = pane.apply_sessions_result(payload);
-                    if !ids.is_empty() {
-                        live_ids = Some(ids);
-                    }
-                    if pane.is_preview_enabled()
-                        && let Some(crate::tui::sessions_pane::SessionsOutcome::LoadPreview {
-                            session_id,
-                            before_seq,
-                        }) = pane.ensure_preview_for_selection()
-                    {
-                        preview_request = Some((session_id, before_seq));
-                    }
+                let payload = match result.payload {
+                    Ok(AsyncActionPayload::Sessions {
+                        generation,
+                        attachment_generation,
+                        sessions,
+                    }) => self.session_rail.apply_sessions_result(
+                        generation,
+                        attachment_generation,
+                        Ok(sessions),
+                    ),
+                    Ok(_) => self.session_rail.apply_sessions_result(
+                        self.session_rail.list_generation(),
+                        self.session_rail.attachment_generation(),
+                        Err("unexpected daemon response".to_string()),
+                    ),
+                    Err(e) => self.session_rail.apply_sessions_result(
+                        self.session_rail.list_generation(),
+                        self.session_rail.attachment_generation(),
+                        Err(e),
+                    ),
+                };
+                let ids = payload;
+                if let Some(ids) = ids
+                    && let Some(live_ids) = self.session_rail.begin_live(ids)
+                {
+                    self.start_sessions_live_status_action(live_ids);
                 }
-                if let Some(ids) = live_ids {
-                    self.start_sessions_live_status_action(ids);
-                }
-                if let Some((session_id, before_seq)) = preview_request {
+                if let Some((session_id, before_seq)) = self.session_rail.begin_preview(None) {
                     self.start_sessions_preview_action(session_id, before_seq);
                 }
             }
             AsyncActionKind::DaemonRpc("sessions.live") => {
-                if let Overlay::Sessions(pane) = &mut self.overlay
-                    && let Ok(AsyncActionPayload::SessionLiveStatus(live)) = result.payload
+                if let Ok(AsyncActionPayload::SessionLiveStatusFenced {
+                    generation,
+                    attachment_generation,
+                    live,
+                }) = result.payload
                 {
-                    pane.apply_live_status(live);
+                    self.session_rail
+                        .apply_live_status(generation, attachment_generation, live);
                 }
             }
-            AsyncActionKind::DaemonRpc("sessions.preview") => {
-                if let Overlay::Sessions(pane) = &mut self.overlay {
-                    match result.payload {
-                        Ok(AsyncActionPayload::SessionMessages {
+            AsyncActionKind::DaemonRpc("sessions.preview") => match result.payload {
+                Ok(AsyncActionPayload::SessionMessages {
+                    generation,
+                    attachment_generation,
+                    session_id,
+                    before_seq,
+                    messages,
+                    has_more,
+                }) => self.session_rail.apply_preview_result(
+                    generation,
+                    attachment_generation,
+                    session_id,
+                    before_seq,
+                    Ok((messages, has_more)),
+                ),
+                Err(error) => {
+                    if let Some(session_id) = self.session_rail.preview_session_id() {
+                        self.session_rail.apply_preview_result(
+                            self.session_rail.list_generation(),
+                            self.session_rail.attachment_generation(),
                             session_id,
-                            before_seq,
-                            messages,
-                            has_more,
-                        }) => pane.apply_preview_result(
-                            session_id,
-                            before_seq,
-                            Ok((messages, has_more)),
-                        ),
-                        Err(error) => {
-                            if let Some((session_id, before_seq)) = pane.take_preview_load() {
-                                pane.apply_preview_result(session_id, before_seq, Err(error));
-                            }
-                        }
-                        Ok(_) => {}
+                            None,
+                            Err(error),
+                        );
                     }
                 }
-            }
+                Ok(_) => {}
+            },
             AsyncActionKind::DaemonRpc("sessions.inbox") => {
                 let mut reload_sessions = false;
-                if let Overlay::Sessions(pane) = &mut self.overlay {
-                    match result.payload {
-                        Ok(AsyncActionPayload::AssistantInbox {
-                            main_session_id,
-                            items,
-                        }) => {
-                            pane.apply_inbox_result(main_session_id, Ok(items));
-                            // The inbox action durably acknowledges the items
-                            // the human opened. Reload daemon-owned summaries
-                            // so the visible badge reflects that immediately.
-                            reload_sessions = true;
-                        }
-                        Err(error) => {
-                            if let Some(main_session_id) = pane.selected_session_id_for_action() {
-                                pane.apply_inbox_result(main_session_id, Err(error));
-                            }
-                        }
-                        Ok(_) => {}
+                match result.payload {
+                    Ok(AsyncActionPayload::AssistantInbox {
+                        main_session_id,
+                        items,
+                    }) => {
+                        self.session_rail
+                            .apply_inbox_result(main_session_id, Ok(items));
+                        reload_sessions = true;
                     }
+                    Err(error) => {
+                        if let Some(main_session_id) =
+                            self.session_rail.selected_session_id_for_action()
+                        {
+                            self.session_rail
+                                .apply_inbox_result(main_session_id, Err(error));
+                        }
+                    }
+                    Ok(_) => {}
                 }
                 if reload_sessions {
                     self.start_sessions_list_action();
@@ -3505,11 +3583,13 @@ impl App {
     }
 
     pub(super) fn start_sessions_list_action(&mut self) {
-        let Overlay::Sessions(pane) = &self.overlay else {
+        if !self.session_rail.begin_list() {
             return;
-        };
-        let (project_id, parent, lineage_root) = pane.root_request();
-        let include_archived = pane.include_archived();
+        }
+        let generation = self.session_rail.list_generation();
+        let attachment_generation = self.session_rail.attachment_generation();
+        let (project_id, parent, lineage_root) = self.session_rail.root_request();
+        let include_archived = self.session_rail.include_archived();
         let endpoint = self.sessions_daemon_endpoint();
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("sessions.list"),
@@ -3524,12 +3604,18 @@ impl App {
                     lineage_root,
                     include_archived,
                 )
-                .map(AsyncActionPayload::Sessions)
+                .map(|sessions| AsyncActionPayload::Sessions {
+                    generation,
+                    attachment_generation,
+                    sessions,
+                })
             },
         );
     }
 
     pub(super) fn start_sessions_live_status_action(&mut self, ids: Vec<uuid::Uuid>) {
+        let generation = self.session_rail.list_generation();
+        let attachment_generation = self.session_rail.attachment_generation();
         let endpoint = self.sessions_daemon_endpoint();
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("sessions.live"),
@@ -3537,9 +3623,11 @@ impl App {
             move || {
                 let endpoint = endpoint
                     .ok_or_else(|| "daemon endpoint unavailable for sessions.live".to_string())?;
-                Ok(AsyncActionPayload::SessionLiveStatus(
-                    crate::tui::agent_runner::session_live_status_blocking(&endpoint, ids),
-                ))
+                Ok(AsyncActionPayload::SessionLiveStatusFenced {
+                    generation,
+                    attachment_generation,
+                    live: crate::tui::agent_runner::session_live_status_blocking(&endpoint, ids),
+                })
             },
         );
     }
@@ -3549,6 +3637,8 @@ impl App {
         session_id: uuid::Uuid,
         before_seq: Option<i64>,
     ) {
+        let generation = self.session_rail.list_generation();
+        let attachment_generation = self.session_rail.attachment_generation();
         let endpoint = self.sessions_daemon_endpoint();
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("sessions.preview"),
@@ -3562,6 +3652,8 @@ impl App {
                         &endpoint, session_id, before_seq, 50,
                     )?;
                 Ok(AsyncActionPayload::SessionMessages {
+                    generation,
+                    attachment_generation,
                     session_id,
                     before_seq,
                     messages,
@@ -3788,6 +3880,7 @@ fn stale_completion_requires_reducer(kind: &AsyncActionKind) -> bool {
                 | "resources.promote"
                 | "sealed.effect"
                 | "sessions.mutation"
+                | "sessions.favorite"
                 | "settings.effect"
                 | "side.discard"
                 | "side.start"

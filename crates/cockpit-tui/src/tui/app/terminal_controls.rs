@@ -12,6 +12,7 @@ impl App {
             || self.pending_workspace_trust.is_some()
             || self.dialog.has_unsettled_local_authority()
             || self.overlay.has_unsettled_local_authority()
+            || self.session_rail.has_unsettled_local_authority()
             || self.pending_mcp_local.is_some()
             || self.pending_leak_reveal.is_some()
             || self.pending_runner_attach.is_some()

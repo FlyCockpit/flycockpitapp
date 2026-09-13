@@ -1461,25 +1461,6 @@ impl App {
                     pane.render(frame, rects.body);
                     self.overlay = Overlay::Usage(pane);
                 }
-                Overlay::Sessions(mut pane) => {
-                    pane.set_pointer_capture(self.mouse_capture);
-                    pane.render_with_buttons(frame, rects.body, Some(&mut self.button_registry));
-                    let preview_request = if pane.needs_preview_for_selection() {
-                        match pane.ensure_preview_for_selection() {
-                            Some(crate::tui::sessions_pane::SessionsOutcome::LoadPreview {
-                                session_id,
-                                before_seq,
-                            }) => Some((session_id, before_seq)),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
-                    self.overlay = Overlay::Sessions(pane);
-                    if let Some((session_id, before_seq)) = preview_request {
-                        self.start_sessions_preview_action(session_id, before_seq);
-                    }
-                }
                 Overlay::Skills(mut pane) => {
                     pane.render(frame, rects.body);
                     self.overlay = Overlay::Skills(pane);
@@ -1551,11 +1532,15 @@ impl App {
                     self.overlay = Overlay::Help(pane);
                 }
                 Overlay::None => {
+                    let frame_width = frame.area().width;
+                    let (persistent_rail, chat_body) =
+                        self.session_rail.split_body(rects.body, frame_width);
+                    let overlay_rail = self.session_rail.overlay_rail_rect(chat_body, frame_width);
                     // Carve the body for an embedded pane (GOALS §1i) when one
                     // is open: fullscreen fills the body, splits divide it. The
                     // chat history renders into whatever's left (or nowhere when
                     // fullscreen). Returns the chat rect, or `None` if hidden.
-                    let chat_rect = self.render_pane(frame, rects.body);
+                    let chat_rect = self.render_pane(frame, chat_body);
                     match chat_rect {
                         Some(chat) => {
                             self.render_chat_history_pane(frame, chat);
@@ -1588,6 +1573,14 @@ impl App {
                     if geom.pins > 0 {
                         self.render_pins_indicator(frame, rects.pins);
                     }
+                    self.session_rail.set_pointer_capture(self.mouse_capture);
+                    self.session_rail.render(
+                        frame,
+                        persistent_rail,
+                        overlay_rail,
+                        Some(&mut self.button_registry),
+                        frame_width,
+                    );
                     // Persistent below-input sandbox-down notice (§6.5). Shown while
                     // the shell sandbox can't initialize; geometry gives it rows.
                     // Persistent — it does not time out like a toast.

@@ -4442,6 +4442,25 @@ impl Request {
                         return Err("authored child markdown is invalid".into());
                     }
                 }
+                if request
+                    .package
+                    .mcp_json
+                    .as_ref()
+                    .is_some_and(|mcp| mcp.len() > crate::MAX_AGENT_MARKDOWN_BYTES)
+                {
+                    return Err("authored mcp.json is invalid".into());
+                }
+                if request.package.sidecars.len() > 8 {
+                    return Err("authored package has too many sidecar declarations".into());
+                }
+                if request
+                    .package
+                    .draft_revision
+                    .as_ref()
+                    .is_some_and(|revision| revision.is_empty() || revision.len() > 128)
+                {
+                    return Err("authored draft revision is invalid".into());
+                }
             }
             Self::GetAuthoredAgentPackageReceipt(query) => {
                 validate_owner_identifier("client operation", &query.client_operation_id, 128)?;

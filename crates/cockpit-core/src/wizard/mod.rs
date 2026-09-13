@@ -14,10 +14,11 @@ pub use apply::{
     ModelAnswersOutcome, OnboardingConfigRollback, PreparedOnboardingAgent, apply_model_answers,
     apply_security_answers, apply_security_answers_with_caps, apply_setup_wizard_answers,
     apply_setup_wizard_answers_authoritative, capture_onboarding_agent_config,
-    compose_wizard_host_capabilities, descriptor_for_cwd, descriptor_for_cwd_with_caps,
-    model_descriptor_for_cwd, onboarding_model_descriptor_for_cwd,
-    prepare_onboarding_agent_answers, prepare_onboarding_agent_answers_for_catalog,
-    publish_onboarding_agent_plan, security_config_path,
+    capture_onboarding_agent_config_for_providers, compose_wizard_host_capabilities,
+    descriptor_for_cwd, descriptor_for_cwd_with_caps, model_descriptor_for_cwd,
+    onboarding_model_descriptor_for_cwd, prepare_onboarding_agent_answers,
+    prepare_onboarding_agent_answers_for_catalog, publish_onboarding_agent_plan,
+    security_config_path,
 };
 
 pub const PROVIDER_WIZARD_ID: &str = "provider";
@@ -679,13 +680,8 @@ pub fn onboarding_agent_descriptor(
                 crate::agents::ranked_compatible_offerings(primary, &offerings, providers)
                     .into_iter()
                     .map(|offering| SelectOption {
-                        id: format!("{}/{}", offering.provider_profile_handle, offering.model_id)
-                            .into(),
-                        label: format!(
-                            "{}/{}",
-                            offering.provider_profile_handle, offering.model_id
-                        )
-                        .into(),
+                        id: format!("{}/{}", offering.provider_id, offering.model_id).into(),
+                        label: format!("{}/{}", offering.provider_id, offering.model_id).into(),
                         description: "Compatible with the selected agent".into(),
                     })
                     .collect();
@@ -706,8 +702,8 @@ pub fn onboarding_agent_descriptor(
         offerings
             .iter()
             .map(|offering| SelectOption {
-                id: format!("{}/{}", offering.provider_profile_handle, offering.model_id).into(),
-                label: format!("{}/{}", offering.provider_profile_handle, offering.model_id).into(),
+                id: format!("{}/{}", offering.provider_id, offering.model_id).into(),
+                label: format!("{}/{}", offering.provider_id, offering.model_id).into(),
                 description: "Compatibility is verified from the fetched pinned definition".into(),
             })
             .collect(),
@@ -717,34 +713,32 @@ pub fn onboarding_agent_descriptor(
         label: "Disable image sidecar".into(),
         description: "Screenshots will not be sent to a separate vision model".into(),
     }];
-    for (provider_id, provider) in &providers.providers {
-        for model in &provider.models {
-            if !providers
-                .resolve_effective_model_capabilities(
-                    provider_id,
-                    &model.id,
-                    providers.resolution_generation,
-                )
-                .supports_image_input()
-            {
-                continue;
-            }
-            let self_hosted = matches!(
-                providers.resolve_location(provider_id, &model.id),
-                Some(crate::config::providers::ModelLocation::Local)
-                    | Some(crate::config::providers::ModelLocation::PrivateRemote)
-            );
-            let locality = if self_hosted { "local" } else { "remote" };
-            sidecar_options.push(SelectOption {
-                id: format!("{locality}:{provider_id}/{}", model.id).into(),
-                label: format!("{provider_id}/{}", model.id).into(),
-                description: if self_hosted {
-                    "Local/self-hosted vision model (preferred)".into()
-                } else {
-                    "Remote vision model; screenshots and image content leave this machine".into()
-                },
-            });
+    for offering in crate::daemon::agent_installation::setup_offerings(providers) {
+        if !providers
+            .resolve_effective_model_capabilities(
+                &offering.provider_profile_handle,
+                &offering.model_id,
+                providers.resolution_generation,
+            )
+            .supports_image_input()
+        {
+            continue;
         }
+        let self_hosted = matches!(
+            providers.resolve_location(&offering.provider_profile_handle, &offering.model_id),
+            Some(crate::config::providers::ModelLocation::Local)
+                | Some(crate::config::providers::ModelLocation::PrivateRemote)
+        );
+        let locality = if self_hosted { "local" } else { "remote" };
+        sidecar_options.push(SelectOption {
+            id: format!("{locality}:{}/{}", offering.provider_id, offering.model_id).into(),
+            label: format!("{}/{}", offering.provider_id, offering.model_id).into(),
+            description: if self_hosted {
+                "Local/self-hosted vision model (preferred)".into()
+            } else {
+                "Remote vision model; screenshots and image content leave this machine".into()
+            },
+        });
     }
     let sidecar_default = crate::onboarding_agent::preferred_self_hosted_sidecar(providers)
         .map(|sidecar| {

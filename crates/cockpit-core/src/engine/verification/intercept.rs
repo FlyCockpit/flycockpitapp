@@ -235,7 +235,7 @@ pub(crate) async fn intercept_ordinary_call(input: InterceptInput<'_>) -> Verifi
                     plan: VerificationDispatchPlan {
                         operation_id: memo.operation_id,
                         attempt_revision: memo.dispatch_attempt_revision,
-                        goal_skeptics: 0,
+                        goal_skeptics: memo.goal_skeptics,
                     },
                 }
             }
@@ -254,7 +254,7 @@ pub(crate) async fn intercept_ordinary_call(input: InterceptInput<'_>) -> Verifi
                 plan: VerificationDispatchPlan {
                     operation_id: memo.operation_id,
                     attempt_revision: memo.dispatch_attempt_revision,
-                    goal_skeptics: 0,
+                    goal_skeptics: memo.goal_skeptics,
                 },
             },
         };

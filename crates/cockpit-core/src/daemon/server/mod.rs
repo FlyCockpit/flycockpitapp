@@ -1017,8 +1017,13 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         | proto::Response::ImageSidecarGrantMutated(..) => {}
         proto::Response::LocalPeerCredential { .. } => {}
         proto::Response::AgentAuthoringProjection(_)
-        | proto::Response::AuthoredAgentPackage(_)
         | proto::Response::AuthoredAgentPackageReceipt(_) => {}
+        proto::Response::AuthoredAgentPackage(
+            cockpit_proto::ApplyAuthoredAgentPackageOutcome::Rejected { message, .. },
+        ) => {
+            scrub_string(message, redact);
+        }
+        proto::Response::AuthoredAgentPackage(_) => {}
         proto::Response::Unknown => {}
     }
 }
@@ -5990,6 +5995,16 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
         tracing::info!(
             count = recovered_agent_mutations,
             "reconciled committed agent mutations before socket publication"
+        );
+    }
+    let recovered_authored =
+        crate::daemon::agent_authoring::recover_authored_agent_package_journals(ctx)
+            .await
+            .context("startup authored-package journal recovery failed")?;
+    if recovered_authored > 0 {
+        tracing::info!(
+            count = recovered_authored,
+            "reconciled committed authored agent packages before socket publication"
         );
     }
     dispatch::recover_committed_oauth_settlements(ctx)

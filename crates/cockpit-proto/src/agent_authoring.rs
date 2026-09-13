@@ -171,8 +171,8 @@ pub struct AuthoredAgentPackageDraft {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_trust_confirmations: Vec<ModelTrustConfirmation>,
     pub make_default: bool,
-    /// Opaque draft identity for edit/delete/retry of the same in-progress
-    /// package. Absent on the first submit.
+    /// Last authoritative package digest for edit/delete/retry of this name.
+    /// Absent on the first submit. A failed child does not advance it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_revision: Option<String>,
 }

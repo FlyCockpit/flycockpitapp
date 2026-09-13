@@ -48,6 +48,7 @@ pub mod app_flags;
 pub mod archive_import;
 pub mod assistant_inbox;
 pub mod assistants;
+pub mod authored_agent_packages;
 pub mod code_root_projection;
 pub mod computer_audit;
 pub mod computer_outcomes;

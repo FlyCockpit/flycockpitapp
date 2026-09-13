@@ -102,6 +102,10 @@ pub struct InterruptVerificationMemo {
     pub operation_id: uuid::Uuid,
     pub dispatch_attempt_revision: i64,
     pub outcome: InterruptVerificationOutcome,
+    /// Compiled goal-skeptic count captured with this intercept so replay
+    /// restores the same scheduled count instead of reconstructing zero.
+    #[serde(default)]
+    pub goal_skeptics: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

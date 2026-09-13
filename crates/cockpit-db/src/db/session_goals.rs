@@ -1787,22 +1787,36 @@ fn pause_goal_for_failure(
     Ok(())
 }
 
+fn goal_cold_skeptic_count(goal: &SessionGoal) -> usize {
+    let value = serde_json::from_str::<serde_json::Value>(&goal.resolved_policy_json).ok();
+    if let Some(skeptics) = value.as_ref().and_then(|value| value.get("goalSkeptics")) {
+        return match skeptics.get("mode").and_then(serde_json::Value::as_str) {
+            Some("off") => 0,
+            Some("count") => skeptics
+                .get("count")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|count| usize::try_from(count).ok())
+                .unwrap_or(0)
+                .min(5),
+            _ => 0,
+        };
+    }
+    value
+        .as_ref()
+        .and_then(|value| value.get("coldSkepticCount"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(3)
+        .clamp(1, 5)
+}
+
 fn register_verification_jobs(
     conn: &rusqlite::Connection,
     goal: &SessionGoal,
     evidence: &str,
     now: i64,
 ) -> Result<()> {
-    let count = serde_json::from_str::<serde_json::Value>(&goal.resolved_policy_json)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("coldSkepticCount")
-                .and_then(serde_json::Value::as_u64)
-        })
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(3)
-        .clamp(1, 5);
+    let count = goal_cold_skeptic_count(goal);
     let gatekeepers = std::iter::once((GoalControlRole::Gatekeeper, 0_i64));
     for (role, slot) in gatekeepers.chain((0..count).map(|slot| {
         (
@@ -2927,6 +2941,58 @@ mod tests {
             jobs.push(job);
         }
         (db, verifying, jobs)
+    }
+
+    #[test]
+    fn goal_skeptics_policy_is_the_verification_scheduler_authority() {
+        let goal = |policy: &str| SessionGoal {
+            id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            project_id: "p".into(),
+            objective: "ship".into(),
+            context: None,
+            disposition: GoalDisposition::Running,
+            phase: Some(GoalPhase::Verifying),
+            resume_phase: None,
+            pause_reason: None,
+            attempt_generation: 1,
+            contract: None,
+            resolved_policy_json: policy.into(),
+            evaluator_outcome_json: None,
+            verifier_outcome_json: None,
+            unresolved_gaps: Vec::new(),
+            gap_fingerprints: Vec::new(),
+            blocker_key: None,
+            blocker_key_streak: 0,
+            token_budget: 1,
+            tokens_used: 0,
+            elapsed_active_ms: 0,
+            active_since: None,
+            lifecycle_history: Vec::new(),
+            blocked_attempts: 0,
+            completion_evidence: None,
+            verification_rounds: 1,
+            last_read_at: None,
+            cleared_at: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert_eq!(
+            goal_cold_skeptic_count(&goal(
+                r#"{"coldSkepticCount":3,"goalSkeptics":{"mode":"off"}}"#
+            )),
+            0
+        );
+        assert_eq!(
+            goal_cold_skeptic_count(&goal(
+                r#"{"coldSkepticCount":3,"goalSkeptics":{"mode":"count","count":2}}"#
+            )),
+            2
+        );
+        assert_eq!(
+            goal_cold_skeptic_count(&goal(r#"{"coldSkepticCount":4}"#)),
+            4
+        );
     }
 
     #[tokio::test]

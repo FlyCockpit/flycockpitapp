@@ -8494,30 +8494,32 @@ async fn handle_serialized_request_impl(
                     code: ErrorCode::BadRequest,
                     message: error.to_string(),
                 })?;
-            let policy = crate::agents::effective_goal_supervision_for_agent(
+            let resolved = crate::agents::effective_goal_supervision_with_agent_policy(
                 std::path::Path::new(&session.project_root),
                 &session.active_agent,
                 session_override.as_ref(),
                 extended.goal_supervision,
             );
-            if !policy.enabled {
+            if !resolved.config.enabled {
                 return Err(ErrorPayload {
                     code: ErrorCode::BadRequest,
                     message: "goal supervision is disabled by operator configuration".to_string(),
                 });
             }
-            policy.validate().map_err(|error| ErrorPayload {
+            resolved.config.validate().map_err(|error| ErrorPayload {
                 code: ErrorCode::BadRequest,
                 message: error.to_string(),
             })?;
-            let budget = token_budget.unwrap_or(policy.default_token_budget);
+            let budget = token_budget.unwrap_or(resolved.config.default_token_budget);
             if budget <= 0 {
                 return Err(ErrorPayload {
                     code: ErrorCode::BadRequest,
                     message: "goal budget must be positive".to_string(),
                 });
             }
-            let policy_json = serde_json::to_string(&policy).map_err(internal)?;
+            let policy_json =
+                crate::agents::resolved_goal_policy_json(&resolved.config, resolved.goal_skeptics)
+                    .map_err(internal)?;
             #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::CreateGoal {
@@ -11184,7 +11186,16 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Replay(response) => return Ok(response),
                 LocalOperationStart::Execute(generation) => generation,
             };
-            let outcome = crate::daemon::agent_authoring::apply_package(ctx, request.clone()).await;
+            let outcome = crate::daemon::agent_authoring::apply_package(
+                ctx,
+                request.clone(),
+                Some(crate::daemon::agent_authoring::AuthoredApplyFence {
+                    owner_digest: settlement_owner.clone(),
+                    request_hash,
+                    fencing_generation,
+                }),
+            )
+            .await;
             match outcome {
                 Ok(response) => {
                     let response = Response::AuthoredAgentPackage(response);
@@ -18376,14 +18387,17 @@ async fn handle_serialized_request_impl(
                     // prior installation and let a later failed publication
                     // delete somebody else's already-successful result.
                     let operation_key = uuid::Uuid::now_v7().to_string();
-                    let owned_installation_id = uuid::Uuid::parse_str(&operation_key)
+                    let mut owned_installation_id = uuid::Uuid::parse_str(&operation_key)
                         .expect("fresh UUID operation key parses");
                     // Prepare the cross-authority rollback before *any*
                     // installation side effect. A daemon death at every later
                     // boundary is recovered before the socket is published.
                     let _publication_rollback =
-                        crate::wizard::capture_onboarding_agent_config(&prepared.draft)
-                            .map_err(internal)?;
+                        crate::wizard::capture_onboarding_agent_config_for_providers(
+                            &prepared.draft,
+                            Some(&prepared.providers),
+                        )
+                        .map_err(internal)?;
                     let previous_default_installation_id = ctx
                         .db
                         .default_agent_installation()
@@ -18412,69 +18426,38 @@ async fn handle_serialized_request_impl(
                         );
                         return Err(internal(error));
                     }
-                    let service = match ctx.agent_installation_service() {
-                        Ok(service) => service,
-                        Err(error) => {
-                            let compensation = compensate_onboarding_agent_publication(
-                                ctx,
-                                owned_installation_id,
-                                &publication_backup,
-                                previous_default_installation_id,
-                            )
-                            .await;
-                            return Err(internal(match compensation {
-                                Ok(()) => error,
-                                Err(recovery) => anyhow::anyhow!(
-                                    "agent onboarding installation service unavailable ({error:#}); recovery remains pending: {recovery:#}"
-                                ),
-                            }));
-                        }
-                    };
-                    let install = service
-                        .begin(
-                            cockpit_proto::AgentInstallationBeginV1 {
-                                dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION,
-                                idempotency_key: operation_key.clone(),
-                                operation: cockpit_proto::AgentInstallationOperationKind::Install,
-                                scope: cockpit_proto::AgentInstallationScopeWire::Global,
-                                workspace_path: None,
-                                source_locator: prepared.draft.source.source_locator.clone(),
-                                target_installation_id: None,
-                                replace_acknowledged: false,
-                                third_party_trust_confirmed: prepared
-                                    .draft
-                                    .source
-                                    .third_party_trust_confirmed,
-                                requested_slot: Some("primary".into()),
-                                roles: Vec::new(),
-                                computer_use: false,
-                                primary_slot_id: None,
-                                auto_select_first_exact: false,
+                    let onboarding =
+                        ctx.db
+                            .onboarding_snapshot()
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|row| {
+                                (row.stage == crate::db::onboarding::OnboardingStage::Agent).then(
+                                    || cockpit_proto::AuthoredAgentOnboardingCorrelation {
+                                        run_id: row.run_id,
+                                        attempt_id: row.attempt_id,
+                                        stage_revision: row.revision,
+                                    },
+                                )
+                            });
+                    let authored =
+                        match crate::daemon::agent_authoring::apply_package_under_publication_lock(
+                            ctx,
+                            cockpit_proto::ApplyAuthoredAgentPackageRequest {
+                                client_operation_id: operation_key.clone(),
+                                expected_policy_revision: prepared.snapshot.policy_revision.clone(),
+                                package: prepared.draft.clone(),
+                                onboarding,
                             },
-                            crate::workspace_lease::now_unix_ms(),
+                            None,
                         )
-                        .await;
-                    let terminal = match install {
-                        cockpit_proto::AgentInstallationResultV1::NeedsChoice {
-                            continuation_token,
-                            choices,
-                            ..
-                        } => {
-                            let grant = prepared.draft.model_trust_confirmations.first();
-                            let choice = choices
-                                .iter()
-                                .find(|choice| {
-                                    grant.is_some_and(|grant| {
-                                        choice.model_id == grant.model_id
-                                            && crate::daemon::agent_installation::resolvable_provider_handle_for_choice(
-                                                &prepared.providers,
-                                                choice,
-                                            )
-                                            .as_deref()
-                                                == Some(grant.provider_id.as_str())
-                                    })
-                                });
-                            let Some(choice) = choice else {
+                        .await
+                        {
+                            Ok(cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(
+                                receipt,
+                            )) if receipt.installation_id.is_some() => receipt,
+                            Ok(other) => {
                                 let compensation = compensate_onboarding_agent_publication(
                                     ctx,
                                     owned_installation_id,
@@ -18482,38 +18465,15 @@ async fn handle_serialized_request_impl(
                                     previous_default_installation_id,
                                 )
                                 .await;
-                                return match compensation {
-                                    Ok(()) => Err(internal(anyhow::anyhow!(
-                                        "selected onboarding model is absent from daemon binding choices"
-                                    ))),
-                                    Err(recovery) => Err(internal(anyhow::anyhow!(
-                                        "selected onboarding model is absent from daemon binding choices; recovery remains pending: {recovery:#}"
-                                    ))),
-                                };
-                            };
-                            service
-                                .submit_choice(
-                                    cockpit_proto::AgentInstallationSubmitChoiceV1 {
-                                        dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION,
-                                        continuation_token,
-                                        choice_id: Some(choice.choice_id.clone()),
-                                        defer: false,
-                                    },
-                                    crate::workspace_lease::now_unix_ms(),
-                                )
-                                .await
-                        }
-                        result => result,
-                    };
-                    let installed_id = match terminal {
-                        cockpit_proto::AgentInstallationResultV1::Receipt {
-                            status:
-                                cockpit_proto::AgentInstallationReceiptStatusV1::Installed
-                                | cockpit_proto::AgentInstallationReceiptStatusV1::Bound,
-                            installation_id: Some(installation_id),
-                            ..
-                        } => match uuid::Uuid::parse_str(&installation_id) {
-                            Ok(installation_id) => installation_id,
+                                return Err(internal(match compensation {
+                                    Ok(()) => anyhow::anyhow!(
+                                        "agent onboarding authored package was not committed: {other:?}"
+                                    ),
+                                    Err(recovery) => anyhow::anyhow!(
+                                        "agent onboarding authored package was not committed ({other:?}); recovery remains pending: {recovery:#}"
+                                    ),
+                                }));
+                            }
                             Err(error) => {
                                 let compensation = compensate_onboarding_agent_publication(
                                     ctx,
@@ -18523,54 +18483,23 @@ async fn handle_serialized_request_impl(
                                 )
                                 .await;
                                 return Err(internal(match compensation {
-                                    Ok(()) => anyhow::Error::from(error),
+                                    Ok(()) => error,
                                     Err(recovery) => anyhow::anyhow!(
-                                        "agent onboarding returned an invalid installation identity ({error}); recovery remains pending: {recovery:#}"
+                                        "agent onboarding authored package failed ({error:#}); recovery remains pending: {recovery:#}"
                                     ),
                                 }));
                             }
-                        },
-                        cockpit_proto::AgentInstallationResultV1::Error { error } => {
-                            let compensation = compensate_onboarding_agent_publication(
-                                ctx,
-                                owned_installation_id,
-                                &publication_backup,
-                                previous_default_installation_id,
-                            )
-                            .await;
-                            return match compensation {
-                                Ok(()) => Err(internal(anyhow::anyhow!(
-                                    "agent onboarding install failed: {}",
-                                    error.message
-                                ))),
-                                Err(recovery) => Err(internal(anyhow::anyhow!(
-                                    "agent onboarding install failed: {}; recovery remains pending: {recovery:#}",
-                                    error.message
-                                ))),
-                            };
-                        }
-                        _ => {
-                            let compensation = compensate_onboarding_agent_publication(
-                                ctx,
-                                owned_installation_id,
-                                &publication_backup,
-                                previous_default_installation_id,
-                            )
-                            .await;
-                            return match compensation {
-                                Ok(()) => Err(internal(anyhow::anyhow!(
-                                    "agent onboarding did not produce a usable primary binding"
-                                ))),
-                                Err(recovery) => Err(internal(anyhow::anyhow!(
-                                    "agent onboarding did not produce a usable primary binding; recovery remains pending: {recovery:#}"
-                                ))),
-                            };
-                        }
-                    };
-                    // Publish config before selecting the DB default. If any
-                    // later participant fails, compensate both authorities
-                    // while the publication gate still excludes other daemon
-                    // writers; onboarding must not leave a visible half-plan.
+                        };
+                    if let Some(installation_id) = authored
+                        .installation_id
+                        .as_deref()
+                        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                    {
+                        owned_installation_id = installation_id;
+                    }
+                    // Trust/default-agent config remains a global policy write.
+                    // Package files, sidecar.json, bindings, and default
+                    // selection are already committed by the authored apply.
                     match crate::wizard::publish_onboarding_agent_plan(&prepared) {
                         Ok(_) => {}
                         Err(error) => {
@@ -18589,29 +18518,6 @@ async fn handle_serialized_request_impl(
                             }));
                         }
                     };
-                    if prepared.draft.make_default
-                        && let Err(error) = ctx
-                            .db
-                            .set_default_agent_installation(
-                                installed_id,
-                                crate::workspace_lease::now_unix_ms(),
-                            )
-                            .await
-                    {
-                        let compensation = compensate_onboarding_agent_publication(
-                            ctx,
-                            owned_installation_id,
-                            &publication_backup,
-                            previous_default_installation_id,
-                        )
-                        .await;
-                        return Err(internal(match compensation {
-                            Ok(()) => error,
-                            Err(recovery) => anyhow::anyhow!(
-                                "agent onboarding default selection failed ({error:#}); recovery remains pending: {recovery:#}"
-                            ),
-                        }));
-                    }
                     // A complete publication is visible only after every
                     // participant succeeds. Release the durable owner before
                     // deleting its private preimage so re-entry can never be
@@ -22656,6 +22562,9 @@ async fn finish_local_operation_error(
                      WHERE owner_digest=?1 AND client_operation_id=?2
                     UNION ALL
                     SELECT 1 FROM assistant_mutation_journals
+                     WHERE owner_digest=?1 AND client_operation_id=?2
+                    UNION ALL
+                    SELECT 1 FROM authored_agent_package_journals
                      WHERE owner_digest=?1 AND client_operation_id=?2
                  )",
                 rusqlite::params![linked_owner, linked_operation],

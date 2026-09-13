@@ -24,10 +24,45 @@ pub async fn get_projection(ctx: &DaemonContext) -> Result<AgentAuthoringProject
     )
 }
 
+pub struct AuthoredApplyFence {
+    pub owner_digest: String,
+    pub request_hash: [u8; 32],
+    pub fencing_generation: i64,
+}
+
 pub async fn apply_package(
     ctx: &DaemonContext,
     request: ApplyAuthoredAgentPackageRequest,
+    fence: Option<AuthoredApplyFence>,
 ) -> Result<ApplyAuthoredAgentPackageOutcome> {
+    let _lock = crate::daemon::server::CONFIG_PUBLICATION_RPC_LOCK
+        .lock()
+        .await;
+    apply_package_under_publication_lock(ctx, request, fence).await
+}
+
+pub async fn apply_package_under_publication_lock(
+    ctx: &DaemonContext,
+    request: ApplyAuthoredAgentPackageRequest,
+    fence: Option<AuthoredApplyFence>,
+) -> Result<ApplyAuthoredAgentPackageOutcome> {
+    if let Some(fence) = &fence
+        && let Some(journal) = ctx
+            .db
+            .authored_agent_package_journal(
+                fence.owner_digest.clone(),
+                request.client_operation_id.clone(),
+            )
+            .await?
+    {
+        if journal.request_hash.as_slice() == fence.request_hash.as_slice() {
+            if let Ok(Response::AuthoredAgentPackage(outcome)) =
+                serde_json::from_str(&journal.terminal_response_json)
+            {
+                return Ok(outcome);
+            }
+        }
+    }
     let providers = ctx
         .config_source()
         .load(&ctx.canonical_cwd)
@@ -67,6 +102,7 @@ pub async fn apply_package(
         &request.package,
         &snapshot,
         &providers,
+        &catalog.index,
     ) {
         Ok(package) => package,
         Err(error) => {
@@ -77,14 +113,41 @@ pub async fn apply_package(
             });
         }
     };
-    let service = ctx.agent_installation_service()?;
     let now = crate::workspace_lease::now_unix_ms();
+    let current_draft = ctx
+        .db
+        .authored_agent_package_draft(request.package.name.clone())
+        .await
+        .context("loading authored draft revision")?;
+    let draft_matches = match (
+        request.package.draft_revision.as_deref(),
+        current_draft
+            .as_ref()
+            .map(|row| row.draft_revision.as_str()),
+    ) {
+        (None, None) => true,
+        (Some(expected), Some(actual)) => expected == actual,
+        _ => false,
+    };
+    if !draft_matches {
+        return Ok(ApplyAuthoredAgentPackageOutcome::Rejected {
+            reason: AuthoredAgentRejectReason::StaleDraft,
+            message: "authored draft revision does not match the last authoritative draft; edit/retry the current revision".into(),
+            projection: None,
+        });
+    }
+    let require_third_party = matches!(
+        request.package.source.kind,
+        cockpit_proto::AgentAuthoringSourceKind::ThirdParty
+    );
+    let service = ctx.agent_installation_service()?;
     let install = service
         .commit_authored_package(
             request.client_operation_id.clone(),
             &request.package.name,
             request.package.source.source_locator.clone(),
             request.package.source.pin.clone(),
+            require_third_party,
             request.package.source.third_party_trust_confirmed,
             package.files.clone(),
             package.digest.clone(),
@@ -116,6 +179,16 @@ pub async fn apply_package(
             });
         }
     };
+    if let Err(error) = crate::onboarding_agent::publish_authored_sidecar_selection(
+        &request.package.sidecars,
+        &providers,
+    ) {
+        return Ok(ApplyAuthoredAgentPackageOutcome::Rejected {
+            reason: AuthoredAgentRejectReason::UnapprovedRemoteSidecarEgress,
+            message: error.to_string(),
+            projection: None,
+        });
+    }
     let default_selected = request.package.make_default;
     if default_selected
         && let Some(installation_id) = installation_id.as_deref()
@@ -126,17 +199,106 @@ pub async fn apply_package(
             .await
             .context("selecting default authored agent installation")?;
     }
+    let cas_ok = ctx
+        .db
+        .cas_authored_agent_package_draft(
+            request.package.name.clone(),
+            request.package.draft_revision.clone(),
+            package.digest.clone(),
+            package.digest.clone(),
+            now,
+        )
+        .await
+        .context("committing authored draft revision")?;
+    if !cas_ok {
+        return Ok(ApplyAuthoredAgentPackageOutcome::Rejected {
+            reason: AuthoredAgentRejectReason::StaleDraft,
+            message: "authored draft revision does not match the last authoritative draft; edit/retry the current revision".into(),
+            projection: None,
+        });
+    }
     let mut receipt = crate::onboarding_agent::committed_receipt(
-        request.client_operation_id,
+        request.client_operation_id.clone(),
         &package,
         &snapshot,
-        installation_id,
+        installation_id.clone(),
         default_selected,
     );
     if let Ok(id) = uuid::Uuid::parse_str(&operation_id) {
         receipt.receipt_id = id;
     }
-    Ok(ApplyAuthoredAgentPackageOutcome::Receipt(receipt))
+    let outcome = ApplyAuthoredAgentPackageOutcome::Receipt(receipt);
+    if let Some(fence) = fence {
+        let terminal_response_json =
+            serde_json::to_string(&Response::AuthoredAgentPackage(outcome.clone()))
+                .context("encoding authored package receipt")?;
+        ctx.db
+            .record_authored_agent_package_journal(
+                crate::db::authored_agent_packages::AuthoredAgentPackageJournalRow {
+                    owner_digest: fence.owner_digest,
+                    client_operation_id: request.client_operation_id,
+                    request_hash: fence.request_hash.to_vec(),
+                    fencing_generation: fence.fencing_generation,
+                    policy_revision: snapshot.policy_revision,
+                    package_digest: package.digest.clone(),
+                    draft_revision: package.digest.clone(),
+                    installation_id,
+                    default_selected,
+                    onboarding_run_id: request
+                        .onboarding
+                        .as_ref()
+                        .map(|row| row.run_id.to_string()),
+                    onboarding_attempt_id: request
+                        .onboarding
+                        .as_ref()
+                        .map(|row| row.attempt_id.to_string()),
+                    onboarding_stage_revision: request
+                        .onboarding
+                        .as_ref()
+                        .map(|row| i64::try_from(row.stage_revision).unwrap_or(i64::MAX)),
+                    terminal_response_json,
+                    created_at_unix_ms: now,
+                },
+            )
+            .await
+            .context("recording authored package journal")?;
+    }
+    Ok(outcome)
+}
+
+pub async fn recover_authored_agent_package_journals(ctx: &DaemonContext) -> Result<u64> {
+    let rows = ctx.db.list_authored_agent_package_journals().await?;
+    let mut recovered = 0_u64;
+    for row in rows {
+        let hash: [u8; 32] = row
+            .request_hash
+            .as_slice()
+            .try_into()
+            .context("authored package journal request hash")?;
+        if matches!(
+            ctx.db
+                .local_operation_settlement(
+                    row.owner_digest.clone(),
+                    row.client_operation_id.clone()
+                )
+                .await?,
+            Some(crate::db::local_operation_receipts::LocalOperationSettlement::Pending(_))
+        ) {
+            ctx.db
+                .finish_local_operation(
+                    row.owner_digest,
+                    row.client_operation_id,
+                    hash,
+                    row.fencing_generation,
+                    "terminal_success".into(),
+                    row.terminal_response_json,
+                )
+                .await
+                .context("finishing authored package local operation from journal")?;
+            recovered = recovered.saturating_add(1);
+        }
+    }
+    Ok(recovered)
 }
 
 pub async fn receipt(
@@ -167,6 +329,16 @@ pub async fn receipt(
             }
         }
         crate::db::local_operation_receipts::LocalOperationSettlement::Pending(_) => {
+            if let Some(journal) = ctx
+                .db
+                .authored_agent_package_journal(owner.to_owned(), query.client_operation_id.clone())
+                .await?
+                && let Ok(Response::AuthoredAgentPackage(
+                    ApplyAuthoredAgentPackageOutcome::Receipt(receipt),
+                )) = serde_json::from_str(&journal.terminal_response_json)
+            {
+                return Ok(receipt);
+            }
             Ok(unknown_receipt(&query.client_operation_id, None))
         }
         _ => Ok(unknown_receipt(&query.client_operation_id, None)),

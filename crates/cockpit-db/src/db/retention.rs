@@ -193,6 +193,17 @@ impl Db {
                     )",
                 params![cutoff_unix_ms],
             )? as u64;
+            let authored_package_journals = conn.execute(
+                "DELETE FROM authored_agent_package_journals
+                  WHERE created_at_unix_ms < ?1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM local_operation_receipts receipt
+                         WHERE receipt.owner_digest=authored_agent_package_journals.owner_digest
+                           AND receipt.client_operation_id=authored_agent_package_journals.client_operation_id
+                           AND receipt.state IN ('prepared','executing')
+                    )",
+                params![cutoff_unix_ms],
+            )? as u64;
             let image_journals = conn.execute(
                 "DELETE FROM image_config_mutation_journals
                   WHERE created_at_unix_ms < ?1
@@ -227,6 +238,7 @@ impl Db {
                 .saturating_add(editor)
                 .saturating_add(patch_journals)
                 .saturating_add(agent_journals)
+                .saturating_add(authored_package_journals)
                 .saturating_add(image_journals)
                 .saturating_add(assistant_journals))
         })

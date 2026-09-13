@@ -131,14 +131,31 @@ impl OnboardingConfigRollback {
 pub fn capture_onboarding_agent_config(
     draft: &cockpit_proto::AuthoredAgentPackageDraft,
 ) -> Result<OnboardingConfigRollback> {
+    capture_onboarding_agent_config_for_providers(draft, None)
+}
+
+pub fn capture_onboarding_agent_config_for_providers(
+    draft: &cockpit_proto::AuthoredAgentPackageDraft,
+    providers: Option<&crate::config::providers::ProvidersConfig>,
+) -> Result<OnboardingConfigRollback> {
     let global_config = global_config_file().context("resolving global agent onboarding config")?;
     let provider = draft
         .model_trust_confirmations
         .first()
-        .map(|grant| grant.provider_id.as_str())
-        .unwrap_or("unknown");
+        .map(|grant| {
+            providers
+                .and_then(|providers| {
+                    crate::daemon::agent_installation::resolvable_provider_handle_for_route(
+                        providers,
+                        &grant.provider_id,
+                        &grant.model_id,
+                    )
+                })
+                .unwrap_or_else(|| grant.provider_id.clone())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
     let model_target =
-        crate::config::providers::provider_file_path_for_config(&global_config, provider)
+        crate::config::providers::provider_file_path_for_config(&global_config, &provider)
             .context("resolving onboarding model config")?;
     OnboardingConfigRollback::capture([global_config, model_target])
 }
@@ -202,9 +219,15 @@ pub fn publish_onboarding_agent_plan(
         .model_trust_confirmations
         .first()
         .context("authored package has no model grant")?;
+    let provider_handle = crate::daemon::agent_installation::resolvable_provider_handle_for_route(
+        &prepared.providers,
+        &grant.provider_id,
+        &grant.model_id,
+    )
+    .unwrap_or_else(|| grant.provider_id.clone());
     let global_config = global_config_file().context("resolving global agent onboarding config")?;
     let model_target =
-        crate::config::providers::provider_file_path_for_config(&global_config, &grant.provider_id)
+        crate::config::providers::provider_file_path_for_config(&global_config, &provider_handle)
             .context("resolving onboarding model config")?;
     let rollback =
         OnboardingConfigRollback::capture([global_config.clone(), model_target.clone()])?;
@@ -213,7 +236,7 @@ pub fn publish_onboarding_agent_plan(
         let mut model_layer = model_doc.providers();
         let provider = model_layer
             .providers
-            .entry(grant.provider_id.clone())
+            .entry(provider_handle.clone())
             .or_default();
         let model_index = provider
             .models
@@ -233,7 +256,7 @@ pub fn publish_onboarding_agent_plan(
         if grant.confirmed {
             model.trust = Some(prepared.global_trust);
         }
-        model_doc.write_model_wizard_fields(&grant.provider_id, model)?;
+        model_doc.write_model_wizard_fields(&provider_handle, model)?;
 
         if prepared.draft.make_default {
             crate::config::providers::mutate_effective_default(
@@ -241,7 +264,7 @@ pub fn publish_onboarding_agent_plan(
                     .parent()
                     .context("global config file has no parent directory")?,
                 Some(&crate::config::providers::ActiveModelRef {
-                    provider: grant.provider_id.clone(),
+                    provider: provider_handle.clone(),
                     model: grant.model_id.clone(),
                     reasoning_effort: None,
                     thinking_mode: None,
@@ -264,8 +287,14 @@ pub fn publish_onboarding_agent_plan(
             use crate::config::image_sidecar::{
                 SidecarMode, SidecarProviderModel, SidecarSelectionConfig,
             };
+            let provider = crate::daemon::agent_installation::resolvable_provider_handle_for_route(
+                &prepared.providers,
+                &sidecar.provider_id,
+                &sidecar.model_id,
+            )
+            .unwrap_or_else(|| sidecar.provider_id.clone());
             let selected = SidecarProviderModel {
-                provider: sidecar.provider_id.clone(),
+                provider,
                 model: sidecar.model_id.clone(),
             };
             extended.image_sidecar = SidecarSelectionConfig {

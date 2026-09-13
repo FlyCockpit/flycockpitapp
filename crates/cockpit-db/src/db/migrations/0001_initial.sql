@@ -8296,6 +8296,65 @@ CREATE TABLE onboarding_agent_publication_journals (
 CREATE INDEX idx_onboarding_agent_publication_journals_previous
     ON onboarding_agent_publication_journals (previous_default_installation_id);
 
+-- Fenced authored-package publication. The terminal response is the exact
+-- apply receipt; crash recovery finishes the local operation from this row
+-- instead of re-validating live policy or onboarding identity.
+CREATE TABLE authored_agent_package_journals (
+    owner_digest           TEXT NOT NULL,
+    client_operation_id    TEXT NOT NULL,
+    request_hash           BLOB NOT NULL CHECK (typeof(request_hash) = 'blob' AND length(request_hash) = 32),
+    fencing_generation     INTEGER NOT NULL CHECK (fencing_generation > 0),
+    policy_revision        TEXT NOT NULL CHECK (length(trim(policy_revision)) > 0),
+    package_digest         TEXT NOT NULL CHECK (length(trim(package_digest)) = 64 AND package_digest = lower(package_digest)),
+    draft_revision         TEXT NOT NULL CHECK (length(trim(draft_revision)) > 0),
+    installation_id        TEXT,
+    default_selected       INTEGER NOT NULL CHECK (default_selected IN (0, 1)),
+    onboarding_run_id      TEXT,
+    onboarding_attempt_id  TEXT,
+    onboarding_stage_revision INTEGER,
+    terminal_response_json TEXT NOT NULL CHECK (
+        json_valid(terminal_response_json)
+        AND length(CAST(terminal_response_json AS BLOB)) <= 1048576
+    ),
+    created_at_unix_ms     INTEGER NOT NULL,
+    PRIMARY KEY (owner_digest, client_operation_id),
+    FOREIGN KEY (owner_digest, client_operation_id)
+        REFERENCES local_operation_receipts(owner_digest, client_operation_id)
+        ON DELETE CASCADE ON UPDATE RESTRICT,
+    CHECK (length(trim(owner_digest)) > 0),
+    CHECK (length(trim(client_operation_id)) > 0)
+);
+CREATE INDEX authored_agent_package_journals_created
+ON authored_agent_package_journals(created_at_unix_ms);
+CREATE TRIGGER authored_agent_package_journals_identity_immutable
+BEFORE UPDATE ON authored_agent_package_journals
+WHEN NEW.owner_digest <> OLD.owner_digest
+  OR NEW.client_operation_id <> OLD.client_operation_id
+  OR NEW.request_hash <> OLD.request_hash
+  OR NEW.fencing_generation <> OLD.fencing_generation
+  OR NEW.policy_revision <> OLD.policy_revision
+  OR NEW.package_digest <> OLD.package_digest
+  OR NEW.draft_revision <> OLD.draft_revision
+  OR NEW.installation_id IS NOT OLD.installation_id
+  OR NEW.default_selected <> OLD.default_selected
+  OR NEW.onboarding_run_id IS NOT OLD.onboarding_run_id
+  OR NEW.onboarding_attempt_id IS NOT OLD.onboarding_attempt_id
+  OR NEW.onboarding_stage_revision IS NOT OLD.onboarding_stage_revision
+  OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
+BEGIN
+    SELECT RAISE(ABORT, 'authored agent package journal identity is immutable');
+END;
+
+-- Last authoritative in-progress authored draft per agent name. Edit/retry
+-- CAS compares draft_revision; a failed child must not advance this row.
+CREATE TABLE authored_agent_package_drafts (
+    agent_name         TEXT PRIMARY KEY,
+    draft_revision     TEXT NOT NULL CHECK (length(trim(draft_revision)) > 0),
+    package_digest     TEXT NOT NULL CHECK (length(trim(package_digest)) = 64 AND package_digest = lower(package_digest)),
+    updated_at_unix_ms INTEGER NOT NULL,
+    CHECK (length(trim(agent_name)) > 0)
+);
+
 CREATE TABLE installation_continuations (
     continuation_token           TEXT PRIMARY KEY,
     operation_id                 TEXT NOT NULL UNIQUE REFERENCES installation_operations(operation_id) ON DELETE CASCADE ON UPDATE RESTRICT,

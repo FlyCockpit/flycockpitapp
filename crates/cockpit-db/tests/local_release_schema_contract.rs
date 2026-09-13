@@ -461,6 +461,7 @@ fn authority_journals_bind_exact_fenced_terminal_receipts() {
         "extended_config_patch_journals",
         "image_config_mutation_journals",
         "agent_mutation_journals",
+        "authored_agent_package_journals",
     ] {
         let declaration = sql
             .split(&format!("CREATE TABLE {table}"))
@@ -502,6 +503,7 @@ fn interrupted_settlement_excludes_provider_journal_owned_receipts() {
         settlement
             .contains("journal.fencing_generation=local_operation_receipts.fencing_generation")
     );
+    assert!(settlement.contains("FROM authored_agent_package_journals journal"));
 }
 
 #[test]

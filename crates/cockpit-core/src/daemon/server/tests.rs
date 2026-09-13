@@ -15140,6 +15140,7 @@ fn authority_recovery_precedes_both_socket_binds() {
         "recover_extended_config_patch_journals",
         "recover_image_config_mutation_journals",
         "recover_agent_mutation_journals",
+        "recover_authored_agent_package_journals",
         "recover_committed_oauth_settlements",
         "recover_assistant_mutation_journals",
         "settle_interrupted_local_operations",

@@ -53,26 +53,23 @@ impl AuthoredPackageRejection {
 }
 
 pub fn preferred_self_hosted_sidecar(providers: &ProvidersConfig) -> Option<SidecarProviderModel> {
-    providers
-        .providers
-        .iter()
-        .find_map(|(provider_id, provider)| {
-            provider.models.iter().find_map(|model| {
-                let supports_images = providers
-                    .resolve_effective_model_capabilities(
-                        provider_id,
-                        &model.id,
-                        providers.resolution_generation,
-                    )
-                    .supports_image_input();
-                let self_hosted = matches!(
-                    providers.resolve_location(provider_id, &model.id),
-                    Some(ModelLocation::Local | ModelLocation::PrivateRemote)
-                );
-                (supports_images && self_hosted).then(|| SidecarProviderModel {
-                    provider: provider_id.clone(),
-                    model: model.id.clone(),
-                })
+    crate::daemon::agent_installation::setup_offerings(providers)
+        .into_iter()
+        .find_map(|offering| {
+            let supports_images = providers
+                .resolve_effective_model_capabilities(
+                    &offering.provider_profile_handle,
+                    &offering.model_id,
+                    providers.resolution_generation,
+                )
+                .supports_image_input();
+            let self_hosted = matches!(
+                providers.resolve_location(&offering.provider_profile_handle, &offering.model_id),
+                Some(ModelLocation::Local | ModelLocation::PrivateRemote)
+            );
+            (supports_images && self_hosted).then(|| SidecarProviderModel {
+                provider: offering.provider_id,
+                model: offering.model_id,
             })
         })
 }
@@ -83,26 +80,37 @@ pub fn policy_snapshot(
     catalog_revision: &str,
 ) -> AgentPolicySnapshot {
     let mut routes = Vec::new();
-    for (provider_id, provider) in &providers.providers {
-        for model in &provider.models {
+    for offering in crate::daemon::agent_installation::setup_offerings(providers) {
+        let Some(provider) = providers.providers.get(&offering.provider_profile_handle) else {
+            continue;
+        };
+        let Some(model) = provider
+            .models
+            .iter()
+            .find(|model| model.id == offering.model_id)
+        else {
+            continue;
+        };
+        {
             let caps = providers.resolve_effective_model_capabilities(
-                provider_id,
+                &offering.provider_profile_handle,
                 &model.id,
                 providers.resolution_generation,
             );
-            let location = providers.resolve_location(provider_id, &model.id);
+            let location = providers.resolve_location(&offering.provider_profile_handle, &model.id);
             let self_hosted = matches!(
                 location,
                 Some(ModelLocation::Local | ModelLocation::PrivateRemote)
             );
             let sidecar_eligible = caps.supports_image_input();
-            let trust = match providers.resolve_trust(provider_id, &model.id) {
+            let trust = match providers.resolve_trust(&offering.provider_profile_handle, &model.id)
+            {
                 ModelTrust::Trusted => AgentPolicyTrustClassification::Trusted,
                 ModelTrust::Untrusted => AgentPolicyTrustClassification::Untrusted,
             };
             let confirmation_required = model.trust.is_none() && provider.trust.is_none();
             routes.push(AgentPolicyRoute {
-                provider_id: provider_id.clone(),
+                provider_id: offering.provider_id.clone(),
                 model_id: model.id.clone(),
                 trust: if confirmation_required {
                     AgentPolicyTrustClassification::Unset
@@ -117,7 +125,8 @@ pub fn policy_snapshot(
                     ModelLocation::Remote => "remote".to_string(),
                     ModelLocation::PrivateRemote => "private_remote".to_string(),
                 }),
-                auto_prune: providers.resolve_auto_prune(provider_id, &model.id),
+                auto_prune: providers
+                    .resolve_auto_prune(&offering.provider_profile_handle, &model.id),
                 sidecar_eligible,
                 remote_sidecar_egress_required: sidecar_eligible && !self_hosted,
             });
@@ -187,7 +196,8 @@ pub fn authoring_projection(
 pub fn canonicalize_authored_package(
     draft: &AuthoredAgentPackageDraft,
     snapshot: &AgentPolicySnapshot,
-    _providers: &ProvidersConfig,
+    providers: &ProvidersConfig,
+    catalog: &AgentCatalogIndex,
 ) -> Result<CanonicalAuthoredPackage, AuthoredPackageRejection> {
     if draft.dto_version != AGENT_AUTHORING_DTO_VERSION {
         return Err(AuthoredPackageRejection::new(
@@ -201,19 +211,32 @@ pub fn canonicalize_authored_package(
             "authored package policy revision does not match the current snapshot",
         ));
     }
-    validate_source(&draft.source)?;
+    let mut draft = rewrite_draft_to_wire_tokens(draft, providers)?;
+    let derived_kind = derive_source_kind(&draft.source, &draft.name, snapshot, catalog)?;
+    if draft.source.kind != derived_kind {
+        return Err(AuthoredPackageRejection::new(
+            AuthoredAgentRejectReason::IncompletePackage,
+            "source kind does not match the locator's membership in the pinned catalog",
+        ));
+    }
+    validate_source_kind(derived_kind, &draft.source)?;
     reject_trust_copy(&draft.markdown)?;
     for child in &draft.children {
         reject_trust_copy(&child.markdown)?;
-        validate_child_path(&child.relative_path)?;
+        crate::agents::validate_package_relative_path(&child.relative_path).map_err(|error| {
+            AuthoredPackageRejection::new(
+                AuthoredAgentRejectReason::InvalidNestedGraph,
+                error.to_string(),
+            )
+        })?;
     }
-    let files = canonical_file_map(draft)?;
+    validate_sidecars(&draft.sidecars, snapshot)?;
+    let files = canonical_file_map(&draft)?;
     let definition = crate::agents::load_workspace_package_from_files(&draft.name, files.clone())
         .map_err(map_package_error)?;
     validate_grants(&definition, snapshot, &draft.model_trust_confirmations)?;
-    validate_sidecars(&draft.sidecars, snapshot)?;
     let digest = hex_digest(&crate::agents::package_digest_preimage(&files));
-    let review = review_from_definition(&definition, snapshot, draft, &digest);
+    let review = review_from_definition(&definition, snapshot, &draft, &digest);
     Ok(CanonicalAuthoredPackage {
         files,
         digest,
@@ -385,8 +408,7 @@ fn catalog_source(
         .into_iter()
         .filter_map(|offering| {
             snapshot.routes.iter().find(|route| {
-                route.provider_id == offering.provider_profile_handle
-                    && route.model_id == offering.model_id
+                route.provider_id == offering.provider_id && route.model_id == offering.model_id
             })
         })
         .map(|route| AgentAuthoringCompatibleRoute {
@@ -503,8 +525,40 @@ fn split_frontmatter(markdown: &str) -> (&str, &str) {
     }
 }
 
-fn validate_source(source: &AuthoredAgentSource) -> Result<(), AuthoredPackageRejection> {
-    match source.kind {
+fn derive_source_kind(
+    source: &AuthoredAgentSource,
+    name: &str,
+    snapshot: &AgentPolicySnapshot,
+    catalog: &AgentCatalogIndex,
+) -> Result<AgentAuthoringSourceKind, AuthoredPackageRejection> {
+    let authored_locator = format!("authored/{name}");
+    if source.source_locator == authored_locator {
+        return Ok(AgentAuthoringSourceKind::Authored);
+    }
+    if let Ok(frontier) = bundled_frontier_entry()
+        && let Ok(locator) = frontier.pinned_source_locator(&snapshot.catalog_revision)
+        && source.source_locator == locator
+    {
+        return Ok(AgentAuthoringSourceKind::BundledFrontier);
+    }
+    for entry in &catalog.agents {
+        if entry.catalog.slug == BUNDLED_FRONTIER_SLUG {
+            continue;
+        }
+        if let Ok(locator) = entry.pinned_source_locator(&snapshot.catalog_revision)
+            && source.source_locator == locator
+        {
+            return Ok(AgentAuthoringSourceKind::FirstPartyCatalog);
+        }
+    }
+    Ok(AgentAuthoringSourceKind::ThirdParty)
+}
+
+fn validate_source_kind(
+    kind: AgentAuthoringSourceKind,
+    source: &AuthoredAgentSource,
+) -> Result<(), AuthoredPackageRejection> {
+    match kind {
         AgentAuthoringSourceKind::ThirdParty => {
             let parsed = crate::daemon::agent_installation::CanonicalAgentSource::parse(
                 &source.source_locator,
@@ -531,23 +585,6 @@ fn validate_source(source: &AuthoredAgentSource) -> Result<(), AuthoredPackageRe
         AgentAuthoringSourceKind::BundledFrontier
         | AgentAuthoringSourceKind::FirstPartyCatalog
         | AgentAuthoringSourceKind::Authored => {}
-    }
-    Ok(())
-}
-
-fn validate_child_path(path: &str) -> Result<(), AuthoredPackageRejection> {
-    let valid = path.starts_with("subagents/")
-        && path.ends_with(".md")
-        && !path.contains('\\')
-        && !path.contains('\0')
-        && !path
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..");
-    if !valid {
-        return Err(AuthoredPackageRejection::new(
-            AuthoredAgentRejectReason::InvalidNestedGraph,
-            format!("child path `{path}` is not a legal package-private subagent"),
-        ));
     }
     Ok(())
 }
@@ -696,6 +733,24 @@ fn canonical_file_map(
     if let Some(mcp) = &draft.mcp_json {
         files.insert("mcp.json".to_string(), mcp.as_bytes().to_vec());
     }
+    if !draft.sidecars.is_empty() {
+        let entries = draft
+            .sidecars
+            .iter()
+            .map(|sidecar| crate::agents::AgentPackageSidecarEntry {
+                provider_id: sidecar.provider_id.clone(),
+                model_id: sidecar.model_id.clone(),
+                remote_image_egress_confirmed: sidecar.remote_image_egress_confirmed,
+            })
+            .collect::<Vec<_>>();
+        let bytes = crate::agents::encode_package_sidecar_file(&entries).map_err(|error| {
+            AuthoredPackageRejection::new(
+                AuthoredAgentRejectReason::IncompletePackage,
+                error.to_string(),
+            )
+        })?;
+        files.insert(crate::agents::PACKAGE_SIDECAR_FILE.to_string(), bytes);
+    }
     let mut seen = BTreeSet::new();
     for child in &draft.children {
         if !seen.insert(child.relative_path.as_str()) {
@@ -704,12 +759,136 @@ fn canonical_file_map(
                 format!("duplicate child path `{}`", child.relative_path),
             ));
         }
+        crate::agents::validate_package_relative_path(&child.relative_path).map_err(|error| {
+            AuthoredPackageRejection::new(
+                AuthoredAgentRejectReason::InvalidNestedGraph,
+                error.to_string(),
+            )
+        })?;
         files.insert(
             child.relative_path.clone(),
             child.markdown.as_bytes().to_vec(),
         );
     }
+    for path in files.keys() {
+        crate::agents::validate_package_relative_path(path).map_err(|error| {
+            AuthoredPackageRejection::new(
+                AuthoredAgentRejectReason::IncompletePackage,
+                error.to_string(),
+            )
+        })?;
+    }
     Ok(files)
+}
+
+fn rewrite_draft_to_wire_tokens(
+    draft: &AuthoredAgentPackageDraft,
+    providers: &ProvidersConfig,
+) -> Result<AuthoredAgentPackageDraft, AuthoredPackageRejection> {
+    let mut draft = draft.clone();
+    draft.markdown = rewrite_markdown_provider_ids(&draft.markdown, providers)?;
+    for child in &mut draft.children {
+        child.markdown = rewrite_markdown_provider_ids(&child.markdown, providers)?;
+    }
+    for sidecar in &mut draft.sidecars {
+        sidecar.provider_id =
+            wire_provider_id_for_submitted(providers, &sidecar.provider_id, &sidecar.model_id)
+                .unwrap_or_else(|| sidecar.provider_id.clone());
+    }
+    for confirmation in &mut draft.model_trust_confirmations {
+        confirmation.provider_id = wire_provider_id_for_submitted(
+            providers,
+            &confirmation.provider_id,
+            &confirmation.model_id,
+        )
+        .unwrap_or_else(|| confirmation.provider_id.clone());
+    }
+    Ok(draft)
+}
+
+fn rewrite_markdown_provider_ids(
+    markdown: &str,
+    providers: &ProvidersConfig,
+) -> Result<String, AuthoredPackageRejection> {
+    let (frontmatter, body) = split_frontmatter(markdown);
+    if frontmatter.is_empty() {
+        return Ok(markdown.to_string());
+    }
+    let mut parsed: crate::agents::AgentDefinitionFrontmatter = serde_yaml::from_str(frontmatter)
+        .map_err(|error| {
+        AuthoredPackageRejection::new(
+            AuthoredAgentRejectReason::InvalidFrontmatter,
+            error.to_string(),
+        )
+    })?;
+    for slot in parsed.model_slots.values_mut() {
+        for grant in &mut slot.models {
+            if let Some(wire_id) =
+                wire_provider_id_for_submitted(providers, &grant.provider_id, &grant.model_id)
+            {
+                grant.provider_id = wire_id;
+            }
+        }
+    }
+    let yaml = serde_yaml::to_string(&parsed).map_err(|error| {
+        AuthoredPackageRejection::new(
+            AuthoredAgentRejectReason::InvalidFrontmatter,
+            error.to_string(),
+        )
+    })?;
+    Ok(format!(
+        "---\n{}---\n{body}",
+        yaml.trim_start_matches("---\n")
+    ))
+}
+
+fn wire_provider_id_for_submitted(
+    providers: &ProvidersConfig,
+    submitted: &str,
+    model_id: &str,
+) -> Option<String> {
+    let matches = crate::daemon::agent_installation::setup_offerings(providers)
+        .into_iter()
+        .filter(|offering| {
+            offering.model_id == model_id
+                && (offering.provider_id == submitted
+                    || offering.provider_profile_handle == submitted)
+        })
+        .map(|offering| offering.provider_id)
+        .collect::<BTreeSet<_>>();
+    (matches.len() == 1).then(|| matches.into_iter().next().expect("unique wire provider id"))
+}
+
+pub fn publish_authored_sidecar_selection(
+    sidecars: &[AuthoredSidecarDeclaration],
+    providers: &ProvidersConfig,
+) -> Result<()> {
+    let Some(sidecar) = sidecars.first() else {
+        return Ok(());
+    };
+    let handle = crate::daemon::agent_installation::resolvable_provider_handle_for_route(
+        providers,
+        &sidecar.provider_id,
+        &sidecar.model_id,
+    )
+    .context("sidecar provider is not a configured route")?;
+    let global_config =
+        crate::config::dirs::global_config_file().context("resolving sidecar config")?;
+    let mut extended_doc = crate::config::extended::ExtendedConfigDoc::load(&global_config)?;
+    let mut extended = extended_doc.config();
+    use crate::config::image_sidecar::{SidecarMode, SidecarProviderModel, SidecarSelectionConfig};
+    let selected = SidecarProviderModel {
+        provider: handle,
+        model: sidecar.model_id.clone(),
+    };
+    extended.image_sidecar = SidecarSelectionConfig {
+        mode: SidecarMode::Always,
+        trusted_primary_default: Some(selected.clone()),
+        untrusted_primary_default: Some(selected),
+        per_primary_override: None,
+    };
+    extended_doc.write(&extended)?;
+    Ok(())
 }
 
 fn review_from_definition(
@@ -799,13 +978,18 @@ mod tests {
     use cockpit_config::config::providers::{
         CapabilityStatus, ModelCapabilities, ModelEntry, ModelLocation, ProviderEntry,
     };
-    use cockpit_proto::{AgentAuthoringCatalogOrigin, AuthoredAgentChild, AuthoredAgentSource};
+    use cockpit_proto::{
+        AgentAuthoringCatalogOrigin, AgentAuthoringSourceKind, AuthoredAgentChild,
+        AuthoredAgentSource,
+    };
+    use std::collections::BTreeMap;
 
     fn providers_with(model: &str, trust: Option<ModelTrust>) -> ProvidersConfig {
         let mut providers = BTreeMap::new();
         providers.insert(
             "vendor".to_string(),
             ProviderEntry {
+                template: Some("vendor".into()),
                 models: vec![ModelEntry {
                     id: model.to_string(),
                     trust,
@@ -879,6 +1063,18 @@ mod tests {
         )
     }
 
+    fn catalog() -> crate::daemon::agent_catalog::AgentCatalogIndex {
+        crate::daemon::agent_catalog::cached_catalog().unwrap()
+    }
+
+    fn canonicalize(
+        draft: &AuthoredAgentPackageDraft,
+        snapshot: &AgentPolicySnapshot,
+        providers: &ProvidersConfig,
+    ) -> Result<CanonicalAuthoredPackage, AuthoredPackageRejection> {
+        canonicalize_authored_package(draft, snapshot, providers, &catalog())
+    }
+
     #[test]
     fn field_mapping_uses_canonical_authorities() {
         let mapping = [
@@ -891,7 +1087,7 @@ mod tests {
             ("interactive subagents", "delegation.interactiveSubagents"),
             ("nested children", "private_subagents / subagents/"),
             ("mcp", "mcp.json package file"),
-            ("sidecar", "sidecar declarations + remote-egress gate"),
+            ("sidecar", "sidecar.json package file + remote-egress gate"),
             ("trust", "global ModelTrust via AgentPolicySnapshot"),
             ("auto-prune", "ProvidersConfig::resolve_auto_prune"),
             ("install", "agent installation authority"),
@@ -929,7 +1125,7 @@ mod tests {
             "helper",
             &[("vendor", "exact-a", true), ("vendor", "exact-b", false)],
         );
-        let canonical = canonicalize_authored_package(&package, &snapshot, &providers).unwrap();
+        let canonical = canonicalize(&package, &snapshot, &providers).unwrap();
         let rendered = canonical.definition.to_markdown().unwrap();
         let reparsed = crate::agents::parse_agent(
             &rendered,
@@ -961,12 +1157,12 @@ mod tests {
         let mut empty = draft("helper", &[("vendor", "exact-a", true)], true);
         empty.policy_revision = snapshot.policy_revision.clone();
         empty.markdown = markdown("helper", &[]);
-        let err = canonicalize_authored_package(&empty, &snapshot, &providers).unwrap_err();
+        let err = canonicalize(&empty, &snapshot, &providers).unwrap_err();
         assert_eq!(err.reason, AuthoredAgentRejectReason::EmptyGrants);
 
         let mut omitted = draft("helper", &[("vendor", "exact-a", true)], false);
         omitted.policy_revision = snapshot.policy_revision.clone();
-        let err = canonicalize_authored_package(&omitted, &snapshot, &providers).unwrap_err();
+        let err = canonicalize(&omitted, &snapshot, &providers).unwrap_err();
         assert_eq!(
             err.reason,
             AuthoredAgentRejectReason::OmittedModelTrustConfirmation
@@ -985,7 +1181,7 @@ mod tests {
             pin: None,
             third_party_trust_confirmed: true,
         };
-        let err = canonicalize_authored_package(&package, &snapshot, &providers).unwrap_err();
+        let err = canonicalize(&package, &snapshot, &providers).unwrap_err();
         assert_eq!(
             err.reason,
             AuthoredAgentRejectReason::UnpinnedThirdPartySource
@@ -994,7 +1190,7 @@ mod tests {
         package.source.pin = Some("abc".into());
         package.source.source_locator = "Acme/agents@abc:helper.md".into();
         package.source.third_party_trust_confirmed = false;
-        let err = canonicalize_authored_package(&package, &snapshot, &providers).unwrap_err();
+        let err = canonicalize(&package, &snapshot, &providers).unwrap_err();
         assert_eq!(
             err.reason,
             AuthoredAgentRejectReason::MissingThirdPartyTrustConfirmation
@@ -1007,17 +1203,17 @@ mod tests {
         let snapshot = snapshot_for(&providers);
         let mut package = draft("helper", &[("vendor", "exact-a", true)], true);
         package.policy_revision = snapshot.policy_revision.clone();
-        let parent = canonicalize_authored_package(&package, &snapshot, &providers).unwrap();
+        let parent = canonicalize(&package, &snapshot, &providers).unwrap();
         package.children.push(AuthoredAgentChild {
             relative_path: "subagents/reviewer.md".into(),
             markdown: markdown("reviewer", &[("vendor", "exact-a", true)]),
         });
-        let with_child = canonicalize_authored_package(&package, &snapshot, &providers).unwrap();
+        let with_child = canonicalize(&package, &snapshot, &providers).unwrap();
         assert_ne!(parent.digest, with_child.digest);
         assert!(with_child.files.contains_key("subagents/reviewer.md"));
 
         package.children[0].markdown = "not a definition".into();
-        let err = canonicalize_authored_package(&package, &snapshot, &providers).unwrap_err();
+        let err = canonicalize(&package, &snapshot, &providers).unwrap_err();
         assert_eq!(err.reason, AuthoredAgentRejectReason::InvalidNestedGraph);
     }
 
@@ -1071,12 +1267,12 @@ mod tests {
             "helper",
             &[("vendor", "exact-a", true), ("vendor", "exact-a", false)],
         );
-        let err = canonicalize_authored_package(&duplicate, &snapshot, &providers).unwrap_err();
+        let err = canonicalize(&duplicate, &snapshot, &providers).unwrap_err();
         assert_eq!(err.reason, AuthoredAgentRejectReason::DuplicateRoutes);
 
         let mut absent = draft("helper", &[("vendor", "exact-a", false)], true);
         absent.policy_revision = snapshot.policy_revision.clone();
-        let err = canonicalize_authored_package(&absent, &snapshot, &providers).unwrap_err();
+        let err = canonicalize(&absent, &snapshot, &providers).unwrap_err();
         assert_eq!(err.reason, AuthoredAgentRejectReason::AbsentDefault);
 
         let mut two_model_providers = providers_with("exact-a", Some(ModelTrust::Untrusted));
@@ -1098,8 +1294,7 @@ mod tests {
         );
         two_defaults.policy_revision = two_model_snapshot.policy_revision.clone();
         let err =
-            canonicalize_authored_package(&two_defaults, &two_model_snapshot, &two_model_providers)
-                .unwrap_err();
+            canonicalize(&two_defaults, &two_model_snapshot, &two_model_providers).unwrap_err();
         assert_eq!(err.reason, AuthoredAgentRejectReason::NonEnabledDefault);
 
         let mut illegal = draft("helper", &[("vendor", "exact-a", true)], true);
@@ -1108,7 +1303,7 @@ mod tests {
             "modelSlots:",
             "toolTierPreferences:\n  question: disabled\nmodelSlots:",
         );
-        let err = canonicalize_authored_package(&illegal, &snapshot, &providers).unwrap_err();
+        let err = canonicalize(&illegal, &snapshot, &providers).unwrap_err();
         assert_eq!(err.reason, AuthoredAgentRejectReason::IllegalToolTier);
     }
 
@@ -1136,7 +1331,7 @@ mod tests {
         trust_copy.markdown = trust_copy
             .markdown
             .replace("description: helper", "description: helper\ntrust: trusted");
-        let err = canonicalize_authored_package(&trust_copy, &snapshot, &providers).unwrap_err();
+        let err = canonicalize(&trust_copy, &snapshot, &providers).unwrap_err();
         assert_eq!(err.reason, AuthoredAgentRejectReason::PerAgentTrustOverride);
 
         let mut sidecar = draft("helper", &[("vendor", "exact-a", true)], true);
@@ -1146,7 +1341,7 @@ mod tests {
             model_id: "vision".into(),
             remote_image_egress_confirmed: false,
         });
-        let err = canonicalize_authored_package(&sidecar, &snapshot, &providers).unwrap_err();
+        let err = canonicalize(&sidecar, &snapshot, &providers).unwrap_err();
         assert_eq!(
             err.reason,
             AuthoredAgentRejectReason::UnapprovedRemoteSidecarEgress
@@ -1165,8 +1360,7 @@ mod tests {
         );
         let mut package = draft("helper", &[("vendor", "exact-a", true)], true);
         package.policy_revision = trusted_snapshot.policy_revision.clone();
-        let err =
-            canonicalize_authored_package(&package, &untrusted_snapshot, &untrusted).unwrap_err();
+        let err = canonicalize(&package, &untrusted_snapshot, &untrusted).unwrap_err();
         assert_eq!(err.reason, AuthoredAgentRejectReason::StaleDraft);
         assert!(!package.markdown.contains("trust:"));
     }
@@ -1183,10 +1377,11 @@ mod tests {
             relative_path: "subagents/reviewer.md".into(),
             markdown: markdown("reviewer", &[("vendor", "exact-a", true)]),
         });
-        let canonical = canonicalize_authored_package(&package, &snapshot, &providers).unwrap();
+        let canonical = canonicalize(&package, &snapshot, &providers).unwrap();
         assert!(canonical.files.contains_key("agent.md"));
         assert!(canonical.files.contains_key("mcp.json"));
         assert!(canonical.files.contains_key("subagents/reviewer.md"));
+        assert!(!canonical.files.contains_key("sidecar.json"));
         assert_eq!(canonical.review.children, vec!["subagents/reviewer.md"]);
         assert!(canonical.review.trust_disclosure.contains("shared global"));
         assert!(
@@ -1202,6 +1397,114 @@ mod tests {
                 .to_markdown()
                 .unwrap()
                 .contains("trust:")
+        );
+    }
+
+    #[test]
+    fn sidecar_changes_package_digest_and_is_a_canonical_file() {
+        let mut providers = providers_with("exact-a", Some(ModelTrust::Untrusted));
+        providers
+            .providers
+            .get_mut("vendor")
+            .unwrap()
+            .models
+            .push(ModelEntry {
+                id: "vision".into(),
+                trust: Some(ModelTrust::Untrusted),
+                location: Some(ModelLocation::Local),
+                capabilities: ModelCapabilities {
+                    image_input: CapabilityStatus::Supported,
+                    ..ModelCapabilities::default()
+                },
+                ..ModelEntry::default()
+            });
+        let snapshot = snapshot_for(&providers);
+        let mut package = draft("helper", &[("vendor", "exact-a", true)], true);
+        package.policy_revision = snapshot.policy_revision.clone();
+        let without = canonicalize(&package, &snapshot, &providers).unwrap();
+        package.sidecars.push(AuthoredSidecarDeclaration {
+            provider_id: "vendor".into(),
+            model_id: "vision".into(),
+            remote_image_egress_confirmed: false,
+        });
+        let with = canonicalize(&package, &snapshot, &providers).unwrap();
+        assert_ne!(without.digest, with.digest);
+        assert!(with.files.contains_key("sidecar.json"));
+        package.sidecars.clear();
+        let removed = canonicalize(&package, &snapshot, &providers).unwrap();
+        assert_eq!(removed.digest, without.digest);
+    }
+
+    #[test]
+    fn source_kind_is_derived_from_locator_membership_not_the_client_label() {
+        let providers = providers_with("exact-a", Some(ModelTrust::Untrusted));
+        let snapshot = snapshot_for(&providers);
+        let mut package = draft("helper", &[("vendor", "exact-a", true)], true);
+        package.policy_revision = snapshot.policy_revision.clone();
+        package.source = AuthoredAgentSource {
+            kind: AgentAuthoringSourceKind::Authored,
+            source_locator: "Acme/agents:helper.md".into(),
+            pin: Some("abc".into()),
+            third_party_trust_confirmed: true,
+        };
+        let err = canonicalize(&package, &snapshot, &providers).unwrap_err();
+        assert_eq!(err.reason, AuthoredAgentRejectReason::IncompletePackage);
+
+        package.source.kind = AgentAuthoringSourceKind::FirstPartyCatalog;
+        package.source.source_locator = "FlyCockpit/agents@deadbeef:agents/helper.md".into();
+        package.source.third_party_trust_confirmed = false;
+        let err = canonicalize(&package, &snapshot, &providers).unwrap_err();
+        assert!(
+            err.reason == AuthoredAgentRejectReason::IncompletePackage
+                || err.reason == AuthoredAgentRejectReason::UnpinnedThirdPartySource
+                || err.reason == AuthoredAgentRejectReason::MissingThirdPartyTrustConfirmation
+        );
+    }
+
+    #[test]
+    fn policy_snapshot_emits_display_tokens_for_custom_provider_handles() {
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "secret-local-handle".to_string(),
+            ProviderEntry {
+                models: vec![ModelEntry {
+                    id: "exact-a".into(),
+                    trust: Some(ModelTrust::Untrusted),
+                    ..ModelEntry::default()
+                }],
+                trust: Some(ModelTrust::Untrusted),
+                ..ProviderEntry::default()
+            },
+        );
+        let providers = ProvidersConfig {
+            providers,
+            ..ProvidersConfig::default()
+        };
+        let snapshot = snapshot_for(&providers);
+        assert!(
+            snapshot
+                .routes
+                .iter()
+                .all(|route| route.provider_id == "configured-provider-0")
+        );
+        assert!(
+            !serde_json::to_string(&snapshot)
+                .unwrap()
+                .contains("secret-local-handle")
+        );
+        let mut package = draft("helper", &[("secret-local-handle", "exact-a", true)], true);
+        package.policy_revision = snapshot.policy_revision.clone();
+        let canonical = canonicalize(&package, &snapshot, &providers).unwrap();
+        assert_eq!(
+            canonical.review.grants[0].provider_id,
+            "configured-provider-0"
+        );
+        assert!(
+            !canonical
+                .definition
+                .to_markdown()
+                .unwrap()
+                .contains("secret-local-handle")
         );
     }
 }

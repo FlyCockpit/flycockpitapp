@@ -4619,6 +4619,7 @@ impl AgentInstallationService {
         name: &str,
         source_locator: String,
         source_revision: Option<String>,
+        require_third_party_confirmation: bool,
         third_party_trust_confirmed: bool,
         files: BTreeMap<String, Vec<u8>>,
         package_digest: String,
@@ -4630,6 +4631,7 @@ impl AgentInstallationService {
                 name,
                 source_locator,
                 source_revision,
+                require_third_party_confirmation,
                 third_party_trust_confirmed,
                 files,
                 package_digest,
@@ -4649,6 +4651,7 @@ impl AgentInstallationService {
         name: &str,
         source_locator: String,
         source_revision: Option<String>,
+        require_third_party_confirmation: bool,
         third_party_trust_confirmed: bool,
         files: BTreeMap<String, Vec<u8>>,
         package_digest: String,
@@ -4672,10 +4675,10 @@ impl AgentInstallationService {
             files.contains_key(crate::agents::PACKAGE_ROOT_FILE),
             "authored package is missing agent.md"
         );
-        if source_locator.contains('/')
-            && !source_locator.starts_with("authored/")
-            && !source_locator.starts_with("FlyCockpit/agents")
-        {
+        for path in files.keys() {
+            crate::agents::validate_package_relative_path(path)?;
+        }
+        if require_third_party_confirmation {
             ensure!(
                 third_party_trust_confirmed,
                 "third-party agent installation requires explicit security confirmation"
@@ -4693,7 +4696,7 @@ impl AgentInstallationService {
             .db
             .begin_installation_operation_with_staged_journal(
                 idempotency_key.clone(),
-                fingerprint,
+                fingerprint.clone(),
                 InstallationOperationKind::Create,
                 None,
                 serde_json::json!({
@@ -4782,6 +4785,18 @@ impl AgentInstallationService {
                 bail!("agent create collision")
             }
         };
+        bind_authored_package_primary(
+            &self.db,
+            &self.providers,
+            name,
+            &files,
+            &package_digest,
+            installation.installation_id,
+            &operation.operation_id.to_string(),
+            &fingerprint,
+            now,
+        )
+        .await?;
         if checkpoint_rank(journal.checkpoint)
             < checkpoint_rank(InstallationJournalCheckpoint::DbCommitted)
         {
@@ -6032,6 +6047,85 @@ fn remove_owned_file(path: &Path) -> Result<()> {
     ensure!(owned_file_exists(path, false)?, "owned file disappeared");
     std::fs::remove_file(path).context("removing owned agent file")
 }
+async fn bind_authored_package_primary(
+    db: &Db,
+    providers: &ProvidersConfig,
+    name: &str,
+    files: &BTreeMap<String, Vec<u8>>,
+    package_digest: &str,
+    installation_id: Uuid,
+    idempotency_key: &str,
+    request_fingerprint: &str,
+    now: i64,
+) -> Result<()> {
+    let definition = crate::agents::load_workspace_package_from_files(name, files.clone())
+        .context("loading authored package for primary binding")?;
+    let Some(primary) = definition
+        .definition_frontmatter()
+        .as_ref()
+        .and_then(|frontmatter| frontmatter.model_slots.get("primary"))
+        .cloned()
+    else {
+        bail!("authored package is missing a primary model slot");
+    };
+    let offerings = setup_offerings(providers);
+    let mut bindings = Vec::new();
+    for grant in &primary.models {
+        let offering = offerings
+            .iter()
+            .find(|offering| {
+                offering.model_id == grant.model_id
+                    && (offering.provider_id == grant.provider_id
+                        || offering.provider_profile_handle == grant.provider_id)
+            })
+            .with_context(|| {
+                format!(
+                    "authored grant {}/{} is not a configured provider route",
+                    grant.provider_id, grant.model_id
+                )
+            })?;
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "slot": "primary",
+            "provider": offering.provider_id,
+            "model": grant.model_id,
+        }))?;
+        bindings.push(cockpit_db::db::agent_installations::AgentBindingInput {
+            slot_id: "primary".into(),
+            provider_profile_handle: offering.provider_profile_handle.clone(),
+            model_id: grant.model_id.clone(),
+            provenance_digest: sha256_hex(&payload),
+            provenance_payload: payload,
+            hard_capability_verified: true,
+            is_default: grant.default,
+        });
+    }
+    ensure!(
+        bindings.iter().filter(|binding| binding.is_default).count() == 1,
+        "authored package must bind exactly one default primary route"
+    );
+    let observation = db
+        .agent_observation(installation_id)
+        .await?
+        .context("authored installation is missing its observation")?;
+    let outcome = db
+        .bind_agent_slot_set(cockpit_db::db::agent_installations::AgentBindSlotSetInput {
+            installation_id,
+            expected_observation_revision: observation.observation_revision,
+            expected_definition_digest: package_digest.to_string(),
+            expected_binding_revision: None,
+            idempotency_key: idempotency_key.to_string(),
+            request_fingerprint: request_fingerprint.to_string(),
+            bindings,
+            now_unix_ms: now,
+        })
+        .await?;
+    match outcome {
+        cockpit_db::db::agent_installations::BindAgentOutcome::Bound(_)
+        | cockpit_db::db::agent_installations::BindAgentOutcome::AlreadyBound(_) => Ok(()),
+        other => bail!("authored package primary bind failed: {other:?}"),
+    }
+}
+
 fn authored_package_stage_dir(global: &Path, name: &str, operation: Uuid) -> PathBuf {
     global.join(format!(".{name}.{operation}.staged-pkg"))
 }
@@ -6043,6 +6137,11 @@ fn authored_package_target_dir(global: &Path, name: &str) -> PathBuf {
 fn write_relative_package_files(root: &Path, files: &BTreeMap<String, Vec<u8>>) -> Result<()> {
     std::fs::create_dir_all(root).context("creating authored package staging directory")?;
     for (relative, bytes) in files {
+        crate::agents::validate_package_relative_path(relative)?;
+        ensure!(
+            !std::path::Path::new(relative).is_absolute(),
+            "authored package path must be relative"
+        );
         let path = root.join(relative);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -6938,6 +7037,27 @@ pub(crate) fn wire_provider_id_for_profile_route(
     (matches.len() == 1)
         .then(|| matches.into_iter().next())
         .flatten()
+}
+
+/// Map a redacted wire provider id plus model back to the daemon-local
+/// credential-route handle. Display tokens (`configured-provider-{index}`)
+/// never persist as live config-map keys.
+pub(crate) fn resolvable_provider_handle_for_route(
+    providers: &ProvidersConfig,
+    provider_id: &str,
+    model_id: &str,
+) -> Option<String> {
+    let offerings = setup_offerings(providers);
+    let mut handles = std::collections::BTreeSet::new();
+    for offering in &offerings {
+        if offering.model_id == model_id
+            && (offering.provider_id == provider_id
+                || offering.provider_profile_handle == provider_id)
+        {
+            handles.insert(offering.provider_profile_handle.clone());
+        }
+    }
+    (handles.len() == 1).then(|| handles.into_iter().next().expect("unique provider handle"))
 }
 
 /// Map a session-setup / installation wire choice back to the config-map key
@@ -8289,7 +8409,10 @@ mod tests {
 
     #[tokio::test]
     async fn authored_package_commit_is_atomic_and_idempotent() {
-        let harness = ServiceHarness::new(FetchReply::Failure("authoring does not fetch".into()));
+        let harness = ServiceHarness::with_providers(
+            FetchReply::Failure("authoring does not fetch".into()),
+            binding_providers(),
+        );
         let markdown = b"---\nschemaVersion: 1\nagentId: authored/helper\nroles: [code]\ndescription: helper\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n    models:\n      - providerId: vendor\n        modelId: exact-a\n        default: true\n---\nbody\n".to_vec();
         let child = markdown.clone();
         let mut files = BTreeMap::new();
@@ -8306,6 +8429,7 @@ mod tests {
                 "helper",
                 "authored/helper".into(),
                 None,
+                false,
                 false,
                 files.clone(),
                 digest.clone(),
@@ -8327,6 +8451,7 @@ mod tests {
                 "helper",
                 "authored/helper".into(),
                 None,
+                false,
                 false,
                 files.clone(),
                 digest.clone(),

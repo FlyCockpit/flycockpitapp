@@ -901,7 +901,7 @@ fn retained_submission_dispatches_exactly_once_after_runner_attach() {
     )
     .unwrap();
 
-    let mut app = App::new(Some(tmp.path()), false);
+    let mut app = App::new_with_bootstrap_config(Some(tmp.path()), false);
     app.first_paint_completed = true;
     app.startup_background.started = true;
     app.launch.active_model = Some(("p".to_string(), "m".to_string()));
@@ -922,6 +922,7 @@ fn retained_submission_dispatches_exactly_once_after_runner_attach() {
     assert_eq!(generation, app.startup_background.generation);
 
     app.startup_background.workspace_ready = true;
+    app.startup_lifecycle = Some(App::stub_startup_lifecycle_for_tests());
     let (control_tx, _control_rx) = mpsc::channel(4);
     app.adopt_runner(Ok(AgentRunner::stub_with_control_tx(control_tx)));
 

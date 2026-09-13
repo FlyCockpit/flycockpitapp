@@ -411,7 +411,7 @@ impl App {
         // These projections used to be queued with startup construction. They
         // are retained, but are intentionally downstream of the accepted
         // workspace trust fence because they inspect the opened project.
-        tokio::task::spawn_blocking(cockpit_core::tokens::warm_cl100k);
+        crate::tui::async_action::spawn_blocking_action_task(cockpit_core::tokens::warm_cl100k);
 
         let cwd = self.launch.cwd.clone();
         let active_model = self.launch.active_model.clone();

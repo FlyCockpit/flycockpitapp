@@ -20,7 +20,7 @@ fn at_popup_app(tmp: &tempfile::TempDir) -> App {
     fs::write(tmp.path().join("kept.rs"), "").unwrap();
     let mut app = cockpit_config::trust::with_workspace_trust_policy(
         super::trusted_workspace_policy_for_tests(tmp.path()),
-        || App::new(Some(tmp.path()), false),
+        || App::new_with_bootstrap_config(Some(tmp.path()), false),
     );
     app.dialog = Dialog::None;
     app

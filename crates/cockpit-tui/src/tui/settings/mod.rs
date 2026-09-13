@@ -5678,6 +5678,15 @@ impl Dialog {
             || matches!(self, Dialog::SetupWizard(wizard) if wizard.pending_operation_id.is_some())
     }
 
+    pub(crate) fn settings_pointer_contains(&self, column: u16, row: u16) -> bool {
+        let Dialog::Settings(settings) = self else {
+            return false;
+        };
+        settings.pointer_surface.area.get().is_some_and(|area| {
+            column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
+        })
+    }
+
     pub(crate) fn handle_settings_pointer(
         &mut self,
         mouse: MouseEvent,

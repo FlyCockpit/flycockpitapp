@@ -23,7 +23,9 @@ fn configured_app_body(tmp: &tempfile::TempDir) -> App {
         r#"{"url":"https://example.test","models":[{"id":"m"}]}"#,
     )
     .unwrap();
-    App::new(Some(tmp.path()), false)
+    let mut app = App::new_with_bootstrap_config(Some(tmp.path()), false);
+    App::prepare_runner_attach_harness(&mut app);
+    app
 }
 
 async fn drain_until_idle(app: &mut App) {

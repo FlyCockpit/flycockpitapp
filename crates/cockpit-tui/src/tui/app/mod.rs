@@ -3510,6 +3510,38 @@ impl App {
         app
     }
 
+    /// Config-seeded harness for unit tests that exercise post-bootstrap
+    /// reducers without running the interactive startup state machine.
+    #[cfg(test)]
+    pub fn new_with_bootstrap_config(project: Option<&Path>, no_sandbox: bool) -> Self {
+        let mut app = Self::new(project, no_sandbox);
+        app.refresh_bootstrap_config_snapshot();
+        app
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stub_startup_lifecycle_for_tests() -> crate::tui::agent_runner::SelectedLifecycle
+    {
+        let (connections, _) = tokio::sync::mpsc::channel(1);
+        let (sensitive, _) = tokio::sync::mpsc::channel(1);
+        crate::tui::agent_runner::SelectedLifecycle {
+            endpoint: cockpit_client::ClientEndpoint::InProcess(
+                cockpit_client::InProcessEndpoint::new(connections, sensitive),
+            ),
+            owns_daemon: true,
+            ephemeral_owner: false,
+            socket: PathBuf::from("test.sock"),
+            startup_notice: None,
+            promoted_from_ephemeral: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_runner_attach_harness(app: &mut Self) {
+        app.startup_background.workspace_ready = true;
+        app.startup_lifecycle = Some(Self::stub_startup_lifecycle_for_tests());
+    }
+
     pub fn new_with_workspace_trust(
         project: Option<&Path>,
         no_sandbox: bool,
@@ -4849,7 +4881,7 @@ fn spawn_git_refresh(
     lifecycle: cockpit_client::LifecycleClient,
     shared: Arc<Mutex<Option<RepoStatus>>>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    crate::tui::async_action::spawn_action_task(async move {
         let project_root = cwd.display().to_string();
         let mut interval = tokio::time::interval(GIT_REFRESH_INTERVAL);
         // Do NOT skip the first tick: `App::new` no longer fetches git
@@ -4884,7 +4916,7 @@ fn spawn_worktree_root_resolve(
     lifecycle: cockpit_client::LifecycleClient,
     shared: Arc<Mutex<Option<std::path::PathBuf>>>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    crate::tui::async_action::spawn_action_task(async move {
         let path = cwd.display().to_string();
         if let Some(root) = daemon_find_worktree_root(&lifecycle, &path).await
             && let Ok(mut guard) = shared.lock()

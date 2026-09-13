@@ -2711,6 +2711,9 @@ impl App {
         // v7 nonce is only the provisional fence key; once the complete
         // submission exists below, the reservation is atomically re-keyed to
         // the payload-derived durable identity without changing its order.
+        let startup_retained_dispatch = self
+            .startup_retained_submission_id
+            .is_some_and(|(generation, _)| generation == self.startup_background.generation);
         let invocation_nonce = self
             .startup_retained_submission_id
             .take()
@@ -3019,7 +3022,7 @@ impl App {
         };
         let identity_pending =
             !pending_probe_ids.is_empty() || self.pending_model_selection.is_some();
-        if !identity_pending {
+        if !identity_pending && !startup_retained_dispatch {
             let derived_submission_id = cockpit_client::submission::derive_client_submission_id(
                 invocation_nonce,
                 &submission.client_fingerprint(),

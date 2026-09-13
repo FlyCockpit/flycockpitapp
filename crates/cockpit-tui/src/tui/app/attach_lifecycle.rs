@@ -177,14 +177,6 @@ impl App {
             self.apply_runner_attach_continuation(continuation);
             return;
         }
-        let Some(selected) = self.startup_lifecycle.clone() else {
-            if latch_error {
-                let error = "startup lifecycle is not ready".to_string();
-                self.adopt_runner(Err(error.clone()));
-                self.apply_runner_attach_failure(&[continuation], &error);
-            }
-            return;
-        };
         let requested_session_id = self.launch.session_id;
         if let Some(pending) = self.pending_runner_attach.as_mut()
             && pending.cwd == self.launch.cwd
@@ -205,6 +197,13 @@ impl App {
             }
             return;
         }
+        let Some(selected) = self.startup_lifecycle.clone() else {
+            if latch_error {
+                let error = "startup lifecycle is not ready".to_string();
+                self.apply_runner_attach_failure(&[continuation], &error);
+            }
+            return;
+        };
 
         let initial_model = match &continuation {
             RunnerAttachContinuation::SelectModel { active, .. } => Some(active.clone()),
@@ -462,6 +461,9 @@ impl App {
                 .is_some_and(|runner| runner.is_ok())
         {
             let _ = self.submit_input();
+            if self.startup_retained_submission_id.is_none() {
+                self.clear_model_and_config_chrome_for_empty_session();
+            }
         }
         if let Some((session_id, connection_epoch)) = attach_ids {
             self.bootstrap_inventory_after_attach(
@@ -553,7 +555,12 @@ impl App {
         }
         self.cancel_paste_probes_matching(|probe| probe.owner_fence.is_none());
         self.cancel_model_controls_for_epoch_change(new_session_id);
-        self.clear_model_and_config_chrome_for_empty_session();
+        // A startup-retained composer draft still dispatches against the
+        // bootstrap catalog held before attach. Clearing the snapshot epoch
+        // first would make model readiness fail closed with NeedsProvider.
+        if self.startup_retained_submission_id.is_none() {
+            self.clear_model_and_config_chrome_for_empty_session();
+        }
         if let Some(state) = state {
             self.apply_active_model_state(
                 state.selection.clone(),

@@ -35,7 +35,7 @@ fn test_async_runtime() -> &'static tokio::runtime::Handle {
     })
 }
 
-fn spawn_action_task<F>(future: F) -> JoinHandle<()>
+pub(crate) fn spawn_action_task<F>(future: F) -> JoinHandle<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
@@ -55,7 +55,7 @@ where
     }
 }
 
-fn spawn_blocking_action_task<F>(work: F) -> JoinHandle<()>
+pub(crate) fn spawn_blocking_action_task<F>(work: F) -> JoinHandle<()>
 where
     F: FnOnce() + Send + 'static,
 {

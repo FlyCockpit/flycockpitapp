@@ -104,6 +104,7 @@ impl App {
             providers,
             extended,
         } = welcome::load_bundle_bootstrap_redacted(Some(&self.launch.cwd), false);
+        self.agent_path = vec![fresh.agent_name.clone()];
         self.config_snapshot = HeldConfig::from_view(
             self.config_snapshot.generation,
             false,

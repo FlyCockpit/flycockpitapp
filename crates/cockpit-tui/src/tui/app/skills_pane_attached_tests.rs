@@ -24,7 +24,7 @@ fn app_for_skills(tmp: &tempfile::TempDir) -> App {
     .unwrap();
     cockpit_config::trust::with_workspace_trust_policy(
         super::trusted_workspace_policy_for_tests(tmp.path()),
-        || App::new(Some(tmp.path()), false),
+        || App::new_with_bootstrap_config(Some(tmp.path()), false),
     )
 }
 

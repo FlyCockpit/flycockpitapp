@@ -37080,7 +37080,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         caffeinate: base.caffeinate.clone(),
         global_events,
         global_redaction: base.global_redaction.clone(),
-        redaction_generation: std::sync::atomic::AtomicU64::new(0),
+        redaction_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         redaction_refresh_failure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         persistent_endpoint_publication_failure: std::sync::atomic::AtomicBool::new(false),
         redaction_publication_poisoned: std::sync::atomic::AtomicBool::new(false),
@@ -37306,7 +37306,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         caffeinate: base.caffeinate.clone(),
         global_events,
         global_redaction: base.global_redaction.clone(),
-        redaction_generation: std::sync::atomic::AtomicU64::new(0),
+        redaction_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         redaction_refresh_failure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         persistent_endpoint_publication_failure: std::sync::atomic::AtomicBool::new(false),
         redaction_publication_poisoned: std::sync::atomic::AtomicBool::new(false),
@@ -42974,4 +42974,96 @@ async fn resolve_interrupt_dispatch_threads_only_the_rendering_live_attachment_p
     .expect_err("a replacement attachment cannot reuse the old render identity");
     assert_eq!(recycled_error.code, ErrorCode::Authorization);
     assert!(work_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn locked_services_never_admit_ordinary_payload_before_coverage() {
+    let (_tmp, locked, _) = super::onboarding_bootstrap_tests::ready_construction().await;
+
+    let denied = handle_locked_in_process_request(&locked, Request::GetStorageReport)
+        .await
+        .expect_err("locked bootstrap must deny ordinary payloads");
+    assert_eq!(denied.code, ErrorCode::BootstrapLocked);
+
+    let constructed = locked
+        .finish_ready_transition()
+        .await
+        .expect("coverage-gated ready construction");
+    assert!(
+        constructed
+            .ready
+            .as_ref()
+            .expect("constructed ready services")
+            .context
+            .redaction_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0,
+        "ReadyServices publication requires an admitted authority generation"
+    );
+    let _ready = constructed.publish_returned();
+    assert!(locked.ready.load(std::sync::atomic::Ordering::Acquire));
+    assert!(
+        locked.finish_ready_transition().await.is_err(),
+        "the LockedServices owner must not open ReadyServices twice"
+    );
+}
+
+#[test]
+fn global_coverage_helper_has_no_legacy_builder() {
+    let source = include_str!("mod.rs");
+    let helper = source
+        .split("async fn acquire_daemon_redaction_table(")
+        .nth(1)
+        .and_then(|body| body.split("fn scrub_json_strings").next())
+        .expect("daemon coverage helper");
+    assert!(helper.contains("RedactionCoverageKey::daemon_global"));
+    assert!(helper.contains("CoverageBuild::capture_without_sealed"));
+    assert!(helper.contains(".use_at_sink"));
+    assert!(!helper.contains("build_daemon_redaction_table"));
+    assert!(!helper.contains("refresh_global_redaction_table"));
+    assert!(!helper.contains("RedactionTable::empty"));
+}
+
+#[tokio::test]
+async fn global_vault_mutation_revokes_coverage() {
+    use crate::redact::coverage_authority::{
+        CoverageBinding, CoverageBuild, CoverageError, CoverageScope, RedactionCoverageAuthority,
+        RedactionCoverageKey,
+    };
+    let authority = RedactionCoverageAuthority::default();
+    let binding = |value| CoverageBinding::from_daemon_bytes([value; 16]);
+    let key = RedactionCoverageKey::daemon_global(
+        binding(1),
+        binding(2),
+        binding(3),
+        binding(4),
+        binding(5),
+        binding(6),
+        binding(7),
+        binding(8),
+    );
+    let admission = authority
+        .acquire(key, CoverageScope::DaemonGlobalRefresh, || {
+            Ok(CoverageBuild::from_complete_table(
+                RedactionTable::empty().with_forced_literal(
+                    "global-vault-coverage-canary".into(),
+                    "$test:global-vault".into(),
+                )?,
+            ))
+        })
+        .await
+        .expect("global coverage admission");
+    authority.invalidate();
+    assert_eq!(
+        admission.use_at_sink(|_| Ok(())),
+        Err(CoverageError::Invalidated)
+    );
+
+    let source = include_str!("mod.rs");
+    let publisher = source
+        .split("install_owner_redaction_publisher")
+        .nth(1)
+        .and_then(|body| body.split("#[cfg(debug_assertions)]").next())
+        .expect("vault mutation publisher");
+    assert!(publisher.contains("coverage_authority.invalidate()"));
 }

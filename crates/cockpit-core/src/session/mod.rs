@@ -494,6 +494,15 @@ pub struct Session {
     /// (a sync, execution-free lookup). Absent in isolated unit sessions, where
     /// command-backed secrets simply resolve as missing.
     command_secret_cache: Mutex<Option<Arc<crate::secret_command::CommandSecretCache>>>,
+    /// Daemon-issued source binding used by every accepted operation in this
+    /// session. Daemon-less sessions have no authority and therefore cannot
+    /// synthesize an ordinary coverage admission.
+    redaction_coverage: Mutex<
+        Option<(
+            crate::redact::coverage_authority::RedactionCoverageAuthority,
+            crate::redact::coverage_authority::RedactionCoverageKey,
+        )>,
+    >,
     /// Daemon-owned descendant process-containment handle. Late-installed by the
     /// registry / daemon before the worker starts (like [`Self::external_journal`]),
     /// so every lifecycle hook this session spawns runs its child under a proven
@@ -1556,6 +1565,23 @@ impl Session {
         &self,
     ) -> Option<Arc<crate::secret_command::CommandSecretCache>> {
         self.command_secret_cache.lock().unwrap().clone()
+    }
+
+    pub(crate) fn set_redaction_coverage(
+        &self,
+        authority: crate::redact::coverage_authority::RedactionCoverageAuthority,
+        key: crate::redact::coverage_authority::RedactionCoverageKey,
+    ) {
+        *self.redaction_coverage.lock().unwrap() = Some((authority, key));
+    }
+
+    pub(crate) fn redaction_coverage(
+        &self,
+    ) -> Option<(
+        crate::redact::coverage_authority::RedactionCoverageAuthority,
+        crate::redact::coverage_authority::RedactionCoverageKey,
+    )> {
+        self.redaction_coverage.lock().unwrap().clone()
     }
 
     /// Install (or inherit) the daemon's descendant process-containment handle.

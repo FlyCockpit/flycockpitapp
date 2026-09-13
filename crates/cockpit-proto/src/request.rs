@@ -487,6 +487,19 @@ pub struct RunInvocationOptions {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case", content = "params")]
 pub enum Request {
+    GetRedactionCoverageStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
+    },
+    RenderInputPrediction {
+        session_id: Uuid,
+        turns: Vec<crate::InputPredictionTurn>,
+        mode: crate::InputPredictionMode,
+    },
+    ResolveTagPreview {
+        session_id: Uuid,
+        input: String,
+    },
     CreateCodeRootV1(crate::CreateCodeRootV1Request),
     AttachExistingCodeRootV1(crate::AttachExistingCodeRootV1Request),
     CloseCodeRootAttachmentV1(crate::CloseCodeRootAttachmentV1Request),
@@ -4504,6 +4517,9 @@ fn validate_agent_interrupt_response(response: &AgentInterruptResponse) -> Resul
 macro_rules! request_variants {
     ($with_variants:ident $(, $context:ident)*) => {
         $with_variants! { ($($context),*) [
+            (Request::GetRedactionCoverageStatus { .. }, "get_redaction_coverage_status");
+            (Request::RenderInputPrediction { .. }, "render_input_prediction");
+            (Request::ResolveTagPreview { .. }, "resolve_tag_preview");
             (Request::CreateCodeRootV1(..), "create_code_root_v1");
             (Request::AttachExistingCodeRootV1(..), "attach_existing_code_root_v1");
             (Request::CloseCodeRootAttachmentV1(..), "close_code_root_attachment_v1");
@@ -4879,6 +4895,9 @@ impl Request {
 macro_rules! command {
     ($with_commands:ident $(, $context:ident)*) => {
         $with_commands! { ($($context),*) [
+            (Request::GetRedactionCoverageStatus { session_id }, "get_redaction_coverage_status", public_read, option_field(session_id), false, read_only, none, concurrent, none, "session_id:Option<Uuid>", [session_id: Option<Uuid> => session]);
+            (Request::RenderInputPrediction { session_id, turns, mode }, "render_input_prediction", owner_only, field(session_id), false, local_only, none, serialized, none, "session_id:Uuid|turns:Vec<InputPredictionTurn>|mode:InputPredictionMode", [session_id: Uuid => session, turns: Vec<$crate::InputPredictionTurn> => param, mode: $crate::InputPredictionMode => param]);
+            (Request::ResolveTagPreview { session_id, input }, "resolve_tag_preview", owner_only, field(session_id), false, local_only, none, serialized, none, "session_id:Uuid|input:String", [session_id: Uuid => session, input: String => param]);
             (Request::CreateCodeRootV1(request), "create_code_root_v1", owner_only, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "request:CreateCodeRootV1Request", [request: $crate::CreateCodeRootV1Request => param]);
             (Request::AttachExistingCodeRootV1(request), "attach_existing_code_root_v1", owner_only, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "request:AttachExistingCodeRootV1Request", [request: $crate::AttachExistingCodeRootV1Request => param]);
             (Request::CloseCodeRootAttachmentV1(request), "close_code_root_attachment_v1", owner_only, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "request:CloseCodeRootAttachmentV1Request", [request: $crate::CloseCodeRootAttachmentV1Request => param]);

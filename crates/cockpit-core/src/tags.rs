@@ -483,19 +483,20 @@ pub fn quote_tracked_tags(buffer: &str, accepted: &[String]) -> String {
 /// expansions for the chat (GOALS §1e).
 #[cfg(test)]
 fn expand_tags(buffer: &str, cwd: &Path) -> ExpandResult {
-    expand_tags_inner(buffer, cwd, None)
+    let policy = TagPolicy::new(cwd, vec!["*".to_string()]);
+    expand_tags_inner(buffer, &policy)
 }
 
 pub fn expand_tags_with_policy(buffer: &str, policy: &TagPolicy) -> ExpandResult {
-    expand_tags_inner(buffer, &policy.cwd, Some(policy))
+    expand_tags_inner(buffer, policy)
 }
 
 pub fn expand_assembly_tags_with_policy(buffer: &str, policy: &TagPolicy) -> ExpandResult {
-    expand_tags_inner_with_mode(buffer, &policy.cwd, Some(policy), ExpansionMode::Assembly)
+    expand_tags_inner_with_mode(buffer, policy, ExpansionMode::Assembly)
 }
 
-fn expand_tags_inner(buffer: &str, cwd: &Path, policy: Option<&TagPolicy>) -> ExpandResult {
-    expand_tags_inner_with_mode(buffer, cwd, policy, ExpansionMode::Composer)
+fn expand_tags_inner(buffer: &str, policy: &TagPolicy) -> ExpandResult {
+    expand_tags_inner_with_mode(buffer, policy, ExpansionMode::Composer)
 }
 
 #[derive(Clone, Copy)]
@@ -506,10 +507,10 @@ enum ExpansionMode {
 
 fn expand_tags_inner_with_mode(
     buffer: &str,
-    cwd: &Path,
-    policy: Option<&TagPolicy>,
+    policy: &TagPolicy,
     mode: ExpansionMode,
 ) -> ExpandResult {
+    let cwd = &policy.cwd;
     let mut wire = String::with_capacity(buffer.len());
     let mut expansions: Vec<TagExpansion> = Vec::new();
     // Dedup state, per call (one message): a repeated `@`-tag of the same
@@ -645,23 +646,15 @@ fn try_inline(
     path_part: &str,
     range: Option<(usize, usize)>,
     raw: &str,
-    policy: Option<&TagPolicy>,
+    policy: &TagPolicy,
     mode: ExpansionMode,
 ) -> Expanded {
     let resolved = resolve_path(cwd, path_part);
-    if let Some(policy) = policy
-        && let Some(blocked) = check_policy(path_part, raw, &resolved, policy)
-    {
+    if let Some(blocked) = check_policy(path_part, raw, &resolved, policy) {
         return blocked;
     }
-    let caps = policy
-        .map(TagPolicy::caps)
-        .unwrap_or(TagInlineCaps::STANDARD);
-    // No policy (bare `expand_tags`) has no session table; the driver and
-    // TUI paths always construct one.
-    let redact = policy
-        .map(|p| p.redact.clone())
-        .unwrap_or_else(|| std::sync::Arc::new(crate::redact::RedactionTable::empty()));
+    let caps = policy.caps();
+    let redact = policy.redact.clone();
     let meta = match std::fs::metadata(&resolved) {
         Ok(m) => m,
         Err(e) => {
@@ -688,7 +681,7 @@ fn try_inline(
         if matches!(mode, ExpansionMode::Assembly) {
             return lazy_reference("list", path_part, raw, "directory reference");
         }
-        let (block, count) = render_directory(&resolved, path_part, policy, caps);
+        let (block, count) = render_directory(&resolved, path_part, Some(policy), caps);
         return Expanded {
             wire_piece: block,
             expansion: TagExpansion {
@@ -973,6 +966,26 @@ mod tests {
 
     fn tmp_root() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
+    }
+
+    #[test]
+    fn no_policy_tag_expansion_is_test_only_and_cannot_reach_submission() {
+        let source = include_str!("tags.rs");
+        let helper = source
+            .split("#[cfg(test)]\nfn expand_tags(")
+            .nth(1)
+            .and_then(|body| body.split("pub fn expand_tags_with_policy").next())
+            .expect("test-only bare tag helper");
+        assert!(helper.contains("TagPolicy::new"));
+        let inline = source
+            .split("fn try_inline(")
+            .nth(1)
+            .and_then(|body| body.split("fn resolve_path(").next())
+            .expect("tag inline funnel");
+        assert!(inline.contains("policy: &TagPolicy"));
+        assert!(inline.contains("policy.redact.clone()"));
+        assert!(!inline.contains("Option<&TagPolicy>"));
+        assert!(!inline.contains("RedactionTable::empty"));
     }
 
     /// Suggestions with an empty frequency map — these tests exercise

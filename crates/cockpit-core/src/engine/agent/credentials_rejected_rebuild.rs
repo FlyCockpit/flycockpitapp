@@ -141,18 +141,37 @@ pub(crate) async fn rebuild_model_for_credentials(
     }
     // The owner-scoped store now carries the freshly-resolved output.
     let store = session.provider_credential_store(&providers)?;
-    // (b) Refreshed redaction table: union the current table with one built from
-    // the refreshed store (which injects the fresh command output), so the NEW
-    // token is scrubbed everywhere on the retry. In-memory only.
-    let refreshed_secrets = RedactionTable::build_with_env_and_credential_store(
-        &extended.redact,
-        &session.project_root,
-        &env,
-        &store,
-    )?;
-    let refreshed_secrets = session
-        .with_machine_scoped_sealed_redactions(&refreshed_secrets)
-        .await?;
+    // (b) Credential rotation revokes the old generation before the retry.
+    // Reacquisition captures the refreshed owner-scoped store and sealed view
+    // on the authority's bounded worker facility.
+    let (authority, coverage_key) = session
+        .redaction_coverage()
+        .ok_or_else(|| anyhow::anyhow!("coverage_unavailable"))?;
+    authority.invalidate_key(&coverage_key);
+    let sealed = session.machine_scoped_sealed_redactions().await?;
+    let capture_config = extended.redact.clone();
+    let capture_root = session.project_root.clone();
+    let capture_env = env.clone();
+    let capture_store = store.clone();
+    let admission = authority
+        .acquire(
+            coverage_key,
+            crate::redact::coverage_authority::CoverageScope::CredentialRetry,
+            move || {
+                crate::redact::coverage_authority::CoverageBuild::capture(
+                    &capture_config,
+                    &capture_root,
+                    &capture_env,
+                    &capture_store,
+                    &sealed,
+                )
+            },
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let refreshed_secrets = admission
+        .use_at_sink(|table| Ok(table.enforced()))
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let refreshed = Arc::new(redact.union(&refreshed_secrets)?);
     // (c) Rebuild a fresh client from the owner-scoped store under the refreshed
     // table. Same construction funnel as the model-swap path.
@@ -199,6 +218,22 @@ mod tests {
             observed_status: None,
             recovery: crate::engine::model::ProviderRecoverySignal::None,
         })
+    }
+
+    #[test]
+    fn retry_reacquires_bound_coverage() {
+        let source = include_str!("credentials_rejected_rebuild.rs");
+        let rebuild = source
+            .split("pub(crate) async fn rebuild_model_for_credentials(")
+            .nth(1)
+            .and_then(|body| body.split("\n#[cfg(test)]\nmod tests").next())
+            .expect("credential retry implementation");
+        assert!(rebuild.contains("authority.invalidate_key(&coverage_key)"));
+        assert!(rebuild.contains("CoverageScope::CredentialRetry"));
+        assert!(rebuild.contains("CoverageBuild::capture"));
+        assert!(rebuild.contains(".use_at_sink"));
+        assert!(!rebuild.contains("RedactionTable::build"));
+        assert!(!rebuild.contains("RedactionTable::empty"));
     }
 
     #[test]

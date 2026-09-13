@@ -1241,6 +1241,9 @@ impl RedactionTable {
                     EnvFileScan::OverLimit => {
                         return Err(EnvFileOverLimitError { path }.into());
                     }
+                    EnvFileScan::Changed => {
+                        return Err(RedactionSourceChangedError.into());
+                    }
                 }
             }
         }
@@ -1248,7 +1251,7 @@ impl RedactionTable {
         // Private SSH keys: each is registered as a forced (non-prunable)
         // secret — key material must never be dropped by the prune step.
         if cfg.scan_ssh_keys {
-            for (value, origin) in collect_ssh_key_candidates(cfg.ssh_key_dir.as_deref()) {
+            for (value, origin) in collect_ssh_key_candidates(cfg.ssh_key_dir.as_deref())? {
                 candidates.push(Candidate::forced(value, origin, true));
             }
         }
@@ -1625,6 +1628,9 @@ impl RedactionTable {
                     self.protected.clone(),
                 )?);
             }
+            EnvFileScan::Changed => {
+                return Err(RedactionSourceChangedError.into());
+            }
         };
         let mut entries: Vec<(String, String, OrdinarySource)> = Vec::new();
         for candidate in candidates {
@@ -1848,6 +1854,28 @@ impl RedactionTable {
     // Retained for `cockpit debug redact` introspection.
     pub fn is_empty(&self) -> bool {
         self.disabled || self.matcher.is_none()
+    }
+
+    /// Conservative private heap accounting for one immutable authority
+    /// artifact. This value never leaves the daemon and is not a source or
+    /// candidate fingerprint.
+    pub(super) fn estimated_immutable_artifact_bytes(&self) -> usize {
+        let entry_bytes = self.entries.iter().fold(0usize, |total, entry| {
+            total
+                .saturating_add(entry.value.capacity())
+                .saturating_add(entry.class.origin_display().len())
+                .saturating_add(std::mem::size_of::<RedactionEntry>())
+        });
+        // Both automatons are compiled from the same pattern vector. Their
+        // exact allocator internals are deliberately not exposed; charging
+        // twice the candidate bytes plus the owned table vectors is a stable,
+        // conservative admission budget.
+        entry_bytes
+            .saturating_mul(3)
+            .saturating_add(self.unsupported_files.capacity() * std::mem::size_of::<PathBuf>())
+            .saturating_add(
+                self.protected_path_conflicts.capacity() * std::mem::size_of::<String>(),
+            )
     }
 
     /// This table with the config-level opt-out (`redact.enabled = false`)
@@ -2301,6 +2329,10 @@ pub(crate) struct EnvFileOverLimitError {
     path: PathBuf,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("redaction source changed during complete capture")]
+struct RedactionSourceChangedError;
+
 /// True when [`RedactionTable::build`] (and siblings) refused so a later
 /// consumer cannot proceed with a table that would miss secrets.
 pub(crate) fn build_would_miss_secrets(error: &anyhow::Error) -> bool {
@@ -2321,6 +2353,9 @@ enum EnvFileScan {
     /// File exceeded the daemon project-file cap. Must fail the table build:
     /// skipping it would miss secrets (fail open).
     OverLimit,
+    /// The source was replaced or changed while it was being captured.
+    /// Refuse this generation; a later acquisition performs a fresh scan.
+    Changed,
 }
 
 #[cfg(test)]

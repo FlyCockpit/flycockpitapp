@@ -604,6 +604,7 @@ pub(crate) async fn generate_session_metadata_fork(
             work.expected_metadata_fork_generation,
             cancel.clone(),
             shutdown_gate.clone(),
+            model.redact_table(),
         );
         let cfg = crate::mcp::config::McpConfig::default();
         let result = tokio::select! {

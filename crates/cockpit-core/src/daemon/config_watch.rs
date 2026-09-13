@@ -155,6 +155,7 @@ pub(crate) fn spawn_config_watcher(
     config_source: ConfigSource,
     handle: SessionWorkerHandle,
     watch_paths: ConfigWatchPaths,
+    coverage_authority: crate::redact::coverage_authority::RedactionCoverageAuthority,
 ) -> Option<JoinHandle<()>> {
     let watch_dirs = watch_paths.watched_dirs();
     if watch_dirs.is_empty() {
@@ -163,8 +164,10 @@ pub(crate) fn spawn_config_watcher(
 
     let (event_tx, event_rx) = watch::channel(ConfigWatchSignal);
     let watch_paths_for_callback = watch_paths.clone();
+    let mutation_authority = coverage_authority.clone();
     let mut watcher = match notify::recommended_watcher(move |result| match result {
         Ok(event) if config_watch_event_matches(&watch_paths_for_callback, &event) => {
+            mutation_authority.invalidate();
             let _ = event_tx.send(ConfigWatchSignal);
         }
         Ok(_) => {}

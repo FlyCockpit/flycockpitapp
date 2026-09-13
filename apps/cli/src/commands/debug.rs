@@ -126,41 +126,27 @@ fn config() -> Result<()> {
     Ok(())
 }
 
-const CONTEXT_OUTPUT_LIMIT: usize = 16 * 1024;
-
 async fn context() -> Result<()> {
-    let cwd = cwd()?;
-    let config = crate::config::config::extended::load_for_cwd(&cwd);
-    let env = crate::env_snapshot::EnvSnapshot::from_process(
-        crate::env_snapshot::EnvSnapshotSource::ExplicitCli,
-    );
-    let redact = crate::redact::RedactionTable::build_with_env(&config.redact, &cwd, env.vars())?;
-    let mut rendered = format!(
-        "System prompt:\n{}",
-        crate::engine::builtin::default_chat_system_prompt(&cwd, "")
-    );
-    if let Some((path, guidance)) = crate::engine::builtin::load_agent_guidance(&cwd) {
-        rendered.push_str("\n\nProject guidance (user-role prelude): ");
-        rendered.push_str(&path.display().to_string());
-        rendered.push('\n');
-        rendered.push_str(&guidance);
+    let probe = discover().await;
+    if probe.status != DaemonStatus::Running {
+        bail!("coverage_unavailable: cockpit daemon is not running");
     }
-    let output = truncate_for_debug(&redact.scrub(&rendered), CONTEXT_OUTPUT_LIMIT);
+    let client = DaemonClient::connect(&probe.paths.socket)
+        .await
+        .context("connecting to the running daemon")?;
+    let response = client
+        .request(Request::GetRedactionCoverageStatus { session_id: None })
+        .await
+        .context("requesting daemon redaction coverage")?
+        .map_err(|_| anyhow::anyhow!("coverage_unavailable"))?;
+    let Response::RedactionCoverageStatus(projection) = response else {
+        bail!("daemon returned an unexpected redaction coverage response");
+    };
+    let output = projection
+        .rendered_context
+        .ok_or_else(|| anyhow::anyhow!("coverage_unavailable"))?;
     println!("assembled context (fresh-session baseline):\n{output}");
     Ok(())
-}
-
-fn truncate_for_debug(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_string();
-    }
-    let cut = text
-        .char_indices()
-        .take_while(|(index, _)| *index < limit)
-        .map(|(index, ch)| index + ch.len_utf8())
-        .last()
-        .unwrap_or(0);
-    format!("{}\n[truncated at {limit} bytes]", &text[..cut])
 }
 
 /// Non-secret projection of one failed/recovered tool-call row as returned by
@@ -484,6 +470,21 @@ fn row_status(hard_fail: bool, kind: Option<&str>, stage: Option<&str>, unknown:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_context_projection_requires_coverage_lease() {
+        let source = include_str!("debug.rs");
+        let context = source
+            .split("async fn context()")
+            .nth(1)
+            .and_then(|body| body.split("/// Non-secret projection").next())
+            .expect("debug context command");
+        assert!(context.contains("Request::GetRedactionCoverageStatus"));
+        assert!(context.contains("coverage_unavailable"));
+        assert!(context.contains(".rendered_context"));
+        assert!(!context.contains("RedactionTable::build"));
+        assert!(!context.contains("EnvSnapshot::from_process"));
+    }
 
     #[test]
     fn hard_fail_and_recovered_statuses_render() {

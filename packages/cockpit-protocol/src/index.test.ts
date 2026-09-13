@@ -832,8 +832,8 @@ describe("cockpit-proto daemon wire schemas", () => {
     );
   });
 
-  it("config_refreshed_typescript_mirror_is_v24", () => {
-    expect(PROTOCOL_VERSION).toBe(24);
+  it("config_refreshed_typescript_mirror_is_current", () => {
+    expect(PROTOCOL_VERSION).toBe(25);
     expect(responseEnvelopeSchema.parse(responsesFixture.config_refreshed)).toEqual(
       responsesFixture.config_refreshed,
     );
@@ -845,8 +845,37 @@ describe("cockpit-proto daemon wire schemas", () => {
     ).toBe(false);
   });
 
+  it("redaction projection requests and responses mirror the exact current protocol", () => {
+    expect(clientEnvelopeSchema.parse(requestsFixture.get_redaction_coverage_status)).toEqual(
+      requestsFixture.get_redaction_coverage_status,
+    );
+    expect(clientEnvelopeSchema.parse(requestsFixture.render_input_prediction)).toEqual(
+      requestsFixture.render_input_prediction,
+    );
+    expect(clientEnvelopeSchema.parse(requestsFixture.resolve_tag_preview)).toEqual(
+      requestsFixture.resolve_tag_preview,
+    );
+    expect(responseEnvelopeSchema.parse(responsesFixture.redaction_coverage_status)).toEqual(
+      responsesFixture.redaction_coverage_status,
+    );
+    expect(responseEnvelopeSchema.parse(responsesFixture.input_prediction)).toEqual(
+      responsesFixture.input_prediction,
+    );
+    expect(responseEnvelopeSchema.parse(responsesFixture.tag_preview)).toEqual(
+      responsesFixture.tag_preview,
+    );
+    for (const neighbor of [PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1]) {
+      expect(
+        clientEnvelopeSchema.safeParse({
+          ...requestsFixture.get_redaction_coverage_status,
+          v: neighbor,
+        }).success,
+      ).toBe(false);
+    }
+  });
+
   it("mirrors non-optional session favorite on list and applied receipts", () => {
-    expect(PROTOCOL_VERSION).toBe(24);
+    expect(PROTOCOL_VERSION).toBe(25);
     const request = {
       v: PROTOCOL_VERSION,
       kind: "req" as const,

@@ -5,13 +5,16 @@
 //! admission and can use it exactly once at its owned sink.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
+    path::Path,
     sync::{Arc, Mutex, Weak},
 };
 
 use anyhow::Result;
-use tokio::sync::{Notify, Semaphore};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use super::RedactionTable;
@@ -25,6 +28,38 @@ pub(crate) const COVERAGE_ADMISSIONS: usize = 256;
 pub(crate) const COVERAGE_RESIDENT_GENERATIONS: usize = 64;
 pub(crate) const COVERAGE_ARTIFACT_BYTES_PER_GENERATION: usize = 4 * 1024 * 1024;
 pub(crate) const COVERAGE_ARTIFACT_BYTES_TOTAL: usize = 32 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CoverageOwnerMode {
+    Persistent,
+    Ephemeral,
+    InProcess,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CoverageLimits {
+    pub workers: usize,
+    pub queued: usize,
+    pub flight_keys: usize,
+    pub waiters_per_key: usize,
+    pub waiters: usize,
+    pub admissions: usize,
+    pub resident_generations: usize,
+    pub artifact_bytes_per_generation: usize,
+    pub artifact_bytes_total: usize,
+}
+
+pub(crate) const COVERAGE_LIMITS: CoverageLimits = CoverageLimits {
+    workers: COVERAGE_WORKERS,
+    queued: COVERAGE_QUEUE,
+    flight_keys: COVERAGE_FLIGHTS,
+    waiters_per_key: COVERAGE_WAITERS_PER_KEY,
+    waiters: COVERAGE_WAITERS,
+    admissions: COVERAGE_ADMISSIONS,
+    resident_generations: COVERAGE_RESIDENT_GENERATIONS,
+    artifact_bytes_per_generation: COVERAGE_ARTIFACT_BYTES_PER_GENERATION,
+    artifact_bytes_total: COVERAGE_ARTIFACT_BYTES_TOTAL,
+};
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -41,6 +76,20 @@ impl CoverageBinding {
     pub(crate) const fn from_daemon_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
+
+    /// Derive a private binding component from daemon-owned identity bytes.
+    /// The result never crosses a protocol or diagnostic boundary.
+    pub(crate) fn derive(domain: &[u8], identity: &[u8]) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(b"flycockpit-redaction-coverage-binding-v1\0");
+        digest.update(domain);
+        digest.update([0]);
+        digest.update(identity);
+        let digest = digest.finalize();
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        Self(bytes)
+    }
 }
 
 impl fmt::Debug for CoverageBinding {
@@ -49,11 +98,15 @@ impl fmt::Debug for CoverageBinding {
     }
 }
 
-/// The purpose is a binding, rather than an instruction to scan separately.
-/// Equal source bindings may therefore share one accepted capture.
+/// The operation purpose is audit metadata on an admission. It is deliberately
+/// not part of [`RedactionCoverageKey`]: one accepted source capture must be
+/// reusable by submission, driver and inference while every source binding is
+/// unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum CoverageScope {
-    DaemonGlobal,
+    DaemonGlobalBootstrap,
+    DaemonGlobalEvent,
+    DaemonGlobalRefresh,
     SessionStart,
     SessionSubmission,
     DriverTurn,
@@ -66,6 +119,7 @@ pub(crate) enum CoverageScope {
     McpSandboxProjection,
     ApprovalPreview,
     DebugContext,
+    RedactionOverride,
 }
 
 /// All members are opaque daemon-derived revisions/identities.  A key cannot
@@ -82,19 +136,24 @@ pub(crate) struct RedactionCoverageKey {
     sealed: CoverageBinding,
     override_revision: CoverageBinding,
     machine_sources: CoverageBinding,
-    scope: CoverageScope,
 }
 
 impl fmt::Debug for RedactionCoverageKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RedactionCoverageKey")
-            .field("scope", &self.scope)
             .finish_non_exhaustive()
     }
 }
 
 impl RedactionCoverageKey {
+    pub(crate) fn for_derived_session(&self, session_id: Uuid) -> Self {
+        let mut derived = self.clone();
+        derived.principal = CoverageBinding::derive(b"principal", session_id.as_bytes());
+        derived.session = Some(CoverageBinding::derive(b"session", session_id.as_bytes()));
+        derived
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn session(
         principal: CoverageBinding,
@@ -107,7 +166,6 @@ impl RedactionCoverageKey {
         sealed: CoverageBinding,
         override_revision: CoverageBinding,
         machine_sources: CoverageBinding,
-        scope: CoverageScope,
     ) -> Self {
         Self {
             principal,
@@ -120,7 +178,6 @@ impl RedactionCoverageKey {
             sealed,
             override_revision,
             machine_sources,
-            scope,
         }
     }
 
@@ -134,7 +191,6 @@ impl RedactionCoverageKey {
         sealed: CoverageBinding,
         override_revision: CoverageBinding,
         machine_sources: CoverageBinding,
-        scope: CoverageScope,
     ) -> Self {
         Self {
             principal,
@@ -147,7 +203,6 @@ impl RedactionCoverageKey {
             sealed,
             override_revision,
             machine_sources,
-            scope,
         }
     }
 }
@@ -181,11 +236,47 @@ pub(crate) struct CoverageBuild {
 }
 
 impl CoverageBuild {
-    pub(crate) fn from_complete_table(table: RedactionTable, artifact_bytes: usize) -> Self {
+    pub(crate) fn from_complete_table(table: RedactionTable) -> Self {
+        let artifact_bytes = table.estimated_immutable_artifact_bytes();
+        Self::from_complete_table_and_artifact_bytes(table, artifact_bytes)
+    }
+
+    /// Construct a build from a table whose complete-capture owner already
+    /// measured the immutable candidate and matcher artifacts.
+    pub(crate) fn from_complete_table_and_artifact_bytes(
+        table: RedactionTable,
+        artifact_bytes: usize,
+    ) -> Self {
         Self {
             table: Arc::new(table),
             artifact_bytes,
         }
+    }
+
+    /// Production-private complete capture funnel. Callers supply immutable
+    /// daemon snapshots; discovery and matcher compilation execute only inside
+    /// the authority worker closure.
+    pub(crate) fn capture(
+        config: &crate::config::extended::RedactConfig,
+        root: &Path,
+        environment: &HashMap<String, String>,
+        store: &crate::credentials::CredentialStore,
+        sealed: &RedactionTable,
+    ) -> Result<Self> {
+        let base =
+            RedactionTable::build_with_env_and_credential_store(config, root, environment, store)?;
+        Ok(Self::from_complete_table(base.union(sealed)?))
+    }
+
+    pub(crate) fn capture_without_sealed(
+        config: &crate::config::extended::RedactConfig,
+        root: &Path,
+        environment: &HashMap<String, String>,
+        store: &crate::credentials::CredentialStore,
+    ) -> Result<Self> {
+        let table =
+            RedactionTable::build_with_env_and_credential_store(config, root, environment, store)?;
+        Ok(Self::from_complete_table(table))
     }
 }
 
@@ -195,6 +286,7 @@ pub(crate) struct RedactionCoverageGeneration {
     id: Uuid,
     key: RedactionCoverageKey,
     epoch: u64,
+    key_revision: u64,
     table: Arc<RedactionTable>,
     artifact_bytes: usize,
     active_admissions: std::sync::atomic::AtomicUsize,
@@ -211,11 +303,12 @@ impl fmt::Debug for RedactionCoverageGeneration {
 }
 
 impl RedactionCoverageGeneration {
-    fn new(key: RedactionCoverageKey, epoch: u64, build: CoverageBuild) -> Self {
+    fn new(key: RedactionCoverageKey, epoch: u64, key_revision: u64, build: CoverageBuild) -> Self {
         Self {
             id: Uuid::now_v7(),
             key,
             epoch,
+            key_revision,
             table: build.table,
             artifact_bytes: build.artifact_bytes,
             active_admissions: std::sync::atomic::AtomicUsize::new(0),
@@ -226,15 +319,22 @@ impl RedactionCoverageGeneration {
 /// The sole explicit raw-export disposition. It is intentionally unrelated to
 /// a coverage generation and cannot be supplied to generic egress.
 #[derive(Debug)]
-pub(crate) enum RawExportDisposition {
-    OwnerAuthorized,
+pub(crate) struct RawExportDisposition(());
+
+impl RawExportDisposition {
+    pub(crate) fn after_owner_local_check(owner_local: bool) -> Option<Self> {
+        owner_local.then_some(Self(()))
+    }
 }
 
 struct Flight {
+    correlation: Uuid,
     epoch: u64,
+    key_revision: u64,
     waiters: std::sync::atomic::AtomicUsize,
     result: Mutex<Option<std::result::Result<Arc<RedactionCoverageGeneration>, CoverageError>>>,
     ready: Notify,
+    interest_changed: Notify,
 }
 
 struct Resident {
@@ -245,17 +345,21 @@ struct State {
     epoch: u64,
     closed: bool,
     queued: usize,
+    allocated_flights: usize,
     waiters: usize,
     admissions: usize,
     artifact_bytes: usize,
     residents: HashMap<RedactionCoverageKey, Resident>,
     lru: VecDeque<RedactionCoverageKey>,
     flights: HashMap<RedactionCoverageKey, Arc<Flight>>,
+    diagnostic_notices: HashSet<Uuid>,
+    key_revisions: HashMap<RedactionCoverageKey, u64>,
 }
 
 struct Inner {
     state: Mutex<State>,
-    workers: Semaphore,
+    workers: Arc<Semaphore>,
+    owner_mode: CoverageOwnerMode,
 }
 
 /// Independent bounded worker facility shared by persistent, ephemeral and
@@ -268,28 +372,40 @@ pub(crate) struct RedactionCoverageAuthority {
 
 impl Default for RedactionCoverageAuthority {
     fn default() -> Self {
-        Self::new()
+        Self::new(CoverageOwnerMode::InProcess)
     }
 }
 
 impl RedactionCoverageAuthority {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(owner_mode: CoverageOwnerMode) -> Self {
         Self {
             inner: Arc::new(Inner {
                 state: Mutex::new(State {
                     epoch: 1,
                     closed: false,
                     queued: 0,
+                    allocated_flights: 0,
                     waiters: 0,
                     admissions: 0,
                     artifact_bytes: 0,
                     residents: HashMap::new(),
                     lru: VecDeque::new(),
                     flights: HashMap::new(),
+                    diagnostic_notices: HashSet::new(),
+                    key_revisions: HashMap::new(),
                 }),
-                workers: Semaphore::new(COVERAGE_WORKERS),
+                workers: Arc::new(Semaphore::new(COVERAGE_WORKERS)),
+                owner_mode,
             }),
         }
+    }
+
+    pub(crate) fn owner_mode(&self) -> CoverageOwnerMode {
+        self.inner.owner_mode
+    }
+
+    pub(crate) const fn limits(&self) -> CoverageLimits {
+        COVERAGE_LIMITS
     }
 
     /// Start (or join) one complete capture. Work executes on the authority's
@@ -297,6 +413,7 @@ impl RedactionCoverageAuthority {
     pub(crate) async fn acquire<F>(
         &self,
         key: RedactionCoverageKey,
+        purpose: CoverageScope,
         capture: F,
     ) -> std::result::Result<CoverageAdmission, CoverageError>
     where
@@ -309,7 +426,11 @@ impl RedactionCoverageAuthority {
             }
             if let Some(resident) = state.residents.get(&key) {
                 let generation = resident.generation.clone();
-                return self.admit_locked(&mut state, generation);
+                if let Some(position) = state.lru.iter().position(|candidate| candidate == &key) {
+                    state.lru.remove(position);
+                }
+                state.lru.push_back(key.clone());
+                return self.admit_locked(&mut state, generation, purpose);
             }
             if let Some(flight) = state.flights.get(&key).cloned() {
                 if flight.waiters.load(std::sync::atomic::Ordering::Acquire)
@@ -322,29 +443,42 @@ impl RedactionCoverageAuthority {
                     .waiters
                     .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 state.waiters += 1;
-                (flight, false)
+                (flight, None)
             } else {
-                if state.flights.len() >= COVERAGE_FLIGHTS || state.queued >= COVERAGE_QUEUE {
+                if state.allocated_flights >= COVERAGE_FLIGHTS {
+                    return Err(CoverageError::Saturated);
+                }
+                let permit = self.inner.workers.clone().try_acquire_owned().ok();
+                if permit.is_none() && state.queued >= COVERAGE_QUEUE {
                     return Err(CoverageError::Saturated);
                 }
                 let flight = Arc::new(Flight {
+                    correlation: Uuid::new_v4(),
                     epoch: state.epoch,
+                    key_revision: state.key_revisions.get(&key).copied().unwrap_or(0),
                     waiters: std::sync::atomic::AtomicUsize::new(1),
                     result: Mutex::new(None),
                     ready: Notify::new(),
+                    interest_changed: Notify::new(),
                 });
-                state.queued += 1;
+                if permit.is_none() {
+                    state.queued += 1;
+                }
                 state.waiters += 1;
+                state.allocated_flights += 1;
                 state.flights.insert(key.clone(), flight.clone());
-                (flight, true)
+                (flight, Some(permit))
             }
         };
 
-        if leader {
+        if let Some(permit) = leader {
             let authority = self.clone();
             let flight_key = key.clone();
+            let worker_flight = flight.clone();
             tokio::spawn(async move {
-                authority.run_flight(flight_key, flight, capture).await;
+                authority
+                    .run_flight(flight_key, worker_flight, permit, capture)
+                    .await;
             });
         }
 
@@ -357,49 +491,108 @@ impl RedactionCoverageAuthority {
         };
 
         let generation = loop {
+            // Register the notification future before observing the result so
+            // `notify_waiters` cannot land in the check/await gap.
+            let notified = flight.ready.notified();
             if let Some(result) = lock(&flight.result).clone() {
                 break result?;
             }
-            flight.ready.notified().await;
+            notified.await;
         };
         waiter.release();
         let mut state = lock(&self.inner.state);
-        self.admit_locked(&mut state, generation)
+        self.admit_locked(&mut state, generation, purpose)
     }
 
-    async fn run_flight<F>(&self, key: RedactionCoverageKey, flight: Arc<Flight>, capture: F)
-    where
+    async fn run_flight<F>(
+        &self,
+        key: RedactionCoverageKey,
+        flight: Arc<Flight>,
+        permit: Option<OwnedSemaphorePermit>,
+        capture: F,
+    ) where
         F: FnOnce() -> Result<CoverageBuild> + Send + 'static,
     {
-        let permit = self.workers.acquire().await;
-        {
+        let was_queued = permit.is_none();
+        let scope_class = if key.session.is_some() {
+            "session"
+        } else {
+            "daemon_global"
+        };
+        tracing::info!(
+            target: crate::startup::TARGET,
+            event = "coverage-phase-start",
+            scope_class,
+            correlation = %flight.correlation,
+            "startup"
+        );
+        let permit = match permit {
+            Some(permit) => Some(permit),
+            None => loop {
+                let interest_changed = flight.interest_changed.notified();
+                if flight.waiters.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                    break None;
+                }
+                tokio::select! {
+                    biased;
+                    _ = interest_changed => continue,
+                    permit = self.inner.workers.clone().acquire_owned() => break permit.ok(),
+                }
+            },
+        };
+        if was_queued {
             let mut state = lock(&self.inner.state);
             state.queued = state.queued.saturating_sub(1);
         }
+        let cancelled = flight.waiters.load(std::sync::atomic::Ordering::Acquire) == 0;
         let result = match permit {
-            Ok(_permit) => match tokio::task::spawn_blocking(capture).await {
-                Ok(Ok(build)) => self.publish(key.clone(), flight.epoch, build),
+            Some(_permit) if !cancelled => match tokio::task::spawn_blocking(capture).await {
+                Ok(Ok(build)) => {
+                    self.publish(key.clone(), flight.epoch, flight.key_revision, build)
+                }
                 Ok(Err(_)) | Err(_) => Err(CoverageError::Unavailable),
             },
-            Err(_) => Err(CoverageError::Unavailable),
+            Some(_) | None => Err(CoverageError::Unavailable),
         };
-        *lock(&flight.result) = Some(result);
+        tracing::info!(
+            target: crate::startup::TARGET,
+            event = "coverage-phase-complete",
+            scope_class,
+            correlation = %flight.correlation,
+            "startup"
+        );
+        let mut stored = lock(&flight.result);
+        if stored.is_none() {
+            *stored = Some(result);
+        }
+        drop(stored);
         flight.ready.notify_waiters();
         let mut state = lock(&self.inner.state);
-        state.flights.remove(&key);
+        state.allocated_flights = state.allocated_flights.saturating_sub(1);
+        if state
+            .flights
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, &flight))
+        {
+            state.flights.remove(&key);
+        }
     }
 
     fn publish(
         &self,
         key: RedactionCoverageKey,
         flight_epoch: u64,
+        flight_key_revision: u64,
         build: CoverageBuild,
     ) -> std::result::Result<Arc<RedactionCoverageGeneration>, CoverageError> {
         if build.artifact_bytes > COVERAGE_ARTIFACT_BYTES_PER_GENERATION {
             return Err(CoverageError::Unavailable);
         }
         let mut state = lock(&self.inner.state);
-        if state.closed || state.epoch != flight_epoch {
+        if state.closed
+            || state.epoch != flight_epoch
+            || state.key_revisions.get(&key).copied().unwrap_or(0) != flight_key_revision
+        {
             return Err(CoverageError::Invalidated);
         }
         while (state.residents.len() >= COVERAGE_RESIDENT_GENERATIONS
@@ -416,6 +609,7 @@ impl RedactionCoverageAuthority {
         let generation = Arc::new(RedactionCoverageGeneration::new(
             key.clone(),
             state.epoch,
+            flight_key_revision,
             build,
         ));
         state.artifact_bytes += generation.artifact_bytes;
@@ -460,9 +654,16 @@ impl RedactionCoverageAuthority {
         &self,
         state: &mut State,
         generation: Arc<RedactionCoverageGeneration>,
+        purpose: CoverageScope,
     ) -> std::result::Result<CoverageAdmission, CoverageError> {
         if state.closed
             || state.epoch != generation.epoch
+            || state
+                .key_revisions
+                .get(&generation.key)
+                .copied()
+                .unwrap_or(0)
+                != generation.key_revision
             || state.admissions >= COVERAGE_ADMISSIONS
         {
             return Err(if state.admissions >= COVERAGE_ADMISSIONS {
@@ -478,6 +679,7 @@ impl RedactionCoverageAuthority {
         Ok(CoverageAdmission {
             inner: Arc::downgrade(&self.inner),
             generation,
+            purpose,
             released: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -490,17 +692,69 @@ impl RedactionCoverageAuthority {
         state.residents.clear();
         state.lru.clear();
         state.artifact_bytes = 0;
+        // Every outstanding admission is revoked by the epoch bump. Drops
+        // from those stale lease objects use saturating subtraction, so the
+        // new epoch begins with its full independent admission budget.
+        state.admissions = 0;
+        state.diagnostic_notices.clear();
+        state.key_revisions.clear();
+        let flights = state
+            .flights
+            .drain()
+            .map(|(_, flight)| flight)
+            .collect::<Vec<_>>();
+        for flight in flights {
+            *lock(&flight.result) = Some(Err(CoverageError::Invalidated));
+            flight.ready.notify_waiters();
+        }
+    }
+
+    /// Revoke exactly one bound source view without discarding unrelated
+    /// session generations. A detached late completion carries the prior
+    /// key revision and therefore cannot publish.
+    pub(crate) fn invalidate_key(&self, key: &RedactionCoverageKey) {
+        let mut state = lock(&self.inner.state);
+        let revision = state.key_revisions.entry(key.clone()).or_insert(0);
+        *revision = revision.wrapping_add(1).max(1);
+        if let Some(resident) = state.residents.remove(key) {
+            let revoked_admissions = resident
+                .generation
+                .active_admissions
+                .load(std::sync::atomic::Ordering::Acquire);
+            state.admissions = state.admissions.saturating_sub(revoked_admissions);
+            state.artifact_bytes = state
+                .artifact_bytes
+                .saturating_sub(resident.generation.artifact_bytes);
+            state.diagnostic_notices.remove(&resident.generation.id);
+        }
+        state.lru.retain(|candidate| candidate != key);
+        if let Some(flight) = state.flights.remove(key) {
+            *lock(&flight.result) = Some(Err(CoverageError::Invalidated));
+            flight.ready.notify_waiters();
+        }
+    }
+
+    pub(crate) fn invalidate_workspace(&self, workspace: CoverageBinding) {
+        let keys = {
+            let state = lock(&self.inner.state);
+            state
+                .residents
+                .keys()
+                .chain(state.flights.keys())
+                .chain(state.key_revisions.keys())
+                .filter(|key| key.workspace == Some(workspace))
+                .cloned()
+                .collect::<HashSet<_>>()
+        };
+        for key in keys {
+            self.invalidate_key(&key);
+        }
     }
 
     /// Rebind is intentionally stronger than invalidation: old waiters wake
     /// with a sanitized refusal and no old result can publish.
     pub(crate) fn rebind(&self) {
         self.invalidate();
-        let state = lock(&self.inner.state);
-        for flight in state.flights.values() {
-            *lock(&flight.result) = Some(Err(CoverageError::Invalidated));
-            flight.ready.notify_waiters();
-        }
     }
 
     /// Close acquisition, revoke every future sink check and wake waiters.
@@ -512,7 +766,15 @@ impl RedactionCoverageAuthority {
         state.residents.clear();
         state.lru.clear();
         state.artifact_bytes = 0;
-        for flight in state.flights.values() {
+        state.admissions = 0;
+        state.diagnostic_notices.clear();
+        state.key_revisions.clear();
+        let flights = state
+            .flights
+            .drain()
+            .map(|(_, flight)| flight)
+            .collect::<Vec<_>>();
+        for flight in flights {
             *lock(&flight.result) = Some(Err(CoverageError::Unavailable));
             flight.ready.notify_waiters();
         }
@@ -539,9 +801,12 @@ impl WaiterLease {
             let mut state = lock(&inner.state);
             state.waiters = state.waiters.saturating_sub(1);
             if let Some(flight) = self.flight.upgrade() {
-                flight
+                let prior = flight
                     .waiters
                     .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                if prior == 1 {
+                    flight.interest_changed.notify_waiters();
+                }
             }
         }
     }
@@ -558,7 +823,39 @@ impl Drop for WaiterLease {
 pub(crate) struct CoverageAdmission {
     inner: Weak<Inner>,
     generation: Arc<RedactionCoverageGeneration>,
+    purpose: CoverageScope,
     released: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UnsupportedSourceDetailClass {
+    UnsupportedFormat,
+    Unreadable,
+    ChangedDuringCapture,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct OwnerUnsupportedSourceDiagnostic {
+    pub display_path: String,
+    pub detail: UnsupportedSourceDetailClass,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct RedactionCoverageStatusProjection {
+    pub state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_diagnostic: Option<OwnerUnsupportedSourceDiagnostic>,
+}
+
+/// Proof that daemon dispatch completed the owner authorization check. The
+/// field is private so a generic egress caller cannot forge the disposition.
+pub(crate) struct OwnerAuthorization(());
+
+impl OwnerAuthorization {
+    pub(crate) fn after_principal_check(is_owner: bool) -> Option<Self> {
+        is_owner.then_some(Self(()))
+    }
 }
 
 impl CoverageAdmission {
@@ -573,14 +870,81 @@ impl CoverageAdmission {
         let current = !state.closed
             && state.epoch == self.generation.epoch
             && state
+                .key_revisions
+                .get(&self.generation.key)
+                .copied()
+                .unwrap_or(0)
+                == self.generation.key_revision
+            && state
                 .residents
                 .get(&self.generation.key)
                 .is_some_and(|resident| resident.generation.id == self.generation.id);
-        drop(state);
         if !current {
             return Err(CoverageError::Invalidated);
         }
-        sink(&self.generation.table.enforced()).map_err(|_| CoverageError::Unavailable)
+        // Keep the authority state locked through the synchronous owned sink.
+        // Invalidation is therefore wholly before or wholly after this one
+        // operation; it cannot race between validation and egress.
+        let result =
+            sink(&self.generation.table.enforced()).map_err(|_| CoverageError::Unavailable);
+        drop(state);
+        result
+    }
+
+    pub(crate) fn purpose(&self) -> CoverageScope {
+        self.purpose
+    }
+
+    pub(crate) fn unsupported_source_projection(
+        self,
+        authorization: Option<OwnerAuthorization>,
+        source_path: &Path,
+        detail: UnsupportedSourceDetailClass,
+    ) -> std::result::Result<RedactionCoverageStatusProjection, CoverageError> {
+        let Some(_authorization) = authorization else {
+            self.release();
+            return Ok(RedactionCoverageStatusProjection {
+                state: "unsupported_coverage",
+                owner_diagnostic: None,
+            });
+        };
+        let generation_id = self.generation.id;
+        let Some(inner) = self.inner.upgrade() else {
+            return Err(CoverageError::Unavailable);
+        };
+        let mut state = lock(&inner.state);
+        let current = !state.closed
+            && state.epoch == self.generation.epoch
+            && state
+                .key_revisions
+                .get(&self.generation.key)
+                .copied()
+                .unwrap_or(0)
+                == self.generation.key_revision
+            && state
+                .residents
+                .get(&self.generation.key)
+                .is_some_and(|resident| resident.generation.id == generation_id);
+        if !current {
+            return Err(CoverageError::Invalidated);
+        }
+        let first_notice = state.diagnostic_notices.insert(generation_id);
+        let owner_diagnostic = first_notice.then(|| {
+            let file_name = source_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("unsupported-source");
+            OwnerUnsupportedSourceDiagnostic {
+                display_path: self.generation.table.enforced().scrub(file_name),
+                detail,
+            }
+        });
+        drop(state);
+        self.release();
+        Ok(RedactionCoverageStatusProjection {
+            state: "unsupported_coverage",
+            owner_diagnostic,
+        })
     }
 
     fn release(&self) {
@@ -595,7 +959,16 @@ impl CoverageAdmission {
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         if let Some(inner) = self.inner.upgrade() {
             let mut state = lock(&inner.state);
-            state.admissions = state.admissions.saturating_sub(1);
+            if state.epoch == self.generation.epoch
+                && state
+                    .key_revisions
+                    .get(&self.generation.key)
+                    .copied()
+                    .unwrap_or(0)
+                    == self.generation.key_revision
+            {
+                state.admissions = state.admissions.saturating_sub(1);
+            }
         }
     }
 }

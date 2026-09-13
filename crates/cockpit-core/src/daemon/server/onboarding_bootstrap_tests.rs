@@ -84,7 +84,7 @@ async fn advance_to_secure_store(
         .0
 }
 
-async fn ready_construction() -> (
+pub(super) async fn ready_construction() -> (
     tempfile::TempDir,
     std::sync::Arc<LockedServices>,
     cockpit_proto::OnboardingTransitionResult,

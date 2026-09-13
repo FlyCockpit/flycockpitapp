@@ -278,7 +278,7 @@ async fn exit_before_lifetime_policy_completion_closes_unstarted_lifecycle_work(
     assert!(requests.recv().await.is_none());
 }
 
-async fn run_startup_trace_case(
+pub(super) async fn run_startup_trace_case(
     workspace: &std::path::Path,
     runtime: &std::path::Path,
     background_agents: bool,
@@ -314,6 +314,25 @@ async fn run_startup_trace_case(
                 while let Some(request) = request_rx.recv().await {
                     let response = match request.request {
                         cockpit_proto::Request::GetOnboardingBootstrapSnapshot => {
+                            tracing::info!(
+                                target: cockpit_core::startup::TARGET,
+                                event = "coverage-phase-start",
+                                scope_class = "daemon_global",
+                                correlation = "opaque-test-correlation",
+                                "startup"
+                            );
+                            tracing::info!(
+                                target: cockpit_core::startup::TARGET,
+                                event = "coverage-phase-complete",
+                                scope_class = "daemon_global",
+                                correlation = "opaque-test-correlation",
+                                "startup"
+                            );
+                            tracing::info!(
+                                target: cockpit_core::startup::TARGET,
+                                event = "daemon-ready",
+                                "startup"
+                            );
                             Ok(cockpit_proto::Response::OnboardingBootstrapSnapshot(Some(
                                 cockpit_proto::OnboardingBootstrapSnapshot {
                                     run_id: uuid::Uuid::from_u128(1),
@@ -330,6 +349,11 @@ async fn run_startup_trace_case(
                             )))
                         }
                         cockpit_proto::Request::GetWorkspaceTrust { .. } => {
+                            tracing::info!(
+                                target: cockpit_core::startup::TARGET,
+                                event = "first-model-request",
+                                "startup"
+                            );
                             Ok(cockpit_proto::Response::WorkspaceTrust {
                                 mode: Some(cockpit_proto::WorkspaceTrustMode::IgnoreConfig),
                                 config_generation: 1,

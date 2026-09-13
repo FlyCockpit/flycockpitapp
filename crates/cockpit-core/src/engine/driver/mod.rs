@@ -3498,17 +3498,31 @@ impl Driver {
             Ok(store) => store,
             Err(error) => return Self::refuse_unredacted_send(tx, error).await,
         };
-        match tokio::task::spawn_blocking(move || {
-            RedactionTable::build_with_env_and_credential_store(&cfg, &cwd, &session_env, &store)
-        })
-        .await
+        let Some((authority, coverage_key)) = self.session.redaction_coverage() else {
+            return Self::refuse_unredacted_send(tx, "coverage_unavailable").await;
+        };
+        let sealed = match self.session.machine_scoped_sealed_redactions().await {
+            Ok(table) => table,
+            Err(error) => return Self::refuse_unredacted_send(tx, error).await,
+        };
+        match authority
+            .acquire(
+                coverage_key,
+                crate::redact::coverage_authority::CoverageScope::DriverTurn,
+                move || {
+                    crate::redact::coverage_authority::CoverageBuild::capture(
+                        &cfg,
+                        &cwd,
+                        &session_env,
+                        &store,
+                        &sealed,
+                    )
+                },
+            )
+            .await
         {
-            Ok(Ok(new_table)) => {
-                let new_table = match self
-                    .session
-                    .with_machine_scoped_sealed_redactions(&new_table)
-                    .await
-                {
+            Ok(admission) => {
+                let new_table = match admission.use_at_sink(|table| Ok(table.enforced())) {
                     Ok(table) => table,
                     Err(error) => return Self::refuse_unredacted_send(tx, error).await,
                 };
@@ -3556,10 +3570,8 @@ impl Driver {
                     if self.redaction_unsupported_notified.insert(path.clone()) {
                         let _ = tx
                             .send(TurnEvent::Notice {
-                                text: format!(
-                                    "`{}` is an unsupported format; redaction for this file will not work",
-                                    path.display()
-                                ),
+                                text: "A configured source has an unsupported format; coverage is unavailable for that source"
+                                    .to_string(),
                             })
                             .await;
                     }
@@ -3567,8 +3579,7 @@ impl Driver {
                 self.set_redaction_table(table);
                 Ok(())
             }
-            Ok(Err(e)) => Self::refuse_unredacted_send(tx, e).await,
-            Err(e) => Self::refuse_unredacted_send(tx, e).await,
+            Err(error) => Self::refuse_unredacted_send(tx, error).await,
         }
     }
 

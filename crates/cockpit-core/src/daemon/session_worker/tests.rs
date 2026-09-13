@@ -52,6 +52,291 @@ fn test_model_selection(provider: &str, model: &str) -> crate::config::providers
     }
 }
 
+fn coverage_test_key(seed: u8) -> crate::redact::coverage_authority::RedactionCoverageKey {
+    use crate::redact::coverage_authority::{CoverageBinding, RedactionCoverageKey};
+    let binding = |offset| CoverageBinding::from_daemon_bytes([seed.wrapping_add(offset); 16]);
+    RedactionCoverageKey::session(
+        binding(0),
+        binding(1),
+        binding(2),
+        binding(3),
+        binding(4),
+        binding(5),
+        binding(6),
+        binding(7),
+        binding(8),
+        binding(9),
+    )
+}
+
+fn coverage_test_capture(
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> impl FnOnce() -> anyhow::Result<crate::redact::coverage_authority::CoverageBuild> + Send + 'static
+{
+    move || {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let table = crate::redact::RedactionTable::empty().with_forced_literal(
+            "session-worker-coverage-canary".into(),
+            "$test:session-worker".into(),
+        )?;
+        Ok(crate::redact::coverage_authority::CoverageBuild::from_complete_table(table))
+    }
+}
+
+#[tokio::test]
+async fn coverage_admission_is_one_operation_and_stale_results_are_inert() {
+    use crate::redact::coverage_authority::{
+        CoverageError, CoverageScope, RedactionCoverageAuthority,
+    };
+    let authority = RedactionCoverageAuthority::default();
+    let key = coverage_test_key(11);
+    let captures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let admission = authority
+        .acquire(
+            key.clone(),
+            CoverageScope::SessionSubmission,
+            coverage_test_capture(captures.clone()),
+        )
+        .await
+        .expect("complete session capture");
+    authority.invalidate_key(&key);
+    let reached_sink = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sink_flag = reached_sink.clone();
+    assert_eq!(
+        admission.use_at_sink(move |_| {
+            sink_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }),
+        Err(CoverageError::Invalidated)
+    );
+    assert!(!reached_sink.load(std::sync::atomic::Ordering::SeqCst));
+
+    authority
+        .acquire(
+            key,
+            CoverageScope::DriverTurn,
+            coverage_test_capture(captures.clone()),
+        )
+        .await
+        .expect("fresh generation after invalidation")
+        .use_at_sink(|table| {
+            assert_eq!(
+                table.scrub("session-worker-coverage-canary"),
+                "**REDACTED BY COCKPIT - DO NOT TRY TO OBTAIN BY WORKAROUND**"
+            );
+            Ok(())
+        })
+        .expect("one fresh operation");
+    assert_eq!(captures.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn owned_mutation_revokes_admission_at_each_sink() {
+    use crate::redact::coverage_authority::{
+        CoverageError, CoverageScope, RedactionCoverageAuthority,
+    };
+    let authority = RedactionCoverageAuthority::default();
+    let captures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for (index, purpose) in [
+        CoverageScope::SessionStart,
+        CoverageScope::SessionSubmission,
+        CoverageScope::DriverTurn,
+        CoverageScope::RedactedExport,
+        CoverageScope::CredentialRetry,
+        CoverageScope::AutoTitle,
+        CoverageScope::DocsAsk,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let key = coverage_test_key(30 + index as u8);
+        let admission = authority
+            .acquire(
+                key.clone(),
+                purpose,
+                coverage_test_capture(captures.clone()),
+            )
+            .await
+            .expect("pre-mutation admission");
+        authority.invalidate_key(&key);
+        let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sink = reached.clone();
+        assert_eq!(
+            admission.use_at_sink(move |_| {
+                sink.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }),
+            Err(CoverageError::Invalidated),
+            "{purpose:?} admitted after its owned binding changed"
+        );
+        assert!(!reached.load(std::sync::atomic::Ordering::SeqCst));
+    }
+    assert_eq!(captures.load(std::sync::atomic::Ordering::SeqCst), 7);
+}
+
+fn redaction_query_match_is_test_only(path: &std::path::Path, source: &str, line: usize) -> bool {
+    if path.file_name().and_then(|name| name.to_str()) == Some("tests.rs")
+        || path.components().any(|part| part.as_os_str() == "tests")
+    {
+        return true;
+    }
+    let line_start = source
+        .split_inclusive('\n')
+        .take(line.saturating_sub(1))
+        .map(str::len)
+        .sum::<usize>();
+    let byte = line_start
+        + source[line_start..]
+            .split('\n')
+            .next()
+            .map_or(0, |source_line| source_line.len() / 2);
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .expect("Rust grammar");
+    let Some(tree) = parser.parse(source, None) else {
+        return false;
+    };
+    let Some(mut node) = tree.root_node().descendant_for_byte_range(byte, byte) else {
+        return false;
+    };
+    loop {
+        if node.kind() == "source_file" {
+            return false;
+        }
+        let start = node.start_byte();
+        let prefix = &source[start..byte.min(source.len())];
+        if prefix.contains("#[cfg(test)]")
+            || prefix.contains("#[cfg(any(test,")
+            || prefix.contains("#[test]")
+            || prefix.contains("#[tokio::test]")
+        {
+            return true;
+        }
+        let mut sibling = node.prev_sibling();
+        while let Some(previous) = sibling {
+            if previous.kind() != "attribute_item" {
+                break;
+            }
+            let attribute = &source[previous.byte_range()];
+            if attribute.contains("cfg(test)")
+                || attribute.contains("cfg(any(test,")
+                || (attribute.contains("cfg(") && attribute.contains("test"))
+                || attribute.contains("#[test]")
+                || attribute.contains("#[tokio::test]")
+            {
+                return true;
+            }
+            sibling = previous.prev_sibling();
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        node = parent;
+    }
+}
+
+#[test]
+fn coverage_map_has_no_unclassified_builder_refresh_or_empty_admission() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root");
+    let output = std::process::Command::new("rg")
+        .current_dir(repo)
+        .args([
+            "-n",
+            "RedactionTable::build(?:_[[:alnum:]_]+)?|build_daemon_redaction_table|refresh_global_redaction_table|RedactionTable::empty",
+            ".",
+            "--glob",
+            "*.rs",
+        ])
+        .output()
+        .expect("run the canonical redaction inventory query");
+    assert!(output.status.success(), "canonical redaction query failed");
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 rg output");
+    let mut authority_internal = 0usize;
+    let mut raw_export = 0usize;
+    let mut inert_empty = 0usize;
+    let mut unclassified = Vec::new();
+    for row in stdout.lines() {
+        let mut fields = row.splitn(3, ':');
+        let path_text = fields.next().expect("query path").trim_start_matches("./");
+        let line = fields
+            .next()
+            .and_then(|value| value.parse::<usize>().ok())
+            .expect("query line");
+        let matched = fields.next().expect("query source line");
+        let path = std::path::Path::new(path_text);
+        let source = std::fs::read_to_string(repo.join(path)).expect("inventory source");
+        let trimmed = matched.trim_start();
+        if trimmed.starts_with("//")
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with('*')
+            || matched.contains("fn build_daemon_redaction_table")
+            || matched.contains("fn refresh_global_redaction_table")
+        {
+            continue;
+        }
+        if redaction_query_match_is_test_only(path, &source, line) {
+            continue;
+        }
+        match path_text {
+            "crates/cockpit-core/src/redact/coverage_authority.rs"
+                if matched.contains("RedactionTable::build_with_env_and_credential_store") =>
+            {
+                authority_internal += 1;
+            }
+            "crates/cockpit-core/src/session/export/mod.rs"
+                if matched.contains("RedactionTable::empty()") =>
+            {
+                raw_export += 1;
+            }
+            "crates/cockpit-core/src/session/lifecycle.rs"
+            | "crates/cockpit-core/src/session/sealed_values.rs"
+            | "crates/cockpit-core/src/engine/rehydrate.rs"
+                if matched.contains("RedactionTable::empty()") =>
+            {
+                inert_empty += 1;
+            }
+            _ => unclassified.push(format!("{path_text}:{line}:{matched}")),
+        }
+    }
+    assert_eq!(authority_internal, 2, "authority capture funnel changed");
+    assert_eq!(
+        raw_export, 1,
+        "raw export must be the sole typed raw branch"
+    );
+    assert_eq!(inert_empty, 5, "inert empty-table ownership changed");
+    assert!(
+        unclassified.is_empty(),
+        "unclassified production redaction constructions:\n{}",
+        unclassified.join("\n")
+    );
+
+    let export =
+        std::fs::read_to_string(repo.join("crates/cockpit-core/src/session/export/mod.rs"))
+            .expect("export owner source");
+    assert!(export.contains("RawExportDisposition"));
+    assert!(export.contains("redacted export requires bound coverage"));
+}
+
+#[test]
+fn toggle_redaction_reacquires_bound_coverage() {
+    let source = include_str!("run.rs");
+    let toggle = source
+        .split("// `/toggle-redaction`: mutate the session's in-memory")
+        .nth(1)
+        .and_then(|body| body.split("// `/toggle-preflight`").next())
+        .expect("toggle redaction command");
+    assert!(toggle.contains("authority.invalidate_key(&coverage_key)"));
+    assert!(toggle.contains("CoverageScope::RedactionOverride"));
+    assert!(toggle.contains("CoverageBuild::capture"));
+    assert!(toggle.contains("admission.use_at_sink"));
+    assert!(!toggle.contains("RedactionTable::build"));
+    assert!(!toggle.contains("RedactionTable::empty"));
+}
+
 #[tokio::test]
 async fn fresh_installed_root_persists_slot_default_and_resume_keeps_it() {
     let db = Db::open_in_memory().unwrap();

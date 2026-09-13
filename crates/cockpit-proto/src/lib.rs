@@ -1343,9 +1343,10 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v24 adds the onboarding-facing agent
-/// authoring projection and atomic authored-package apply/receipt family
-/// on top of v23's durable logical-conversation favorites
+/// Current wire schema version. v25 adds daemon-rendered redaction coverage,
+/// input-prediction, and tag-preview projections on top of v24's
+/// onboarding-facing agent authoring projection and atomic authored-package
+/// apply/receipt family and v23's durable logical-conversation favorites
 /// (`SetSessionFavorite` / `SessionFavoriteApplied` and the resolved-root
 /// `SessionSummary.favorite` bit), daemon-authoritative onboarding
 /// (`BeginOrReopenOnboarding` / `ApplyOnboardingTransition` and bootstrap
@@ -1355,7 +1356,7 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// MCP scopes on the attached-session and daemon-owned setup inventory,
 /// bounded base64 media previews, the rolling-precompaction resume choice,
 /// and knowledge-dream completion receipts including ordered all-KB runs.
-pub const PROTOCOL_VERSION: u32 = 24;
+pub const PROTOCOL_VERSION: u32 = 25;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -3825,6 +3826,73 @@ pub struct TagExpansionMeta {
     pub ok: bool,
 }
 
+/// Boundary-safe user/assistant turn supplied to the daemon prediction
+/// renderer. Tool payloads and reasoning are structurally absent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InputPredictionTurn {
+    pub user: String,
+    pub agent: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InputPredictionMode {
+    Short,
+    Long,
+}
+
+/// Redacted output produced while the daemon holds a one-operation coverage
+/// admission. No matcher, candidate, source identity, or cache identifier is
+/// representable in this DTO.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InputPredictionProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// Daemon-rendered `@` expansion. The wire body has already crossed the
+/// coverage sink; clients receive only boundary-safe content and display
+/// metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TagPreviewProjection {
+    pub wire: String,
+    #[serde(default)]
+    pub expansions: Vec<TagExpansionMeta>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RedactionCoverageState {
+    Ready,
+    UnsupportedCoverage,
+    CoverageUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UnsupportedSourceDetailClass {
+    UnsupportedFormat,
+    Unreadable,
+    ChangedDuringCapture,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OwnerUnsupportedSourceDiagnostic {
+    pub display_path: String,
+    pub detail: UnsupportedSourceDetailClass,
+}
+
+/// Safe status projection for CLI/debug consumers. Non-owners receive only
+/// `state`; the owner-only diagnostic is constructed by the daemon authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RedactionCoverageStatusProjection {
+    pub state: RedactionCoverageState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_diagnostic: Option<OwnerUnsupportedSourceDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rendered_context: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QueueTarget {
     pub id: String,
@@ -4607,6 +4675,9 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
 ";
 
     const REQUEST_ALLOWLIST: &[&str] = &[
+        "get_redaction_coverage_status",
+        "render_input_prediction",
+        "resolve_tag_preview",
         "archive_session",
         // Migrated to a typed bulk transfer reference by
         // `remote-transport-logical-lanes`; mirrored so the TypeScript schemas
@@ -4669,6 +4740,9 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
 
     const RESPONSE_ALLOWLIST: &[&str] = &[
         "ack",
+        "redaction_coverage_status",
+        "input_prediction",
+        "tag_preview",
         "config_refreshed",
         "bulk_transfer_chunk",
         "bulk_transfer_chunk_accepted",
@@ -7451,7 +7525,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v10_request_is_rejected_after_the_current_only_v24_cutover() {
+    async fn historical_request_is_rejected_after_the_current_only_cutover() {
         let (a, b) = duplex(4096);
         let mut sender = ProtoStream::with_version(a, 10);
         let mut receiver = ProtoStream::with_version(b, 10);
@@ -7516,12 +7590,12 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 24);
+        assert_eq!(PROTOCOL_VERSION, 25);
         let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
-                .expect("current v24 config_refreshed fixture")
+                .expect("current protocol config_refreshed fixture")
                 .clone(),
         )
         .unwrap();
@@ -7536,19 +7610,19 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 24);
+        assert_eq!(PROTOCOL_VERSION, 25);
         let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
                 .get(response_name)
-                .unwrap_or_else(|| panic!("current v24 {response_name} fixture"));
+                .unwrap_or_else(|| panic!("current protocol {response_name} fixture"));
             assert_eq!(
                 response["data"]["goal"]["max_verification_attempts"], 4,
-                "current v24 {response_name} must freeze the inclusive verification cap"
+                "current protocol {response_name} must freeze the inclusive verification cap"
             );
             serde_json::from_value::<Response>(response.clone()).unwrap_or_else(|error| {
-                panic!("current v24 {response_name} must deserialize: {error}")
+                panic!("current protocol {response_name} must deserialize: {error}")
             });
         }
     }
@@ -7561,13 +7635,13 @@ mod tests {
                 serde_json::from_value(fixture[response_name]["data"]["assistant"].clone())
                     .unwrap();
             validate_assistant_summary(&summary).unwrap_or_else(|error| {
-                panic!("current v24 {response_name} assistant identity is invalid: {error}")
+                panic!("current protocol {response_name} assistant identity is invalid: {error}")
             });
         }
         let summary: AssistantSummary =
             serde_json::from_value(fixture["assistants"]["data"]["assistants"][0].clone()).unwrap();
         validate_assistant_summary(&summary)
-            .expect("current v24 assistant inventory must carry bounded opaque revisions");
+            .expect("current protocol assistant inventory must carry bounded opaque revisions");
         assert_eq!(fixture["assistants"]["data"]["config_generation"], 7);
         assert_eq!(
             fixture["agent_inventory"]["data"]["config_generation"],
@@ -7653,7 +7727,7 @@ mod tests {
         ] {
             assert!(
                 mcp[field].is_string(),
-                "current v24 MCP CAS fixture must carry {field}"
+                "current protocol MCP CAS fixture must carry {field}"
             );
         }
         assert_eq!(mcp["expected_revision"].as_str().map(str::len), Some(64));
@@ -7703,7 +7777,7 @@ mod tests {
         ] {
             assert!(
                 requests[tag]["params"]["client_operation_id"].is_string(),
-                "current v24 fixture must carry an operation id for {tag}"
+                "current protocol fixture must carry an operation id for {tag}"
             );
         }
         let responses = proto_fixture_files::read_fixture("response.json");

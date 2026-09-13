@@ -419,18 +419,36 @@ async fn refresh_redaction_for_turn(
 ) -> RedactionRefreshOutcome {
     let mut cfg = base_redact;
     overrides.apply_to(&mut cfg);
-    let new_table = session.credential_store().and_then(|store| {
-        crate::redact::RedactionTable::build_with_env_and_credential_store(
-            &cfg,
-            project_root,
-            env,
-            &store,
-        )
-    });
-    let new_table = match new_table {
-        Ok(table) => session.with_machine_scoped_sealed_redactions(&table).await,
-        Err(error) => Err(error),
+    let Some((authority, coverage_key)) = session.redaction_coverage() else {
+        return RedactionRefreshOutcome::Refused("coverage_unavailable".to_string());
     };
+    let store = match session.credential_store() {
+        Ok(store) => store,
+        Err(error) => return RedactionRefreshOutcome::Refused(error.to_string()),
+    };
+    let sealed = match session.machine_scoped_sealed_redactions().await {
+        Ok(table) => table,
+        Err(error) => return RedactionRefreshOutcome::Refused(error.to_string()),
+    };
+    let root = project_root.to_path_buf();
+    let env = env.clone();
+    let new_table = authority
+        .acquire(
+            coverage_key,
+            crate::redact::coverage_authority::CoverageScope::SessionSubmission,
+            move || {
+                crate::redact::coverage_authority::CoverageBuild::capture(
+                    &cfg, &root, &env, &store, &sealed,
+                )
+            },
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+        .and_then(|admission| {
+            admission
+                .use_at_sink(|table| Ok(table.enforced()))
+                .map_err(|error| anyhow::anyhow!(error.to_string()))
+        });
     match new_table {
         Ok(new_table) => {
             // H1: read the LATEST table, union, persist, and swap all under the
@@ -496,10 +514,8 @@ async fn refresh_redaction_for_turn(
                         &table,
                         proto::Event::Notice {
                             session_id,
-                            text: format!(
-                                "`{}` is an unsupported format; redaction for this file will not work",
-                                path.display()
-                            ),
+                        text: "A configured source has an unsupported format; coverage is unavailable for that source"
+                            .to_string(),
                         },
                         NoticeSource::DaemonDirect,
                     );

@@ -1375,7 +1375,12 @@ impl SessionWorkerHandle {
             .env_overlay
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *overlay = vars;
+        if *overlay != vars {
+            *overlay = vars;
+            if let Some((authority, key)) = self.session.redaction_coverage() {
+                authority.invalidate_key(&key);
+            }
+        }
     }
 
     /// Snapshot the authenticated session environment for daemon-owned
@@ -1911,6 +1916,37 @@ impl SessionWorkerHandle {
 
     pub fn redaction_table(&self) -> Arc<RedactionTable> {
         current_redaction(&self.redaction)
+    }
+
+    /// Acquire the session's daemon-bound coverage for one immediate sink.
+    /// This is the common route for utility inference, tag rendering, debug
+    /// projection, and other attached operations that do not run through the
+    /// main worker submission refresh.
+    pub(crate) async fn acquire_redaction_coverage(
+        &self,
+        purpose: crate::redact::coverage_authority::CoverageScope,
+    ) -> anyhow::Result<crate::redact::coverage_authority::CoverageAdmission> {
+        let (authority, key) = self
+            .session
+            .redaction_coverage()
+            .ok_or_else(|| anyhow::anyhow!("coverage_unavailable"))?;
+        let config = self.config_snapshot().extended.redact;
+        let root = self.project_root.clone();
+        let environment = self.env_overlay_snapshot();
+        let store = self.session.credential_store()?;
+        let sealed = self.session.machine_scoped_sealed_redactions().await?;
+        authority
+            .acquire(key, purpose, move || {
+                crate::redact::coverage_authority::CoverageBuild::capture(
+                    &config,
+                    &root,
+                    &environment,
+                    &store,
+                    &sealed,
+                )
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
     }
 
     /// Delete a sealed value. Reached only from the daemon's `owner_only`

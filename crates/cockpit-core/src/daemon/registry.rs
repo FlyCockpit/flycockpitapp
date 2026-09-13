@@ -308,6 +308,9 @@ struct Inner {
     /// tests inject fixed configs so no attach/resume/worker path consults
     /// the machine's live layered config.
     config_source: crate::daemon::config_source::ConfigSource,
+    /// Single daemon-owned redaction coverage scheduler/cache. It exists in
+    /// every composition, independently of the optional resource scheduler.
+    coverage_authority: crate::redact::coverage_authority::RedactionCoverageAuthority,
     /// Test-only seam for proving that the start boundary cannot replace the
     /// authority/configuration preflight selected. Production has no callback
     /// between those two phases.
@@ -332,6 +335,12 @@ struct Inner {
     image_generation_dispatch_registry: crate::daemon::image_runtime::DaemonImageDispatchRegistry,
     /// Daemon-owned installed-agent tree (`<pid-file-parent>/agents`).
     daemon_agents_dir: Mutex<Option<PathBuf>>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.coverage_authority.shutdown();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -791,6 +800,42 @@ impl SessionRegistry {
         resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
         config_source: crate::daemon::config_source::ConfigSource,
     ) -> Self {
+        Self::new_with_coverage_mode(
+            db,
+            locks,
+            shutdown,
+            resource_scheduler,
+            config_source,
+            crate::redact::coverage_authority::CoverageOwnerMode::InProcess,
+        )
+    }
+
+    pub(crate) fn new_with_coverage_mode(
+        db: Db,
+        locks: Arc<LockManager>,
+        shutdown: ShutdownSignal,
+        resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+        config_source: crate::daemon::config_source::ConfigSource,
+        coverage_mode: crate::redact::coverage_authority::CoverageOwnerMode,
+    ) -> Self {
+        Self::new_with_coverage_authority(
+            db,
+            locks,
+            shutdown,
+            resource_scheduler,
+            config_source,
+            crate::redact::coverage_authority::RedactionCoverageAuthority::new(coverage_mode),
+        )
+    }
+
+    pub(crate) fn new_with_coverage_authority(
+        db: Db,
+        locks: Arc<LockManager>,
+        shutdown: ShutdownSignal,
+        resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+        config_source: crate::daemon::config_source::ConfigSource,
+        coverage_authority: crate::redact::coverage_authority::RedactionCoverageAuthority,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 guidance_proposals: Arc::new(tokio::sync::Mutex::new(
@@ -826,6 +871,7 @@ impl SessionRegistry {
                 shutdown,
                 global_bus: Mutex::new(None),
                 config_source,
+                coverage_authority,
                 #[cfg(test)]
                 pre_start_worker_hook: Mutex::new(None),
                 host_capabilities: Mutex::new(None),
@@ -845,6 +891,12 @@ impl SessionRegistry {
                 daemon_agents_dir: Mutex::new(None),
             }),
         }
+    }
+
+    pub(crate) fn coverage_authority(
+        &self,
+    ) -> &crate::redact::coverage_authority::RedactionCoverageAuthority {
+        &self.inner.coverage_authority
     }
 
     pub fn set_daemon_agents_dir(&self, dir: PathBuf) {
@@ -1701,6 +1753,10 @@ impl SessionRegistry {
                 &trust_policy,
             )?,
         );
+        let project_root = workspace_root_authority
+            .attached_root
+            .canonical_path()
+            .to_path_buf();
         // Use the complete attach-time source chain. In addition to avoiding
         // a later ambient `COCKPIT_CONFIG` redirect, this preserves exact
         // provenance for global provider/model choices so an attached
@@ -2401,22 +2457,83 @@ impl SessionRegistry {
         // lookup). Pre-resolution has already run on the async caller path.
         session.set_command_secret_cache(Some(self.command_secret_cache()));
 
-        // Build per-session redaction table from the immutable session env.
+        // Build per-session redaction coverage from the immutable session env
+        // through the daemon's sole bounded authority. Machine-scoped sealed
+        // values are captured before matcher publication and folded into the
+        // same generation.
         // `credential_store` injects any resolved command-backed output into the
         // store, so the planted token joins the redaction table while the argv
         // spec never does (`command_secret_output_joins_redaction_table`).
-        let redact = RedactionTable::build_with_env_and_credential_store(
-            &extended_cfg.redact,
-            &project_root,
-            env_snapshot.vars(),
-            &session.credential_store()?,
-        )
-        .context("building redaction table")?;
-        let redact = session
-            .with_machine_scoped_sealed_redactions(&redact)
+        let sealed = session
+            .machine_scoped_sealed_redactions()
             .await
-            .context("adding machine-scoped sealed values to redaction table")?;
-        let redact = Arc::new(redact);
+            .context("capturing machine-scoped sealed redaction values")?;
+        let store = session.credential_store()?;
+        let config = extended_cfg.redact.clone();
+        let root = project_root.clone();
+        let env = env_snapshot.vars().clone();
+        let vault_revision = self
+            .secret_vault()?
+            .current_inventory_generation()
+            .map_err(|error| anyhow::anyhow!("reading redaction vault revision: {error}"))?;
+        let trust_revision_bytes = trust_revision.to_le_bytes();
+        let vault_revision_bytes = vault_revision.to_le_bytes();
+        let coverage_key = crate::redact::coverage_authority::RedactionCoverageKey::session(
+            crate::redact::coverage_authority::CoverageBinding::derive(
+                b"principal",
+                session_id.as_bytes(),
+            ),
+            crate::redact::coverage_authority::CoverageBinding::derive(
+                b"owner-authorization",
+                &trust_revision_bytes,
+            ),
+            crate::redact::coverage_authority::CoverageBinding::derive(
+                b"session",
+                session_id.as_bytes(),
+            ),
+            crate::redact::coverage_authority::CoverageBinding::derive(
+                b"workspace",
+                project_root.as_os_str().as_encoded_bytes(),
+            ),
+            crate::redact::coverage_authority::CoverageBinding::derive(
+                b"environment",
+                env_snapshot.digest().as_bytes(),
+            ),
+            crate::redact::coverage_authority::CoverageBinding::derive(
+                b"credential-vault",
+                &vault_revision_bytes,
+            ),
+            crate::redact::coverage_authority::CoverageBinding::derive(
+                b"policy",
+                &trust_revision_bytes,
+            ),
+            crate::redact::coverage_authority::CoverageBinding::derive(
+                b"sealed",
+                session_id.as_bytes(),
+            ),
+            crate::redact::coverage_authority::CoverageBinding::derive(b"override", &[]),
+            crate::redact::coverage_authority::CoverageBinding::derive(
+                b"machine-sources",
+                project_root.as_os_str().as_encoded_bytes(),
+            ),
+        );
+        let admission = self
+            .coverage_authority()
+            .acquire(
+                coverage_key.clone(),
+                crate::redact::coverage_authority::CoverageScope::SessionStart,
+                move || {
+                    crate::redact::coverage_authority::CoverageBuild::capture(
+                        &config, &root, &env, &store, &sealed,
+                    )
+                },
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let redact = admission
+            .use_at_sink(|table| Ok(Arc::new(table.enforced())))
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        session.set_redaction_coverage(self.coverage_authority().clone(), coverage_key);
 
         // Build the model from providers config. Errors out loud if
         // no provider is configured for the session's active model. Install
@@ -2647,6 +2764,7 @@ impl SessionRegistry {
             self.inner.config_source.clone(),
             handle.clone(),
             config_watch_paths,
+            self.coverage_authority().clone(),
         );
         crate::sync::lock_or_recover(&self.inner.worker_joins).insert(
             session_id,
@@ -3478,6 +3596,30 @@ mod tests {
             ProvidersConfig::default(),
             ExtendedConfig::default(),
         ))
+    }
+
+    #[test]
+    fn session_start_acquires_bound_coverage() {
+        let source = include_str!("registry.rs");
+        let start = source
+            .split("async fn start_worker(")
+            .nth(1)
+            .and_then(|body| {
+                body.split("// Build the model from providers config.")
+                    .next()
+            })
+            .expect("session-start coverage section");
+        assert!(start.contains("RedactionCoverageKey::session"));
+        assert!(start.contains("CoverageScope::SessionStart"));
+        assert!(start.contains("CoverageBuild::capture"));
+        assert!(start.contains("use_at_sink"));
+        assert!(start.contains("set_redaction_coverage"));
+        assert!(!start.contains("RedactionTable::build"));
+        assert!(!start.contains("RedactionTable::empty"));
+        assert!(
+            start.find("use_at_sink").expect("admission sink")
+                < start.find("Build the model").unwrap_or(start.len())
+        );
     }
 
     fn test_registry_with_config_source(

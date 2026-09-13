@@ -13522,17 +13522,43 @@ pub(super) async fn run_worker(
                         .read()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone();
-                    let new_table = session.credential_store().and_then(|store| {
-                        crate::redact::RedactionTable::build_with_env_and_credential_store(
-                            &effective_redact,
-                            &project_root,
-                            &session_env,
-                            &store,
-                        )
-                    });
-                    let new_table = match new_table {
-                        Ok(table) => session.with_machine_scoped_sealed_redactions(&table).await,
-                        Err(error) => Err(error),
+                    let new_table = if let Some((authority, coverage_key)) =
+                        session.redaction_coverage()
+                    {
+                        authority.invalidate_key(&coverage_key);
+                        match session.credential_store() {
+                            Ok(store) => match session.machine_scoped_sealed_redactions().await {
+                                Ok(sealed) => {
+                                    let root = project_root.clone();
+                                    let capture_redact = effective_redact.clone();
+                                    authority
+                                        .acquire(
+                                            coverage_key,
+                                            crate::redact::coverage_authority::CoverageScope::RedactionOverride,
+                                            move || {
+                                                crate::redact::coverage_authority::CoverageBuild::capture(
+                                                    &capture_redact,
+                                                    &root,
+                                                    &session_env,
+                                                    &store,
+                                                    &sealed,
+                                                )
+                                            },
+                                        )
+                                        .await
+                                        .map_err(|error| anyhow::anyhow!(error.to_string()))
+                                        .and_then(|admission| {
+                                            admission
+                                                .use_at_sink(|table| Ok(table.enforced()))
+                                                .map_err(|error| anyhow::anyhow!(error.to_string()))
+                                        })
+                                }
+                                Err(error) => Err(error),
+                            },
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        Err(anyhow::anyhow!("coverage_unavailable"))
                     };
                     match new_table {
                         Ok(new_table) => {
@@ -13587,10 +13613,8 @@ pub(super) async fn run_worker(
                                         &redaction,
                                         proto::Event::Notice {
                                             session_id,
-                                            text: format!(
-                                                "`{}` is an unsupported format; redaction for this file will not work",
-                                                path.display()
-                                            ),
+                                            text: "A configured source has an unsupported format; coverage is unavailable for that source"
+                                                .to_string(),
                                         },
                                         NoticeSource::DaemonDirect,
                                     );

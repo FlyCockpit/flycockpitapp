@@ -71,6 +71,9 @@ pub struct HostContext {
     pub child_events: Option<McpChildEventRecorder>,
     pub builtin_registry: Arc<BuiltinRegistry>,
     pub native_tool_ctx: Option<Arc<ToolCtx>>,
+    /// Daemon-internal bound projection table for deliberately isolated forks
+    /// that cannot carry a native tool context. Never serialized or exposed.
+    pub(crate) projection_redact: Option<Arc<crate::redact::RedactionTable>>,
     pub scan_tool_results: bool,
     /// Present only for the isolated metadata fork. It fences the generated
     /// write to the user-content boundary that scheduled the fork.
@@ -127,6 +130,7 @@ impl HostContext {
             child_events,
             builtin_registry: ctx.mcp_builtin_registry.clone(),
             native_tool_ctx: Some(Arc::new(ctx.clone_stripped())),
+            projection_redact: Some(ctx.redact.clone()),
             scan_tool_results: true,
             metadata_expected_user_content_tokens: None,
             metadata_expected_generation: None,
@@ -153,6 +157,7 @@ impl HostContext {
         expected_generation: i64,
         cancel: tokio_util::sync::CancellationToken,
         shutdown_gate: crate::daemon::shutdown::ShutdownSignal,
+        projection_redact: Arc<crate::redact::RedactionTable>,
     ) -> Self {
         Self {
             db: Some(session.db.clone()),
@@ -166,6 +171,7 @@ impl HostContext {
             child_events: None,
             builtin_registry: Arc::new(BuiltinRegistry::metadata_fork()),
             native_tool_ctx: None,
+            projection_redact: Some(projection_redact),
             scan_tool_results: false,
             metadata_expected_user_content_tokens: Some(expected_user_content_tokens as i64),
             metadata_expected_generation: Some(expected_generation),
@@ -189,6 +195,7 @@ impl HostContext {
         cwd: PathBuf,
         config: crate::daemon::session_worker::SessionConfigHandle,
         slot: Arc<std::sync::Mutex<Option<Vec<crate::engine::seed_reads::SeedRead>>>>,
+        projection_redact: Arc<crate::redact::RedactionTable>,
     ) -> Self {
         Self {
             db: Some(session.db.clone()),
@@ -202,6 +209,7 @@ impl HostContext {
             child_events: None,
             builtin_registry: Arc::new(BuiltinRegistry::seed_reads_fork(slot)),
             native_tool_ctx: None,
+            projection_redact: Some(projection_redact),
             scan_tool_results: false,
             metadata_expected_user_content_tokens: None,
             metadata_expected_generation: None,
@@ -253,7 +261,7 @@ impl HostContext {
             .is_none_or(|ctx| ctx.mcp_resolver.external_servers_allowed())
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn empty_for_tests() -> Self {
         Self {
             db: None,
@@ -267,6 +275,7 @@ impl HostContext {
             child_events: None,
             builtin_registry: default_registry(),
             native_tool_ctx: None,
+            projection_redact: Some(Arc::new(crate::redact::RedactionTable::empty())),
             scan_tool_results: false,
             metadata_expected_user_content_tokens: None,
             metadata_expected_generation: None,
@@ -279,6 +288,12 @@ impl HostContext {
             #[cfg(test)]
             test_external_approval_entered: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn without_projection_coverage(mut self) -> Self {
+        self.projection_redact = None;
+        self
     }
 
     #[cfg(test)]
@@ -3493,6 +3508,7 @@ mod tests {
             child_events: None,
             builtin_registry: default_registry(),
             native_tool_ctx: None,
+            projection_redact: None,
             scan_tool_results: false,
             metadata_expected_user_content_tokens: None,
             metadata_expected_generation: None,
@@ -3599,6 +3615,7 @@ mod tests {
             child_events: None,
             builtin_registry: default_registry(),
             native_tool_ctx: None,
+            projection_redact: None,
             scan_tool_results: false,
             metadata_expected_user_content_tokens: None,
             metadata_expected_generation: None,

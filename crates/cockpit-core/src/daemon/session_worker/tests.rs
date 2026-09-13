@@ -3302,6 +3302,15 @@ async fn turn_refresh_sends_rebuilt_redaction_table_to_driver() {
     let (driver_tx, mut driver_rx) = mpsc::channel(1);
     let mut notified = HashSet::new();
 
+    let session = std::sync::Arc::new(session);
+    let env_overlay = std::sync::Arc::new(std::sync::RwLock::new(HashMap::new()));
+    let config_snapshot = std::sync::Arc::new(std::sync::RwLock::new(
+        crate::daemon::session_worker::handle::SessionConfigSnapshot::new(
+            0,
+            crate::config::providers::ProvidersConfig::default(),
+            crate::config::extended::ExtendedConfig::default(),
+        ),
+    ));
     crate::config::trust::scope_workspace_trust_policy(
         trusted_test_policy(tmp.path()),
         refresh_redaction_for_turn(
@@ -3312,10 +3321,11 @@ async fn turn_refresh_sends_rebuilt_redaction_table_to_driver() {
             &RedactionSourceOverrides::default(),
             &mut notified,
             &redaction,
-            &crate::engine::interrupt::InterruptHub::detached(),
+            &std::sync::Arc::new(crate::engine::interrupt::InterruptHub::detached()),
             &event_tx,
             &driver_tx,
-            &HashMap::new(),
+            env_overlay,
+            config_snapshot,
         ),
     )
     .await;
@@ -3364,6 +3374,15 @@ async fn turn_refresh_refuses_when_dotenv_exceeds_the_file_cap() {
     let redaction: SharedRedactionTable = Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
     let (driver_tx, mut driver_rx) = mpsc::channel(1);
     let mut notified = HashSet::new();
+    let session = std::sync::Arc::new(session);
+    let env_overlay = std::sync::Arc::new(std::sync::RwLock::new(HashMap::new()));
+    let config_snapshot = std::sync::Arc::new(std::sync::RwLock::new(
+        crate::daemon::session_worker::handle::SessionConfigSnapshot::new(
+            0,
+            crate::config::providers::ProvidersConfig::default(),
+            crate::config::extended::ExtendedConfig::default(),
+        ),
+    ));
 
     let outcome = crate::config::trust::scope_workspace_trust_policy(
         trusted_test_policy(tmp.path()),
@@ -3375,10 +3394,11 @@ async fn turn_refresh_refuses_when_dotenv_exceeds_the_file_cap() {
             &RedactionSourceOverrides::default(),
             &mut notified,
             &redaction,
-            &crate::engine::interrupt::InterruptHub::detached(),
+            &std::sync::Arc::new(crate::engine::interrupt::InterruptHub::detached()),
             &event_tx,
             &driver_tx,
-            &HashMap::new(),
+            env_overlay,
+            config_snapshot,
         ),
     )
     .await;

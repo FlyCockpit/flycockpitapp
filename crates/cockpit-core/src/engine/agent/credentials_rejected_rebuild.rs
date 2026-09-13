@@ -172,6 +172,40 @@ pub(crate) async fn rebuild_model_for_credentials(
     let publish_vault = session.secret_vault().clone();
     let publish_db = session.db.clone();
     let publish_command_cache = command_cache.clone();
+    let config_for_publish = config.clone();
+    let env_overlay_for_publish = env_overlay.clone();
+    let capture_root_for_publish = capture_root.clone();
+    let publish_fence = crate::redact::coverage_bindings::session_publish_owners(
+        publish_vault.clone(),
+        publish_db.clone(),
+        publish_command_cache.clone(),
+        crate::redact::coverage_bindings::SessionCoveragePublishLive {
+            environment: std::sync::Arc::new(move || {
+                Ok(crate::env_snapshot::EnvSnapshot::new(
+                    cockpit_proto::EnvSnapshotSource::SessionWorker,
+                    env_overlay_for_publish
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone(),
+                ))
+            }),
+            policy_digest: std::sync::Arc::new({
+                let config_for_publish = config_for_publish.clone();
+                move || {
+                    crate::redact::coverage_bindings::redact_config_digest(
+                        &config_for_publish.extended().redact,
+                    )
+                }
+            }),
+            override_revision: std::sync::Arc::new(|| 0),
+            redact_config: std::sync::Arc::new({
+                let config_for_publish = config_for_publish.clone();
+                move || config_for_publish.extended().redact.clone()
+            }),
+            workspace_root: std::sync::Arc::new(move || capture_root_for_publish.clone()),
+        },
+    )
+    .publish_fence();
     let admission = authority
         .acquire(
             coverage_key,
@@ -198,25 +232,14 @@ pub(crate) async fn rebuild_model_for_credentials(
                     &sealed,
                     &capture_inputs,
                 )?;
-                Ok(build.with_publish_fence(
-                    crate::redact::coverage_bindings::session_publish_owners_from_inputs(
-                        &capture_inputs,
-                        publish_vault,
-                        publish_db,
-                        publish_command_cache,
-                        std::sync::Arc::new(env_snapshot_for_capture.clone()),
-                    )
-                    .publish_fence(),
-                ))
+                Ok(build.with_publish_fence(publish_fence))
             },
         )
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let refreshed_secrets = admission
-        .into_unbound_table()
-        .map(|table| table.as_ref().clone())
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let refreshed = Arc::new(redact.union(&refreshed_secrets)?);
+    let refreshed = admission.consume_at_sink(|refreshed_secrets| {
+        Ok(Arc::new(redact.union(refreshed_secrets.as_ref())?))
+    })?;
     // (c) Rebuild a fresh client from the owner-scoped store under the refreshed
     // table. Same construction funnel as the model-swap path.
     let env_overlay = env_overlay.clone();

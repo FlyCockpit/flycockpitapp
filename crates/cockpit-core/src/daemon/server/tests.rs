@@ -43018,7 +43018,7 @@ fn global_coverage_helper_has_no_legacy_builder() {
         .expect("daemon coverage helper");
     assert!(helper.contains("RedactionCoverageKey::daemon_global"));
     assert!(helper.contains("CoverageBuild::capture_without_sealed"));
-    assert!(helper.contains("into_unbound_table"));
+    assert!(helper.contains("consume_at_sink"));
     assert!(!helper.contains("build_daemon_redaction_table"));
     assert!(!helper.contains("refresh_global_redaction_table"));
     assert!(!helper.contains("RedactionTable::empty"));

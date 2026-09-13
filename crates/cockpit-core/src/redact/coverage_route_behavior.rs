@@ -77,8 +77,8 @@ pub(crate) mod tests {
             )
             .await
             .expect("session-start capture")
-            .into_unbound_table()
-            .expect("install unbound session table");
+            .consume_at_sink(|table| Ok(table))
+            .expect("install session table at sink");
         let forced = base_table
             .as_ref()
             .clone()
@@ -94,8 +94,8 @@ pub(crate) mod tests {
             )
             .await
             .expect("submission refresh capture")
-            .into_unbound_table()
-            .expect("refreshed unbound table");
+            .consume_at_sink(|table| Ok(table))
+            .expect("refreshed table at sink");
         let unioned = base_table
             .as_ref()
             .clone()
@@ -220,7 +220,7 @@ pub(crate) mod tests {
             )
             .await
             .expect("left capture")
-            .use_at_sink(|table| Ok(table.clone()))
+            .consume_at_sink(|table| Ok(table.as_ref().clone()))
             .expect("left sink");
         let right = authority
             .acquire(
@@ -230,7 +230,7 @@ pub(crate) mod tests {
             )
             .await
             .expect("right capture")
-            .use_at_sink(|table| Ok(table.clone()))
+            .consume_at_sink(|table| Ok(table.as_ref().clone()))
             .expect("right sink");
         assert!(left.union(&right).is_err());
     }

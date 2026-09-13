@@ -1510,11 +1510,14 @@ impl RedactionTable {
             protected,
         )?;
         merged.coverage_binding = match (&self.coverage_binding, &other.coverage_binding) {
-            (None, None) => None,
             (Some(left), Some(right)) if left.same_generation(right) => Some(left.clone()),
-            (Some(_), None) | (None, Some(_)) | (Some(_), Some(_)) => {
-                anyhow::bail!("coverage binding mismatch across union operands")
+            (Some(binding), None) | (None, Some(binding)) => Some(binding.clone()),
+            (None, None)
+                if self.is_union_identity_operand() && other.is_union_identity_operand() =>
+            {
+                None
             }
+            _ => anyhow::bail!("coverage binding mismatch across union operands"),
         };
         Ok(merged)
     }
@@ -1903,12 +1906,16 @@ impl RedactionTable {
     /// [`aho_corasick::AhoCorasick::memory_usage`]. This value never leaves the
     /// daemon and is not a source or candidate fingerprint.
     pub(super) fn measured_immutable_artifact_bytes(&self) -> usize {
-        let entry_bytes = self.entries.iter().fold(0usize, |total, entry| {
-            total
-                .saturating_add(entry.value.capacity())
-                .saturating_add(entry.class.origin_display().len())
-                .saturating_add(std::mem::size_of::<RedactionEntry>())
-        });
+        let entry_bytes = self
+            .entries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<RedactionEntry>())
+            .saturating_add(self.entries.iter().fold(0usize, |total, entry| {
+                total
+                    .saturating_add(entry.value.capacity())
+                    .saturating_add(entry.class.origin_display().capacity())
+                    .saturating_add(std::mem::size_of::<RedactionEntry>())
+            }));
         let automaton_bytes = self
             .matcher
             .as_ref()
@@ -1922,26 +1929,42 @@ impl RedactionTable {
             );
         let unsupported_path_bytes = self
             .unsupported_files
-            .iter()
-            .map(|path| path.as_os_str().len())
-            .sum::<usize>();
+            .capacity()
+            .saturating_mul(std::mem::size_of::<PathBuf>())
+            .saturating_add(
+                self.unsupported_files
+                    .iter()
+                    .map(|path| {
+                        path.as_os_str()
+                            .len()
+                            .saturating_add(std::mem::size_of::<PathBuf>())
+                    })
+                    .sum::<usize>(),
+            );
         let conflict_string_bytes = self
             .protected_path_conflicts
-            .iter()
-            .map(|value| value.len())
-            .sum::<usize>();
-        let protected_path_bytes = self
-            .protected
-            .to_persisted()
-            .iter()
-            .map(|value| value.len())
-            .sum::<usize>();
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_add(
+                self.protected_path_conflicts
+                    .iter()
+                    .map(|value| value.capacity())
+                    .sum::<usize>(),
+            );
+        let protected_path_bytes = self.protected.measured_retained_bytes();
         entry_bytes
             .saturating_add(automaton_bytes)
-            .saturating_add(self.placeholder.len())
+            .saturating_add(self.placeholder.capacity())
             .saturating_add(unsupported_path_bytes)
             .saturating_add(conflict_string_bytes)
             .saturating_add(protected_path_bytes)
+    }
+
+    fn is_union_identity_operand(&self) -> bool {
+        self.entries.is_empty()
+            && self.unsupported_files.is_empty()
+            && self.protected_path_conflicts.is_empty()
+            && self.protected.is_empty()
     }
 
     /// This table with the config-level opt-out (`redact.enabled = false`)

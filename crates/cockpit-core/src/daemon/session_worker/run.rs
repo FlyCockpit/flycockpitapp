@@ -10977,7 +10977,8 @@ pub(super) async fn run_worker(
                         &interrupts,
                         &event_tx,
                         &driver_control_tx,
-                        &session_env,
+                        env_overlay.clone(),
+                        config_snapshot.clone(),
                     )
                     .await
                     {
@@ -13562,6 +13563,16 @@ pub(super) async fn run_worker(
                                     let publish_vault = session.secret_vault().clone();
                                     let publish_db = session.db.clone();
                                     let publish_command_cache = command_cache.clone();
+                                    let publish_fence = crate::daemon::session_worker::worker_coverage_publish_owners(
+                                        &session,
+                                        &env_overlay,
+                                        &config_snapshot,
+                                        &redaction_overrides,
+                                        publish_vault.clone(),
+                                        publish_db.clone(),
+                                        publish_command_cache.clone(),
+                                    )
+                                    .publish_fence();
                                     authority
                                         .acquire(
                                             coverage_key,
@@ -13590,28 +13601,30 @@ pub(super) async fn run_worker(
                                                         &sealed,
                                                         &capture_inputs,
                                                     )?;
-                                                Ok(
-                                                    build.with_publish_fence(
-                                                        crate::redact::coverage_bindings::session_publish_owners_from_inputs(
-                                                            &capture_inputs,
-                                                            publish_vault,
-                                                            publish_db,
-                                                            publish_command_cache,
-                                                            std::sync::Arc::new(env_snapshot_for_capture.clone()),
-                                                        )
-                                                        .publish_fence(),
-                                                    ),
-                                                )
+                                                Ok(build.with_publish_fence(publish_fence))
                                             },
                                         )
                                         .await
                                         .map_err(|error| anyhow::anyhow!(error.to_string()))
                                         .and_then(|admission| {
-                                            admission
-                                                .into_unbound_table()
-                                                .map(|table| table.as_ref().clone())
-                                                .map_err(|error| anyhow::anyhow!(error.to_string()))
+                                            admission.consume_at_async_sink(|new_table| {
+                                                let session = session.clone();
+                                                let redaction = redaction.clone();
+                                                let interrupts = interrupts.clone();
+                                                async move {
+                                                    let _redaction_guard =
+                                                        interrupts.lock_redaction_table_write().await;
+                                                    let base = current_redaction(&redaction);
+                                                    let unioned = base.union(new_table.as_ref())?;
+                                                    let unioned = Arc::new(unioned);
+                                                    session.persist_redaction_table(&unioned)?;
+                                                    set_current_redaction(&redaction, unioned.clone());
+                                                    Ok(unioned)
+                                                }
+                                            })
                                         })
+                                        .await
+                                        .map_err(|error| anyhow::anyhow!(error.to_string()))
                                 }
                                 Err(error) => Err(error),
                             },
@@ -13621,50 +13634,7 @@ pub(super) async fn run_worker(
                         Err(anyhow::anyhow!("coverage_unavailable"))
                     };
                     match new_table {
-                        Ok(new_table) => {
-                            // H1: read the LATEST table, union, persist, and swap
-                            // under the per-session redaction-table write lock so
-                            // this `/toggle-redaction` refresh serializes with
-                            // sealed adoption / approved-secret-file registration
-                            // and cannot clobber a concurrently-committed adoption.
-                            // The guard is released before the driver `.await`.
-                            let table = {
-                                let _redaction_guard =
-                                    interrupts.lock_redaction_table_write().await;
-                                let base = current_redaction(&redaction);
-                                match base.union(&new_table) {
-                                    Ok(unioned) => {
-                                        let unioned = Arc::new(unioned);
-                                        // J3: persist BEFORE swapping the live table
-                                        // so a persist failure never leaves the live
-                                        // table advanced ahead of the durable one (a
-                                        // restart would lose the accumulated entry).
-                                        // On failure keep the previously-committed
-                                        // table live and surface the error.
-                                        match session.persist_redaction_table(&unioned) {
-                                            Ok(()) => {
-                                                set_current_redaction(&redaction, unioned.clone());
-                                                unioned
-                                            }
-                                            Err(error) => {
-                                                tracing::warn!(error = %error, %session_id, "persisting redaction table failed; keeping previously committed redaction table live");
-                                                base
-                                            }
-                                        }
-                                    }
-                                    Err(error) => {
-                                        // K6: never overwrite the committed table
-                                        // (which may hold a sealed literal adopted this
-                                        // turn) with a bare disk scan on a union error.
-                                        // Keep the committed `base` live and durable and
-                                        // defer the disk delta to the next refresh,
-                                        // mirroring
-                                        // `InterruptHub::refresh_union_redaction`.
-                                        tracing::warn!(error = %error, %session_id, "unioning redaction table failed; keeping committed redaction table live");
-                                        base
-                                    }
-                                }
-                            };
+                        Ok(table) => {
                             for path in table.unsupported_files() {
                                 if unsupported_redaction_notified.insert(path.clone()) {
                                     send_current_session_event(

@@ -1918,6 +1918,68 @@ impl SessionWorkerHandle {
         current_redaction(&self.redaction)
     }
 
+    pub(crate) fn coverage_publish_owners(
+        &self,
+        vault: std::sync::Arc<crate::secure_key::SecretVault>,
+        db: cockpit_db::Db,
+        command_cache: std::sync::Arc<crate::secret_command::CommandSecretCache>,
+    ) -> crate::redact::coverage_bindings::SessionCoveragePublishOwners {
+        use crate::redact::coverage_bindings::{
+            SessionCoveragePublishLive, session_publish_owners,
+        };
+        let session = self.session.clone();
+        let config_snapshot = self.config_snapshot.clone();
+        let env_overlay = self.env_overlay.clone();
+        let project_root = self.project_root.clone();
+        session_publish_owners(
+            vault,
+            db,
+            command_cache,
+            SessionCoveragePublishLive {
+                environment: std::sync::Arc::new(move || {
+                    Ok(crate::env_snapshot::EnvSnapshot::new(
+                        cockpit_proto::EnvSnapshotSource::SessionWorker,
+                        env_overlay
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone(),
+                    ))
+                }),
+                policy_digest: std::sync::Arc::new({
+                    let session = session.clone();
+                    let config_snapshot = config_snapshot.clone();
+                    move || {
+                        session
+                            .redaction_coverage()
+                            .map(|(_, _, digest)| digest)
+                            .unwrap_or_else(|| {
+                                crate::redact::coverage_bindings::redact_config_digest(
+                                    &config_snapshot
+                                        .read()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .extended
+                                        .redact,
+                                )
+                            })
+                    }
+                }),
+                override_revision: std::sync::Arc::new(|| 0),
+                redact_config: std::sync::Arc::new({
+                    let config_snapshot = config_snapshot.clone();
+                    move || {
+                        config_snapshot
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .extended
+                            .redact
+                            .clone()
+                    }
+                }),
+                workspace_root: std::sync::Arc::new(move || project_root.clone()),
+            },
+        )
+    }
+
     /// Acquire the session's daemon-bound coverage for one immediate sink.
     /// This is the common route for utility inference, tag rendering, debug
     /// projection, and other attached operations that do not run through the
@@ -1962,6 +2024,9 @@ impl SessionWorkerHandle {
         let publish_vault = self.session.secret_vault().clone();
         let publish_db = self.session.db.clone();
         let publish_command_cache = command_cache.clone();
+        let publish_fence = self
+            .coverage_publish_owners(publish_vault, publish_db, publish_command_cache)
+            .publish_fence();
         authority
             .acquire(key, purpose, move || {
                 let capture_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
@@ -1985,16 +2050,7 @@ impl SessionWorkerHandle {
                     &sealed,
                     &capture_inputs,
                 )?;
-                Ok(build.with_publish_fence(
-                    crate::redact::coverage_bindings::session_publish_owners_from_inputs(
-                        &capture_inputs,
-                        publish_vault,
-                        publish_db,
-                        publish_command_cache,
-                        std::sync::Arc::new(env_snapshot_for_capture.clone()),
-                    )
-                    .publish_fence(),
-                ))
+                Ok(build.with_publish_fence(publish_fence))
             })
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))

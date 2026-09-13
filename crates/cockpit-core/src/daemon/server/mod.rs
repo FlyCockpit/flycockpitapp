@@ -197,18 +197,23 @@ async fn acquire_daemon_redaction_table(
                 &capture_inputs,
             )?;
             Ok(build.with_publish_fence(
-                crate::redact::coverage_bindings::daemon_global_publish_owners_from_inputs(
-                    &capture_inputs,
+                crate::redact::coverage_bindings::daemon_global_publish_owners_for_config(
+                    source.clone(),
                     capture_vault.clone(),
                     capture_cache.clone(),
-                    std::sync::Arc::new(env_snapshot_for_capture.clone()),
+                    std::sync::Arc::new(move || {
+                        Ok(crate::env_snapshot::EnvSnapshot::new(
+                            cockpit_proto::EnvSnapshotSource::DaemonStart,
+                            daemon_process_env(),
+                        ))
+                    }),
                 )
                 .publish_fence(),
             ))
         })
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?
-        .into_unbound_table()
+        .consume_at_sink(|table| Ok(table))
         .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
@@ -5629,6 +5634,24 @@ pub(crate) async fn boot_ready_with_db(
     let capture_policy_digest = boot_policy_digest.clone();
     let capture_config = boot_extended.redact.clone();
     let boot_env_snapshot_for_capture = boot_env_snapshot.clone();
+    let boot_config_source = config_source.clone();
+    let boot_env_baseline = std::sync::Arc::new(std::sync::RwLock::new(boot_env_snapshot.clone()));
+    let boot_publish_fence =
+        crate::redact::coverage_bindings::daemon_global_publish_owners_for_config(
+            boot_config_source.clone(),
+            boot_secret_store.vault.clone(),
+            boot_command_cache.clone(),
+            std::sync::Arc::new({
+                let boot_env_baseline = boot_env_baseline.clone();
+                move || {
+                    Ok(boot_env_baseline
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone())
+                }
+            }),
+        )
+        .publish_fence();
     let boot_redaction = coverage_authority
         .acquire(
             boot_key,
@@ -5656,20 +5679,12 @@ pub(crate) async fn boot_ready_with_db(
                         &store,
                         &capture_inputs,
                     )?;
-                Ok(build.with_publish_fence(
-                    crate::redact::coverage_bindings::daemon_global_publish_owners_from_inputs(
-                        &capture_inputs,
-                        capture_vault.clone(),
-                        capture_cache.clone(),
-                        std::sync::Arc::new(boot_env_snapshot.clone()),
-                    )
-                    .publish_fence(),
-                ))
+                Ok(build.with_publish_fence(boot_publish_fence))
             },
         )
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?
-        .into_unbound_table()
+        .consume_at_sink(|table| Ok(table))
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     timer.phase("redaction_table");
     let mut ctx = DaemonContext::new_with_boot_authority(

@@ -2507,6 +2507,53 @@ impl SessionRegistry {
         let publish_vault = session.secret_vault().clone();
         let publish_db = session.db.clone();
         let publish_command_cache = command_cache.clone();
+        let env_live = std::sync::Arc::new(std::sync::RwLock::new(env_snapshot.clone()));
+        let config_source = self.config_source().clone();
+        let publish_project_root = project_root.clone();
+        let publish_trust_policy = trust_policy.clone();
+        let publish_fence = crate::redact::coverage_bindings::session_publish_owners(
+            publish_vault.clone(),
+            publish_db.clone(),
+            publish_command_cache.clone(),
+            crate::redact::coverage_bindings::SessionCoveragePublishLive {
+                environment: std::sync::Arc::new({
+                    let env_live = env_live.clone();
+                    move || {
+                        Ok(env_live
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone())
+                    }
+                }),
+                policy_digest: std::sync::Arc::new({
+                    let config_source = config_source.clone();
+                    let publish_project_root = publish_project_root.clone();
+                    let publish_trust_policy = publish_trust_policy.clone();
+                    move || {
+                        let (_, extended) = config_source
+                            .load_with_trust(&publish_project_root, &publish_trust_policy)
+                            .expect("loading worker redact policy at publication");
+                        crate::redact::coverage_bindings::redact_config_digest(&extended.redact)
+                    }
+                }),
+                override_revision: std::sync::Arc::new(|| 0),
+                redact_config: std::sync::Arc::new({
+                    let config_source = config_source.clone();
+                    let publish_project_root = publish_project_root.clone();
+                    let publish_trust_policy = publish_trust_policy.clone();
+                    move || {
+                        config_source
+                            .load_with_trust(&publish_project_root, &publish_trust_policy)
+                            .expect("loading worker redact config at publication")
+                            .1
+                            .redact
+                            .clone()
+                    }
+                }),
+                workspace_root: std::sync::Arc::new(move || publish_project_root.clone()),
+            },
+        )
+        .publish_fence();
         let admission = self
             .coverage_authority()
             .acquire(
@@ -2534,22 +2581,13 @@ impl SessionRegistry {
                         &sealed,
                         &capture_inputs,
                     )?;
-                    Ok(build.with_publish_fence(
-                        crate::redact::coverage_bindings::session_publish_owners_from_inputs(
-                            &capture_inputs,
-                            publish_vault,
-                            publish_db,
-                            publish_command_cache,
-                            std::sync::Arc::new(env_snapshot_for_capture.clone()),
-                        )
-                        .publish_fence(),
-                    ))
+                    Ok(build.with_publish_fence(publish_fence))
                 },
             )
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let redact = admission
-            .into_unbound_table()
+            .consume_at_sink(|table| Ok(table))
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         session.set_redaction_coverage(
             self.coverage_authority().clone(),

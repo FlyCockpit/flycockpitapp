@@ -3535,6 +3535,59 @@ impl Driver {
         let publish_vault = self.session.secret_vault().clone();
         let publish_db = self.session.db.clone();
         let publish_command_cache = command_cache.clone();
+        let session_for_publish = self.session.clone();
+        let config_for_publish = self.config.clone();
+        let env_overlay_for_publish = self.stack[0].agent.env_overlay.clone();
+        let cwd_for_publish = cwd.clone();
+        let publish_fence = crate::redact::coverage_bindings::session_publish_owners(
+            publish_vault.clone(),
+            publish_db.clone(),
+            publish_command_cache.clone(),
+            crate::redact::coverage_bindings::SessionCoveragePublishLive {
+                environment: std::sync::Arc::new(move || {
+                    Ok(crate::env_snapshot::EnvSnapshot::new(
+                        cockpit_proto::EnvSnapshotSource::SessionWorker,
+                        env_overlay_for_publish
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone(),
+                    ))
+                }),
+                policy_digest: std::sync::Arc::new({
+                    let session_for_publish = session_for_publish.clone();
+                    let config_for_publish = config_for_publish.clone();
+                    move || {
+                        session_for_publish
+                            .redaction_coverage()
+                            .map(|(_, _, digest)| digest)
+                            .unwrap_or_else(|| {
+                                crate::redact::coverage_bindings::redact_config_digest(
+                                    &config_for_publish.extended().redact,
+                                )
+                            })
+                    }
+                }),
+                override_revision: std::sync::Arc::new(|| 0),
+                redact_config: std::sync::Arc::new({
+                    let config_for_publish = config_for_publish.clone();
+                    move || {
+                        let mut live_cfg = config_for_publish.extended().redact;
+                        if let Some(v) = scan_environment_override {
+                            live_cfg.scan_environment = v;
+                        }
+                        if let Some(v) = scan_dotenv_override {
+                            live_cfg.scan_dotenv = v;
+                        }
+                        if let Some(v) = scan_ssh_keys_override {
+                            live_cfg.scan_ssh_keys = v;
+                        }
+                        live_cfg
+                    }
+                }),
+                workspace_root: std::sync::Arc::new(move || cwd_for_publish.clone()),
+            },
+        )
+        .publish_fence();
         match authority
             .acquire(
                 coverage_key,
@@ -3561,64 +3614,37 @@ impl Driver {
                         &sealed,
                         &capture_inputs,
                     )?;
-                    Ok(build.with_publish_fence(
-                        crate::redact::coverage_bindings::session_publish_owners_from_inputs(
-                            &capture_inputs,
-                            publish_vault,
-                            publish_db,
-                            publish_command_cache,
-                            std::sync::Arc::new(env_snapshot_for_capture.clone()),
-                        )
-                        .publish_fence(),
-                    ))
+                    Ok(build.with_publish_fence(publish_fence))
                 },
             )
             .await
         {
             Ok(admission) => {
-                let new_table = match admission.into_unbound_table() {
-                    Ok(table) => table.as_ref().clone(),
-                    Err(error) => return Self::refuse_unredacted_send(tx, error).await,
-                };
-                // J2: route the per-turn refresh through the hub so it unions the
-                // disk scan onto the LATEST shared table under the same
-                // `redaction_table_write_lock` as sealed adoption. `self.redact`
-                // is only a COPY that a mid-turn `seal_redaction_with_identity`
-                // never updates; unioning onto it and persisting here (the old
-                // behavior) could overwrite the durable adopted table without a
-                // sealed literal committed this turn (decision 10.1). The hub
-                // persists-before-swap and returns the committed table.
-                let table = match self
-                    .interrupts
-                    .refresh_union_redaction(&self.session, &new_table)
+                let table = match admission
+                    .consume_at_async_sink(|new_table| {
+                        let interrupts = self.interrupts.clone();
+                        let session = self.session.clone();
+                        let redact = self.redact.clone();
+                        async move {
+                            match interrupts
+                                .refresh_union_redaction(&session, new_table.as_ref())
+                                .await
+                            {
+                                Ok(Some(table)) => Ok(table),
+                                Ok(None) => {
+                                    let table = redact.union(new_table.as_ref())?;
+                                    let table = Arc::new(table);
+                                    session.persist_redaction_table(&table)?;
+                                    Ok(table)
+                                }
+                                Err(error) => Err(error),
+                            }
+                        }
+                    })
                     .await
                 {
-                    Ok(Some(table)) => table,
-                    Ok(None) => {
-                        // Detached hub (standalone shim / tests): no shared table
-                        // to serialize against, so union onto the driver's own
-                        // copy and persist directly — still persist-before-swap.
-                        let table = match self.redact.union(&new_table) {
-                            Ok(table) => Arc::new(table),
-                            Err(error) => {
-                                return Self::refuse_unredacted_send(tx, error).await;
-                            }
-                        };
-                        if let Err(error) = self.session.persist_redaction_table(&table) {
-                            // Fail-closed: do not advance `self.redact` ahead of
-                            // the durable table when the persist did not commit,
-                            // and do not send with a table that omitted this
-                            // turn's scan (rotated / newly introduced secrets).
-                            return Self::refuse_unredacted_send(tx, error).await;
-                        }
-                        table
-                    }
-                    Err(error) => {
-                        // The committed table is left live under the hub lock;
-                        // abort this send rather than proceeding without the
-                        // turn-boundary scan.
-                        return Self::refuse_unredacted_send(tx, error).await;
-                    }
+                    Ok(table) => table,
+                    Err(error) => return Self::refuse_unredacted_send(tx, error).await,
                 };
                 for path in table.unsupported_files() {
                     if self.redaction_unsupported_notified.insert(path.clone()) {

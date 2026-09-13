@@ -676,22 +676,26 @@ impl RedactionCoverageAuthority {
                     // publication again after the completed-capture boundary
                     // so zero-interest running work never enters the cache.
                     let publish_fence = build.publish_fence.take();
-                    let publish_revisions = if let Some(fence) = publish_fence {
-                        let table = build.table.clone();
-                        match tokio::task::spawn_blocking(move || fence(&table)).await {
-                            Ok(Ok(revisions)) => revisions,
-                            Ok(Err(_)) | Err(_) => return Err(CoverageError::Invalidated),
+                    let publish_revisions = match publish_fence {
+                        Some(fence) => {
+                            let table = build.table.clone();
+                            match tokio::task::spawn_blocking(move || fence(&table)).await {
+                                Ok(Ok(revisions)) => Some(revisions),
+                                Ok(Err(_)) | Err(_) => None,
+                            }
                         }
-                    } else {
-                        build.boundary_revisions.clone()
+                        None => Some(build.boundary_revisions.clone()),
                     };
-                    self.publish(
-                        key.clone(),
-                        flight.epoch,
-                        flight.key_revision,
-                        build,
-                        publish_revisions,
-                    )
+                    match publish_revisions {
+                        Some(publish_revisions) => self.publish(
+                            key.clone(),
+                            flight.epoch,
+                            flight.key_revision,
+                            build,
+                            publish_revisions,
+                        ),
+                        None => Err(CoverageError::Invalidated),
+                    }
                 }
                 Ok(Ok(_)) => Err(CoverageError::Unavailable),
                 Ok(Err(_)) | Err(_) => Err(CoverageError::Unavailable),
@@ -992,9 +996,9 @@ impl Drop for WaiterLease {
     }
 }
 
-/// A one-operation lease. It cannot be cloned. [`Self::use_at_sink`] and
-/// [`Self::begin_egress`] consume the lease at one owned sink; retained tables
-/// must be unbound via [`Self::into_unbound_table`].
+/// A one-operation lease. It cannot be cloned. [`Self::use_at_sink`],
+/// [`Self::consume_at_sink`], and [`Self::consume_at_async_sink`] each validate
+/// immediately and consume the lease at one owned sink.
 pub(crate) struct CoverageAdmission {
     inner: Weak<Inner>,
     generation: Arc<RedactionCoverageGeneration>,
@@ -1033,18 +1037,6 @@ impl OwnerAuthorization {
     }
 }
 
-/// Keeps a one-operation admission alive across an owned egress scope.
-pub(crate) struct CoverageEgress {
-    admission: CoverageAdmission,
-    table: std::sync::Arc<RedactionTable>,
-}
-
-impl CoverageEgress {
-    pub(crate) fn table(&self) -> &RedactionTable {
-        &self.table
-    }
-}
-
 impl CoverageAdmission {
     fn validate_current(&self) -> std::result::Result<(), CoverageError> {
         let Some(inner) = self.inner.upgrade() else {
@@ -1070,22 +1062,30 @@ impl CoverageAdmission {
         }
     }
 
-    /// Transfer the admitted generation into an unbound table for durable
-    /// session/installation sinks. The admission lease is consumed immediately.
-    pub(crate) fn into_unbound_table(
+    /// Run one immediate sink against the admitted generation table. The lease
+    /// is consumed before the sink returns; the table cannot be retained.
+    pub(crate) fn consume_at_sink<T>(
         self,
-    ) -> std::result::Result<std::sync::Arc<RedactionTable>, CoverageError> {
+        sink: impl FnOnce(std::sync::Arc<RedactionTable>) -> Result<T>,
+    ) -> std::result::Result<T, CoverageError> {
         self.validate_current()?;
-        Ok(self.generation.table.clone())
+        sink(self.generation.table.clone()).map_err(|_| CoverageError::Unavailable)
     }
 
-    /// Hold the one-operation lease across a multi-step owned egress scope.
-    pub(crate) fn begin_egress(self) -> std::result::Result<CoverageEgress, CoverageError> {
+    /// Async variant of [`Self::consume_at_sink`]. The lease stays active until
+    /// the future completes so the sink can await owned egress work.
+    pub(crate) async fn consume_at_async_sink<T, F, Fut>(
+        self,
+        sink: F,
+    ) -> std::result::Result<T, CoverageError>
+    where
+        F: FnOnce(std::sync::Arc<RedactionTable>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
         self.validate_current()?;
-        Ok(CoverageEgress {
-            admission: self,
-            table: self.generation.table.clone(),
-        })
+        sink(self.generation.table.clone())
+            .await
+            .map_err(|_| CoverageError::Unavailable)
     }
 
     pub(crate) fn use_at_sink<T>(

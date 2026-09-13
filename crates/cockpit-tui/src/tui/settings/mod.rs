@@ -653,6 +653,31 @@ struct PendingProviderAdd {
     onboarding: bool,
 }
 
+enum PendingOnboardingValidationCommit {
+    Live {
+        provider_id: String,
+        catalog: cockpit_config::providers::ProviderModelCatalog,
+    },
+    Fallback {
+        provider_id: String,
+        reason: String,
+    },
+    FailedKeptExisting {
+        provider_id: String,
+        reason: String,
+    },
+}
+
+impl PendingOnboardingValidationCommit {
+    fn provider_id(&self) -> &str {
+        match self {
+            Self::Live { provider_id, .. }
+            | Self::Fallback { provider_id, .. }
+            | Self::FailedKeptExisting { provider_id, .. } => provider_id,
+        }
+    }
+}
+
 impl std::fmt::Debug for ProviderMutationPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProviderMutationPlan")
@@ -1183,7 +1208,7 @@ pub(crate) struct SettingsBlockingEffectMetadata {
 /// client and tests feed responses through the same snapshot/patch/receipt
 /// validation below; a test double may replace only transport, never config
 /// loading or persistence.
-trait SettingsDaemonEffect: Send + Sync {
+pub(crate) trait SettingsDaemonEffect: Send + Sync {
     fn request(&self, request: Request) -> Result<Response, String>;
 }
 
@@ -2541,12 +2566,6 @@ pub const DIALOG_HEIGHT: u16 = 20;
 
 pub enum Dialog {
     None,
-    OnboardingWelcome {
-        cwd: PathBuf,
-        frame: usize,
-        reduced_motion: bool,
-    },
-    OnboardingSecureStore(Box<OnboardingSecureStoreDialog>),
     WorkspaceTrust {
         root: cockpit_config::trust::TrustRoot,
         cursor: usize,
@@ -2594,21 +2613,14 @@ pub enum Dialog {
         cursor: usize,
     },
     SetupWizard(Box<SetupWizardDialog>),
-    FirstRunComplete {
-        summary: String,
-        cursor: usize,
-        choice: Option<FirstRunChoice>,
-    },
+    /// Wizard engine hosted exclusively by the full-screen onboarding shell.
+    /// Keeping it distinct prevents first-run routing from entering the
+    /// generic settings/setup dialog path.
+    OnboardingWizard(Box<SetupWizardDialog>),
     /// Boxed because [`SettingsDialog`] dwarfs the other variants
     /// (~1.1KB vs <100 bytes), which would otherwise bloat every
     /// [`Dialog`] on the stack.
     Settings(Box<SettingsDialog>),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FirstRunChoice {
-    AddAnotherProvider,
-    StartCoding,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2753,28 +2765,31 @@ pub struct SetupWizardDialog {
     queued_daemon_effect: Option<SettingsDaemonEffectRequest>,
     pending_operation_id: Option<uuid::Uuid>,
     settled_operation_id: Option<uuid::Uuid>,
+    /// Config generation of the daemon authority as of the settled
+    /// `ApplySetupWizard` receipt. The daemon's onboarding settlement fence
+    /// compares the claimed generation against its current authority, and a
+    /// pre-attach client cannot learn that generation from disk
+    /// (`resolution_generation` is runtime-only), so the receipt itself is
+    /// the settlement's generation authority.
+    settled_config_generation: Option<u64>,
 }
 
-pub struct OnboardingSecureStoreDialog {
-    capabilities: cockpit_proto::HostCapabilitySnapshot,
-    cursor: usize,
-    phase: SecureStoreInputPhase,
-    passphrase: zeroize::Zeroizing<String>,
-    confirmation: zeroize::Zeroizing<String>,
-    submitted: Option<SecureStoreSubmission>,
-    status: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SecureStoreInputPhase {
-    Choice,
-    Passphrase,
-    Confirmation,
-}
-
-pub struct SecureStoreSubmission {
-    pub placement: cockpit_proto::OnboardingSecurePlacement,
-    pub passphrase: Option<cockpit_proto::SensitiveOnboardingPassphrase>,
+impl SetupWizardDialog {
+    /// Paste into the wizard's shared text buffer. The buffer is only
+    /// meaningful while a `StepKind::Text` step holds focus (it is resynced
+    /// from the step prefill on every step change), so pastes on other step
+    /// kinds are dropped.
+    fn paste(&mut self, text: &str) {
+        if self.pending_operation_id.is_some() {
+            return;
+        }
+        if matches!(
+            self.run.current_step(),
+            Some(step) if matches!(step.kind, cockpit_core::wizard::StepKind::Text)
+        ) {
+            self.text.paste(text);
+        }
+    }
 }
 
 pub struct SettingsDialog {
@@ -2789,6 +2804,7 @@ fn setup_wizard_dialog(
     cwd: &std::path::Path,
     descriptor: cockpit_core::wizard::WizardDescriptor,
     status: Option<String>,
+    onboarding: bool,
 ) -> Result<Dialog, String> {
     let run = cockpit_core::wizard::WizardRun::new(descriptor).map_err(|e| e.to_string())?;
     let mut cursor = 0;
@@ -2808,7 +2824,7 @@ fn setup_wizard_dialog(
             tool_surface_touched: &mut tool_surface_touched,
         },
     );
-    Ok(Dialog::SetupWizard(Box::new(SetupWizardDialog {
+    let wizard = Box::new(SetupWizardDialog {
         run,
         cursor,
         text,
@@ -2822,7 +2838,13 @@ fn setup_wizard_dialog(
         queued_daemon_effect: None,
         pending_operation_id: None,
         settled_operation_id: None,
-    })))
+        settled_config_generation: None,
+    });
+    Ok(if onboarding {
+        Dialog::OnboardingWizard(wizard)
+    } else {
+        Dialog::SetupWizard(wizard)
+    })
 }
 
 impl Deref for SettingsDialog {
@@ -3171,6 +3193,7 @@ pub struct SettingsCx {
     completed_web_credential: Option<(String, Result<(), String>)>,
     completed_provider_auth: Option<CompletedProviderAuthMutation>,
     pending_provider_add: Option<PendingProviderAdd>,
+    pending_onboarding_validation_commit: Option<PendingOnboardingValidationCommit>,
     completed_provider_add: Option<Result<(String, ProviderEntry, bool), String>>,
     completed_provider_mutation: Option<Result<(), String>>,
     pending_provider_mutation_navigation: Option<ProviderMutationNavigation>,
@@ -3892,6 +3915,43 @@ impl SettingsCx {
         self.queue_provider_catalog_for(provider_id, None);
     }
 
+    fn commit_onboarding_validation_after_catalog_refresh(&mut self) {
+        let Some(pending) = self.pending_onboarding_validation_commit.take() else {
+            return;
+        };
+        let provider_id = pending.provider_id().to_string();
+        let Some(entry) = self.config.providers.get_mut(&provider_id) else {
+            self.completed_provider_add = Some(Err(
+                "validated provider disappeared from the authoritative catalog".into(),
+            ));
+            return;
+        };
+        match pending {
+            PendingOnboardingValidationCommit::Live { catalog, .. } => {
+                entry.mark_model_fetch_success(catalog);
+            }
+            PendingOnboardingValidationCommit::Fallback { reason, .. } => {
+                entry.mark_model_fetch_fallback(reason);
+            }
+            PendingOnboardingValidationCommit::FailedKeptExisting { reason, .. } => {
+                entry.mark_model_fetch_failed_kept_existing(reason);
+            }
+        }
+        let entry = entry.clone();
+        self.pending_provider_add = Some(PendingProviderAdd {
+            id: provider_id,
+            entry,
+            supports_models_endpoint: true,
+            detected_environment_copy: None,
+            onboarding: true,
+        });
+        if let Err(error) = self.save_config() {
+            self.reject_pending_provider_add(format!(
+                "could not commit the validated provider checkpoint: {error}"
+            ));
+        }
+    }
+
     fn queue_provider_catalog_for(
         &mut self,
         provider_id: Option<String>,
@@ -4362,6 +4422,15 @@ impl SettingsCx {
                             base_revision,
                             config_generation,
                         });
+                        if self
+                            .pending_onboarding_validation_commit
+                            .as_ref()
+                            .is_some_and(|pending| {
+                                provider_id.as_deref() == Some(pending.provider_id())
+                            })
+                        {
+                            self.commit_onboarding_validation_after_catalog_refresh();
+                        }
                         if let Some(navigation) = navigation {
                             self.completed_provider_navigation =
                                 Some((navigation, self.config.clone()));
@@ -4420,9 +4489,21 @@ impl SettingsCx {
                         }
                     }
                     Ok(other) => {
-                        tracing::warn!(response = ?other, "unexpected async provider catalog response")
+                        tracing::warn!(response = ?other, "unexpected async provider catalog response");
+                        if self.pending_onboarding_validation_commit.take().is_some() {
+                            self.completed_provider_add = Some(Err(
+                                "daemon returned an unexpected provider catalog refresh response"
+                                    .into(),
+                            ));
+                        }
                     }
-                    Err(error) => tracing::warn!(%error, "async provider catalog load failed"),
+                    Err(error) => {
+                        tracing::warn!(%error, "async provider catalog load failed");
+                        if self.pending_onboarding_validation_commit.take().is_some() {
+                            self.completed_provider_add =
+                                Some(Err(format!("provider catalog refresh failed: {error}")));
+                        }
+                    }
                 }
             }
             PendingSettingsOperation::ExtendedSave {
@@ -5675,7 +5756,11 @@ impl Dialog {
     }
     pub(crate) fn has_unsettled_local_authority(&self) -> bool {
         matches!(self, Dialog::Settings(settings) if settings.authority_operation_pending())
-            || matches!(self, Dialog::SetupWizard(wizard) if wizard.pending_operation_id.is_some())
+            || matches!(
+                self,
+                Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)
+                    if wizard.pending_operation_id.is_some()
+            )
     }
 
     pub(crate) fn settings_pointer_contains(&self, column: u16, row: u16) -> bool {
@@ -5744,8 +5829,9 @@ impl Dialog {
             Dialog::Settings(settings) => Some(settings.page.test_name()),
             Dialog::WorkspaceTrust { .. } => Some("workspace_trust"),
             Dialog::WizardMenu { .. } => Some("wizard_menu"),
-            Dialog::SetupWizard(wizard) => Some(wizard.run.descriptor().id),
-            Dialog::FirstRunComplete { .. } => Some("first_run_complete"),
+            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard) => {
+                Some(wizard.run.descriptor().id)
+            }
             _ => None,
         }
     }
@@ -5786,6 +5872,38 @@ impl Dialog {
         add.error.as_deref()
     }
 
+    /// Current step id of the onboarding provider engine's Add wizard, for
+    /// integration tests that drive the wizard with real keys and wait for
+    /// daemon-backed steps (save, validation) to settle.
+    #[cfg(test)]
+    pub(crate) fn test_provider_add_step(&self) -> Option<&'static str> {
+        let Dialog::Settings(settings) = self else {
+            return None;
+        };
+        let page = settings.page.as_any().downcast_ref::<ProvidersPage>()?;
+        let ProvidersPage::Add(add) = page else {
+            return None;
+        };
+        add.run.current_step_id()
+    }
+
+    /// Whether the onboarding provider engine has a validation fetch in
+    /// flight. Real-daemon tests wait for this to clear before driving the
+    /// offline continuation keys.
+    #[cfg(test)]
+    pub(crate) fn test_provider_add_fetch_pending(&self) -> bool {
+        let Dialog::Settings(settings) = self else {
+            return false;
+        };
+        let Some(page) = settings.page.as_any().downcast_ref::<ProvidersPage>() else {
+            return false;
+        };
+        let ProvidersPage::Add(add) = page else {
+            return false;
+        };
+        add.fetch.is_some()
+    }
+
     #[cfg(test)]
     pub(crate) fn test_mark_provider_add_done(&mut self, provider_id: &str) {
         let Dialog::Settings(settings) = self else {
@@ -5814,7 +5932,7 @@ impl Dialog {
 
     #[cfg(test)]
     pub(crate) fn test_mark_setup_complete(&mut self, step_id: &str) {
-        let Dialog::SetupWizard(wizard) = self else {
+        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
             panic!("expected setup wizard");
         };
         wizard
@@ -5826,6 +5944,11 @@ impl Dialog {
             .submit(cockpit_core::wizard::WizardAnswer::Acknowledged)
             .expect("setup completion step accepts acknowledgement");
         wizard.settled_operation_id = Some(uuid::Uuid::now_v7());
+        // A completed onboarding wizard is backed by a committed daemon
+        // apply whose published generation the settlement fence proves
+        // against. Stamp one so the synthesized path constructs the same
+        // settlement the production receipt path does.
+        wizard.settled_config_generation = Some(1);
     }
 
     #[cfg(test)]
@@ -5833,7 +5956,7 @@ impl Dialog {
         &self,
         step_id: &str,
     ) -> Option<cockpit_core::wizard::WizardAnswer> {
-        let Dialog::SetupWizard(wizard) = self else {
+        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
             return None;
         };
         wizard.run.answer(step_id).cloned()
@@ -5841,10 +5964,81 @@ impl Dialog {
 
     #[cfg(test)]
     pub(crate) fn test_setup_prefill(&self) -> Option<cockpit_core::wizard::WizardAnswer> {
-        let Dialog::SetupWizard(wizard) = self else {
+        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
             return None;
         };
         wizard.run.prefill()
+    }
+
+    /// Current wizard step id (both wizard dialog variants), for tests that
+    /// drive the wizard step by step.
+    #[cfg(test)]
+    pub(crate) fn test_setup_step(&self) -> Option<&'static str> {
+        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
+            return None;
+        };
+        wizard.run.current_step().map(|step| step.id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_setup_status(&self) -> Option<&str> {
+        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
+            return None;
+        };
+        wizard.status.as_deref()
+    }
+    /// Kind name of the current wizard step: one of `select`, `text`,
+    /// `confirm`, `info`, `action`, `multi`, `tools`, `secret`.
+    #[cfg(test)]
+    pub(crate) fn test_setup_step_kind(&self) -> Option<&'static str> {
+        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
+            return None;
+        };
+        let step = wizard.run.current_step()?;
+        Some(match step.kind {
+            cockpit_core::wizard::StepKind::Select { .. } => "select",
+            cockpit_core::wizard::StepKind::Text => "text",
+            cockpit_core::wizard::StepKind::Confirm => "confirm",
+            cockpit_core::wizard::StepKind::Info => "info",
+            cockpit_core::wizard::StepKind::Action { .. } => "action",
+            cockpit_core::wizard::StepKind::MultiToggle { .. } => "multi",
+            cockpit_core::wizard::StepKind::ToolSurface => "tools",
+            cockpit_core::wizard::StepKind::Secret => "secret",
+        })
+    }
+
+    /// Number of select options on the current wizard step.
+    #[cfg(test)]
+    pub(crate) fn test_setup_step_options(&self) -> usize {
+        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
+            return 0;
+        };
+        wizard.run.select_options().len()
+    }
+
+    /// Select-option ids of the wizard's focused Select step, so tests pick
+    /// rendered rows (including authority-resolved agent/model offerings)
+    /// instead of hardcoding cursor positions.
+    #[cfg(test)]
+    pub(crate) fn test_setup_step_option_ids(&self) -> Vec<String> {
+        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
+            return Vec::new();
+        };
+        wizard
+            .run
+            .select_options()
+            .iter()
+            .map(|option| option.id.to_string())
+            .collect()
+    }
+
+    /// Current text-buffer contents of the wizard's focused Text step.
+    #[cfg(test)]
+    pub(crate) fn test_setup_text(&self) -> Option<String> {
+        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
+            return None;
+        };
+        Some(wizard.text.text().to_string())
     }
 
     pub fn open(cwd: &std::path::Path) -> Self {
@@ -5955,77 +6149,45 @@ impl Dialog {
         Self::open_providers_add_with_status(cwd, None)
     }
 
-    pub fn open_onboarding_provider_add(cwd: &std::path::Path, status: Option<String>) -> Self {
+    pub fn open_providers_add_with_status(cwd: &std::path::Path, status: Option<String>) -> Self {
+        Self::open_providers_add_mode(cwd, status, false)
+    }
+
+    /// Provider-add engine for the onboarding shell: the same daemon-backed
+    /// add wizard the providers page hosts, presented inside the full-screen
+    /// shell instead of the settings modal. The onboarding flag keeps its
+    /// resume/validation semantics.
+    pub fn onboarding_provider_engine(cwd: &std::path::Path, status: Option<String>) -> Self {
         Self::open_providers_add_mode(cwd, status, true)
     }
 
-    /// Resume validation of a provider whose daemon-owned save committed
-    /// after the add wizard was cancelled.
-    pub fn open_onboarding_provider_validation(cwd: &std::path::Path, provider_id: &str) -> Self {
-        let path = global_config_dir().map(|root| (root.join(CONFIG_FILE), root));
-        match path {
-            Ok((path, global_root)) => {
-                let mut s = SettingsDialog::open_from_picker(path, global_root);
-                if s.config.providers.contains_key(provider_id) {
-                    let mut add = AddState::new_with_onboarding(true);
-                    s.resume_onboarding_provider_validation(&mut add, provider_id);
-                    s.page = providers_page(ProvidersPage::Add(add));
-                } else {
-                    let mut add = AddState::new_with_onboarding(true);
-                    add.error = Some(format!(
-                        "The saved provider `{provider_id}` is no longer configured. Add and validate a provider to resume setup."
-                    ));
-                    s.page = providers_page(ProvidersPage::Add(add));
-                }
-                Dialog::Settings(Box::new(s))
-            }
-            Err(error) => Dialog::CreateConfig {
-                choices: Vec::new(),
-                cursor: 0,
-                cwd: cwd.to_path_buf(),
-                status: Some(format!(
-                    "could not resolve the global Cockpit config: {error}"
-                )),
-            },
-        }
-    }
-
-    pub fn open_onboarding_welcome(cwd: &std::path::Path) -> Self {
-        let reduced_motion = std::env::var_os("NO_COLOR").is_some()
-            || std::env::var("TERM").is_ok_and(|term| term == "dumb")
-            || ["COCKPIT_REDUCE_MOTION", "REDUCE_MOTION"]
-                .into_iter()
-                .any(|name| std::env::var(name).is_ok_and(|value| value != "0"));
-        Self::OnboardingWelcome {
-            cwd: cwd.to_path_buf(),
-            frame: 0,
-            reduced_motion,
-        }
-    }
-
-    pub fn open_onboarding_secure_store(
-        capabilities: cockpit_proto::HostCapabilitySnapshot,
-    ) -> Self {
-        Dialog::OnboardingSecureStore(Box::new(OnboardingSecureStoreDialog {
-            capabilities,
-            cursor: 0,
-            phase: SecureStoreInputPhase::Choice,
-            passphrase: zeroize::Zeroizing::new(String::new()),
-            confirmation: zeroize::Zeroizing::new(String::new()),
-            submitted: None,
-            status: None,
-        }))
-    }
-
-    pub fn take_onboarding_secure_store_submission(&mut self) -> Option<SecureStoreSubmission> {
+    /// True while this dialog is the onboarding provider engine sitting on
+    /// its Add page. The shell uses this to detect the wizard abandoning
+    /// provider setup (its own back semantics) so it can return to the
+    /// searchable catalog instead of a settings list.
+    pub fn is_provider_add(&self) -> bool {
         match self {
-            Dialog::OnboardingSecureStore(dialog) => dialog.submitted.take(),
-            _ => None,
+            Dialog::Settings(settings) => matches!(
+                settings.page.as_any().downcast_ref::<ProvidersPage>(),
+                Some(ProvidersPage::Add(_))
+            ),
+            _ => false,
         }
     }
 
-    pub fn open_providers_add_with_status(cwd: &std::path::Path, status: Option<String>) -> Self {
-        Self::open_providers_add_mode(cwd, status, false)
+    /// Seed the provider-add engine with a template chosen from the shell's
+    /// searchable catalog. Applies the same prefill the wizard's template
+    /// step performs (id/url/headers/env-var defaults) and advances past
+    /// the template step; the canonical `'static` template identity is
+    /// preserved unchanged.
+    pub fn seed_provider_template(
+        &mut self,
+        template: &'static cockpit_core::providers::ProviderTemplate,
+    ) {
+        let Dialog::Settings(settings) = self else {
+            return;
+        };
+        settings.seed_onboarding_template(template);
     }
 
     fn open_providers_add_mode(
@@ -6071,18 +6233,47 @@ impl Dialog {
         let global_root = global_config_dir().map_err(|error| error.to_string())?;
         match wizard_id {
             cockpit_core::wizard::PROVIDER_WIZARD_ID => Ok(Self::open_providers_add(cwd)),
-            cockpit_core::wizard::SECURITY_WIZARD_ID
-            | cockpit_core::wizard::MODEL_WIZARD_ID
-            | cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID
-            | cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID
-            | cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID
-            | cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID => {
+            cockpit_core::wizard::SECURITY_WIZARD_ID | cockpit_core::wizard::MODEL_WIZARD_ID => {
                 let descriptor = cockpit_core::wizard::descriptor_for_cwd(wizard_id, &global_root)
                     .ok_or_else(|| format!("unknown setup wizard `{wizard_id}`"))?;
-                setup_wizard_dialog(&global_root, descriptor, None)
+                setup_wizard_dialog(&global_root, descriptor, None, false)
             }
             other => Err(format!("unknown setup wizard `{other}`")),
         }
+    }
+
+    /// Wizard engine for the onboarding shell's profile/model/agent/lifetime
+    /// stages. The same wizard machinery (and daemon-effect settlement) as
+    /// the non-onboarding setup wizards, presented inside the full-screen
+    /// shell instead of the settings modal. `preselected_model` seeds the
+    /// model wizard's provider/model pair when the committed provider
+    /// catalog already offers one.
+    pub fn onboarding_wizard_engine(
+        wizard_id: &str,
+        preselected_model: Option<(&str, &str)>,
+        status: Option<String>,
+    ) -> Result<Self, String> {
+        let global_root = global_config_dir().map_err(|error| error.to_string())?;
+        let descriptor = match wizard_id {
+            cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID => {
+                cockpit_core::wizard::descriptor_for_cwd(wizard_id, &global_root)
+            }
+            cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID => {
+                Some(cockpit_core::wizard::onboarding_model_descriptor_for_cwd(
+                    &global_root,
+                    preselected_model,
+                ))
+            }
+            cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID => {
+                cockpit_core::wizard::descriptor_for_cwd(wizard_id, &global_root)
+            }
+            cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID => {
+                Some(cockpit_core::wizard::onboarding_lifetime_descriptor())
+            }
+            other => return Err(format!("unknown onboarding wizard `{other}`")),
+        }
+        .ok_or_else(|| format!("could not build onboarding wizard `{wizard_id}`"))?;
+        setup_wizard_dialog(&global_root, descriptor, status, true)
     }
 
     pub fn open_model_setup_preselected(
@@ -6096,43 +6287,7 @@ impl Dialog {
             &global_root,
             Some((provider_id, model_id)),
         );
-        setup_wizard_dialog(&global_root, descriptor, status)
-    }
-
-    pub fn open_onboarding_model_setup_preselected(
-        provider_id: &str,
-        model_id: &str,
-        status: Option<String>,
-    ) -> Result<Self, String> {
-        let global_root = global_config_dir().map_err(|error| error.to_string())?;
-        let descriptor = cockpit_core::wizard::onboarding_model_descriptor_for_cwd(
-            &global_root,
-            Some((provider_id, model_id)),
-        );
-        setup_wizard_dialog(&global_root, descriptor, status)
-    }
-
-    pub fn open_onboarding_model_setup(status: Option<String>) -> Result<Self, String> {
-        let global_root = global_config_dir().map_err(|error| error.to_string())?;
-        let descriptor =
-            cockpit_core::wizard::onboarding_model_descriptor_for_cwd(&global_root, None);
-        setup_wizard_dialog(&global_root, descriptor, status)
-    }
-
-    pub fn open_onboarding_lifetime_setup(status: Option<String>) -> Result<Self, String> {
-        let global_root = global_config_dir().map_err(|error| error.to_string())?;
-        let descriptor = cockpit_core::wizard::onboarding_lifetime_descriptor();
-        setup_wizard_dialog(&global_root, descriptor, status)
-    }
-
-    pub fn open_onboarding_agent_setup(status: Option<String>) -> Result<Self, String> {
-        let global_root = global_config_dir().map_err(|error| error.to_string())?;
-        let descriptor = cockpit_core::wizard::descriptor_for_cwd(
-            cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID,
-            &global_root,
-        )
-        .ok_or_else(|| "could not build onboarding agent catalog".to_string())?;
-        setup_wizard_dialog(&global_root, descriptor, status)
+        setup_wizard_dialog(&global_root, descriptor, status, false)
     }
 
     pub fn open_model_setup_choice(
@@ -6148,21 +6303,6 @@ impl Dialog {
         }
     }
 
-    pub fn open_first_run_complete(summary: String) -> Self {
-        Dialog::FirstRunComplete {
-            summary,
-            cursor: 1,
-            choice: None,
-        }
-    }
-
-    pub fn take_first_run_choice(&mut self) -> Option<FirstRunChoice> {
-        let Dialog::FirstRunComplete { choice, .. } = self else {
-            return None;
-        };
-        choice.take()
-    }
-
     pub fn take_completed_provider_id(&mut self) -> Option<String> {
         let Dialog::Settings(settings) = self else {
             return None;
@@ -6171,7 +6311,11 @@ impl Dialog {
         let ProvidersPage::Add(add) = page else {
             return None;
         };
-        if add.run.is_complete() || add.is_step("done") {
+        // The descriptor completes before the daemon-backed save, validation,
+        // and checkpoint publication finish. Only the terminal presentation
+        // step proves the provider mutation has a settlement the onboarding
+        // authority may consume.
+        if add.is_step("done") {
             return add.saved_provider_id.clone();
         }
         None
@@ -6187,6 +6331,14 @@ impl Dialog {
         let Dialog::Settings(settings) = self else {
             return None;
         };
+        if settings
+            .cx
+            .pending_settings
+            .values()
+            .any(|pending| matches!(pending, PendingSettingsOperation::ProviderMutation { .. }))
+        {
+            return None;
+        }
         let operation_id = settings
             .cx
             .last_provider_mutation_operation_id
@@ -6218,18 +6370,25 @@ impl Dialog {
     pub fn onboarding_wizard_settlement(
         &self,
         wizard_id: &str,
-        config_generation: u64,
         run_id: uuid::Uuid,
         attempt_id: uuid::Uuid,
         stage_revision: u64,
     ) -> Option<cockpit_proto::OnboardingStageSettlement> {
-        let Dialog::SetupWizard(wizard) = self else {
+        let Dialog::OnboardingWizard(wizard) = self else {
             return None;
         };
-        if wizard.run.descriptor().id != wizard_id || config_generation == 0 {
+        if wizard.run.descriptor().id != wizard_id {
             return None;
         }
         let operation_id = wizard.settled_operation_id?.to_string();
+        // The settlement's generation authority is the apply receipt itself:
+        // the daemon published that generation as part of the apply's durable
+        // commit and proves the stage advance against it. A wizard that
+        // completed without a daemon receipt has no settlement to claim, so
+        // the stage cannot advance on local state alone.
+        let config_generation = wizard
+            .settled_config_generation
+            .filter(|generation| *generation > 0)?;
         Some(cockpit_proto::OnboardingStageSettlement {
             run_id,
             attempt_id,
@@ -6245,7 +6404,7 @@ impl Dialog {
     pub fn setup_wizard_is_complete(&self, wizard_id: &str) -> bool {
         matches!(
             self,
-            Dialog::SetupWizard(wizard)
+            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)
                 if wizard.run.descriptor().id == wizard_id && wizard.run.is_complete()
         )
     }
@@ -6253,13 +6412,17 @@ impl Dialog {
     pub fn setup_wizard_is_complete_any(&self, wizard_ids: &[&str]) -> bool {
         matches!(
             self,
-            Dialog::SetupWizard(wizard)
+            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)
                 if wizard_ids.contains(&wizard.run.descriptor().id) && wizard.run.is_complete()
         )
     }
 
     pub fn setup_wizard_is_active(&self, wizard_id: &str) -> bool {
-        matches!(self, Dialog::SetupWizard(wizard) if wizard.run.descriptor().id == wizard_id)
+        matches!(
+            self,
+            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)
+                if wizard.run.descriptor().id == wizard_id
+        )
     }
 
     /// Open directly on one configured provider. OAuth-expired failures for a
@@ -6419,14 +6582,6 @@ impl Dialog {
                 s.tick();
                 false
             }
-            Dialog::OnboardingWelcome {
-                frame,
-                reduced_motion,
-                ..
-            } if !*reduced_motion => {
-                *frame = frame.wrapping_add(1);
-                true
-            }
             _ => false,
         }
     }
@@ -6434,33 +6589,6 @@ impl Dialog {
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         match self {
             Dialog::None => false,
-            Dialog::OnboardingWelcome { cwd, .. } => {
-                match Self::open_setup_wizard(
-                    cwd,
-                    cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
-                ) {
-                    Ok(next) => *self = next,
-                    Err(error) => {
-                        *self = Dialog::CreateConfig {
-                            choices: Vec::new(),
-                            cursor: 0,
-                            cwd: cwd.clone(),
-                            status: Some(format!("Could not open profile setup: {error}")),
-                        };
-                    }
-                }
-                false
-            }
-            Dialog::OnboardingSecureStore(dialog) => handle_secure_store_key(dialog, key),
-            Dialog::FirstRunComplete { cursor, choice, .. } => {
-                match list_key_action(key, cursor, 2) {
-                    ListAction::Stay => {}
-                    ListAction::Close => *choice = Some(FirstRunChoice::StartCoding),
-                    ListAction::Select(0) => *choice = Some(FirstRunChoice::AddAnotherProvider),
-                    ListAction::Select(_) => *choice = Some(FirstRunChoice::StartCoding),
-                }
-                false
-            }
             Dialog::WorkspaceTrust { cursor, chosen, .. } => {
                 match workspace_trust_key_action(key, cursor) {
                     WorkspaceTrustAction::Stay => false,
@@ -6587,7 +6715,9 @@ impl Dialog {
                     }
                 }
             }
-            Dialog::SetupWizard(wizard) => handle_setup_wizard_key(wizard, key),
+            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard) => {
+                handle_setup_wizard_key(wizard, key)
+            }
             Dialog::Settings(s) => {
                 let close = s.handle_key(key);
                 if close
@@ -6602,17 +6732,15 @@ impl Dialog {
         }
     }
 
-    /// Insert pasted text into the focused text field. Only the settings
-    /// pages own text fields; the config pickers are pure list nav, so a
-    /// paste there is dropped.
+    /// Insert pasted text into the focused text field. The settings pages
+    /// and the setup wizards own text fields; the config pickers are pure
+    /// list nav, so a paste there is dropped. Wizard engines reached
+    /// through the onboarding shell share this path, so model ids and other
+    /// manual wizard text stay pasteable during onboarding.
     pub fn paste(&mut self, text: &str) {
         match self {
             Dialog::Settings(s) => s.paste(text),
-            Dialog::OnboardingSecureStore(dialog) => match dialog.phase {
-                SecureStoreInputPhase::Passphrase => dialog.passphrase.push_str(text),
-                SecureStoreInputPhase::Confirmation => dialog.confirmation.push_str(text),
-                SecureStoreInputPhase::Choice => {}
-            },
+            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard) => wizard.paste(text),
             _ => {}
         }
     }
@@ -6635,7 +6763,9 @@ impl Dialog {
     pub(crate) fn take_settings_daemon_effect(&mut self) -> Option<SettingsDaemonEffectRequest> {
         match self {
             Dialog::Settings(settings) => settings.cx.take_daemon_effect(),
-            Dialog::SetupWizard(wizard) => wizard.queued_daemon_effect.take(),
+            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard) => {
+                wizard.queued_daemon_effect.take()
+            }
             _ => None,
         }
     }
@@ -6666,7 +6796,9 @@ impl Dialog {
         completion: SettingsDaemonEffectCompletion,
     ) {
         match self {
-            Dialog::SetupWizard(wizard) if completion.dialog_id == wizard.dialog_id => {
+            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)
+                if completion.dialog_id == wizard.dialog_id =>
+            {
                 apply_setup_wizard_daemon_completion(wizard, completion);
             }
             Dialog::Settings(settings) if completion.dialog_id == settings.cx.dialog_id => {
@@ -6852,14 +6984,6 @@ impl Dialog {
     ) {
         match self {
             Dialog::None => {}
-            Dialog::OnboardingWelcome {
-                frame: animation_frame,
-                reduced_motion,
-                ..
-            } => render_onboarding_welcome(frame, area, *animation_frame, *reduced_motion),
-            Dialog::OnboardingSecureStore(dialog) => {
-                render_onboarding_secure_store(frame, area, dialog)
-            }
             Dialog::WorkspaceTrust { root, cursor, .. } => {
                 render_workspace_trust(frame, area, root, *cursor)
             }
@@ -6917,10 +7041,9 @@ impl Dialog {
                 pending.as_ref(),
                 *cursor,
             ),
-            Dialog::SetupWizard(wizard) => render_setup_wizard(frame, area, wizard),
-            Dialog::FirstRunComplete {
-                summary, cursor, ..
-            } => render_first_run_complete(frame, area, summary, *cursor),
+            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard) => {
+                render_setup_wizard(frame, area, wizard)
+            }
             Dialog::Settings(s) => s.render(frame, area, links),
         }
     }
@@ -7656,6 +7779,7 @@ impl SettingsDialog {
                 completed_web_credential: None,
                 completed_provider_auth: None,
                 pending_provider_add: None,
+                pending_onboarding_validation_commit: None,
                 completed_provider_add: None,
                 completed_provider_mutation: None,
                 pending_provider_mutation_navigation: None,
@@ -9703,6 +9827,7 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
         queued_daemon_effect,
         pending_operation_id,
         settled_operation_id: _,
+        settled_config_generation: _,
     } = wizard;
     if pending_operation_id.is_some() {
         return false;
@@ -9783,8 +9908,13 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
         cockpit_core::wizard::StepKind::Action { .. } => {
             if matches!(
                 step.id,
-                "security-save" | "model-save" | "profile-save" | "lifetime-save"
+                "security-save" | "model-save" | "profile-save" | "lifetime-save" | "agent-install"
             ) {
+                // Every terminal onboarding wizard step settles through the
+                // daemon's ApplySetupWizard operation: the recorded terminal
+                // receipt is what the onboarding advance settlement is
+                // validated against, so a wizard that skips the RPC can
+                // never advance its stage.
                 let answers_json = match run.answers_json() {
                     Ok(answers_json) => answers_json,
                     Err(error) => {
@@ -9933,114 +10063,6 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
     false
 }
 
-fn handle_secure_store_key(dialog: &mut OnboardingSecureStoreDialog, key: KeyEvent) -> bool {
-    match dialog.phase {
-        SecureStoreInputPhase::Choice => match key.code {
-            KeyCode::Up => {
-                dialog.cursor = dialog.cursor.saturating_sub(1);
-                dialog.status = None;
-            }
-            KeyCode::Down => {
-                dialog.cursor = (dialog.cursor + 1).min(2);
-                dialog.status = None;
-            }
-            KeyCode::Esc => return true,
-            KeyCode::Enter => {
-                let (placement, capability_id) = match dialog.cursor {
-                    0 => (
-                        cockpit_proto::OnboardingSecurePlacement::Automatic,
-                        "secret_store.keyring",
-                    ),
-                    1 => (
-                        cockpit_proto::OnboardingSecurePlacement::PassphraseFile,
-                        "secret_store.file",
-                    ),
-                    _ => (
-                        cockpit_proto::OnboardingSecurePlacement::MachineBoundFile,
-                        "secret_store.file",
-                    ),
-                };
-                let Some(capability) = dialog.capabilities.feature(capability_id) else {
-                    dialog.status = Some("Secure-store capability is not ready; retry after the host check completes.".into());
-                    return false;
-                };
-                if !capability.state.is_available() {
-                    dialog.status = Some(
-                        capability
-                            .fix_command
-                            .as_deref()
-                            .or(capability.remedy_text.as_deref())
-                            .unwrap_or(capability.reason.as_str())
-                            .to_string(),
-                    );
-                    return false;
-                }
-                if placement == cockpit_proto::OnboardingSecurePlacement::PassphraseFile {
-                    dialog.phase = SecureStoreInputPhase::Passphrase;
-                } else {
-                    dialog.submitted = Some(SecureStoreSubmission {
-                        placement,
-                        passphrase: None,
-                    });
-                }
-            }
-            _ => {}
-        },
-        SecureStoreInputPhase::Passphrase | SecureStoreInputPhase::Confirmation => match key.code {
-            KeyCode::Esc => {
-                dialog.passphrase.clear();
-                dialog.confirmation.clear();
-                dialog.phase = SecureStoreInputPhase::Choice;
-                dialog.status = None;
-            }
-            KeyCode::Backspace => {
-                let target = if dialog.phase == SecureStoreInputPhase::Passphrase {
-                    &mut dialog.passphrase
-                } else {
-                    &mut dialog.confirmation
-                };
-                target.pop();
-            }
-            KeyCode::Char(ch) => {
-                let ch = crate::tui::textfield::normalize_shift_char(&key, ch);
-                let target = if dialog.phase == SecureStoreInputPhase::Passphrase {
-                    &mut dialog.passphrase
-                } else {
-                    &mut dialog.confirmation
-                };
-                target.push(ch);
-            }
-            KeyCode::Enter if dialog.phase == SecureStoreInputPhase::Passphrase => {
-                if dialog.passphrase.is_empty() {
-                    dialog.status = Some("Passphrase must not be empty.".into());
-                } else {
-                    dialog.phase = SecureStoreInputPhase::Confirmation;
-                    dialog.status = None;
-                }
-            }
-            KeyCode::Enter => {
-                let value = std::mem::take(&mut *dialog.passphrase);
-                let confirmation = std::mem::take(&mut *dialog.confirmation);
-                match cockpit_proto::SensitiveOnboardingPassphrase::confirmed(value, confirmation) {
-                    Ok(passphrase) => {
-                        dialog.submitted = Some(SecureStoreSubmission {
-                            placement: cockpit_proto::OnboardingSecurePlacement::PassphraseFile,
-                            passphrase: Some(passphrase),
-                        });
-                        dialog.status = None;
-                    }
-                    Err(error) => {
-                        dialog.status = Some(error.into());
-                        dialog.phase = SecureStoreInputPhase::Passphrase;
-                    }
-                }
-            }
-            _ => {}
-        },
-    }
-    false
-}
-
 fn apply_setup_wizard_daemon_completion(
     wizard: &mut SetupWizardDialog,
     completion: SettingsDaemonEffectCompletion,
@@ -10059,7 +10081,12 @@ fn apply_setup_wizard_daemon_completion(
             changed,
             model_file_written,
             default_scope,
+            config_generation,
         }) => {
+            // The receipt's generation is the settlement's generation
+            // authority (see `settled_config_generation`); the daemon
+            // publishes it with the apply, so every receipt carries it.
+            wizard.settled_config_generation = Some(config_generation);
             if let Err(error) = wizard
                 .run
                 .submit(cockpit_core::wizard::WizardAnswer::Acknowledged)
@@ -10683,159 +10710,6 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
     frame.render_widget(
         help_line("↑/↓  space: toggle  t: tier  enter: select/continue  y/n: confirm  esc: close"),
         layout[1],
-    );
-}
-
-fn render_onboarding_secure_store(
-    frame: &mut Frame,
-    area: Rect,
-    dialog: &OnboardingSecureStoreDialog,
-) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Secure secret store ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let selected = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
-    let mut lines = vec![
-        Line::from("Choose where Cockpit encrypts credentials before adding a provider."),
-        Line::from(Span::styled(
-            "Automatic means the platform keyring only; a failure requires a new explicit choice.",
-            muted,
-        )),
-        Line::default(),
-    ];
-    match dialog.phase {
-        SecureStoreInputPhase::Choice => {
-            let choices = [
-                ("Platform keyring (recommended)", "No silent file fallback."),
-                (
-                    "Passphrase-protected file",
-                    "You must enter it again after a pre-commit crash.",
-                ),
-                (
-                    "Machine-bound encrypted file",
-                    "Explicit fallback tied to this machine.",
-                ),
-            ];
-            for (index, (label, description)) in choices.into_iter().enumerate() {
-                lines.push(Line::from(vec![
-                    Span::raw(if dialog.cursor == index { "▸ " } else { "  " }),
-                    Span::styled(
-                        label,
-                        if dialog.cursor == index {
-                            selected
-                        } else {
-                            Style::default()
-                        },
-                    ),
-                    Span::raw("  "),
-                    Span::styled(description, muted),
-                ]));
-            }
-        }
-        SecureStoreInputPhase::Passphrase => {
-            lines.push(Line::from("Enter a vault passphrase:"));
-            lines.push(Line::from("•".repeat(dialog.passphrase.chars().count())));
-        }
-        SecureStoreInputPhase::Confirmation => {
-            lines.push(Line::from("Confirm the vault passphrase:"));
-            lines.push(Line::from("•".repeat(dialog.confirmation.chars().count())));
-        }
-    }
-    if let Some(status) = dialog.status.as_deref() {
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(status.to_string(), Color::Red)));
-    }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
-    let help = match dialog.phase {
-        SecureStoreInputPhase::Choice => "↑/↓  enter: select  esc: cancel",
-        SecureStoreInputPhase::Passphrase | SecureStoreInputPhase::Confirmation => {
-            "enter: continue  esc: choose again"
-        }
-    };
-    frame.render_widget(help_line(help), layout[1]);
-}
-
-fn render_first_run_complete(frame: &mut Frame, area: Rect, summary: &str, cursor: usize) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Setup complete ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let mut lines = vec![
-        Line::from("Cockpit is ready."),
-        Line::from(summary.to_string()),
-        Line::default(),
-        Line::from("Next: run /setup security to choose project trust and approval defaults."),
-        Line::from("Use /help any time to see available commands."),
-        Line::default(),
-    ];
-    for (index, label) in ["Add another provider", "Start coding"].iter().enumerate() {
-        lines.push(Line::from(Span::styled(
-            format!("{} {label}", if index == cursor { "›" } else { " " }),
-            if index == cursor {
-                Style::default().fg(Color::Yellow)
-            } else {
-                muted
-            },
-        )));
-    }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
-}
-
-fn render_onboarding_welcome(
-    frame: &mut Frame,
-    area: Rect,
-    animation_frame: usize,
-    reduced_motion: bool,
-) {
-    let block = Block::default().borders(Borders::ALL).title(" Welcome ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let stages = ["·", "✦", "✈", "✦"];
-    let mark = if reduced_motion {
-        "✈"
-    } else {
-        stages[(animation_frame / 3) % stages.len()]
-    };
-    let description = if inner.width < 54 {
-        "Your coding cockpit."
-    } else {
-        "A focused cockpit for coding with the models you choose."
-    };
-    let mut lines = vec![
-        Line::from(Span::styled(
-            format!("{mark}  FlyCockpit"),
-            if reduced_motion {
-                Style::default()
-            } else {
-                Style::default().fg(Color::Yellow)
-            },
-        )),
-        Line::default(),
-        Line::from(description),
-        Line::default(),
-        Line::from("No Cockpit telemetry is collected."),
-        Line::from("Inference providers may have their own telemetry policies."),
-        Line::default(),
-        Line::from(Span::styled(
-            "Press any key to begin setup.",
-            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
-        )),
-    ];
-    lines.truncate(lines.len().min(inner.height as usize));
-    frame.render_widget(
-        Paragraph::new(lines)
-            .alignment(ratatui::layout::Alignment::Center)
-            .wrap(Wrap { trim: false }),
-        inner,
     );
 }
 

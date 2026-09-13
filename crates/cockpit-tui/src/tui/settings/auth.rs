@@ -30,8 +30,27 @@ impl FetchHandle {
     pub fn spawn(
         lifecycle: cockpit_client::LifecycleClient,
         provider_id: String,
+        entry: ProviderEntry,
+        project_root: String,
+    ) -> Self {
+        Self::spawn_with_fallback(lifecycle, provider_id, entry, project_root, false)
+    }
+
+    pub fn spawn_allowing_fallback(
+        lifecycle: cockpit_client::LifecycleClient,
+        provider_id: String,
+        entry: ProviderEntry,
+        project_root: String,
+    ) -> Self {
+        Self::spawn_with_fallback(lifecycle, provider_id, entry, project_root, true)
+    }
+
+    fn spawn_with_fallback(
+        lifecycle: cockpit_client::LifecycleClient,
+        provider_id: String,
         _entry: ProviderEntry,
         project_root: String,
+        allow_fallback: bool,
     ) -> Self {
         let state = Arc::new(Mutex::new(FetchState::Running));
         let state_w = Arc::clone(&state);
@@ -48,7 +67,7 @@ impl FetchHandle {
                         model_id: None,
                         deep: false,
                         on_unlisted: None,
-                        allow_fallback: false,
+                        allow_fallback,
                     })
                     .await
                     .map_err(|error| error.to_string())?

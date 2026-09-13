@@ -1421,6 +1421,11 @@ impl App {
         if self.startup_modal_on_top() == Some(StartupModal::WorkspaceTrust) {
             self.dialog
                 .render(frame, rects.body, &mut self.link_registry);
+        } else if let Some(shell) = self.onboarding_shell.as_mut() {
+            // Full-screen onboarding shell: it replaces the entire chat UI,
+            // drawing its own chrome and delegating engine-stage content to
+            // the embedded settings dialog.
+            shell.render(frame, frame.area(), &self.dialog, &mut self.link_registry);
         } else if self.question_dialog.is_some() {
             // Answering dialog (GOALS §3b): a compact, bottom-anchored
             // overlay above the status row. History stays visible above

@@ -1200,6 +1200,27 @@ impl App {
                     Ok(_) | Err(_) => {}
                 }
             }
+            // Read-only authority refresh used by the daemon-global
+            // onboarding broadcast and the failed-transition recovery path.
+            // Unlike the initial fetch it never begins or reopens a run (a
+            // reopen would supersede the active attempt), so it carries no
+            // generation fence or pending-operation correlation: a stale
+            // read is inert by construction.
+            AsyncActionKind::DaemonRpc("onboarding.bootstrap_refresh") => match result.payload {
+                Ok(AsyncActionPayload::OnboardingBootstrap(snapshot)) => {
+                    self.apply_onboarding_bootstrap_snapshot(snapshot);
+                }
+                Err(error) => {
+                    self.show_toast(
+                        format!("Onboarding authority unavailable: {error}"),
+                        crate::tui::app::ToastKind::Error,
+                    );
+                }
+                Ok(_) => self.show_toast(
+                    "Onboarding authority returned an invalid projection",
+                    crate::tui::app::ToastKind::Error,
+                ),
+            },
             AsyncActionKind::DaemonRpc(
                 label @ ("onboarding.transition"
                 | "onboarding.secure_intent"
@@ -1243,6 +1264,21 @@ impl App {
                             format!("Onboarding transition unavailable: {error}"),
                             crate::tui::app::ToastKind::Error,
                         );
+                        // A failed transition (a Replace loser, a revision
+                        // conflict, transport loss) leaves the shell latched on
+                        // a revision that will never land: clear the latch and
+                        // re-read the authority so the stage can retry from the
+                        // real checkpoint instead of staying wedged. The
+                        // read-only refresh never begins or reopens a run, so
+                        // the active attempt keeps its revision. Read-only
+                        // fetch failures and the ready-construction retry keep
+                        // their existing user-driven retry loop (no
+                        // auto-restart here, and secure-intent failures latch
+                        // nothing).
+                        if let Some(shell) = self.onboarding_shell.as_mut() {
+                            shell.clear_pending_transition();
+                        }
+                        self.refresh_onboarding_bootstrap_snapshot();
                     }
                     Ok(_) if !self.exit_requested && pending_request_id.is_some() => {
                         self.show_toast(
@@ -3865,6 +3901,10 @@ fn stale_completion_requires_reducer(kind: &AsyncActionKind) -> bool {
                 | "fork.create"
                 | "goal-settings.effect"
                 | "mcp.local"
+                | "onboarding.bootstrap"
+                | "onboarding.ready_retry"
+                | "onboarding.secure_intent"
+                | "onboarding.transition"
                 | "paste.image_path_admission"
                 | "queue.control"
                 | "queue.edit.commit"

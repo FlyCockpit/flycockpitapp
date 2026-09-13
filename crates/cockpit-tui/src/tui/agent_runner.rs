@@ -1041,6 +1041,7 @@ fn is_global_turn_event(event: &TurnEvent) -> bool {
             | TurnEvent::DaemonLinkResynced { .. }
             | TurnEvent::DaemonLinkTerminal { .. }
             | TurnEvent::HostCapabilitiesChanged { .. }
+            | TurnEvent::OnboardingBootstrapChanged
             | TurnEvent::CaffeinateState { .. }
             | TurnEvent::DaemonDraining { .. }
             | TurnEvent::InterruptRaised { .. }
@@ -4464,7 +4465,7 @@ fn acknowledge_event_receipts(
     acknowledge_durable_submissions(awaiting_durable, session_id, ids);
 }
 
-fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
+pub(crate) fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
     use proto::Event::*;
     Some(match event {
         ThinkingStarted { agent, turn_id, .. } => TurnEvent::ThinkingStarted { agent, turn_id },
@@ -5201,6 +5202,9 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         HostCapabilitiesChanged { snapshot } => TurnEvent::HostCapabilitiesChanged {
             snapshot: Box::new(snapshot),
         },
+        // The broadcast carries only correlation ids; the authoritative
+        // projection is re-fetched by the consumer.
+        OnboardingBootstrap(..) => TurnEvent::OnboardingBootstrapChanged,
         // Agent-tree changes invalidate daemon-owned setup/tree queries.
         // Consume as a refresh signal, never a transcript row: a higher
         // tree seq must not make reconnect drop a later transcript event.
@@ -5222,8 +5226,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             proto::WorkspaceTrustReconciliationState::Applied
             | proto::WorkspaceTrustReconciliationState::StopRetrying => return None,
         },
-        OnboardingBootstrap(..)
-        | InterruptRaised { .. }
+        InterruptRaised { .. }
         | EventStreamLagged { .. }
         | SessionEnded { .. }
         | TerminalOutput { .. }

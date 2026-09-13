@@ -7854,6 +7854,73 @@ fn stub_layered_config_source() -> crate::daemon::config_source::ConfigSource {
     )
 }
 
+/// The daemon-global `OnboardingBootstrap` broadcast is the only production
+/// trigger for a concurrent client's read-only refresh: every committed
+/// authority change (begin/reopen and every applied transition) must be
+/// announced with the correlation of its resulting snapshot.
+#[tokio::test]
+async fn onboarding_authority_changes_broadcast_the_daemon_global_event() {
+    let ctx = test_ctx();
+    let mut state = owner_state();
+    let mut rx = ctx.subscribe_global();
+
+    let begin = match handle_request(
+        Request::BeginOrReopenOnboarding(proto::BeginOrReopenOnboarding {
+            expected_revision: None,
+            client_operation_id: "broadcast-begin".into(),
+            reentry: false,
+        }),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("onboarding begin transport")
+    {
+        proto::Response::OnboardingTransition(result) => result,
+        other => panic!("unexpected onboarding begin: {other:?}"),
+    };
+    assert_eq!(begin.snapshot.stage, proto::OnboardingStage::Welcome);
+
+    let advanced = match handle_request(
+        Request::ApplyOnboardingTransition(proto::ApplyOnboardingTransition {
+            run_id: begin.snapshot.run_id,
+            attempt_id: begin.snapshot.attempt_id,
+            expected_revision: begin.snapshot.revision,
+            client_operation_id: "broadcast-advance".into(),
+            transition: proto::OnboardingTransitionKind::Advance,
+            settlement: None,
+        }),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("onboarding advance transport")
+    {
+        proto::Response::OnboardingTransition(result) => result,
+        other => panic!("unexpected onboarding advance: {other:?}"),
+    };
+    assert_eq!(advanced.snapshot.stage, proto::OnboardingStage::Profile);
+    assert_eq!(advanced.snapshot.revision, begin.snapshot.revision + 1);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut seen = Vec::new();
+    while seen.len() < 2 {
+        let envelope = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("onboarding authority broadcasts")
+            .expect("global event stream");
+        if let proto::Event::OnboardingBootstrap(event) = envelope.event {
+            seen.push(event);
+        }
+    }
+    for (event, snapshot) in [(&seen[0], &begin.snapshot), (&seen[1], &advanced.snapshot)] {
+        assert_eq!(event.run_id, snapshot.run_id);
+        assert_eq!(event.attempt_id, snapshot.attempt_id);
+        assert_eq!(event.revision, snapshot.revision);
+        assert_eq!(event.state, snapshot.bootstrap_state);
+    }
+}
+
 pub(crate) fn test_ctx() -> Arc<DaemonContext> {
     test_ctx_with_config_source(stub_config_source())
 }

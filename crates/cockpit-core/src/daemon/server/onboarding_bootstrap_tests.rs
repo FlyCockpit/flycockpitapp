@@ -166,6 +166,214 @@ async fn locked_dispatch_denies_ordinary_reads_with_the_typed_error() {
     assert_eq!(denied.message, "daemon bootstrap is locked");
 }
 
+/// The profile stage precedes the secure-store choice (#391), so its wizard
+/// settlement is the one ordinary config mutation that must complete while
+/// locked. The admission is scoped to exactly that: the onboarding profile
+/// wizard at the Profile stage. Every other wizard apply — and this wizard
+/// at any other stage — stays on the deny-by-default locked matrix.
+#[tokio::test]
+async fn locked_bootstrap_settles_only_the_onboarding_profile_wizard_apply() {
+    let (tmp, locked) = fresh_locked_services().await;
+    let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
+    // The fixture daemon is ephemeral; an authorized (pre-existing) global
+    // layer keeps the ephemeral create-global-layer refusal out of this
+    // admission test, which is about the matrix and the publication.
+    std::fs::create_dir_all(
+        crate::config::dirs::global_config_dir().expect("isolated global config dir"),
+    )
+    .expect("authorize the global config layer");
+
+    let (welcome, _) = locked
+        .onboarding
+        .begin_or_reopen(
+            BeginOrReopenOnboarding {
+                expected_revision: None,
+                client_operation_id: "begin-profile-settlement".into(),
+                reentry: false,
+            },
+            locked.host_capabilities.clone(),
+        )
+        .await
+        .expect("begin onboarding");
+    assert_eq!(welcome.stage, OnboardingStage::Welcome);
+
+    let mut run = crate::wizard::WizardRun::new(crate::wizard::onboarding_profile_descriptor())
+        .expect("onboarding profile descriptor");
+    run.submit(crate::wizard::WizardAnswer::Text("Ada".into()))
+        .expect("profile name answer");
+    let answers_json = run.answers_json().expect("client profile answers");
+    let profile_apply =
+        |client_operation_id: &str, wizard_id: &str, answers: String| Request::ApplySetupWizard {
+            client_operation_id: client_operation_id.into(),
+            project_root: tmp.path().display().to_string(),
+            wizard_id: wizard_id.into(),
+            answers_json: answers,
+        };
+
+    // The profile settlement is legal only at the Profile stage.
+    let denied_at_welcome = handle_locked_in_process_request(
+        &locked,
+        profile_apply(
+            "settle-at-welcome",
+            crate::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+            answers_json.clone(),
+        ),
+    )
+    .await
+    .expect_err("the profile settlement is only valid at the Profile stage");
+    assert_eq!(denied_at_welcome.code, ErrorCode::BootstrapLocked);
+
+    let (profile, _) = locked
+        .onboarding
+        .apply_transition(
+            ApplyOnboardingTransition {
+                run_id: welcome.run_id,
+                attempt_id: welcome.attempt_id,
+                expected_revision: welcome.revision,
+                client_operation_id: "commit-welcome".into(),
+                transition: OnboardingTransitionKind::Advance,
+                settlement: None,
+            },
+            locked.host_capabilities.clone(),
+        )
+        .await
+        .expect("advance to the Profile stage");
+    assert_eq!(profile.stage, OnboardingStage::Profile);
+
+    // Every other wizard apply stays denied while locked.
+    let denied_other_wizard = handle_locked_in_process_request(
+        &locked,
+        profile_apply(
+            "settle-security",
+            crate::wizard::SECURITY_WIZARD_ID,
+            "{}".into(),
+        ),
+    )
+    .await
+    .expect_err("ordinary wizard applies stay denied while locked");
+    assert_eq!(denied_other_wizard.code, ErrorCode::BootstrapLocked);
+
+    // The scoped admission settles the wizard exactly like the ready
+    // dispatch: the write is durable and the receipt carries the published
+    // post-apply config generation.
+    let applied = match handle_locked_in_process_request(
+        &locked,
+        profile_apply(
+            "settle-profile",
+            crate::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+            answers_json.clone(),
+        ),
+    )
+    .await
+    .expect("the locked onboarding profile settlement")
+    {
+        Response::SetupWizardApplied {
+            changed,
+            model_file_written,
+            default_scope,
+            config_generation,
+            ..
+        } => (
+            changed,
+            model_file_written,
+            default_scope,
+            config_generation,
+        ),
+        other => panic!("unexpected settlement response: {other:?}"),
+    };
+    let (changed, model_file_written, default_scope, published_generation) = applied;
+    assert!(changed, "a fresh name is a durable config change");
+    assert!(!model_file_written);
+    assert_eq!(default_scope, None);
+    assert!(
+        published_generation >= 1,
+        "a changed apply publishes a config generation"
+    );
+    let config_path = crate::config::dirs::global_config_file().expect("isolated global config");
+    let config = crate::config::extended::ExtendedConfigDoc::load(&config_path)
+        .expect("the locked settlement wrote the global config")
+        .config();
+    assert_eq!(config.name.as_deref(), Some("Ada"));
+
+    // A replay of the same answers is an idempotent no-op: nothing changed,
+    // so the receipt keeps the current generation.
+    let replayed = match handle_locked_in_process_request(
+        &locked,
+        profile_apply(
+            "settle-profile-replay",
+            crate::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+            answers_json,
+        ),
+    )
+    .await
+    .expect("the locked onboarding profile settlement replay")
+    {
+        Response::SetupWizardApplied {
+            changed,
+            config_generation,
+            ..
+        } => (changed, config_generation),
+        other => panic!("unexpected settlement replay response: {other:?}"),
+    };
+    assert!(!replayed.0, "an identical apply must not rewrite the name");
+    assert!(replayed.1 >= published_generation);
+
+    // Once the stage leaves Profile the settlement closes again: the
+    // admission is a profile-stage bootstrap operation, not a general
+    // config-write window.
+    let (secure, _) = locked
+        .onboarding
+        .apply_transition(
+            ApplyOnboardingTransition {
+                run_id: profile.run_id,
+                attempt_id: profile.attempt_id,
+                expected_revision: profile.revision,
+                client_operation_id: "commit-profile".into(),
+                transition: OnboardingTransitionKind::Advance,
+                settlement: None,
+            },
+            locked.host_capabilities.clone(),
+        )
+        .await
+        .expect("advance past the Profile stage");
+    assert_eq!(secure.stage, OnboardingStage::SecureStore);
+    let denied_after_advance = handle_locked_in_process_request(
+        &locked,
+        profile_apply(
+            "settle-after-advance",
+            crate::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+            "{}".into(),
+        ),
+    )
+    .await
+    .expect_err("the profile settlement closes once the stage advances");
+    assert_eq!(denied_after_advance.code, ErrorCode::BootstrapLocked);
+
+    // The pre-vault transition admission also covers Back from the
+    // secure-store choice: the shell offers that Escape choice, so denying
+    // it would make the secure-store screen uncompletable in the other
+    // direction. The authority's legality rules stay the only transition
+    // gate inside the admission.
+    let back = match handle_locked_in_process_request(
+        &locked,
+        Request::ApplyOnboardingTransition(ApplyOnboardingTransition {
+            run_id: secure.run_id,
+            attempt_id: secure.attempt_id,
+            expected_revision: secure.revision,
+            client_operation_id: "back-from-secure-store".into(),
+            transition: OnboardingTransitionKind::Back,
+            settlement: None,
+        }),
+    )
+    .await
+    .expect("Back from the secure-store choice is admissible while locked")
+    {
+        Response::OnboardingTransition(result) => result.snapshot,
+        other => panic!("unexpected locked back transition: {other:?}"),
+    };
+    assert_eq!(back.stage, OnboardingStage::Profile);
+}
+
 #[tokio::test]
 async fn ready_transition_keeps_the_acquired_permit_until_return_publication() {
     let (_tmp, locked, _) = ready_construction().await;

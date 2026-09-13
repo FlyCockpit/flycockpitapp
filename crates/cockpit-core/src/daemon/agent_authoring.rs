@@ -673,7 +673,7 @@ mod tests {
         assert!(recover.contains("compensate_onboarding_agent_publication"));
 
         let apply = dispatch
-            .split("wizard_id == crate::wizard::ONBOARDING_AGENT_WIZARD_ID")
+            .split("if wizard_id == crate::wizard::ONBOARDING_AGENT_WIZARD_ID")
             .nth(1)
             .and_then(|tail| {
                 tail.split("crate::wizard::apply_setup_wizard_answers_authoritative")

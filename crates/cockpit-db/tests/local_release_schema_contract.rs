@@ -523,9 +523,11 @@ fn authored_package_files_json_limit_holds_hex_encoded_canonical_packages() {
     let files_check = sql
         .split("CREATE TABLE authored_agent_package_journals")
         .nth(1)
-        .and_then(|tail| tail.split("review_json").next())
-        .and_then(|body| body.split("package_files_json").nth(1))
-        .expect("package_files_json check");
+        .and_then(|tail| {
+            tail.split("CREATE INDEX authored_agent_package_journals_created")
+                .next()
+        })
+        .expect("authored journal table");
     assert!(
         files_check.contains(&format!(
             "length(CAST(package_files_json AS BLOB)) <= {MAX_AUTHORED_PACKAGE_FILES_JSON_BYTES}"

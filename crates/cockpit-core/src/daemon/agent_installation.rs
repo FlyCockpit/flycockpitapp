@@ -7385,7 +7385,7 @@ fn redacted_error(error: anyhow::Error) -> AgentInstallationResultV1 {
         AgentInstallationErrorCodeV1::IdempotencyConflict
     } else if text.contains("workspace authorization") {
         AgentInstallationErrorCodeV1::UnauthorizedWorkspace
-    } else if text.contains("authorization") || text.contains("private") {
+    } else if text.contains("authorization") {
         AgentInstallationErrorCodeV1::PrivateSourceUnauthorized
     } else if text.contains("unknown installation choice") {
         AgentInstallationErrorCodeV1::UnknownChoice
@@ -7407,6 +7407,8 @@ fn redacted_error(error: anyhow::Error) -> AgentInstallationResultV1 {
     } else if text.contains("vNext")
         || text.contains("invalid fetched AgentDef")
         || text.contains("fetched agent Markdown")
+        || text.contains("loading authored package")
+        || text.contains("private subagent")
     {
         AgentInstallationErrorCodeV1::InvalidDefinition
     } else if text.contains("fetch") {
@@ -8403,7 +8405,7 @@ mod tests {
             binding_providers(),
         );
         let markdown = b"---\nschemaVersion: 1\nagentId: authored/helper\nroles: [code]\ndescription: helper\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n    models:\n      - providerId: vendor\n        modelId: exact-a\n        default: true\n---\nbody\n".to_vec();
-        let child = markdown.clone();
+        let child = b"---\nschemaVersion: 1\nagentId: authored/reviewer\nroles: [code]\ndescription: reviewer\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n    models:\n      - providerId: vendor\n        modelId: exact-a\n        default: true\n---\nbody\n".to_vec();
         let mut files = BTreeMap::new();
         files.insert("agent.md".into(), markdown);
         files.insert("subagents/reviewer.md".into(), child);

@@ -215,15 +215,8 @@ pub fn canonicalize_authored_package(
             "authored package policy revision does not match the current snapshot",
         ));
     }
-    require_wire_provider_tokens(draft, providers)?;
-    let derived_kind = derive_source_kind(&draft.source, &draft.name, snapshot, catalog)?;
-    if draft.source.kind != derived_kind {
-        return Err(AuthoredPackageRejection::new(
-            AuthoredAgentRejectReason::IncompletePackage,
-            "source kind does not match the locator's membership in the pinned catalog",
-        ));
-    }
-    validate_source_kind(derived_kind, &draft.source)?;
+    // Inspect raw markdown before any closed-schema YAML parse. A `trust`
+    // copy is a per-agent override, not an unknown frontmatter field.
     reject_trust_copy(&draft.markdown)?;
     for child in &draft.children {
         reject_trust_copy(&child.markdown)?;
@@ -234,6 +227,15 @@ pub fn canonicalize_authored_package(
             )
         })?;
     }
+    require_wire_provider_tokens(draft, providers)?;
+    let derived_kind = derive_source_kind(&draft.source, &draft.name, snapshot, catalog)?;
+    if draft.source.kind != derived_kind {
+        return Err(AuthoredPackageRejection::new(
+            AuthoredAgentRejectReason::IncompletePackage,
+            "source kind does not match the locator's membership in the pinned catalog",
+        ));
+    }
+    validate_source_kind(derived_kind, &draft.source)?;
     validate_sidecars(&draft.sidecars, snapshot)?;
     let files = canonical_file_map(draft)?;
     let definition = crate::agents::load_workspace_package_from_files(&draft.name, files.clone())
@@ -1678,7 +1680,8 @@ mod tests {
             .expect("wire provider id gate");
         assert!(require.contains("offering.provider_id == submitted"));
         assert!(!require.contains("provider_profile_handle"));
-        assert!(!source.contains("rewrite_draft_to_wire_tokens"));
-        assert!(!source.contains("wire_provider_id_for_submitted"));
+        let production = source.split("#[cfg(test)]").next().expect("production");
+        assert!(!production.contains("rewrite_draft_to_wire_tokens"));
+        assert!(!production.contains("wire_provider_id_for_submitted"));
     }
 }

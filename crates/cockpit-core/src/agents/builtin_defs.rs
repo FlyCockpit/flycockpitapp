@@ -337,7 +337,11 @@ fn builtin_vnext(name: &str, _mode: AgentMode) -> VnextAgentDef {
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
             default_child: None,
-            interactive_subagents: false,
+            // Built-in agents with a child graph already participate in
+            // interactive `task` handoffs. Authored packages default this
+            // off; omitting it here would silently disable that existing
+            // launch path.
+            interactive_subagents: true,
         }
     };
     VnextAgentDef {

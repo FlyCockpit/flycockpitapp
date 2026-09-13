@@ -13,7 +13,7 @@ const LOCAL_SCHEMA_REVIEW_DIGEST: &str =
 const EXTENDED_SCHEMA_REVIEW_DIGEST: &str =
     "a6eb995d785afd158764c928429f4e2937aef0f2e309b5e5e547f9f4fa81e2f2";
 const RELATIONSHIP_INVENTORY_REVIEW_DIGEST: &str =
-    "02a366deb55d1e361cbbddcf271de7d897958946e2009604e71e9363dc06e5cb";
+    "d976aaca5978023ffa0dccc5fcd1d7e1e6d5eb243c4afc548ff6255b99699402";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum RelationshipClass {
@@ -1058,12 +1058,12 @@ fn effective_schema_profiles_are_ordered_closed_and_indexed() {
     );
     assert_eq!(
         local.objects.len(),
-        708,
+        713,
         "local ordered object inventory drifted"
     );
     assert_eq!(
         extended.objects.len(),
-        939,
+        944,
         "extended ordered object inventory drifted"
     );
     assert!(

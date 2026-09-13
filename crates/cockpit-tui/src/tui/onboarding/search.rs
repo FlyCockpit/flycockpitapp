@@ -60,7 +60,10 @@ pub(crate) struct ProviderRow<'a> {
 /// State for the provider search screen.
 pub(crate) struct ProviderSearchScreen {
     query: TextField,
-    /// Cursor index into the *filtered* list.
+    /// Cursor index into the *filtered* list. A query edit re-anchors this
+    /// index to the previously selected canonical template id (see
+    /// [`ProviderSearchScreen::remap_selection`]) so filtering can never
+    /// silently move the selection onto a different visible row.
     cursor: usize,
     /// First visible row index of the viewport.
     offset: usize,
@@ -104,8 +107,10 @@ impl ProviderSearchScreen {
     }
 
     /// Clamp cursor and viewport to the current filtered list. Called after
-    /// every query edit, key move, pointer selection, and viewport resize
-    /// observation so the two indices can never dangle past the list.
+    /// every key move, pointer selection, and viewport resize observation
+    /// so the two indices can never dangle past the list. Query edits use
+    /// [`Self::remap_selection`] instead: an index clamp alone can move the
+    /// cursor onto a *different* template when the list shrinks around it.
     fn clamp(&mut self) {
         let len = self.filtered().len();
         self.cursor = self.cursor.min(len.saturating_sub(1));
@@ -118,9 +123,28 @@ impl ProviderSearchScreen {
         }
     }
 
-    /// A filter edit re-clamps the cursor/viewport; the selected template id
-    /// is stable whenever the entry is still visible, and the canonical
-    /// identity is what selection resolves either way.
+    /// Re-anchor the cursor to the previously selected canonical template
+    /// after a query edit. While the entry stays visible, the selected
+    /// template id is unchanged by construction (the cursor is moved to the
+    /// entry's new index); only when it no longer matches does the cursor
+    /// fall back to an index clamp over the remaining rows.
+    fn remap_selection(&mut self, previous: Option<&'static ProviderTemplate>) {
+        if let Some(previous) = previous
+            && let Some(index) = self
+                .filtered()
+                .iter()
+                .position(|candidate| candidate.id == previous.id)
+        {
+            self.cursor = index;
+        } else {
+            self.cursor = self.cursor.min(self.filtered().len().saturating_sub(1));
+        }
+        self.clamp();
+    }
+
+    /// A filter edit re-anchors the cursor to the previously selected
+    /// canonical template (see [`Self::remap_selection`]); movement keys
+    /// re-clamp, and Enter resolves the cursor's canonical registry entry.
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Option<&'static ProviderTemplate> {
         match key.code {
             KeyCode::Down => {
@@ -149,9 +173,10 @@ impl ProviderSearchScreen {
                 return self.activate(self.selected_template());
             }
             _ => {
+                let previous = self.selected_template();
                 if self.query.handle_key(key) {
                     self.status = None;
-                    self.clamp();
+                    self.remap_selection(previous);
                 }
             }
         }
@@ -298,11 +323,13 @@ impl ProviderSearchScreen {
         Line::from(spans)
     }
 
-    /// Paste into the query field.
+    /// Paste into the query field. The cursor re-anchors to the previously
+    /// selected canonical template like any other query edit.
     pub(crate) fn paste_query(&mut self, text: &str) {
+        let previous = self.selected_template();
         self.query.paste(text);
         self.status = None;
-        self.clamp();
+        self.remap_selection(previous);
     }
 
     /// Help text under the list.

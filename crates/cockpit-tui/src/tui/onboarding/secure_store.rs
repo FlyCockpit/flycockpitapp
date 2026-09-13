@@ -13,6 +13,11 @@ use ratatui::text::{Line, Span};
 
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
+/// The sensitive ingress rejects passphrases past this byte length; enforce
+/// the same cap *before* buffering so an oversized paste is rejected at
+/// ingress instead of after unbounded allocation and comparison.
+const MAX_PASSPHRASE_BYTES: usize = cockpit_proto::MAX_SENSITIVE_ONBOARDING_PASSPHRASE_BYTES;
+
 pub struct SecureStoreSubmission {
     pub placement: cockpit_proto::OnboardingSecurePlacement,
     pub passphrase: Option<cockpit_proto::SensitiveOnboardingPassphrase>,
@@ -52,14 +57,27 @@ impl SecureStoreScreen {
         self.submitted.take()
     }
 
+    /// Append `text` to the focused passphrase buffer, rejecting the whole
+    /// append when it would cross the ingress byte cap (no silent
+    /// truncation of secret material).
+    fn append_to_focused(&mut self, text: &str) {
+        let target = match self.phase {
+            SecureStoreInputPhase::Passphrase => &mut self.passphrase,
+            SecureStoreInputPhase::Confirmation => &mut self.confirmation,
+            SecureStoreInputPhase::Choice => return,
+        };
+        if target.len().saturating_add(text.len()) > MAX_PASSPHRASE_BYTES {
+            self.status =
+                Some("Passphrase exceeds the maximum accepted length; input was rejected.".into());
+            return;
+        }
+        target.push_str(text);
+    }
+
     /// Paste into whichever passphrase field is focused (no-op on the
     /// choice list).
     pub(crate) fn paste(&mut self, text: &str) {
-        match self.phase {
-            SecureStoreInputPhase::Passphrase => self.passphrase.push_str(text),
-            SecureStoreInputPhase::Confirmation => self.confirmation.push_str(text),
-            SecureStoreInputPhase::Choice => {}
-        }
+        self.append_to_focused(text);
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) {
@@ -94,12 +112,8 @@ impl SecureStoreScreen {
                     }
                     KeyCode::Char(ch) => {
                         let ch = crate::tui::textfield::normalize_shift_char(&key, ch);
-                        let target = if self.phase == SecureStoreInputPhase::Passphrase {
-                            &mut self.passphrase
-                        } else {
-                            &mut self.confirmation
-                        };
-                        target.push(ch);
+                        let mut encoded = [0u8; 4];
+                        self.append_to_focused(ch.encode_utf8(&mut encoded));
                     }
                     KeyCode::Enter if self.phase == SecureStoreInputPhase::Passphrase => {
                         if self.passphrase.is_empty() {

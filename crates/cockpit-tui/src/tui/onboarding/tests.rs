@@ -175,10 +175,12 @@ fn escape_offers_visible_choices_and_never_defers_silently() {
     let mut engine = Dialog::None;
     // Plain Escape opens the menu without emitting any transition.
     assert!(shell.handle_key(key(KeyCode::Esc), &mut engine).is_none());
-    // Provider stage offers Back, Defer, and Cancel in that order.
+    // The daemon never accepts Back from Provider (the committed
+    // secure-store choice cannot be reopened through onboarding), so the
+    // menu offers only Defer and Cancel.
     let rendered = render_string(&mut shell, 80, 24, &engine);
     assert!(rendered.contains("Leave setup?"));
-    assert!(rendered.contains("Back to the previous step"));
+    assert!(!rendered.contains("Back to the previous step"));
     assert!(rendered.contains("Defer provider setup (limited mode)"));
     assert!(rendered.contains("Cancel setup for now"));
     // Escape again dismisses without effect.
@@ -197,9 +199,11 @@ fn escape_menu_choices_differ_by_stage() {
             &["Back to the previous step", "Cancel setup for now"],
         ),
         (
+            // Back from Provider would reopen the committed secure-store
+            // choice; the daemon rejects that transition, so it is never
+            // offered.
             OnboardingStage::Provider,
             &[
-                "Back to the previous step",
                 "Defer provider setup (limited mode)",
                 "Cancel setup for now",
             ],
@@ -229,6 +233,15 @@ fn escape_menu_choices_differ_by_stage() {
                 "{stage:?} must not offer defer"
             );
         }
+        if matches!(
+            stage,
+            OnboardingStage::Welcome | OnboardingStage::Profile | OnboardingStage::Provider
+        ) {
+            assert!(
+                !rendered.contains("Back to the previous step"),
+                "{stage:?} must not offer an illegal Back transition"
+            );
+        }
     }
 }
 
@@ -236,8 +249,8 @@ fn escape_menu_choices_differ_by_stage() {
 fn escape_menu_selection_emits_distinct_actions() {
     let mut engine = Dialog::None;
 
-    // Back on the provider stage.
-    let mut shell = shell_at(OnboardingStage::Provider);
+    // Back is offered where the daemon accepts it (from Model).
+    let mut shell = shell_at(OnboardingStage::Model);
     shell.handle_key(key(KeyCode::Esc), &mut engine);
     assert!(matches!(
         shell.handle_key(key(KeyCode::Enter), &mut engine),
@@ -247,10 +260,9 @@ fn escape_menu_selection_emits_distinct_actions() {
         ))
     ));
 
-    // Defer (second row) on the provider stage.
+    // Defer (first row) on the provider stage, where Back is withheld.
     let mut shell = shell_at(OnboardingStage::Provider);
     shell.handle_key(key(KeyCode::Esc), &mut engine);
-    shell.handle_key(key(KeyCode::Down), &mut engine);
     assert!(matches!(
         shell.handle_key(key(KeyCode::Enter), &mut engine),
         Some(OnboardingShellAction::Transition(
@@ -259,10 +271,9 @@ fn escape_menu_selection_emits_distinct_actions() {
         ))
     ));
 
-    // Cancel (third row) closes the shell without a transition.
+    // Cancel (second row) closes the shell without a transition.
     let mut shell = shell_at(OnboardingStage::Provider);
     shell.handle_key(key(KeyCode::Esc), &mut engine);
-    shell.handle_key(key(KeyCode::Down), &mut engine);
     shell.handle_key(key(KeyCode::Down), &mut engine);
     assert!(matches!(
         shell.handle_key(key(KeyCode::Enter), &mut engine),
@@ -278,7 +289,7 @@ fn escape_menu_pointer_selection_chooses_the_clicked_row() {
     // Render first so the menu records its row rects.
     let rendered = render_string(&mut shell, 100, 30, &engine);
     assert!(rendered.contains("Defer provider setup"));
-    let defer_row = shell.escape.as_ref().unwrap().row_rects[1];
+    let defer_row = shell.escape.as_ref().unwrap().row_rects[0];
     let outcome = shell.handle_mouse(click(defer_row.x, defer_row.y));
     assert!(outcome.consumed);
     assert!(matches!(
@@ -541,6 +552,44 @@ fn filtering_never_changes_selected_template_identity() {
         before.id, after.id,
         "filtering must resolve the same canonical template id"
     );
+
+    // A filter that keeps several entries — including, but not isolating,
+    // the selection — must keep the same canonical selection identity
+    // instead of silently snapping to a different row. Find an entry whose
+    // id prefix is shared by at least one other row (e.g. `openai` and
+    // `openai-compatible`) so the fixture does not depend on exact
+    // registry ordering.
+    screen = ProviderSearchScreen::new();
+    screen.observe_viewport(onboarding_catalog().len().max(8));
+    let mut shared_prefix = None;
+    for _ in 0..onboarding_catalog().len() {
+        let selected = screen.selected_template().expect("cursor in catalog");
+        let prefix: String = selected.id.chars().take(3).collect();
+        let kept = filter_catalog(&onboarding_catalog(), &prefix);
+        if kept.len() > 1 && kept.iter().any(|t| t.id == selected.id) {
+            shared_prefix = Some((prefix, selected));
+            break;
+        }
+        screen.handle_key(key(KeyCode::Down));
+    }
+    let (prefix, selected) =
+        shared_prefix.expect("the registry contains shared-prefix entries (openai)");
+    for ch in prefix.chars() {
+        screen.handle_key(key(KeyCode::Char(ch)));
+    }
+    let filtered = screen.filtered();
+    assert!(
+        filtered.len() > 1,
+        "fixture must keep a set containing the selection: {:?}",
+        filtered.iter().map(|t| t.id).collect::<Vec<_>>()
+    );
+    assert!(filtered.iter().any(|t| t.id == selected.id));
+    assert_eq!(
+        screen.selected_template().expect("selection survives").id,
+        selected.id,
+        "a query that keeps the selection must not change which template is selected"
+    );
+
     // A filter that excludes the entry clamps to the remaining list and
     // still resolves an original template id.
     screen.handle_key(key(KeyCode::End));
@@ -681,24 +730,46 @@ fn completion_screen_choices_are_distinct() {
     assert!(rendered.contains("/setup security"));
     assert!(rendered.contains("/help"));
 
-    // "Add another provider" returns to the searchable catalog (no
-    // transition); "Start coding" requests the terminal transition.
+    // "Add another provider" is a shell-local detour (the daemon stage is
+    // already Complete): the searchable catalog returns, and Escape offers
+    // a local return to the stored summary instead of a daemon transition.
     shell.handle_key(key(KeyCode::Up), &mut engine);
     assert!(
         shell.handle_key(key(KeyCode::Enter), &mut engine).is_none(),
         "adding another provider is shell-local"
     );
     assert_eq!(shell.screen_kind(), OnboardingScreenKind::ProviderSearch);
+    shell.handle_key(key(KeyCode::Esc), &mut engine);
+    let detour_menu = render_string(&mut shell, 90, 24, &engine);
+    assert!(detour_menu.contains("Return to the setup summary"));
+    assert!(matches!(
+        shell.handle_key(key(KeyCode::Enter), &mut engine),
+        Some(OnboardingShellAction::ReturnToCompletion)
+    ));
+    assert_eq!(shell.screen_kind(), OnboardingScreenKind::Complete);
 
+    // "Start coding" is a local close: the terminal Complete transition was
+    // already committed when the lifetime stage settled.
     shell.present_completion("again".into());
     shell.handle_key(key(KeyCode::Down), &mut engine);
     assert!(matches!(
         shell.handle_key(key(KeyCode::Enter), &mut engine),
-        Some(OnboardingShellAction::Transition(
-            cockpit_proto::OnboardingTransitionKind::Complete,
-            None
-        ))
+        Some(OnboardingShellAction::Close)
     ));
+}
+
+#[test]
+fn completion_detour_escape_replaces_back_and_cancel() {
+    let mut shell = shell_at(OnboardingStage::Lifetime);
+    let mut engine = Dialog::None;
+    shell.present_completion("summary".into());
+    shell.begin_completion_provider_detour(Some("status".into()));
+    shell.handle_key(key(KeyCode::Esc), &mut engine);
+    let rendered = render_string(&mut shell, 90, 24, &engine);
+    assert!(rendered.contains("Return to the setup summary"));
+    assert!(!rendered.contains("Cancel setup for now"));
+    assert!(!rendered.contains("Back to the previous step"));
+    assert!(!rendered.contains("Defer provider setup"));
 }
 
 // ── Snapshot authority ───────────────────────────────────────────────────

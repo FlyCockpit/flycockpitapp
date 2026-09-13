@@ -1197,9 +1197,12 @@ impl SettingsDialog {
         }
         s.wire_api_cursor = 0;
         s.error = None;
-        s.run
-            .submit(WizardAnswer::Select(template.id.to_string()))
-            .expect("provider template is a valid select answer");
+        if let Err(error) = s.run.submit(WizardAnswer::Select(template.id.to_string())) {
+            // The template came from the same registry the descriptor
+            // validates against, so this is unreachable in practice — but a
+            // registry/descriptor drift must surface, not panic the TUI.
+            s.error = Some(error);
+        }
     }
 
     pub(super) fn apply_fetch_result(
@@ -1366,6 +1369,13 @@ impl SettingsDialog {
                     let reason = redact_model_fetch_reason(e.as_str());
                     if let Some(entry) = self.config.providers.get_mut(provider_id) {
                         entry.mark_model_fetch_failed_kept_existing(reason.clone());
+                    }
+                    // A hard offline/validation error is exactly as much
+                    // "a completed provider validation attempt" as a
+                    // fallback-eligible miss: first-run onboarding must be
+                    // able to continue through explicit manual model entry.
+                    if onboarding_validation {
+                        validation_failure = Some(reason.clone());
                     }
                     message = match self.save_config() {
                         Ok(()) if daemon_visibility_guidance.is_some() => format!(
@@ -1787,6 +1797,18 @@ impl SettingsCx {
         // Back/escape unconditionally returns to the list.
         let oauth_step = matches!(s.run.current_step_id(), Some("grok-oauth" | "codex-oauth"));
         if matches!(key.code, KeyCode::Esc) && !oauth_step {
+            // A provider authority operation (mutation, catalog refresh) is
+            // already in flight: abandoning the page now would leave an
+            // uncorrelated daemon effect that can commit a credential after
+            // the user believes setup was left. Keep the page mounted until
+            // the operation settles through its own completion path.
+            if self.authority_operation_pending() {
+                s.error = Some(
+                    "A provider authority operation is in flight; it must settle before this page can be left."
+                        .into(),
+                );
+                return Nav::Stay;
+            }
             s.run.abort();
             return Nav::Replace(super::providers_page(ProvidersPage::List {
                 cursor: initial_list_cursor(&self.config),
@@ -1843,9 +1865,9 @@ impl SettingsCx {
                     }
                     s.wire_api_cursor = 0;
                     s.error = None;
-                    s.run
-                        .submit(WizardAnswer::Select(t.id.to_string()))
-                        .expect("provider template is a valid select answer");
+                    if let Err(error) = s.run.submit(WizardAnswer::Select(t.id.to_string())) {
+                        s.error = Some(error);
+                    }
                 }
                 _ => {}
             },
@@ -2240,13 +2262,18 @@ impl SettingsCx {
                 // Disable input while in-flight, except Esc (handled above).
             }
             Some("done") | None if s.run.is_complete() || s.is_step("done") => {
-                if matches!(key.code, KeyCode::Enter) {
+                if matches!(key.code, KeyCode::Enter) && !s.onboarding {
                     return Nav::Replace(super::providers_page(ProvidersPage::List {
                         cursor: initial_list_cursor(&self.config),
                         status: s.error.clone(),
                         delete_pending: false,
                     }));
                 }
+                // The onboarding engine never leaves its Add page on Done:
+                // the shell's service poll owns the exit (settled advance at
+                // the Provider stage, return to the summary during the
+                // completion detour). Leaving the page here would read as an
+                // abandon and drop the settlement pairing.
             }
             Some(other) => {
                 s.error = Some(format!("unsupported provider wizard step `{other}`"));

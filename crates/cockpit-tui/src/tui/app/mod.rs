@@ -210,6 +210,8 @@ mod auth_failure_recovery_tests;
 #[cfg(test)]
 mod control_request_tests;
 #[cfg(test)]
+mod first_run_daemon_tests;
+#[cfg(test)]
 mod first_run_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2739,6 +2741,12 @@ pub struct App {
     pub(super) onboarding_shell: Option<Box<crate::tui::onboarding::OnboardingShell>>,
     onboarding_skip: bool,
     onboarding_force: bool,
+    /// Occupancy fence: the user explicitly closed the shell (Cancel /
+    /// completion exit). Late authority results and concurrent-client
+    /// broadcasts still update [`Self::onboarding_snapshot`] but must not
+    /// reopen the surface; only explicit re-entry (the no-provider send
+    /// guard) clears the flag.
+    pub(super) onboarding_dismissed: bool,
     /// An open `/side` side conversation, or `None` in the main session. While
     /// `Some`, the TUI is bound to an ephemeral throwaway fork: the chrome
     /// shows the side indicator with `/side end` guidance, and the fork is
@@ -3982,6 +3990,7 @@ impl App {
             onboarding_shell: None,
             onboarding_skip: false,
             onboarding_force: false,
+            onboarding_dismissed: false,
             side_conversation: None,
             daemon_draining: false,
             predict_setting,

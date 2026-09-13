@@ -159,6 +159,10 @@ pub(crate) enum OnboardingShellAction {
     SecureIntent(SecureStoreSubmission),
     /// Seed the provider engine with the selected canonical template.
     SelectTemplate(&'static ProviderTemplate),
+    /// Leave the "add another provider" detour and present the stored
+    /// completion summary again. Purely shell-local: the daemon stage is
+    /// already `Complete`.
+    ReturnToCompletion,
     /// Close the shell preserving committed daemon progress; discard only
     /// local unsaved text.
     Close,
@@ -179,6 +183,7 @@ impl std::fmt::Debug for OnboardingShellAction {
                 .debug_tuple("SelectTemplate")
                 .field(&template.id)
                 .finish(),
+            Self::ReturnToCompletion => formatter.write_str("ReturnToCompletion"),
             Self::Close => formatter.write_str("Close"),
         }
     }
@@ -219,6 +224,9 @@ enum EscapeChoice {
     Back,
     Defer,
     Cancel,
+    /// Shell-local: leave the completion-screen "add another provider"
+    /// detour and present the stored summary again.
+    ReturnToSummary,
 }
 
 impl EscapeChoice {
@@ -227,6 +235,7 @@ impl EscapeChoice {
             Self::Back => "Back to the previous step",
             Self::Defer => "Defer provider setup (limited mode)",
             Self::Cancel => "Cancel setup for now",
+            Self::ReturnToSummary => "Return to the setup summary",
         }
     }
 
@@ -237,6 +246,7 @@ impl EscapeChoice {
                 OnboardingShellAction::Transition(OnboardingTransitionKind::DeferProvider, None)
             }
             Self::Cancel => OnboardingShellAction::Close,
+            Self::ReturnToSummary => OnboardingShellAction::ReturnToCompletion,
         }
     }
 }
@@ -248,28 +258,48 @@ struct EscapeMenu {
 }
 
 impl EscapeMenu {
-    fn open(stage: OnboardingStage, engine_has_authority_pending: bool) -> Self {
-        // Authority work in flight is never discardable: the daemon owns its
-        // settlement, so the menu offers neither Back nor Cancel while a
-        // mutation could still commit. Defer stays available on the provider
-        // stage because it is an explicit daemon transition, not a discard.
+    /// Build the visible Escape choices for the current shell state, or
+    /// `None` when nothing is offerable and Escape must stay inert.
+    ///
+    /// Authority work in flight is never discardable and never deferrable:
+    /// the daemon owns its settlement, so while any engine authority
+    /// operation is pending there is no menu at all (Escape flows to the
+    /// engine's correlated handling). Outside the detour the menu offers
+    /// only transitions the daemon accepts for the stage: `Back` is
+    /// withheld on `Provider` because the committed secure-store choice
+    /// cannot be reopened through onboarding.
+    fn open(
+        stage: OnboardingStage,
+        engine_has_authority_pending: bool,
+        completion_detour: bool,
+    ) -> Option<Self> {
+        if engine_has_authority_pending {
+            return None;
+        }
         let mut choices = Vec::new();
-        let can_navigate_back = !engine_has_authority_pending
-            && !matches!(stage, OnboardingStage::Welcome | OnboardingStage::Profile);
-        if can_navigate_back {
-            choices.push(EscapeChoice::Back);
-        }
-        if stage == OnboardingStage::Provider {
-            choices.push(EscapeChoice::Defer);
-        }
-        if !engine_has_authority_pending {
+        if completion_detour {
+            choices.push(EscapeChoice::ReturnToSummary);
+        } else {
+            let can_navigate_back = !matches!(
+                stage,
+                OnboardingStage::Welcome | OnboardingStage::Profile | OnboardingStage::Provider
+            );
+            if can_navigate_back {
+                choices.push(EscapeChoice::Back);
+            }
+            if stage == OnboardingStage::Provider {
+                choices.push(EscapeChoice::Defer);
+            }
             choices.push(EscapeChoice::Cancel);
         }
-        Self {
+        if choices.is_empty() {
+            return None;
+        }
+        Some(Self {
             cursor: 0,
             choices,
             row_rects: Vec::new(),
-        }
+        })
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Option<EscapeChoice> {
@@ -314,6 +344,15 @@ pub struct OnboardingShell {
     frame: usize,
     screen: OnboardingScreen,
     escape: Option<EscapeMenu>,
+    /// Summary text computed when the lifetime stage settled; presented on
+    /// the completion screen when the authoritative `Complete` revision
+    /// lands, and again when the "add another provider" detour ends.
+    completion_summary: Option<String>,
+    /// True while the shell is in the completion screen's local "add
+    /// another provider" detour (search + provider engine). The daemon
+    /// stage stays `Complete`; Escape offers a local return instead of a
+    /// daemon transition.
+    completion_detour: bool,
     /// Latched daemon transition awaiting its snapshot, so a stage that
     /// completed cannot request the same transition twice before the
     /// authoritative revision lands.
@@ -337,6 +376,8 @@ impl OnboardingShell {
             frame: 0,
             screen,
             escape: None,
+            completion_summary: None,
+            completion_detour: false,
             pending_transition: None,
             list_row_rects: Vec::new(),
         }
@@ -350,6 +391,16 @@ impl OnboardingShell {
             )),
             OnboardingStage::Provider => {
                 OnboardingScreen::ProviderSearch(Box::new(ProviderSearchScreen::new()))
+            }
+            OnboardingStage::Complete => {
+                // A fresh construction at `Complete` only happens when a
+                // caller bypassed the occupancy fence; present the
+                // completion surface rather than panicking on a stage that
+                // has no engine.
+                OnboardingScreen::Complete {
+                    summary: "Cockpit is ready.".to_string(),
+                    cursor: 1,
+                }
             }
             // Engine stages are mounted by the app, which owns the settings
             // dialog; `present_engine` pairs the screen with that mount
@@ -420,15 +471,81 @@ impl OnboardingShell {
         self.escape = None;
     }
 
-    /// Swap to the completion screen (the daemon stage stays Lifetime until
-    /// the final Complete transition commits).
+    /// Adopt an authoritative `Complete` revision without rebuilding the
+    /// native screen: the completion surface is presented from the summary
+    /// recorded when the lifetime stage settled.
+    pub(crate) fn note_authoritative_complete(
+        &mut self,
+        snapshot: &OnboardingBootstrapSnapshot,
+    ) -> bool {
+        self.run_id = snapshot.run_id;
+        self.attempt_id = snapshot.attempt_id;
+        self.revision = snapshot.revision;
+        self.stage = snapshot.stage;
+        self.limited_mode = snapshot.limited_mode;
+        self.bootstrap_state = snapshot.bootstrap_state;
+        self.pending_transition = None;
+        self.escape = None;
+        if matches!(self.screen, OnboardingScreen::Complete { .. }) {
+            return false;
+        }
+        self.present_completion(
+            self.completion_summary
+                .clone()
+                .unwrap_or_else(|| "Cockpit is ready.".to_string()),
+        );
+        true
+    }
+
+    /// Record the summary computed when the lifetime stage settled; it is
+    /// presented on the completion screen once the authoritative `Complete`
+    /// revision lands.
+    pub(crate) fn note_completion_summary(&mut self, summary: String) {
+        self.completion_summary = Some(summary);
+    }
+
+    /// Swap to the completion screen (the daemon stage is already
+    /// `Complete`: the terminal transition was requested when the lifetime
+    /// stage settled, and the authoritative revision presented this screen).
     pub(crate) fn present_completion(&mut self, summary: String) {
         self.screen = OnboardingScreen::Complete { summary, cursor: 1 };
+        self.completion_detour = false;
         self.escape = None;
     }
 
-    /// Return to the provider catalog (completion screen "add another
-    /// provider", or a provider engine that abandoned its Add page).
+    /// Return to the stored completion summary, leaving the "add another
+    /// provider" detour.
+    pub(crate) fn return_to_completion(&mut self) {
+        let summary = self
+            .completion_summary
+            .clone()
+            .unwrap_or_else(|| "Cockpit is ready.".to_string());
+        self.present_completion(summary);
+    }
+
+    /// True while the completion screen's "add another provider" detour is
+    /// active.
+    pub(crate) fn completion_detour_active(&self) -> bool {
+        self.completion_detour
+    }
+
+    /// Enter the completion screen's local "add another provider" detour:
+    /// the searchable catalog (and, after a selection, the provider
+    /// engine) with a shell-local return path. The daemon stage stays
+    /// `Complete`; the added provider settles through the ordinary
+    /// provider mutation authority, not an onboarding transition.
+    pub(crate) fn begin_completion_provider_detour(&mut self, status: Option<String>) {
+        let mut screen = ProviderSearchScreen::new();
+        screen.set_status(status);
+        self.screen = OnboardingScreen::ProviderSearch(Box::new(screen));
+        self.completion_detour = true;
+        self.escape = None;
+    }
+
+    /// Return to the provider catalog. Used when a provider engine mounted
+    /// from the `Provider` stage abandons its Add page. The completion
+    /// detour flag is preserved: abandoning the detour's engine stays
+    /// inside the detour, whose Escape offers a local return.
     pub(crate) fn present_provider_search(&mut self, status: Option<String>) {
         let mut screen = ProviderSearchScreen::new();
         screen.set_status(status);
@@ -444,6 +561,49 @@ impl OnboardingShell {
 
     pub(crate) fn transition_pending(&self) -> bool {
         self.pending_transition.is_some()
+    }
+
+    /// The latched in-flight transition kind, if any. Callers suppress a
+    /// duplicate request of the *same* kind while it is in flight; a
+    /// different kind supersedes it (the app aborts the earlier RPC).
+    pub(crate) fn pending_transition_kind(&self) -> Option<OnboardingTransitionKind> {
+        self.pending_transition.map(|(_, kind)| kind)
+    }
+
+    /// Clear the latch after a failed transition so the stage can retry.
+    pub(crate) fn clear_pending_transition(&mut self) {
+        self.pending_transition = None;
+    }
+
+    /// Reconcile the provider-engine pairing after any input path (key,
+    /// pointer, tick): an engine that left its Add page abandoned provider
+    /// setup, so the shell returns to the searchable catalog instead of a
+    /// settings list. Completion is *not* an abandon — the onboarding
+    /// wizard never leaves its Add page on Done; the daemon transition
+    /// owns that exit.
+    pub(crate) fn reconcile_provider_engine(&mut self, engine: &Dialog) {
+        if matches!(self.screen, OnboardingScreen::Engine(EngineStage::Provider))
+            && !engine.is_provider_add()
+        {
+            self.present_provider_search(Some(
+                "Provider setup was cancelled; nothing was saved.".into(),
+            ));
+        }
+    }
+
+    /// Feed live host capabilities to the secure-store screen. Placement is
+    /// gated on these rows; a bootstrap snapshot fetched while capabilities
+    /// were unpublished must not strand a stale view. Generation-monotonic:
+    /// an unpublished placeholder never clobbers published rows.
+    pub(crate) fn apply_host_capabilities(
+        &mut self,
+        capabilities: &cockpit_proto::HostCapabilitySnapshot,
+    ) {
+        if let OnboardingScreen::SecureStore(screen) = &mut self.screen {
+            if capabilities.generation >= screen.capabilities.generation {
+                screen.capabilities = capabilities.clone();
+            }
+        }
     }
 
     /// Advance the welcome fly-in exactly one frame. Returns whether the
@@ -527,14 +687,16 @@ impl OnboardingShell {
                     KeyCode::Down => *cursor = (*cursor + 1).min(1),
                     KeyCode::Enter | KeyCode::Char(' ') => {
                         if *cursor == 0 {
-                            self.present_provider_search(Some(
+                            // Local detour: the daemon stage stays Complete.
+                            self.begin_completion_provider_detour(Some(
                                 "Add another provider; live validation is required.".into(),
                             ));
                         } else {
-                            return Some(OnboardingShellAction::Transition(
-                                OnboardingTransitionKind::Complete,
-                                None,
-                            ));
+                            // The terminal Complete transition already
+                            // committed when the lifetime stage settled;
+                            // leaving the summary is a local close that
+                            // preserves committed progress.
+                            return Some(OnboardingShellAction::Close);
                         }
                     }
                     _ => {}
@@ -545,8 +707,9 @@ impl OnboardingShell {
                 let stage = *current;
                 if matches!(key.code, KeyCode::Esc) {
                     // While the engine owns an unsettled authority operation,
-                    // Escape belongs to its correlated cancellation, not to
-                    // the shell menu.
+                    // Escape belongs to its correlated handling (the engine
+                    // keeps the page mounted until the operation settles),
+                    // not to the shell menu.
                     if !engine.has_unsettled_local_authority() {
                         self.open_escape_menu(engine);
                         return None;
@@ -558,27 +721,21 @@ impl OnboardingShell {
                     // the flow; present the visible choice instead.
                     self.open_escape_menu(engine);
                 }
-                self.after_engine_key(stage, engine);
+                if stage == EngineStage::Provider {
+                    self.reconcile_provider_engine(engine);
+                }
                 None
             }
         }
     }
 
-    /// After routing a key to the provider engine, detect the wizard
-    /// abandoning its Add page (its own Escape/back semantics) and return
-    /// to the searchable catalog rather than a settings list.
-    fn after_engine_key(&mut self, stage: EngineStage, engine: &Dialog) {
-        if stage == EngineStage::Provider && !engine.is_provider_add() {
-            self.present_provider_search(Some(
-                "Provider setup was cancelled; nothing was saved.".into(),
-            ));
-        }
-    }
-
     fn open_escape_menu(&mut self, engine: &Dialog) {
-        let authority_pending = matches!(self.screen, OnboardingScreen::Engine(_))
-            && engine.has_unsettled_local_authority();
-        self.escape = Some(EscapeMenu::open(self.stage, authority_pending));
+        // Authority work in flight is a property of the app's daemon
+        // effects, not of which screen holds focus: even on a native screen
+        // (for example the catalog after an abandoned engine) an in-flight
+        // provider mutation makes Back/Defer/Cancel unofferable.
+        let authority_pending = engine.has_unsettled_local_authority();
+        self.escape = EscapeMenu::open(self.stage, authority_pending, self.completion_detour);
     }
 
     /// Pointer routing for the shell's own chrome and native screens. The
@@ -661,15 +818,12 @@ impl OnboardingShell {
                 };
                 *cursor = index.min(1);
                 if *cursor == 0 {
-                    self.present_provider_search(Some(
+                    self.begin_completion_provider_detour(Some(
                         "Add another provider; live validation is required.".into(),
                     ));
                     PointerOutcome::consumed()
                 } else {
-                    PointerOutcome::acted(OnboardingShellAction::Transition(
-                        OnboardingTransitionKind::Complete,
-                        None,
-                    ))
+                    PointerOutcome::acted(OnboardingShellAction::Close)
                 }
             }
             _ => PointerOutcome::ignored(),

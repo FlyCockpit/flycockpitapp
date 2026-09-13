@@ -1041,6 +1041,7 @@ fn is_global_turn_event(event: &TurnEvent) -> bool {
             | TurnEvent::DaemonLinkResynced { .. }
             | TurnEvent::DaemonLinkTerminal { .. }
             | TurnEvent::HostCapabilitiesChanged { .. }
+            | TurnEvent::OnboardingBootstrapChanged
             | TurnEvent::CaffeinateState { .. }
             | TurnEvent::DaemonDraining { .. }
             | TurnEvent::InterruptRaised { .. }
@@ -5154,6 +5155,9 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         HostCapabilitiesChanged { snapshot } => TurnEvent::HostCapabilitiesChanged {
             snapshot: Box::new(snapshot),
         },
+        // The broadcast carries only correlation ids; the authoritative
+        // projection is re-fetched by the consumer.
+        OnboardingBootstrap(..) => TurnEvent::OnboardingBootstrapChanged,
         // Agent-tree changes invalidate daemon-owned setup/tree queries.
         // Consume as a refresh signal, never a transcript row: a higher
         // tree seq must not make reconnect drop a later transcript event.

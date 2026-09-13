@@ -67,6 +67,13 @@ impl App {
                     return;
                 }
                 let _ = self.dialog.handle_settings_pointer(mouse);
+                // Pointer input can navigate the engine off its Add page
+                // (its own Done/Back affordances); apply the same abandon
+                // reconciliation the keyboard path runs so both input
+                // paths share one state machine.
+                if let Some(shell) = self.onboarding_shell.as_mut() {
+                    shell.reconcile_provider_engine(&self.dialog);
+                }
             }
             return;
         }

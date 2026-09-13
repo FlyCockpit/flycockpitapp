@@ -18551,6 +18551,7 @@ async fn handle_serialized_request_impl(
                         changed: true,
                         model_file_written: true,
                         default_scope: Some("global".into()),
+                        config_generation: inventory::current_config_generation(),
                     });
                 }
                 let result = crate::wizard::apply_setup_wizard_answers_authoritative(
@@ -18565,6 +18566,7 @@ async fn handle_serialized_request_impl(
                     changed: result.0,
                     model_file_written: result.1,
                     default_scope: result.2,
+                    config_generation: inventory::current_config_generation(),
                 })
             };
             match mutation.await {

@@ -139,6 +139,12 @@ impl App {
     /// onboarding entry/exit point: fresh launch, resume, deferred resume,
     /// and post-transition refreshes all flow through here.
     ///
+    /// A user-dismissed shell never reopens from a snapshot alone: Cancel,
+    /// close, and late authority results stay inert for occupancy while
+    /// still updating the stored snapshot (committed daemon progress is
+    /// never lost). Explicit re-entry (the no-provider send guard, or a
+    /// fresh launch) clears the dismissal.
+    ///
     /// A deferred run (`limited_mode`) does not auto-open the shell: defer
     /// means "limited mode now"; the shell reopens through the no-provider
     /// send guard or an explicit re-entry. A snapshot that commits the
@@ -151,14 +157,27 @@ impl App {
             self.onboarding_shell = None;
             return;
         }
+        if self.onboarding_dismissed {
+            // The user closed the shell; a snapshot alone must not reopen
+            // it (an in-flight transition result arriving after Cancel
+            // stays inert for occupancy).
+            return;
+        }
         if snapshot.stage == cockpit_proto::OnboardingStage::Complete {
-            // A completed run presents no onboarding surface. When the shell
-            // is showing its completion screen, the Start Coding action
-            // requested exactly this transition; closing here is the
-            // committed end. "Add another provider" keeps the daemon stage
-            // on Lifetime, so it never reaches this branch.
-            self.onboarding_shell = None;
-            self.dialog = crate::tui::settings::Dialog::None;
+            // A completed run presents no onboarding surface to a fresh
+            // launch. A shell that is still open just committed its own
+            // terminal transition: present the completion screen from the
+            // summary recorded when the lifetime stage settled. "Add
+            // another provider" is a local detour on top of that screen and
+            // never reaches this branch.
+            if let Some(shell) = self.onboarding_shell.as_mut() {
+                if shell.note_authoritative_complete(snapshot) {
+                    self.dialog = crate::tui::settings::Dialog::None;
+                }
+            } else {
+                self.onboarding_shell = None;
+                self.dialog = crate::tui::settings::Dialog::None;
+            }
             return;
         }
         if snapshot.limited_mode {
@@ -184,6 +203,7 @@ impl App {
 
     /// User-initiated reopen (the no-provider send guard): present the
     /// authoritative stage through the shell even in deferred limited mode.
+    /// Explicit re-entry clears the dismissal fence.
     pub(super) fn reopen_onboarding_shell(
         &mut self,
         snapshot: &cockpit_proto::OnboardingBootstrapSnapshot,
@@ -191,6 +211,7 @@ impl App {
         if self.onboarding_skip || snapshot.stage == cockpit_proto::OnboardingStage::Complete {
             return;
         }
+        self.onboarding_dismissed = false;
         if self.onboarding_shell.is_none() {
             self.onboarding_shell = Some(Box::new(crate::tui::onboarding::OnboardingShell::new(
                 snapshot,
@@ -198,6 +219,46 @@ impl App {
             )));
             self.mount_onboarding_engine(snapshot.stage);
         }
+    }
+
+    /// Read-only refresh of the authoritative bootstrap snapshot. Used by
+    /// the daemon-global `OnboardingBootstrap` broadcast so concurrent
+    /// clients follow authority changes; unlike the initial fetch it never
+    /// begins or reopens a run (a reopen would supersede the active
+    /// attempt and invalidate in-flight transition revisions).
+    pub(super) fn refresh_onboarding_bootstrap_snapshot(&mut self) {
+        if self.onboarding_skip {
+            return;
+        }
+        let lifecycle = self.lifecycle.clone();
+        self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.bootstrap_refresh"),
+            crate::tui::async_action::AsyncActionPolicy::Dedupe(
+                crate::tui::async_action::AsyncActionKey::new("onboarding.bootstrap_refresh"),
+            ),
+            async move {
+                let client = crate::tui::settings::settings_daemon_client(&lifecycle)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let current = match client
+                    .request(cockpit_proto::Request::GetOnboardingBootstrapSnapshot)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    Ok(cockpit_proto::Response::OnboardingBootstrapSnapshot(snapshot)) => snapshot,
+                    Ok(other) => return Err(format!("unexpected onboarding response: {other:?}")),
+                    Err(error) => return Err(error.to_string()),
+                };
+                if current.as_ref().is_some_and(|snapshot| {
+                    snapshot.bootstrap_state == cockpit_proto::OnboardingBootstrapState::Failed
+                }) {
+                    return retry_onboarding_ready_construction_snapshot(&lifecycle)
+                        .await
+                        .map(crate::tui::async_action::AsyncActionPayload::OnboardingBootstrap);
+                }
+                Ok(crate::tui::async_action::AsyncActionPayload::OnboardingBootstrap(current))
+            },
+        );
     }
 
     /// Mount the settings-dialog engine for wizard stages. The engine stays
@@ -352,7 +413,12 @@ impl App {
         let lifecycle = self.lifecycle.clone();
         self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.transition"),
-            crate::tui::async_action::AsyncActionPolicy::Dedupe(
+            // A superseding user intent owns the slot: Replace aborts the
+            // in-flight transition RPC before the new one starts, so a
+            // Back chosen while an Advance is in flight is never silently
+            // dropped by dedupe. The daemon's revision CAS is the final
+            // arbiter; losers reconcile through the error-path refresh.
+            crate::tui::async_action::AsyncActionPolicy::Replace(
                 crate::tui::async_action::AsyncActionKey::new("onboarding.transition"),
             ),
             async move {
@@ -394,6 +460,18 @@ impl App {
         match action {
             None => {}
             Some(OnboardingShellAction::Transition(kind, settlement)) => {
+                // A duplicate of the already in-flight intent is dropped:
+                // repeated completions (poller + user key) must not abort
+                // and resend the same RPC. A *different* kind supersedes
+                // the slot — `request_onboarding_transition` replaces the
+                // in-flight action.
+                let already_in_flight = self
+                    .onboarding_shell
+                    .as_ref()
+                    .is_some_and(|shell| shell.pending_transition_kind() == Some(kind));
+                if already_in_flight {
+                    return;
+                }
                 self.request_onboarding_transition(kind, settlement);
             }
             Some(OnboardingShellAction::SecureIntent(submission)) => {
@@ -411,10 +489,25 @@ impl App {
                     shell.present_engine(crate::tui::onboarding::EngineStage::Provider);
                 }
             }
+            Some(OnboardingShellAction::ReturnToCompletion) => {
+                // Shell-local: leave the completion screen's "add another
+                // provider" detour. The detour engine's in-flight provider
+                // authority work (if any) is not discardable — the escape
+                // menu offering this choice is suppressed while any is
+                // pending.
+                if let Some(shell) = self.onboarding_shell.as_mut() {
+                    shell.return_to_completion();
+                }
+                self.dialog = crate::tui::settings::Dialog::None;
+            }
             Some(OnboardingShellAction::Close) => {
                 // Cancel/exit preserves committed daemon progress and drops
                 // only the local engine state; a later reopen resumes from
-                // the authoritative snapshot.
+                // the authoritative snapshot. The dismissal fence keeps
+                // late authority results (an in-flight transition, a
+                // concurrent client's broadcast) from reopening the shell;
+                // only explicit re-entry clears it.
+                self.onboarding_dismissed = true;
                 self.onboarding_shell = None;
                 self.dialog = crate::tui::settings::Dialog::None;
             }
@@ -443,7 +536,11 @@ impl App {
         let lifecycle = self.lifecycle.clone();
         self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.secure_intent"),
-            crate::tui::async_action::AsyncActionPolicy::Dedupe(
+            // A later explicit placement choice owns the slot: Replace
+            // aborts an in-flight secure intent the same way transitions
+            // are superseded. The daemon's revision CAS plus the one-shot
+            // receipt keep a loser inert.
+            crate::tui::async_action::AsyncActionPolicy::Replace(
                 crate::tui::async_action::AsyncActionKey::new("onboarding.secure_intent"),
             ),
             async move {
@@ -454,23 +551,42 @@ impl App {
         );
     }
 
-    /// Service the full-screen onboarding shell each wake: advance stages
-    /// whose engine settled, present completion, and keep the shell paired
-    /// with a live engine. Key-driven intents are applied inline in
-    /// `handle_onboarding_shell_key`; this poll covers completions that the
-    /// engine reaches asynchronously.
+    /// Service the full-screen onboarding shell each wake: reconcile the
+    /// provider-engine pairing, advance stages whose engine settled,
+    /// commit the terminal transition once the lifetime stage settles, and
+    /// end the completion detour when its provider finishes. Key-driven
+    /// intents are applied inline in `handle_onboarding_shell_key`; this
+    /// poll covers completions that the engine reaches asynchronously.
     pub(super) fn service_onboarding_shell(&mut self) -> bool {
         let Some(snapshot) = self.onboarding_snapshot.clone() else {
             return false;
         };
-        let Some(shell) = self.onboarding_shell.as_ref() else {
+        let Some(shell) = self.onboarding_shell.as_mut() else {
             return false;
         };
+        // The provider engine can leave its Add page from pointer input and
+        // its own async completions, not only keys; reconcile here so every
+        // path shares one abandon detector.
+        shell.reconcile_provider_engine(&self.dialog);
         if shell.transition_pending() {
             return false;
         }
         match shell.stage() {
-            cockpit_proto::OnboardingStage::Complete => false,
+            cockpit_proto::OnboardingStage::Complete => {
+                // The completion screen's "add another provider" detour:
+                // the added provider settles through the ordinary provider
+                // mutation authority; once its engine reaches its done page
+                // the detour ends and the stored summary is presented again.
+                if shell.completion_detour_active()
+                    && shell.screen_is_engine(crate::tui::onboarding::EngineStage::Provider)
+                    && self.dialog.take_completed_provider_id().is_some()
+                {
+                    shell.return_to_completion();
+                    self.dialog = crate::tui::settings::Dialog::None;
+                    return true;
+                }
+                false
+            }
             cockpit_proto::OnboardingStage::Welcome
             | cockpit_proto::OnboardingStage::SecureStore => false,
             cockpit_proto::OnboardingStage::Profile => {
@@ -574,7 +690,7 @@ impl App {
                 let configured_model = self.config_snapshot.providers.active_model.clone();
                 let summary = self.onboarding_completion_summary();
                 if let Some(shell) = self.onboarding_shell.as_mut() {
-                    shell.present_completion(summary);
+                    shell.note_completion_summary(summary);
                 }
                 if self.submit_after_model_selection {
                     match configured_model {
@@ -597,6 +713,14 @@ impl App {
                         }
                     }
                 }
+                // Commit the terminal transition now that the lifetime
+                // stage settled: completion becomes an authoritative stage.
+                // The completion screen is presented from the stored
+                // summary when the resulting snapshot lands.
+                self.request_onboarding_transition(
+                    cockpit_proto::OnboardingTransitionKind::Complete,
+                    None,
+                );
                 true
             }
         }

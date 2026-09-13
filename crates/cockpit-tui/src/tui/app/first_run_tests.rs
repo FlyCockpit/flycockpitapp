@@ -286,16 +286,96 @@ fn first_run_flow_completes_end_to_end() {
     );
     app.dialog.test_mark_setup_complete("lifetime-save");
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    // The terminal Complete transition is now requested when the lifetime
+    // stage settles; the completion screen itself waits for the
+    // authoritative Complete revision to land.
+    assert!(
+        app.onboarding_shell
+            .as_ref()
+            .is_some_and(|shell| shell.transition_pending()),
+        "the lifetime settlement must request the terminal transition"
+    );
+
+    set_onboarding_stage(&mut app, OnboardingStage::Complete);
+    assert_eq!(
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::Complete),
+        "the authoritative Complete revision presents the stored summary"
+    );
+    assert!(!app.dialog.is_active());
+
+    // "Start coding" is a local close: the terminal transition already
+    // committed, so leaving the summary just closes the shell behind the
+    // occupancy fence.
+    shell_key(&mut app, KeyCode::Enter);
+    assert!(app.onboarding_shell.is_none());
+    assert!(!app.dialog.is_active());
+    assert!(app.onboarding_dismissed);
+
+    // A late authority result must not reopen the closed shell.
+    set_onboarding_stage(&mut app, OnboardingStage::Complete);
+    assert!(app.onboarding_shell.is_none());
+}
+
+#[test]
+fn completion_detour_ends_when_the_added_provider_settles() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    write_config(tmp.path(), &ProvidersConfig::default());
+    let mut app = App::new(Some(tmp.path()), false);
+    advance_through_secure_store(&mut app, tmp.path());
+    select_provider_template(&mut app, "openai");
+    write_global_config(&config_with_provider("p", "m"));
+    app.dialog.test_mark_provider_add_done("p");
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    set_onboarding_stage(&mut app, OnboardingStage::Model);
+    app.dialog.test_mark_setup_complete("model-save");
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    set_onboarding_stage(&mut app, OnboardingStage::Agent);
+    app.dialog.test_mark_setup_complete("agent-install");
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    set_onboarding_stage(&mut app, OnboardingStage::Lifetime);
+    app.dialog.test_mark_setup_complete("lifetime-save");
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    set_onboarding_stage(&mut app, OnboardingStage::Complete);
     assert_eq!(
         shell_screen_kind(&app),
         Some(crate::tui::onboarding::OnboardingScreenKind::Complete)
     );
 
-    // Start coding commits the terminal transition; the arriving
-    // authoritative snapshot closes the shell.
+    // "Add another provider" opens the local detour: the searchable catalog
+    // mounts without any daemon transition, and Escape offers a local
+    // return to the stored summary.
+    shell_key(&mut app, KeyCode::Up);
     shell_key(&mut app, KeyCode::Enter);
-    set_onboarding_stage(&mut app, OnboardingStage::Complete);
-    assert!(app.onboarding_shell.is_none());
+    assert_eq!(
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::ProviderSearch)
+    );
+    assert!(
+        app.onboarding_shell
+            .as_ref()
+            .is_some_and(|shell| shell.completion_detour_active())
+    );
+    shell_key(&mut app, KeyCode::Esc);
+    shell_key(&mut app, KeyCode::Enter);
+    assert_eq!(
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::Complete)
+    );
+
+    // A second detour that adds a provider ends when the provider engine
+    // reaches its done page: the stored summary is presented again and the
+    // engine unmounts.
+    shell_key(&mut app, KeyCode::Up);
+    shell_key(&mut app, KeyCode::Enter);
+    select_provider_template(&mut app, "openai");
+    app.dialog.test_mark_provider_add_done("p2");
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    assert_eq!(
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::Complete)
+    );
     assert!(!app.dialog.is_active());
 }
 
@@ -450,9 +530,10 @@ fn defer_provider_closes_shell_and_limited_resume_reopens_it() {
     advance_through_secure_store(&mut app, tmp.path());
 
     // Escape → Defer: an explicit, visible choice — never a silent
-    // key-to-defer mapping.
+    // key-to-defer mapping. Defer is the first row on the provider stage
+    // (Back is withheld: the daemon rejects reopening the committed
+    // secure-store choice).
     shell_key(&mut app, KeyCode::Esc);
-    shell_key(&mut app, KeyCode::Down);
     shell_key(&mut app, KeyCode::Enter);
 
     // The DeferProvider transition commits limited mode; the authoritative
@@ -506,13 +587,15 @@ fn cancel_preserves_progress_and_reopen_uses_authoritative_stage() {
     advance_through_secure_store(&mut app, tmp.path());
 
     // Escape → Cancel: closes the shell; committed daemon progress (the
-    // snapshot) is untouched.
+    // snapshot) is untouched. On the provider stage the menu is
+    // [Defer, Cancel] (Back would reopen the committed secure-store
+    // choice), so Cancel is one Down away.
     shell_key(&mut app, KeyCode::Esc);
-    shell_key(&mut app, KeyCode::Down);
     shell_key(&mut app, KeyCode::Down);
     shell_key(&mut app, KeyCode::Enter);
     assert!(app.onboarding_shell.is_none());
     assert!(!app.dialog.is_active());
+    assert!(app.onboarding_dismissed);
     assert_eq!(
         app.onboarding_snapshot
             .as_ref()
@@ -521,9 +604,20 @@ fn cancel_preserves_progress_and_reopen_uses_authoritative_stage() {
         "cancel must not erase the committed stage"
     );
 
-    // A later authoritative snapshot reopens at the current stage — the
-    // provider catalog, not a stale settings page.
+    // A snapshot alone must not reopen a dismissed shell — not even the
+    // authoritative transition result of work that was in flight when the
+    // user cancelled. Only explicit re-entry clears the fence.
     set_onboarding_stage(&mut app, OnboardingStage::Provider);
+    assert!(
+        app.onboarding_shell.is_none(),
+        "the occupancy fence keeps a dismissed shell closed"
+    );
+
+    // Explicit re-entry (the no-provider send guard) reopens at the
+    // authoritative stage — the provider catalog, not a stale settings page.
+    app.composer.set("resume after cancel".to_string());
+    assert!(!app.submit_input());
+    assert!(!app.onboarding_dismissed);
     assert!(app.onboarding_shell.is_some());
     assert_eq!(
         shell_screen_kind(&app),
@@ -590,7 +684,7 @@ fn late_engine_completion_after_close_is_inert() {
 }
 
 #[test]
-fn provider_engine_abandoned_returns_to_search_not_settings() {
+fn provider_engine_escape_never_offers_an_illegal_back() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
@@ -599,17 +693,39 @@ fn provider_engine_abandoned_returns_to_search_not_settings() {
     select_provider_template(&mut app, "openai");
     assert!(app.dialog.is_provider_add());
 
-    // The engine's own Escape is intercepted by the shell; the visible
-    // menu's Cancel is the only way out. Choose Back instead: the daemon
-    // Back transition returns to the prior committed stage, and the next
-    // snapshot remounts the secure-store screen.
+    // The engine's Escape is intercepted by the shell. The visible menu
+    // from the provider engine offers only what the daemon accepts for the
+    // stage: Defer and Cancel — Back from Provider would reopen the
+    // committed secure-store choice, so it is never offered.
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
     shell_key(&mut app, KeyCode::Esc);
-    shell_key(&mut app, KeyCode::Enter);
-    set_onboarding_stage(&mut app, OnboardingStage::SecureStore);
-    assert_eq!(
-        shell_screen_kind(&app),
-        Some(crate::tui::onboarding::OnboardingScreenKind::SecureStore)
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let rendered: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(rendered.contains("Leave setup?"), "{rendered}");
+    assert!(
+        !rendered.contains("Back to the previous step"),
+        "{rendered}"
     );
+    assert!(rendered.contains("Defer provider setup"), "{rendered}");
+
+    // Defer is an explicit daemon transition, not a silent key mapping.
+    shell_key(&mut app, KeyCode::Enter);
+    assert!(app.async_actions.has_pending_kind(
+        &crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.transition")
+    ));
+
+    // The committed deferral hands the surface to limited mode.
+    let mut deferred = onboarding_snapshot(OnboardingStage::Provider);
+    deferred.limited_mode = true;
+    deferred.revision += 10;
+    app.apply_onboarding_bootstrap_snapshot(Some(deferred));
+    assert!(app.onboarding_shell.is_none());
 }
 
 #[test]

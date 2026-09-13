@@ -2765,6 +2765,31 @@ pub struct SetupWizardDialog {
     queued_daemon_effect: Option<SettingsDaemonEffectRequest>,
     pending_operation_id: Option<uuid::Uuid>,
     settled_operation_id: Option<uuid::Uuid>,
+    /// Config generation of the daemon authority as of the settled
+    /// `ApplySetupWizard` receipt. The daemon's onboarding settlement fence
+    /// compares the claimed generation against its current authority, and a
+    /// pre-attach client cannot learn that generation from disk
+    /// (`resolution_generation` is runtime-only), so the receipt itself is
+    /// the settlement's generation authority.
+    settled_config_generation: Option<u64>,
+}
+
+impl SetupWizardDialog {
+    /// Paste into the wizard's shared text buffer. The buffer is only
+    /// meaningful while a `StepKind::Text` step holds focus (it is resynced
+    /// from the step prefill on every step change), so pastes on other step
+    /// kinds are dropped.
+    fn paste(&mut self, text: &str) {
+        if self.pending_operation_id.is_some() {
+            return;
+        }
+        if matches!(
+            self.run.current_step(),
+            Some(step) if matches!(step.kind, cockpit_core::wizard::StepKind::Text)
+        ) {
+            self.text.paste(text);
+        }
+    }
 }
 
 pub struct SettingsDialog {
@@ -2813,6 +2838,7 @@ fn setup_wizard_dialog(
         queued_daemon_effect: None,
         pending_operation_id: None,
         settled_operation_id: None,
+        settled_config_generation: None,
     });
     Ok(if onboarding {
         Dialog::OnboardingWizard(wizard)
@@ -5837,6 +5863,38 @@ impl Dialog {
         add.error.as_deref()
     }
 
+    /// Current step id of the onboarding provider engine's Add wizard, for
+    /// integration tests that drive the wizard with real keys and wait for
+    /// daemon-backed steps (save, validation) to settle.
+    #[cfg(test)]
+    pub(crate) fn test_provider_add_step(&self) -> Option<&'static str> {
+        let Dialog::Settings(settings) = self else {
+            return None;
+        };
+        let page = settings.page.as_any().downcast_ref::<ProvidersPage>()?;
+        let ProvidersPage::Add(add) = page else {
+            return None;
+        };
+        add.run.current_step_id()
+    }
+
+    /// Whether the onboarding provider engine has a validation fetch in
+    /// flight. Real-daemon tests wait for this to clear before driving the
+    /// offline continuation keys.
+    #[cfg(test)]
+    pub(crate) fn test_provider_add_fetch_pending(&self) -> bool {
+        let Dialog::Settings(settings) = self else {
+            return false;
+        };
+        let Some(page) = settings.page.as_any().downcast_ref::<ProvidersPage>() else {
+            return false;
+        };
+        let ProvidersPage::Add(add) = page else {
+            return false;
+        };
+        add.fetch.is_some()
+    }
+
     #[cfg(test)]
     pub(crate) fn test_mark_provider_add_done(&mut self, provider_id: &str) {
         let Dialog::Settings(settings) = self else {
@@ -5896,6 +5954,54 @@ impl Dialog {
             return None;
         };
         wizard.run.prefill()
+    }
+
+    /// Current wizard step id (both wizard dialog variants), for tests that
+    /// drive the wizard step by step.
+    #[cfg(test)]
+    pub(crate) fn test_setup_step(&self) -> Option<&'static str> {
+        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
+            return None;
+        };
+        wizard.run.current_step().map(|step| step.id)
+    }
+
+    /// Kind name of the current wizard step: one of `select`, `text`,
+    /// `confirm`, `info`, `action`, `multi`, `tools`, `secret`.
+    #[cfg(test)]
+    pub(crate) fn test_setup_step_kind(&self) -> Option<&'static str> {
+        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
+            return None;
+        };
+        let step = wizard.run.current_step()?;
+        Some(match step.kind {
+            cockpit_core::wizard::StepKind::Select { .. } => "select",
+            cockpit_core::wizard::StepKind::Text => "text",
+            cockpit_core::wizard::StepKind::Confirm => "confirm",
+            cockpit_core::wizard::StepKind::Info => "info",
+            cockpit_core::wizard::StepKind::Action { .. } => "action",
+            cockpit_core::wizard::StepKind::MultiToggle { .. } => "multi",
+            cockpit_core::wizard::StepKind::ToolSurface => "tools",
+            cockpit_core::wizard::StepKind::Secret => "secret",
+        })
+    }
+
+    /// Number of select options on the current wizard step.
+    #[cfg(test)]
+    pub(crate) fn test_setup_step_options(&self) -> usize {
+        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
+            return 0;
+        };
+        wizard.run.select_options().len()
+    }
+
+    /// Current text-buffer contents of the wizard's focused Text step.
+    #[cfg(test)]
+    pub(crate) fn test_setup_text(&self) -> Option<String> {
+        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
+            return None;
+        };
+        Some(wizard.text.text().to_string())
     }
 
     pub fn open(cwd: &std::path::Path) -> Self {
@@ -6231,10 +6337,23 @@ impl Dialog {
         let Dialog::OnboardingWizard(wizard) = self else {
             return None;
         };
-        if wizard.run.descriptor().id != wizard_id || config_generation == 0 {
+        if wizard.run.descriptor().id != wizard_id {
             return None;
         }
         let operation_id = wizard.settled_operation_id?.to_string();
+        // The daemon's fence compares the claimed generation against its
+        // current authority. The settled receipt's own generation is the
+        // one value guaranteed to match it; the caller-supplied (disk
+        // derived) generation is a fallback for receipts predating the
+        // field. Both must be non-zero to name a checkpoint past stage
+        // entry.
+        let config_generation = wizard
+            .settled_config_generation
+            .filter(|generation| *generation > 0)
+            .unwrap_or(config_generation);
+        if config_generation == 0 {
+            return None;
+        }
         Some(cockpit_proto::OnboardingStageSettlement {
             run_id,
             attempt_id,
@@ -6578,12 +6697,15 @@ impl Dialog {
         }
     }
 
-    /// Insert pasted text into the focused text field. Only the settings
-    /// pages own text fields; the config pickers are pure list nav, so a
-    /// paste there is dropped.
+    /// Insert pasted text into the focused text field. The settings pages
+    /// and the setup wizards own text fields; the config pickers are pure
+    /// list nav, so a paste there is dropped. Wizard engines reached
+    /// through the onboarding shell share this path, so model ids and other
+    /// manual wizard text stay pasteable during onboarding.
     pub fn paste(&mut self, text: &str) {
         match self {
             Dialog::Settings(s) => s.paste(text),
+            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard) => wizard.paste(text),
             _ => {}
         }
     }
@@ -9744,8 +9866,13 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
         cockpit_core::wizard::StepKind::Action { .. } => {
             if matches!(
                 step.id,
-                "security-save" | "model-save" | "profile-save" | "lifetime-save"
+                "security-save" | "model-save" | "profile-save" | "lifetime-save" | "agent-install"
             ) {
+                // Every terminal onboarding wizard step settles through the
+                // daemon's ApplySetupWizard operation: the recorded terminal
+                // receipt is what the onboarding advance settlement is
+                // validated against, so a wizard that skips the RPC can
+                // never advance its stage.
                 let answers_json = match run.answers_json() {
                     Ok(answers_json) => answers_json,
                     Err(error) => {
@@ -9912,7 +10039,14 @@ fn apply_setup_wizard_daemon_completion(
             changed,
             model_file_written,
             default_scope,
+            config_generation,
         }) => {
+            // The receipt's generation is the settlement's generation
+            // authority (see `settled_config_generation`); a zero means a
+            // daemon older than the field and keeps the caller's fallback.
+            if config_generation > 0 {
+                wizard.settled_config_generation = Some(config_generation);
+            }
             if let Err(error) = wizard
                 .run
                 .submit(cockpit_core::wizard::WizardAnswer::Acknowledged)

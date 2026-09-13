@@ -992,6 +992,7 @@ impl App {
             }
             AsyncActionKind::DaemonRpc(
                 "onboarding.bootstrap"
+                | "onboarding.bootstrap_refresh"
                 | "onboarding.transition"
                 | "onboarding.secure_intent"
                 | "onboarding.ready_retry",
@@ -999,10 +1000,31 @@ impl App {
                 Ok(AsyncActionPayload::OnboardingBootstrap(snapshot)) => {
                     self.apply_onboarding_bootstrap_snapshot(snapshot);
                 }
-                Err(error) => self.show_toast(
-                    format!("Onboarding authority unavailable: {error}"),
-                    crate::tui::app::ToastKind::Error,
-                ),
+                Err(error) => {
+                    self.show_toast(
+                        format!("Onboarding authority unavailable: {error}"),
+                        crate::tui::app::ToastKind::Error,
+                    );
+                    // A failed transition (a Replace loser, a revision
+                    // conflict, transport loss) leaves the shell latched on
+                    // a revision that will never land: clear the latch and
+                    // re-read the authority so the stage can retry from the
+                    // real checkpoint instead of staying wedged. Read-only
+                    // fetch failures and the ready-construction retry keep
+                    // their existing user-driven retry loop (no
+                    // auto-restart here, and secure-intent failures latch
+                    // nothing).
+                    let is_authority_write = matches!(
+                        result.kind,
+                        AsyncActionKind::DaemonRpc("onboarding.transition")
+                    );
+                    if is_authority_write {
+                        if let Some(shell) = self.onboarding_shell.as_mut() {
+                            shell.clear_pending_transition();
+                        }
+                        self.refresh_onboarding_bootstrap_snapshot();
+                    }
+                }
                 Ok(_) => self.show_toast(
                     "Onboarding authority returned an invalid projection",
                     crate::tui::app::ToastKind::Error,

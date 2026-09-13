@@ -403,8 +403,22 @@ impl App {
             self.project_id = Some(r.project_id.clone());
             self.foreground_input_target = r.foreground_target.clone();
             self.maybe_show_daemon_version_chip(&r.daemon_version, r.daemon_compatible);
+            let endpoint_changed = match (
+                self.startup_background.daemon_socket.as_ref(),
+                Some(&r.socket),
+            ) {
+                (None, _) => true,
+                (Some(previous), Some(next)) => previous != next,
+                (Some(_), None) => true,
+            };
             self.startup_background.daemon_socket = Some(r.socket.clone());
             self.startup_background.daemon_endpoint = Some(r.endpoint.clone());
+            if endpoint_changed && self.session_rail.list_generation() > 0 {
+                self.session_rail.discard_for_attachment_change();
+                self.abort_session_rail_runner_actions(true);
+            }
+            self.session_rail.set_daemon_connected(true);
+            self.maybe_start_session_rail_list();
             // Flush records buffered before the runner existed,
             // backfilling tag project ids now that we know the project.
             let pid = self.project_id.clone();

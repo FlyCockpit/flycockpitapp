@@ -229,9 +229,15 @@ impl ScreenSnapshot {
 
     /// First non-whitespace cell and last non-whitespace cell on `row`.
     pub fn row_content_span(&self, row: u16) -> Option<(CellPos, CellPos)> {
+        self.row_content_span_from(row, 0)
+    }
+
+    /// First/last non-whitespace cells on `row` at columns `>= min_col`.
+    /// Use `min_col` to exclude a left-hand chrome column such as the session rail.
+    pub fn row_content_span_from(&self, row: u16, min_col: u16) -> Option<(CellPos, CellPos)> {
         let mut first = None;
         let mut last = None;
-        for col in 0..self.cols {
+        for col in min_col..self.cols {
             let Some(cell) = self.cell_at(row, col) else {
                 continue;
             };

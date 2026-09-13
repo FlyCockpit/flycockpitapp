@@ -20,7 +20,7 @@ Conversation rules are lineage-scoped advisory directives. `/rules` opens the pa
 | Key | Action | Description |
 | --- | --- | --- |
 | `Enter` | send | submit the message |
-| `Ctrl+J` | newline | insert a newline |
+| `Shift+Enter` / `Alt+Enter` | newline | insert a newline |
 | `Ctrl+T` | thinking | toggle reasoning blocks |
 | `Ctrl+Y` | copy pick | pick a message or code block to copy |
 | `Shift+Tab` | cycle agent | switch the primary agent |
@@ -147,18 +147,24 @@ Box-level `[send now] [steer all\|hold all] [edit] [cancel]` also sit on the top
 
 ## Sessions
 
+The session rail is persistent in the chat shell. `/sessions` focuses it and
+opens search. `Ctrl+J` focuses the rail; Escape returns to the composer.
+
 | Key | Action | Description |
 | --- | --- | --- |
+| `Ctrl+J` | focus | focus the session rail |
 | `↑/↓` | move | highlight a session |
 | `Enter` | resume | resume the highlighted session |
+| `/` | search | search the current projection |
 | `i` | inbox source | open the latest assistant inbox source thread |
 | `n` | inbox | show notify and pending assistant inbox entries |
 | `→/l` | forks | descend into a session's forks |
 | `e` | windows | expand a compaction lineage |
 | `←/h` | back | ascend to the parent level |
 | `a` | archived | toggle showing archived sessions |
+| `f` | favorite | toggle the lineage favorite |
 | `u / d` | archive | unarchive / archive the highlighted session |
-| `q · Esc` | close | close the browser |
+| `Esc` | composer | return focus to the composer |
 
 ## Permissions
 

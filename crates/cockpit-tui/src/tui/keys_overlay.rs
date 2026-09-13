@@ -195,9 +195,9 @@ const COMPOSER: KeyGroup = KeyGroup {
             desc: "submit the message",
         },
         KeyBinding {
-            key: "Ctrl+J",
+            key: "Shift+Enter",
             action: "newline",
-            desc: "insert a newline",
+            desc: "insert a newline (Alt+Enter also)",
         },
         KeyBinding {
             key: "Ctrl+T",
@@ -676,7 +676,7 @@ fn groups_for_owned(context: KeyContext, keyboard_enhancement_active: bool) -> V
         KeyContext::SlashMenu => SLASH_MENU.into(),
         KeyContext::ModelPicker => MODEL_PICKER.into(),
         KeyContext::Settings => SETTINGS.into(),
-        KeyContext::Sessions => crate::tui::sessions_pane::SessionsPane::keybindings().into(),
+        KeyContext::Sessions => crate::tui::session_rail::SessionRail::keybindings().into(),
         KeyContext::Permissions => {
             crate::tui::permissions_pane::PermissionsPane::keybindings().into()
         }

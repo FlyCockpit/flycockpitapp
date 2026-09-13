@@ -7322,6 +7322,12 @@ impl SettingsDialog {
     }
 
     #[cfg(test)]
+    pub(crate) fn pointer_test_has_hover(&self) -> bool {
+        self.cx.pointer_surface.hover.borrow().is_some()
+            || self.cx.pointer_surface.header_hover.get().is_some()
+    }
+
+    #[cfg(test)]
     pub(crate) fn pointer_test_button_targets(&self) -> Vec<crate::tui::button::RegisteredButton> {
         self.cx.pointer_surface.buttons.borrow().targets().to_vec()
     }

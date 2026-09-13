@@ -142,21 +142,19 @@ async fn coverage_admission_is_one_operation_and_stale_results_are_inert() {
             Ok(())
         })
         .expect("one fresh operation");
-    let bound = authority
+    let stale_admission = authority
         .acquire(
             coverage_test_key(41),
             CoverageScope::SessionSubmission,
             coverage_test_capture(captures.clone(), 41),
         )
         .await
-        .expect("bound table capture")
-        .into_bound_table()
-        .expect("bound table install");
+        .expect("fresh capture after invalidation");
     authority.invalidate();
-    assert_eq!(
-        bound.scrub("session-worker-coverage-canary"),
-        "**REDACTED BY COCKPIT - DO NOT TRY TO OBTAIN BY WORKAROUND**"
-    );
+    assert!(matches!(
+        stale_admission.use_at_sink(|_| Ok(())),
+        Err(crate::redact::coverage_authority::CoverageError::Invalidated)
+    ));
     assert_eq!(captures.load(std::sync::atomic::Ordering::SeqCst), 3);
 }
 
@@ -353,7 +351,8 @@ fn coverage_map_has_no_unclassified_builder_refresh_or_empty_admission() {
 
 #[tokio::test]
 async fn toggle_redaction_reacquires_bound_coverage() {
-    crate::redact::coverage_route_behavior::tests::assert_derived_tables_preserve_binding().await;
+    crate::redact::coverage_route_behavior::tests::assert_unbound_tables_support_derived_transforms()
+        .await;
     crate::redact::coverage_route_behavior::tests::assert_publish_fence_rejects_stale_owned_revisions()
         .await;
 }

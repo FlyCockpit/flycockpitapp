@@ -197,17 +197,18 @@ async fn acquire_daemon_redaction_table(
                 &capture_inputs,
             )?;
             Ok(build.with_publish_fence(
-                crate::redact::coverage_bindings::DaemonGlobalCoveragePublishContext::from_inputs(
+                crate::redact::coverage_bindings::daemon_global_publish_owners_from_inputs(
                     &capture_inputs,
                     capture_vault.clone(),
                     capture_cache.clone(),
+                    std::sync::Arc::new(env_snapshot_for_capture.clone()),
                 )
                 .publish_fence(),
             ))
         })
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?
-        .into_bound_table()
+        .into_unbound_table()
         .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
@@ -5647,28 +5648,28 @@ pub(crate) async fn boot_ready_with_db(
                     source_root: &boot_root,
                     redact_config: &capture_config,
                 };
-                let build = crate::redact::coverage_authority::CoverageBuild::capture_without_sealed(
-                    &capture_config,
-                    &boot_root,
-                    &boot_env,
-                    &store,
-                    &capture_inputs,
-                )?;
-                Ok(
-                    build.with_publish_fence(
-                        crate::redact::coverage_bindings::DaemonGlobalCoveragePublishContext::from_inputs(
-                            &capture_inputs,
-                            capture_vault.clone(),
-                            capture_cache.clone(),
-                        )
-                        .publish_fence(),
-                    ),
-                )
+                let build =
+                    crate::redact::coverage_authority::CoverageBuild::capture_without_sealed(
+                        &capture_config,
+                        &boot_root,
+                        &boot_env,
+                        &store,
+                        &capture_inputs,
+                    )?;
+                Ok(build.with_publish_fence(
+                    crate::redact::coverage_bindings::daemon_global_publish_owners_from_inputs(
+                        &capture_inputs,
+                        capture_vault.clone(),
+                        capture_cache.clone(),
+                        std::sync::Arc::new(boot_env_snapshot.clone()),
+                    )
+                    .publish_fence(),
+                ))
             },
         )
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?
-        .into_bound_table()
+        .into_unbound_table()
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     timer.phase("redaction_table");
     let mut ctx = DaemonContext::new_with_boot_authority(

@@ -3561,23 +3561,22 @@ impl Driver {
                         &sealed,
                         &capture_inputs,
                     )?;
-                    Ok(
-                        build.with_publish_fence(
-                            crate::redact::coverage_bindings::SessionCoveragePublishContext::from_session_inputs(
-                                &capture_inputs,
-                                publish_vault,
-                                publish_db,
-                                publish_command_cache,
-                            )
-                            .publish_fence(),
-                        ),
-                    )
+                    Ok(build.with_publish_fence(
+                        crate::redact::coverage_bindings::session_publish_owners_from_inputs(
+                            &capture_inputs,
+                            publish_vault,
+                            publish_db,
+                            publish_command_cache,
+                            std::sync::Arc::new(env_snapshot_for_capture.clone()),
+                        )
+                        .publish_fence(),
+                    ))
                 },
             )
             .await
         {
             Ok(admission) => {
-                let new_table = match admission.into_bound_table() {
+                let new_table = match admission.into_unbound_table() {
                     Ok(table) => table.as_ref().clone(),
                     Err(error) => return Self::refuse_unredacted_send(tx, error).await,
                 };

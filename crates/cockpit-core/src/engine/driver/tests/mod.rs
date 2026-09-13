@@ -3,8 +3,10 @@ use cockpit_test_support::provider::{ScriptedProvider, Turn, Usage, WireDialect}
 
 #[tokio::test]
 async fn turn_uses_daemon_coverage_lease() {
-    crate::redact::coverage_route_behavior::tests::assert_derived_tables_preserve_binding().await;
-    crate::redact::coverage_route_behavior::tests::assert_live_current_binding_survives_lru().await;
+    crate::redact::coverage_route_behavior::tests::assert_unbound_tables_support_derived_transforms()
+        .await;
+    crate::redact::coverage_route_behavior::tests::assert_resident_generation_survives_lru_while_admitted()
+        .await;
 }
 
 mod context;

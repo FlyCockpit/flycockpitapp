@@ -182,23 +182,9 @@ async fn coverage_admission_is_one_operation_and_stale_results_are_inert() {
 }
 
 #[tokio::test]
-async fn bound_table_rejects_scrub_after_invalidation() {
-    let authority = RedactionCoverageAuthority::default();
-    let captures = Arc::new(AtomicUsize::new(0));
-    let base = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
-    let bound = authority
-        .acquire(
-            key(base),
-            CoverageScope::SessionSubmission,
-            capture(captures.clone(), base),
-        )
-        .await
-        .expect("complete capture is admitted")
-        .into_bound_table()
-        .expect("bound table installs generation binding");
-    assert_eq!(bound.scrub("coverage-canary-secret"), REDACTED);
-    authority.invalidate();
-    assert_eq!(bound.scrub("coverage-canary-secret"), REDACTED);
+async fn bound_sink_refuses_scrub_after_invalidation() {
+    crate::redact::coverage_route_behavior::tests::assert_bound_sink_scrub_refuses_stale_binding()
+        .await;
 }
 
 #[tokio::test]
@@ -707,13 +693,26 @@ async fn external_mutation_before_completed_scan_boundary_retries_or_refuses() {
 }
 
 #[tokio::test]
-async fn derived_tables_preserve_admitted_generation_binding() {
-    crate::redact::coverage_route_behavior::tests::assert_derived_tables_preserve_binding().await;
+async fn unbound_tables_support_derived_transforms() {
+    crate::redact::coverage_route_behavior::tests::assert_unbound_tables_support_derived_transforms()
+        .await;
 }
 
 #[tokio::test]
-async fn live_current_binding_survives_lru_eviction() {
-    crate::redact::coverage_route_behavior::tests::assert_live_current_binding_survives_lru().await;
+async fn resident_generation_survives_lru_while_admitted() {
+    crate::redact::coverage_route_behavior::tests::assert_resident_generation_survives_lru_while_admitted()
+        .await;
+}
+
+#[tokio::test]
+async fn one_shot_admission_refuses_after_invalidation() {
+    crate::redact::coverage_route_behavior::tests::assert_one_shot_admission_refuses_after_invalidation()
+        .await;
+}
+
+#[tokio::test]
+async fn union_refuses_mismatched_generation_bindings() {
+    crate::redact::coverage_route_behavior::tests::assert_union_refuses_mismatched_bindings().await;
 }
 
 #[tokio::test]

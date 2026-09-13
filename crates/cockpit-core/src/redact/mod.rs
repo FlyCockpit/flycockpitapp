@@ -1509,10 +1509,12 @@ impl RedactionTable {
             unsupported_files,
             protected,
         )?;
-        merged.coverage_binding = match (&other.coverage_binding, &self.coverage_binding) {
-            (Some(right), _) => Some(right.clone()),
-            (None, Some(left)) => Some(left.clone()),
+        merged.coverage_binding = match (&self.coverage_binding, &other.coverage_binding) {
             (None, None) => None,
+            (Some(left), Some(right)) if left.same_generation(right) => Some(left.clone()),
+            (Some(_), None) | (None, Some(_)) | (Some(_), Some(_)) => {
+                anyhow::bail!("coverage binding mismatch across union operands")
+            }
         };
         Ok(merged)
     }
@@ -1785,6 +1787,8 @@ impl RedactionTable {
             if body.is_empty() {
                 return Cow::Borrowed(body);
             }
+            // A stale generation-bound table must not silently substitute the
+            // whole payload; callers holding an admission lease must refuse.
             return Cow::Owned(self.placeholder.clone());
         }
         // The config-level opt-out (`redact.enabled = false`) suppresses
@@ -1916,12 +1920,28 @@ impl RedactionTable {
                     .map(|matcher| matcher.memory_usage())
                     .unwrap_or(0),
             );
+        let unsupported_path_bytes = self
+            .unsupported_files
+            .iter()
+            .map(|path| path.as_os_str().len())
+            .sum::<usize>();
+        let conflict_string_bytes = self
+            .protected_path_conflicts
+            .iter()
+            .map(|value| value.len())
+            .sum::<usize>();
+        let protected_path_bytes = self
+            .protected
+            .to_persisted()
+            .iter()
+            .map(|value| value.len())
+            .sum::<usize>();
         entry_bytes
             .saturating_add(automaton_bytes)
-            .saturating_add(self.unsupported_files.capacity() * std::mem::size_of::<PathBuf>())
-            .saturating_add(
-                self.protected_path_conflicts.capacity() * std::mem::size_of::<String>(),
-            )
+            .saturating_add(self.placeholder.len())
+            .saturating_add(unsupported_path_bytes)
+            .saturating_add(conflict_string_bytes)
+            .saturating_add(protected_path_bytes)
     }
 
     /// This table with the config-level opt-out (`redact.enabled = false`)
@@ -1961,6 +1981,15 @@ impl RedactionTable {
             coverage_binding: Some(binding),
             ..self
         }
+    }
+
+    pub(crate) fn ensure_binding_current(
+        &self,
+    ) -> std::result::Result<(), coverage_authority::CoverageError> {
+        if let Some(binding) = &self.coverage_binding {
+            binding.validate()?;
+        }
+        Ok(())
     }
 
     fn coverage_binding_stale(&self) -> bool {

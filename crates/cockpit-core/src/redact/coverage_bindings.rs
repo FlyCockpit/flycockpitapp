@@ -262,65 +262,50 @@ impl DaemonGlobalCoverageInputs<'_> {
     }
 }
 
-/// Owned inputs needed to reread live source revisions at publication time.
-pub(crate) struct SessionCoveragePublishContext {
-    environment: EnvSnapshot,
-    policy_digest: String,
-    override_revision: u64,
-    redact_config: RedactConfig,
-    workspace_root: PathBuf,
-    command_cache: std::sync::Arc<crate::secret_command::CommandSecretCache>,
+/// Live owners consulted independently at publication time.
+pub(crate) struct SessionCoveragePublishOwners {
     vault: std::sync::Arc<crate::secure_key::SecretVault>,
     db: cockpit_db::Db,
+    command_cache: std::sync::Arc<crate::secret_command::CommandSecretCache>,
+    environment: std::sync::Arc<EnvSnapshot>,
+    policy_digest: std::sync::Arc<dyn Fn() -> String + Send + Sync>,
+    override_revision: std::sync::Arc<dyn Fn() -> u64 + Send + Sync>,
+    redact_config: std::sync::Arc<dyn Fn() -> RedactConfig + Send + Sync>,
+    workspace_root: std::sync::Arc<dyn Fn() -> PathBuf + Send + Sync>,
 }
 
-impl SessionCoveragePublishContext {
-    pub(crate) fn from_session_inputs(
-        inputs: &SessionCoverageInputs<'_>,
-        vault: std::sync::Arc<crate::secure_key::SecretVault>,
-        db: cockpit_db::Db,
-        command_cache: std::sync::Arc<crate::secret_command::CommandSecretCache>,
-    ) -> Self {
-        Self {
-            environment: inputs.environment.clone(),
-            policy_digest: inputs.policy_digest.to_string(),
-            override_revision: inputs.override_revision,
-            redact_config: inputs.redact_config.clone(),
-            workspace_root: inputs.workspace_root.to_path_buf(),
-            command_cache,
-            vault,
-            db,
-        }
-    }
-
-    pub(crate) fn owned_revisions(&self, table: &RedactionTable) -> OwnedSourceRevisions {
-        let vault_revision = self.vault.current_inventory_generation().unwrap_or(0);
+impl SessionCoveragePublishOwners {
+    pub(crate) fn owned_revisions(
+        &self,
+        table: &RedactionTable,
+    ) -> anyhow::Result<OwnedSourceRevisions> {
+        let vault_revision = self
+            .vault
+            .current_inventory_generation()
+            .map_err(|error| anyhow::anyhow!("reading redaction vault revision: {error}"))?;
         let sealed_records = tokio::runtime::Handle::try_current()
-            .and_then(|handle| {
-                handle
-                    .block_on(self.db.machine_scoped_sealed_redaction_records())
-                    .ok()
-            })
-            .unwrap_or_default();
+            .map_err(|_| anyhow::anyhow!("coverage publication requires async runtime"))?
+            .block_on(self.db.machine_scoped_sealed_redaction_records())
+            .map_err(|error| anyhow::anyhow!("reading sealed redaction records: {error}"))?;
         let sealed = sealed_records_binding(&sealed_records);
-        OwnedSourceRevisions {
+        let policy_digest = self.policy_digest();
+        let override_revision = self.override_revision();
+        let redact_config = self.redact_config();
+        let workspace_root = self.workspace_root();
+        Ok(OwnedSourceRevisions {
             environment: CoverageBinding::derive(
                 b"environment",
                 self.environment.digest().as_bytes(),
             ),
             credential_vault: credential_vault_binding(vault_revision, &self.command_cache),
-            policy: CoverageBinding::derive(b"policy", self.policy_digest.as_bytes()),
+            policy: CoverageBinding::derive(b"policy", policy_digest.as_bytes()),
             sealed,
             override_revision: CoverageBinding::derive(
                 b"override",
-                &self.override_revision.to_le_bytes(),
+                &override_revision.to_le_bytes(),
             ),
-            machine_sources: machine_sources_binding(
-                &self.redact_config,
-                &self.workspace_root,
-                Some(table),
-            ),
-        }
+            machine_sources: machine_sources_binding(&redact_config, &workspace_root, Some(table)),
+        })
     }
 
     pub(crate) fn publish_fence(self) -> super::coverage_authority::CoveragePublishFence {
@@ -329,56 +314,93 @@ impl SessionCoveragePublishContext {
 }
 
 /// Daemon-global publication fence that rereads sync-accessible owned sources.
-pub(crate) struct DaemonGlobalCoveragePublishContext {
-    environment: EnvSnapshot,
-    policy_digest: String,
-    override_revision: u64,
-    redact_config: RedactConfig,
-    source_root: PathBuf,
-    command_cache: std::sync::Arc<crate::secret_command::CommandSecretCache>,
+pub(crate) struct DaemonGlobalCoveragePublishOwners {
     vault: std::sync::Arc<crate::secure_key::SecretVault>,
+    environment: std::sync::Arc<EnvSnapshot>,
+    policy_digest: std::sync::Arc<dyn Fn() -> String + Send + Sync>,
+    override_revision: std::sync::Arc<dyn Fn() -> u64 + Send + Sync>,
+    redact_config: std::sync::Arc<dyn Fn() -> RedactConfig + Send + Sync>,
+    source_root: std::sync::Arc<dyn Fn() -> PathBuf + Send + Sync>,
+    command_cache: std::sync::Arc<crate::secret_command::CommandSecretCache>,
+    sealed: std::sync::Arc<dyn Fn() -> CoverageBinding + Send + Sync>,
 }
 
-impl DaemonGlobalCoveragePublishContext {
-    pub(crate) fn from_inputs(
-        inputs: &DaemonGlobalCoverageInputs<'_>,
-        vault: std::sync::Arc<crate::secure_key::SecretVault>,
-        command_cache: std::sync::Arc<crate::secret_command::CommandSecretCache>,
-    ) -> Self {
-        Self {
-            environment: inputs.environment.clone(),
-            policy_digest: inputs.policy_digest.to_string(),
-            override_revision: inputs.override_revision,
-            redact_config: inputs.redact_config.clone(),
-            source_root: inputs.source_root.to_path_buf(),
-            command_cache,
-            vault,
-        }
-    }
-
-    pub(crate) fn owned_revisions(&self, table: &RedactionTable) -> OwnedSourceRevisions {
-        let vault_revision = self.vault.current_inventory_generation().unwrap_or(0);
-        OwnedSourceRevisions {
+impl DaemonGlobalCoveragePublishOwners {
+    pub(crate) fn owned_revisions(
+        &self,
+        table: &RedactionTable,
+    ) -> anyhow::Result<OwnedSourceRevisions> {
+        let vault_revision = self
+            .vault
+            .current_inventory_generation()
+            .map_err(|error| anyhow::anyhow!("reading redaction vault revision: {error}"))?;
+        let policy_digest = self.policy_digest();
+        let override_revision = self.override_revision();
+        let redact_config = self.redact_config();
+        let source_root = self.source_root();
+        Ok(OwnedSourceRevisions {
             environment: CoverageBinding::derive(
                 b"environment",
                 self.environment.digest().as_bytes(),
             ),
             credential_vault: credential_vault_binding(vault_revision, &self.command_cache),
-            policy: CoverageBinding::derive(b"policy", self.policy_digest.as_bytes()),
-            sealed: CoverageBinding::derive(b"sealed", b"daemon-global"),
+            policy: CoverageBinding::derive(b"policy", policy_digest.as_bytes()),
+            sealed: self.sealed(),
             override_revision: CoverageBinding::derive(
                 b"override",
-                &self.override_revision.to_le_bytes(),
+                &override_revision.to_le_bytes(),
             ),
-            machine_sources: machine_sources_binding(
-                &self.redact_config,
-                &self.source_root,
-                Some(table),
-            ),
-        }
+            machine_sources: machine_sources_binding(&redact_config, &source_root, Some(table)),
+        })
     }
 
     pub(crate) fn publish_fence(self) -> super::coverage_authority::CoveragePublishFence {
         Box::new(move |table| self.owned_revisions(table))
+    }
+}
+
+pub(crate) fn session_publish_owners_from_inputs(
+    inputs: &SessionCoverageInputs<'_>,
+    vault: std::sync::Arc<crate::secure_key::SecretVault>,
+    db: cockpit_db::Db,
+    command_cache: std::sync::Arc<crate::secret_command::CommandSecretCache>,
+    environment: std::sync::Arc<EnvSnapshot>,
+) -> SessionCoveragePublishOwners {
+    let policy_digest = inputs.policy_digest.to_string();
+    let override_revision = inputs.override_revision;
+    let redact_config = inputs.redact_config.clone();
+    let workspace_root = inputs.workspace_root.to_path_buf();
+    SessionCoveragePublishOwners {
+        vault,
+        db,
+        command_cache,
+        environment,
+        policy_digest: std::sync::Arc::new(move || policy_digest.clone()),
+        override_revision: std::sync::Arc::new(move || override_revision),
+        redact_config: std::sync::Arc::new(move || redact_config.clone()),
+        workspace_root: std::sync::Arc::new(move || workspace_root.clone()),
+    }
+}
+
+pub(crate) fn daemon_global_publish_owners_from_inputs(
+    inputs: &DaemonGlobalCoverageInputs<'_>,
+    vault: std::sync::Arc<crate::secure_key::SecretVault>,
+    command_cache: std::sync::Arc<crate::secret_command::CommandSecretCache>,
+    environment: std::sync::Arc<EnvSnapshot>,
+) -> DaemonGlobalCoveragePublishOwners {
+    let policy_digest = inputs.policy_digest.to_string();
+    let override_revision = inputs.override_revision;
+    let redact_config = inputs.redact_config.clone();
+    let source_root = inputs.source_root.to_path_buf();
+    let sealed = inputs.sealed;
+    DaemonGlobalCoveragePublishOwners {
+        vault,
+        environment,
+        policy_digest: std::sync::Arc::new(move || policy_digest.clone()),
+        override_revision: std::sync::Arc::new(move || override_revision),
+        redact_config: std::sync::Arc::new(move || redact_config.clone()),
+        source_root: std::sync::Arc::new(move || source_root.clone()),
+        command_cache,
+        sealed: std::sync::Arc::new(move || sealed),
     }
 }

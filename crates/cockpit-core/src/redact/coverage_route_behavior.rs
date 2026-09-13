@@ -20,6 +20,7 @@ pub(crate) mod tests {
     };
 
     const REDACTED: &str = "**REDACTED BY COCKPIT - DO NOT TRY TO OBTAIN BY WORKAROUND**";
+    const CANARY: &str = "coverage-canary-secret";
 
     fn binding(value: u8) -> CoverageBinding {
         CoverageBinding::from_daemon_bytes([value; 16])
@@ -58,34 +59,32 @@ pub(crate) mod tests {
         let boundary = boundary_for(parts);
         move || {
             counter.fetch_add(1, Ordering::SeqCst);
-            let table = RedactionTable::empty().with_forced_literal(
-                "coverage-canary-secret".to_string(),
-                "$test:coverage".to_string(),
-            )?;
+            let table = RedactionTable::empty()
+                .with_forced_literal(CANARY.to_string(), "$test:coverage".to_string())?;
             Ok(CoverageBuild::from_complete_table(table, boundary))
         }
     }
 
-    pub(crate) async fn assert_derived_tables_preserve_binding() {
+    pub(crate) async fn assert_unbound_tables_support_derived_transforms() {
         let authority = RedactionCoverageAuthority::default();
         let captures = Arc::new(AtomicUsize::new(0));
         let base = [8, 8, 8, 8, 8, 8, 8, 8, 8, 8];
-        let bound = authority
+        let base_table = authority
             .acquire(
                 key(base),
                 CoverageScope::SessionStart,
                 capture(captures.clone(), base),
             )
             .await
-            .expect("session-start style bound table")
-            .into_bound_table()
-            .expect("live current binding install");
-        let forced = bound
+            .expect("session-start capture")
+            .into_unbound_table()
+            .expect("install unbound session table");
+        let forced = base_table
             .as_ref()
             .clone()
             .with_forced_literal("provider-auth-extra".into(), "$provider:auth".into())
             .expect("provider guard extension");
-        assert_eq!(forced.scrub("coverage-canary-secret"), REDACTED);
+        assert_eq!(forced.scrub(CANARY), REDACTED);
 
         let refreshed = authority
             .acquire(
@@ -95,32 +94,73 @@ pub(crate) mod tests {
             )
             .await
             .expect("submission refresh capture")
-            .into_bound_table()
-            .expect("refreshed bound table");
-        let unioned = bound.union(refreshed.as_ref()).expect("accumulated union");
-        assert_eq!(unioned.scrub("coverage-canary-secret"), REDACTED);
+            .into_unbound_table()
+            .expect("refreshed unbound table");
+        let unioned = base_table
+            .as_ref()
+            .clone()
+            .union(refreshed.as_ref())
+            .expect("same-binding union of unbound tables");
+        assert_eq!(unioned.scrub(CANARY), REDACTED);
 
         let sealed_derived = unioned.with_sealed_replacements(&Default::default());
-        assert_eq!(sealed_derived.scrub("coverage-canary-secret"), REDACTED);
-
-        authority.invalidate();
-        assert_eq!(unioned.scrub("coverage-canary-secret"), REDACTED);
+        assert_eq!(sealed_derived.scrub(CANARY), REDACTED);
     }
 
-    pub(crate) async fn assert_live_current_binding_survives_lru() {
+    pub(crate) async fn assert_one_shot_admission_refuses_after_invalidation() {
+        let authority = RedactionCoverageAuthority::default();
+        let captures = Arc::new(AtomicUsize::new(0));
+        let parts = [7, 7, 7, 7, 7, 7, 7, 7, 7, 7];
+        let admission = authority
+            .acquire(
+                key(parts),
+                CoverageScope::SessionStart,
+                capture(captures.clone(), parts),
+            )
+            .await
+            .expect("pinned generation");
+        authority.invalidate();
+        assert!(matches!(
+            admission.use_at_sink(|table| {
+                assert_eq!(table.scrub(CANARY), REDACTED);
+                Ok(())
+            }),
+            Err(CoverageError::Invalidated)
+        ));
+    }
+
+    pub(crate) async fn assert_bound_sink_scrub_refuses_stale_binding() {
+        let authority = RedactionCoverageAuthority::default();
+        let captures = Arc::new(AtomicUsize::new(0));
+        let parts = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6];
+        authority
+            .acquire(
+                key(parts),
+                CoverageScope::DriverTurn,
+                capture(captures.clone(), parts),
+            )
+            .await
+            .expect("fresh generation")
+            .use_at_sink(|table| {
+                authority.invalidate();
+                assert!(table.ensure_binding_current().is_err());
+                Ok(())
+            })
+            .expect("one-shot sink reached");
+    }
+
+    pub(crate) async fn assert_resident_generation_survives_lru_while_admitted() {
         let authority = RedactionCoverageAuthority::new(CoverageOwnerMode::InProcess);
         let captures = Arc::new(AtomicUsize::new(0));
         let pinned = [7, 7, 7, 7, 7, 7, 7, 7, 7, 7];
-        let bound = authority
+        let admission = authority
             .acquire(
                 key(pinned),
                 CoverageScope::SessionStart,
                 capture(captures.clone(), pinned),
             )
             .await
-            .expect("pinned generation")
-            .into_bound_table()
-            .expect("live current binding");
+            .expect("pinned generation");
         for index in 0..COVERAGE_LIMITS.resident_generations {
             let eviction_parts = [70 + index as u8; 10];
             authority
@@ -134,7 +174,12 @@ pub(crate) mod tests {
                 .use_at_sink(|_| Ok(()))
                 .expect("one-shot sink");
         }
-        assert_eq!(bound.scrub("coverage-canary-secret"), REDACTED);
+        admission
+            .use_at_sink(|table| {
+                assert_eq!(table.scrub(CANARY), REDACTED);
+                Ok(())
+            })
+            .expect("resident generation still admitted at sink");
     }
 
     pub(crate) async fn assert_publish_fence_rejects_stale_owned_revisions() {
@@ -153,14 +198,40 @@ pub(crate) mod tests {
         let result = authority
             .acquire(key(base), CoverageScope::SessionSubmission, move || {
                 captures.fetch_add(1, Ordering::SeqCst);
-                let table = RedactionTable::empty().with_forced_literal(
-                    "coverage-canary-secret".to_string(),
-                    "$test:coverage".to_string(),
-                )?;
+                let table = RedactionTable::empty()
+                    .with_forced_literal(CANARY.to_string(), "$test:coverage".to_string())?;
                 Ok(CoverageBuild::from_complete_table(table, boundary)
-                    .with_publish_fence(Box::new(|_| mismatched.clone())))
+                    .with_publish_fence(Box::new(|_| Ok(mismatched.clone()))))
             })
             .await;
         assert!(matches!(result, Err(CoverageError::Invalidated)));
+    }
+
+    pub(crate) async fn assert_union_refuses_mismatched_bindings() {
+        let authority = RedactionCoverageAuthority::default();
+        let captures = Arc::new(AtomicUsize::new(0));
+        let left_parts = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+        let right_parts = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2];
+        let left = authority
+            .acquire(
+                key(left_parts),
+                CoverageScope::SessionSubmission,
+                capture(captures.clone(), left_parts),
+            )
+            .await
+            .expect("left capture")
+            .use_at_sink(|table| Ok(table.clone()))
+            .expect("left sink");
+        let right = authority
+            .acquire(
+                key(right_parts),
+                CoverageScope::DriverTurn,
+                capture(captures.clone(), right_parts),
+            )
+            .await
+            .expect("right capture")
+            .use_at_sink(|table| Ok(table.clone()))
+            .expect("right sink");
+        assert!(left.union(&right).is_err());
     }
 }

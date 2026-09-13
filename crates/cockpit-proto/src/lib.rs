@@ -1343,10 +1343,10 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v25 adds daemon-rendered redaction coverage,
-/// input-prediction, and tag-preview projections on top of v24's
-/// onboarding-facing agent authoring projection and atomic authored-package
-/// apply/receipt family and v23's durable logical-conversation favorites
+/// Current wire schema version. v24 adds daemon-rendered redaction coverage,
+/// input-prediction, and tag-preview projections alongside the onboarding-facing
+/// agent authoring projection and atomic authored-package apply/receipt family
+/// and v23's durable logical-conversation favorites
 /// (`SetSessionFavorite` / `SessionFavoriteApplied` and the resolved-root
 /// `SessionSummary.favorite` bit), daemon-authoritative onboarding
 /// (`BeginOrReopenOnboarding` / `ApplyOnboardingTransition` and bootstrap
@@ -1356,7 +1356,7 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// MCP scopes on the attached-session and daemon-owned setup inventory,
 /// bounded base64 media previews, the rolling-precompaction resume choice,
 /// and knowledge-dream completion receipts including ordered all-KB runs.
-pub const PROTOCOL_VERSION: u32 = 25;
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -7590,7 +7590,7 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 25);
+        assert_eq!(PROTOCOL_VERSION, 24);
         let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
@@ -7610,7 +7610,7 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 25);
+        assert_eq!(PROTOCOL_VERSION, 24);
         let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {

@@ -2226,13 +2226,13 @@
           "entry_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
           "consumed_entry_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           "client_nonce": null,
-          "display_mask": "\u2022\u2022\u2022\u2022"
+          "display_mask": "••••"
         },
         {
           "entry_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
           "consumed_entry_id": null,
           "client_nonce": "33333333-3333-4333-8333-333333333333",
-          "display_mask": "\u2022\u2022\u2022\u2022"
+          "display_mask": "••••"
         }
       ]
     },
@@ -3834,6 +3834,26 @@
         "trust_is_shared": true,
         "trust_disclosure": "Trust classification is shared global provider/model policy, not a per-agent override."
       }
+    }
+  },
+  "redaction_coverage_status": {
+    "response": "redaction_coverage_status",
+    "data": {
+      "state": "ready",
+      "rendered_context": "safe"
+    }
+  },
+  "input_prediction": {
+    "response": "input_prediction",
+    "data": {
+      "text": "next"
+    }
+  },
+  "tag_preview": {
+    "response": "tag_preview",
+    "data": {
+      "wire": "safe",
+      "expansions": []
     }
   }
 }

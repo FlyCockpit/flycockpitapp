@@ -13592,11 +13592,12 @@ pub(super) async fn run_worker(
                                                     )?;
                                                 Ok(
                                                     build.with_publish_fence(
-                                                        crate::redact::coverage_bindings::SessionCoveragePublishContext::from_session_inputs(
+                                                        crate::redact::coverage_bindings::session_publish_owners_from_inputs(
                                                             &capture_inputs,
                                                             publish_vault,
                                                             publish_db,
                                                             publish_command_cache,
+                                                            std::sync::Arc::new(env_snapshot_for_capture.clone()),
                                                         )
                                                         .publish_fence(),
                                                     ),
@@ -13607,7 +13608,7 @@ pub(super) async fn run_worker(
                                         .map_err(|error| anyhow::anyhow!(error.to_string()))
                                         .and_then(|admission| {
                                             admission
-                                                .into_bound_table()
+                                                .into_unbound_table()
                                                 .map(|table| table.as_ref().clone())
                                                 .map_err(|error| anyhow::anyhow!(error.to_string()))
                                         })

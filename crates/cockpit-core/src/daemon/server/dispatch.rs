@@ -3208,7 +3208,8 @@ mod oauth_store_tests {
             .and_then(|body| body.split("async fn ").next())
             .expect("DocsAsk implementation");
         assert!(docs.contains("CoverageScope::DocsAsk"));
-        assert!(docs.contains("into_bound_table"));
+        assert!(docs.contains("into_unbound_table"));
+        assert!(docs.contains("use_at_sink"));
         assert!(!docs.contains("RedactionTable::build"));
     }
 
@@ -3223,7 +3224,8 @@ mod oauth_store_tests {
         assert!(title.contains("let live = ctx.registry.live_handle(session_id)"));
         assert!(title.contains("if session.redaction_coverage().is_none()"));
         assert!(title.contains("CoverageScope::AutoTitle"));
-        assert!(title.contains("into_bound_table"));
+        assert!(title.contains("begin_egress"));
+        assert!(title.contains("into_unbound_table"));
         assert!(!title.contains("RedactionTable::build"));
     }
 
@@ -6543,7 +6545,7 @@ async fn handle_serialized_request_impl(
                 )
                 .await
                 .map_err(internal)?;
-            let redactor = admission.into_bound_table().map_err(internal)?;
+            let egress = admission.begin_egress().map_err(internal)?;
             let snapshot = handle.config_snapshot();
             let turns = turns
                 .into_iter()
@@ -6565,7 +6567,7 @@ async fn handle_serialized_request_impl(
                 mode,
                 &snapshot.extended,
                 &snapshot.providers,
-                redactor,
+                egress.table().clone(),
             )
             .await;
             Ok(Response::InputPrediction(
@@ -31545,11 +31547,12 @@ async fn run_docs_ask_pipeline(
                     )?;
                 Ok(
                     build.with_publish_fence(
-                        crate::redact::coverage_bindings::SessionCoveragePublishContext::from_session_inputs(
+                        crate::redact::coverage_bindings::session_publish_owners_from_inputs(
                             &capture_inputs,
                             publish_vault,
                             publish_db,
                             publish_command_cache,
+                            std::sync::Arc::new(env_snapshot_for_capture.clone()),
                         )
                         .publish_fence(),
                     ),
@@ -31559,7 +31562,7 @@ async fn run_docs_ask_pipeline(
         .await
         .map_err(|error| error.to_string())?;
     let redact = admission
-        .into_bound_table()
+        .into_unbound_table()
         .map_err(|error| error.to_string())?;
     session.set_redaction_coverage(coverage_authority, coverage_key, policy_digest);
     let model = Arc::new(
@@ -32412,7 +32415,7 @@ pub(super) async fn export_session_data(
             )
             .await
             .map_err(internal)?;
-        Some(admission.into_bound_table().map_err(internal)?)
+        Some(admission.into_unbound_table().map_err(internal)?)
     } else {
         let session = crate::session::Session::resume(
             ctx.db.clone(),
@@ -32510,22 +32513,21 @@ pub(super) async fn export_session_data(
                         &sealed,
                         &capture_inputs,
                     )?;
-                    Ok(
-                        build.with_publish_fence(
-                            crate::redact::coverage_bindings::SessionCoveragePublishContext::from_session_inputs(
-                                &capture_inputs,
-                                publish_vault,
-                                publish_db,
-                                publish_command_cache,
-                            )
-                            .publish_fence(),
-                        ),
-                    )
+                    Ok(build.with_publish_fence(
+                        crate::redact::coverage_bindings::session_publish_owners_from_inputs(
+                            &capture_inputs,
+                            publish_vault,
+                            publish_db,
+                            publish_command_cache,
+                            std::sync::Arc::new(env_snapshot_for_capture.clone()),
+                        )
+                        .publish_fence(),
+                    ))
                 },
             )
             .await
             .map_err(internal)?;
-        Some(admission.into_bound_table().map_err(internal)?)
+        Some(admission.into_unbound_table().map_err(internal)?)
     };
     // A redacted export rides the type-bound RedactedExport class (owner-remoted
     // reader); the raw archive rides the plain Export class (owner-local generic
@@ -32812,28 +32814,27 @@ pub(super) async fn auto_title_request(
                     &sealed,
                     &capture_inputs,
                 )?;
-                Ok(
-                    build.with_publish_fence(
-                        crate::redact::coverage_bindings::SessionCoveragePublishContext::from_session_inputs(
-                            &capture_inputs,
-                            publish_vault,
-                            publish_db,
-                            publish_command_cache,
-                        )
-                        .publish_fence(),
-                    ),
-                )
+                Ok(build.with_publish_fence(
+                    crate::redact::coverage_bindings::session_publish_owners_from_inputs(
+                        &capture_inputs,
+                        publish_vault,
+                        publish_db,
+                        publish_command_cache,
+                        std::sync::Arc::new(env_snapshot_for_capture.clone()),
+                    )
+                    .publish_fence(),
+                ))
             },
         )
         .await
         .map_err(internal)?;
-    let redact = admission.into_bound_table().map_err(internal)?;
+    let egress = admission.begin_egress().map_err(internal)?;
 
     let title = crate::auto_title::generate_session_title_slug_once(
         &session,
         extended,
         providers,
-        redact,
+        egress.table().clone(),
         String::new(),
         crate::session::TitleAction::Explicit,
     )

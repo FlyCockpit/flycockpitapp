@@ -1985,17 +1985,16 @@ impl SessionWorkerHandle {
                     &sealed,
                     &capture_inputs,
                 )?;
-                Ok(
-                    build.with_publish_fence(
-                        crate::redact::coverage_bindings::SessionCoveragePublishContext::from_session_inputs(
-                            &capture_inputs,
-                            publish_vault,
-                            publish_db,
-                            publish_command_cache,
-                        )
-                        .publish_fence(),
-                    ),
-                )
+                Ok(build.with_publish_fence(
+                    crate::redact::coverage_bindings::session_publish_owners_from_inputs(
+                        &capture_inputs,
+                        publish_vault,
+                        publish_db,
+                        publish_command_cache,
+                        std::sync::Arc::new(env_snapshot_for_capture.clone()),
+                    )
+                    .publish_fence(),
+                ))
             })
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))

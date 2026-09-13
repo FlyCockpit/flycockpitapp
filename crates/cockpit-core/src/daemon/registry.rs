@@ -2534,23 +2534,22 @@ impl SessionRegistry {
                         &sealed,
                         &capture_inputs,
                     )?;
-                    Ok(
-                        build.with_publish_fence(
-                            crate::redact::coverage_bindings::SessionCoveragePublishContext::from_session_inputs(
-                                &capture_inputs,
-                                publish_vault,
-                                publish_db,
-                                publish_command_cache,
-                            )
-                            .publish_fence(),
-                        ),
-                    )
+                    Ok(build.with_publish_fence(
+                        crate::redact::coverage_bindings::session_publish_owners_from_inputs(
+                            &capture_inputs,
+                            publish_vault,
+                            publish_db,
+                            publish_command_cache,
+                            std::sync::Arc::new(env_snapshot_for_capture.clone()),
+                        )
+                        .publish_fence(),
+                    ))
                 },
             )
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let redact = admission
-            .into_bound_table()
+            .into_unbound_table()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         session.set_redaction_coverage(
             self.coverage_authority().clone(),
@@ -3628,9 +3627,9 @@ mod tests {
 
     #[tokio::test]
     async fn session_start_acquires_bound_coverage() {
-        crate::redact::coverage_route_behavior::tests::assert_derived_tables_preserve_binding()
+        crate::redact::coverage_route_behavior::tests::assert_unbound_tables_support_derived_transforms()
             .await;
-        crate::redact::coverage_route_behavior::tests::assert_live_current_binding_survives_lru()
+        crate::redact::coverage_route_behavior::tests::assert_resident_generation_survives_lru_while_admitted()
             .await;
         crate::redact::coverage_route_behavior::tests::assert_publish_fence_rejects_stale_owned_revisions()
             .await;

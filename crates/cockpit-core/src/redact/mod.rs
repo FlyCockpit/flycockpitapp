@@ -86,7 +86,11 @@ impl std::error::Error for RedactionTableUnavailable {}
 
 mod command_output;
 pub(crate) mod coverage_authority;
+pub(crate) mod coverage_bindings;
 mod dotenv;
+pub(super) use dotenv::matched_dotenv_paths;
+#[cfg(test)]
+pub(crate) use dotenv::{dotenv_max_depth, dotenv_scan_start_is_unbounded};
 mod protected;
 pub(crate) mod protected_redaction_history;
 // The production key resolver is wired into the daemon / registry / Session
@@ -1058,6 +1062,8 @@ pub struct RedactionTable {
     protected: ProtectedPaths,
     /// Forced-secret origins that intentionally override protected paths.
     protected_path_conflicts: Vec<String>,
+    /// When set, every scrub revalidates the admitting generation before egress.
+    coverage_binding: Option<coverage_authority::CoverageTableBinding>,
     /// Test-only fault injection: when set, [`Self::enforced_checked`] returns
     /// an error, so a caller's fail-closed-before-side-effect path (e.g. the
     /// external-harness runner constructing its scrub view before spawning a
@@ -1239,7 +1245,9 @@ impl RedactionTable {
                         }
                     }
                     EnvFileScan::Unsupported => unsupported_files.push(path.clone()),
-                    EnvFileScan::Unreadable => {}
+                    EnvFileScan::Unreadable => {
+                        return Err(RedactionSourceUnreadableError { path: path.clone() }.into());
+                    }
                     EnvFileScan::OverLimit => {
                         return Err(EnvFileOverLimitError { path: path.clone() }.into());
                     }
@@ -1442,6 +1450,7 @@ impl RedactionTable {
                 unsupported_files,
                 protected,
                 protected_path_conflicts,
+                coverage_binding: None,
                 #[cfg(test)]
                 fail_enforced_view: false,
             });
@@ -1479,6 +1488,7 @@ impl RedactionTable {
             unsupported_files,
             protected,
             protected_path_conflicts,
+            coverage_binding: None,
             #[cfg(test)]
             fail_enforced_view: false,
         })
@@ -1492,13 +1502,15 @@ impl RedactionTable {
         unsupported_files.sort();
         unsupported_files.dedup();
         let protected = self.protected.union(&other.protected);
-        Self::from_redaction_entries(
+        let mut merged = Self::from_redaction_entries(
             entries,
             self.placeholder.clone(),
             self.disabled && other.disabled,
             unsupported_files,
             protected,
-        )
+        )?;
+        merged.coverage_binding = self.coverage_binding.clone();
+        Ok(merged)
     }
 
     /// Add one caller-supplied ordinary literal to this table.  Sealed-value
@@ -1760,6 +1772,12 @@ impl RedactionTable {
     /// no-table-or-disabled path returns a borrowed input, and a configured
     /// table with no match also avoids allocating.
     pub fn scrub_cow<'a>(&self, body: &'a str) -> Cow<'a, str> {
+        if self.coverage_binding_stale() {
+            if body.is_empty() {
+                return Cow::Borrowed(body);
+            }
+            return Cow::Owned(self.placeholder.clone());
+        }
         // The config-level opt-out (`redact.enabled = false`) suppresses
         // substitution even though the entries are present. Only routes
         // entitled to honor the opt-out ever hold a table in this state;
@@ -1877,12 +1895,19 @@ impl RedactionTable {
                 .saturating_add(entry.class.origin_display().len())
                 .saturating_add(std::mem::size_of::<RedactionEntry>())
         });
-        // Both automatons are compiled from the same pattern vector. Their
-        // exact allocator internals are deliberately not exposed; charging
-        // twice the candidate bytes plus the owned table vectors is a stable,
-        // conservative admission budget.
+        // Both automatons are compiled from the same pattern vector. Charge each
+        // pattern byte multiple times to cover transition tables, state vectors,
+        // and allocator overhead that are not reflected in the entry strings.
+        let pattern_bytes = self
+            .entries
+            .iter()
+            .map(|entry| entry.value.len())
+            .sum::<usize>();
+        let automaton_bytes = pattern_bytes
+            .saturating_mul(8)
+            .saturating_add(self.entries.len().saturating_mul(512));
         entry_bytes
-            .saturating_mul(3)
+            .saturating_add(automaton_bytes.saturating_mul(2))
             .saturating_add(self.unsupported_files.capacity() * std::mem::size_of::<PathBuf>())
             .saturating_add(
                 self.protected_path_conflicts.capacity() * std::mem::size_of::<String>(),
@@ -1912,9 +1937,26 @@ impl RedactionTable {
             unsupported_files: self.unsupported_files.clone(),
             protected: self.protected.clone(),
             protected_path_conflicts: self.protected_path_conflicts.clone(),
+            coverage_binding: self.coverage_binding.clone(),
             #[cfg(test)]
             fail_enforced_view: self.fail_enforced_view,
         }
+    }
+
+    pub(crate) fn with_coverage_binding(
+        self,
+        binding: coverage_authority::CoverageTableBinding,
+    ) -> Self {
+        Self {
+            coverage_binding: Some(binding),
+            ..self
+        }
+    }
+
+    fn coverage_binding_stale(&self) -> bool {
+        self.coverage_binding
+            .as_ref()
+            .is_some_and(|binding| binding.validate().is_err())
     }
 
     /// [`Self::enforced`] wrapped in a `Result`.
@@ -2149,6 +2191,7 @@ impl RedactionTable {
             unsupported_files: Vec::new(),
             protected: ProtectedPaths::default(),
             protected_path_conflicts: Vec::new(),
+            coverage_binding: None,
             #[cfg(test)]
             fail_enforced_view: false,
         }
@@ -2344,12 +2387,23 @@ pub(crate) struct EnvFileOverLimitError {
 #[error("redaction source changed during complete capture")]
 struct RedactionSourceChangedError;
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "configured redaction source `{path}` is unreadable; refusing to publish incomplete coverage"
+)]
+pub(crate) struct RedactionSourceUnreadableError {
+    path: PathBuf,
+}
+
 /// True when [`RedactionTable::build`] (and siblings) refused so a later
 /// consumer cannot proceed with a table that would miss secrets.
 pub(crate) fn build_would_miss_secrets(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.downcast_ref::<EnvFileOverLimitError>().is_some())
+    error.chain().any(|cause| {
+        cause.downcast_ref::<EnvFileOverLimitError>().is_some()
+            || cause
+                .downcast_ref::<RedactionSourceUnreadableError>()
+                .is_some()
+    })
 }
 
 /// Outcome of scanning one matched env file (§4).

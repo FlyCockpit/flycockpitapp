@@ -1275,6 +1275,9 @@ impl SessionRegistry {
             // observable outside the cache.
             cache.ensure_resolved(name, &argv).await;
         }
+        if !referenced.is_empty() {
+            self.coverage_authority().invalidate();
+        }
     }
 
     #[cfg(feature = "extended")]
@@ -2476,64 +2479,70 @@ impl SessionRegistry {
             .secret_vault()?
             .current_inventory_generation()
             .map_err(|error| anyhow::anyhow!("reading redaction vault revision: {error}"))?;
-        let trust_revision_bytes = trust_revision.to_le_bytes();
-        let vault_revision_bytes = vault_revision.to_le_bytes();
-        let coverage_key = crate::redact::coverage_authority::RedactionCoverageKey::session(
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"principal",
-                session_id.as_bytes(),
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"owner-authorization",
-                &trust_revision_bytes,
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"session",
-                session_id.as_bytes(),
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"workspace",
-                project_root.as_os_str().as_encoded_bytes(),
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"environment",
-                env_snapshot.digest().as_bytes(),
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"credential-vault",
-                &vault_revision_bytes,
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"policy",
-                &trust_revision_bytes,
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"sealed",
-                session_id.as_bytes(),
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(b"override", &[]),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"machine-sources",
-                project_root.as_os_str().as_encoded_bytes(),
-            ),
-        );
+        let sealed_records = session
+            .db
+            .machine_scoped_sealed_redaction_records()
+            .await
+            .context("listing machine-scoped sealed redaction records")?;
+        let sealed_binding =
+            crate::redact::coverage_bindings::sealed_records_binding(&sealed_records);
+        let policy_digest = workspace_layer.digest.clone();
+        let command_cache = self.command_secret_cache();
+        let principal = crate::daemon::principal::ClientPrincipal::owner();
+        let coverage_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+            principal: &principal,
+            owner_authorization_revision: trust_revision,
+            session_id,
+            workspace_root: &project_root,
+            environment: &env_snapshot,
+            vault_revision,
+            command_cache: &command_cache,
+            policy_digest: &policy_digest,
+            sealed: sealed_binding,
+            override_revision: 0,
+            redact_config: &extended_cfg.redact,
+        };
+        let coverage_key = coverage_inputs.coverage_key();
+        let env_snapshot_for_capture = env_snapshot.clone();
         let admission = self
             .coverage_authority()
             .acquire(
                 coverage_key.clone(),
                 crate::redact::coverage_authority::CoverageScope::SessionStart,
                 move || {
+                    let capture_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+                        principal: &principal,
+                        owner_authorization_revision: trust_revision,
+                        session_id,
+                        workspace_root: &root,
+                        environment: &env_snapshot_for_capture,
+                        vault_revision,
+                        command_cache: &command_cache,
+                        policy_digest: &policy_digest,
+                        sealed: sealed_binding,
+                        override_revision: 0,
+                        redact_config: &config,
+                    };
                     crate::redact::coverage_authority::CoverageBuild::capture(
-                        &config, &root, &env, &store, &sealed,
+                        &config,
+                        &root,
+                        &env,
+                        &store,
+                        &sealed,
+                        &capture_inputs,
                     )
                 },
             )
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let redact = admission
-            .use_at_sink(|table| Ok(Arc::new(table.enforced())))
+            .into_bound_table()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        session.set_redaction_coverage(self.coverage_authority().clone(), coverage_key);
+        session.set_redaction_coverage(
+            self.coverage_authority().clone(),
+            coverage_key,
+            policy_digest,
+        );
 
         // Build the model from providers config. Errors out loud if
         // no provider is configured for the session's active model. Install
@@ -3617,12 +3626,12 @@ mod tests {
         assert!(start.contains("RedactionCoverageKey::session"));
         assert!(start.contains("CoverageScope::SessionStart"));
         assert!(start.contains("CoverageBuild::capture"));
-        assert!(start.contains("use_at_sink"));
+        assert!(start.contains("into_bound_table"));
         assert!(start.contains("set_redaction_coverage"));
         assert!(!start.contains("RedactionTable::build"));
         assert!(!start.contains("RedactionTable::empty"));
         assert!(
-            start.find("use_at_sink").expect("admission sink")
+            start.find("into_bound_table").expect("admission sink")
                 < start.find("Build the model").unwrap_or(start.len())
         );
     }

@@ -3498,32 +3498,73 @@ impl Driver {
             Ok(store) => store,
             Err(error) => return Self::refuse_unredacted_send(tx, error).await,
         };
-        let Some((authority, coverage_key)) = self.session.redaction_coverage() else {
+        let Some((authority, coverage_key, policy_digest)) = self.session.redaction_coverage()
+        else {
             return Self::refuse_unredacted_send(tx, "coverage_unavailable").await;
         };
         let sealed = match self.session.machine_scoped_sealed_redactions().await {
             Ok(table) => table,
             Err(error) => return Self::refuse_unredacted_send(tx, error).await,
         };
+        let environment = crate::env_snapshot::EnvSnapshot::new(
+            cockpit_proto::EnvSnapshotSource::SessionWorker,
+            session_env.clone(),
+        );
+        let sealed_records = match self
+            .session
+            .db
+            .machine_scoped_sealed_redaction_records()
+            .await
+        {
+            Ok(records) => records,
+            Err(error) => return Self::refuse_unredacted_send(tx, error).await,
+        };
+        let sealed_binding =
+            crate::redact::coverage_bindings::sealed_records_binding(&sealed_records);
+        let principal = crate::daemon::principal::ClientPrincipal::owner();
+        let command_cache = match self.session.command_secret_cache() {
+            Some(cache) => cache,
+            None => return Self::refuse_unredacted_send(tx, "coverage_unavailable").await,
+        };
+        let vault_revision = match self.session.secret_vault().current_inventory_generation() {
+            Ok(revision) => revision,
+            Err(error) => return Self::refuse_unredacted_send(tx, error).await,
+        };
+        let session_id = self.session.id;
+        let env_snapshot_for_capture = environment.clone();
         match authority
             .acquire(
                 coverage_key,
                 crate::redact::coverage_authority::CoverageScope::DriverTurn,
                 move || {
+                    let capture_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+                        principal: &principal,
+                        owner_authorization_revision: 0,
+                        session_id,
+                        workspace_root: &cwd,
+                        environment: &env_snapshot_for_capture,
+                        vault_revision,
+                        command_cache: &command_cache,
+                        policy_digest: &policy_digest,
+                        sealed: sealed_binding,
+                        override_revision: 0,
+                        redact_config: &cfg,
+                    };
                     crate::redact::coverage_authority::CoverageBuild::capture(
                         &cfg,
                         &cwd,
                         &session_env,
                         &store,
                         &sealed,
+                        &capture_inputs,
                     )
                 },
             )
             .await
         {
             Ok(admission) => {
-                let new_table = match admission.use_at_sink(|table| Ok(table.enforced())) {
-                    Ok(table) => table,
+                let new_table = match admission.into_bound_table() {
+                    Ok(table) => table.as_ref().clone(),
                     Err(error) => return Self::refuse_unredacted_send(tx, error).await,
                 };
                 // J2: route the per-turn refresh through the hub so it unions the

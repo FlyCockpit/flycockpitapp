@@ -419,7 +419,7 @@ async fn refresh_redaction_for_turn(
 ) -> RedactionRefreshOutcome {
     let mut cfg = base_redact;
     overrides.apply_to(&mut cfg);
-    let Some((authority, coverage_key)) = session.redaction_coverage() else {
+    let Some((authority, coverage_key, policy_digest)) = session.redaction_coverage() else {
         return RedactionRefreshOutcome::Refused("coverage_unavailable".to_string());
     };
     let store = match session.credential_store() {
@@ -432,13 +432,50 @@ async fn refresh_redaction_for_turn(
     };
     let root = project_root.to_path_buf();
     let env = env.clone();
+    let environment = crate::env_snapshot::EnvSnapshot::new(
+        cockpit_proto::EnvSnapshotSource::SessionWorker,
+        env.clone(),
+    );
+    let sealed_records = session
+        .db
+        .machine_scoped_sealed_redaction_records()
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let sealed_binding = crate::redact::coverage_bindings::sealed_records_binding(&sealed_records);
+    let principal = crate::daemon::principal::ClientPrincipal::owner();
+    let command_cache = session
+        .command_secret_cache()
+        .ok_or_else(|| anyhow::anyhow!("coverage_unavailable"))?;
+    let vault_revision = session
+        .secret_vault()
+        .current_inventory_generation()
+        .map_err(|error| anyhow::anyhow!("reading redaction vault revision: {error}"))?;
+    let env_snapshot_for_capture = environment.clone();
     let new_table = authority
         .acquire(
             coverage_key,
             crate::redact::coverage_authority::CoverageScope::SessionSubmission,
             move || {
+                let capture_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+                    principal: &principal,
+                    owner_authorization_revision: 0,
+                    session_id,
+                    workspace_root: &root,
+                    environment: &env_snapshot_for_capture,
+                    vault_revision,
+                    command_cache: &command_cache,
+                    policy_digest: &policy_digest,
+                    sealed: sealed_binding,
+                    override_revision: 0,
+                    redact_config: &cfg,
+                };
                 crate::redact::coverage_authority::CoverageBuild::capture(
-                    &cfg, &root, &env, &store, &sealed,
+                    &cfg,
+                    &root,
+                    &env,
+                    &store,
+                    &sealed,
+                    &capture_inputs,
                 )
             },
         )
@@ -446,7 +483,8 @@ async fn refresh_redaction_for_turn(
         .map_err(|error| anyhow::anyhow!(error.to_string()))
         .and_then(|admission| {
             admission
-                .use_at_sink(|table| Ok(table.enforced()))
+                .into_bound_table()
+                .map(|table| table.as_ref().clone())
                 .map_err(|error| anyhow::anyhow!(error.to_string()))
         });
     match new_table {

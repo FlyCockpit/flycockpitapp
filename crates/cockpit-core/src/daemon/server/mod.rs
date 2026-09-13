@@ -134,6 +134,7 @@ async fn acquire_daemon_redaction_table(
     authority: crate::redact::coverage_authority::RedactionCoverageAuthority,
     config_source: &crate::daemon::config_source::ConfigSource,
     vault: &Arc<crate::secure_key::SecretVault>,
+    command_cache: &Arc<crate::secret_command::CommandSecretCache>,
     purpose: crate::redact::coverage_authority::CoverageScope,
 ) -> Result<Arc<RedactionTable>> {
     let root = std::env::current_dir()
@@ -148,48 +149,57 @@ async fn acquire_daemon_redaction_table(
     let vault_revision = vault
         .current_inventory_generation()
         .map_err(|error| anyhow::anyhow!("reading daemon redaction vault revision: {error}"))?;
-    let vault_revision_bytes = vault_revision.to_le_bytes();
-    let key = crate::redact::coverage_authority::RedactionCoverageKey::daemon_global(
-        crate::redact::coverage_authority::CoverageBinding::derive(b"principal", b"daemon"),
-        crate::redact::coverage_authority::CoverageBinding::derive(
-            b"owner-authorization",
-            b"daemon-owner",
+    let (_, extended) = config_source
+        .load(&root)
+        .context("loading config for daemon redaction coverage")?;
+    let policy_digest = crate::redact::coverage_bindings::redact_config_digest(&extended.redact);
+    let coverage_inputs = crate::redact::coverage_bindings::DaemonGlobalCoverageInputs {
+        environment: &env_snapshot,
+        vault_revision,
+        command_cache,
+        policy_digest: &policy_digest,
+        sealed: crate::redact::coverage_authority::CoverageBinding::derive(
+            b"sealed",
+            b"daemon-global",
         ),
-        crate::redact::coverage_authority::CoverageBinding::derive(
-            b"environment",
-            env_snapshot.digest().as_bytes(),
-        ),
-        crate::redact::coverage_authority::CoverageBinding::derive(
-            b"credential-vault",
-            &vault_revision_bytes,
-        ),
-        crate::redact::coverage_authority::CoverageBinding::derive(
-            b"policy",
-            root.as_os_str().as_encoded_bytes(),
-        ),
-        crate::redact::coverage_authority::CoverageBinding::derive(b"sealed", b"daemon-global"),
-        crate::redact::coverage_authority::CoverageBinding::derive(b"override", &[]),
-        crate::redact::coverage_authority::CoverageBinding::derive(
-            b"machine-sources",
-            root.as_os_str().as_encoded_bytes(),
-        ),
-    );
+        override_revision: 0,
+        source_root: &root,
+        redact_config: &extended.redact,
+    };
+    let key = coverage_inputs.coverage_key();
     let source = config_source.clone();
     let capture_vault = vault.clone();
+    let capture_cache = command_cache.clone();
+    let capture_policy_digest = policy_digest.clone();
+    let capture_config = extended.redact.clone();
+    let env_snapshot_for_capture = env_snapshot.clone();
     authority
         .acquire(key, purpose, move || {
-            let (_, extended) = source.load(&root)?;
             let store = crate::credentials::CredentialStore::from_vault(capture_vault)?;
+            let capture_inputs = crate::redact::coverage_bindings::DaemonGlobalCoverageInputs {
+                environment: &env_snapshot_for_capture,
+                vault_revision,
+                command_cache: &capture_cache,
+                policy_digest: &capture_policy_digest,
+                sealed: crate::redact::coverage_authority::CoverageBinding::derive(
+                    b"sealed",
+                    b"daemon-global",
+                ),
+                override_revision: 0,
+                source_root: &root,
+                redact_config: &capture_config,
+            };
             crate::redact::coverage_authority::CoverageBuild::capture_without_sealed(
-                &extended.redact,
+                &capture_config,
                 &root,
                 &env,
                 &store,
+                &capture_inputs,
             )
         })
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?
-        .use_at_sink(|table| Ok(Arc::new(table.enforced())))
+        .into_bound_table()
         .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
@@ -3330,13 +3340,49 @@ impl DaemonContext {
                 panic!("production daemon construction requires admitted boot coverage")
             }
         }));
+        let redaction_generation = Arc::new(std::sync::atomic::AtomicU64::new(
+            secret_vault
+                .current_inventory_generation()
+                .unwrap_or(u64::from(boot_coverage_admitted)),
+        ));
         // MCP connections retain only the vault handle, not the full daemon
         // context. Install the owner publication seam here so an in-band
         // OAuth refresh cannot commit a new token while leaving the active
         // daemon redaction table stale. A Weak avoids a vault↔callback cycle.
+        let publisher_redaction = global_redaction.clone();
+        let publisher_config = config_source.clone();
+        let publisher_vault = Arc::downgrade(&secret_vault);
+        let publisher_authority = coverage_authority.clone();
+        let publisher_cache = registry.command_secret_cache();
+        let publisher_generation = redaction_generation.clone();
         secret_vault.install_owner_redaction_publisher(Arc::new(move || {
-            coverage_authority.invalidate();
-            Ok(())
+            publisher_authority.invalidate();
+            let vault = publisher_vault
+                .upgrade()
+                .ok_or_else(|| "daemon vault is no longer available".to_string())?;
+            let runtime = tokio::runtime::Handle::try_current()
+                .map_err(|_| "coverage_unavailable: daemon runtime is not available".to_string())?;
+            tokio::task::block_in_place(|| {
+                runtime
+                    .block_on(async {
+                        let generation = vault
+                            .current_inventory_generation()
+                            .map_err(|error| error.to_string())?;
+                        let table = acquire_daemon_redaction_table(
+                            publisher_authority.clone(),
+                            &publisher_config,
+                            &vault,
+                            &publisher_cache,
+                            crate::redact::coverage_authority::CoverageScope::DaemonGlobalRefresh,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                        set_current_redaction(&publisher_redaction, table);
+                        publisher_generation.store(generation, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .map_err(|error: String| error)
+            })
         }));
         #[cfg(debug_assertions)]
         let agent_installation_fixture =
@@ -3492,9 +3538,7 @@ impl DaemonContext {
             caffeinate: Arc::new(crate::daemon::caffeinate::CaffeineController::new()),
             global_events,
             global_redaction,
-            redaction_generation: Arc::new(std::sync::atomic::AtomicU64::new(u64::from(
-                boot_coverage_admitted,
-            ))),
+            redaction_generation,
             terminal_host,
             client_presence,
             shutdown,
@@ -4190,65 +4234,52 @@ impl DaemonContext {
             return;
         }
 
-        // A known source mutation closes this egress operation. Capture and
-        // matcher compilation happen on the authority's bounded workers; this
-        // event is sent only by the admitted completion and is otherwise
-        // discarded. A burst coalesces on the authority flight key and is
-        // bounded by its waiter limits.
-        if let Err(error) = self.queue_global_redaction_refresh(Some(event)) {
+        if let Err(error) = self.republish_global_redaction_sync(Some(event)) {
             tracing::error!(%error, "daemon event refused while coverage is unavailable");
         }
     }
 
     pub(crate) fn refresh_redaction_table(&self) -> Result<()> {
         self.registry.coverage_authority().invalidate();
-        self.queue_global_redaction_refresh(None)
+        self.republish_global_redaction_sync(None)
     }
 
-    fn queue_global_redaction_refresh(&self, event: Option<proto::Event>) -> Result<()> {
+    fn republish_global_redaction_sync(&self, event: Option<proto::Event>) -> Result<()> {
         let runtime = tokio::runtime::Handle::try_current()
             .context("coverage_unavailable: daemon runtime is not available")?;
         let authority = self.registry.coverage_authority().clone();
         let source = self.config_source.clone();
         let vault = self.secret_vault.clone();
+        let command_cache = self.registry.command_secret_cache();
         let shared = self.global_redaction.clone();
         let published_generation = self.redaction_generation.clone();
         let events = self.global_events.clone();
-        runtime.spawn(async move {
-            let generation = match vault.current_inventory_generation() {
-                Ok(generation) => generation,
-                Err(_) => {
-                    tracing::error!(
-                        "coverage_unavailable: reading daemon redaction source revision"
-                    );
-                    return;
+        let purpose = if event.is_some() {
+            crate::redact::coverage_authority::CoverageScope::DaemonGlobalEvent
+        } else {
+            crate::redact::coverage_authority::CoverageScope::DaemonGlobalRefresh
+        };
+        tokio::task::block_in_place(|| {
+            runtime.block_on(async {
+                let generation = vault
+                    .current_inventory_generation()
+                    .context("reading daemon redaction source revision")?;
+                let table = acquire_daemon_redaction_table(
+                    authority,
+                    &source,
+                    &vault,
+                    &command_cache,
+                    purpose,
+                )
+                .await?;
+                set_current_redaction(&shared, table.clone());
+                published_generation.store(generation, std::sync::atomic::Ordering::SeqCst);
+                if let Some(event) = event {
+                    send_event(&events, &table, event);
                 }
-            };
-            let table = match acquire_daemon_redaction_table(
-                authority,
-                &source,
-                &vault,
-                if event.is_some() {
-                    crate::redact::coverage_authority::CoverageScope::DaemonGlobalEvent
-                } else {
-                    crate::redact::coverage_authority::CoverageScope::DaemonGlobalRefresh
-                },
-            )
-            .await
-            {
-                Ok(table) => table,
-                Err(error) => {
-                    tracing::error!(%error, "daemon redaction coverage refresh refused");
-                    return;
-                }
-            };
-            set_current_redaction(&shared, table.clone());
-            published_generation.store(generation, std::sync::atomic::Ordering::SeqCst);
-            if let Some(event) = event {
-                send_event(&events, &table, event);
-            }
-        });
-        Ok(())
+                Ok(())
+            })
+        })
     }
 
     #[cfg(test)]
@@ -5564,53 +5595,62 @@ pub(crate) async fn boot_ready_with_db(
         .vault
         .current_inventory_generation()
         .map_err(|error| anyhow::anyhow!("reading daemon redaction vault revision: {error}"))?;
-    let vault_revision_bytes = vault_revision.to_le_bytes();
-    let boot_key = crate::redact::coverage_authority::RedactionCoverageKey::daemon_global(
-        crate::redact::coverage_authority::CoverageBinding::derive(b"principal", b"daemon"),
-        crate::redact::coverage_authority::CoverageBinding::derive(
-            b"owner-authorization",
-            b"daemon-owner",
+    let (_, boot_extended) = config_source
+        .load(&boot_root)
+        .context("loading config for daemon boot redaction")?;
+    let boot_policy_digest =
+        crate::redact::coverage_bindings::redact_config_digest(&boot_extended.redact);
+    let boot_command_cache = registry.command_secret_cache();
+    let boot_coverage_inputs = crate::redact::coverage_bindings::DaemonGlobalCoverageInputs {
+        environment: &boot_env_snapshot,
+        vault_revision,
+        command_cache: &boot_command_cache,
+        policy_digest: &boot_policy_digest,
+        sealed: crate::redact::coverage_authority::CoverageBinding::derive(
+            b"sealed",
+            b"daemon-global",
         ),
-        crate::redact::coverage_authority::CoverageBinding::derive(
-            b"environment",
-            boot_env_snapshot.digest().as_bytes(),
-        ),
-        crate::redact::coverage_authority::CoverageBinding::derive(
-            b"credential-vault",
-            &vault_revision_bytes,
-        ),
-        crate::redact::coverage_authority::CoverageBinding::derive(
-            b"policy",
-            boot_root.as_os_str().as_encoded_bytes(),
-        ),
-        crate::redact::coverage_authority::CoverageBinding::derive(b"sealed", b"daemon-global"),
-        crate::redact::coverage_authority::CoverageBinding::derive(b"override", &[]),
-        crate::redact::coverage_authority::CoverageBinding::derive(
-            b"machine-sources",
-            boot_root.as_os_str().as_encoded_bytes(),
-        ),
-    );
-    let capture_source = config_source.clone();
+        override_revision: 0,
+        source_root: &boot_root,
+        redact_config: &boot_extended.redact,
+    };
+    let boot_key = boot_coverage_inputs.coverage_key();
     let capture_vault = boot_secret_store.vault.clone();
-    let capture_root = boot_root.clone();
+    let capture_cache = boot_command_cache.clone();
+    let capture_policy_digest = boot_policy_digest.clone();
+    let capture_config = boot_extended.redact.clone();
+    let boot_env_snapshot_for_capture = boot_env_snapshot.clone();
     let boot_redaction = coverage_authority
         .acquire(
             boot_key,
             crate::redact::coverage_authority::CoverageScope::DaemonGlobalBootstrap,
             move || {
-                let (_, extended) = capture_source.load(&capture_root)?;
                 let store = crate::credentials::CredentialStore::from_vault(capture_vault)?;
+                let capture_inputs = crate::redact::coverage_bindings::DaemonGlobalCoverageInputs {
+                    environment: &boot_env_snapshot_for_capture,
+                    vault_revision,
+                    command_cache: &capture_cache,
+                    policy_digest: &capture_policy_digest,
+                    sealed: crate::redact::coverage_authority::CoverageBinding::derive(
+                        b"sealed",
+                        b"daemon-global",
+                    ),
+                    override_revision: 0,
+                    source_root: &boot_root,
+                    redact_config: &capture_config,
+                };
                 crate::redact::coverage_authority::CoverageBuild::capture_without_sealed(
-                    &extended.redact,
-                    &capture_root,
+                    &capture_config,
+                    &boot_root,
                     &boot_env,
                     &store,
+                    &capture_inputs,
                 )
             },
         )
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?
-        .use_at_sink(|table| Ok(Arc::new(table.enforced())))
+        .into_bound_table()
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     timer.phase("redaction_table");
     let mut ctx = DaemonContext::new_with_boot_authority(

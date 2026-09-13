@@ -13,6 +13,7 @@ use super::super::{
         CoverageScope, OwnerAuthorization, RedactionCoverageAuthority, RedactionCoverageKey,
         UnsupportedSourceDetailClass,
     },
+    coverage_bindings::OwnedSourceRevisions,
 };
 
 const REDACTED: &str = "**REDACTED BY COCKPIT - DO NOT TRY TO OBTAIN BY WORKAROUND**";
@@ -36,14 +37,29 @@ fn key(parts: [u8; 10]) -> RedactionCoverageKey {
     )
 }
 
-fn capture(counter: Arc<AtomicUsize>) -> impl FnOnce() -> Result<CoverageBuild> + Send + 'static {
+fn boundary_for(parts: [u8; 10]) -> OwnedSourceRevisions {
+    OwnedSourceRevisions {
+        environment: binding(parts[4]),
+        credential_vault: binding(parts[5]),
+        policy: binding(parts[6]),
+        sealed: binding(parts[7]),
+        override_revision: binding(parts[8]),
+        machine_sources: binding(parts[9]),
+    }
+}
+
+fn capture(
+    counter: Arc<AtomicUsize>,
+    parts: [u8; 10],
+) -> impl FnOnce() -> Result<CoverageBuild> + Send + 'static {
+    let boundary = boundary_for(parts);
     move || {
         counter.fetch_add(1, Ordering::SeqCst);
         let table = RedactionTable::empty().with_forced_literal(
             "coverage-canary-secret".to_string(),
             "$test:coverage".to_string(),
         )?;
-        Ok(CoverageBuild::from_complete_table(table))
+        Ok(CoverageBuild::from_complete_table(table, boundary))
     }
 }
 
@@ -56,7 +72,7 @@ async fn bound_keys_never_coalesce_across_principal_session_root_env_vault_polic
         .acquire(
             key(base),
             CoverageScope::SessionSubmission,
-            capture(captures.clone()),
+            capture(captures.clone(), base),
         )
         .await
         .expect("first complete capture is admitted");
@@ -64,7 +80,7 @@ async fn bound_keys_never_coalesce_across_principal_session_root_env_vault_polic
         .acquire(
             key(base),
             CoverageScope::DriverTurn,
-            capture(captures.clone()),
+            capture(captures.clone(), base),
         )
         .await
         .expect("same bound capture reuses its generation");
@@ -77,7 +93,7 @@ async fn bound_keys_never_coalesce_across_principal_session_root_env_vault_polic
                 .acquire(
                     key(changed),
                     CoverageScope::SessionSubmission,
-                    capture(captures.clone()),
+                    capture(captures.clone(), changed),
                 )
                 .await
                 .expect("every changed source binding requires a distinct generation"),
@@ -140,7 +156,7 @@ async fn coverage_admission_is_one_operation_and_stale_results_are_inert() {
         .acquire(
             key(base),
             CoverageScope::SessionSubmission,
-            capture(captures.clone()),
+            capture(captures.clone(), base),
         )
         .await
         .expect("complete capture is admitted");
@@ -153,7 +169,7 @@ async fn coverage_admission_is_one_operation_and_stale_results_are_inert() {
         .acquire(
             key(base),
             CoverageScope::DriverTurn,
-            capture(captures.clone()),
+            capture(captures.clone(), base),
         )
         .await
         .expect("invalidated work requires a fresh complete capture")
@@ -163,6 +179,26 @@ async fn coverage_admission_is_one_operation_and_stale_results_are_inert() {
         })
         .expect("fresh generation is admitted at its sink");
     assert_eq!(captures.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn bound_table_rejects_scrub_after_invalidation() {
+    let authority = RedactionCoverageAuthority::default();
+    let captures = Arc::new(AtomicUsize::new(0));
+    let base = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+    let bound = authority
+        .acquire(
+            key(base),
+            CoverageScope::SessionSubmission,
+            capture(captures.clone(), base),
+        )
+        .await
+        .expect("complete capture is admitted")
+        .into_bound_table()
+        .expect("bound table installs generation binding");
+    assert_eq!(bound.scrub("coverage-canary-secret"), REDACTED);
+    authority.invalidate();
+    assert_eq!(bound.scrub("coverage-canary-secret"), REDACTED);
 }
 
 #[tokio::test]
@@ -202,7 +238,8 @@ async fn coverage_limits_are_identical_in_persistent_ephemeral_and_inprocess_mod
         );
         assert_eq!(limits, COVERAGE_LIMITS);
 
-        let admissions_key = key([3, 3, 3, 3, 3, 3, 3, 3, 3, 3]);
+        let admissions_parts = [3, 3, 3, 3, 3, 3, 3, 3, 3, 3];
+        let admissions_key = key(admissions_parts);
         let captures = Arc::new(AtomicUsize::new(0));
         let mut admissions = Vec::new();
         for _ in 0..limits.admissions {
@@ -211,7 +248,7 @@ async fn coverage_limits_are_identical_in_persistent_ephemeral_and_inprocess_mod
                     .acquire(
                         admissions_key.clone(),
                         CoverageScope::SessionSubmission,
-                        capture(captures.clone()),
+                        capture(captures.clone(), admissions_parts),
                     )
                     .await
                     .expect("admission within exact cap"),
@@ -222,7 +259,7 @@ async fn coverage_limits_are_identical_in_persistent_ephemeral_and_inprocess_mod
                 .acquire(
                     admissions_key.clone(),
                     CoverageScope::SessionSubmission,
-                    capture(captures.clone()),
+                    capture(captures.clone(), admissions_parts),
                 )
                 .await,
             Err(CoverageError::Saturated)
@@ -234,7 +271,7 @@ async fn coverage_limits_are_identical_in_persistent_ephemeral_and_inprocess_mod
             .acquire(
                 admissions_key.clone(),
                 CoverageScope::DriverTurn,
-                capture(captures.clone()),
+                capture(captures.clone(), admissions_parts),
             )
             .await
             .expect("pre-rebind admission");
@@ -247,7 +284,7 @@ async fn coverage_limits_are_identical_in_persistent_ephemeral_and_inprocess_mod
             .acquire(
                 admissions_key,
                 CoverageScope::DriverTurn,
-                capture(captures.clone()),
+                capture(captures.clone(), admissions_parts),
             )
             .await
             .expect("new epoch capture")
@@ -255,34 +292,38 @@ async fn coverage_limits_are_identical_in_persistent_ephemeral_and_inprocess_mod
             .expect("new epoch admission");
         assert_eq!(captures.load(Ordering::SeqCst), 2);
 
-        let oversize_key = key([5, 5, 5, 5, 5, 5, 5, 5, 5, 5]);
+        let oversize_parts = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5];
+        let oversize_key = key(oversize_parts);
         assert!(matches!(
             authority
                 .acquire(oversize_key, CoverageScope::SessionSubmission, || {
                     Ok(CoverageBuild::from_complete_table_and_artifact_bytes(
                         RedactionTable::empty(),
                         COVERAGE_LIMITS.artifact_bytes_per_generation + 1,
+                        boundary_for(oversize_parts),
                     ))
                 })
                 .await,
             Err(CoverageError::Unavailable)
         ));
 
-        let pinned_key = key([6, 6, 6, 6, 6, 6, 6, 6, 6, 6]);
+        let pinned_parts = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6];
+        let pinned_key = key(pinned_parts);
         let pinned = authority
             .acquire(
                 pinned_key,
                 CoverageScope::SessionSubmission,
-                capture(captures.clone()),
+                capture(captures.clone(), pinned_parts),
             )
             .await
             .expect("active resident generation");
         for index in 0..COVERAGE_LIMITS.resident_generations {
+            let eviction_parts = [70 + index as u8; 10];
             authority
                 .acquire(
-                    key([70 + index as u8; 10]),
+                    key(eviction_parts),
                     CoverageScope::DriverTurn,
-                    capture(captures.clone()),
+                    capture(captures.clone(), eviction_parts),
                 )
                 .await
                 .expect("bounded LRU insertion")
@@ -319,6 +360,7 @@ async fn coverage_limits_are_identical_in_persistent_ephemeral_and_inprocess_mod
                             "late-cancelled-coverage-canary".to_string(),
                             "$test:late-cancelled".to_string(),
                         )?,
+                        boundary_for([4, 4, 4, 4, 4, 4, 4, 4, 4, 4]),
                     ))
                 })
                 .await
@@ -342,7 +384,7 @@ async fn coverage_limits_are_identical_in_persistent_ephemeral_and_inprocess_mod
                 .acquire(
                     key([4, 4, 4, 4, 4, 4, 4, 4, 4, 4]),
                     CoverageScope::SessionSubmission,
-                    capture(captures.clone()),
+                    capture(captures.clone(), [4, 4, 4, 4, 4, 4, 4, 4, 4, 4]),
                 )
                 .await,
             Err(CoverageError::Unavailable)
@@ -450,7 +492,7 @@ async fn owner_unsupported_source_diagnostic_is_bound_authorized_and_deduplicate
         .acquire(
             key.clone(),
             CoverageScope::DebugContext,
-            capture(captures.clone()),
+            capture(captures.clone(), base),
         )
         .await
         .expect("owner diagnostic admission")
@@ -470,7 +512,7 @@ async fn owner_unsupported_source_diagnostic_is_bound_authorized_and_deduplicate
         .acquire(
             key.clone(),
             CoverageScope::DebugContext,
-            capture(captures.clone()),
+            capture(captures.clone(), base),
         )
         .await
         .expect("duplicate diagnostic admission")
@@ -483,7 +525,11 @@ async fn owner_unsupported_source_diagnostic_is_bound_authorized_and_deduplicate
     assert!(duplicate.owner_diagnostic.is_none());
 
     let non_owner = authority
-        .acquire(key, CoverageScope::DebugContext, capture(captures.clone()))
+        .acquire(
+            key,
+            CoverageScope::DebugContext,
+            capture(captures.clone(), base),
+        )
         .await
         .expect("generic diagnostic admission")
         .unsupported_source_projection(
@@ -527,7 +573,7 @@ async fn accepted_operation_reuses_one_capture_across_submission_driver_and_infe
         CoverageScope::AutoTitle,
     ] {
         let admission = authority
-            .acquire(key.clone(), purpose, capture(captures.clone()))
+            .acquire(key.clone(), purpose, capture(captures.clone(), base))
             .await
             .expect("unchanged accepted operation coverage");
         assert_eq!(admission.purpose(), purpose);
@@ -618,7 +664,10 @@ async fn external_mutation_before_completed_scan_boundary_retries_or_refuses() {
                     "stale-before-boundary-secret".to_string(),
                     "$test:stale".to_string(),
                 )?;
-                Ok(CoverageBuild::from_complete_table(table))
+                Ok(CoverageBuild::from_complete_table(
+                    table,
+                    boundary_for([1, 1, 1, 1, 1, 1, 1, 1, 1, 1]),
+                ))
             })
             .await
     });
@@ -645,7 +694,7 @@ async fn external_mutation_before_completed_scan_boundary_retries_or_refuses() {
         .acquire(
             source_key,
             CoverageScope::SessionSubmission,
-            capture(captures.clone()),
+            capture(captures.clone(), base),
         )
         .await
         .expect("fresh complete capture after mutation")

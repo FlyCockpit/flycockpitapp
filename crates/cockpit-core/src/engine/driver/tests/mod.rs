@@ -12,7 +12,7 @@ fn turn_uses_daemon_coverage_lease() {
     assert!(refresh.contains("session.redaction_coverage()"));
     assert!(refresh.contains("CoverageScope::DriverTurn"));
     assert!(refresh.contains("CoverageBuild::capture"));
-    assert!(refresh.contains("admission.use_at_sink"));
+    assert!(refresh.contains("into_bound_table"));
     assert!(refresh.contains("refuse_unredacted_send"));
     assert!(!refresh.contains("RedactionTable::build"));
     assert!(!refresh.contains("RedactionTable::empty"));

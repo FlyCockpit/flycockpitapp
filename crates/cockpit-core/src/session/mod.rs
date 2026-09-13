@@ -501,6 +501,7 @@ pub struct Session {
         Option<(
             crate::redact::coverage_authority::RedactionCoverageAuthority,
             crate::redact::coverage_authority::RedactionCoverageKey,
+            String,
         )>,
     >,
     /// Daemon-owned descendant process-containment handle. Late-installed by the
@@ -1571,8 +1572,9 @@ impl Session {
         &self,
         authority: crate::redact::coverage_authority::RedactionCoverageAuthority,
         key: crate::redact::coverage_authority::RedactionCoverageKey,
+        policy_digest: String,
     ) {
-        *self.redaction_coverage.lock().unwrap() = Some((authority, key));
+        *self.redaction_coverage.lock().unwrap() = Some((authority, key, policy_digest));
     }
 
     pub(crate) fn redaction_coverage(
@@ -1580,6 +1582,7 @@ impl Session {
     ) -> Option<(
         crate::redact::coverage_authority::RedactionCoverageAuthority,
         crate::redact::coverage_authority::RedactionCoverageKey,
+        String,
     )> {
         self.redaction_coverage.lock().unwrap().clone()
     }
@@ -1691,6 +1694,10 @@ impl Session {
             if cache.ensure_resolved(name, &argv).await.is_resolved() {
                 reresolved_any = true;
             }
+        }
+        if reresolved_any && let Some((authority, key, _policy_digest)) = self.redaction_coverage()
+        {
+            authority.invalidate_key(&key);
         }
         reresolved_any
     }

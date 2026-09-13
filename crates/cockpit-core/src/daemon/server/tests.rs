@@ -43018,7 +43018,7 @@ fn global_coverage_helper_has_no_legacy_builder() {
         .expect("daemon coverage helper");
     assert!(helper.contains("RedactionCoverageKey::daemon_global"));
     assert!(helper.contains("CoverageBuild::capture_without_sealed"));
-    assert!(helper.contains(".use_at_sink"));
+    assert!(helper.contains("into_bound_table"));
     assert!(!helper.contains("build_daemon_redaction_table"));
     assert!(!helper.contains("refresh_global_redaction_table"));
     assert!(!helper.contains("RedactionTable::empty"));
@@ -43049,6 +43049,14 @@ async fn global_vault_mutation_revokes_coverage() {
                     "global-vault-coverage-canary".into(),
                     "$test:global-vault".into(),
                 )?,
+                crate::redact::coverage_bindings::OwnedSourceRevisions {
+                    environment: binding(3),
+                    credential_vault: binding(4),
+                    policy: binding(5),
+                    sealed: binding(6),
+                    override_revision: binding(7),
+                    machine_sources: binding(8),
+                },
             ))
         })
         .await

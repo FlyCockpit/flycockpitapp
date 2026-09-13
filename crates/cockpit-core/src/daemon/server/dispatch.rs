@@ -3208,7 +3208,7 @@ mod oauth_store_tests {
             .and_then(|body| body.split("async fn ").next())
             .expect("DocsAsk implementation");
         assert!(docs.contains("CoverageScope::DocsAsk"));
-        assert!(docs.contains("use_at_sink"));
+        assert!(docs.contains("into_bound_table"));
         assert!(!docs.contains("RedactionTable::build"));
     }
 
@@ -3223,7 +3223,7 @@ mod oauth_store_tests {
         assert!(title.contains("let live = ctx.registry.live_handle(session_id)"));
         assert!(title.contains("if session.redaction_coverage().is_none()"));
         assert!(title.contains("CoverageScope::AutoTitle"));
-        assert!(title.contains("use_at_sink"));
+        assert!(title.contains("into_bound_table"));
         assert!(!title.contains("RedactionTable::build"));
     }
 
@@ -6510,6 +6510,7 @@ async fn handle_serialized_request_impl(
                     ctx.registry.coverage_authority().clone(),
                     ctx.config_source(),
                     &ctx.secret_vault,
+                    &ctx.registry.command_secret_cache(),
                     crate::redact::coverage_authority::CoverageScope::DebugContext,
                 )
                 .await
@@ -6542,9 +6543,7 @@ async fn handle_serialized_request_impl(
                 )
                 .await
                 .map_err(internal)?;
-            let redactor = admission
-                .use_at_sink(|table| Ok(Arc::new(table.enforced())))
-                .map_err(internal)?;
+            let redactor = admission.into_bound_table().map_err(internal)?;
             let snapshot = handle.config_snapshot();
             let turns = turns
                 .into_iter()
@@ -31489,66 +31488,65 @@ async fn run_docs_ask_pipeline(
     let vault_revision = vault
         .current_inventory_generation()
         .map_err(|_| "coverage_unavailable".to_string())?;
-    let revision = vault_revision.to_le_bytes();
-    let coverage_key = crate::redact::coverage_authority::RedactionCoverageKey::session(
-        crate::redact::coverage_authority::CoverageBinding::derive(
-            b"principal",
-            session.id.as_bytes(),
-        ),
-        crate::redact::coverage_authority::CoverageBinding::derive(
-            b"owner-authorization",
-            b"owner",
-        ),
-        crate::redact::coverage_authority::CoverageBinding::derive(
-            b"session",
-            session.id.as_bytes(),
-        ),
-        crate::redact::coverage_authority::CoverageBinding::derive(
-            b"workspace",
-            cwd.as_os_str().as_encoded_bytes(),
-        ),
-        crate::redact::coverage_authority::CoverageBinding::derive(
-            b"environment",
-            env_snapshot.digest().as_bytes(),
-        ),
-        crate::redact::coverage_authority::CoverageBinding::derive(b"credential-vault", &revision),
-        crate::redact::coverage_authority::CoverageBinding::derive(
-            b"policy",
-            cwd.as_os_str().as_encoded_bytes(),
-        ),
-        crate::redact::coverage_authority::CoverageBinding::derive(
-            b"sealed",
-            session.id.as_bytes(),
-        ),
-        crate::redact::coverage_authority::CoverageBinding::derive(b"override", &[]),
-        crate::redact::coverage_authority::CoverageBinding::derive(
-            b"machine-sources",
-            cwd.as_os_str().as_encoded_bytes(),
-        ),
-    );
+    let policy_digest = crate::redact::coverage_bindings::redact_config_digest(&extended.redact);
+    let principal = crate::daemon::principal::ClientPrincipal::owner();
+    let command_cache = command_secret_cache.clone();
+    let coverage_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+        principal: &principal,
+        owner_authorization_revision: 0,
+        session_id: session.id,
+        workspace_root: &cwd,
+        environment: &env_snapshot,
+        vault_revision,
+        command_cache: &command_cache,
+        policy_digest: &policy_digest,
+        sealed: crate::redact::coverage_authority::CoverageBinding::derive(b"sealed", &[]),
+        override_revision: 0,
+        redact_config: &extended.redact,
+    };
+    let coverage_key = coverage_inputs.coverage_key();
+    let docs_session_id = session.id;
     let capture_config = extended.redact.clone();
     let capture_root = cwd.clone();
     let capture_env = env_snapshot.vars().clone();
     let capture_store = store.clone();
+    let env_snapshot_for_capture = env_snapshot.clone();
     let admission = coverage_authority
         .acquire(
             coverage_key.clone(),
             crate::redact::coverage_authority::CoverageScope::DocsAsk,
             move || {
-                crate::redact::coverage_authority::CoverageBuild::capture_without_sealed(
+                let capture_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+                    principal: &principal,
+                    owner_authorization_revision: 0,
+                    session_id: docs_session_id,
+                    workspace_root: &capture_root,
+                    environment: &env_snapshot_for_capture,
+                    vault_revision,
+                    command_cache: &command_cache,
+                    policy_digest: &policy_digest,
+                    sealed: crate::redact::coverage_authority::CoverageBinding::derive(
+                        b"sealed",
+                        &[],
+                    ),
+                    override_revision: 0,
+                    redact_config: &capture_config,
+                };
+                crate::redact::coverage_authority::CoverageBuild::capture_session_without_sealed(
                     &capture_config,
                     &capture_root,
                     &capture_env,
                     &capture_store,
+                    &capture_inputs,
                 )
             },
         )
         .await
         .map_err(|error| error.to_string())?;
     let redact = admission
-        .use_at_sink(|table| Ok(Arc::new(table.enforced())))
+        .into_bound_table()
         .map_err(|error| error.to_string())?;
-    session.set_redaction_coverage(coverage_authority, coverage_key);
+    session.set_redaction_coverage(coverage_authority, coverage_key, policy_digest);
     let model = Arc::new(
         crate::engine::model::Model::from_config_with_store(
             &providers,
@@ -32399,11 +32397,7 @@ pub(super) async fn export_session_data(
             )
             .await
             .map_err(internal)?;
-        Some(
-            admission
-                .use_at_sink(|table| Ok(Arc::new(table.enforced())))
-                .map_err(internal)?,
-        )
+        Some(admission.into_bound_table().map_err(internal)?)
     } else {
         let session = crate::session::Session::resume(
             ctx.db.clone(),
@@ -32435,46 +32429,31 @@ pub(super) async fn export_session_data(
             .secret_vault
             .current_inventory_generation()
             .map_err(internal)?;
-        let revision = vault_revision.to_le_bytes();
-        let key = crate::redact::coverage_authority::RedactionCoverageKey::session(
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"principal",
-                session.id.as_bytes(),
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"owner-authorization",
-                b"owner",
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"session",
-                session.id.as_bytes(),
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"workspace",
-                session.project_root.as_os_str().as_encoded_bytes(),
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"environment",
-                env_snapshot.digest().as_bytes(),
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"credential-vault",
-                &revision,
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"policy",
-                session.project_root.as_os_str().as_encoded_bytes(),
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"sealed",
-                session.id.as_bytes(),
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(b"override", &[]),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"machine-sources",
-                session.project_root.as_os_str().as_encoded_bytes(),
-            ),
-        );
+        let policy_digest =
+            crate::redact::coverage_bindings::redact_config_digest(&extended.redact);
+        let principal = crate::daemon::principal::ClientPrincipal::owner();
+        let command_cache = ctx.registry.command_secret_cache();
+        let sealed_records = session
+            .db
+            .machine_scoped_sealed_redaction_records()
+            .await
+            .map_err(internal)?;
+        let sealed_binding =
+            crate::redact::coverage_bindings::sealed_records_binding(&sealed_records);
+        let coverage_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+            principal: &principal,
+            owner_authorization_revision: 0,
+            session_id: session.id,
+            workspace_root: &session.project_root,
+            environment: &env_snapshot,
+            vault_revision,
+            command_cache: &command_cache,
+            policy_digest: &policy_digest,
+            sealed: sealed_binding,
+            override_revision: 0,
+            redact_config: &extended.redact,
+        };
+        let key = coverage_inputs.coverage_key();
         let sealed = session
             .machine_scoped_sealed_redactions()
             .await
@@ -32483,6 +32462,8 @@ pub(super) async fn export_session_data(
         let config = extended.redact;
         let root = session.project_root.clone();
         let environment = env_snapshot.vars().clone();
+        let env_snapshot_for_capture = env_snapshot.clone();
+        let export_session_id = session.id;
         let admission = ctx
             .registry
             .coverage_authority()
@@ -32490,22 +32471,32 @@ pub(super) async fn export_session_data(
                 key,
                 crate::redact::coverage_authority::CoverageScope::RedactedExport,
                 move || {
+                    let capture_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+                        principal: &principal,
+                        owner_authorization_revision: 0,
+                        session_id: export_session_id,
+                        workspace_root: &root,
+                        environment: &env_snapshot_for_capture,
+                        vault_revision,
+                        command_cache: &command_cache,
+                        policy_digest: &policy_digest,
+                        sealed: sealed_binding,
+                        override_revision: 0,
+                        redact_config: &config,
+                    };
                     crate::redact::coverage_authority::CoverageBuild::capture(
                         &config,
                         &root,
                         &environment,
                         &store,
                         &sealed,
+                        &capture_inputs,
                     )
                 },
             )
             .await
             .map_err(internal)?;
-        Some(
-            admission
-                .use_at_sink(|table| Ok(Arc::new(table.enforced())))
-                .map_err(internal)?,
-        )
+        Some(admission.into_bound_table().map_err(internal)?)
     };
     // A redacted export rides the type-bound RedactedExport class (owner-remoted
     // reader); the raw archive rides the plain Export class (owner-local generic
@@ -32708,49 +32699,38 @@ pub(super) async fn auto_title_request(
             .secret_vault
             .current_inventory_generation()
             .map_err(internal)?;
-        let revision = vault_revision.to_le_bytes();
-        let key = crate::redact::coverage_authority::RedactionCoverageKey::session(
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"principal",
-                session.id.as_bytes(),
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"owner-authorization",
-                b"owner",
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"session",
-                session.id.as_bytes(),
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"workspace",
-                session.project_root.as_os_str().as_encoded_bytes(),
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"environment",
-                env_identity.digest().as_bytes(),
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"credential-vault",
-                &revision,
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"policy",
-                session.project_root.as_os_str().as_encoded_bytes(),
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"sealed",
-                session.id.as_bytes(),
-            ),
-            crate::redact::coverage_authority::CoverageBinding::derive(b"override", &[]),
-            crate::redact::coverage_authority::CoverageBinding::derive(
-                b"machine-sources",
-                session.project_root.as_os_str().as_encoded_bytes(),
-            ),
+        let policy_digest =
+            crate::redact::coverage_bindings::redact_config_digest(&extended.redact);
+        let principal = crate::daemon::principal::ClientPrincipal::owner();
+        let command_cache = ctx.registry.command_secret_cache();
+        let sealed_records = session
+            .db
+            .machine_scoped_sealed_redaction_records()
+            .await
+            .map_err(internal)?;
+        let sealed_binding =
+            crate::redact::coverage_bindings::sealed_records_binding(&sealed_records);
+        let coverage_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+            principal: &principal,
+            owner_authorization_revision: 0,
+            session_id: session.id,
+            workspace_root: &session.project_root,
+            environment: &env_identity,
+            vault_revision,
+            command_cache: &command_cache,
+            policy_digest: &policy_digest,
+            sealed: sealed_binding,
+            override_revision: 0,
+            redact_config: &extended.redact,
+        };
+        let key = coverage_inputs.coverage_key();
+        session.set_redaction_coverage(
+            ctx.registry.coverage_authority().clone(),
+            key,
+            policy_digest,
         );
-        session.set_redaction_coverage(ctx.registry.coverage_authority().clone(), key);
     }
-    let (authority, key) = session
+    let (authority, key, policy_digest) = session
         .redaction_coverage()
         .ok_or_else(|| internal("coverage_unavailable"))?;
     let store = session.credential_store().map_err(internal)?;
@@ -32760,25 +32740,51 @@ pub(super) async fn auto_title_request(
         .map_err(internal)?;
     let capture_config = extended.redact.clone();
     let capture_root = session.project_root.clone();
+    let sealed_records = session
+        .db
+        .machine_scoped_sealed_redaction_records()
+        .await
+        .map_err(internal)?;
+    let sealed_binding = crate::redact::coverage_bindings::sealed_records_binding(&sealed_records);
+    let principal = crate::daemon::principal::ClientPrincipal::owner();
+    let command_cache = ctx.registry.command_secret_cache();
+    let vault_revision = ctx
+        .secret_vault
+        .current_inventory_generation()
+        .map_err(internal)?;
+    let session_id = session.id;
+    let env_snapshot_for_capture = env_identity.clone();
     let admission = authority
         .acquire(
             key,
             crate::redact::coverage_authority::CoverageScope::AutoTitle,
             move || {
+                let capture_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+                    principal: &principal,
+                    owner_authorization_revision: 0,
+                    session_id,
+                    workspace_root: &capture_root,
+                    environment: &env_snapshot_for_capture,
+                    vault_revision,
+                    command_cache: &command_cache,
+                    policy_digest: &policy_digest,
+                    sealed: sealed_binding,
+                    override_revision: 0,
+                    redact_config: &capture_config,
+                };
                 crate::redact::coverage_authority::CoverageBuild::capture(
                     &capture_config,
                     &capture_root,
                     &env,
                     &store,
                     &sealed,
+                    &capture_inputs,
                 )
             },
         )
         .await
         .map_err(internal)?;
-    let redact = admission
-        .use_at_sink(|table| Ok(Arc::new(table.enforced())))
-        .map_err(internal)?;
+    let redact = admission.into_bound_table().map_err(internal)?;
 
     let title = crate::auto_title::generate_session_title_slug_once(
         &session,

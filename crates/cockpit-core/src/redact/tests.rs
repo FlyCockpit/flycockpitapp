@@ -1484,6 +1484,40 @@ fn extra_dotenv_paths_still_honored() {
     assert_eq!(t.scrub("extra-path-secret-value"), "***REDACT***");
 }
 
+#[test]
+fn dotenv_scan_refuses_filesystem_root_but_honors_explicit_extra_paths() {
+    let dir = TempDir::new().unwrap();
+    let extra = dir.path().join("explicit.env");
+    std::fs::write(&extra, "EXTRA=explicit-secret-value\n").unwrap();
+
+    let paths = matched_dotenv_paths(
+        Path::new("/"),
+        &crate::config::extended::default_dotenv_patterns(),
+        std::slice::from_ref(&extra),
+    );
+
+    assert_eq!(paths, vec![extra]);
+}
+
+#[test]
+fn dotenv_scan_refuses_home_without_project_marker() {
+    let home = dirs::home_dir().expect("home directory");
+
+    assert!(
+        dotenv_scan_start_is_unbounded(&home),
+        "home directory itself is an unbounded scan start"
+    );
+}
+
+#[test]
+fn dotenv_max_depth_caps_outside_repo_unbounded_inside() {
+    // Inside a git repo: unbounded so no `.env` is ever missed.
+    assert_eq!(dotenv_max_depth(true), None);
+    // Outside a repo: capped at depth 8 (the giant-dir pathological
+    // case; `.env` files live near the root in practice).
+    assert_eq!(dotenv_max_depth(false), Some(8));
+}
+
 /// Build a temp tree with a `.env` nine directory levels below the root
 /// (`a/b/c/d/e/f/g/h/i/.env`). `walkdir` counts the root as depth 0, so
 /// `a`=1 … `i`=9: the `.env` file itself sits at depth 10's parent — it
@@ -1501,13 +1535,58 @@ fn deep_env_tree() -> (TempDir, PathBuf) {
 }
 
 #[test]
-fn complete_walker_finds_deep_env_without_git_metadata() {
+fn walker_depth8_drops_depth9_env() {
+    use ignore::WalkBuilder;
+    use ignore::overrides::OverrideBuilder;
+
     let (_dir, root) = deep_env_tree();
-    let found = matched_dotenv_paths(
-        &root,
-        &crate::config::extended::default_dotenv_patterns(),
-        &[],
+    let mut ob = OverrideBuilder::new(&root);
+    for pat in crate::config::extended::default_dotenv_patterns() {
+        ob.add(&pat).unwrap();
+    }
+    let overrides = ob.build().unwrap();
+    let mut builder = WalkBuilder::new(&root);
+    builder
+        .standard_filters(false)
+        .max_depth(Some(8))
+        .overrides(overrides);
+    let mut found: Vec<PathBuf> = builder
+        .build()
+        .flatten()
+        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+        .map(|e| e.into_path())
+        .collect();
+    found.sort();
+    // The root `.env` is in range; the depth-9 nested one is not.
+    assert!(found.iter().any(|p| p == &root.join(".env")));
+    assert!(
+        !found.iter().any(|p| p.ends_with("a/b/c/d/e/f/g/h/i/.env")),
+        "depth-9 `.env` must be dropped by max_depth(8): {found:?}"
     );
+}
+
+#[test]
+fn walker_unbounded_finds_depth9_env() {
+    use ignore::WalkBuilder;
+    use ignore::overrides::OverrideBuilder;
+
+    let (_dir, root) = deep_env_tree();
+    let mut ob = OverrideBuilder::new(&root);
+    for pat in crate::config::extended::default_dotenv_patterns() {
+        ob.add(&pat).unwrap();
+    }
+    let overrides = ob.build().unwrap();
+    let mut builder = WalkBuilder::new(&root);
+    builder
+        .standard_filters(false)
+        .max_depth(None)
+        .overrides(overrides);
+    let found: Vec<PathBuf> = builder
+        .build()
+        .flatten()
+        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+        .map(|e| e.into_path())
+        .collect();
     assert!(
         found.iter().any(|p| p.ends_with("a/b/c/d/e/f/g/h/i/.env")),
         "unbounded walk must find the depth-9 `.env`: {found:?}"

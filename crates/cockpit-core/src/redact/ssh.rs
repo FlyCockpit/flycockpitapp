@@ -64,9 +64,12 @@ pub(super) fn collect_ssh_key_candidates_with_fence(
             }
         };
         let mut paths = read_dir
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.path())
-            .collect::<Vec<_>>();
+            .map(|entry| {
+                entry.map_err(|error| {
+                    anyhow::anyhow!("configured SSH source is unavailable during capture: {error}")
+                })
+            })
+            .collect::<Result<Vec<PathBuf>>>()?;
         paths.sort();
         Ok(Some(paths))
     };
@@ -85,19 +88,18 @@ pub(super) fn collect_ssh_key_candidates_with_fence(
         }
         // `fs::metadata` follows symlinks — we want the target's content if
         // it's a regular file (it's the key *material* being redacted).
-        let Ok(meta) = std::fs::metadata(&path) else {
-            continue;
-        };
+        let meta = std::fs::metadata(&path).map_err(|error| {
+            anyhow::anyhow!("configured SSH source is unreadable during capture: {error}")
+        })?;
         if !meta.is_file() {
             continue;
         }
-        let Ok(target_before) = std::fs::canonicalize(&path) else {
-            continue;
-        };
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            // Binary / unreadable file: not a PEM key.
-            continue;
-        };
+        let target_before = std::fs::canonicalize(&path).map_err(|error| {
+            anyhow::anyhow!("configured SSH source is unreadable during capture: {error}")
+        })?;
+        let content = std::fs::read_to_string(&path).map_err(|error| {
+            anyhow::anyhow!("configured SSH source is unreadable during capture: {error}")
+        })?;
         before_confirm(&path);
         // A configured symlink can be retargeted independently of the
         // directory entry. Capture refuses an unstable read instead of

@@ -13522,7 +13522,7 @@ pub(super) async fn run_worker(
                         .read()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone();
-                    let new_table = if let Some((authority, coverage_key)) =
+                    let new_table = if let Some((authority, coverage_key, policy_digest)) =
                         session.redaction_coverage()
                     {
                         authority.invalidate_key(&coverage_key);
@@ -13531,17 +13531,60 @@ pub(super) async fn run_worker(
                                 Ok(sealed) => {
                                     let root = project_root.clone();
                                     let capture_redact = effective_redact.clone();
+                                    let environment = crate::env_snapshot::EnvSnapshot::new(
+                                        cockpit_proto::EnvSnapshotSource::SessionWorker,
+                                        session_env.clone(),
+                                    );
+                                    let sealed_records = session
+                                        .db
+                                        .machine_scoped_sealed_redaction_records()
+                                        .await
+                                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                                    let sealed_binding =
+                                        crate::redact::coverage_bindings::sealed_records_binding(
+                                            &sealed_records,
+                                        );
+                                    let principal =
+                                        crate::daemon::principal::ClientPrincipal::owner();
+                                    let command_cache = session
+                                        .command_secret_cache()
+                                        .ok_or_else(|| anyhow::anyhow!("coverage_unavailable"))?;
+                                    let vault_revision = session
+                                        .secret_vault()
+                                        .current_inventory_generation()
+                                        .map_err(|error| {
+                                            anyhow::anyhow!(
+                                                "reading redaction vault revision: {error}"
+                                            )
+                                        })?;
+                                    let env = session_env.clone();
+                                    let env_snapshot_for_capture = environment.clone();
                                     authority
                                         .acquire(
                                             coverage_key,
                                             crate::redact::coverage_authority::CoverageScope::RedactionOverride,
                                             move || {
+                                                let capture_inputs =
+                                                    crate::redact::coverage_bindings::SessionCoverageInputs {
+                                                        principal: &principal,
+                                                        owner_authorization_revision: 0,
+                                                        session_id,
+                                                        workspace_root: &root,
+                                                        environment: &env_snapshot_for_capture,
+                                                        vault_revision,
+                                                        command_cache: &command_cache,
+                                                        policy_digest: &policy_digest,
+                                                        sealed: sealed_binding,
+                                                        override_revision: 0,
+                                                        redact_config: &capture_redact,
+                                                    };
                                                 crate::redact::coverage_authority::CoverageBuild::capture(
                                                     &capture_redact,
                                                     &root,
-                                                    &session_env,
+                                                    &env,
                                                     &store,
                                                     &sealed,
+                                                    &capture_inputs,
                                                 )
                                             },
                                         )
@@ -13549,7 +13592,8 @@ pub(super) async fn run_worker(
                                         .map_err(|error| anyhow::anyhow!(error.to_string()))
                                         .and_then(|admission| {
                                             admission
-                                                .use_at_sink(|table| Ok(table.enforced()))
+                                                .into_bound_table()
+                                                .map(|table| table.as_ref().clone())
                                                 .map_err(|error| anyhow::anyhow!(error.to_string()))
                                         })
                                 }

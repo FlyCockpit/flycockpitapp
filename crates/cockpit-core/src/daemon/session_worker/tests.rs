@@ -69,17 +69,32 @@ fn coverage_test_key(seed: u8) -> crate::redact::coverage_authority::RedactionCo
     )
 }
 
+fn coverage_test_boundary(seed: u8) -> crate::redact::coverage_bindings::OwnedSourceRevisions {
+    use crate::redact::coverage_authority::CoverageBinding;
+    let binding = |offset| CoverageBinding::from_daemon_bytes([seed.wrapping_add(offset); 16]);
+    crate::redact::coverage_bindings::OwnedSourceRevisions {
+        environment: binding(4),
+        credential_vault: binding(5),
+        policy: binding(6),
+        sealed: binding(7),
+        override_revision: binding(8),
+        machine_sources: binding(9),
+    }
+}
+
 fn coverage_test_capture(
     calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    seed: u8,
 ) -> impl FnOnce() -> anyhow::Result<crate::redact::coverage_authority::CoverageBuild> + Send + 'static
 {
+    let boundary = coverage_test_boundary(seed);
     move || {
         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let table = crate::redact::RedactionTable::empty().with_forced_literal(
             "session-worker-coverage-canary".into(),
             "$test:session-worker".into(),
         )?;
-        Ok(crate::redact::coverage_authority::CoverageBuild::from_complete_table(table))
+        Ok(crate::redact::coverage_authority::CoverageBuild::from_complete_table(table, boundary))
     }
 }
 
@@ -95,7 +110,7 @@ async fn coverage_admission_is_one_operation_and_stale_results_are_inert() {
         .acquire(
             key.clone(),
             CoverageScope::SessionSubmission,
-            coverage_test_capture(captures.clone()),
+            coverage_test_capture(captures.clone(), 11),
         )
         .await
         .expect("complete session capture");
@@ -115,7 +130,7 @@ async fn coverage_admission_is_one_operation_and_stale_results_are_inert() {
         .acquire(
             key,
             CoverageScope::DriverTurn,
-            coverage_test_capture(captures.clone()),
+            coverage_test_capture(captures.clone(), 11),
         )
         .await
         .expect("fresh generation after invalidation")
@@ -127,7 +142,22 @@ async fn coverage_admission_is_one_operation_and_stale_results_are_inert() {
             Ok(())
         })
         .expect("one fresh operation");
-    assert_eq!(captures.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let bound = authority
+        .acquire(
+            coverage_test_key(41),
+            CoverageScope::SessionSubmission,
+            coverage_test_capture(captures.clone(), 41),
+        )
+        .await
+        .expect("bound table capture")
+        .into_bound_table()
+        .expect("bound table install");
+    authority.invalidate();
+    assert_eq!(
+        bound.scrub("session-worker-coverage-canary"),
+        "**REDACTED BY COCKPIT - DO NOT TRY TO OBTAIN BY WORKAROUND**"
+    );
+    assert_eq!(captures.load(std::sync::atomic::Ordering::SeqCst), 3);
 }
 
 #[tokio::test]
@@ -154,7 +184,7 @@ async fn owned_mutation_revokes_admission_at_each_sink() {
             .acquire(
                 key.clone(),
                 purpose,
-                coverage_test_capture(captures.clone()),
+                coverage_test_capture(captures.clone(), 30 + index as u8),
             )
             .await
             .expect("pre-mutation admission");
@@ -333,7 +363,7 @@ fn toggle_redaction_reacquires_bound_coverage() {
     assert!(toggle.contains("CoverageScope::RedactionOverride"));
     assert!(toggle.contains("CoverageBuild::capture"));
     assert!(toggle.contains(".and_then(|admission|"));
-    assert!(toggle.contains(".use_at_sink"));
+    assert!(toggle.contains("into_bound_table"));
     assert!(!toggle.contains("RedactionTable::build"));
     assert!(!toggle.contains("RedactionTable::empty"));
 }

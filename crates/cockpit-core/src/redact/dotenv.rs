@@ -10,6 +10,20 @@ use super::*;
 /// directories still descend (a directory matching no glob returns
 /// `Match::None`, not `Ignore`), so the patterns match at any depth with
 /// gitignore semantics.
+/// The `.env` walk depth cap for the redaction scan.
+///
+/// In a git repo: `None` (unbounded) — finding every `.env` for the
+/// redaction guarantee outranks speed (priority #1, correctness/safety:
+/// never let a secret leak because the scan was capped). Outside a repo,
+/// an arbitrary giant directory is the pathological case and `.env` files
+/// live near the root in practice, so cap at depth 8. `ignore`'s
+/// `WalkBuilder::max_depth` (via `walkdir`) counts the root as depth 0, its
+/// direct children as depth 1, and so on — so `Some(8)` yields entries up
+/// to eight levels below `cwd` and stops descending past that.
+pub(super) fn dotenv_max_depth(in_git_repo: bool) -> Option<usize> {
+    if in_git_repo { None } else { Some(8) }
+}
+
 pub(super) fn matched_dotenv_paths(
     cwd: &Path,
     patterns: &[String],
@@ -19,6 +33,31 @@ pub(super) fn matched_dotenv_paths(
     use ignore::overrides::OverrideBuilder;
 
     let mut out: Vec<PathBuf> = Vec::new();
+
+    let in_git_repo = crate::git::find_worktree_root(cwd).is_some();
+    if !in_git_repo && dotenv_scan_start_is_unbounded(cwd) {
+        tracing::debug!(
+            cwd = %cwd.display(),
+            "redaction `.env` walk skipped from unbounded filesystem start; explicit extra dotenv paths are still honored"
+        );
+        for p in extra {
+            if p.is_file() {
+                out.push(p.clone());
+            }
+        }
+        out.sort();
+        out.dedup();
+        return out;
+    }
+
+    // Bound the walk only outside a git repo: inside one we keep the
+    // unbounded walk so no `.env` is ever missed (correctness/safety #1).
+    let max_depth = dotenv_max_depth(in_git_repo);
+    if max_depth.is_some() {
+        tracing::debug!(
+            "redaction `.env` walk capped at depth 8 (cwd not in a git repo); a deeper `.env` won't be scanned"
+        );
+    }
 
     let mut override_builder = OverrideBuilder::new(cwd);
     let mut added_any = false;
@@ -39,10 +78,7 @@ pub(super) fn matched_dotenv_paths(
         let mut builder = WalkBuilder::new(cwd);
         builder
             .standard_filters(false)
-            // Coverage capture is complete for the trusted root. A reduced
-            // depth would make admission depend on repository shape and miss
-            // hidden secrets in a deep non-git workspace.
-            .max_depth(None)
+            .max_depth(max_depth)
             .overrides(overrides)
             .filter_entry(|entry| {
                 // Never descend into the git object store.
@@ -64,6 +100,23 @@ pub(super) fn matched_dotenv_paths(
     out.sort();
     out.dedup();
     out
+}
+
+pub(super) fn dotenv_scan_start_is_unbounded(cwd: &Path) -> bool {
+    if cwd.parent().is_none() {
+        return true;
+    }
+    dirs::home_dir().is_some_and(|home| same_path_lexical_or_canonical(cwd, &home))
+}
+
+fn same_path_lexical_or_canonical(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Auto-detect a matched env file's format and collect its scrub-candidate

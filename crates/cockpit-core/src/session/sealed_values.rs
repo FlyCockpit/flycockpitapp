@@ -552,7 +552,7 @@ impl Session {
         // transaction commits, so a rollback never leaves a cache ahead of the
         // durable table.
         *self.redaction_table_json.lock().unwrap() = Some(json);
-        if let Some((authority, key)) = self.redaction_coverage() {
+        if let Some((authority, key, _policy_digest)) = self.redaction_coverage() {
             authority.invalidate_key(&key);
         }
         Ok(metadata)
@@ -587,7 +587,7 @@ impl Session {
                 chrono::Utc::now().timestamp_millis(),
             )
             .await?;
-        if deleted && let Some((authority, key)) = self.redaction_coverage() {
+        if deleted && let Some((authority, key, _policy_digest)) = self.redaction_coverage() {
             authority.invalidate_key(&key);
         }
         Ok(deleted)

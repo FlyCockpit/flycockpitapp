@@ -147,6 +147,18 @@ impl fmt::Debug for RedactionCoverageKey {
 }
 
 impl RedactionCoverageKey {
+    pub(crate) fn matches_owned_revisions(
+        &self,
+        revisions: &super::coverage_bindings::OwnedSourceRevisions,
+    ) -> bool {
+        self.environment == revisions.environment
+            && self.credential_vault == revisions.credential_vault
+            && self.policy == revisions.policy
+            && self.sealed == revisions.sealed
+            && self.override_revision == revisions.override_revision
+            && self.machine_sources == revisions.machine_sources
+    }
+
     pub(crate) fn for_derived_session(&self, session_id: Uuid) -> Self {
         let mut derived = self.clone();
         derived.principal = CoverageBinding::derive(b"principal", session_id.as_bytes());
@@ -228,17 +240,50 @@ impl fmt::Display for CoverageError {
 
 impl std::error::Error for CoverageError {}
 
+/// Generation-bound egress proof carried on [`RedactionTable`] scrub paths.
+#[derive(Clone)]
+pub(crate) struct CoverageTableBinding {
+    authority: Weak<Inner>,
+    generation_id: Uuid,
+    epoch: u64,
+    key_revision: u64,
+    key: RedactionCoverageKey,
+}
+
+impl CoverageTableBinding {
+    pub(crate) fn validate(&self) -> Result<(), CoverageError> {
+        let inner = self.authority.upgrade().ok_or(CoverageError::Unavailable)?;
+        let state = lock(&inner.state);
+        let current = !state.closed
+            && state.epoch == self.epoch
+            && state.key_revisions.get(&self.key).copied().unwrap_or(0) == self.key_revision
+            && state
+                .residents
+                .get(&self.key)
+                .is_some_and(|resident| resident.generation.id == self.generation_id);
+        if current {
+            Ok(())
+        } else {
+            Err(CoverageError::Invalidated)
+        }
+    }
+}
+
 /// Complete, in-memory-only result of a source capture. `artifact_bytes` is
 /// supplied by the capture owner after measuring private parsed artifacts.
 pub(crate) struct CoverageBuild {
     table: Arc<RedactionTable>,
     artifact_bytes: usize,
+    boundary_revisions: super::coverage_bindings::OwnedSourceRevisions,
 }
 
 impl CoverageBuild {
-    pub(crate) fn from_complete_table(table: RedactionTable) -> Self {
+    pub(crate) fn from_complete_table(
+        table: RedactionTable,
+        boundary_revisions: super::coverage_bindings::OwnedSourceRevisions,
+    ) -> Self {
         let artifact_bytes = table.estimated_immutable_artifact_bytes();
-        Self::from_complete_table_and_artifact_bytes(table, artifact_bytes)
+        Self::from_complete_table_and_artifact_bytes(table, artifact_bytes, boundary_revisions)
     }
 
     /// Construct a build from a table whose complete-capture owner already
@@ -246,10 +291,12 @@ impl CoverageBuild {
     pub(crate) fn from_complete_table_and_artifact_bytes(
         table: RedactionTable,
         artifact_bytes: usize,
+        boundary_revisions: super::coverage_bindings::OwnedSourceRevisions,
     ) -> Self {
         Self {
             table: Arc::new(table),
             artifact_bytes,
+            boundary_revisions,
         }
     }
 
@@ -262,10 +309,13 @@ impl CoverageBuild {
         environment: &HashMap<String, String>,
         store: &crate::credentials::CredentialStore,
         sealed: &RedactionTable,
+        boundary_inputs: &super::coverage_bindings::SessionCoverageInputs<'_>,
     ) -> Result<Self> {
         let base =
             RedactionTable::build_with_env_and_credential_store(config, root, environment, store)?;
-        Ok(Self::from_complete_table(base.union(sealed)?))
+        let table = base.union(sealed)?;
+        let boundary_revisions = boundary_inputs.boundary_revisions(&table);
+        Ok(Self::from_complete_table(table, boundary_revisions))
     }
 
     pub(crate) fn capture_without_sealed(
@@ -273,10 +323,25 @@ impl CoverageBuild {
         root: &Path,
         environment: &HashMap<String, String>,
         store: &crate::credentials::CredentialStore,
+        boundary_inputs: &super::coverage_bindings::DaemonGlobalCoverageInputs<'_>,
     ) -> Result<Self> {
         let table =
             RedactionTable::build_with_env_and_credential_store(config, root, environment, store)?;
-        Ok(Self::from_complete_table(table))
+        let boundary_revisions = boundary_inputs.boundary_revisions(&table);
+        Ok(Self::from_complete_table(table, boundary_revisions))
+    }
+
+    pub(crate) fn capture_session_without_sealed(
+        config: &crate::config::extended::RedactConfig,
+        root: &Path,
+        environment: &HashMap<String, String>,
+        store: &crate::credentials::CredentialStore,
+        boundary_inputs: &super::coverage_bindings::SessionCoverageInputs<'_>,
+    ) -> Result<Self> {
+        let table =
+            RedactionTable::build_with_env_and_credential_store(config, root, environment, store)?;
+        let boundary_revisions = boundary_inputs.boundary_revisions(&table);
+        Ok(Self::from_complete_table(table, boundary_revisions))
     }
 }
 
@@ -601,6 +666,7 @@ impl RedactionCoverageAuthority {
         if state.closed
             || state.epoch != flight_epoch
             || state.key_revisions.get(&key).copied().unwrap_or(0) != flight_key_revision
+            || !key.matches_owned_revisions(&build.boundary_revisions)
         {
             return Err(CoverageError::Invalidated);
         }
@@ -665,6 +731,10 @@ impl RedactionCoverageAuthority {
         generation: Arc<RedactionCoverageGeneration>,
         purpose: CoverageScope,
     ) -> std::result::Result<CoverageAdmission, CoverageError> {
+        let resident_matches = state
+            .residents
+            .get(&generation.key)
+            .is_some_and(|resident| resident.generation.id == generation.id);
         if state.closed
             || state.epoch != generation.epoch
             || state
@@ -673,6 +743,7 @@ impl RedactionCoverageAuthority {
                 .copied()
                 .unwrap_or(0)
                 != generation.key_revision
+            || !resident_matches
             || state.admissions >= COVERAGE_ADMISSIONS
         {
             return Err(if state.admissions >= COVERAGE_ADMISSIONS {
@@ -883,6 +954,25 @@ impl OwnerAuthorization {
 }
 
 impl CoverageAdmission {
+    pub(crate) fn into_bound_table(
+        self,
+    ) -> std::result::Result<std::sync::Arc<RedactionTable>, CoverageError> {
+        let binding = CoverageTableBinding {
+            authority: self.inner.clone(),
+            generation_id: self.generation.id,
+            epoch: self.generation.epoch,
+            key_revision: self.generation.key_revision,
+            key: self.generation.key.clone(),
+        };
+        binding.validate()?;
+        let table = self
+            .generation
+            .table
+            .enforced()
+            .with_coverage_binding(binding);
+        Ok(std::sync::Arc::new(table))
+    }
+
     pub(crate) fn use_at_sink<T>(
         self,
         sink: impl FnOnce(&RedactionTable) -> Result<T>,
@@ -890,29 +980,39 @@ impl CoverageAdmission {
         let Some(inner) = self.inner.upgrade() else {
             return Err(CoverageError::Unavailable);
         };
-        let state = lock(&inner.state);
-        let current = !state.closed
-            && state.epoch == self.generation.epoch
-            && state
-                .key_revisions
-                .get(&self.generation.key)
-                .copied()
-                .unwrap_or(0)
-                == self.generation.key_revision
-            && state
-                .residents
-                .get(&self.generation.key)
-                .is_some_and(|resident| resident.generation.id == self.generation.id);
-        if !current {
-            return Err(CoverageError::Invalidated);
+        {
+            let state = lock(&inner.state);
+            let current = !state.closed
+                && state.epoch == self.generation.epoch
+                && state
+                    .key_revisions
+                    .get(&self.generation.key)
+                    .copied()
+                    .unwrap_or(0)
+                    == self.generation.key_revision
+                && state
+                    .residents
+                    .get(&self.generation.key)
+                    .is_some_and(|resident| resident.generation.id == self.generation.id);
+            if !current {
+                return Err(CoverageError::Invalidated);
+            }
         }
-        // Keep the authority state locked through the synchronous owned sink.
-        // Invalidation is therefore wholly before or wholly after this one
-        // operation; it cannot race between validation and egress.
-        let result =
-            sink(&self.generation.table.enforced()).map_err(|_| CoverageError::Unavailable);
-        drop(state);
-        result
+        // Release the authority mutex before synchronous sink work. The table
+        // binding revalidates on every scrub while the admission remains live.
+        let binding = CoverageTableBinding {
+            authority: self.inner.clone(),
+            generation_id: self.generation.id,
+            epoch: self.generation.epoch,
+            key_revision: self.generation.key_revision,
+            key: self.generation.key.clone(),
+        };
+        let table = self
+            .generation
+            .table
+            .enforced()
+            .with_coverage_binding(binding);
+        sink(&table).map_err(|_| CoverageError::Unavailable)
     }
 
     pub(crate) fn purpose(&self) -> CoverageScope {

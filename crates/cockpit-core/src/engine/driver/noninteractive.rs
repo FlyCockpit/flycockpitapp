@@ -1816,8 +1816,12 @@ impl Driver {
         // store funnel injects the same resolved command outputs (its
         // model/redaction/backup stores would otherwise resolve as missing).
         session.set_command_secret_cache(self.session.command_secret_cache());
-        if let Some((authority, key)) = self.session.redaction_coverage() {
-            session.set_redaction_coverage(authority, key.for_derived_session(session.id));
+        if let Some((authority, key, policy_digest)) = self.session.redaction_coverage() {
+            session.set_redaction_coverage(
+                authority,
+                key.for_derived_session(session.id),
+                policy_digest,
+            );
         }
         // Inherit the parent's descendant containment handle so the forked task
         // session's lifecycle hooks run their children under a proven lease (they

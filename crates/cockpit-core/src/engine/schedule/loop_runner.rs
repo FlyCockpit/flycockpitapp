@@ -439,8 +439,12 @@ fn fork_from_live_context(ctx: &ScheduleContext) -> anyhow::Result<Arc<crate::se
     // Inherit the parent's command-secret cache so the scheduled loop fork's
     // store funnel injects resolved command outputs.
     session.set_command_secret_cache(ctx.session.command_secret_cache());
-    if let Some((authority, key)) = ctx.session.redaction_coverage() {
-        session.set_redaction_coverage(authority, key.for_derived_session(session.id));
+    if let Some((authority, key, policy_digest)) = ctx.session.redaction_coverage() {
+        session.set_redaction_coverage(
+            authority,
+            key.for_derived_session(session.id),
+            policy_digest,
+        );
     }
     // Inherit the parent's descendant containment handle so the scheduled loop
     // fork's lifecycle hooks run under a proven lease instead of failing open.

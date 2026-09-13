@@ -1377,7 +1377,7 @@ impl SessionWorkerHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if *overlay != vars {
             *overlay = vars;
-            if let Some((authority, key)) = self.session.redaction_coverage() {
+            if let Some((authority, key, _policy_digest)) = self.session.redaction_coverage() {
                 authority.invalidate_key(&key);
             }
         }
@@ -1926,23 +1926,61 @@ impl SessionWorkerHandle {
         &self,
         purpose: crate::redact::coverage_authority::CoverageScope,
     ) -> anyhow::Result<crate::redact::coverage_authority::CoverageAdmission> {
-        let (authority, key) = self
+        let (authority, key, policy_digest) = self
             .session
             .redaction_coverage()
             .ok_or_else(|| anyhow::anyhow!("coverage_unavailable"))?;
-        let config = self.config_snapshot().extended.redact;
+        let config = self.config_snapshot().extended.redact.clone();
         let root = self.project_root.clone();
-        let environment = self.env_overlay_snapshot();
+        let environment = crate::env_snapshot::EnvSnapshot::new(
+            cockpit_proto::EnvSnapshotSource::SessionWorker,
+            self.env_overlay_snapshot(),
+        );
+        let sealed_records = self
+            .session
+            .db
+            .machine_scoped_sealed_redaction_records()
+            .await?;
+        let sealed_binding =
+            crate::redact::coverage_bindings::sealed_records_binding(&sealed_records);
+        let principal = crate::daemon::principal::ClientPrincipal::owner();
+        let trust_revision = self.current_trust_revision();
+        let session_id = self.session.id;
+        let command_cache = self
+            .session
+            .command_secret_cache()
+            .ok_or_else(|| anyhow::anyhow!("coverage_unavailable"))?;
+        let vault_revision = self
+            .session
+            .secret_vault()
+            .current_inventory_generation()
+            .map_err(|error| anyhow::anyhow!("reading redaction vault revision: {error}"))?;
         let store = self.session.credential_store()?;
         let sealed = self.session.machine_scoped_sealed_redactions().await?;
+        let env = environment.vars().clone();
+        let env_snapshot_for_capture = environment.clone();
         authority
             .acquire(key, purpose, move || {
+                let capture_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+                    principal: &principal,
+                    owner_authorization_revision: trust_revision,
+                    session_id,
+                    workspace_root: &root,
+                    environment: &env_snapshot_for_capture,
+                    vault_revision,
+                    command_cache: &command_cache,
+                    policy_digest: &policy_digest,
+                    sealed: sealed_binding,
+                    override_revision: 0,
+                    redact_config: &config,
+                };
                 crate::redact::coverage_authority::CoverageBuild::capture(
                     &config,
                     &root,
-                    &environment,
+                    &env,
                     &store,
                     &sealed,
+                    &capture_inputs,
                 )
             })
             .await

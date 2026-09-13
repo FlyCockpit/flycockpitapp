@@ -2393,6 +2393,7 @@ pub async fn try_spawn(
         no_sandbox,
         lifecycle,
         intent,
+        None,
     )
     .await
 }
@@ -2441,6 +2442,7 @@ pub async fn try_spawn_with_model_and_entry_mode(
         no_sandbox,
         lifecycle,
         intent,
+        None,
     )
     .await
 }
@@ -2466,6 +2468,55 @@ pub async fn attach_to_session(
         no_sandbox,
         lifecycle,
         intent,
+        None,
+    )
+    .await
+}
+
+/// The one daemon owner selected by the interactive startup lifecycle request.
+#[derive(Debug, Clone)]
+pub(crate) struct SelectedLifecycle {
+    pub(crate) endpoint: ClientEndpoint,
+    pub(crate) owns_daemon: bool,
+    pub(crate) ephemeral_owner: bool,
+    pub(crate) socket: PathBuf,
+    pub(crate) startup_notice: Option<String>,
+    pub(crate) promoted_from_ephemeral: bool,
+}
+
+impl From<cockpit_client::LifecycleResolution> for SelectedLifecycle {
+    fn from(value: cockpit_client::LifecycleResolution) -> Self {
+        Self {
+            endpoint: value.endpoint,
+            owns_daemon: value.owns_daemon,
+            ephemeral_owner: value.ephemeral_owner,
+            socket: value.socket,
+            startup_notice: value.startup_notice,
+            promoted_from_ephemeral: value.promoted_from_ephemeral,
+        }
+    }
+}
+
+/// Attach through the owner already selected by startup. This never submits a
+/// second lifecycle request.
+pub(crate) async fn attach_to_selected_lifecycle(
+    cwd: &Path,
+    session_id: Option<uuid::Uuid>,
+    initial_model: Option<cockpit_config::providers::ActiveModelRef>,
+    requested_session_entry_mode: Option<proto::SessionEntryMode>,
+    no_sandbox: bool,
+    lifecycle: LifecycleClient,
+    selected: SelectedLifecycle,
+) -> Result<AgentRunner, String> {
+    try_spawn_inner(
+        cwd,
+        session_id,
+        initial_model,
+        requested_session_entry_mode,
+        no_sandbox,
+        lifecycle,
+        LifecycleIntent::AttachOrPersistent,
+        Some(selected),
     )
     .await
 }
@@ -2488,6 +2539,7 @@ async fn try_spawn_inner(
     no_sandbox: bool,
     lifecycle: LifecycleClient,
     intent: LifecycleIntent,
+    selected: Option<SelectedLifecycle>,
 ) -> Result<AgentRunner, String> {
     // A picker choice made before the first runner exists is an explicit root
     // selection, not merely seed data for a model-less session. Carry the same
@@ -2499,16 +2551,11 @@ async fn try_spawn_inner(
     let root_model_override = root_model_override_for_attach(session_id, &initial_model);
     let attached = {
         let mut timer = cockpit_core::startup::PhaseTimer::start("agent_runner::try_spawn");
-        // A session id is durable but mode-blind at this boundary. Resolve all
-        // generic resumes through the persistent policy; Code and Computer
-        // remain valid there, while Assistant cannot attach to an ephemeral
-        // owner before its durable mode is loaded by the daemon.
-        let lifecycle_intent = if session_id.is_some() {
-            LifecycleIntent::PromoteToPersistent
+        let daemon = if let Some(selected) = selected {
+            selected
         } else {
-            intent
+            lifecycle.resolve(intent).await?.into()
         };
-        let daemon = lifecycle.resolve(lifecycle_intent).await?;
         timer.phase("resolve_lifecycle");
         let owns_daemon = daemon.owns_daemon;
         let ephemeral_owner = daemon.ephemeral_owner;

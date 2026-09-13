@@ -396,6 +396,9 @@ impl App {
         if cmd.is_empty() {
             return;
         }
+        if !self.guard_startup_workspace_effects() {
+            return;
+        }
         let cmd = cmd.to_string();
         let cwd = self.launch.cwd.clone();
         self.start_local_command_action(format!("! {cmd}"), None, move || {
@@ -409,6 +412,9 @@ impl App {
         let args = args.trim();
         if args.is_empty() {
             self.push_plain("/git: usage `/git <args>` (e.g. `/git status`)".to_string());
+            return;
+        }
+        if !self.guard_startup_workspace_effects() {
             return;
         }
         let args = args.to_string();

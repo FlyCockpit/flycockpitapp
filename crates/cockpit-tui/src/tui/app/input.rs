@@ -1818,6 +1818,15 @@ impl App {
                 .abort_key(&AsyncActionKey::new("autocomplete.files"));
             return;
         };
+        if !self.guard_startup_workspace_effects() {
+            self.at_cache.borrow_mut().take();
+            self.at_suggestions_loading = false;
+            self.at_suggestions_loaded_query = None;
+            self.at_suggestions_error = None;
+            self.async_actions
+                .abort_key(&AsyncActionKey::new("autocomplete.files"));
+            return;
+        }
         let cwd = self.launch.cwd.clone();
         let usage_tags = self.usage_tags.clone();
         let session_allow = self.gitignore_session_allow.clone();
@@ -2488,6 +2497,9 @@ impl App {
         // Shell mode: a leading `!` runs the rest as a one-shot local
         // command (GOALS §1k). Never reaches the agent or the wire.
         if self.composer.text().starts_with('!') {
+            if !self.guard_startup_workspace_effects() {
+                return false;
+            }
             let cmd = self.composer.text()[1..].to_string();
             self.clear_composer_buffer();
             self.run_shell_command(&cmd);
@@ -2499,8 +2511,11 @@ impl App {
             }
             return false;
         }
-        if let Some(query) = self.slash_query() {
-            if let Some(command) = super::hidden_slash_alias(query) {
+        if let Some(query) = self.slash_query().map(str::to_owned) {
+            if !self.guard_startup_workspace_effects() {
+                return false;
+            }
+            if let Some(command) = super::hidden_slash_alias(&query) {
                 return self.execute_slash(command);
             }
             // Run whatever is highlighted. The default highlight is the
@@ -2619,6 +2634,24 @@ impl App {
             }
             return false;
         }
+        if (self.first_paint_completed || self.startup_background.started)
+            && (!self.startup_background.workspace_ready
+                || !matches!(self.agent_runner, Some(Ok(_))))
+        {
+            if self
+                .startup_retained_submission_id
+                .is_none_or(|(generation, _)| generation != self.startup_background.generation)
+            {
+                self.startup_retained_submission_id =
+                    Some((self.startup_background.generation, uuid::Uuid::now_v7()));
+            }
+            self.show_toast(
+                "Message retained until startup attaches the session",
+                super::ToastKind::Info,
+            );
+            self.retry_startup_background();
+            return false;
+        }
         // A selection in flight is deliberately *not* a missing-model state.
         // Build the exact submission below and hold it behind that correlated
         // transaction instead of opening configuration or losing paste/tag
@@ -2678,7 +2711,15 @@ impl App {
         // v7 nonce is only the provisional fence key; once the complete
         // submission exists below, the reservation is atomically re-keyed to
         // the payload-derived durable identity without changing its order.
-        let invocation_nonce = uuid::Uuid::now_v7();
+        let startup_retained_dispatch = self
+            .startup_retained_submission_id
+            .is_some_and(|(generation, _)| generation == self.startup_background.generation);
+        let invocation_nonce = self
+            .startup_retained_submission_id
+            .take()
+            .filter(|(generation, _)| *generation == self.startup_background.generation)
+            .map(|(_, id)| id)
+            .unwrap_or_else(uuid::Uuid::now_v7);
         let mut client_submission_id = invocation_nonce;
         let Ok(fence_sequence) =
             self.submission_order
@@ -2981,7 +3022,7 @@ impl App {
         };
         let identity_pending =
             !pending_probe_ids.is_empty() || self.pending_model_selection.is_some();
-        if !identity_pending {
+        if !identity_pending && !startup_retained_dispatch {
             let derived_submission_id = cockpit_client::submission::derive_client_submission_id(
                 invocation_nonce,
                 &submission.client_fingerprint(),

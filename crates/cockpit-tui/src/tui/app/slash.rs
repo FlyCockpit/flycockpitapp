@@ -1496,6 +1496,9 @@ impl App {
     /// honors the choice; otherwise dispatches the fresh-write turn
     /// immediately. `config.json` is never touched.
     pub(super) fn handle_init_command(&mut self, args: &str) {
+        if !self.guard_startup_workspace_effects() {
+            return;
+        }
         if self.busy {
             self.push_plain("/init: a turn is already running — wait for it to finish".to_string());
             return;
@@ -1900,26 +1903,40 @@ impl App {
             self.push_plain(format!("/assistant: {error}"));
             return;
         }
-        let request = cockpit_proto::Request::ResolveAssistantSession {
-            assistant_id: name.to_string(),
-            project_root: self.launch.cwd.to_string_lossy().into_owned(),
-            mode: cockpit_proto::AssistantSessionResolutionMode::MostRecentOrCreate,
+        if !self.guard_startup_workspace_effects() {
+            return;
+        }
+        let Some(endpoint) = self
+            .startup_lifecycle
+            .as_ref()
+            .map(|selected| selected.endpoint.clone())
+        else {
+            self.push_plain("/assistant: startup session is not ready".to_string());
+            return;
         };
+        let assistant_id = name.to_string();
+        let project_root = self.launch.cwd.to_string_lossy().into_owned();
         let source_session_id = self.launch.session_id;
-        let lifecycle = self.lifecycle.clone();
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("assistant.resolve"),
             AsyncActionPolicy::AllowConcurrent,
             move || {
-                let resolution =
-                    agent_runner::resolve_assistant_session_blocking(lifecycle, request)?;
-                match resolution.response {
+                let request = cockpit_proto::Request::ResolveAssistantSession {
+                    assistant_id,
+                    project_root,
+                    mode: cockpit_proto::AssistantSessionResolutionMode::MostRecentOrCreate,
+                };
+                let response = agent_runner::daemon_request_at_blocking(&endpoint, request)
+                    .map_err(|error| {
+                        format!("assistant session resolution unavailable: {error}")
+                    })?;
+                match response {
                     cockpit_proto::Response::AssistantSessionResolved { session, .. } => {
                         Ok(AsyncActionPayload::AssistantSessionResolved {
                             session_id: session.session_id,
                             source_session_id,
-                            startup_notice: resolution.startup_notice,
-                            promoted_from_ephemeral: resolution.promoted_from_ephemeral,
+                            startup_notice: None,
+                            promoted_from_ephemeral: false,
                         })
                     }
                     other => Err(format!("unexpected assistant response: {other:?}")),

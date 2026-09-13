@@ -11,7 +11,7 @@ impl App {
         &mut self,
         parent_session_id: uuid::Uuid,
         endpoint: cockpit_client::ClientEndpoint,
-        socket: std::path::PathBuf,
+        _socket: std::path::PathBuf,
         fork_session_id: uuid::Uuid,
         fork_short_id: String,
         fork_point_seq: Option<i64>,

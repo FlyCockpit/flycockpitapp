@@ -23,7 +23,9 @@ fn configured_app_body(tmp: &tempfile::TempDir) -> App {
         r#"{"url":"https://example.test","models":[{"id":"m"}]}"#,
     )
     .unwrap();
-    App::new(Some(tmp.path()), false)
+    let mut app = App::new_with_bootstrap_config(Some(tmp.path()), false);
+    App::prepare_runner_attach_harness(&mut app);
+    app
 }
 
 async fn drain_until_idle(app: &mut App) {
@@ -50,6 +52,7 @@ fn seed_pending_runner_attach(
         requested_session_id: app.launch.session_id,
         model_state_generation: app.active_model_state_generation,
         config_generation: app.config_snapshot.generation,
+        startup_generation: None,
         latch_error: false,
         continuations,
     });

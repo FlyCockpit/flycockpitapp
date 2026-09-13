@@ -4218,3 +4218,25 @@ fn extended_config_key_alias_table_matches_serde() {
         );
     }
 }
+
+#[test]
+fn daemon_lifetime_policy_is_narrow_default_true_and_fail_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    assert!(load_daemon_lifetime_policy_at(&path).unwrap());
+
+    std::fs::write(
+        &path,
+        r#"{"daemon":{"background_agents":false,"unrelated":{"malformed":true}}}"#,
+    )
+    .unwrap();
+    assert!(!load_daemon_lifetime_policy_at(&path).unwrap());
+
+    std::fs::write(&path, r#"{"daemon":{"background_agents":"false"}}"#).unwrap();
+    let error = load_daemon_lifetime_policy_at(&path).unwrap_err();
+    assert!(error.to_string().contains("must be a boolean"));
+
+    std::fs::write(&path, r#"{"daemon":false}"#).unwrap();
+    let error = load_daemon_lifetime_policy_at(&path).unwrap_err();
+    assert!(error.to_string().contains("daemon must be an object"));
+}

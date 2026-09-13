@@ -2194,6 +2194,34 @@ pub fn load_installation_daemon_boot() -> Result<DaemonBootConfig> {
     Ok(boot)
 }
 
+/// Read the only installation-wide setting that participates in interactive
+/// daemon acquisition. This deliberately does not resolve a workspace, a
+/// machine-local layer, or any other part of the effective configuration.
+///
+/// A missing global layer is the product default: background agents are
+/// enabled. A present but unreadable or malformed layer is an error rather
+/// than an implicit request for an ephemeral owner.
+pub fn load_global_daemon_lifetime_policy() -> Result<bool> {
+    let path = crate::config::dirs::global_config_file()?;
+    load_daemon_lifetime_policy_at(&path)
+}
+
+fn load_daemon_lifetime_policy_at(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(DaemonConfig::default().background_agents);
+    }
+    let doc = ExtendedConfigDoc::load(&path)?;
+    match doc.raw_field("daemon") {
+        Some(Value::Object(daemon)) => match daemon.get("background_agents") {
+            Some(Value::Bool(value)) => Ok(*value),
+            Some(_) => anyhow::bail!("daemon.background_agents must be a boolean"),
+            None => Ok(DaemonConfig::default().background_agents),
+        },
+        Some(_) => anyhow::bail!("daemon must be an object"),
+        None => Ok(DaemonConfig::default().background_agents),
+    }
+}
+
 /// Effective config plus the non-secret warnings raised while merging the
 /// layered documents. This is the real layered load path's warning channel:
 /// it surfaces fail-closed events that happen during layer merge (e.g. a

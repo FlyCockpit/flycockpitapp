@@ -17,8 +17,8 @@ use crate::cli::{
     AssistantSoulEditMode, MediaAccountingCommand,
 };
 use crate::commands::setup::{TerminalActionHandler, TerminalIo, run_terminal_wizard};
-use crate::daemon::client::{ensure_assistant_persistent_daemon, ensure_persistent_daemon};
-use crate::daemon::proto::{AssistantSessionResolutionMode, Request, Response};
+use crate::daemon::client::ensure_persistent_daemon;
+use crate::daemon::proto::{Request, Response};
 #[cfg(test)]
 use crate::session::project_id_for;
 use crate::wizard::WizardRun;
@@ -27,13 +27,16 @@ pub async fn run(
     cmd: AssistantCommand,
     no_sandbox: bool,
     launch_start: Option<Instant>,
+    debug_last_message: bool,
 ) -> Result<()> {
     match cmd {
         AssistantCommand::New(args) => new(args).await,
         AssistantCommand::List => list().await,
         AssistantCommand::Show { name } => show(&name).await,
         AssistantCommand::Delete(args) => delete(args).await,
-        AssistantCommand::Chat { name } => chat(&name, no_sandbox, launch_start).await,
+        AssistantCommand::Chat { name } => {
+            chat(&name, no_sandbox, launch_start, debug_last_message).await
+        }
         AssistantCommand::SoulEditMode { mode } => set_primary_soul_edit_mode(mode).await,
         AssistantCommand::Learn(args) => crate::commands::learn::run(args, no_sandbox).await,
         AssistantCommand::Media { command } => media(command).await,
@@ -497,42 +500,21 @@ async fn fetch_assistant(
     Ok(assistant)
 }
 
-async fn chat(name: &str, no_sandbox: bool, launch_start: Option<Instant>) -> Result<()> {
+async fn chat(
+    name: &str,
+    no_sandbox: bool,
+    launch_start: Option<Instant>,
+    debug_last_message: bool,
+) -> Result<()> {
     crate::assistants::validate_named_assistant_name(name)?;
-    let project_root = std::env::current_dir().context("resolving cwd")?;
-    let project_root_str = project_root.to_string_lossy().into_owned();
-    let daemon = ensure_assistant_persistent_daemon()
-        .await
-        .context("starting persistent daemon for assistant chat")?;
-    if daemon.promoted_from_ephemeral() {
-        eprintln!(
-            "{}",
-            cockpit_core::daemon::client::ASSISTANT_PERSISTENCE_NOTICE
-        );
-    }
-    let response = daemon
-        .client
-        .request(Request::ResolveAssistantSession {
-            assistant_id: name.to_string(),
-            project_root: project_root_str,
-            mode: AssistantSessionResolutionMode::MostRecentOrCreate,
-        })
-        .await
-        .context("requesting assistant session resolution from daemon")?
-        .map_err(|error| {
-            anyhow::anyhow!("daemon rejected assistant session resolution: {error}")
-        })?;
-    let session_id = match response {
-        Response::AssistantSessionResolved { session, .. } => session.session_id,
-        other => {
-            bail!("daemon returned unexpected response to assistant session resolution: {other:?}")
-        }
-    };
-    crate::commands::tui::run_with_session(
-        Some(&project_root),
+    // Named-session resolution is presentation work and therefore belongs
+    // behind the shell's first-paint lifecycle gate.
+    crate::commands::tui::run_named_assistant(
+        None,
         no_sandbox,
-        session_id,
+        name.to_string(),
         launch_start,
+        debug_last_message,
     )
     .await
 }

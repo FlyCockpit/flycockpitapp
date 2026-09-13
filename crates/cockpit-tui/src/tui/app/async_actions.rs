@@ -914,9 +914,96 @@ impl App {
             return;
         }
         match result.kind {
+            AsyncActionKind::Blocking("startup.lifetime-policy") => match result.payload {
+                Ok(AsyncActionPayload::StartupLifetimePolicy {
+                    generation,
+                    result: Ok(background_agents),
+                }) if generation == self.startup_background.generation && !self.exit_requested => {
+                    self.startup_background.retry = None;
+                    self.ephemeral_preference = !background_agents;
+                    self.lifecycle.set_default_intent(self.lifecycle_intent());
+                    if self.mark_startup_trace_milestone("lifetime-policy-ready") {
+                        tracing::info!(target: cockpit_core::startup::TARGET, event = "lifetime-policy-ready", background_agents, "startup");
+                    }
+                    // Lifecycle acquisition is deliberately downstream of the
+                    // policy receipt.  The bootstrap action resolves exactly
+                    // this selected lifecycle capability after first paint.
+                    self.start_startup_lifecycle_resolution();
+                }
+                Ok(AsyncActionPayload::StartupLifetimePolicy {
+                    generation,
+                    result: Err(_),
+                }) if generation == self.startup_background.generation && !self.exit_requested => {
+                    // The launch trace is a machine-readable ordering aid;
+                    // it must not leak a configuration path through an I/O
+                    // error. The visible retryable toast retains detail.
+                    if self.mark_startup_trace_milestone("lifetime-policy-error") {
+                        tracing::warn!(target: cockpit_core::startup::TARGET, event = "lifetime-policy-error", "startup");
+                    }
+                    self.startup_background.retry = Some(StartupRetry::LifetimePolicy);
+                    self.show_toast(
+                        "Could not read daemon lifetime policy; retry startup",
+                        crate::tui::app::ToastKind::Error,
+                    );
+                }
+                Ok(_) | Err(_) => {}
+            },
             AsyncActionKind::Internal("runner.attach") => {
                 self.apply_runner_attach_result(result.id, result.payload);
             }
+            AsyncActionKind::Internal("startup.lifecycle") => match result.payload {
+                Ok(AsyncActionPayload::StartupLifecycleResolved {
+                    generation,
+                    result: Ok(lifecycle),
+                }) if generation == self.startup_background.generation && !self.exit_requested => {
+                    self.startup_background.retry = None;
+                    let selected_lifetime = match self.lifecycle_intent() {
+                        cockpit_client::LifecycleIntent::AttachOrPersistent
+                        | cockpit_client::LifecycleIntent::PromoteToPersistent => "persistent",
+                        cockpit_client::LifecycleIntent::AttachOrEphemeral => "ephemeral",
+                    };
+                    let actual_lifetime = if lifecycle.ephemeral_owner {
+                        "ephemeral"
+                    } else {
+                        "persistent"
+                    };
+                    let outcome = if lifecycle.promoted_from_ephemeral {
+                        "promoted"
+                    } else if lifecycle.owns_daemon {
+                        "spawned"
+                    } else {
+                        "reused"
+                    };
+                    if self.mark_startup_trace_milestone("lifecycle-ready") {
+                        tracing::info!(
+                            target: cockpit_core::startup::TARGET,
+                            event = "lifecycle-ready",
+                            selected_lifetime,
+                            actual_lifetime,
+                            outcome,
+                            promoted = lifecycle.promoted_from_ephemeral,
+                            reused = !lifecycle.owns_daemon,
+                            "startup"
+                        );
+                    }
+                    self.startup_lifecycle = Some(lifecycle);
+                    self.start_onboarding_bootstrap_fetch();
+                }
+                Ok(AsyncActionPayload::StartupLifecycleResolved {
+                    generation,
+                    result: Err(error),
+                }) if generation == self.startup_background.generation && !self.exit_requested => {
+                    if self.mark_startup_trace_milestone("lifecycle-error") {
+                        tracing::warn!(target: cockpit_core::startup::TARGET, event = "lifecycle-error", "startup");
+                    }
+                    self.startup_background.retry = Some(StartupRetry::Lifecycle);
+                    self.show_toast(
+                        format!("Daemon lifecycle unavailable: {error}"),
+                        crate::tui::app::ToastKind::Error,
+                    );
+                }
+                Ok(_) | Err(_) => {}
+            },
             AsyncActionKind::Internal("btw.runner.attach") => {
                 self.apply_btw_runner_attach(result.id, result.payload);
             }
@@ -990,23 +1077,135 @@ impl App {
                     self.apply_workspace_trust_completion(completion);
                 }
             }
-            AsyncActionKind::DaemonRpc(
-                "onboarding.bootstrap"
-                | "onboarding.transition"
-                | "onboarding.secure_intent"
-                | "onboarding.ready_retry",
-            ) => match result.payload {
-                Ok(AsyncActionPayload::OnboardingBootstrap(snapshot)) => {
-                    self.apply_onboarding_bootstrap_snapshot(snapshot);
+            AsyncActionKind::DaemonRpc("onboarding.bootstrap") => {
+                let pending_request_id = self
+                    .pending_startup_onboarding_operations
+                    .remove(&result.id);
+                match result.payload {
+                    Ok(AsyncActionPayload::StartupOnboardingBootstrap {
+                        generation,
+                        request_id,
+                        receipt,
+                        snapshot,
+                    }) => {
+                        if self.exit_requested || generation != self.startup_background.generation {
+                            return;
+                        }
+                        let receipt_matches = receipt.as_ref().is_none_or(|receipt| {
+                            receipt.status == cockpit_proto::OnboardingReceiptStatus::Committed
+                                && snapshot.as_ref().is_some_and(|snapshot| {
+                                    receipt.run_id == snapshot.run_id
+                                        && receipt.attempt_id == snapshot.attempt_id
+                                        && snapshot.last_receipt.as_ref() == Some(receipt)
+                                })
+                        });
+                        if !receipt_matches || pending_request_id.as_deref() != Some(&request_id) {
+                            return;
+                        }
+                        self.startup_background.retry = None;
+                        if self.mark_startup_trace_milestone("onboarding-ready") {
+                            tracing::info!(target: cockpit_core::startup::TARGET, event = "onboarding-ready", "startup");
+                        }
+                        self.apply_onboarding_bootstrap_snapshot(snapshot);
+                    }
+                    Ok(AsyncActionPayload::StartupOnboardingFailed { generation, error })
+                        if generation == self.startup_background.generation
+                            && !self.exit_requested =>
+                    {
+                        self.startup_background.retry = Some(StartupRetry::Onboarding);
+                        if self.mark_startup_trace_milestone("onboarding-error") {
+                            tracing::warn!(target: cockpit_core::startup::TARGET, event = "onboarding-error", "startup");
+                        }
+                        self.show_toast(
+                            format!("Onboarding authority unavailable: {error}"),
+                            crate::tui::app::ToastKind::Error,
+                        );
+                    }
+                    Ok(_) | Err(_) => {}
                 }
-                Err(error) => self.show_toast(
-                    format!("Onboarding authority unavailable: {error}"),
-                    crate::tui::app::ToastKind::Error,
-                ),
-                Ok(_) => self.show_toast(
-                    "Onboarding authority returned an invalid projection",
-                    crate::tui::app::ToastKind::Error,
-                ),
+            }
+            AsyncActionKind::DaemonRpc(
+                label @ ("onboarding.transition"
+                | "onboarding.secure_intent"
+                | "onboarding.ready_retry"),
+            ) => {
+                let pending_request_id = self
+                    .pending_startup_onboarding_operations
+                    .remove(&result.id);
+                match result.payload {
+                    Ok(AsyncActionPayload::StartupOnboardingTransition(completion))
+                        if completion.generation == self.startup_background.generation
+                            && !self.exit_requested
+                            && self.onboarding_snapshot.as_ref().is_some_and(|current| {
+                                current.run_id == completion.run_id
+                                    && current.attempt_id == completion.attempt_id
+                                    && current.revision == completion.expected_revision
+                            })
+                            && pending_request_id.as_deref() == Some(&completion.request_id)
+                            && (label == "onboarding.ready_retry"
+                                || completion.receipt.is_some())
+                            && completion.receipt.as_ref().is_none_or(|receipt| {
+                                receipt.status == cockpit_proto::OnboardingReceiptStatus::Committed
+                                    && receipt.run_id == completion.run_id
+                                    && receipt.attempt_id == completion.attempt_id
+                                    && receipt.consumed_revision == completion.expected_revision
+                                    && (label == "onboarding.secure_intent"
+                                        || completion.snapshot.as_ref().is_some_and(|snapshot| {
+                                            snapshot.last_receipt.as_ref() == Some(receipt)
+                                        }))
+                            }) =>
+                    {
+                        self.apply_onboarding_bootstrap_snapshot(completion.snapshot);
+                    }
+                    Ok(AsyncActionPayload::StartupOnboardingTransition(_)) => {}
+                    Err(error) if !self.exit_requested && pending_request_id.is_some() => {
+                        self.startup_background.retry = Some(StartupRetry::Onboarding);
+                        if self.mark_startup_trace_milestone("onboarding-error") {
+                            tracing::warn!(target: cockpit_core::startup::TARGET, event = "onboarding-error", "startup");
+                        }
+                        self.show_toast(
+                            format!("Onboarding transition unavailable: {error}"),
+                            crate::tui::app::ToastKind::Error,
+                        );
+                    }
+                    Ok(_) if !self.exit_requested && pending_request_id.is_some() => {
+                        self.show_toast(
+                            "Onboarding authority returned an invalid projection",
+                            crate::tui::app::ToastKind::Error,
+                        );
+                    }
+                    Ok(_) | Err(_) => {}
+                }
+            }
+            AsyncActionKind::DaemonRpc("startup.workspace") => match result.payload {
+                Ok(AsyncActionPayload::StartupWorkspace(completion)) => {
+                    self.apply_startup_workspace_completion(completion);
+                }
+                Ok(AsyncActionPayload::StartupWorkspaceFailed {
+                    generation,
+                    snapshot,
+                    error,
+                }) if generation == self.startup_background.generation && !self.exit_requested => {
+                    self.startup_background.retry = Some(StartupRetry::Workspace(snapshot));
+                    if self.mark_startup_trace_milestone("trust-error") {
+                        tracing::warn!(target: cockpit_core::startup::TARGET, event = "trust-error", "startup");
+                    }
+                    self.show_toast(
+                        format!("Workspace trust could not be resolved: {error}"),
+                        crate::tui::app::ToastKind::Error,
+                    );
+                }
+                Ok(_)
+                    if !self.exit_requested
+                        && self.startup_background.started
+                        && !self.startup_background.workspace_ready =>
+                {
+                    self.show_toast(
+                        "Workspace trust returned an invalid projection",
+                        crate::tui::app::ToastKind::Error,
+                    );
+                }
+                Ok(_) | Err(_) => {}
             },
             AsyncActionKind::DaemonRpc("sealed.effect") => {
                 if let Ok(AsyncActionPayload::Sealed(completion)) = result.payload {
@@ -1415,12 +1614,45 @@ impl App {
             AsyncActionKind::Internal("startup.dependencies") => {
                 if let Ok(AsyncActionPayload::StartupDependencyProjection(projection)) =
                     result.payload
+                    && !self.exit_requested
+                    && self.startup_background.workspace_ready
                     && let Some(summary) =
                         cockpit_core::external_runtime::startup_dependency_policy(&projection)
                             .summary
                 {
                     self.show_toast(format!("Dependency warning: {summary}"), ToastKind::Warning);
                 }
+            }
+            AsyncActionKind::Internal("startup.clipboard_reconcile") => {
+                if let Ok(AsyncActionPayload::StartupClipboardReconciled {
+                    generation,
+                    removed,
+                    unsafe_entries,
+                    failed,
+                }) = result.payload
+                    && generation == self.startup_background.generation
+                    && !self.exit_requested
+                {
+                    if failed {
+                        self.show_toast(
+                            "Clipboard recovery reconciliation failed",
+                            ToastKind::Warning,
+                        );
+                    } else if removed > 0 || unsafe_entries > 0 {
+                        self.show_toast(
+                            format!(
+                                "Clipboard recovery reconciled: removed {removed}, unsafe {unsafe_entries}"
+                            ),
+                            ToastKind::Info,
+                        );
+                    }
+                }
+            }
+            AsyncActionKind::Internal("startup.export_recovery") => {
+                // Recovery owns only secure cleanup I/O. Its completion has no
+                // presentation or authority effect, including after exit or a
+                // startup-generation replacement.
+                let _ = result.payload;
             }
             AsyncActionKind::Internal(label @ ("session.switch" | "session.resume")) => {
                 match result.payload {
@@ -1650,6 +1882,27 @@ impl App {
                 ),
             },
             AsyncActionKind::DaemonRpc("assistant.resolve") => match result.payload {
+                Ok(AsyncActionPayload::StartupAssistantSessionResolved { generation, result }) => {
+                    if generation == self.startup_background.generation && !self.exit_requested {
+                        match result {
+                            Ok(session_id) => {
+                                self.startup_background.retry = None;
+                                self.startup_assistant_name = None;
+                                self.launch.session_id = Some(session_id);
+                            }
+                            Err(error) => {
+                                self.startup_background.retry = Some(StartupRetry::NamedAssistant);
+                                if self.mark_startup_trace_milestone("session-error") {
+                                    tracing::warn!(target: cockpit_core::startup::TARGET, event = "session-error", "startup");
+                                }
+                                self.show_toast(
+                                    format!("Assistant session could not be resolved: {error}"),
+                                    ToastKind::Error,
+                                );
+                            }
+                        }
+                    }
+                }
                 Ok(AsyncActionPayload::AssistantSessionResolved {
                     session_id,
                     source_session_id,
@@ -1657,6 +1910,7 @@ impl App {
                     promoted_from_ephemeral,
                 }) => {
                     if self.launch.session_id == source_session_id {
+                        self.startup_assistant_name = None;
                         if let Some(notice) = startup_notice {
                             // A lifecycle warning is independent of the
                             // ownership transition below. Keep it in the

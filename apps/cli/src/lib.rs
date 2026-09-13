@@ -36,9 +36,8 @@ pub(crate) mod daemon {
     pub(crate) mod client {
         pub(crate) use cockpit_core::daemon::client::{
             OwnedDaemonRunError, OwnedSessionMode, ScopedDaemonClient, acquire_acp_socket_daemon,
-            ensure_assistant_persistent_daemon, ensure_persistent_daemon,
-            promote_attached_owner_in_place, run_assistant_daemon, run_one_shot_daemon,
-            run_owned_daemon,
+            ensure_persistent_daemon, promote_attached_owner_in_place, run_assistant_daemon,
+            run_one_shot_daemon, run_owned_daemon,
         };
     }
     #[cfg(test)]
@@ -64,7 +63,7 @@ pub use cockpit_db as db;
 mod terminal_host;
 
 use anyhow::Context;
-use std::io::Write;
+use std::io::{IsTerminal as _, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, mpsc};
@@ -879,6 +878,9 @@ fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
         command,
         Some(Command::Run(_))
             | Some(Command::Init(_))
+            | Some(Command::Assistants(
+                crate::cli::AssistantCommand::Chat { .. }
+            ))
             | Some(Command::Assistants(crate::cli::AssistantCommand::Learn(_)))
     ) {
         return false;
@@ -934,6 +936,17 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         crate::cli::PublicCli::from_arg_matches(&crate::cli::public_v0_1_command().get_matches())?
             .into();
 
+    let interactive_shell = std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && (tui_mode_for_command(cli.command.as_ref()).is_some()
+            || matches!(
+                cli.command.as_ref(),
+                Some(Command::Setup(crate::cli::SetupArgs { wizard: None }))
+                    | Some(Command::Assistants(
+                        crate::cli::AssistantCommand::Chat { .. }
+                    ))
+            ));
+
     // File-backed tracing must never put filesystem latency on the daemon's
     // boot/publication path. Keep the worker guard alive for the whole command
     // so shutdown can drain the bounded queue before the process exits.
@@ -941,18 +954,8 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         cli.log_level.as_deref(),
         cli.print_logs,
         drain_logs_on_exit(cli.command.as_ref()),
+        interactive_shell,
     );
-
-    if cli.debug_last_message {
-        match std::env::current_dir() {
-            Ok(cwd) => engine::model::enable_debug_last_message(cwd.join(".lastmessage")),
-            Err(e) => tracing::warn!(error = %e, "--debug-last-message: cwd unavailable"),
-        }
-    }
-
-    if command_requires_workspace_trust(cli.command.as_ref()) {
-        install_cli_trust_policy(cli.project.as_deref()).await?;
-    }
 
     if let Some(mode) = tui_mode_for_command(cli.command.as_ref()) {
         return commands::tui::run_mode(
@@ -962,6 +965,7 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
             Some(launch_start),
             cli.skip_setup,
             false,
+            cli.debug_last_message,
         )
         .await;
     }
@@ -977,8 +981,27 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
             Some(launch_start),
             false,
             true,
+            cli.debug_last_message,
         )
         .await;
+    }
+
+    if cli.debug_last_message && !interactive_shell {
+        match std::env::current_dir() {
+            Ok(cwd) => engine::model::enable_debug_last_message(cwd.join(".lastmessage")),
+            Err(e) => tracing::warn!(error = %e, "--debug-last-message: cwd unavailable"),
+        }
+    }
+
+    let deferred_named_assistant_trust = interactive_shell
+        && matches!(
+            cli.command.as_ref(),
+            Some(Command::Assistants(
+                crate::cli::AssistantCommand::Chat { .. }
+            ))
+        );
+    if command_requires_workspace_trust(cli.command.as_ref()) && !deferred_named_assistant_trust {
+        install_cli_trust_policy(cli.project.as_deref()).await?;
     }
 
     match cli.command {
@@ -990,7 +1013,13 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         Some(Command::Invocation(sub)) => commands::invocation::run(sub).await,
         Some(Command::Agent(sub)) => commands::agent::run(sub).await,
         Some(Command::Assistants(sub)) => {
-            commands::assistant::run(sub, cli.no_sandbox, Some(launch_start)).await
+            commands::assistant::run(
+                sub,
+                cli.no_sandbox,
+                Some(launch_start),
+                cli.debug_last_message,
+            )
+            .await
         }
         #[cfg(feature = "remote")]
         Some(Command::Account(sub)) => match sub {
@@ -1076,13 +1105,31 @@ fn init_tracing(
     level: Option<&str>,
     print_logs: bool,
     drain_logs_on_exit: bool,
-) -> Option<LogWorkerGuard> {
+    safe_interactive_shell: bool,
+) -> Option<TracingGuard> {
     use tracing_subscriber::{EnvFilter, fmt};
 
     let filter = match level {
         Some(l) => EnvFilter::try_new(l).unwrap_or_else(|_| EnvFilter::new("warn")),
         None => EnvFilter::try_from_env("COCKPIT_LOG").unwrap_or_else(|_| EnvFilter::new("warn")),
     };
+
+    // The interactive shell has not painted yet. Do not open a rotating file
+    // or write stderr into the alternate-screen handoff before it does. Keep
+    // a bounded sequence of formatted trace records and flush it only when
+    // the TUI has restored the terminal on return.
+    if safe_interactive_shell {
+        cockpit_core::startup::reset_interactive_first_paint();
+        let log = DeferredInteractiveLog::new(print_logs);
+        fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(log.clone())
+            .init();
+        return Some(TracingGuard::Deferred {
+            _guard: DeferredInteractiveLogGuard { log },
+        });
+    }
 
     if print_logs {
         fmt()
@@ -1104,7 +1151,7 @@ fn init_tracing(
                 .with_ansi(false)
                 .with_writer(writer)
                 .init();
-            Some(guard)
+            Some(TracingGuard::Worker { _guard: guard })
         }
         None => {
             fmt()
@@ -1113,6 +1160,188 @@ fn init_tracing(
                 .init();
             None
         }
+    }
+}
+
+/// Owns the installed tracing sink for a command.  Interactive sessions use
+/// the deferred variant so construction can record the first-paint sequence
+/// without opening a cache path or contaminating the alternate screen.
+enum TracingGuard {
+    Worker { _guard: LogWorkerGuard },
+    Deferred { _guard: DeferredInteractiveLogGuard },
+}
+
+/// The early interactive sink is intentionally small and record-oriented:
+/// whole formatted records are retained in arrival order, while the oldest
+/// complete records are evicted under pressure.  It never opens a file.
+#[derive(Clone)]
+struct DeferredInteractiveLog {
+    records: Arc<Mutex<DeferredInteractiveLogState>>,
+    print_logs: bool,
+}
+
+#[derive(Default)]
+struct DeferredInteractiveLogState {
+    records: std::collections::VecDeque<Vec<u8>>,
+    bytes: usize,
+    sink_open_attempted: bool,
+    sink: Option<RotatingLog>,
+}
+
+const DEFERRED_INTERACTIVE_LOG_CAPACITY: usize = 256 * 1024;
+
+struct DeferredInteractiveLogWriter {
+    log: DeferredInteractiveLog,
+    bytes: Vec<u8>,
+    accepted: bool,
+}
+
+impl DeferredInteractiveLog {
+    fn new(print_logs: bool) -> Self {
+        Self {
+            records: Arc::new(Mutex::new(DeferredInteractiveLogState::default())),
+            print_logs,
+        }
+    }
+
+    fn records(&self) -> Vec<Vec<u8>> {
+        self.records
+            .lock()
+            .expect("deferred interactive log mutex poisoned")
+            .records
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    fn push_record(&self, bytes: Vec<u8>) {
+        if bytes.is_empty() || bytes.len() > DEFERRED_INTERACTIVE_LOG_CAPACITY {
+            return;
+        }
+        let mut state = self
+            .records
+            .lock()
+            .expect("deferred interactive log mutex poisoned");
+        while state.bytes + bytes.len() > DEFERRED_INTERACTIVE_LOG_CAPACITY {
+            let Some(removed) = state.records.pop_front() else {
+                break;
+            };
+            state.bytes -= removed.len();
+        }
+        state.bytes += bytes.len();
+        state.records.push_back(bytes);
+        let should_open = !self.print_logs
+            && cockpit_core::startup::interactive_first_paint_completed()
+            && !state.sink_open_attempted;
+        if should_open {
+            state.sink_open_attempted = true;
+        }
+        drop(state);
+        if should_open {
+            self.open_and_flush_file_sink();
+        } else if !self.print_logs && cockpit_core::startup::interactive_first_paint_completed() {
+            self.flush_file_sink();
+        }
+    }
+
+    fn open_and_flush_file_sink(&self) {
+        let sink = dirs::cache_dir()
+            .map(|dir| dir.join("cockpit"))
+            .and_then(open_log_file_at);
+        let mut state = self
+            .records
+            .lock()
+            .expect("deferred interactive log mutex poisoned");
+        state.sink = sink;
+        Self::flush_locked(&mut state);
+    }
+
+    fn flush_file_sink(&self) {
+        let mut state = self
+            .records
+            .lock()
+            .expect("deferred interactive log mutex poisoned");
+        Self::flush_locked(&mut state);
+    }
+
+    fn flush_locked(state: &mut DeferredInteractiveLogState) {
+        let Some(log) = state.sink.clone() else {
+            return;
+        };
+        let records = state.records.drain(..).collect::<Vec<_>>();
+        state.bytes = 0;
+        let mut writer = tracing_subscriber::fmt::MakeWriter::make_writer(&log);
+        for record in records {
+            let _ = writer.write_all(&record);
+        }
+        let _ = writer.flush();
+    }
+}
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for DeferredInteractiveLog {
+    type Writer = DeferredInteractiveLogWriter;
+
+    fn make_writer(&self) -> Self::Writer {
+        DeferredInteractiveLogWriter {
+            log: self.clone(),
+            bytes: Vec::new(),
+            accepted: true,
+        }
+    }
+
+    fn make_writer_for(&self, metadata: &tracing::Metadata<'_>) -> Self::Writer {
+        // Before paint, retain only Cockpit's deliberately path/secret-free
+        // startup schema. Other targets resume their normal sink only after
+        // the completed-draw fence; arbitrary early diagnostics must never be
+        // persisted later as if they had crossed a redaction boundary.
+        DeferredInteractiveLogWriter {
+            log: self.clone(),
+            bytes: Vec::new(),
+            accepted: cockpit_core::startup::interactive_first_paint_completed()
+                || metadata.target() == cockpit_core::startup::TARGET,
+        }
+    }
+}
+
+impl Write for DeferredInteractiveLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.accepted {
+            self.bytes.extend_from_slice(bytes);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for DeferredInteractiveLogWriter {
+    fn drop(&mut self) {
+        if self.accepted {
+            self.log.push_record(std::mem::take(&mut self.bytes));
+        }
+    }
+}
+
+/// Drops after `App::run` has cleaned up the alternate screen.  This is the
+/// sole place interactive startup records acquire an external sink.
+struct DeferredInteractiveLogGuard {
+    log: DeferredInteractiveLog,
+}
+
+impl Drop for DeferredInteractiveLogGuard {
+    fn drop(&mut self) {
+        let records = self.log.records();
+        if self.log.print_logs {
+            let mut stderr = std::io::stderr().lock();
+            for record in records {
+                let _ = stderr.write_all(&record);
+            }
+            let _ = stderr.flush();
+            return;
+        }
+        self.log.flush_file_sink();
     }
 }
 
@@ -1432,6 +1661,138 @@ mod production_path_ratchet;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_interactive_log_retains_complete_records_in_order() {
+        cockpit_core::startup::reset_interactive_first_paint();
+        let log = DeferredInteractiveLog::new(true);
+        let mut first = tracing_subscriber::fmt::MakeWriter::make_writer(&log);
+        first.write_all(b"shell-constructed\n").unwrap();
+        drop(first);
+        let mut second = tracing_subscriber::fmt::MakeWriter::make_writer(&log);
+        second.write_all(b"first-paint\n").unwrap();
+        drop(second);
+
+        assert_eq!(
+            log.records(),
+            vec![b"shell-constructed\n".to_vec(), b"first-paint\n".to_vec()]
+        );
+    }
+
+    #[test]
+    fn deferred_interactive_log_evicts_whole_oldest_records() {
+        cockpit_core::startup::reset_interactive_first_paint();
+        let log = DeferredInteractiveLog::new(true);
+        log.push_record(vec![b'a'; DEFERRED_INTERACTIVE_LOG_CAPACITY / 2]);
+        log.push_record(vec![b'b'; DEFERRED_INTERACTIVE_LOG_CAPACITY / 2]);
+        log.push_record(vec![b'c'; 1]);
+
+        let records = log.records();
+        assert_eq!(records.len(), 2);
+        assert!(records[0].iter().all(|byte| *byte == b'b'));
+        assert_eq!(records[1], b"c");
+    }
+
+    #[test]
+    fn deferred_interactive_log_flushes_early_records_in_order_after_paint() {
+        cockpit_core::startup::reset_interactive_first_paint();
+        let tmp = tempfile::tempdir().unwrap();
+        let log = DeferredInteractiveLog::new(false);
+        let sink = open_log_file_at(tmp.path().join("logs")).unwrap();
+        {
+            let mut state = log.records.lock().unwrap();
+            state.sink_open_attempted = true;
+            state.sink = Some(sink);
+        }
+        log.push_record(b"shell-constructed\n".to_vec());
+        cockpit_core::startup::mark_interactive_first_paint();
+        log.push_record(b"first-paint\n".to_vec());
+        log.push_record(b"input-ready\n".to_vec());
+
+        assert_eq!(
+            std::fs::read(tmp.path().join("logs/cockpit.log")).unwrap(),
+            b"shell-constructed\nfirst-paint\ninput-ready\n"
+        );
+    }
+
+    #[test]
+    fn print_logs_remains_buffered_after_paint_for_terminal_cleanup() {
+        cockpit_core::startup::reset_interactive_first_paint();
+        let log = DeferredInteractiveLog::new(true);
+        log.push_record(b"shell-constructed\n".to_vec());
+        cockpit_core::startup::mark_interactive_first_paint();
+        log.push_record(b"first-paint\n".to_vec());
+        assert_eq!(
+            log.records(),
+            vec![b"shell-constructed\n".to_vec(), b"first-paint\n".to_vec()]
+        );
+        assert!(!log.records.lock().unwrap().sink_open_attempted);
+    }
+
+    #[test]
+    fn deferred_interactive_log_drops_non_startup_records_before_redaction_is_ready() {
+        cockpit_core::startup::reset_interactive_first_paint();
+        let log = DeferredInteractiveLog::new(true);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(log.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "untrusted::early", token = "prepaint-canary", "diagnostic");
+            tracing::info!(target: cockpit_core::startup::TARGET, event = "shell-constructed", "startup");
+        });
+        let joined = String::from_utf8(log.records().concat()).unwrap();
+        assert!(joined.contains("shell-constructed"));
+        assert!(!joined.contains("prepaint-canary"));
+        assert!(!joined.contains("untrusted::early"));
+    }
+
+    #[test]
+    fn interactive_dispatch_inventory_keeps_shell_and_line_routes_explicit() {
+        let lib = include_str!("lib.rs");
+        let tui = include_str!("commands/tui.rs");
+        let assistant = include_str!("commands/assistant.rs");
+        for route in [
+            "None | Some(Command::Code)",
+            "Some(Command::Assistant)",
+            "Some(Command::Computer)",
+            "Some(Command::Setup(crate::cli::SetupArgs { wizard: None }))",
+            "AssistantCommand::Chat { name }",
+            "run_with_session",
+        ] {
+            assert!(
+                lib.contains(route) || tui.contains(route) || assistant.contains(route),
+                "interactive route `{route}` is missing from the dispatch inventory"
+            );
+        }
+        assert!(lib.contains("Some(Command::Setup(args)) => commands::setup::run(args).await"));
+        assert!(
+            lib.contains("Some(Command::Provider(sub)) => commands::providers::run(sub).await")
+        );
+        assert!(
+            lib.contains(
+                "command_requires_workspace_trust(cli.command.as_ref()) && !deferred_named_assistant_trust"
+            ),
+            "named Assistant chat must reach its safe shell before generic trust composition"
+        );
+
+        let lib_production = lib.split("mod production_path_ratchet;").next().unwrap();
+        let tui_production = tui.split("mod tests {").next().unwrap();
+        let assistant_production = assistant.split("mod tests {").next().unwrap();
+        let shell_sources = format!("{lib_production}\n{tui_production}\n{assistant_production}");
+        for removed in [
+            "initialize_onboarding_if_first_run",
+            "configure_onboarding_launch_stage",
+            "ensure_assistant_persistent_daemon()",
+        ] {
+            assert!(
+                !shell_sources.contains(removed),
+                "normal interactive dispatch still calls removed helper `{removed}`"
+            );
+        }
+    }
 
     #[test]
     fn lib_trust_policy_does_not_open_db() {

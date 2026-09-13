@@ -115,7 +115,7 @@ fn stub_runner() -> AgentRunner {
 }
 
 fn app_for_tree(tree: &Path) -> App {
-    with_trusted_tree(tree, || App::new(Some(tree), false))
+    with_trusted_tree(tree, || App::new_with_bootstrap_config(Some(tree), false))
 }
 
 // ---- Criterion 8: behavior parity ------------------------------------------

@@ -8,48 +8,25 @@ pub(super) async fn list_sessions(
     parent_session_id: Option<Uuid>,
     assistant_id: Option<String>,
     compaction_lineage_root_id: Option<Uuid>,
+    include_archived: bool,
 ) -> std::result::Result<Response, ErrorPayload> {
-    // The row assembly (level selection, fork counts, read/unread inputs)
-    // lives in one place — `Db::list_session_summaries` — so the daemon
-    // and the TUI's unavailable-connection fallback produce the same shape
-    // (ordering / scoping / fork-grouping). The daemon adds its live
-    // processing overlay below; disconnected readers still get the durable
-    // DB-derived state.
+    // Eligibility (scope, archive, assistant, principal) is composed in the
+    // one bounded DB projection. The daemon only overlays live activity;
+    // it never re-filters, re-orders, or re-caps the durable result.
+    let query = crate::db::sessions::SessionListQuery {
+        project_id,
+        parent_session_id,
+        compaction_lineage_root_id,
+        assistant_id,
+        include_archived,
+        visibility: session_list_visibility(principal),
+        limit: 100,
+    };
     let db = ctx.db.clone();
     let mut sessions = db
-        .read(move |conn| {
-            crate::db::Db::list_session_summaries_conn(
-                conn,
-                project_id.as_deref(),
-                parent_session_id,
-                compaction_lineage_root_id,
-                100,
-            )
-        })
+        .read(move |conn| crate::db::Db::list_session_summaries_conn(conn, &query))
         .await
         .map_err(internal)?;
-    // v10-only assistant_id filter: retain only sessions whose
-    // `assistant_name` matches. `SessionSummary` does not carry
-    // `assistant_name`, so we look up the matching session ids from the
-    // DB when the filter is present.
-    if let Some(assistant) = assistant_id {
-        let assistant_for_db = assistant.clone();
-        let matching_ids = db
-            .read(move |conn| {
-                crate::db::Db::list_sessions_for_assistant_conn(conn, &assistant_for_db, false, 100)
-            })
-            .await
-            .map_err(internal)?
-            .into_iter()
-            .map(|row| row.session_id)
-            .collect::<std::collections::HashSet<_>>();
-        sessions.retain(|summary| matching_ids.contains(&summary.session_id));
-    }
-    if !principal.has_owner_level_authority() {
-        sessions.retain(|summary| {
-            session_access_for_summary(principal, summary) != SessionAccess::None
-        });
-    }
     for summary in &mut sessions {
         if let Some((_has_active_schedules, processing, tool_running)) =
             ctx.registry.live_status(summary.session_id)
@@ -58,6 +35,118 @@ pub(super) async fn list_sessions(
         }
     }
     Ok(Response::Sessions { sessions })
+}
+
+fn session_list_visibility(
+    principal: &ClientPrincipal,
+) -> crate::db::sessions::SessionListVisibility {
+    use crate::db::sessions::SessionListVisibility;
+
+    if principal.has_owner_level_authority() {
+        return SessionListVisibility::Unrestricted;
+    }
+    let principal_tag = principal.tag().unwrap_or_default();
+    let grants = principal_agent_grants(principal);
+    let has_wildcard = grants
+        .iter()
+        .any(|grant| grant.project_root.is_none() && is_agent_scope(grant.scope));
+    if has_wildcard {
+        return SessionListVisibility::Restricted {
+            principal_tag,
+            project_roots: None,
+        };
+    }
+    let project_roots = grants
+        .iter()
+        .filter(|grant| is_agent_scope(grant.scope))
+        .filter_map(|grant| grant.project_root.clone())
+        .collect();
+    SessionListVisibility::Restricted {
+        principal_tag,
+        project_roots: Some(project_roots),
+    }
+}
+
+fn is_agent_scope(scope: crate::daemon::principal::PrincipalScope) -> bool {
+    use crate::daemon::principal::PrincipalScope;
+    matches!(scope, PrincipalScope::Agent | PrincipalScope::AgentReadonly)
+}
+
+fn principal_agent_grants(
+    principal: &ClientPrincipal,
+) -> &[crate::daemon::principal::PrincipalGrant] {
+    match principal {
+        ClientPrincipal::Owner => &[],
+        ClientPrincipal::Local(local) => local.grants.as_slice(),
+        #[cfg(feature = "remote")]
+        ClientPrincipal::Remote(remote) => match &remote.authorization {
+            crate::daemon::principal::RemoteAuthorization::LegacyRelayScopes(grants) => {
+                grants.as_slice()
+            }
+            crate::daemon::principal::RemoteAuthorization::AttemptGrant(_) => &[],
+        },
+    }
+}
+
+enum SessionFavoriteTxn {
+    Applied(crate::db::sessions::SessionFavoriteApplied),
+    Unknown,
+    ReadOnly,
+    Unauthorized,
+}
+
+pub(super) async fn set_session_favorite(
+    ctx: &DaemonContext,
+    principal: &ClientPrincipal,
+    session_id: Uuid,
+    favorite: bool,
+) -> std::result::Result<Response, ErrorPayload> {
+    let db = ctx.db.clone();
+    let principal = principal.clone();
+    let outcome = db
+        .transaction(move |conn| {
+            let Some(row) = crate::db::Db::get_session_conn(conn, session_id)? else {
+                return Ok(SessionFavoriteTxn::Unknown);
+            };
+            Ok(match session_access_for_row(&principal, &row) {
+                SessionAccess::Owner | SessionAccess::Writer => SessionFavoriteTxn::Applied(
+                    crate::db::Db::set_session_favorite_conn(conn, session_id, favorite)?,
+                ),
+                SessionAccess::Readonly => SessionFavoriteTxn::ReadOnly,
+                SessionAccess::None => SessionFavoriteTxn::Unauthorized,
+            })
+        })
+        .await
+        .map_err(|error| {
+            if error
+                .downcast_ref::<crate::db::sessions::SessionFavoriteUnknown>()
+                .is_some()
+            {
+                ErrorPayload {
+                    code: ErrorCode::UnknownSession,
+                    message: format!("unknown session {session_id}"),
+                }
+            } else {
+                internal(error)
+            }
+        })?;
+    match outcome {
+        SessionFavoriteTxn::Applied(applied) => Ok(Response::SessionFavoriteApplied {
+            session_id: applied.session_id,
+            lineage_root_id: applied.lineage_root_id,
+            favorite: applied.favorite,
+        }),
+        SessionFavoriteTxn::Unknown => Err(ErrorPayload {
+            code: ErrorCode::UnknownSession,
+            message: format!("unknown session {session_id}"),
+        }),
+        SessionFavoriteTxn::ReadOnly => Err(read_only_error(
+            "remote principal has read-only access to this session",
+        )),
+        SessionFavoriteTxn::Unauthorized => Err(authorization_error(
+            "remote principal cannot access this session",
+        )),
+    }
 }
 
 pub(super) fn apply_live_activity_state(
@@ -837,6 +926,7 @@ mod sessions_activity_tests {
             open_interrupts: 0,
             activity_state,
             archived_at_unix_ms: None,
+            favorite: false,
             pin_count: 0,
             assistant_inbox_unread: 0,
             assistant_inbox_latest_source_session_id: None,

@@ -52,8 +52,8 @@
   ],
   "counts": {
     "event": 88,
-    "request": 289,
-    "response": 202
+    "request": 290,
+    "response": 203
   },
   "messages": {
     "event": [
@@ -1198,6 +1198,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "unarchive_session"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_session_favorite"
       },
       {
         "class": "bounded_request_response",
@@ -2430,6 +2436,12 @@
         "inlinePayloadBound": "paged",
         "lane": "interactive",
         "tag": "sessions"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "session_favorite_applied"
       },
       {
         "class": "bounded_request_response",

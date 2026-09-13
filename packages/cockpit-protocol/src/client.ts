@@ -17,6 +17,7 @@ import {
   parseGitStatusResult,
   parseHistoryPageResult,
   parseListSessionsResult,
+  parseSessionFavoriteAppliedResult,
   parseSessionLiveStatusResult,
   parseSessionMessagesResult,
   parseStorageCleanupCompletedResult,
@@ -362,6 +363,12 @@ export class RemoteSessionClient {
 
   async listSessions(params: ParamsOf<"list_sessions"> = {}) {
     return parseListSessionsResult(await this.send({ request: "list_sessions", params }));
+  }
+
+  async setSessionFavorite(session_id: string, favorite: boolean) {
+    return parseSessionFavoriteAppliedResult(
+      await this.send({ request: "set_session_favorite", params: { session_id, favorite } }),
+    );
   }
 
   async readSessionMessages(params: ParamsOf<"read_session_messages">) {

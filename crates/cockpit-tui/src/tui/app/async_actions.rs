@@ -3255,6 +3255,7 @@ impl App {
             return;
         };
         let (project_id, parent, lineage_root) = pane.root_request();
+        let include_archived = pane.include_archived();
         let endpoint = self.sessions_daemon_endpoint();
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("sessions.list"),
@@ -3267,6 +3268,7 @@ impl App {
                     project_id,
                     parent,
                     lineage_root,
+                    include_archived,
                 )
                 .map(AsyncActionPayload::Sessions)
             },

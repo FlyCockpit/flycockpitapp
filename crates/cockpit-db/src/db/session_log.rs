@@ -4647,7 +4647,10 @@ mod tests {
             .unwrap();
 
         let before = db
-            .list_session_summaries(Some("p"), None, 10)
+            .list_session_summaries(crate::db::sessions::SessionListQuery::project(
+                Some("p"),
+                10,
+            ))
             .await
             .unwrap()
             .remove(0);
@@ -4674,7 +4677,10 @@ mod tests {
         assert_eq!(older[0].seq, user_one);
 
         let after = db
-            .list_session_summaries(Some("p"), None, 10)
+            .list_session_summaries(crate::db::sessions::SessionListQuery::project(
+                Some("p"),
+                10,
+            ))
             .await
             .unwrap()
             .remove(0);

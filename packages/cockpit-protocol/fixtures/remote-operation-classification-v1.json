@@ -2135,6 +2135,26 @@
     {
       "class": "transactional_mutation",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid|favorite:bool",
+      "fcorRoles": [
+        {
+          "field": "session_id",
+          "role": "session",
+          "type": "Uuid"
+        },
+        {
+          "field": "favorite",
+          "role": "param",
+          "type": "bool"
+        }
+      ],
+      "fcorSchema": "session_id:Uuid|favorite:bool",
+      "strategy": "sql_transaction",
+      "tag": "set_session_favorite"
+    },
+    {
+      "class": "transactional_mutation",
+      "evidence": null,
       "fcorCanonicalSchema": "parent_session_id:uuid|fork_point_turn_id:option<string>|ephemeral:bool|fresh_thread:bool",
       "fcorRoles": [
         {

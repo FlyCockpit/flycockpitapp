@@ -52,7 +52,8 @@
         "session_entry_mode": "code",
         "compaction_predecessor_session_id": null,
         "compaction_lineage_root_id": "11111111-1111-4111-8111-111111111111",
-        "lineage_window_count": 1
+        "lineage_window_count": 1,
+        "favorite": true
       }
     },
     "id": "11111111-1111-4111-8111-111111111111",
@@ -141,7 +142,8 @@
           "project_root": "/tmp/project",
           "reason": "daemon_shutdown",
           "session_id": "11111111-1111-4111-8111-111111111111",
-          "updated_at": 1700000000
+          "updated_at": 1700000000,
+          "favorite": true
         }
       ],
       "project_id": "project_id-fixture",
@@ -167,7 +169,8 @@
       },
       "session_id": "11111111-1111-4111-8111-111111111111",
       "short_id": "short_id-fixture",
-      "session_entry_mode": "assistant"
+      "session_entry_mode": "assistant",
+      "favorite": true
     },
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
@@ -506,7 +509,8 @@
           "session_entry_mode": "code",
           "compaction_predecessor_session_id": null,
           "compaction_lineage_root_id": "11111111-1111-4111-8111-111111111111",
-          "lineage_window_count": 1
+          "lineage_window_count": 1,
+          "favorite": true
         }
       ]
     },
@@ -802,7 +806,14 @@
             "family": "filesystem"
           }
         ],
-        "mcps": [{ "name": "docs", "scope": "workspace", "enabled": true, "profile": "default" }],
+        "mcps": [
+          {
+            "name": "docs",
+            "scope": "workspace",
+            "enabled": true,
+            "profile": "default"
+          }
+        ],
         "candidates": [
           {
             "installation": {
@@ -904,8 +915,16 @@
     "data": {
       "total_bytes": 536870913,
       "categories": [
-        { "category": "ledger", "total_bytes": 1, "reclaimable_bytes": 0 },
-        { "category": "result_blobs", "total_bytes": 536870912, "reclaimable_bytes": 0 }
+        {
+          "category": "ledger",
+          "total_bytes": 1,
+          "reclaimable_bytes": 0
+        },
+        {
+          "category": "result_blobs",
+          "total_bytes": 536870912,
+          "reclaimable_bytes": 0
+        }
       ],
       "orphaned_workspace_storage": [],
       "archived_sessions": [],
@@ -923,7 +942,10 @@
         "preview_id": "22222222-2222-4222-8222-222222222222",
         "target": {
           "kind": "archive_sessions_older_than",
-          "data": { "age_days": 30, "include_renamed_or_pinned": false }
+          "data": {
+            "age_days": 30,
+            "include_renamed_or_pinned": false
+          }
         },
         "items": [],
         "bytes_to_free": 0
@@ -935,7 +957,9 @@
     "v": 23
   },
   "storage_cleanup_completed": {
-    "data": { "bytes_freed": 0 },
+    "data": {
+      "bytes_freed": 0
+    },
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "storage_cleanup_completed",
@@ -1041,7 +1065,8 @@
             "project_root": "/tmp/project",
             "reason": "daemon_shutdown",
             "session_id": "11111111-1111-4111-8111-111111111111",
-            "updated_at": 1700000000
+            "updated_at": 1700000000,
+            "favorite": true
           }
         ],
         "project_id": "project_id-fixture",
@@ -1156,7 +1181,8 @@
             "project_root": "/tmp/project",
             "reason": "daemon_shutdown",
             "session_id": "11111111-1111-4111-8111-111111111111",
-            "updated_at": 1700000000
+            "updated_at": 1700000000,
+            "favorite": true
           }
         ],
         "project_id": "project_id-fixture",
@@ -1281,7 +1307,8 @@
             "project_root": "/tmp/project",
             "reason": "daemon_shutdown",
             "session_id": "11111111-1111-4111-8111-111111111111",
-            "updated_at": 1700000000
+            "updated_at": 1700000000,
+            "favorite": true
           }
         ],
         "project_id": "project_id-fixture",
@@ -1330,5 +1357,16 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "response": "code_root_interrupt_resolved",
     "data": "accepted"
+  },
+  "session_favorite_applied": {
+    "data": {
+      "favorite": true,
+      "lineage_root_id": "11111111-1111-4111-8111-111111111111",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "res",
+    "response": "session_favorite_applied",
+    "v": 23
   }
 }

@@ -3721,6 +3721,7 @@ pub fn list_sessions_blocking(
     project_id: Option<String>,
     parent_session_id: Option<uuid::Uuid>,
     compaction_lineage_root_id: Option<uuid::Uuid>,
+    include_archived: bool,
 ) -> Result<Vec<proto::SessionSummary>, String> {
     match daemon_request_at_blocking(
         endpoint,
@@ -3729,6 +3730,7 @@ pub fn list_sessions_blocking(
             parent_session_id,
             assistant_id: None,
             compaction_lineage_root_id,
+            include_archived,
         },
     )? {
         Response::Sessions { sessions } => Ok(sessions),

@@ -1332,8 +1332,12 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v23 includes first-class assistant-thread
-/// creation and durable lineage projections, alongside the V2 tagged ingress envelope,
+/// Current wire schema version. v23 adds durable logical-conversation
+/// favorites (`SetSessionFavorite` / `SessionFavoriteApplied` and the
+/// resolved-root `SessionSummary.favorite` bit) and daemon-authoritative
+/// onboarding (`BeginOrReopenOnboarding` / `ApplyOnboardingTransition` and
+/// bootstrap snapshots) on top of v22's first-class assistant-thread
+/// creation and durable lineage projections, the V2 tagged ingress envelope,
 /// queued-message delivery classes, local queue controls, MCP credential
 /// profiles, agent-dimensioned MCP scopes on the attached-session and
 /// daemon-owned setup inventory, bounded base64 media previews, the
@@ -4645,6 +4649,7 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "set_agent",
         "set_default_model",
         "set_model_favorite",
+        "set_session_favorite",
         "share_session",
         "stats_rollup",
         "unarchive_session",
@@ -4675,6 +4680,7 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "session_messages",
         "assistant_inbox",
         "sessions",
+        "session_favorite_applied",
         "session_setup_snapshot",
         "guidance_proposals",
         "guidance_enablement_trace",
@@ -7363,6 +7369,7 @@ mod tests {
                     parent_session_id: None,
                     assistant_id: Some("helper-bot".into()),
                     compaction_lineage_root_id: None,
+                    include_archived: false,
                 },
             },
         };
@@ -7432,7 +7439,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v10_request_is_rejected_after_the_current_only_v22_cutover() {
+    async fn v10_request_is_rejected_after_the_current_only_v23_cutover() {
         let (a, b) = duplex(4096);
         let mut sender = ProtoStream::with_version(a, 10);
         let mut receiver = ProtoStream::with_version(b, 10);

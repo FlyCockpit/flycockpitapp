@@ -36,8 +36,10 @@ use crate::wizard::{
 };
 
 pub struct PreparedOnboardingAgent {
-    pub plan: crate::onboarding_agent::OnboardingAgentPlan,
+    pub draft: cockpit_proto::AuthoredAgentPackageDraft,
+    pub snapshot: cockpit_proto::AgentPolicySnapshot,
     pub providers: crate::config::providers::ProvidersConfig,
+    pub global_trust: crate::config::providers::ModelTrust,
 }
 
 /// Exact pre-onboarding bytes for the configuration files this flow owns.
@@ -127,14 +129,17 @@ impl OnboardingConfigRollback {
 /// before installation begins so a process death can always reconcile to
 /// either the complete plan or the previous durable state.
 pub fn capture_onboarding_agent_config(
-    plan: &crate::onboarding_agent::OnboardingAgentPlan,
+    draft: &cockpit_proto::AuthoredAgentPackageDraft,
 ) -> Result<OnboardingConfigRollback> {
     let global_config = global_config_file().context("resolving global agent onboarding config")?;
-    let model_target = crate::config::providers::provider_file_path_for_config(
-        &global_config,
-        &plan.default_model.provider,
-    )
-    .context("resolving onboarding model config")?;
+    let provider = draft
+        .model_trust_confirmations
+        .first()
+        .map(|grant| grant.provider_id.as_str())
+        .unwrap_or("unknown");
+    let model_target =
+        crate::config::providers::provider_file_path_for_config(&global_config, provider)
+            .context("resolving onboarding model config")?;
     OnboardingConfigRollback::capture([global_config, model_target])
 }
 
@@ -172,24 +177,35 @@ pub fn prepare_onboarding_agent_answers_for_catalog(
         catalog.revision.clone(),
     );
     let run = WizardRun::from_answers_json(descriptor, answers_json)?;
-    let (slug, answers) = crate::wizard::onboarding_agent_answers(&run, catalog.revision.clone())?;
-    let entry = (slug != "third-party")
-        .then(|| catalog.index.entry(&slug))
+    let selection = crate::wizard::onboarding_agent_answers(&run, catalog.revision.clone())?;
+    let entry = (selection.slug != "third-party")
+        .then(|| catalog.index.entry(&selection.slug))
         .flatten();
-    let plan = crate::onboarding_agent::build_onboarding_agent_plan(entry, answers, &providers)?;
-    Ok(PreparedOnboardingAgent { plan, providers })
+    let snapshot =
+        crate::onboarding_agent::policy_snapshot(&providers, catalog.origin, &catalog.revision);
+    let global_trust = selection.model_trust;
+    let draft = crate::onboarding_agent::draft_from_selection(selection, entry, &snapshot)?;
+    Ok(PreparedOnboardingAgent {
+        draft,
+        snapshot,
+        providers,
+        global_trust,
+    })
 }
 
 pub fn publish_onboarding_agent_plan(
-    plan: &crate::onboarding_agent::OnboardingAgentPlan,
+    prepared: &PreparedOnboardingAgent,
 ) -> Result<OnboardingConfigRollback> {
     ensure_global_layer_for_write()?;
+    let grant = prepared
+        .draft
+        .model_trust_confirmations
+        .first()
+        .context("authored package has no model grant")?;
     let global_config = global_config_file().context("resolving global agent onboarding config")?;
-    let model_target = crate::config::providers::provider_file_path_for_config(
-        &global_config,
-        &plan.default_model.provider,
-    )
-    .context("resolving onboarding model config")?;
+    let model_target =
+        crate::config::providers::provider_file_path_for_config(&global_config, &grant.provider_id)
+            .context("resolving onboarding model config")?;
     let rollback =
         OnboardingConfigRollback::capture([global_config.clone(), model_target.clone()])?;
     let result = (|| {
@@ -197,15 +213,15 @@ pub fn publish_onboarding_agent_plan(
         let mut model_layer = model_doc.providers();
         let provider = model_layer
             .providers
-            .entry(plan.default_model.provider.clone())
+            .entry(grant.provider_id.clone())
             .or_default();
         let model_index = provider
             .models
             .iter()
-            .position(|model| model.id == plan.default_model.model)
+            .position(|model| model.id == grant.model_id)
             .unwrap_or_else(|| {
                 provider.models.push(crate::config::providers::ModelEntry {
-                    id: plan.default_model.model.clone(),
+                    id: grant.model_id.clone(),
                     ..Default::default()
                 });
                 provider.models.len() - 1
@@ -214,15 +230,23 @@ pub fn publish_onboarding_agent_plan(
             .models
             .get_mut(model_index)
             .context("onboarding model insertion failed")?;
-        model.trust = Some(plan.model_trust);
-        model_doc.write_model_wizard_fields(&plan.default_model.provider, model)?;
+        if grant.confirmed {
+            model.trust = Some(prepared.global_trust);
+        }
+        model_doc.write_model_wizard_fields(&grant.provider_id, model)?;
 
-        if plan.make_default {
+        if prepared.draft.make_default {
             crate::config::providers::mutate_effective_default(
                 global_config
                     .parent()
                     .context("global config file has no parent directory")?,
-                Some(&plan.default_model),
+                Some(&crate::config::providers::ActiveModelRef {
+                    provider: grant.provider_id.clone(),
+                    model: grant.model_id.clone(),
+                    reasoning_effort: None,
+                    thinking_mode: None,
+                    prompt_cache_retention: None,
+                }),
                 crate::config::providers::ActiveModelWriteMode::Replace,
                 None,
                 None,
@@ -233,8 +257,24 @@ pub fn publish_onboarding_agent_plan(
 
         let mut extended_doc = ExtendedConfigDoc::load(&global_config)?;
         let mut extended = extended_doc.config();
-        let mut providers = ConfigDoc::load(&global_config)?.providers();
-        plan.apply_to_configs(&mut providers, &mut extended)?;
+        if prepared.draft.make_default {
+            extended.default_agent = Some(prepared.draft.name.clone());
+        }
+        if let Some(sidecar) = prepared.draft.sidecars.first() {
+            use crate::config::image_sidecar::{
+                SidecarMode, SidecarProviderModel, SidecarSelectionConfig,
+            };
+            let selected = SidecarProviderModel {
+                provider: sidecar.provider_id.clone(),
+                model: sidecar.model_id.clone(),
+            };
+            extended.image_sidecar = SidecarSelectionConfig {
+                mode: SidecarMode::Always,
+                trusted_primary_default: Some(selected.clone()),
+                untrusted_primary_default: Some(selected),
+                per_primary_override: None,
+            };
+        }
         extended_doc.write(&extended)?;
         Ok(())
     })();

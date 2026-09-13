@@ -753,8 +753,8 @@ pub fn onboarding_agent_descriptor(
         .unwrap_or_else(|| WizardAnswer::Select("disabled".into()));
     WizardDescriptor {
         id: ONBOARDING_AGENT_WIZARD_ID,
-        title: "Install your coding agent",
-        description: "Choose an agent, confirm model trust, configure tools, and select an image sidecar",
+        title: "Create your coding agent",
+        description: "Author a real agent definition with model grants, trust confirmation, tools, and sidecar",
         write_policy: WritePolicy::CommitAtEnd,
         model_context: None,
         onboarding_agent_models,
@@ -1029,19 +1029,17 @@ fn onboarding_sidecar_branch(_: &WizardRun, answer: &WizardAnswer) -> Option<&'s
 pub fn onboarding_agent_answers(
     run: &WizardRun,
     catalog_revision: String,
-) -> Result<(String, crate::onboarding_agent::OnboardingAgentAnswers)> {
-    use crate::onboarding_agent::{
-        OnboardingAgentAnswers, OnboardingModelTrust, OnboardingSidecarSelection,
-        OnboardingToolConfiguration, OnboardingToolMode,
-    };
+) -> Result<crate::onboarding_agent::WizardAuthoringSelection> {
     let agent = match run.answer("agent") {
         Some(WizardAnswer::Select(value)) => value.clone(),
         _ => return Err(anyhow!("agent selection is required")),
     };
     let model_trust = match run.answer("model-trust") {
-        Some(WizardAnswer::Select(value)) if value == "trusted" => OnboardingModelTrust::Trusted,
+        Some(WizardAnswer::Select(value)) if value == "trusted" => {
+            crate::config::providers::ModelTrust::Trusted
+        }
         Some(WizardAnswer::Select(value)) if value == "untrusted" => {
-            OnboardingModelTrust::Untrusted
+            crate::config::providers::ModelTrust::Untrusted
         }
         _ => return Err(anyhow!("model trust selection is required")),
     };
@@ -1067,50 +1065,19 @@ pub fn onboarding_agent_answers(
             .context("default model selection omitted provider or model")?,
         _ => return Err(anyhow!("default model selection is required")),
     };
-    let tools = match run.answer("tool-configuration") {
-        Some(WizardAnswer::Select(value)) if value == "author-defaults" => {
-            OnboardingToolConfiguration::AuthorDefaults
-        }
+    let tool_tiers = match run.answer("tool-configuration") {
+        Some(WizardAnswer::Select(value)) if value == "author-defaults" => BTreeMap::new(),
         Some(WizardAnswer::Select(value)) if value == "advanced" => {
             let selection = match run.answer("advanced-tools") {
                 Some(WizardAnswer::ToolSurface(selection)) => selection,
                 _ => return Err(anyhow!("advanced tool configuration is required")),
             };
-            let mut modes = BTreeMap::new();
-            for tool in crate::agents::known_tool_names() {
-                let selected = selection.tools.iter().any(|selected| selected == tool);
-                let tier = if selected {
-                    Some(
-                        selection
-                            .tool_tiers
-                            .get(*tool)
-                            .copied()
-                            .unwrap_or(crate::agents::ToolTier::Enabled),
-                    )
-                } else {
-                    crate::agents::legal_tool_tiers(tool)
-                        .contains(&crate::agents::ToolTier::Disabled)
-                        .then_some(crate::agents::ToolTier::Disabled)
-                };
-                if let Some(tier) = tier {
-                    modes.insert(
-                        (*tool).to_string(),
-                        match tier {
-                            crate::agents::ToolTier::Enabled => OnboardingToolMode::Enabled,
-                            crate::agents::ToolTier::Discoverable => OnboardingToolMode::MontyOnly,
-                            crate::agents::ToolTier::Disabled => OnboardingToolMode::Disabled,
-                        },
-                    );
-                }
-            }
-            OnboardingToolConfiguration::Advanced(modes)
+            selection.tool_tiers.clone()
         }
         _ => return Err(anyhow!("tool configuration selection is required")),
     };
     let sidecar = match run.answer("sidecar") {
-        Some(WizardAnswer::Select(value)) if value == "disabled" => {
-            OnboardingSidecarSelection::Disabled
-        }
+        Some(WizardAnswer::Select(value)) if value == "disabled" => None,
         Some(WizardAnswer::Select(value)) => {
             let selector = if let Some(selector) = value.strip_prefix("local:") {
                 selector
@@ -1122,38 +1089,33 @@ pub fn onboarding_agent_answers(
             let (provider, model) = selector
                 .split_once('/')
                 .context("sidecar selection omitted provider or model")?;
-            OnboardingSidecarSelection::Model {
-                provider: provider.to_string(),
-                model: model.to_string(),
-                // Locality labels are presentation-only. The authoritative
-                // resolver derives locality from the configured model; this
-                // bit is exclusively the user's explicit confirmation.
+            Some(cockpit_proto::AuthoredSidecarDeclaration {
+                provider_id: provider.to_string(),
+                model_id: model.to_string(),
                 remote_image_egress_confirmed: matches!(
                     run.answer("sidecar-egress-confirm"),
                     Some(WizardAnswer::Confirm(true))
                 ),
-            }
+            })
         }
         _ => return Err(anyhow!("sidecar selection is required")),
     };
-    Ok((
-        agent,
-        OnboardingAgentAnswers {
-            catalog_revision,
-            default_model_provider,
-            default_model,
-            model_trust,
-            model_trust_confirmed,
-            third_party_source,
-            third_party_trust_confirmed,
-            tools,
-            sidecar,
-            make_default: matches!(
-                run.answer("make-default"),
-                Some(WizardAnswer::Confirm(true))
-            ),
-        },
-    ))
+    Ok(crate::onboarding_agent::WizardAuthoringSelection {
+        slug: agent,
+        catalog_revision,
+        default_model_provider,
+        default_model,
+        model_trust,
+        model_trust_confirmed,
+        third_party_source,
+        third_party_trust_confirmed,
+        tool_tiers,
+        sidecar,
+        make_default: matches!(
+            run.answer("make-default"),
+            Some(WizardAnswer::Confirm(true))
+        ),
+    })
 }
 
 /// Extract the descriptor-bound catalog revision before a daemon reconstructs

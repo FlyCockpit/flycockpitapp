@@ -1057,3 +1057,56 @@ async fn agent_cli_management_socket_update_targets_exact_installation_and_never
     assert!(!after_dirty.contains(&"d".repeat(40)));
     assert!(after_dirty.contains("RebindRequired"));
 }
+
+#[test]
+fn authored_agent_package_protocol_is_daemon_owned_and_secret_free() {
+    use cockpit_proto::{
+        AGENT_AUTHORING_DTO_VERSION, AgentAuthoringSourceKind, ApplyAuthoredAgentPackageRequest,
+        AuthoredAgentPackageDraft, AuthoredAgentSource,
+    };
+
+    let request = ApplyAuthoredAgentPackageRequest {
+        client_operation_id: "e2e-authored".into(),
+        expected_policy_revision: "aa".repeat(32),
+        package: AuthoredAgentPackageDraft {
+            dto_version: AGENT_AUTHORING_DTO_VERSION,
+            name: "helper".into(),
+            markdown: "---\ndescription: helper\n---\nbody\n".into(),
+            source: AuthoredAgentSource {
+                kind: AgentAuthoringSourceKind::Authored,
+                source_locator: "authored/helper".into(),
+                pin: None,
+                third_party_trust_confirmed: false,
+            },
+            children: vec![],
+            mcp_json: None,
+            sidecars: vec![],
+            policy_revision: "aa".repeat(32),
+            model_trust_confirmations: vec![],
+            make_default: true,
+            draft_revision: None,
+        },
+        onboarding: None,
+    };
+    let encoded = serde_json::to_string(&request).expect("encode authored package request");
+    assert!(!encoded.contains("api_key"));
+    assert!(!encoded.contains("profile_handle"));
+    assert!(encoded.contains("authored/helper"));
+    assert_eq!(
+        cockpit_proto::Request::GetAgentAuthoringProjection.wire_tag(),
+        "get_agent_authoring_projection"
+    );
+    assert_eq!(
+        cockpit_proto::Request::ApplyAuthoredAgentPackage(request.clone()).wire_tag(),
+        "apply_authored_agent_package"
+    );
+    assert_eq!(
+        cockpit_proto::Request::GetAuthoredAgentPackageReceipt(
+            cockpit_proto::AuthoredAgentPackageReceiptQuery {
+                client_operation_id: "e2e-authored".into(),
+            }
+        )
+        .wire_tag(),
+        "get_authored_agent_package_receipt"
+    );
+}

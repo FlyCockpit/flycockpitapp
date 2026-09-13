@@ -4610,6 +4610,242 @@ impl AgentInstallationService {
         Ok(receipt)
     }
 
+    /// Persist a canonical authored package through the installation journal.
+    /// The complete file map is staged and published before the installation
+    /// row becomes visible; a failed child never leaves a partial parent.
+    pub(crate) async fn commit_authored_package(
+        &self,
+        idempotency_key: String,
+        name: &str,
+        source_locator: String,
+        source_revision: Option<String>,
+        third_party_trust_confirmed: bool,
+        files: BTreeMap<String, Vec<u8>>,
+        package_digest: String,
+        now: i64,
+    ) -> AgentInstallationResultV1 {
+        match self
+            .commit_authored_package_inner(
+                idempotency_key,
+                name,
+                source_locator,
+                source_revision,
+                third_party_trust_confirmed,
+                files,
+                package_digest,
+                now,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => redacted_error(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_authored_package_inner(
+        &self,
+        idempotency_key: String,
+        name: &str,
+        source_locator: String,
+        source_revision: Option<String>,
+        third_party_trust_confirmed: bool,
+        files: BTreeMap<String, Vec<u8>>,
+        package_digest: String,
+        now: i64,
+    ) -> Result<AgentInstallationResultV1> {
+        ensure!(
+            !name.is_empty()
+                && !name.contains('/')
+                && !name.contains('\\')
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
+            "authored agent name is invalid"
+        );
+        ensure!(
+            !crate::agents::is_builtin_agent(name),
+            "daemon authoring may not overwrite a protected builtin agent"
+        );
+        validate_idempotency_key(&idempotency_key)?;
+        ensure!(
+            files.contains_key(crate::agents::PACKAGE_ROOT_FILE),
+            "authored package is missing agent.md"
+        );
+        if source_locator.contains('/')
+            && !source_locator.starts_with("authored/")
+            && !source_locator.starts_with("FlyCockpit/agents")
+        {
+            ensure!(
+                third_party_trust_confirmed,
+                "third-party agent installation requires explicit security confirmation"
+            );
+        }
+        let mut fingerprint_hasher = Sha256::new();
+        fingerprint_hasher.update(b"authored-package-v1\0");
+        fingerprint_hasher.update(name.as_bytes());
+        fingerprint_hasher.update([0]);
+        fingerprint_hasher.update(source_locator.as_bytes());
+        fingerprint_hasher.update([0]);
+        fingerprint_hasher.update(package_digest.as_bytes());
+        let fingerprint = crate::intel::hex_lower(&fingerprint_hasher.finalize());
+        let begun = self
+            .db
+            .begin_installation_operation_with_staged_journal(
+                idempotency_key.clone(),
+                fingerprint,
+                InstallationOperationKind::Create,
+                None,
+                serde_json::json!({
+                    "target_name": name,
+                    "digest": package_digest,
+                    "files": files.keys().cloned().collect::<Vec<_>>(),
+                })
+                .to_string(),
+                package_digest.clone(),
+                now,
+            )
+            .await?;
+        let operation = match begun {
+            BeginInstallationOperation::KeyConflict => {
+                bail!("idempotency key was previously used for a different request")
+            }
+            BeginInstallationOperation::Replay(operation) => {
+                if operation.terminal_receipt_json.is_some() {
+                    return replay_operation(operation.terminal_receipt_json.as_deref());
+                }
+                operation
+            }
+            BeginInstallationOperation::Created(operation) => operation,
+        };
+        let prior_journal = self.db.installation_journal(operation.operation_id).await?;
+        let package_dir = self.daemon_agents_dir.join(name);
+        let flat_target = owned_path(
+            &self.daemon_agents_dir,
+            None,
+            AgentInstallationScopeWire::Global,
+            name,
+        )?;
+        ensure_no_reparse_components(
+            flat_target
+                .parent()
+                .context("owned authored package missing parent")?,
+        )?;
+        let journal = prior_journal.unwrap_or(InstallationJournalRow {
+            journal_id: Uuid::new_v4(),
+            operation_id: operation.operation_id,
+            checkpoint: InstallationJournalCheckpoint::Staged,
+            staged_file_metadata_json: Some(
+                serde_json::json!({"target_name": name, "digest": package_digest}).to_string(),
+            ),
+            prior_file_metadata_json: None,
+            expected_digest: package_digest.clone(),
+        });
+        ensure!(
+            journal.expected_digest == package_digest,
+            "recovery package digest changed for the original authored request"
+        );
+        if journal.checkpoint == InstallationJournalCheckpoint::Staged {
+            std::fs::create_dir_all(&self.daemon_agents_dir)
+                .context("creating daemon-owned authored package directory")?;
+            stage_authored_package_files(
+                &self.daemon_agents_dir,
+                name,
+                operation.operation_id,
+                &files,
+            )?;
+            self.db
+                .record_installation_journal(journal.clone(), now)
+                .await?;
+        }
+        let outcome = self
+            .db
+            .install_agent(AgentInstallationInput {
+                installation_id: operation.operation_id,
+                scope: AgentInstallationScope::Global,
+                canonical_workspace_id: None,
+                source_agent_id: format!("authored/{name}"),
+                source_identity: source_locator,
+                source_revision,
+                source_digest: package_digest.clone(),
+                fetched_at_unix_ms: now,
+            })
+            .await?;
+        let installation = match outcome {
+            InstallAgentOutcome::Installed(row) | InstallAgentOutcome::AlreadyInstalled(row) => row,
+            InstallAgentOutcome::Conflict => {
+                rollback_authored_package_stage(
+                    &self.daemon_agents_dir,
+                    name,
+                    operation.operation_id,
+                );
+                bail!("agent create collision")
+            }
+        };
+        if checkpoint_rank(journal.checkpoint)
+            < checkpoint_rank(InstallationJournalCheckpoint::DbCommitted)
+        {
+            self.db
+                .record_installation_journal(
+                    InstallationJournalRow {
+                        checkpoint: InstallationJournalCheckpoint::DbCommitted,
+                        ..journal.clone()
+                    },
+                    now,
+                )
+                .await?;
+        }
+        if checkpoint_rank(journal.checkpoint)
+            < checkpoint_rank(InstallationJournalCheckpoint::FileRenamed)
+        {
+            publish_authored_package_files(
+                &self.daemon_agents_dir,
+                name,
+                operation.operation_id,
+                &files,
+                &package_digest,
+            )?;
+            self.db
+                .record_installation_journal(
+                    InstallationJournalRow {
+                        checkpoint: InstallationJournalCheckpoint::FileRenamed,
+                        ..journal.clone()
+                    },
+                    now,
+                )
+                .await?;
+        } else {
+            ensure!(
+                authored_package_digest_matches(&package_dir, &flat_target, &package_digest)?,
+                "published authored package digest changed during recovery"
+            );
+        }
+        let receipt = receipt(
+            operation.operation_id,
+            AgentInstallationReceiptStatusV1::Created,
+            Some(installation.installation_id.to_string()),
+            None,
+        );
+        self.db
+            .record_installation_journal(
+                InstallationJournalRow {
+                    checkpoint: InstallationJournalCheckpoint::Complete,
+                    ..journal
+                },
+                now,
+            )
+            .await?;
+        self.db
+            .finish_installation_operation(
+                operation.operation_id,
+                serde_json::to_string(&receipt)?,
+                now,
+            )
+            .await?;
+        discard_authored_package_prior(&self.daemon_agents_dir, name, operation.operation_id)?;
+        Ok(receipt)
+    }
+
     async fn resolve_scope(
         &self,
         scope: AgentInstallationScopeWire,
@@ -5796,6 +6032,128 @@ fn remove_owned_file(path: &Path) -> Result<()> {
     ensure!(owned_file_exists(path, false)?, "owned file disappeared");
     std::fs::remove_file(path).context("removing owned agent file")
 }
+fn authored_package_stage_dir(global: &Path, name: &str, operation: Uuid) -> PathBuf {
+    global.join(format!(".{name}.{operation}.staged-pkg"))
+}
+
+fn authored_package_target_dir(global: &Path, name: &str) -> PathBuf {
+    global.join(name)
+}
+
+fn write_relative_package_files(root: &Path, files: &BTreeMap<String, Vec<u8>>) -> Result<()> {
+    std::fs::create_dir_all(root).context("creating authored package staging directory")?;
+    for (relative, bytes) in files {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating authored package parent for {relative}"))?;
+        }
+        crate::config::config::files::atomic_write(&path, bytes)
+            .with_context(|| format!("writing authored package file {relative}"))?;
+    }
+    Ok(())
+}
+
+fn stage_authored_package_files(
+    global: &Path,
+    name: &str,
+    operation: Uuid,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<()> {
+    let staged = authored_package_stage_dir(global, name, operation);
+    if staged.exists() {
+        if let Ok(existing) = collect_package_tree(&staged)
+            && &existing == files
+        {
+            return Ok(());
+        }
+        let _ = std::fs::remove_dir_all(&staged);
+    }
+    write_relative_package_files(&staged, files)
+}
+
+fn publish_authored_package_files(
+    global: &Path,
+    name: &str,
+    operation: Uuid,
+    files: &BTreeMap<String, Vec<u8>>,
+    digest: &str,
+) -> Result<()> {
+    let staged = authored_package_stage_dir(global, name, operation);
+    let target = authored_package_target_dir(global, name);
+    let staged_files = collect_package_tree(&staged)?;
+    ensure!(
+        sha256_hex(&crate::agents::package_digest_preimage(&staged_files)) == digest,
+        "staged authored package digest changed before publish"
+    );
+    ensure!(
+        &staged_files == files,
+        "staged authored package files changed before publish"
+    );
+    if target.exists() {
+        let current = collect_package_tree(&target)?;
+        if sha256_hex(&crate::agents::package_digest_preimage(&current)) == digest {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Ok(());
+        }
+        bail!("owned authored package became dirty/collided before publish");
+    }
+    std::fs::rename(&staged, &target).context("publishing authored package directory")?;
+    Ok(())
+}
+
+fn rollback_authored_package_stage(global: &Path, name: &str, operation: Uuid) {
+    let staged = authored_package_stage_dir(global, name, operation);
+    let _ = std::fs::remove_dir_all(staged);
+}
+
+fn discard_authored_package_prior(global: &Path, name: &str, operation: Uuid) -> Result<()> {
+    let staged = authored_package_stage_dir(global, name, operation);
+    if staged.exists() {
+        std::fs::remove_dir_all(&staged)
+            .context("discarding leftover authored package staging directory")?;
+    }
+    Ok(())
+}
+
+fn authored_package_digest_matches(
+    package_dir: &Path,
+    flat_target: &Path,
+    digest: &str,
+) -> Result<bool> {
+    if package_dir.is_dir() {
+        let files = collect_package_tree(package_dir)?;
+        return Ok(sha256_hex(&crate::agents::package_digest_preimage(&files)) == digest);
+    }
+    if owned_file_exists(flat_target, false)? {
+        let bytes = read_owned_file(flat_target, "reading published authored definition")?;
+        let mut files = BTreeMap::new();
+        files.insert(crate::agents::PACKAGE_ROOT_FILE.to_string(), bytes);
+        return Ok(sha256_hex(&crate::agents::package_digest_preimage(&files)) == digest);
+    }
+    Ok(false)
+}
+
+fn collect_package_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+    #[cfg(any(unix, windows))]
+    {
+        return cockpit_host::private_fs::read_nofollow_directory_tree(
+            root,
+            MAX_AGENT_MARKDOWN_BYTES as u64,
+            MAX_AGENT_PACKAGE_BYTES as u64,
+        )
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("reading authored package {}", root.display()));
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        bail!(
+            "authored package traversal is unavailable on this platform; refusing pathname-based fallback for {}",
+            root.display()
+        )
+    }
+}
+
 fn rollback_stage(target: &Path, operation: Uuid) {
     if let Ok(staged) = stage_path(target, operation) {
         let _ = remove_owned_file(&staged);
@@ -7927,6 +8285,73 @@ mod tests {
             panic!("same scope authored identity must not overwrite")
         };
         assert_eq!(error.code, AgentInstallationErrorCodeV1::Collision);
+    }
+
+    #[tokio::test]
+    async fn authored_package_commit_is_atomic_and_idempotent() {
+        let harness = ServiceHarness::new(FetchReply::Failure("authoring does not fetch".into()));
+        let markdown = b"---\nschemaVersion: 1\nagentId: authored/helper\nroles: [code]\ndescription: helper\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n    models:\n      - providerId: vendor\n        modelId: exact-a\n        default: true\n---\nbody\n".to_vec();
+        let child = markdown.clone();
+        let mut files = BTreeMap::new();
+        files.insert("agent.md".into(), markdown);
+        files.insert("subagents/reviewer.md".into(), child);
+        files.insert("mcp.json".into(), b"{\"mcpServers\":{}}".to_vec());
+        let digest = crate::intel::hex_lower(&Sha256::digest(
+            &crate::agents::package_digest_preimage(&files),
+        ));
+        let first = harness
+            .service
+            .commit_authored_package(
+                "authored-package-once".into(),
+                "helper",
+                "authored/helper".into(),
+                None,
+                false,
+                files.clone(),
+                digest.clone(),
+                1,
+            )
+            .await;
+        let AgentInstallationResultV1::Receipt {
+            installation_id: Some(installation_id),
+            status: AgentInstallationReceiptStatusV1::Created,
+            ..
+        } = first
+        else {
+            panic!("authored package must install once: {first:?}")
+        };
+        let replay = harness
+            .service
+            .commit_authored_package(
+                "authored-package-once".into(),
+                "helper",
+                "authored/helper".into(),
+                None,
+                false,
+                files.clone(),
+                digest.clone(),
+                2,
+            )
+            .await;
+        let AgentInstallationResultV1::Receipt {
+            installation_id: Some(replay_id),
+            ..
+        } = replay
+        else {
+            panic!("same operation must replay the exact install: {replay:?}")
+        };
+        assert_eq!(installation_id, replay_id);
+        assert_eq!(harness.fetcher.calls.load(Ordering::SeqCst), 0);
+        let package = harness._root.path().join("daemon-agents/helper");
+        assert!(package.join("agent.md").is_file());
+        assert!(package.join("subagents/reviewer.md").is_file());
+        assert!(package.join("mcp.json").is_file());
+        let listed = harness
+            .db
+            .list_agent_installations(AgentInstallationScope::Global, None)
+            .await
+            .expect("list installations");
+        assert_eq!(listed.len(), 1);
     }
 
     #[tokio::test]

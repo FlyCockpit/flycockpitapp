@@ -66,7 +66,7 @@ pub(crate) use vnext::author_slot;
 pub use vnext::{
     AgentRole, AllowedChild, AutoAnswer, CompiledVerificationPolicy, CompiledVerificationRegion,
     DEFAULT_CLEAN_ROOM_LAST_N_READS, DelegationPolicy, DelegationTarget, EffectiveDelegationGrant,
-    EffectiveQuestionPolicy, EffectiveVnextGrant, ExecutionKind, GeneratorSpec,
+    EffectiveQuestionPolicy, EffectiveVnextGrant, ExecutionKind, GeneratorSpec, GoalSkepticsPolicy,
     LocalInstallationIdentity, LocalInstallationResolver, MAX_GENERATOR_TURNS,
     MAX_VERIFICATION_CANDIDATES, ModelCapability, ModelLocality, ModelRecommendation, ModelSlot,
     ModelTrustSuggestion, OnAdjudicationFailure, OnBudgetExceeded, PROFILE_CLEAN_ROOM,

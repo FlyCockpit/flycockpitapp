@@ -1016,6 +1016,9 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         proto::Response::ImageSidecarAuthoritySnapshot(..)
         | proto::Response::ImageSidecarGrantMutated(..) => {}
         proto::Response::LocalPeerCredential { .. } => {}
+        proto::Response::AgentAuthoringProjection(_)
+        | proto::Response::AuthoredAgentPackage(_)
+        | proto::Response::AuthoredAgentPackageReceipt(_) => {}
         proto::Response::Unknown => {}
     }
 }

@@ -2976,6 +2976,16 @@ pub enum Request {
 
     AgentInstallationInspect(crate::AgentInstallationReadV1),
 
+    /// Redacted global policy snapshot plus catalog sources filtered by
+    /// actually configured model capabilities.
+    GetAgentAuthoringProjection,
+
+    /// Atomically validate, digest, and publish a complete authored package.
+    ApplyAuthoredAgentPackage(crate::ApplyAuthoredAgentPackageRequest),
+
+    /// Query the exact apply receipt by client operation id. Never a retry.
+    GetAuthoredAgentPackageReceipt(crate::AuthoredAgentPackageReceiptQuery),
+
     #[serde(other)]
     Unknown,
 }
@@ -4401,6 +4411,41 @@ impl Request {
             {
                 return Err("operation_id must be UUIDv7".to_string());
             }
+            Self::ApplyAuthoredAgentPackage(request) => {
+                validate_owner_identifier("client operation", &request.client_operation_id, 128)?;
+                if request.expected_policy_revision.is_empty()
+                    || request.expected_policy_revision.len() > 128
+                {
+                    return Err("authored package policy revision is invalid".into());
+                }
+                if request.package.dto_version != crate::AGENT_AUTHORING_DTO_VERSION {
+                    return Err("unsupported authored package DTO version".into());
+                }
+                if request.package.name.is_empty() || request.package.name.len() > 128 {
+                    return Err("authored agent name is invalid".into());
+                }
+                if request.package.markdown.is_empty()
+                    || request.package.markdown.len() > crate::MAX_AGENT_MARKDOWN_BYTES
+                {
+                    return Err("authored agent markdown is invalid".into());
+                }
+                if request.package.children.len() > 64 {
+                    return Err("authored package has too many children".into());
+                }
+                for child in &request.package.children {
+                    if child.relative_path.is_empty() || child.relative_path.len() > 256 {
+                        return Err("authored child path is invalid".into());
+                    }
+                    if child.markdown.is_empty()
+                        || child.markdown.len() > crate::MAX_AGENT_MARKDOWN_BYTES
+                    {
+                        return Err("authored child markdown is invalid".into());
+                    }
+                }
+            }
+            Self::GetAuthoredAgentPackageReceipt(query) => {
+                validate_owner_identifier("client operation", &query.client_operation_id, 128)?;
+            }
             _ => {}
         }
         Ok(())
@@ -4772,6 +4817,9 @@ macro_rules! request_variants {
             (Request::AgentInstallationSubmitChoice(_), "agent_installation_submit_choice");
             (Request::AgentInstallationList(_), "agent_installation_list");
             (Request::AgentInstallationInspect(_), "agent_installation_inspect");
+            (Request::GetAgentAuthoringProjection, "get_agent_authoring_projection");
+            (Request::ApplyAuthoredAgentPackage(_), "apply_authored_agent_package");
+            (Request::GetAuthoredAgentPackageReceipt(_), "get_authored_agent_package_receipt");
             (Request::Unknown, "__unknown");
         ] }
     };
@@ -5172,6 +5220,9 @@ macro_rules! command {
             (Request::AgentInstallationSubmitChoice(_request), "agent_installation_submit_choice", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::AgentInstallationList(_request), "agent_installation_list", owner_only, none, false, local_only, none, concurrent, none, "-", []);
             (Request::AgentInstallationInspect(_request), "agent_installation_inspect", owner_only, none, false, local_only, none, concurrent, none, "-", []);
+            (Request::GetAgentAuthoringProjection, "get_agent_authoring_projection", owner_only, none, false, local_only, none, serialized, none, "-", []);
+            (Request::ApplyAuthoredAgentPackage(_request), "apply_authored_agent_package", owner_only, none, true, local_only, none, serialized, none, "-", []);
+            (Request::GetAuthoredAgentPackageReceipt(_request), "get_authored_agent_package_receipt", owner_only, none, false, local_only, none, serialized, none, "-", []);
             (Request::Unknown, "unknown", owner_only, none, false, rejected, rejected_before_dispatch, serialized, none, "-", []);
         ] }
     };
@@ -6601,6 +6652,9 @@ mod tests {
             "agent_installation_submit_choice",
             "agent_installation_list",
             "agent_installation_inspect",
+            "get_agent_authoring_projection",
+            "apply_authored_agent_package",
+            "get_authored_agent_package_receipt",
         ] {
             assert_eq!(
                 remote_operation_class_for_tag(tag),

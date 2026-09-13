@@ -7960,6 +7960,7 @@ pub(crate) mod tests {
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
             default_child: None,
+            interactive_subagents: false,
         };
         let mut args = test_spawn_args(tmp.path());
         args.delegated = true;

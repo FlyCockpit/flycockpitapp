@@ -337,6 +337,7 @@ fn builtin_vnext(name: &str, _mode: AgentMode) -> VnextAgentDef {
             max_concurrent_children: Some(1),
             targets: vec![DelegationTarget::SameRoot],
             default_child: None,
+            interactive_subagents: false,
         }
     };
     VnextAgentDef {

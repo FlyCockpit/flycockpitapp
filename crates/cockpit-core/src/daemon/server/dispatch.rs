@@ -348,49 +348,64 @@ async fn validate_onboarding_stage_settlement(
             }
         }
         proto::OnboardingStage::Agent => {
-            let wizard_id = settlement
-                .wizard_id
-                .as_deref()
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    bad_request("agent advance requires a settled setup wizard identity")
-                })?;
-            if wizard_id != crate::wizard::ONBOARDING_AGENT_WIZARD_ID {
-                return Err(bad_request(
-                    "agent onboarding settlement references an invalid setup wizard",
-                ));
+            if settlement.wizard_id.as_deref() == Some(crate::wizard::ONBOARDING_AGENT_WIZARD_ID) {
+                let (identity, response_json) = validate_terminal_local_operation_settlement(
+                    ctx,
+                    owner,
+                    &operation_id,
+                    "apply_setup_wizard",
+                )
+                .await?;
+                validate_settlement_request_hash(&identity)?;
+                let response: Response = serde_json::from_str(&response_json).map_err(internal)?;
+                return match response {
+                    Response::SetupWizardApplied {
+                        wizard_id: committed_wizard_id,
+                        changed,
+                        ..
+                    } if committed_wizard_id == crate::wizard::ONBOARDING_AGENT_WIZARD_ID
+                        && changed =>
+                    {
+                        if ctx
+                            .db
+                            .default_agent_installation()
+                            .await
+                            .map_err(internal)?
+                            .is_some()
+                        {
+                            Ok(())
+                        } else {
+                            Err(bad_request(
+                                "agent onboarding advance requires a committed default installation",
+                            ))
+                        }
+                    }
+                    _ => Err(bad_request(
+                        "agent onboarding settlement does not match the requested advance",
+                    )),
+                };
             }
             let (identity, response_json) = validate_terminal_local_operation_settlement(
                 ctx,
                 owner,
                 &operation_id,
-                "apply_setup_wizard",
+                "apply_authored_agent_package",
             )
             .await?;
             validate_settlement_request_hash(&identity)?;
             let response: Response = serde_json::from_str(&response_json).map_err(internal)?;
             match response {
-                Response::SetupWizardApplied {
-                    wizard_id: committed_wizard_id,
-                    changed,
-                    ..
-                } if committed_wizard_id == wizard_id && changed => {
-                    if ctx
-                        .db
-                        .default_agent_installation()
-                        .await
-                        .map_err(internal)?
-                        .is_some()
-                    {
-                        Ok(())
-                    } else {
-                        Err(bad_request(
-                            "agent onboarding advance requires a committed default installation",
-                        ))
-                    }
+                Response::AuthoredAgentPackage(
+                    cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(receipt),
+                ) if receipt.client_operation_id == operation_id
+                    && receipt.status == cockpit_proto::AuthoredAgentReceiptStatus::Committed
+                    && receipt.default_selected
+                    && receipt.installation_id.is_some() =>
+                {
+                    Ok(())
                 }
                 _ => Err(bad_request(
-                    "agent onboarding settlement does not match the requested advance",
+                    "agent onboarding settlement does not match the requested authored package",
                 )),
             }
         }
@@ -11148,6 +11163,64 @@ async fn handle_serialized_request_impl(
             let service = ctx.agent_installation_service().map_err(internal)?;
             Ok(Response::AgentInstallation(service.inspect(request).await))
         }
+        Request::GetAgentAuthoringProjection => {
+            let projection = crate::daemon::agent_authoring::get_projection(ctx)
+                .await
+                .map_err(internal)?;
+            Ok(Response::AgentAuthoringProjection(projection))
+        }
+        Request::ApplyAuthoredAgentPackage(request) => {
+            let settlement_owner = settings_capability_owner(state);
+            let request_hash = local_operation_request_hash(&request)?;
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &settlement_owner,
+                &request.client_operation_id,
+                "apply_authored_agent_package",
+                request_hash,
+            )
+            .await?
+            {
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
+            let outcome = crate::daemon::agent_authoring::apply_package(ctx, request.clone()).await;
+            match outcome {
+                Ok(response) => {
+                    let response = Response::AuthoredAgentPackage(response);
+                    finish_local_operation(
+                        ctx,
+                        settlement_owner,
+                        request.client_operation_id.clone(),
+                        request_hash,
+                        fencing_generation,
+                        &response,
+                    )
+                    .await?;
+                    Ok(response)
+                }
+                Err(error) => {
+                    let error = internal(error);
+                    finish_local_operation_error(
+                        ctx,
+                        settlement_owner,
+                        request.client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    Err(error)
+                }
+            }
+        }
+        Request::GetAuthoredAgentPackageReceipt(query) => {
+            let owner = settings_capability_owner(state);
+            let receipt = crate::daemon::agent_authoring::receipt(ctx, &owner, query)
+                .await
+                .map_err(internal)?;
+            Ok(Response::AuthoredAgentPackageReceipt(Some(receipt)))
+        }
 
         Request::CreateAssistantSession {
             name,
@@ -18309,7 +18382,7 @@ async fn handle_serialized_request_impl(
                     // installation side effect. A daemon death at every later
                     // boundary is recovered before the socket is published.
                     let _publication_rollback =
-                        crate::wizard::capture_onboarding_agent_config(&prepared.plan)
+                        crate::wizard::capture_onboarding_agent_config(&prepared.draft)
                             .map_err(internal)?;
                     let previous_default_installation_id = ctx
                         .db
@@ -18365,11 +18438,12 @@ async fn handle_serialized_request_impl(
                                 operation: cockpit_proto::AgentInstallationOperationKind::Install,
                                 scope: cockpit_proto::AgentInstallationScopeWire::Global,
                                 workspace_path: None,
-                                source_locator: prepared.plan.source_locator.clone(),
+                                source_locator: prepared.draft.source.source_locator.clone(),
                                 target_installation_id: None,
                                 replace_acknowledged: false,
                                 third_party_trust_confirmed: prepared
-                                    .plan
+                                    .draft
+                                    .source
                                     .third_party_trust_confirmed,
                                 requested_slot: Some("primary".into()),
                                 roles: Vec::new(),
@@ -18386,16 +18460,19 @@ async fn handle_serialized_request_impl(
                             choices,
                             ..
                         } => {
+                            let grant = prepared.draft.model_trust_confirmations.first();
                             let choice = choices
                                 .iter()
                                 .find(|choice| {
-                                    choice.model_id == prepared.plan.default_model.model
-                                        && crate::daemon::agent_installation::resolvable_provider_handle_for_choice(
-                                            &prepared.providers,
-                                            choice,
-                                        )
-                                        .as_deref()
-                                            == Some(prepared.plan.default_model.provider.as_str())
+                                    grant.is_some_and(|grant| {
+                                        choice.model_id == grant.model_id
+                                            && crate::daemon::agent_installation::resolvable_provider_handle_for_choice(
+                                                &prepared.providers,
+                                                choice,
+                                            )
+                                            .as_deref()
+                                                == Some(grant.provider_id.as_str())
+                                    })
                                 });
                             let Some(choice) = choice else {
                                 let compensation = compensate_onboarding_agent_publication(
@@ -18494,7 +18571,7 @@ async fn handle_serialized_request_impl(
                     // later participant fails, compensate both authorities
                     // while the publication gate still excludes other daemon
                     // writers; onboarding must not leave a visible half-plan.
-                    match crate::wizard::publish_onboarding_agent_plan(&prepared.plan) {
+                    match crate::wizard::publish_onboarding_agent_plan(&prepared) {
                         Ok(_) => {}
                         Err(error) => {
                             let compensation = compensate_onboarding_agent_publication(
@@ -18512,7 +18589,7 @@ async fn handle_serialized_request_impl(
                             }));
                         }
                     };
-                    if prepared.plan.make_default
+                    if prepared.draft.make_default
                         && let Err(error) = ctx
                             .db
                             .set_default_agent_installation(

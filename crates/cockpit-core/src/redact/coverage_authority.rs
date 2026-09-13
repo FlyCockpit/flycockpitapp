@@ -232,7 +232,7 @@ pub(crate) enum RawExportDisposition {
 
 struct Flight {
     epoch: u64,
-    waiters: usize,
+    waiters: std::sync::atomic::AtomicUsize,
     result: Mutex<Option<std::result::Result<Arc<RedactionCoverageGeneration>, CoverageError>>>,
     ready: Notify,
 }
@@ -312,10 +312,15 @@ impl RedactionCoverageAuthority {
                 return self.admit_locked(&mut state, generation);
             }
             if let Some(flight) = state.flights.get(&key).cloned() {
-                if flight.waiters >= COVERAGE_WAITERS_PER_KEY || state.waiters >= COVERAGE_WAITERS {
+                if flight.waiters.load(std::sync::atomic::Ordering::Acquire)
+                    >= COVERAGE_WAITERS_PER_KEY
+                    || state.waiters >= COVERAGE_WAITERS
+                {
                     return Err(CoverageError::Saturated);
                 }
-                flight.waiters += 1;
+                flight
+                    .waiters
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 state.waiters += 1;
                 (flight, false)
             } else {
@@ -324,7 +329,7 @@ impl RedactionCoverageAuthority {
                 }
                 let flight = Arc::new(Flight {
                     epoch: state.epoch,
-                    waiters: 1,
+                    waiters: std::sync::atomic::AtomicUsize::new(1),
                     result: Mutex::new(None),
                     ready: Notify::new(),
                 });
@@ -534,7 +539,9 @@ impl WaiterLease {
             let mut state = lock(&inner.state);
             state.waiters = state.waiters.saturating_sub(1);
             if let Some(flight) = self.flight.upgrade() {
-                flight.waiters = flight.waiters.saturating_sub(1);
+                flight
+                    .waiters
+                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             }
         }
     }

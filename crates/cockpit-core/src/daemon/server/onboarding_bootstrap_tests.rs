@@ -10,6 +10,12 @@ async fn fresh_locked_services() -> (tempfile::TempDir, super::LockedServices) {
     let tmp = tempfile::tempdir().expect("temporary daemon installation");
     let db = crate::db::Db::open(&tmp.path().join("cockpit.db")).expect("fresh database");
     let mut extended = crate::config::extended::ExtendedConfig::default();
+    // Locked/ready transition tests exercise lifecycle publication, not source
+    // discovery. Keep their fixed config hermetic so ready construction never
+    // walks the checkout, process environment, or the developer's SSH home.
+    extended.redact.scan_environment = false;
+    extended.redact.scan_dotenv = false;
+    extended.redact.scan_ssh_keys = false;
     extended.daemon.boot.secret_store_backend =
         crate::config::extended::DaemonSecretStoreBackend::File;
     extended.daemon.boot.secret_store_path = Some(tmp.path().join("secret-vault"));

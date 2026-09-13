@@ -1,5 +1,12 @@
 import { z } from "zod";
 import {
+  agentAuthoringProjectionSchema,
+  applyAuthoredAgentPackageOutcomeSchema,
+  applyAuthoredAgentPackageReceiptSchema,
+  applyAuthoredAgentPackageRequestSchema,
+  authoredAgentPackageReceiptQuerySchema,
+} from "./agent-authoring";
+import {
   applyOnboardingTransitionSchema,
   beginOrReopenOnboardingSchema,
   lockedBootstrapHelloSchema,
@@ -11,6 +18,7 @@ import {
 } from "./onboarding";
 import { canonicalU64DecimalStringSchema, decodeProtocolIdBase64Url } from "./remote-protocol-id";
 
+export * from "./agent-authoring";
 export * from "./dependency-health";
 export * from "./onboarding";
 export * from "./remote-attempt-grants";
@@ -26,7 +34,7 @@ export * from "./remote-websocket-fallback";
 export * from "./remote-wire-magic-registry";
 export * from "./send-user-message-v2";
 
-export const PROTOCOL_VERSION = 23 as const;
+export const PROTOCOL_VERSION = 24 as const;
 
 /** Immutable daemon-owned session setup metadata; never an authority grant. */
 export const sessionEntryModeSchema = z.enum(["code", "assistant", "computer"]);
@@ -926,6 +934,9 @@ const requestParamSchemas = {
   begin_or_reopen_onboarding: beginOrReopenOnboardingSchema,
   apply_onboarding_transition: applyOnboardingTransitionSchema,
   get_onboarding_transition_receipt: onboardingReceiptQuerySchema,
+  get_agent_authoring_projection: z.undefined(),
+  apply_authored_agent_package: applyAuthoredAgentPackageRequestSchema,
+  get_authored_agent_package_receipt: authoredAgentPackageReceiptQuerySchema,
   get_storage_report: z.undefined(),
   get_app_flag: z
     .object({ key: z.enum(["daemon_autostart_notice", "storage_management_hint"]) })
@@ -1446,6 +1457,12 @@ const clientRequestVariants = [
     "get_onboarding_transition_receipt",
     requestParamSchemas.get_onboarding_transition_receipt,
   ),
+  requestVariantNoParams("get_agent_authoring_projection"),
+  requestVariant("apply_authored_agent_package", requestParamSchemas.apply_authored_agent_package),
+  requestVariant(
+    "get_authored_agent_package_receipt",
+    requestParamSchemas.get_authored_agent_package_receipt,
+  ),
   requestVariant("create_code_root_v1", requestParamSchemas.create_code_root_v1),
   requestVariant("attach_existing_code_root_v1", requestParamSchemas.attach_existing_code_root_v1),
   requestVariant(
@@ -1653,6 +1670,9 @@ export const responseNameSchema = z.enum([
   "locked_bootstrap_hello",
   "onboarding_transition",
   "onboarding_transition_receipt",
+  "agent_authoring_projection",
+  "authored_agent_package",
+  "authored_agent_package_receipt",
   "app_flag",
   "app_flag_seen",
   "assistant_session_resolved",
@@ -2180,6 +2200,12 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
   responseVariant("locked_bootstrap_hello", lockedBootstrapHelloSchema),
   responseVariant("onboarding_transition", onboardingTransitionResultSchema),
   responseVariant("onboarding_transition_receipt", onboardingTransitionReceiptSchema.nullable()),
+  responseVariant("agent_authoring_projection", agentAuthoringProjectionSchema),
+  responseVariant("authored_agent_package", applyAuthoredAgentPackageOutcomeSchema),
+  responseVariant(
+    "authored_agent_package_receipt",
+    applyAuthoredAgentPackageReceiptSchema.nullable(),
+  ),
   responseVariant(
     "app_flag",
     z

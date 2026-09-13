@@ -1718,6 +1718,21 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    row(
+        "get_agent_authoring_projection",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "apply_authored_agent_package",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "get_authored_agent_package_receipt",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
 ];
 
 /// Every `Response` variant.
@@ -2550,6 +2565,21 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
     ),
     row(
         "agent_installation",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "agent_authoring_projection",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "authored_agent_package",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "authored_agent_package_receipt",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
@@ -3502,13 +3532,13 @@ mod tests {
 
         // Exact table sizes, so a silent shrink is caught.
         #[cfg(feature = "extended")]
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 290);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 293);
         #[cfg(not(feature = "extended"))]
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 267);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 270);
         #[cfg(feature = "extended")]
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 203);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 206);
         #[cfg(not(feature = "extended"))]
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 195);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 198);
         #[cfg(feature = "extended")]
         assert_eq!(EVENT_CLASSIFICATION.len(), 88);
         #[cfg(not(feature = "extended"))]

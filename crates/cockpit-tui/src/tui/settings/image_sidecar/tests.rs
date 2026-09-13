@@ -287,6 +287,7 @@ fn cap_only_save_preserves_configured_models_when_catalog_is_unavailable() {
             provider: "configured".into(),
             model: "override".into(),
         }),
+        permitted: Vec::new(),
     };
     let mut form = SidecarFormState::from_authoritative_config(&config);
     form.set_central_cap(7);

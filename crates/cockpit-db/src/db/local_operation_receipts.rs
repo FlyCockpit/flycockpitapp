@@ -164,6 +164,13 @@ impl Db {
                        SELECT 1 FROM agent_mutation_journals journal
                        WHERE journal.owner_digest=local_operation_receipts.owner_digest
                          AND journal.client_operation_id=local_operation_receipts.client_operation_id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM authored_agent_package_journals journal
+                       WHERE journal.owner_digest=local_operation_receipts.owner_digest
+                         AND journal.client_operation_id=local_operation_receipts.client_operation_id
+                         AND journal.request_hash=local_operation_receipts.request_hash
+                         AND journal.fencing_generation=local_operation_receipts.fencing_generation
                    )",
                 params![outcome, now],
             )? as u64)

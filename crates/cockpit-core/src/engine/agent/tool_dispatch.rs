@@ -1627,6 +1627,7 @@ async fn execute_ordinary_call_unscoped(
                         operation_id,
                         dispatch_attempt_revision: plan.attempt_revision,
                         outcome: crate::db::needs_attention::InterruptVerificationOutcome::DispatchOriginal,
+                        goal_skeptics: plan.goal_skeptics,
                     },
                 );
                 let label = format!(
@@ -1711,6 +1712,7 @@ async fn execute_ordinary_call_unscoped(
                                 crate::db::needs_attention::InterruptVerificationOutcome::Block {
                                     message: message.clone(),
                                 },
+                            goal_skeptics: 0,
                         });
                 }
                 (Err(invalid_input(message)), 0)
@@ -1743,6 +1745,7 @@ async fn execute_ordinary_call_unscoped(
                             args: revised_args.clone(),
                             disclosure: disclosure.clone(),
                         },
+                        goal_skeptics: plan.goal_skeptics,
                     });
                 let authorization = if replaying_selected_args {
                     // Replay has already entered this ordinary pipeline with
@@ -1854,6 +1857,7 @@ async fn execute_ordinary_call_unscoped(
                                     outcome: crate::db::needs_attention::InterruptVerificationOutcome::Block {
                                         message: message.clone(),
                                     },
+                                    goal_skeptics: 0,
                                 });
                             (Err(invalid_input(message)), 0)
                         } else {
@@ -1923,6 +1927,7 @@ async fn execute_ordinary_call_unscoped(
                         operation_id,
                         dispatch_attempt_revision: plan.attempt_revision,
                         outcome: crate::db::needs_attention::InterruptVerificationOutcome::DispatchOriginal,
+                        goal_skeptics: plan.goal_skeptics,
                     },
                 );
                 tool_was_dispatched = true;
@@ -3572,6 +3577,7 @@ mod tests {
             operation_id: uuid::Uuid::nil(),
             dispatch_attempt_revision,
             outcome,
+            goal_skeptics: 0,
         };
 
         assert!(replay_memo_has_reserved_dispatch(&memo(

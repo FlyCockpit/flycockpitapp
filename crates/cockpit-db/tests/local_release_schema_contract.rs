@@ -461,6 +461,7 @@ fn authority_journals_bind_exact_fenced_terminal_receipts() {
         "extended_config_patch_journals",
         "image_config_mutation_journals",
         "agent_mutation_journals",
+        "authored_agent_package_journals",
     ] {
         let declaration = sql
             .split(&format!("CREATE TABLE {table}"))
@@ -502,6 +503,89 @@ fn interrupted_settlement_excludes_provider_journal_owned_receipts() {
         settlement
             .contains("journal.fencing_generation=local_operation_receipts.fencing_generation")
     );
+    assert!(settlement.contains("FROM authored_agent_package_journals journal"));
+}
+
+#[test]
+fn authored_package_files_json_limit_holds_hex_encoded_canonical_packages() {
+    use cockpit_db::db::authored_agent_packages::{
+        MAX_AUTHORED_PACKAGE_FILES_JSON_BYTES, MAX_AUTHORED_PACKAGE_FILES_JSON_WRAP_BYTES,
+        MAX_CANONICAL_AGENT_PACKAGE_BYTES,
+    };
+    assert_eq!(MAX_CANONICAL_AGENT_PACKAGE_BYTES, 4 * 1024 * 1024);
+    assert_eq!(
+        MAX_AUTHORED_PACKAGE_FILES_JSON_BYTES,
+        MAX_CANONICAL_AGENT_PACKAGE_BYTES
+            .saturating_mul(2)
+            .saturating_add(MAX_AUTHORED_PACKAGE_FILES_JSON_WRAP_BYTES)
+    );
+    let sql = include_str!("../src/db/migrations/0001_initial.sql");
+    let files_check = sql
+        .split("CREATE TABLE authored_agent_package_journals")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("CREATE INDEX authored_agent_package_journals_created")
+                .next()
+        })
+        .expect("authored journal table");
+    assert!(
+        files_check.contains(&format!(
+            "length(CAST(package_files_json AS BLOB)) <= {MAX_AUTHORED_PACKAGE_FILES_JSON_BYTES}"
+        )),
+        "SQL CHECK must match MAX_AUTHORED_PACKAGE_FILES_JSON_BYTES={MAX_AUTHORED_PACKAGE_FILES_JSON_BYTES}: {files_check}"
+    );
+    let ownership = include_str!("../schema-ownership.toml");
+    let authored = ownership
+        .split("\"authored_agent_package_journals\"")
+        .nth(1)
+        .and_then(|tail| tail.split("\"authored_agent_package_drafts\"").next())
+        .expect("authored journal ownership");
+    assert!(
+        authored.contains("hex-encoded canonical package files including markdown"),
+        "ownership must declare that package_files_json stores markdown for recovery"
+    );
+    assert!(
+        authored.contains("resolved sidecar selection including provider handles"),
+        "ownership must declare that sidecar_intent_json stores resolved handles for recovery"
+    );
+    assert!(
+        authored.contains("credentials are never stored"),
+        "ownership must keep the credential exclusion"
+    );
+}
+
+#[test]
+fn onboarding_publication_journal_owns_nested_authored_identity() {
+    let sql = include_str!("../src/db/migrations/0001_initial.sql");
+    let declaration = sql
+        .split("CREATE TABLE onboarding_agent_publication_journals")
+        .nth(1)
+        .and_then(|tail| tail.split(");").next())
+        .expect("onboarding publication journal");
+    assert!(
+        declaration.contains("authored_owner_digest"),
+        "crash recovery must persist the nested authored journal owner"
+    );
+    let accessors = include_str!("../src/db/authored_agent_packages.rs");
+    let production = accessors
+        .split("#[cfg(test)]")
+        .next()
+        .expect("authored accessors");
+    assert!(
+        !production.contains("delete_authored_agent_package_journals_by_client_operation"),
+        "authored journals must be compensated by composite identity"
+    );
+    assert!(production.contains("compensate_authored_agent_package_journal"));
+    let compensate = production
+        .split("pub async fn compensate_authored_agent_package_journal")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("pub async fn authored_agent_package_draft")
+                .next()
+        })
+        .expect("authored compensation");
+    assert!(compensate.contains("restore_authored_agent_package_draft_conn"));
+    assert!(compensate.contains("owner_digest=?1 AND client_operation_id=?2"));
 }
 
 #[test]

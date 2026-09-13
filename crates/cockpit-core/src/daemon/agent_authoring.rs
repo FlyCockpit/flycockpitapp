@@ -631,6 +631,82 @@ mod tests {
     }
 
     #[test]
+    fn onboarding_compensation_inverts_draft_cas_under_composite_journal_identity() {
+        let dispatch = include_str!("server/dispatch.rs");
+        let compensate = dispatch
+            .split("async fn compensate_onboarding_agent_publication")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("pub(super) async fn recover_onboarding_agent_publication_journals")
+                    .next()
+            })
+            .expect("onboarding compensation");
+        assert!(
+            compensate.contains("compensate_authored_agent_package_journal"),
+            "compensation must invert the nested authored journal object, including draft CAS"
+        );
+        assert!(
+            compensate.contains("authored_owner_digest"),
+            "compensation must address the authored journal by owner identity"
+        );
+        assert!(
+            !compensate.contains("delete_authored_agent_package_journals_by_client_operation"),
+            "compensation must not delete every journal sharing a client operation id"
+        );
+        let authored_idx = compensate
+            .find("compensate_authored_agent_package_journal")
+            .expect("authored inverse");
+        let install_idx = compensate
+            .find("cleanup_owned_onboarding_installation")
+            .expect("installation inverse");
+        assert!(
+            authored_idx < install_idx,
+            "authored inverse must run before other effects so recovery cannot complete-forward a compensating apply"
+        );
+
+        let recover = dispatch
+            .split("pub(super) async fn recover_onboarding_agent_publication_journals")
+            .nth(1)
+            .and_then(|tail| tail.split("/// Recover the catalog").next())
+            .expect("onboarding recovery");
+        assert!(recover.contains("authored_owner_digest"));
+        assert!(recover.contains("compensate_onboarding_agent_publication"));
+
+        let apply = dispatch
+            .split("wizard_id == crate::wizard::ONBOARDING_AGENT_WIZARD_ID")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("crate::wizard::apply_setup_wizard_answers_authoritative")
+                    .next()
+            })
+            .expect("onboarding apply");
+        assert!(
+            apply.contains("authored_owner_digest"),
+            "onboarding must persist the nested authored journal owner before effects"
+        );
+        assert!(
+            apply.contains("journal_authored_owner = settlement_owner.clone()"),
+            "the persisted owner must be the capability owner used as the authored fence"
+        );
+        assert!(
+            !apply.contains("owned_installation_id = installation_id"),
+            "compensation and settlement must keep the minted operation identity"
+        );
+        assert_eq!(
+            apply
+                .matches("compensate_onboarding_agent_publication")
+                .count(),
+            3,
+            "every onboarding failure path compensates"
+        );
+        assert_eq!(
+            apply.matches("settlement_owner.clone(),").count(),
+            4,
+            "the authored fence and every compensation call must pass the persisted capability owner"
+        );
+    }
+
+    #[test]
     fn recovery_completes_pending_journals_without_rechecking_live_policy() {
         let source = include_str!("agent_authoring.rs");
         let recover = source

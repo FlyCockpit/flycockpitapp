@@ -8284,13 +8284,16 @@ CREATE TABLE installation_operations (
 
 -- Cross-authority onboarding publication intent. Config preimages remain in
 -- a daemon-private journal file; this row is the durable recovery owner that
--- restores those bytes, restores the prior default selection, and removes
--- only the installation named by operation.  The row and private preimage are
--- one recovery authority: neither is discarded while compensation remains.
+-- restores those bytes, restores the prior default selection, removes only
+-- the installation named by operation, and inverts the nested authored
+-- journal addressed by (authored_owner_digest, operation_id).  The row and
+-- private preimage are one recovery authority: neither is discarded while
+-- compensation remains.
 CREATE TABLE onboarding_agent_publication_journals (
     operation_id                 TEXT PRIMARY KEY,
     backup_path                  TEXT NOT NULL,
     previous_default_installation_id TEXT REFERENCES agent_installations(installation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    authored_owner_digest        TEXT NOT NULL CHECK (length(trim(authored_owner_digest)) > 0),
     created_at_unix_ms           INTEGER NOT NULL
 );
 CREATE INDEX idx_onboarding_agent_publication_journals_previous
@@ -8394,6 +8397,9 @@ END;
 
 -- Last authoritative in-progress authored draft per agent name. Edit/retry
 -- CAS compares draft_revision; a failed child must not advance this row.
+-- Compensation of a failed outer publication restores expected_draft_revision
+-- (deleting the row when that prior state was None) before dropping the
+-- nested authored journal.
 CREATE TABLE authored_agent_package_drafts (
     agent_name         TEXT PRIMARY KEY,
     draft_revision     TEXT NOT NULL CHECK (length(trim(draft_revision)) > 0),

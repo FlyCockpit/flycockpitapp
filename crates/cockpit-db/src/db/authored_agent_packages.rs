@@ -2,7 +2,9 @@
 //!
 //! Intent is inserted before any recoverable publication effect. The terminal
 //! receipt is attached only after installation, sidecar publication, default
-//! selection, and draft CAS have completed.
+//! selection, and draft CAS have completed. Compensation of one journal
+//! object restores the prior authoritative draft, then deletes the row by
+//! its composite `(owner_digest, client_operation_id)` identity.
 
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{OptionalExtension, params};
@@ -250,15 +252,50 @@ impl Db {
         .await
     }
 
-    pub async fn delete_authored_agent_package_journals_by_client_operation(
+    /// Inverse of one authored-package journal object. Restores the prior
+    /// authoritative draft if this journal advanced it, then deletes the
+    /// composite-keyed row. A missing row is already compensated.
+    pub async fn compensate_authored_agent_package_journal(
         &self,
+        owner_digest: String,
         client_operation_id: String,
-    ) -> Result<u64> {
-        self.write(move |conn| {
-            Ok(conn.execute(
-                "DELETE FROM authored_agent_package_journals WHERE client_operation_id=?1",
-                params![client_operation_id],
-            )? as u64)
+    ) -> Result<()> {
+        self.transaction(move |conn| {
+            ensure!(
+                !owner_digest.trim().is_empty() && !client_operation_id.trim().is_empty(),
+                "authored package journal compensation requires composite identity"
+            );
+            let journal = conn
+                .query_row(
+                    &format!(
+                        "SELECT {JOURNAL_COLUMNS}
+                         FROM authored_agent_package_journals
+                         WHERE owner_digest=?1 AND client_operation_id=?2"
+                    ),
+                    params![owner_digest, client_operation_id],
+                    decode_journal,
+                )
+                .optional()
+                .context("loading authored package journal for compensation")?;
+            let Some(journal) = journal else {
+                return Ok(());
+            };
+            restore_authored_agent_package_draft_conn(
+                conn,
+                &journal.agent_name,
+                &journal.draft_revision,
+                journal.expected_draft_revision.as_deref(),
+            )?;
+            let deleted = conn.execute(
+                "DELETE FROM authored_agent_package_journals
+                 WHERE owner_digest=?1 AND client_operation_id=?2",
+                params![journal.owner_digest, journal.client_operation_id],
+            )?;
+            ensure!(
+                deleted == 1,
+                "authored package journal disappeared during compensation"
+            );
+            Ok(())
         })
         .await
     }
@@ -338,6 +375,32 @@ impl Db {
     }
 }
 
+fn restore_authored_agent_package_draft_conn(
+    conn: &rusqlite::Connection,
+    agent_name: &str,
+    advanced_revision: &str,
+    previous_revision: Option<&str>,
+) -> Result<()> {
+    match previous_revision {
+        None => {
+            conn.execute(
+                "DELETE FROM authored_agent_package_drafts
+                 WHERE agent_name=?1 AND draft_revision=?2",
+                params![agent_name, advanced_revision],
+            )?;
+        }
+        Some(previous) => {
+            conn.execute(
+                "UPDATE authored_agent_package_drafts
+                 SET draft_revision=?2, package_digest=?2
+                 WHERE agent_name=?1 AND draft_revision=?3",
+                params![agent_name, previous, advanced_revision],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn json_valid_len(value: &str, max_bytes: usize) -> bool {
     value.len() <= max_bytes && serde_json::from_str::<serde_json::Value>(value).is_ok()
 }
@@ -370,4 +433,49 @@ fn decode_journal(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthoredAgentPack
         terminal_response_json: row.get(23)?,
         created_at_unix_ms: row.get(24)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn journal_compensation_restores_draft_under_composite_identity() {
+        let source = include_str!("authored_agent_packages.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production accessors");
+        assert!(
+            !production.contains("delete_authored_agent_package_journals_by_client_operation"),
+            "authored journals must not be deleted by client_operation_id alone"
+        );
+        let compensate = production
+            .split("pub async fn compensate_authored_agent_package_journal")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("pub async fn authored_agent_package_draft")
+                    .next()
+            })
+            .expect("authored journal compensation");
+        assert!(compensate.contains("owner_digest=?1 AND client_operation_id=?2"));
+        assert!(
+            !compensate.contains("WHERE client_operation_id=?1"),
+            "authored journal writes must include owner_digest"
+        );
+        assert!(compensate.contains("restore_authored_agent_package_draft_conn"));
+        assert!(
+            compensate.contains("expected_draft_revision"),
+            "compensation must invert draft CAS from the journal's prior revision"
+        );
+        let restore = production
+            .split("fn restore_authored_agent_package_draft_conn")
+            .nth(1)
+            .and_then(|tail| tail.split("fn json_valid_len").next())
+            .expect("draft CAS inverse");
+        assert!(restore.contains("DELETE FROM authored_agent_package_drafts"));
+        assert!(restore.contains("UPDATE authored_agent_package_drafts"));
+        assert!(
+            restore.contains("WHERE agent_name=?1 AND draft_revision="),
+            "draft inverse must be CAS-predicated on the revision this journal advanced"
+        );
+    }
 }

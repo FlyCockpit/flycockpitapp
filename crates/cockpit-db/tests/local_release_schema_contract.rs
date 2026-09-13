@@ -553,6 +553,40 @@ fn authored_package_files_json_limit_holds_hex_encoded_canonical_packages() {
 }
 
 #[test]
+fn onboarding_publication_journal_owns_nested_authored_identity() {
+    let sql = include_str!("../src/db/migrations/0001_initial.sql");
+    let declaration = sql
+        .split("CREATE TABLE onboarding_agent_publication_journals")
+        .nth(1)
+        .and_then(|tail| tail.split(");").next())
+        .expect("onboarding publication journal");
+    assert!(
+        declaration.contains("authored_owner_digest"),
+        "crash recovery must persist the nested authored journal owner"
+    );
+    let accessors = include_str!("../src/db/authored_agent_packages.rs");
+    let production = accessors
+        .split("#[cfg(test)]")
+        .next()
+        .expect("authored accessors");
+    assert!(
+        !production.contains("delete_authored_agent_package_journals_by_client_operation"),
+        "authored journals must be compensated by composite identity"
+    );
+    assert!(production.contains("compensate_authored_agent_package_journal"));
+    let compensate = production
+        .split("pub async fn compensate_authored_agent_package_journal")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("pub async fn authored_agent_package_draft")
+                .next()
+        })
+        .expect("authored compensation");
+    assert!(compensate.contains("restore_authored_agent_package_draft_conn"));
+    assert!(compensate.contains("owner_digest=?1 AND client_operation_id=?2"));
+}
+
+#[test]
 fn assistant_mutation_recovery_is_keyed_identity_only_and_receipt_fenced() {
     let sql = include_str!("../src/db/migrations/0001_initial.sql");
     let declaration = sql

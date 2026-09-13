@@ -9,11 +9,11 @@ const SCHEMA: &str = include_str!("../src/db/migrations/0001_initial.sql");
 const EXTENDED_SCHEMA: &str = include_str!("../src/db/migrations/0001_extended_profile.sql");
 const RELATIONSHIP_INVENTORY: &str = include_str!("support/relationship_inventory.tsv");
 const LOCAL_SCHEMA_REVIEW_DIGEST: &str =
-    "0fae6e32047c6b7d4e0ec6db5928890fc4bfb80d6eaf19e624f7ab158a7fb399";
+    "d4ffb2d42eea9eb13be7fc063cc39f5ddd1feb540a956397f35791160951a76e";
 const EXTENDED_SCHEMA_REVIEW_DIGEST: &str =
     "a6eb995d785afd158764c928429f4e2937aef0f2e309b5e5e547f9f4fa81e2f2";
 const RELATIONSHIP_INVENTORY_REVIEW_DIGEST: &str =
-    "42d0aa8f7fded117aea4f357017b52d53b3c8e223cf6d4ea4e50608604b3e093";
+    "02a366deb55d1e361cbbddcf271de7d897958946e2009604e71e9363dc06e5cb";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum RelationshipClass {

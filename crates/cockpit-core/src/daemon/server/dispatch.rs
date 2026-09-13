@@ -473,9 +473,16 @@ async fn compensate_onboarding_agent_publication(
     operation_id: uuid::Uuid,
     backup: &std::path::Path,
     previous_default_installation_id: Option<uuid::Uuid>,
+    authored_owner_digest: String,
 ) -> anyhow::Result<()> {
     // Always attempt every inverse operation.  The journal remains intact on
     // any failure, so startup can retry exactly this full compensation.
+    // Invert the nested authored journal first so a later crash cannot
+    // complete-forward an apply this compensation is rolling back.
+    let authored = ctx
+        .db
+        .compensate_authored_agent_package_journal(authored_owner_digest, operation_id.to_string())
+        .await;
     let config = crate::wizard::OnboardingConfigRollback::restore_durable_journal(backup);
     let installation = cleanup_owned_onboarding_installation(ctx, operation_id).await;
     let default = ctx
@@ -485,11 +492,6 @@ async fn compensate_onboarding_agent_publication(
             crate::workspace_lease::now_unix_ms(),
         )
         .await;
-    let authored = ctx
-        .db
-        .delete_authored_agent_package_journals_by_client_operation(operation_id.to_string())
-        .await
-        .map(|_| ());
     if let (Ok(()), Ok(()), Ok(()), Ok(())) = (&config, &installation, &default, &authored) {
         return settle_onboarding_publication_journal(ctx, operation_id, backup).await;
     }
@@ -512,25 +514,25 @@ async fn compensate_onboarding_agent_publication(
 
 /// Reconcile an interrupted onboarding publication before the daemon accepts
 /// clients. The intent is created before installation, so restoring its exact
-/// config preimage, prior DB default, and operation-named installation exposes
-/// none of an interrupted plan. A missing/corrupt private journal fails closed
-/// and keeps the socket unpublished.
+/// config preimage, prior DB default, operation-named installation, and nested
+/// authored journal (draft CAS included) exposes none of an interrupted plan.
+/// A missing/corrupt private journal fails closed and keeps the socket unpublished.
 pub(super) async fn recover_onboarding_agent_publication_journals(
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
-    let rows: Vec<(String, String, Option<String>)> = ctx
+    let rows: Vec<(String, String, Option<String>, String)> = ctx
         .db
         .read(|conn| {
             let mut statement = conn.prepare(
-                "SELECT operation_id,backup_path,previous_default_installation_id FROM onboarding_agent_publication_journals ORDER BY created_at_unix_ms",
+                "SELECT operation_id,backup_path,previous_default_installation_id,authored_owner_digest FROM onboarding_agent_publication_journals ORDER BY created_at_unix_ms",
             )?;
             Ok(statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?)
         })
         .await
         .map_err(internal)?;
-    for (operation, backup_path, previous_default) in rows {
+    for (operation, backup_path, previous_default, authored_owner_digest) in rows {
         let operation_id = uuid::Uuid::parse_str(&operation)
             .map_err(|error| internal(anyhow::Error::from(error)))?;
         let backup = std::path::PathBuf::from(backup_path);
@@ -538,9 +540,15 @@ pub(super) async fn recover_onboarding_agent_publication_journals(
             .map(|value| uuid::Uuid::parse_str(&value))
             .transpose()
             .map_err(|error| internal(anyhow::Error::from(error)))?;
-        compensate_onboarding_agent_publication(ctx, operation_id, &backup, previous_default)
-            .await
-            .map_err(internal)?;
+        compensate_onboarding_agent_publication(
+            ctx,
+            operation_id,
+            &backup,
+            previous_default,
+            authored_owner_digest,
+        )
+        .await
+        .map_err(internal)?;
     }
     Ok(())
 }
@@ -18395,7 +18403,7 @@ async fn handle_serialized_request_impl(
                     // prior installation and let a later failed publication
                     // delete somebody else's already-successful result.
                     let operation_key = uuid::Uuid::now_v7().to_string();
-                    let mut owned_installation_id = uuid::Uuid::parse_str(&operation_key)
+                    let owned_installation_id = uuid::Uuid::parse_str(&operation_key)
                         .expect("fresh UUID operation key parses");
                     // Prepare the cross-authority rollback before *any*
                     // installation side effect. A daemon death at every later
@@ -18418,12 +18426,13 @@ async fn handle_serialized_request_impl(
                     let journal_backup = publication_backup.to_string_lossy().into_owned();
                     let journal_previous_default =
                         previous_default_installation_id.map(|id| id.to_string());
+                    let journal_authored_owner = settlement_owner.clone();
                     if let Err(error) = ctx
                         .db
                         .write(move |conn| {
                             conn.execute(
-                                "INSERT INTO onboarding_agent_publication_journals(operation_id,backup_path,previous_default_installation_id,created_at_unix_ms) VALUES(?1,?2,?3,?4)",
-                                rusqlite::params![journal_operation,journal_backup,journal_previous_default,crate::workspace_lease::now_unix_ms()],
+                                "INSERT INTO onboarding_agent_publication_journals(operation_id,backup_path,previous_default_installation_id,authored_owner_digest,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5)",
+                                rusqlite::params![journal_operation,journal_backup,journal_previous_default,journal_authored_owner,crate::workspace_lease::now_unix_ms()],
                             )?;
                             Ok(())
                         })
@@ -18456,61 +18465,54 @@ async fn handle_serialized_request_impl(
                         onboarding,
                     };
                     let authored_request_hash = local_operation_request_hash(&authored_request)?;
-                    let authored =
-                        match crate::daemon::agent_authoring::apply_package_under_publication_lock(
-                            ctx,
-                            authored_request,
-                            Some(crate::daemon::agent_authoring::AuthoredApplyFence {
-                                owner_digest: settlement_owner.clone(),
-                                request_hash: authored_request_hash,
-                                fencing_generation,
-                            }),
-                        )
-                        .await
-                        {
-                            Ok(cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(
-                                receipt,
-                            )) if receipt.installation_id.is_some() => receipt,
-                            Ok(other) => {
-                                let compensation = compensate_onboarding_agent_publication(
-                                    ctx,
-                                    owned_installation_id,
-                                    &publication_backup,
-                                    previous_default_installation_id,
-                                )
-                                .await;
-                                return Err(internal(match compensation {
-                                    Ok(()) => anyhow::anyhow!(
-                                        "agent onboarding authored package was not committed: {other:?}"
-                                    ),
-                                    Err(recovery) => anyhow::anyhow!(
-                                        "agent onboarding authored package was not committed ({other:?}); recovery remains pending: {recovery:#}"
-                                    ),
-                                }));
-                            }
-                            Err(error) => {
-                                let compensation = compensate_onboarding_agent_publication(
-                                    ctx,
-                                    owned_installation_id,
-                                    &publication_backup,
-                                    previous_default_installation_id,
-                                )
-                                .await;
-                                return Err(internal(match compensation {
-                                    Ok(()) => error,
-                                    Err(recovery) => anyhow::anyhow!(
-                                        "agent onboarding authored package failed ({error:#}); recovery remains pending: {recovery:#}"
-                                    ),
-                                }));
-                            }
-                        };
-                    if let Some(installation_id) = authored
-                        .installation_id
-                        .as_deref()
-                        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                    match crate::daemon::agent_authoring::apply_package_under_publication_lock(
+                        ctx,
+                        authored_request,
+                        Some(crate::daemon::agent_authoring::AuthoredApplyFence {
+                            owner_digest: settlement_owner.clone(),
+                            request_hash: authored_request_hash,
+                            fencing_generation,
+                        }),
+                    )
+                    .await
                     {
-                        owned_installation_id = installation_id;
-                    }
+                        Ok(cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(receipt))
+                            if receipt.installation_id.is_some() => {}
+                        Ok(other) => {
+                            let compensation = compensate_onboarding_agent_publication(
+                                ctx,
+                                owned_installation_id,
+                                &publication_backup,
+                                previous_default_installation_id,
+                                settlement_owner.clone(),
+                            )
+                            .await;
+                            return Err(internal(match compensation {
+                                Ok(()) => anyhow::anyhow!(
+                                    "agent onboarding authored package was not committed: {other:?}"
+                                ),
+                                Err(recovery) => anyhow::anyhow!(
+                                    "agent onboarding authored package was not committed ({other:?}); recovery remains pending: {recovery:#}"
+                                ),
+                            }));
+                        }
+                        Err(error) => {
+                            let compensation = compensate_onboarding_agent_publication(
+                                ctx,
+                                owned_installation_id,
+                                &publication_backup,
+                                previous_default_installation_id,
+                                settlement_owner.clone(),
+                            )
+                            .await;
+                            return Err(internal(match compensation {
+                                Ok(()) => error,
+                                Err(recovery) => anyhow::anyhow!(
+                                    "agent onboarding authored package failed ({error:#}); recovery remains pending: {recovery:#}"
+                                ),
+                            }));
+                        }
+                    };
                     // Trust/default-agent config remains a global policy write.
                     // Package files, sidecar.json, bindings, and default
                     // selection are already committed by the authored apply.
@@ -18522,6 +18524,7 @@ async fn handle_serialized_request_impl(
                                 owned_installation_id,
                                 &publication_backup,
                                 previous_default_installation_id,
+                                settlement_owner.clone(),
                             )
                             .await;
                             return Err(internal(match compensation {

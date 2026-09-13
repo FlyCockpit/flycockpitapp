@@ -855,15 +855,20 @@ impl App {
     ) {
         let rail_id = effect.rail_id;
         let operation_id = effect.operation_id;
+        let generation = effect.generation;
+        let attachment_generation = effect.attachment_generation;
         let target = effect.target;
         let request = effect.request;
-        let lifecycle = self.lifecycle.clone();
+        let endpoint = self.sessions_daemon_endpoint();
         self.async_actions.start(
             AsyncActionKind::DaemonRpc("sessions.mutation"),
-            AsyncActionPolicy::AllowConcurrent,
+            AsyncActionPolicy::Replace(AsyncActionKey::new("sessions.mutation")),
             async move {
                 let response = async {
-                    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
+                    let endpoint = endpoint.ok_or_else(|| {
+                        "daemon endpoint unavailable for sessions.mutation".to_string()
+                    })?;
+                    let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
                         .await
                         .map_err(|error| error.to_string())?;
                     client
@@ -877,6 +882,8 @@ impl App {
                     crate::tui::session_rail::SessionsMutationCompletion {
                         rail_id,
                         operation_id,
+                        generation,
+                        attachment_generation,
                         target,
                         response,
                     },
@@ -893,7 +900,7 @@ impl App {
     ) {
         let generation = self.session_rail.list_generation();
         let attachment_generation = self.session_rail.attachment_generation();
-        let lifecycle = self.lifecycle.clone();
+        let endpoint = self.sessions_daemon_endpoint();
         self.async_actions.start(
             AsyncActionKind::DaemonRpc("sessions.favorite"),
             AsyncActionPolicy::Replace(AsyncActionKey::new(format!(
@@ -901,7 +908,10 @@ impl App {
             ))),
             async move {
                 let result = async {
-                    let client = crate::tui::settings::settings_daemon_client(&lifecycle)
+                    let endpoint = endpoint.ok_or_else(|| {
+                        "daemon endpoint unavailable for sessions.favorite".to_string()
+                    })?;
+                    let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
                         .await
                         .map_err(|error| error.to_string())?;
                     match client

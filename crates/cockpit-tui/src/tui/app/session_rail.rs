@@ -52,7 +52,11 @@ impl App {
         }
     }
 
-    pub(super) fn abort_session_rail_runner_actions(&mut self, include_favorites: bool) {
+    /// Abort in-flight rail RPCs. Projection reads always abort. Write RPCs
+    /// (favorite and archive/delete/unarchive) abort only on reconnect or
+    /// attachment epoch change so a disconnect can still settle a paired
+    /// intent.
+    pub(super) fn abort_session_rail_runner_actions(&mut self, include_writes: bool) {
         self.async_actions
             .abort_kind(&AsyncActionKind::DaemonRpc("sessions.list"));
         self.async_actions
@@ -61,9 +65,11 @@ impl App {
             .abort_kind(&AsyncActionKind::DaemonRpc("sessions.preview"));
         self.async_actions
             .abort_kind(&AsyncActionKind::DaemonRpc("sessions.inbox"));
-        if include_favorites {
+        if include_writes {
             self.async_actions
                 .abort_kind(&AsyncActionKind::DaemonRpc("sessions.favorite"));
+            self.async_actions
+                .abort_kind(&AsyncActionKind::DaemonRpc("sessions.mutation"));
         }
     }
 
@@ -121,8 +127,10 @@ mod tests {
     use crate::tui::session_rail::{
         COMPACT_AFFORDANCE_WIDTH, COMPACT_BREAKPOINT, RailLayoutMode, WIDE_BREAKPOINT,
     };
+    use cockpit_proto::SessionSummary;
     use crossterm::event::{KeyEventKind, KeyEventState};
     use ratatui::{Terminal, backend::TestBackend};
+    use uuid::Uuid;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -162,6 +170,50 @@ mod tests {
             super::super::trusted_workspace_policy_for_tests(tmp.path()),
             || App::new(Some(tmp.path()), false),
         )
+    }
+
+    fn summary(id: Uuid, last_active: i64) -> SessionSummary {
+        SessionSummary {
+            session_id: id,
+            session_entry_mode: "code".into(),
+            short_id: Some("abc123".into()),
+            project_root: "/proj/alpha".into(),
+            project_id: "pid".into(),
+            started_at_unix_ms: 0,
+            last_active_at_unix_ms: last_active,
+            turns: 0,
+            active_agent: "builder".into(),
+            title: Some(format!("session-{id}")),
+            description: None,
+            parent_session_id: None,
+            fork_point_turn_id: None,
+            is_assistant_thread: false,
+            fork_count: 0,
+            descendant_count: 0,
+            last_viewed_at_unix_ms: None,
+            latest_activity_at_unix_ms: None,
+            open_interrupts: 0,
+            activity_state: None,
+            archived_at_unix_ms: None,
+            favorite: false,
+            created_by_principal: None,
+            shared_with_collaborators: false,
+            pin_count: 0,
+            assistant_inbox_unread: 0,
+            assistant_inbox_latest_source_session_id: None,
+            compaction_predecessor_session_id: None,
+            compaction_lineage_root_id: None,
+            lineage_window_count: 1,
+        }
+    }
+
+    fn seed_rail_sessions(app: &mut App, sessions: Vec<SessionSummary>) {
+        app.session_rail.set_daemon_connected(true);
+        assert!(app.session_rail.begin_list());
+        let generation = app.session_rail.list_generation();
+        let attachment = app.session_rail.attachment_generation();
+        app.session_rail
+            .apply_sessions_result(generation, attachment, Ok(sessions));
     }
 
     fn render_width(app: &mut App, width: u16, height: u16) -> String {
@@ -311,6 +363,43 @@ mod tests {
         app.session_rail
             .apply_sessions_result(stale_list, attach, Ok(vec![]));
         assert_eq!(app.session_rail.request_counts().list_in_flight, 0);
+        app.session_rail.handle_key(press(KeyCode::Esc));
+        app.session_rail.handle_key(press(KeyCode::Esc));
+
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        seed_rail_sessions(&mut app, vec![summary(first, 20), summary(second, 10)]);
+        app.session_rail.focus();
+        let started = app.session_rail.begin_preview(None).expect("preview");
+        assert_eq!(started.0, first);
+        app.start_sessions_preview_action(started.0, started.1);
+        let stale_preview_gen = app.session_rail.list_generation();
+        let stale_preview_attach = app.session_rail.attachment_generation();
+        app.handle_session_rail_key(press(KeyCode::Down));
+        assert_eq!(app.session_rail.selected_id(), Some(second));
+        assert_eq!(app.session_rail.request_counts().preview_in_flight, 1);
+        assert_eq!(
+            app.async_actions
+                .pending_kinds()
+                .into_iter()
+                .filter(|kind| kind == &AsyncActionKind::DaemonRpc("sessions.preview"))
+                .count(),
+            1
+        );
+        app.session_rail.apply_preview_result(
+            stale_preview_gen,
+            stale_preview_attach,
+            first,
+            None,
+            Ok((Vec::new(), false)),
+        );
+        assert_eq!(
+            app.session_rail.request_counts().preview_in_flight,
+            1,
+            "stale preview for the previous selection must not consume the replacement in-flight slot"
+        );
+        assert_eq!(app.session_rail.preview_session_id(), Some(second));
+        assert_eq!(app.session_rail.preview_message_count(), 0);
 
         app.session_rail.set_daemon_connected(true);
         assert!(app.session_rail.begin_list());
@@ -325,6 +414,57 @@ mod tests {
         assert!(app.session_rail.request_counts().live_in_flight <= 1);
         assert!(app.session_rail.request_counts().preview_in_flight <= 1);
         assert!(app.session_rail.request_counts().favorite_in_flight <= 1);
+    }
+
+    #[test]
+    fn reconnect_aborts_pending_session_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = configured_app(&tmp);
+        app.first_paint_completed = true;
+        seed_rail_sessions(&mut app, vec![summary(Uuid::from_u128(1), 10)]);
+        app.session_rail.focus();
+        app.handle_session_rail_key(press(KeyCode::Char('d')));
+        app.handle_session_rail_key(press(KeyCode::Right));
+        app.handle_session_rail_key(press(KeyCode::Enter));
+        assert!(app.session_rail.has_unsettled_local_authority());
+        assert!(
+            app.async_actions
+                .pending_kinds()
+                .contains(&AsyncActionKind::DaemonRpc("sessions.mutation"))
+        );
+        app.invalidate_session_rail_for_reconnect();
+        assert!(!app.session_rail.has_unsettled_local_authority());
+        assert!(
+            !app.async_actions
+                .pending_kinds()
+                .contains(&AsyncActionKind::DaemonRpc("sessions.mutation"))
+        );
+    }
+
+    #[test]
+    fn attachment_change_aborts_pending_session_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = configured_app(&tmp);
+        app.first_paint_completed = true;
+        seed_rail_sessions(&mut app, vec![summary(Uuid::from_u128(1), 10)]);
+        app.session_rail.focus();
+        app.handle_session_rail_key(press(KeyCode::Char('d')));
+        app.handle_session_rail_key(press(KeyCode::Right));
+        app.handle_session_rail_key(press(KeyCode::Enter));
+        assert!(app.session_rail.has_unsettled_local_authority());
+        assert!(
+            app.async_actions
+                .pending_kinds()
+                .contains(&AsyncActionKind::DaemonRpc("sessions.mutation"))
+        );
+        app.session_rail.discard_for_attachment_change();
+        app.abort_session_rail_runner_actions(true);
+        assert!(!app.session_rail.has_unsettled_local_authority());
+        assert!(
+            !app.async_actions
+                .pending_kinds()
+                .contains(&AsyncActionKind::DaemonRpc("sessions.mutation"))
+        );
     }
 
     #[test]

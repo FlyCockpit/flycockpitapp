@@ -65,6 +65,26 @@ fn apply_list(rail: &mut SessionRail, sessions: Vec<SessionSummary>) {
     rail.apply_sessions_result(generation, attachment, Ok(sessions));
 }
 
+fn start_archive(rail: &mut SessionRail) -> SessionsMutationEffect {
+    rail.handle_key(press(KeyCode::Char('d')));
+    rail.handle_key(press(KeyCode::Right));
+    match rail.handle_key(press(KeyCode::Enter)) {
+        Some(RailOutcome::Mutate(effect)) => *effect,
+        other => panic!("expected archive mutate, got {other:?}"),
+    }
+}
+
+fn ack_completion(effect: &SessionsMutationEffect) -> SessionsMutationCompletion {
+    SessionsMutationCompletion {
+        rail_id: effect.rail_id,
+        operation_id: effect.operation_id,
+        generation: effect.generation,
+        attachment_generation: effect.attachment_generation,
+        target: effect.target.clone(),
+        response: Ok(cockpit_proto::Response::Ack),
+    }
+}
+
 fn message(seq: i64, text: &str) -> SessionMessage {
     SessionMessage {
         seq,
@@ -450,9 +470,10 @@ fn card_storage_is_bounded_by_list_limit() {
 #[test]
 fn churn_keeps_one_in_flight_list_live_preview_and_coalesced_favorite() {
     let root = Uuid::from_u128(7);
-    let mut a = summary(Uuid::from_u128(1), 10);
+    let mut a = summary(Uuid::from_u128(1), 20);
     a.compaction_lineage_root_id = Some(root);
-    let mut rail = test_rail(vec![(a.clone(), Tier::Idle)]);
+    let b = summary(Uuid::from_u128(2), 10);
+    let mut rail = test_rail(vec![(a.clone(), Tier::Idle), (b.clone(), Tier::Idle)]);
     rail.list_generation = 0;
     rail.counts = RailRequestCounts::default();
     assert!(rail.begin_list());
@@ -462,19 +483,44 @@ fn churn_keeps_one_in_flight_list_live_preview_and_coalesced_favorite() {
     assert_eq!(rail.request_counts().list_started, 2);
     let list_gen = rail.list_generation;
     let attach = rail.attachment_generation;
-    rail.apply_sessions_result(list_gen, attach, Ok(vec![a.clone()]));
+    rail.apply_sessions_result(list_gen, attach, Ok(vec![a.clone(), b.clone()]));
     assert_eq!(rail.request_counts().list_in_flight, 0);
 
-    let ids = rail.begin_live(vec![a.session_id]).unwrap();
+    let ids = rail.begin_live(vec![a.session_id, b.session_id]).unwrap();
     assert!(ids.len() <= LIST_LIMIT);
     assert_eq!(rail.request_counts().live_in_flight, 1);
-    rail.begin_live(vec![a.session_id]);
+    rail.begin_live(vec![a.session_id, b.session_id]);
     assert_eq!(rail.request_counts().live_in_flight, 1);
 
     rail.current_mut().selected_session_id = Some(a.session_id);
     rail.begin_preview(None);
     rail.begin_preview(None);
     assert_eq!(rail.request_counts().preview_in_flight, 1);
+    let stale_preview = (
+        rail.list_generation,
+        rail.attachment_generation,
+        a.session_id,
+    );
+    assert!(
+        rail.handle_key(press(KeyCode::Down)).is_some(),
+        "selection change must replace the pending preview"
+    );
+    assert_eq!(rail.selected_id(), Some(b.session_id));
+    assert_eq!(rail.request_counts().preview_in_flight, 1);
+    rail.apply_preview_result(
+        stale_preview.0,
+        stale_preview.1,
+        stale_preview.2,
+        None,
+        Ok((vec![message(1, "stale")], false)),
+    );
+    assert_eq!(
+        rail.request_counts().preview_in_flight,
+        1,
+        "stale preview for the previous selection must not consume the replacement in-flight slot"
+    );
+    assert_eq!(rail.preview_session_id(), Some(b.session_id));
+    assert_eq!(rail.preview_message_count(), 0);
 
     rail.begin_favorite(a.session_id, true);
     rail.begin_favorite(a.session_id, false);
@@ -493,11 +539,18 @@ fn attachment_change_discards_generations_and_favorite_intent() {
     let mut rail = test_rail(vec![(summary(id, 10), Tier::Idle)]);
     rail.begin_list();
     rail.begin_favorite(id, true);
+    let mutation = start_archive(&mut rail);
     rail.discard_for_attachment_change();
     assert_eq!(rail.request_counts().list_in_flight, 0);
     assert_eq!(rail.request_counts().favorite_in_flight, 0);
+    assert!(!rail.has_unsettled_local_authority());
     assert!(rail.current().cards.is_empty());
     assert_eq!(rail.list_generation(), 0);
+    assert!(
+        !rail.apply_mutation_completion(ack_completion(&mutation)),
+        "pre-attachment archive must not commit"
+    );
+    assert_ne!(rail.notice(), Some("archive committed"));
 }
 
 #[test]
@@ -837,11 +890,13 @@ fn reconnect_invalidates_pending_intents() {
     let mut rail = test_rail(vec![(summary(id, 10), Tier::Idle)]);
     assert!(rail.begin_list());
     rail.begin_favorite(id, true);
+    let mutation = start_archive(&mut rail);
     let stale_gen = rail.list_generation;
     let stale_attach = rail.attachment_generation;
     rail.invalidate_for_reconnect();
     assert_eq!(rail.request_counts().list_in_flight, 0);
     assert_eq!(rail.request_counts().favorite_in_flight, 0);
+    assert!(!rail.has_unsettled_local_authority());
     assert!(rail.is_stale());
     rail.apply_sessions_result(stale_gen, stale_attach, Ok(vec![summary(id, 99)]));
     assert_ne!(
@@ -849,6 +904,11 @@ fn reconnect_invalidates_pending_intents() {
         99,
         "pre-reconnect list must not land"
     );
+    assert!(
+        !rail.apply_mutation_completion(ack_completion(&mutation)),
+        "pre-reconnect archive must not commit"
+    );
+    assert_ne!(rail.notice(), Some("archive committed"));
 }
 
 #[test]
@@ -879,6 +939,64 @@ fn attachment_change_does_not_apply_stale_favorite() {
             .is_none()
     );
     assert!(!rail.has_unsettled_local_authority());
+}
+
+#[test]
+fn replacement_mutation_after_attachment_change_is_not_wedged_by_stale_receipt() {
+    let id = Uuid::from_u128(1);
+    let mut rail = test_rail(vec![(summary(id, 10), Tier::Idle)]);
+    let stale = start_archive(&mut rail);
+    rail.discard_for_attachment_change();
+    rail.set_daemon_connected(true);
+    apply_list(&mut rail, vec![summary(id, 10)]);
+    let fresh = start_archive(&mut rail);
+    assert!(rail.has_unsettled_local_authority());
+    assert!(!rail.apply_mutation_completion(ack_completion(&stale)));
+    assert!(rail.has_unsettled_local_authority());
+    assert!(rail.apply_mutation_completion(ack_completion(&fresh)));
+    assert!(!rail.has_unsettled_local_authority());
+    assert_eq!(rail.notice(), Some("archive committed"));
+}
+
+#[test]
+fn disconnect_keeps_mutation_intent_paired() {
+    let id = Uuid::from_u128(1);
+    let mut rail = test_rail(vec![(summary(id, 10), Tier::Idle)]);
+    let effect = start_archive(&mut rail);
+    rail.set_daemon_connected(false);
+    assert!(rail.has_unsettled_local_authority());
+    assert!(rail.apply_mutation_completion(ack_completion(&effect)));
+    assert!(!rail.has_unsettled_local_authority());
+    assert_eq!(rail.notice(), Some("archive committed"));
+}
+
+#[test]
+fn search_keeps_mutation_intent_paired() {
+    let id = Uuid::from_u128(1);
+    let mut rail = test_rail(vec![(summary(id, 10), Tier::Idle)]);
+    let effect = start_archive(&mut rail);
+    rail.invalidate_for_search();
+    assert!(rail.has_unsettled_local_authority());
+    assert!(rail.apply_mutation_completion(ack_completion(&effect)));
+    assert!(!rail.has_unsettled_local_authority());
+    assert_eq!(rail.notice(), Some("archive committed"));
+}
+
+#[test]
+fn unarchive_is_generation_and_attachment_fenced() {
+    let mut archived = summary(Uuid::from_u128(1), 10);
+    archived.archived_at_unix_ms = Some(4);
+    let mut rail = test_rail(vec![(archived, Tier::Idle)]);
+    rail.show_archived = true;
+    let effect = match rail.handle_key(press(KeyCode::Char('u'))) {
+        Some(RailOutcome::Mutate(effect)) => *effect,
+        other => panic!("expected unarchive mutate, got {other:?}"),
+    };
+    assert_eq!(effect.generation, rail.list_generation());
+    assert_eq!(effect.attachment_generation, rail.attachment_generation());
+    rail.invalidate_for_reconnect();
+    assert!(!rail.apply_mutation_completion(ack_completion(&effect)));
+    assert_ne!(rail.notice(), Some("unarchive committed"));
 }
 
 #[test]

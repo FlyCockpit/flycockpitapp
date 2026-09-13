@@ -68,6 +68,8 @@ pub struct SessionsMutationTarget {
 pub struct SessionsMutationEffect {
     pub rail_id: Uuid,
     pub operation_id: Uuid,
+    pub generation: u64,
+    pub attachment_generation: u64,
     pub target: SessionsMutationTarget,
     pub request: cockpit_proto::Request,
 }
@@ -76,6 +78,8 @@ pub struct SessionsMutationEffect {
 pub struct SessionsMutationCompletion {
     pub rail_id: Uuid,
     pub operation_id: Uuid,
+    pub generation: u64,
+    pub attachment_generation: u64,
     pub target: SessionsMutationTarget,
     pub response: Result<cockpit_proto::Response, String>,
 }
@@ -83,6 +87,8 @@ pub struct SessionsMutationCompletion {
 #[derive(Debug, Clone)]
 struct PendingSessionsMutation {
     operation_id: Uuid,
+    generation: u64,
+    attachment_generation: u64,
     target: SessionsMutationTarget,
 }
 
@@ -616,12 +622,12 @@ impl SessionRail {
 
     /// Discard every in-flight rail generation. Called on daemon attach
     /// replacement. The App must also abort matching runner actions so a
-    /// durable favorite intent cannot be orphaned from its RPC.
+    /// durable write intent cannot be orphaned from its RPC.
     pub fn discard_for_attachment_change(&mut self) {
         self.attachment_generation = self.attachment_generation.saturating_add(1);
         self.list_generation = 0;
         self.clear_read_pendings();
-        self.clear_favorite_intents();
+        self.clear_write_intents();
         self.preview = None;
         self.loading = self.daemon_connected;
         self.stale = false;
@@ -630,19 +636,20 @@ impl SessionRail {
     }
 
     /// Same-session reconnect/resync: bump the attachment fence, drop every
-    /// in-flight rail intent, and keep confirmed cards tagged stale.
+    /// in-flight rail intent (reads and writes), and keep confirmed cards
+    /// tagged stale.
     pub fn invalidate_for_reconnect(&mut self) {
         self.attachment_generation = self.attachment_generation.saturating_add(1);
         self.clear_read_pendings();
-        self.clear_favorite_intents();
+        self.clear_write_intents();
         if !self.current().cards.is_empty() {
             self.stale = true;
         }
     }
 
     /// Search/filter changes fence out in-flight projection reads. Favorite
-    /// writes stay paired with their runner actions: they are durable
-    /// lineage mutations, not a projection load.
+    /// and archive/delete/unarchive writes stay paired with their runner
+    /// actions: they are durable mutations, not a projection load.
     pub fn invalidate_for_search(&mut self) {
         self.list_generation = self.list_generation.saturating_add(1);
         self.clear_read_pendings();
@@ -981,6 +988,8 @@ impl SessionRail {
         };
         if completion.rail_id != self.rail_id
             || completion.operation_id != pending.operation_id
+            || completion.generation != pending.generation
+            || completion.attachment_generation != pending.attachment_generation
             || completion.target != pending.target
         {
             return false;
@@ -1446,9 +1455,10 @@ impl SessionRail {
         } else {
             self.stale = true;
         }
-        // Fence projection reads. Keep in-flight favorite intents paired with
-        // their runner actions so a late receipt can settle and exit stays
-        // guarded until that durable write completes.
+        // Fence projection reads. Keep in-flight write intents (favorite and
+        // archive/delete/unarchive) paired with their runner actions so a
+        // late receipt can settle and exit stays guarded until that durable
+        // write completes.
         self.attachment_generation = self.attachment_generation.saturating_add(1);
         self.clear_read_pendings();
     }
@@ -1465,6 +1475,11 @@ impl SessionRail {
     fn clear_favorite_intents(&mut self) {
         self.pending_favorites.clear();
         self.counts.favorite_in_flight = 0;
+    }
+
+    fn clear_write_intents(&mut self) {
+        self.clear_favorite_intents();
+        self.pending_mutation = None;
     }
 
     fn load_list_if_connected(&mut self) -> Option<RailOutcome> {
@@ -1678,15 +1693,21 @@ impl SessionRail {
         request: cockpit_proto::Request,
     ) -> SessionsMutationEffect {
         let operation_id = Uuid::new_v4();
+        let generation = self.list_generation;
+        let attachment_generation = self.attachment_generation;
         let target = SessionsMutationTarget { session_id, kind };
         self.pending_mutation = Some(PendingSessionsMutation {
             operation_id,
+            generation,
+            attachment_generation,
             target: target.clone(),
         });
         self.notice = Some(format!("{kind} pending…"));
         SessionsMutationEffect {
             rail_id: self.rail_id,
             operation_id,
+            generation,
+            attachment_generation,
             target,
             request,
         }

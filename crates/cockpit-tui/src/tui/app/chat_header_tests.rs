@@ -4,10 +4,15 @@
 
 use super::{
     App, AttentionInterruptKind, AttentionInterruptState, HistoryEntry, Overlay,
-    StartupWorkspaceTrust,
+    StartupWorkspaceTrust, TranscriptFind,
 };
 use crate::tui::chat_header::{CHAT_HEADER_HEIGHT, HEADER_COLLAPSE_PROBE_WIDTHS, HeaderPillKind};
-use cockpit_proto::RepoStatus;
+use crate::tui::pins_overlay::{CopyPick, ForkPick, PinPick, PinsReview};
+use crate::tui::rules_overlay::RulesReview;
+use cockpit_proto::{
+    ConversationRule, ConversationRuleCreatedBy, ConversationRuleSourceTrust, PinnedMessage,
+    RepoStatus,
+};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
@@ -780,6 +785,208 @@ fn header_pills_yield_to_the_question_dialog() {
         "Enter must reach the question dialog, not the timer pill"
     );
     assert_eq!(app.header_pill_selection, None);
+}
+
+/// Header chrome never preempts a body-owning keyboard modal: while any
+/// pick/review mode is open, the mouse funnel (pill activation) is
+/// refused, the collapsed-pill popover closes instead of floating above
+/// the modal, and pill keys are swallowed by the modal rather than
+/// cycling pills. The pick/review modes route ahead of the header in
+/// `handle_key`, so the keyboard side is ordering-protected; these
+/// assertions lock the mouse path to the same invariant. The fixture
+/// keeps pills collapsed at 40 columns so the popover close can only come
+/// from the gate, not from a missing `more` chip.
+#[test]
+fn header_pills_yield_to_pick_and_review_modals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    app.busy = true;
+    app.attention_interrupt = Some(AttentionInterruptState {
+        interrupt_id: Uuid::new_v4(),
+        kind: AttentionInterruptKind::Approval,
+        pending: true,
+        pending_count: 1,
+        next_renudge_at: Instant::now(),
+    });
+    app.history.push(HistoryEntry::SkillAutoInjected {
+        name: "firecrawl".to_string(),
+        reason: None,
+    });
+    schedule(&mut app, "t1", "timer");
+    schedule(&mut app, "b1", "background");
+    let _ = render(&mut app, 40, 30);
+    let layout = app.chat_header_layout.clone().expect("header rendered");
+    assert!(
+        layout.more_button.is_some(),
+        "fixture keeps pills collapsed so the popover close is meaningful"
+    );
+
+    let modes: Vec<(&str, Box<dyn Fn(&mut App)>)> = vec![
+        (
+            "/pin pick",
+            Box::new(|app: &mut App| {
+                app.pin_pick = PinPick::enter(vec![0]);
+            }),
+        ),
+        (
+            "/fork pick",
+            Box::new(|app: &mut App| {
+                app.fork_pick = ForkPick::enter(vec![0]);
+            }),
+        ),
+        (
+            "/copy-pick",
+            Box::new(|app: &mut App| {
+                app.copy_pick = CopyPick::enter(vec![0]);
+            }),
+        ),
+        (
+            "/pins review",
+            Box::new(|app: &mut App| {
+                app.pins_review = PinsReview::enter(vec![PinnedMessage {
+                    seq: 1,
+                    is_assistant: false,
+                    text: "pinned".to_string(),
+                }]);
+            }),
+        ),
+        (
+            "/rules review",
+            Box::new(|app: &mut App| {
+                app.rules_review = RulesReview::enter(vec![ConversationRule {
+                    rule_id: Uuid::new_v4(),
+                    lineage_id: Uuid::new_v4(),
+                    text: "cite the spec".to_string(),
+                    created_by: ConversationRuleCreatedBy::User,
+                    source_trust: ConversationRuleSourceTrust::Trusted,
+                    created_at_unix_ms: 0,
+                }]);
+            }),
+        ),
+    ];
+
+    for (name, open) in modes {
+        open(&mut app);
+
+        // The mouse funnel (a pill click) is refused while the modal is
+        // up: no surface opens, the task pill never fires /schedule, and
+        // any selection is released.
+        app.header_pill_selection = Some(HeaderPillKind::Timer);
+        app.activate_header_pill(HeaderPillKind::Task);
+        assert!(
+            matches!(app.overlay, Overlay::None),
+            "{name}: no surface opens over the modal"
+        );
+        assert!(
+            !plain_lines(&app)
+                .iter()
+                .any(|l| l.contains("/schedule: active")),
+            "{name}: the task pill must not fire /schedule over the modal"
+        );
+        assert_eq!(
+            app.header_pill_selection, None,
+            "{name}: refused activation releases the selection"
+        );
+
+        // The collapsed-pill popover closes instead of floating above the
+        // modal.
+        app.chat_header_more_open = true;
+        let _ = render(&mut app, 40, 30);
+        assert!(!app.chat_header_more_open, "{name}: popover closes");
+        assert!(app.chat_header_more_rect.is_none(), "{name}: no popover");
+
+        // The modal swallows the key: the pill cycler never runs, so the
+        // selection cannot move (and Enter-style activation is unreachable
+        // the same way).
+        app.header_pill_selection = Some(HeaderPillKind::Timer);
+        app.handle_key(press(KeyCode::Right));
+        assert_eq!(
+            app.header_pill_selection,
+            Some(HeaderPillKind::Timer),
+            "{name}: the modal owns the key, not the pill cycler"
+        );
+
+        // Reset every modal state before the next mode.
+        app.pin_pick = None;
+        app.fork_pick = None;
+        app.copy_pick = None;
+        app.pins_review = None;
+        app.rules_review = None;
+        app.transcript_find = None;
+    }
+}
+
+/// The transcript-find bar is the same body-owning keyboard-modal class:
+/// it paints over the transcript and swallows every key, but unlike the
+/// pick/review modes its key routing sits *below* the header's, so the
+/// gate must also refuse pill activation and release a stale selection —
+/// otherwise a click could open an overlay over the find bar and the
+/// click-set selection would outrank the bar's keys once the overlay
+/// closes.
+#[test]
+fn header_pills_yield_to_the_transcript_find_bar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    app.busy = true;
+    app.attention_interrupt = Some(AttentionInterruptState {
+        interrupt_id: Uuid::new_v4(),
+        kind: AttentionInterruptKind::Approval,
+        pending: true,
+        pending_count: 1,
+        next_renudge_at: Instant::now(),
+    });
+    app.history.push(HistoryEntry::SkillAutoInjected {
+        name: "firecrawl".to_string(),
+        reason: None,
+    });
+    schedule(&mut app, "t1", "timer");
+    schedule(&mut app, "b1", "background");
+    let _ = render(&mut app, 40, 30);
+    let layout = app.chat_header_layout.clone().expect("header rendered");
+    assert!(
+        layout.more_button.is_some(),
+        "fixture keeps pills collapsed so the popover close is meaningful"
+    );
+    app.transcript_find = Some(TranscriptFind::default());
+
+    // The mouse funnel (a pill click) is refused while the find bar owns
+    // the keyboard.
+    app.header_pill_selection = Some(HeaderPillKind::Timer);
+    app.activate_header_pill(HeaderPillKind::Task);
+    assert!(
+        matches!(app.overlay, Overlay::None),
+        "no surface opens over the find bar"
+    );
+    assert!(
+        !plain_lines(&app)
+            .iter()
+            .any(|l| l.contains("/schedule: active")),
+        "the task pill must not fire /schedule over the find bar"
+    );
+    assert_eq!(
+        app.header_pill_selection, None,
+        "refused activation releases the selection"
+    );
+
+    // The popover closes instead of floating above the find bar.
+    app.chat_header_more_open = true;
+    let _ = render(&mut app, 40, 30);
+    assert!(!app.chat_header_more_open);
+    assert!(app.chat_header_more_rect.is_none());
+
+    // A stale selection releases its keys to the find bar instead of
+    // cycling pills (the pill handler sits ahead of find routing, so only
+    // the gate can hand the key back).
+    app.header_pill_selection = Some(HeaderPillKind::Timer);
+    app.handle_key(press(KeyCode::Right));
+    assert_eq!(
+        app.header_pill_selection, None,
+        "the find bar owns the key, not the pill cycler"
+    );
+    assert!(
+        app.transcript_find.is_some(),
+        "the find bar stays open and keeps the key"
+    );
 }
 
 /// While an overlay owns the body (the header did not render that frame),

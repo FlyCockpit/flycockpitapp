@@ -346,16 +346,38 @@ impl App {
     /// Whether the header's interactive chrome (pills, the `more` chip and
     /// popover) may take input this frame: the header must have rendered,
     /// and no body-owning surface may be on top — the approval question
-    /// dialog, any settings/wizard dialog, or any overlay (an overlay
-    /// holding unsettled local authority also means the header did not
-    /// render, so its pane cannot be dropped by a pill). Header rows still
-    /// render behind a modal — the attention/status summary is exactly
-    /// then most relevant — but they never preempt its keys or clicks.
+    /// dialog, any settings/wizard dialog, any overlay (an overlay holding
+    /// unsettled local authority also means the header did not render, so
+    /// its pane cannot be dropped by a pill), or any keyboard-modal body
+    /// surface (the pick/review modes and the transcript-find bar). Header
+    /// rows still render behind a modal — the attention/status summary is
+    /// exactly then most relevant — but they never preempt its keys or
+    /// clicks.
     pub(super) fn header_chrome_interactive(&self) -> bool {
         self.chat_header_layout.is_some()
             && matches!(self.overlay, Overlay::None)
             && self.question_dialog.is_none()
             && !self.dialog.is_active()
+            && !self.keyboard_modal_body_surface_open()
+    }
+
+    /// The body-owning keyboard modals that are neither `Overlay` variants
+    /// nor dialogs: the `/pin`/`/fork`/`/copy-pick` pick modes, the
+    /// `/pins`/`/rules` review panels, and the transcript-find bar. Each
+    /// paints over the transcript and swallows every keystroke while open
+    /// (`handle_key` routes the pick/review modes ahead of the header; the
+    /// find bar owns every key once no pill selection is live), so header
+    /// chrome must yield to them on the mouse path too — otherwise a pill
+    /// click could preempt a workflow the keyboard already treats as
+    /// modal, and the click-set selection would then outrank the modal's
+    /// keys once the opened overlay closes.
+    fn keyboard_modal_body_surface_open(&self) -> bool {
+        self.pin_pick.is_some()
+            || self.fork_pick.is_some()
+            || self.copy_pick.is_some()
+            || self.pins_review.is_some()
+            || self.rules_review.is_some()
+            || self.transcript_find.is_some()
     }
 
     /// Activate one header pill: select it and open its existing

@@ -1806,7 +1806,9 @@ impl Composer {
                 self.insert_char(ch);
                 true
             }
-            // Ctrl+J / Shift+Enter / Alt+Enter insert a newline.
+            // Direct composer Ctrl+J newline. The chat shell intercepts
+            // Ctrl+J to focus the session rail; Shift+Enter / Alt+Enter
+            // remain the shell newline bindings.
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.insert_char('\n');
                 true

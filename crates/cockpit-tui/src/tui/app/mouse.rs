@@ -22,6 +22,15 @@ pub(super) fn point_in(rect: Rect, col: u16, row: u16) -> bool {
 }
 
 impl App {
+    pub(super) fn pointer_over_session_rail(&self, col: u16, row: u16) -> bool {
+        self.session_rail
+            .rail_area()
+            .or(self.session_rail.compact_area())
+            .is_some_and(|area| point_in(area, col, row))
+    }
+}
+
+impl App {
     /// - left-down on a chat thinking-chip → toggle reasoning expansion;
     /// - left-down on a non-chip chat row → start drag-select (T8.f);
     /// - left-drag → extend the active drag-select;
@@ -85,6 +94,19 @@ impl App {
             return;
         }
         if matches!(mouse.kind, MouseEventKind::Moved) {
+            if self.pointer_over_session_rail(mouse.column, mouse.row)
+                && matches!(self.overlay, Overlay::None)
+            {
+                self.link_registry.clear_hover();
+                self.hovered_suggestion = None;
+                self.hovered_control_chip = None;
+                self.hovered_affordance = None;
+                self.hovered_footer_control = None;
+                if self.mouse_capture {
+                    let _ = self.session_rail.handle_mouse(mouse);
+                }
+                return;
+            }
             if self.mouse_capture {
                 let _ = self.button_registry.handle_mouse(mouse);
                 self.update_queue_pointer(mouse);
@@ -121,6 +143,32 @@ impl App {
         if !self.mouse_capture {
             self.link_pointer_gesture.cancel();
             self.pending_link_activation = None;
+        }
+        // Overlay/compact rails paint over the transcript. Hits in that rect
+        // belong to the rail, not to hidden links or pin/fork chips.
+        if self.pointer_over_session_rail(mouse.column, mouse.row)
+            && matches!(self.overlay, Overlay::None)
+            && !(self.mouse_capture
+                && self
+                    .dialog
+                    .settings_pointer_contains(mouse.column, mouse.row))
+        {
+            self.link_registry.clear_hover();
+            self.link_pointer_gesture.cancel();
+            self.pending_link_activation = None;
+            let pointer = matches!(
+                mouse.kind,
+                MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Moved
+            );
+            let wheel = matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            );
+            if wheel || (self.mouse_capture && pointer) {
+                let outcome = self.session_rail.handle_mouse(mouse);
+                self.apply_session_rail_outcome(outcome);
+            }
+            return;
         }
         let hit_url = self
             .link_registry
@@ -253,27 +301,6 @@ impl App {
             }
             return;
         }
-        let over_rail = self
-            .session_rail
-            .rail_area()
-            .or(self.session_rail.compact_area())
-            .is_some_and(|area| point_in(area, mouse.column, mouse.row));
-        if over_rail && matches!(self.overlay, Overlay::None) {
-            let pointer = matches!(
-                mouse.kind,
-                MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Moved
-            );
-            let wheel = matches!(
-                mouse.kind,
-                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-            );
-            if wheel || (self.mouse_capture && pointer) {
-                let outcome = self.session_rail.handle_mouse(mouse);
-                self.apply_session_rail_outcome(outcome);
-            }
-            return;
-        }
-
         // The `/sealed` no-echo overlay is modal: a left-click dismisses it,
         // which cancels the pending write and drops the minted capability (or
         // hides a recover reveal). Handled before the `&mut self.overlay` match

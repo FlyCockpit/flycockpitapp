@@ -1,4 +1,5 @@
 use super::*;
+use crate::tui::async_action::AsyncActionKind;
 use crate::tui::session_rail::RailOutcome;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -15,9 +16,11 @@ impl App {
         let worktree = self.resolved_worktree_root();
         self.session_rail
             .set_project_scope(worktree.as_deref(), &self.launch.cwd);
-        self.session_rail.set_daemon_connected(
+        if self.session_rail.set_daemon_connected(
             self.sessions_daemon_endpoint().is_some() || self.sessions_daemon_socket().is_some(),
-        );
+        ) {
+            self.abort_session_rail_runner_actions(false);
+        }
         self.session_rail
             .set_use_emojis(self.config_snapshot.extended.tui.use_emojis);
         self.session_rail.focus_search();
@@ -32,9 +35,35 @@ impl App {
         }
         let connected =
             self.sessions_daemon_endpoint().is_some() || self.sessions_daemon_socket().is_some();
-        self.session_rail.set_daemon_connected(connected);
+        if self.session_rail.set_daemon_connected(connected) {
+            self.abort_session_rail_runner_actions(false);
+        }
         if connected && self.session_rail.needs_initial_list() {
             self.start_sessions_list_action();
+        }
+    }
+
+    pub(super) fn invalidate_session_rail_for_reconnect(&mut self) {
+        self.session_rail.set_daemon_connected(true);
+        self.session_rail.invalidate_for_reconnect();
+        self.abort_session_rail_runner_actions(true);
+        if self.first_paint_completed {
+            self.start_sessions_list_action();
+        }
+    }
+
+    pub(super) fn abort_session_rail_runner_actions(&mut self, include_favorites: bool) {
+        self.async_actions
+            .abort_kind(&AsyncActionKind::DaemonRpc("sessions.list"));
+        self.async_actions
+            .abort_kind(&AsyncActionKind::DaemonRpc("sessions.live"));
+        self.async_actions
+            .abort_kind(&AsyncActionKind::DaemonRpc("sessions.preview"));
+        self.async_actions
+            .abort_kind(&AsyncActionKind::DaemonRpc("sessions.inbox"));
+        if include_favorites {
+            self.async_actions
+                .abort_kind(&AsyncActionKind::DaemonRpc("sessions.favorite"));
         }
     }
 
@@ -255,6 +284,77 @@ mod tests {
         assert!(
             !source.contains("Sessions(crate::tui::sessions_pane::SessionsPane)"),
             "Overlay::Sessions production variant must be removed"
+        );
+    }
+
+    #[test]
+    fn churn_counts_one_list_through_startup_resize_search_reconnect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = configured_app(&tmp);
+        app.first_paint_completed = true;
+        app.session_rail.set_daemon_connected(true);
+        app.start_sessions_list_action();
+        app.start_sessions_list_action();
+        assert_eq!(app.session_rail.request_counts().list_in_flight, 1);
+        assert_eq!(app.session_rail.request_counts().list_started, 2);
+
+        render_width(&mut app, 80, 24);
+        render_width(&mut app, 100, 24);
+        assert_eq!(app.session_rail.request_counts().list_in_flight, 1);
+
+        let stale_list = app.session_rail.list_generation();
+        let attach = app.session_rail.attachment_generation();
+        app.session_rail.focus();
+        app.session_rail.handle_key(press(KeyCode::Char('/')));
+        app.session_rail.handle_key(press(KeyCode::Char('q')));
+        assert_eq!(app.session_rail.request_counts().list_in_flight, 0);
+        app.session_rail
+            .apply_sessions_result(stale_list, attach, Ok(vec![]));
+        assert_eq!(app.session_rail.request_counts().list_in_flight, 0);
+
+        app.session_rail.set_daemon_connected(true);
+        assert!(app.session_rail.begin_list());
+        let pre_reconnect_gen = app.session_rail.list_generation();
+        let pre_reconnect_attach = app.session_rail.attachment_generation();
+        app.invalidate_session_rail_for_reconnect();
+        assert_eq!(app.session_rail.request_counts().list_in_flight, 1);
+        app.session_rail
+            .apply_sessions_result(pre_reconnect_gen, pre_reconnect_attach, Ok(vec![]));
+        assert_ne!(app.session_rail.list_generation(), pre_reconnect_gen);
+        assert!(app.session_rail.request_counts().list_in_flight <= 1);
+        assert!(app.session_rail.request_counts().live_in_flight <= 1);
+        assert!(app.session_rail.request_counts().preview_in_flight <= 1);
+        assert!(app.session_rail.request_counts().favorite_in_flight <= 1);
+    }
+
+    #[test]
+    fn overlay_rail_masks_transcript_hits() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::layout::Rect;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = configured_app(&tmp);
+        app.mouse_capture = true;
+        app.session_rail.focus();
+        render_width(&mut app, 55, 24);
+        let rail = app.session_rail.rail_area().expect("focused overlay rail");
+        let hidden = Rect {
+            x: rail.x,
+            y: rail.y.saturating_add(1),
+            width: rail.width.min(8).max(1),
+            height: 1,
+        };
+        app.link_registry
+            .register(hidden, "https://example.invalid/hidden", "hidden");
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hidden.x,
+            row: hidden.y,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert!(
+            app.pending_link_activation.is_none(),
+            "hidden transcript links under the overlay rail must not activate"
         );
     }
 }

@@ -2,6 +2,7 @@ use super::*;
 use cockpit_proto::MessageRole;
 use crossterm::event::{KeyEventKind, KeyEventState};
 use ratatui::{Terminal, backend::TestBackend};
+use std::collections::HashMap;
 
 fn press(code: KeyCode) -> KeyEvent {
     KeyEvent {
@@ -62,6 +63,15 @@ fn apply_list(rail: &mut SessionRail, sessions: Vec<SessionSummary>) {
     let generation = rail.list_generation;
     let attachment = rail.attachment_generation;
     rail.apply_sessions_result(generation, attachment, Ok(sessions));
+}
+
+fn message(seq: i64, text: &str) -> SessionMessage {
+    SessionMessage {
+        seq,
+        ts_ms: seq,
+        role: MessageRole::User,
+        text: text.into(),
+    }
 }
 
 #[test]
@@ -300,10 +310,10 @@ fn late_live_status_is_generation_fenced() {
     rail.apply_live_status(
         list_gen.wrapping_add(1),
         attach,
-        HashMap::from([(id, (true, true))]),
+        Ok(HashMap::from([(id, (true, true))])),
     );
     assert_eq!(rail.current().cards[0].1, Tier::Idle);
-    rail.apply_live_status(list_gen, attach, HashMap::from([(id, (true, true))]));
+    rail.apply_live_status(list_gen, attach, Ok(HashMap::from([(id, (true, true))])));
     assert_eq!(rail.current().cards[0].1, Tier::ActiveSchedules);
 }
 
@@ -542,7 +552,7 @@ fn comparator_does_not_reconstruct_eligibility() {
 fn capability_parity_table_covers_sessions_pane_operations() {
     let names: Vec<_> = capability_parity_table()
         .iter()
-        .map(|(name, _)| *name)
+        .map(|row| row.operation)
         .collect();
     for required in [
         "project/all scope",
@@ -560,8 +570,25 @@ fn capability_parity_table_covers_sessions_pane_operations() {
         "archive",
         "unarchive",
         "delete",
+        "inbox source",
+        "assistant inbox",
+        "mouse confirm",
     ] {
         assert!(names.contains(&required), "missing parity row: {required}");
+    }
+    let proofs = format!(
+        "{}\n{}\n{}",
+        include_str!("tests.rs"),
+        include_str!("../app/session_rail.rs"),
+        include_str!("../app/selection_copy_state_tests.rs"),
+    );
+    for row in capability_parity_table() {
+        assert!(
+            proofs.contains(&format!("fn {}(", row.proof)),
+            "missing named proof {} for {}",
+            row.proof,
+            row.operation
+        );
     }
 }
 
@@ -658,4 +685,268 @@ fn unarchive_is_a_named_rail_action() {
         Some(RailOutcome::Mutate(effect))
             if matches!(effect.request, cockpit_proto::Request::UnarchiveSession { .. })
     ));
+}
+
+#[test]
+fn archived_filter_reloads_list() {
+    let mut rail = test_rail(vec![(summary(Uuid::from_u128(1), 10), Tier::Idle)]);
+    assert!(!rail.include_archived());
+    assert!(matches!(
+        rail.handle_key(press(KeyCode::Char('a'))),
+        Some(RailOutcome::LoadList)
+    ));
+    assert!(rail.include_archived());
+}
+
+#[test]
+fn inbox_source_resumes_source_session() {
+    let source = Uuid::from_u128(9);
+    let mut card = summary(Uuid::from_u128(1), 10);
+    card.assistant_inbox_latest_source_session_id = Some(source);
+    let mut rail = test_rail(vec![(card, Tier::Idle)]);
+    assert!(matches!(
+        rail.handle_key(press(KeyCode::Char('i'))),
+        Some(RailOutcome::Resume(got)) if got == source
+    ));
+}
+
+#[test]
+fn assistant_inbox_loads_inbox() {
+    let id = Uuid::from_u128(1);
+    let mut rail = test_rail(vec![(summary(id, 10), Tier::Idle)]);
+    assert!(matches!(
+        rail.handle_key(press(KeyCode::Char('n'))),
+        Some(RailOutcome::LoadInbox { main_session_id }) if main_session_id == id
+    ));
+}
+
+#[test]
+fn mouse_confirm_archive_dispatches_existing_mutation() {
+    let id = Uuid::from_u128(1);
+    let mut rail = test_rail(vec![(summary(id, 10), Tier::Idle)]);
+    rail.handle_key(press(KeyCode::Char('d')));
+    let outcome =
+        rail.pointer_activate_confirm(crate::tui::button::ButtonDispatch::SessionsConfirmArchive);
+    assert!(matches!(
+        outcome,
+        Some(RailOutcome::Mutate(effect))
+            if matches!(effect.request, cockpit_proto::Request::ArchiveSession { cascade: true, .. })
+    ));
+}
+
+#[test]
+fn preview_pagination_is_fenced_and_capped() {
+    let id = Uuid::from_u128(1);
+    let mut rail = test_rail(vec![(summary(id, 10), Tier::Idle)]);
+    rail.current_mut().selected_session_id = Some(id);
+    rail.begin_preview(None);
+    let list_gen = rail.list_generation;
+    let attach = rail.attachment_generation;
+    rail.apply_preview_result(
+        list_gen,
+        attach,
+        id,
+        None,
+        Ok((vec![message(100, "newest")], true)),
+    );
+    assert_eq!(rail.preview_message_count(), 1);
+
+    rail.begin_preview(Some(100));
+    rail.apply_preview_result(
+        list_gen,
+        attach,
+        id,
+        None,
+        Ok((vec![message(1, "stale-first-page")], false)),
+    );
+    assert_eq!(rail.preview_message_count(), 1);
+    assert_eq!(rail.preview.as_ref().unwrap().messages[0].text, "newest");
+
+    rail.apply_preview_result(
+        list_gen,
+        attach,
+        id,
+        Some(100),
+        Ok((vec![message(50, "older")], true)),
+    );
+    assert_eq!(rail.preview_message_count(), 2);
+    assert_eq!(rail.preview.as_ref().unwrap().messages[0].text, "older");
+
+    let mut older_pages = Vec::new();
+    for seq in 0..PREVIEW_MAX_MESSAGES as i64 {
+        older_pages.push(message(seq, "page"));
+    }
+    rail.begin_preview(Some(50));
+    rail.apply_preview_result(list_gen, attach, id, Some(50), Ok((older_pages, true)));
+    assert!(rail.preview_message_count() <= PREVIEW_MAX_MESSAGES);
+    assert!(rail.stored_card_bound_ok());
+    assert!(
+        rail.begin_preview(Some(0)).is_none(),
+        "pagination must stop at the preview window cap"
+    );
+}
+
+#[test]
+fn stale_preview_error_does_not_poison_current_preview() {
+    let id = Uuid::from_u128(1);
+    let mut rail = test_rail(vec![(summary(id, 10), Tier::Idle)]);
+    rail.current_mut().selected_session_id = Some(id);
+    rail.begin_preview(None);
+    let first_gen = rail.list_generation;
+    let attach = rail.attachment_generation;
+    rail.invalidate_for_search();
+    rail.begin_preview(None);
+    let second_gen = rail.list_generation;
+    assert_ne!(first_gen, second_gen);
+    rail.apply_preview_result(
+        first_gen,
+        attach,
+        id,
+        None,
+        Err("stale preview failed".into()),
+    );
+    assert!(rail.preview_error().is_none());
+    rail.apply_preview_result(
+        second_gen,
+        attach,
+        id,
+        None,
+        Err("current preview failed".into()),
+    );
+    assert_eq!(rail.preview_error(), Some("current preview failed"));
+}
+
+#[test]
+fn search_invalidates_in_flight_projection_reads() {
+    let keep = Uuid::from_u128(1);
+    let mut rail = test_rail(vec![(summary(keep, 10), Tier::Idle)]);
+    assert!(rail.begin_list());
+    let stale_gen = rail.list_generation;
+    let attach = rail.attachment_generation;
+    rail.handle_key(press(KeyCode::Char('/')));
+    rail.handle_key(press(KeyCode::Char('s')));
+    assert_eq!(rail.search_query(), "s");
+    assert_eq!(rail.request_counts().list_in_flight, 0);
+    rail.apply_sessions_result(stale_gen, attach, Ok(vec![summary(Uuid::from_u128(99), 1)]));
+    assert_eq!(rail.current().cards[0].0.session_id, keep);
+}
+
+#[test]
+fn reconnect_invalidates_pending_intents() {
+    let id = Uuid::from_u128(1);
+    let mut rail = test_rail(vec![(summary(id, 10), Tier::Idle)]);
+    assert!(rail.begin_list());
+    rail.begin_favorite(id, true);
+    let stale_gen = rail.list_generation;
+    let stale_attach = rail.attachment_generation;
+    rail.invalidate_for_reconnect();
+    assert_eq!(rail.request_counts().list_in_flight, 0);
+    assert_eq!(rail.request_counts().favorite_in_flight, 0);
+    assert!(rail.is_stale());
+    rail.apply_sessions_result(stale_gen, stale_attach, Ok(vec![summary(id, 99)]));
+    assert_ne!(
+        rail.current().cards[0].0.last_active_at_unix_ms,
+        99,
+        "pre-reconnect list must not land"
+    );
+}
+
+#[test]
+fn disconnect_keeps_favorite_intent_paired() {
+    let id = Uuid::from_u128(1);
+    let mut rail = test_rail(vec![(summary(id, 10), Tier::Idle)]);
+    let started = rail.begin_favorite(id, true).expect("favorite");
+    let list_gen = rail.list_generation;
+    let attach = rail.attachment_generation;
+    rail.set_daemon_connected(false);
+    assert!(rail.has_unsettled_local_authority());
+    rail.apply_favorite_result(list_gen, attach, started.1, id, Ok((started.1, true)));
+    assert!(!rail.has_unsettled_local_authority());
+    assert!(rail.current().cards[0].0.favorite);
+}
+
+#[test]
+fn attachment_change_does_not_apply_stale_favorite() {
+    let id = Uuid::from_u128(1);
+    let mut rail = test_rail(vec![(summary(id, 10), Tier::Idle)]);
+    let started = rail.begin_favorite(id, true).expect("favorite");
+    let list_gen = rail.list_generation;
+    let attach = rail.attachment_generation;
+    rail.discard_for_attachment_change();
+    assert!(!rail.has_unsettled_local_authority());
+    assert!(
+        rail.apply_favorite_result(list_gen, attach, started.1, id, Ok((started.1, true)))
+            .is_none()
+    );
+    assert!(!rail.has_unsettled_local_authority());
+}
+
+#[test]
+fn replacement_favorite_after_attachment_change_is_not_wedged_by_stale_receipt() {
+    let id = Uuid::from_u128(1);
+    let mut rail = test_rail(vec![(summary(id, 10), Tier::Idle)]);
+    let stale = rail.begin_favorite(id, true).expect("favorite");
+    let stale_gen = rail.list_generation;
+    let stale_attach = rail.attachment_generation;
+    rail.discard_for_attachment_change();
+    rail.set_daemon_connected(true);
+    apply_list(&mut rail, vec![summary(id, 10)]);
+    let fresh = rail
+        .begin_favorite(id, false)
+        .expect("replacement favorite");
+    let fresh_gen = rail.list_generation;
+    let fresh_attach = rail.attachment_generation;
+    assert!(rail.has_unsettled_local_authority());
+    assert!(
+        rail.apply_favorite_result(stale_gen, stale_attach, stale.1, id, Ok((stale.1, true)))
+            .is_none()
+    );
+    assert!(rail.has_unsettled_local_authority());
+    rail.apply_favorite_result(fresh_gen, fresh_attach, fresh.1, id, Ok((fresh.1, false)));
+    assert!(!rail.has_unsettled_local_authority());
+    assert!(!rail.current().cards[0].0.favorite);
+}
+
+#[test]
+fn unselected_cards_do_not_record_action_hits() {
+    let selected = Uuid::from_u128(1);
+    let other = Uuid::from_u128(2);
+    let mut rail = test_rail(vec![
+        (summary(selected, 20), Tier::Idle),
+        (summary(other, 10), Tier::Idle),
+    ]);
+    rail.current_mut().selected_session_id = Some(selected);
+    let backend = TestBackend::new(36, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            rail.render(frame, Some(Rect::new(0, 0, 36, 24)), None, None, 80);
+        })
+        .unwrap();
+    assert!(
+        !rail.action_hits.is_empty(),
+        "selected card must expose action hits"
+    );
+    assert!(
+        rail.action_hits.iter().all(|hit| hit.index == 0),
+        "action hits must only cover the selected card"
+    );
+    let other_card = rail
+        .card_hits
+        .iter()
+        .find(|hit| hit.index == 1)
+        .expect("unselected card hit");
+    let meta_row = other_card
+        .rect
+        .y
+        .saturating_add(other_card.rect.height.saturating_sub(2));
+    let outcome = rail.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: other_card.rect.x.saturating_add(2),
+        row: meta_row,
+        modifiers: KeyModifiers::empty(),
+    });
+    assert!(!matches!(outcome, Some(RailOutcome::Resume(_))));
+    assert!(!matches!(outcome, Some(RailOutcome::SetFavorite { .. })));
+    assert!(!matches!(outcome, Some(RailOutcome::Mutate(_))));
 }

@@ -290,12 +290,12 @@ pub enum AsyncActionPayload {
     Sessions {
         generation: u64,
         attachment_generation: u64,
-        sessions: Vec<cockpit_proto::SessionSummary>,
+        sessions: Result<Vec<cockpit_proto::SessionSummary>, String>,
     },
     SessionLiveStatusFenced {
         generation: u64,
         attachment_generation: u64,
-        live: std::collections::HashMap<uuid::Uuid, (bool, bool)>,
+        live: Result<std::collections::HashMap<uuid::Uuid, (bool, bool)>, String>,
     },
     SessionsMutation(crate::tui::session_rail::SessionsMutationCompletion),
     SessionFavorite {
@@ -310,12 +310,11 @@ pub enum AsyncActionPayload {
         attachment_generation: u64,
         session_id: uuid::Uuid,
         before_seq: Option<i64>,
-        messages: Vec<cockpit_proto::SessionMessage>,
-        has_more: bool,
+        result: Result<(Vec<cockpit_proto::SessionMessage>, bool), String>,
     },
     AssistantInbox {
         main_session_id: uuid::Uuid,
-        items: Vec<cockpit_proto::AssistantInboxItemWire>,
+        items: Result<Vec<cockpit_proto::AssistantInboxItemWire>, String>,
     },
     ClientSubmissionReceipt {
         client_submission_id: uuid::Uuid,
@@ -1625,6 +1624,19 @@ impl AsyncActionRunner {
             return false;
         };
         self.abort_id(id)
+    }
+
+    /// Abort every pending action of `kind`. Used when a rail generation or
+    /// attachment fence is invalidated so durable intents cannot stay paired
+    /// with a superseded runner task.
+    pub fn abort_kind(&mut self, kind: &AsyncActionKind) -> usize {
+        let ids: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| &pending.kind == kind)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.into_iter().filter(|id| self.abort_id(*id)).count()
     }
 
     pub fn abort_id(&mut self, id: AsyncActionId) -> bool {

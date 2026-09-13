@@ -410,3 +410,43 @@ fn auto_copy_release_with_copy_on_release_disabled_no_copy() {
     );
     assert!(app.pending_mouse_copies.is_empty());
 }
+
+#[test]
+fn transcript_selection_works_with_rail_focus_boundaries() {
+    let mut app = app_with_selection();
+    assert!(!app.session_rail.is_focused());
+    let mut copied = None;
+    app.copy_selection_plaintext_with(|text| {
+        copied = Some(text.to_string());
+        Ok(copy_outcome())
+    });
+    assert_eq!(copied.as_deref(), Some("hello"));
+
+    let mut app = app_with_selection();
+    app.session_rail.focus();
+    app.selection = Some(Selection {
+        anchor: (0, 0),
+        focus: (4, 0),
+        active: false,
+    });
+    let mut copied = None;
+    app.copy_selection_plaintext_with(|text| {
+        copied = Some(text.to_string());
+        Ok(copy_outcome())
+    });
+    assert_eq!(copied.as_deref(), Some("hello"));
+    assert!(app.session_rail.is_focused());
+
+    let mut app = app_with_selection();
+    app.mouse_capture = true;
+    app.copy_on_release = false;
+    app.session_rail.focus();
+    app.selection = None;
+    app.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 0, 0));
+    app.handle_mouse(mouse_at(MouseEventKind::Drag(MouseButton::Left), 4, 0));
+    app.handle_mouse(mouse_at(MouseEventKind::Up(MouseButton::Left), 4, 0));
+    assert!(
+        app.selection.is_some(),
+        "chat remainder drag-select must still work while the rail is focused"
+    );
+}

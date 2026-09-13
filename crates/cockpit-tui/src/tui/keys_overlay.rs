@@ -195,9 +195,9 @@ const COMPOSER: KeyGroup = KeyGroup {
             desc: "submit the message",
         },
         KeyBinding {
-            key: "Ctrl+J",
+            key: "Shift+Enter",
             action: "newline",
-            desc: "insert a newline",
+            desc: "insert a newline (Alt+Enter also)",
         },
         KeyBinding {
             key: "Ctrl+T",

@@ -20,7 +20,7 @@ Conversation rules are lineage-scoped advisory directives. `/rules` opens the pa
 | Key | Action | Description |
 | --- | --- | --- |
 | `Enter` | send | submit the message |
-| `Ctrl+J` | newline | insert a newline |
+| `Shift+Enter` / `Alt+Enter` | newline | insert a newline |
 | `Ctrl+T` | thinking | toggle reasoning blocks |
 | `Ctrl+Y` | copy pick | pick a message or code block to copy |
 | `Shift+Tab` | cycle agent | switch the primary agent |

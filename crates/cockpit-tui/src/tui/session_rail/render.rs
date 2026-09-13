@@ -306,6 +306,7 @@ impl SessionRail {
     ) {
         let mut hits = Vec::new();
         let mut actions = Vec::new();
+        let selected_id = self.selected_id();
         for (index, start, end) in spans.iter().copied() {
             let visible_start = start.max(scroll);
             let visible_end = end.min(scroll + body.height as usize);
@@ -319,8 +320,17 @@ impl SessionRail {
                 height: (visible_end - visible_start) as u16,
             };
             hits.push(CardHit { index, rect });
-            if rect.height >= 3 && rect.width >= 12 {
-                let action_y = rect.y.saturating_add(rect.height.saturating_sub(2));
+            let selected = Some(cards[index].0.session_id) == selected_id;
+            // Action labels are painted only on the selected card, on the
+            // second-to-last content line (above the bottom border). Hits
+            // exist only on that painted row.
+            let action_line = end.saturating_sub(2);
+            if selected
+                && rect.width >= 12
+                && action_line >= visible_start
+                && action_line < visible_end
+            {
+                let action_y = body.y + (action_line - scroll) as u16;
                 let mut x = rect.x.saturating_add(2);
                 for (label, action) in action_labels(&cards[index].0) {
                     let width = (label.len() as u16).saturating_add(2).min(rect.width);

@@ -896,7 +896,7 @@ impl App {
         let lifecycle = self.lifecycle.clone();
         self.async_actions.start(
             AsyncActionKind::DaemonRpc("sessions.favorite"),
-            AsyncActionPolicy::Dedupe(AsyncActionKey::new(format!(
+            AsyncActionPolicy::Replace(AsyncActionKey::new(format!(
                 "sessions.favorite:{canonical_root}"
             ))),
             async move {
@@ -1317,7 +1317,9 @@ impl App {
                 Err(error) => self.push_plain(format!("question: {error}")),
             },
             AsyncActionKind::DaemonRpc("sessions.list") => {
-                let payload = match result.payload {
+                // Completions without a captured fence (abort/timeout/unexpected)
+                // must not reconstruct identity from current rail state.
+                let ids = match result.payload {
                     Ok(AsyncActionPayload::Sessions {
                         generation,
                         attachment_generation,
@@ -1325,20 +1327,10 @@ impl App {
                     }) => self.session_rail.apply_sessions_result(
                         generation,
                         attachment_generation,
-                        Ok(sessions),
+                        sessions,
                     ),
-                    Ok(_) => self.session_rail.apply_sessions_result(
-                        self.session_rail.list_generation(),
-                        self.session_rail.attachment_generation(),
-                        Err("unexpected daemon response".to_string()),
-                    ),
-                    Err(e) => self.session_rail.apply_sessions_result(
-                        self.session_rail.list_generation(),
-                        self.session_rail.attachment_generation(),
-                        Err(e),
-                    ),
+                    Ok(_) | Err(_) => None,
                 };
-                let ids = payload;
                 if let Some(ids) = ids
                     && let Some(live_ids) = self.session_rail.begin_live(ids)
                 {
@@ -1359,54 +1351,33 @@ impl App {
                         .apply_live_status(generation, attachment_generation, live);
                 }
             }
-            AsyncActionKind::DaemonRpc("sessions.preview") => match result.payload {
-                Ok(AsyncActionPayload::SessionMessages {
+            AsyncActionKind::DaemonRpc("sessions.preview") => {
+                if let Ok(AsyncActionPayload::SessionMessages {
                     generation,
                     attachment_generation,
                     session_id,
                     before_seq,
-                    messages,
-                    has_more,
-                }) => self.session_rail.apply_preview_result(
-                    generation,
-                    attachment_generation,
-                    session_id,
-                    before_seq,
-                    Ok((messages, has_more)),
-                ),
-                Err(error) => {
-                    if let Some(session_id) = self.session_rail.preview_session_id() {
-                        self.session_rail.apply_preview_result(
-                            self.session_rail.list_generation(),
-                            self.session_rail.attachment_generation(),
-                            session_id,
-                            None,
-                            Err(error),
-                        );
-                    }
+                    result,
+                }) = result.payload
+                {
+                    self.session_rail.apply_preview_result(
+                        generation,
+                        attachment_generation,
+                        session_id,
+                        before_seq,
+                        result,
+                    );
                 }
-                Ok(_) => {}
-            },
+            }
             AsyncActionKind::DaemonRpc("sessions.inbox") => {
                 let mut reload_sessions = false;
-                match result.payload {
-                    Ok(AsyncActionPayload::AssistantInbox {
-                        main_session_id,
-                        items,
-                    }) => {
-                        self.session_rail
-                            .apply_inbox_result(main_session_id, Ok(items));
-                        reload_sessions = true;
-                    }
-                    Err(error) => {
-                        if let Some(main_session_id) =
-                            self.session_rail.selected_session_id_for_action()
-                        {
-                            self.session_rail
-                                .apply_inbox_result(main_session_id, Err(error));
-                        }
-                    }
-                    Ok(_) => {}
+                if let Ok(AsyncActionPayload::AssistantInbox {
+                    main_session_id,
+                    items,
+                }) = result.payload
+                {
+                    reload_sessions = items.is_ok();
+                    self.session_rail.apply_inbox_result(main_session_id, items);
                 }
                 if reload_sessions {
                     self.start_sessions_list_action();
@@ -3595,16 +3566,19 @@ impl App {
             AsyncActionKind::DaemonRpc("sessions.list"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("sessions.list")),
             move || {
-                let endpoint = endpoint
-                    .ok_or_else(|| "daemon endpoint unavailable for sessions.list".to_string())?;
-                crate::tui::agent_runner::list_sessions_blocking(
-                    &endpoint,
-                    project_id,
-                    parent,
-                    lineage_root,
-                    include_archived,
-                )
-                .map(|sessions| AsyncActionPayload::Sessions {
+                let sessions = (|| {
+                    let endpoint = endpoint.ok_or_else(|| {
+                        "daemon endpoint unavailable for sessions.list".to_string()
+                    })?;
+                    crate::tui::agent_runner::list_sessions_blocking(
+                        &endpoint,
+                        project_id,
+                        parent,
+                        lineage_root,
+                        include_archived,
+                    )
+                })();
+                Ok(AsyncActionPayload::Sessions {
                     generation,
                     attachment_generation,
                     sessions,
@@ -3621,12 +3595,18 @@ impl App {
             AsyncActionKind::DaemonRpc("sessions.live"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("sessions.live")),
             move || {
-                let endpoint = endpoint
-                    .ok_or_else(|| "daemon endpoint unavailable for sessions.live".to_string())?;
+                let live: Result<_, String> = (|| {
+                    let endpoint = endpoint.ok_or_else(|| {
+                        "daemon endpoint unavailable for sessions.live".to_string()
+                    })?;
+                    Ok(crate::tui::agent_runner::session_live_status_blocking(
+                        &endpoint, ids,
+                    ))
+                })();
                 Ok(AsyncActionPayload::SessionLiveStatusFenced {
                     generation,
                     attachment_generation,
-                    live: crate::tui::agent_runner::session_live_status_blocking(&endpoint, ids),
+                    live,
                 })
             },
         );
@@ -3644,20 +3624,20 @@ impl App {
             AsyncActionKind::DaemonRpc("sessions.preview"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("sessions.preview")),
             move || {
-                let endpoint = endpoint.ok_or_else(|| {
-                    "daemon endpoint unavailable for sessions.preview".to_string()
-                })?;
-                let (messages, has_more) =
+                let result = (|| {
+                    let endpoint = endpoint.ok_or_else(|| {
+                        "daemon endpoint unavailable for sessions.preview".to_string()
+                    })?;
                     crate::tui::agent_runner::read_session_messages_blocking(
                         &endpoint, session_id, before_seq, 50,
-                    )?;
+                    )
+                })();
                 Ok(AsyncActionPayload::SessionMessages {
                     generation,
                     attachment_generation,
                     session_id,
                     before_seq,
-                    messages,
-                    has_more,
+                    result,
                 })
             },
         );
@@ -3669,12 +3649,15 @@ impl App {
             AsyncActionKind::DaemonRpc("sessions.inbox"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("sessions.inbox")),
             move || {
-                let endpoint = endpoint
-                    .ok_or_else(|| "daemon endpoint unavailable for sessions.inbox".to_string())?;
-                let items = crate::tui::agent_runner::read_assistant_inbox_blocking(
-                    &endpoint,
-                    main_session_id,
-                )?;
+                let items = (|| {
+                    let endpoint = endpoint.ok_or_else(|| {
+                        "daemon endpoint unavailable for sessions.inbox".to_string()
+                    })?;
+                    crate::tui::agent_runner::read_assistant_inbox_blocking(
+                        &endpoint,
+                        main_session_id,
+                    )
+                })();
                 Ok(AsyncActionPayload::AssistantInbox {
                     main_session_id,
                     items,

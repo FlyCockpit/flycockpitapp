@@ -415,6 +415,7 @@ impl App {
             self.startup_background.daemon_endpoint = Some(r.endpoint.clone());
             if endpoint_changed && self.session_rail.list_generation() > 0 {
                 self.session_rail.discard_for_attachment_change();
+                self.abort_session_rail_runner_actions(true);
             }
             self.session_rail.set_daemon_connected(true);
             self.maybe_start_session_rail_list();

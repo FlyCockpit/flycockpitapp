@@ -7,8 +7,8 @@
 //! terminal's bypass modifier (Shift on most Linux/Windows Terminal,
 //! Option on iTerm2, Fn on macOS Terminal). With capture off: the
 //! terminal handles wheel/select/copy natively and `MouseEvent`s
-//! never reach this loop — the user can use `Ctrl+J` as a newline
-//! fallback in the composer.
+//! never reach this loop — Shift+Enter / Alt+Enter insert a newline in
+//! the composer. `Ctrl+J` focuses the session rail in the normal chat shell.
 
 mod agent_inventory;
 mod agent_tree;

@@ -1154,6 +1154,13 @@ impl App {
             return false;
         }
 
+        // Transcript selection copy is a global chord. It must outrank rail
+        // focus so drag-select remains copyable while the rail is focused.
+        if self.is_copy_selection_key(&key) {
+            self.copy_selection_plaintext();
+            return false;
+        }
+
         if Self::is_session_rail_focus_chord(&key)
             && self.question_dialog.is_none()
             && !self.dialog.is_active()
@@ -1253,14 +1260,6 @@ impl App {
             && matches!(key.code, KeyCode::Char('y'))
         {
             self.enter_copy_pick_mode();
-            return false;
-        }
-
-        // Ctrl+Shift+C / forwarded Command+C — copy the active drag-selection
-        // through OSC52 (SSH-safe) + local clipboard. No-op when nothing is
-        // selected. (plan.md T8.f copy path)
-        if self.is_copy_selection_key(&key) {
-            self.copy_selection_plaintext();
             return false;
         }
 
@@ -1538,12 +1537,10 @@ impl App {
                     self.complete_or_submit()
                 }
             }
-            // Newline fallback for terminals that can't disambiguate
-            // Shift+Enter (most legacy terminfo entries, every plain
-            // xterm-256color, and the common path through tmux+ssh
-            // without the kitty keyboard protocol). Ctrl+J is the
-            // canonical LF on every Unix terminal and survives every
-            // multiplexer hop.
+            // Ctrl+J focuses the session rail in the normal chat shell.
+            // This arm is reachable only when that global chord is masked
+            // (dialog, overlay, keys overlay). Shift+Enter / Alt+Enter remain
+            // the composer newline bindings.
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.composer.insert_char('\n');
                 self.reset_slash_window();

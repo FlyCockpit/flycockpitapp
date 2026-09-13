@@ -30,6 +30,8 @@ pub use sort::{Tier, canonical_root, classify, tier_sort};
 pub const LIST_LIMIT: usize = 100;
 /// Existing preview page size.
 pub const PREVIEW_PAGE: u32 = 50;
+/// Preview window cap: eight pages of `PREVIEW_PAGE` messages.
+pub const PREVIEW_MAX_MESSAGES: usize = PREVIEW_PAGE as usize * 8;
 const SKELETON_CARDS: usize = 4;
 
 const DAEMON_UNAVAILABLE_HINT: &str =
@@ -442,10 +444,18 @@ impl SessionRail {
         self.daemon_connected
     }
 
-    pub fn set_daemon_connected(&mut self, connected: bool) {
+    /// Update the daemon link. Returns `true` when the rail transitioned
+    /// from connected to disconnected and invalidated in-flight reads.
+    pub fn set_daemon_connected(&mut self, connected: bool) -> bool {
+        if self.daemon_connected == connected {
+            return false;
+        }
         self.daemon_connected = connected;
         if !connected {
             self.mark_disconnected();
+            true
+        } else {
+            false
         }
     }
 
@@ -552,8 +562,10 @@ impl SessionRail {
             && self
                 .preview
                 .as_ref()
-                .is_none_or(|preview| preview.messages.len() <= PREVIEW_PAGE as usize * 8)
-            && self.pending_list.is_none_or(|_| true)
+                .is_none_or(|preview| preview.messages.len() <= PREVIEW_MAX_MESSAGES)
+            && self.counts.list_in_flight <= 1
+            && self.counts.live_in_flight <= 1
+            && self.counts.preview_in_flight <= 1
     }
 
     pub fn root_request(&self) -> (Option<String>, Option<Uuid>, Option<Uuid>) {
@@ -582,9 +594,9 @@ impl SessionRail {
             return false;
         }
         self.list_generation = self.list_generation.saturating_add(1);
+        self.clear_read_pendings();
         self.pending_list = Some((self.list_generation, self.attachment_generation));
-        self.pending_live = None;
-        self.pending_preview = None;
+        self.counts.list_in_flight = 1;
         if self.current().cards.is_empty() {
             self.loading = true;
         } else {
@@ -592,9 +604,6 @@ impl SessionRail {
         }
         self.error = None;
         self.counts.list_started = self.counts.list_started.saturating_add(1);
-        self.counts.list_in_flight = 1;
-        self.counts.live_in_flight = 0;
-        self.counts.preview_in_flight = 0;
         true
     }
 
@@ -606,23 +615,37 @@ impl SessionRail {
     }
 
     /// Discard every in-flight rail generation. Called on daemon attach
-    /// replacement.
+    /// replacement. The App must also abort matching runner actions so a
+    /// durable favorite intent cannot be orphaned from its RPC.
     pub fn discard_for_attachment_change(&mut self) {
         self.attachment_generation = self.attachment_generation.saturating_add(1);
         self.list_generation = 0;
-        self.pending_list = None;
-        self.pending_live = None;
-        self.pending_preview = None;
-        self.pending_favorites.clear();
+        self.clear_read_pendings();
+        self.clear_favorite_intents();
         self.preview = None;
-        self.counts.list_in_flight = 0;
-        self.counts.live_in_flight = 0;
-        self.counts.preview_in_flight = 0;
-        self.counts.favorite_in_flight = 0;
         self.loading = self.daemon_connected;
         self.stale = false;
         self.levels = vec![Level::empty(None)];
         self.error = None;
+    }
+
+    /// Same-session reconnect/resync: bump the attachment fence, drop every
+    /// in-flight rail intent, and keep confirmed cards tagged stale.
+    pub fn invalidate_for_reconnect(&mut self) {
+        self.attachment_generation = self.attachment_generation.saturating_add(1);
+        self.clear_read_pendings();
+        self.clear_favorite_intents();
+        if !self.current().cards.is_empty() {
+            self.stale = true;
+        }
+    }
+
+    /// Search/filter changes fence out in-flight projection reads. Favorite
+    /// writes stay paired with their runner actions: they are durable
+    /// lineage mutations, not a projection load.
+    pub fn invalidate_for_search(&mut self) {
+        self.list_generation = self.list_generation.saturating_add(1);
+        self.clear_read_pendings();
     }
 
     pub fn apply_sessions_result(
@@ -693,13 +716,16 @@ impl SessionRail {
         &mut self,
         generation: u64,
         attachment_generation: u64,
-        live: HashMap<Uuid, (bool, bool)>,
+        live: Result<HashMap<Uuid, (bool, bool)>, String>,
     ) {
         if self.pending_live != Some((generation, attachment_generation)) {
             return;
         }
         self.pending_live = None;
         self.counts.live_in_flight = 0;
+        let Ok(live) = live else {
+            return;
+        };
         let selected_id = self.current().selected_session_id;
         if let Some(level) = self.levels.last_mut() {
             let cards = level
@@ -718,6 +744,14 @@ impl SessionRail {
     pub fn begin_preview(&mut self, before_seq: Option<i64>) -> Option<(Uuid, Option<i64>)> {
         let session_id = self.selected_id()?;
         if !self.daemon_connected {
+            return None;
+        }
+        if before_seq.is_some()
+            && self
+                .preview
+                .as_ref()
+                .is_some_and(|preview| preview.messages.len() >= PREVIEW_MAX_MESSAGES)
+        {
             return None;
         }
         let needs_reset = self
@@ -767,22 +801,13 @@ impl SessionRail {
         before_seq: Option<i64>,
         result: Result<(Vec<SessionMessage>, bool), String>,
     ) {
-        let expected = self.pending_preview;
-        if expected != Some((generation, attachment_generation, session_id, before_seq))
-            && expected.is_none_or(|(pending_gen, attach, id, _)| {
-                pending_gen != generation || attach != attachment_generation || id != session_id
-            })
+        if self.pending_preview != Some((generation, attachment_generation, session_id, before_seq))
         {
             return;
         }
+        self.pending_preview = None;
+        self.counts.preview_in_flight = 0;
         if self.selected_id() != Some(session_id) {
-            if self
-                .pending_preview
-                .is_some_and(|(_, _, id, _)| id == session_id)
-            {
-                self.pending_preview = None;
-                self.counts.preview_in_flight = 0;
-            }
             return;
         }
         if self
@@ -797,8 +822,6 @@ impl SessionRail {
         {
             return;
         }
-        self.pending_preview = None;
-        self.counts.preview_in_flight = 0;
         let Some(preview) = self.preview.as_mut() else {
             return;
         };
@@ -806,19 +829,24 @@ impl SessionRail {
         match result {
             Ok((messages, has_more)) => {
                 preview.error = None;
-                preview.has_more = has_more;
                 if before_seq.is_none() {
                     preview.messages = messages.into_iter().take(PREVIEW_PAGE as usize).collect();
                     preview.scroll = 0;
+                    preview.has_more = has_more && preview.messages.len() < PREVIEW_MAX_MESSAGES;
                 } else {
                     let existing: HashSet<i64> =
                         preview.messages.iter().map(|message| message.seq).collect();
+                    let room = PREVIEW_MAX_MESSAGES.saturating_sub(preview.messages.len());
                     let mut older: Vec<_> = messages
                         .into_iter()
                         .filter(|message| !existing.contains(&message.seq))
+                        .take(room)
                         .collect();
+                    let filled_window = room == 0 || older.len() == room;
                     older.append(&mut preview.messages);
                     preview.messages = older;
+                    preview.has_more =
+                        has_more && !filled_window && preview.messages.len() < PREVIEW_MAX_MESSAGES;
                 }
             }
             Err(error) => {
@@ -1361,14 +1389,13 @@ impl SessionRail {
     }
 
     fn restore_selection_after_filter(&mut self) {
+        self.invalidate_for_search();
         let selected = self.current().selected_session_id;
         if let Some(level) = self.levels.last_mut() {
             level.restore_selection(selected);
         }
         if self.selected_id() != self.preview.as_ref().map(|preview| preview.session_id) {
             self.preview = None;
-            self.pending_preview = None;
-            self.counts.preview_in_flight = 0;
         }
     }
 
@@ -1419,13 +1446,24 @@ impl SessionRail {
         } else {
             self.stale = true;
         }
+        // Fence projection reads. Keep in-flight favorite intents paired with
+        // their runner actions so a late receipt can settle and exit stays
+        // guarded until that durable write completes.
+        self.attachment_generation = self.attachment_generation.saturating_add(1);
+        self.clear_read_pendings();
+    }
+
+    fn clear_read_pendings(&mut self) {
         self.pending_list = None;
         self.pending_live = None;
         self.pending_preview = None;
-        self.pending_favorites.clear();
         self.counts.list_in_flight = 0;
         self.counts.live_in_flight = 0;
         self.counts.preview_in_flight = 0;
+    }
+
+    fn clear_favorite_intents(&mut self) {
+        self.pending_favorites.clear();
         self.counts.favorite_in_flight = 0;
     }
 
@@ -1678,17 +1716,13 @@ impl SessionRail {
                         .map(|before_seq| (preview.session_id, before_seq))
                 })
                 .flatten();
-            if let Some((session_id, before_seq)) = request {
+            if let Some((_session_id, before_seq)) = request {
                 return self
                     .begin_preview(Some(before_seq))
                     .map(|(session_id, before_seq)| RailOutcome::LoadPreview {
                         session_id,
                         before_seq,
-                    })
-                    .or(Some(RailOutcome::LoadPreview {
-                        session_id,
-                        before_seq: Some(before_seq),
-                    }));
+                    });
             }
             return None;
         }
@@ -1776,31 +1810,107 @@ fn hit_action(hits: &[ActionHit], col: u16, row: u16) -> Option<(usize, CardActi
 }
 
 /// Named capability-parity rows. Each SessionsPane operation maps to one
+/// rail action or retained confirmation surface and a named behavioral test.
+#[derive(Debug, Clone, Copy)]
+pub struct CapabilityParityRow {
+    pub operation: &'static str,
+    pub surface: &'static str,
+    pub proof: &'static str,
+}
+
+/// Named capability-parity rows. Each SessionsPane operation maps to one
 /// rail action or retained confirmation surface.
-pub fn capability_parity_table() -> &'static [(&'static str, &'static str)] {
+pub fn capability_parity_table() -> &'static [CapabilityParityRow] {
     &[
-        ("project/all scope", "rail scope toggle (p)"),
-        ("root list", "rail root ListSessions"),
-        ("fork drill-in", "rail →/l LoadList parent_session_id"),
-        (
-            "compaction lineage",
-            "rail e LoadList compaction_lineage_root_id",
-        ),
-        ("active/archived filter", "rail a include_archived"),
-        ("search/clear", "rail / search field + Esc clear"),
-        (
-            "selected preview pagination",
-            "rail preview 50-message page",
-        ),
-        ("resume", "rail Enter / Open hit"),
-        ("fork", "rail fork drill-in"),
-        ("compaction drill-in", "rail e"),
-        ("attention/unread/live", "rail card metadata from summary"),
-        ("favorite", "rail f / Favorite hit SetSessionFavorite"),
-        ("archive", "rail d confirm ArchiveSession cascade"),
-        ("unarchive", "rail u UnarchiveSession"),
-        ("delete", "rail d confirm DeleteSession"),
-        ("inbox source", "rail i resume source session"),
-        ("assistant inbox", "rail n ReadAssistantInbox"),
+        CapabilityParityRow {
+            operation: "project/all scope",
+            surface: "rail scope toggle (p)",
+            proof: "list_scopes_send_existing_request_shapes",
+        },
+        CapabilityParityRow {
+            operation: "root list",
+            surface: "rail root ListSessions",
+            proof: "list_scopes_send_existing_request_shapes",
+        },
+        CapabilityParityRow {
+            operation: "fork drill-in",
+            surface: "rail →/l LoadList parent_session_id",
+            proof: "fork_and_lineage_are_named_rail_actions",
+        },
+        CapabilityParityRow {
+            operation: "compaction lineage",
+            surface: "rail e LoadList compaction_lineage_root_id",
+            proof: "fork_and_lineage_are_named_rail_actions",
+        },
+        CapabilityParityRow {
+            operation: "active/archived filter",
+            surface: "rail a include_archived",
+            proof: "archived_filter_reloads_list",
+        },
+        CapabilityParityRow {
+            operation: "search/clear",
+            surface: "rail / search field + Esc clear",
+            proof: "slash_starts_search_while_focused",
+        },
+        CapabilityParityRow {
+            operation: "selected preview pagination",
+            surface: "rail preview 50-message page",
+            proof: "preview_pagination_is_fenced_and_capped",
+        },
+        CapabilityParityRow {
+            operation: "resume",
+            surface: "rail Enter / Open hit",
+            proof: "enter_resumes_selected_session",
+        },
+        CapabilityParityRow {
+            operation: "fork",
+            surface: "rail fork drill-in",
+            proof: "fork_and_lineage_are_named_rail_actions",
+        },
+        CapabilityParityRow {
+            operation: "compaction drill-in",
+            surface: "rail e",
+            proof: "fork_and_lineage_are_named_rail_actions",
+        },
+        CapabilityParityRow {
+            operation: "attention/unread/live",
+            surface: "rail card metadata from summary",
+            proof: "cards_render_only_daemon_confirmed_fields",
+        },
+        CapabilityParityRow {
+            operation: "favorite",
+            surface: "rail f / Favorite hit SetSessionFavorite",
+            proof: "open_hit_resumes_and_favorite_hit_does_not",
+        },
+        CapabilityParityRow {
+            operation: "archive",
+            surface: "rail d confirm ArchiveSession cascade",
+            proof: "archive_and_delete_use_cascade_confirm",
+        },
+        CapabilityParityRow {
+            operation: "unarchive",
+            surface: "rail u UnarchiveSession",
+            proof: "unarchive_is_a_named_rail_action",
+        },
+        CapabilityParityRow {
+            operation: "delete",
+            surface: "rail d confirm DeleteSession",
+            proof: "archive_and_delete_use_cascade_confirm",
+        },
+        CapabilityParityRow {
+            operation: "inbox source",
+            surface: "rail i resume source session",
+            proof: "inbox_source_resumes_source_session",
+        },
+        CapabilityParityRow {
+            operation: "assistant inbox",
+            surface: "rail n ReadAssistantInbox",
+            proof: "assistant_inbox_loads_inbox",
+        },
+        CapabilityParityRow {
+            operation: "mouse confirm",
+            surface: "rail confirm button pointer path",
+            proof: "mouse_confirm_archive_dispatches_existing_mutation",
+        },
     ]
 }

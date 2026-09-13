@@ -2634,6 +2634,7 @@ impl App {
                 "Message retained until startup attaches the session",
                 super::ToastKind::Info,
             );
+            self.retry_startup_background();
             return false;
         }
         // A selection in flight is deliberately *not* a missing-model state.

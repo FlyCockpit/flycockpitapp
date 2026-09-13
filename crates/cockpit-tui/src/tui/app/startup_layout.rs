@@ -42,6 +42,30 @@ async fn onboarding_snapshot_after_secure_intent(
 }
 
 impl App {
+    pub(super) fn mark_startup_trace_milestone(&mut self, event: &'static str) -> bool {
+        self.startup_background.trace_milestones.insert(event)
+    }
+
+    pub(super) fn start_startup_lifecycle_resolution(&mut self) {
+        let generation = self.startup_background.generation;
+        let lifecycle = self.lifecycle.clone();
+        self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::Internal("startup.lifecycle"),
+            crate::tui::async_action::AsyncActionPolicy::Dedupe(
+                crate::tui::async_action::AsyncActionKey::new("startup.lifecycle"),
+            ),
+            async move {
+                let result = lifecycle.resolve_default().await.map(Into::into);
+                Ok(
+                    crate::tui::async_action::AsyncActionPayload::StartupLifecycleResolved {
+                        generation,
+                        result,
+                    },
+                )
+            },
+        );
+    }
+
     pub fn configure_onboarding_launch(&mut self, skip: bool, force: bool) {
         self.onboarding_skip = skip;
         self.onboarding_force = force;
@@ -54,76 +78,68 @@ impl App {
 
     pub(super) fn start_onboarding_bootstrap_fetch(&mut self) {
         let generation = self.startup_background.generation;
-        let lifecycle = self.lifecycle.clone();
         let force = self.onboarding_force;
         let skip = self.onboarding_skip;
-        let intent = self.lifecycle_intent();
+        let Some(selected) = self.startup_lifecycle.clone() else {
+            return;
+        };
         self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.bootstrap"),
             crate::tui::async_action::AsyncActionPolicy::Dedupe(
                 crate::tui::async_action::AsyncActionKey::new("onboarding.bootstrap"),
             ),
             async move {
-                let resolved = match lifecycle.resolve_default().await {
-                    Ok(resolved) => resolved,
+                let endpoint = selected.endpoint.clone();
+                let client = match cockpit_client::DaemonClient::connect_endpoint(&endpoint).await {
+                    Ok(client) => client,
                     Err(error) => {
-                        tracing::warn!(target: cockpit_core::startup::TARGET, event = "lifecycle-error", "startup");
-                        return Err(error);
+                        return Ok(crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
+                            generation,
+                            error: error.to_string(),
+                        });
                     }
                 };
-                let selected_lifetime = match intent {
-                    cockpit_client::LifecycleIntent::AttachOrPersistent
-                    | cockpit_client::LifecycleIntent::PromoteToPersistent => "persistent",
-                    cockpit_client::LifecycleIntent::AttachOrEphemeral => "ephemeral",
-                };
-                let actual_lifetime = if resolved.ephemeral_owner {
-                    "ephemeral"
-                } else {
-                    "persistent"
-                };
-                let outcome = if resolved.promoted_from_ephemeral {
-                    "promoted"
-                } else if resolved.owns_daemon {
-                    "spawned"
-                } else {
-                    "reused"
-                };
-                tracing::info!(
-                    target: cockpit_core::startup::TARGET,
-                    event = "lifecycle-ready",
-                    selected_lifetime,
-                    actual_lifetime,
-                    outcome,
-                    promoted = resolved.promoted_from_ephemeral,
-                    reused = !resolved.owns_daemon,
-                    "startup"
-                );
-                let selected: crate::tui::agent_runner::SelectedLifecycle = resolved.into();
-                let endpoint = selected.endpoint.clone();
-                let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
-                    .await
-                    .map_err(|error| error.to_string())?;
                 let current = match client
                     .request(cockpit_proto::Request::GetOnboardingBootstrapSnapshot)
                     .await
-                    .map_err(|error| error.to_string())?
                 {
-                    Ok(cockpit_proto::Response::OnboardingBootstrapSnapshot(snapshot)) => snapshot,
-                    Ok(other) => return Err(format!("unexpected onboarding response: {other:?}")),
-                    Err(error) => return Err(error.to_string()),
+                    Ok(Ok(cockpit_proto::Response::OnboardingBootstrapSnapshot(snapshot))) => snapshot,
+                    Ok(Ok(other)) => {
+                        return Ok(crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
+                            generation,
+                            error: format!("unexpected onboarding response: {other:?}"),
+                        });
+                    }
+                    Ok(Err(error)) => {
+                        return Ok(crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
+                            generation,
+                            error: error.to_string(),
+                        });
+                    }
+                    Err(error) => {
+                        return Ok(crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
+                            generation,
+                            error: error.to_string(),
+                        });
+                    }
                 };
                 if current.as_ref().is_some_and(|snapshot| {
                     snapshot.bootstrap_state == cockpit_proto::OnboardingBootstrapState::Failed
                 }) {
-                    return retry_onboarding_ready_construction_snapshot(&endpoint)
-                        .await
-                        .map(|snapshot| {
+                    return match retry_onboarding_ready_construction_snapshot(&endpoint).await {
+                        Ok(snapshot) => Ok(
                             crate::tui::async_action::AsyncActionPayload::StartupOnboardingBootstrap {
                                 generation,
                                 snapshot,
-                                lifecycle: selected,
-                            }
-                        });
+                            },
+                        ),
+                        Err(error) => Ok(
+                            crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
+                                generation,
+                                error,
+                            },
+                        ),
+                    };
                 }
                 if current.as_ref().is_some_and(|snapshot| {
                     !force && snapshot.stage == cockpit_proto::OnboardingStage::Complete
@@ -133,7 +149,6 @@ impl App {
                         crate::tui::async_action::AsyncActionPayload::StartupOnboardingBootstrap {
                             generation,
                             snapshot: current,
-                            lifecycle: selected,
                         },
                     );
                 }
@@ -142,20 +157,25 @@ impl App {
                     client_operation_id: uuid::Uuid::new_v4().to_string(),
                     reentry: force || current.is_some(),
                 };
-                match client
-                    .request(cockpit_proto::Request::BeginOrReopenOnboarding(request))
-                    .await
-                    .map_err(|error| error.to_string())?
-                {
-                    Ok(cockpit_proto::Response::OnboardingTransition(result)) => Ok(
+                match client.request(cockpit_proto::Request::BeginOrReopenOnboarding(request)).await {
+                    Ok(Ok(cockpit_proto::Response::OnboardingTransition(result))) => Ok(
                         crate::tui::async_action::AsyncActionPayload::StartupOnboardingBootstrap {
                             generation,
                             snapshot: Some(result.snapshot),
-                            lifecycle: selected,
                         },
                     ),
-                    Ok(other) => Err(format!("unexpected onboarding response: {other:?}")),
-                    Err(error) => Err(error.to_string()),
+                    Ok(Ok(other)) => Ok(crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
+                        generation,
+                        error: format!("unexpected onboarding response: {other:?}"),
+                    }),
+                    Ok(Err(error)) => Ok(crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
+                        generation,
+                        error: error.to_string(),
+                    }),
+                    Err(error) => Ok(crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
+                        generation,
+                        error: error.to_string(),
+                    }),
                 }
             },
         );
@@ -209,48 +229,64 @@ impl App {
             .startup_lifecycle
             .as_ref()
             .map(|selected| selected.endpoint.clone());
+        let failure_snapshot = snapshot.clone();
         self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::DaemonRpc("startup.workspace"),
             crate::tui::async_action::AsyncActionPolicy::Dedupe(
                 crate::tui::async_action::AsyncActionKey::new("startup.workspace"),
             ),
             async move {
-                let opened = if requested_project == std::path::Path::new(".") {
-                    std::env::current_dir()
-                        .map_err(|error| format!("resolving workspace: {error}"))?
-                } else {
-                    requested_project
-                };
-                let root = cockpit_config::trust::resolve_trust_root(&opened)
-                    .map_err(|error| format!("resolving workspace trust root: {error}"))?;
-                let project_root = root.root.to_string_lossy().into_owned();
-                let endpoint =
-                    endpoint.ok_or_else(|| "selected startup daemon is unavailable".to_string())?;
-                let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let response = client
-                    .request(cockpit_proto::Request::GetWorkspaceTrust { project_root })
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let mode = match response {
-                    Ok(cockpit_proto::Response::WorkspaceTrust { mode, .. }) => mode,
-                    Ok(other) => {
-                        return Err(format!("unexpected workspace trust response: {other:?}"));
-                    }
-                    Err(error) => return Err(error.to_string()),
-                };
-                Ok(
-                    crate::tui::async_action::AsyncActionPayload::StartupWorkspace(
-                        StartupWorkspaceCompletion {
-                            generation,
-                            opened,
-                            root,
+                let result: Result<StartupWorkspaceCompletion, String> = async move {
+                    let opened = if requested_project == std::path::Path::new(".") {
+                        std::env::current_dir()
+                            .map_err(|error| format!("resolving workspace: {error}"))?
+                    } else {
+                        requested_project
+                    };
+                    let root = cockpit_config::trust::resolve_trust_root(&opened)
+                        .map_err(|error| format!("resolving workspace trust root: {error}"))?;
+                    let project_root = root.root.to_string_lossy().into_owned();
+                    let endpoint = endpoint
+                        .ok_or_else(|| "selected startup daemon is unavailable".to_string())?;
+                    let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let response = client
+                        .request(cockpit_proto::Request::GetWorkspaceTrust { project_root })
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let (mode, config_generation) = match response {
+                        Ok(cockpit_proto::Response::WorkspaceTrust {
                             mode,
-                            snapshot,
-                        },
-                    ),
-                )
+                            config_generation,
+                        }) => (mode, config_generation),
+                        Ok(other) => {
+                            return Err(format!("unexpected workspace trust response: {other:?}"));
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    };
+                    Ok(StartupWorkspaceCompletion {
+                        generation,
+                        opened,
+                        root,
+                        mode,
+                        config_generation,
+                        snapshot,
+                    })
+                }
+                .await;
+                Ok(match result {
+                    Ok(completion) => {
+                        crate::tui::async_action::AsyncActionPayload::StartupWorkspace(completion)
+                    }
+                    Err(error) => {
+                        crate::tui::async_action::AsyncActionPayload::StartupWorkspaceFailed {
+                            generation,
+                            snapshot: failure_snapshot,
+                            error,
+                        }
+                    }
+                })
             },
         );
     }
@@ -262,15 +298,42 @@ impl App {
         if completion.generation != self.startup_background.generation || self.exit_requested {
             return;
         }
+        self.startup_background.retry = None;
         let mode = match completion.mode {
             Some(cockpit_proto::WorkspaceTrustMode::Trust) => {
                 cockpit_config::WorkspaceTrustMode::Trust
             }
-            Some(cockpit_proto::WorkspaceTrustMode::IgnoreConfig) | None => {
+            Some(cockpit_proto::WorkspaceTrustMode::IgnoreConfig) => {
                 cockpit_config::WorkspaceTrustMode::IgnoreConfig
             }
+            None => {
+                // An unset daemon decision is not an accepted IgnoreConfig
+                // choice. Install the restrictive runtime policy while the
+                // modal is open, but do not expose config, onboarding, or a
+                // session until the correlated SetWorkspaceTrust receipt.
+                cockpit_config::trust::set_runtime_policy(
+                    completion.root.clone(),
+                    cockpit_config::WorkspaceTrustMode::IgnoreConfig,
+                );
+                self.launch.cwd = completion.opened;
+                self.config_snapshot.generation = self
+                    .config_snapshot
+                    .generation
+                    .max(completion.config_generation);
+                self.config_snapshot
+                    .providers
+                    .set_resolution_generation(self.config_snapshot.generation);
+                self.startup_pending_trust = Some(StartupPendingTrust {
+                    generation: completion.generation,
+                    snapshot: completion.snapshot,
+                });
+                self.dialog = crate::tui::settings::Dialog::open_workspace_trust(completion.root);
+                return;
+            }
             Some(cockpit_proto::WorkspaceTrustMode::Untrusted) => {
-                tracing::warn!(target: cockpit_core::startup::TARGET, event = "trust-error", "startup");
+                if self.mark_startup_trace_milestone("trust-error") {
+                    tracing::warn!(target: cockpit_core::startup::TARGET, event = "trust-error", "startup");
+                }
                 self.push_plain("workspace is untrusted and cannot be opened".to_string());
                 self.exit_requested = true;
                 return;
@@ -278,35 +341,31 @@ impl App {
         };
         cockpit_config::trust::set_runtime_policy(completion.root, mode);
         self.launch.cwd = completion.opened;
+        self.config_snapshot.generation = self
+            .config_snapshot
+            .generation
+            .max(completion.config_generation);
+        self.config_snapshot
+            .providers
+            .set_resolution_generation(self.config_snapshot.generation);
         if self.startup_debug_last_message {
             cockpit_core::engine::model::enable_debug_last_message(
                 self.launch.cwd.join(".lastmessage"),
             );
         }
         self.startup_background.workspace_ready = true;
-        tracing::info!(target: cockpit_core::startup::TARGET, event = "trust-ready", "startup");
+        if self.mark_startup_trace_milestone("trust-ready") {
+            tracing::info!(target: cockpit_core::startup::TARGET, event = "trust-ready", "startup");
+        }
         self.apply_onboarding_bootstrap_snapshot(completion.snapshot);
         self.start_post_trust_cleanup();
     }
 
-    fn start_post_trust_cleanup(&mut self) {
-        let generation = self.startup_background.generation;
+    pub(super) fn start_post_trust_cleanup(&mut self) {
         let exports_dir = self.launch.cwd.join(".cockpit").join("exports");
-        self.async_actions.start(
-            crate::tui::async_action::AsyncActionKind::Internal("startup.export_recovery"),
-            crate::tui::async_action::AsyncActionPolicy::Dedupe(
-                crate::tui::async_action::AsyncActionKey::new("startup.export_recovery"),
-            ),
-            async move {
-                crate::tui::app::export_actions::recover_deferred_export_cleanup(&exports_dir)
-                    .await;
-                Ok(
-                    crate::tui::async_action::AsyncActionPayload::StartupExportRecovery {
-                        generation,
-                    },
-                )
-            },
-        );
+        self.schedule_startup_export_recovery(async move {
+            crate::tui::app::export_actions::recover_deferred_export_cleanup(&exports_dir).await;
+        });
 
         // These projections used to be queued with startup construction. They
         // are retained, but are intentionally downstream of the accepted
@@ -362,6 +421,27 @@ impl App {
         #[cfg(feature = "remote")]
         self.start_startup_disclosures_fetch();
     }
+
+    pub(super) fn schedule_startup_export_recovery<F>(&mut self, work: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let generation = self.startup_background.generation;
+        self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::Internal("startup.export_recovery"),
+            crate::tui::async_action::AsyncActionPolicy::Dedupe(
+                crate::tui::async_action::AsyncActionKey::new("startup.export_recovery"),
+            ),
+            async move {
+                work.await;
+                Ok(
+                    crate::tui::async_action::AsyncActionPayload::StartupExportRecovery {
+                        generation,
+                    },
+                )
+            },
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -370,6 +450,13 @@ pub(crate) struct StartupWorkspaceCompletion {
     pub(crate) opened: std::path::PathBuf,
     pub(crate) root: cockpit_config::trust::TrustRoot,
     pub(crate) mode: Option<cockpit_proto::WorkspaceTrustMode>,
+    pub(crate) config_generation: u64,
+    pub(crate) snapshot: Option<cockpit_proto::OnboardingBootstrapSnapshot>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StartupPendingTrust {
+    pub(crate) generation: u64,
     pub(crate) snapshot: Option<cockpit_proto::OnboardingBootstrapSnapshot>,
 }
 
@@ -891,14 +978,34 @@ impl App {
                 crate::tui::async_action::AsyncActionKey::new("startup.lifetime-policy"),
             ),
             async move {
-                policy.await.map(|background_agents| {
+                Ok(
                     crate::tui::async_action::AsyncActionPayload::StartupLifetimePolicy {
                         generation,
-                        background_agents,
-                    }
-                })
+                        result: policy.await,
+                    },
+                )
             },
         );
+    }
+
+    pub(super) fn retry_startup_background(&mut self) {
+        let Some(retry) = self.startup_background.retry.take() else {
+            return;
+        };
+        match retry {
+            StartupRetry::LifetimePolicy => {
+                self.startup_background.started = false;
+                self.start_startup_background_tasks();
+            }
+            StartupRetry::Lifecycle => self.start_startup_lifecycle_resolution(),
+            StartupRetry::Onboarding => self.start_onboarding_bootstrap_fetch(),
+            StartupRetry::Workspace(snapshot) => self.start_workspace_resolution(snapshot),
+            StartupRetry::NamedAssistant => {
+                if let Some(name) = self.startup_assistant_name.clone() {
+                    self.start_named_assistant_resolution(name);
+                }
+            }
+        }
     }
 
     #[cfg(feature = "remote")]

@@ -192,12 +192,14 @@ impl App {
     {
         if !self.first_paint_completed
             || self.exit_requested
+            || self.startup_background.clipboard_reconcile_scheduled
             || self.clipboard_recovery != cockpit_config::extended::ClipboardRecovery::PrivateFile
         {
             return;
         }
 
         let generation = self.startup_background.generation;
+        self.startup_background.clipboard_reconcile_scheduled = true;
         self.async_actions.start_blocking(
             crate::tui::async_action::AsyncActionKind::Internal("startup.clipboard_reconcile"),
             crate::tui::async_action::AsyncActionPolicy::Dedupe(

@@ -50,6 +50,7 @@ fn seed_pending_runner_attach(
         requested_session_id: app.launch.session_id,
         model_state_generation: app.active_model_state_generation,
         config_generation: app.config_snapshot.generation,
+        startup_generation: None,
         latch_error: false,
         continuations,
     });

@@ -26,6 +26,12 @@ impl App {
         if let Some(name) = self.startup_assistant_name.clone()
             && self.launch.session_id.is_none()
         {
+            if matches!(
+                self.startup_background.retry,
+                Some(StartupRetry::NamedAssistant)
+            ) {
+                return;
+            }
             self.start_named_assistant_resolution(name);
             return;
         }
@@ -42,7 +48,7 @@ impl App {
         }
     }
 
-    fn start_named_assistant_resolution(&mut self, assistant_id: String) {
+    pub(super) fn start_named_assistant_resolution(&mut self, assistant_id: String) {
         let generation = self.startup_background.generation;
         let Some(endpoint) = self
             .startup_lifecycle
@@ -61,15 +67,15 @@ impl App {
                     project_root,
                     mode: cockpit_proto::AssistantSessionResolutionMode::MostRecentOrCreate,
                 };
-                let response = agent_runner::daemon_request_at_blocking(&endpoint, request)?;
-                let cockpit_proto::Response::AssistantSessionResolved { session, .. } = response
-                else {
-                    return Err("unexpected assistant session response".to_string());
-                };
-                Ok(AsyncActionPayload::StartupAssistantSessionResolved {
-                    generation,
-                    session_id: session.session_id,
-                })
+                let result = agent_runner::daemon_request_at_blocking(&endpoint, request).and_then(
+                    |response| match response {
+                        cockpit_proto::Response::AssistantSessionResolved { session, .. } => {
+                            Ok(session.session_id)
+                        }
+                        _ => Err("unexpected assistant session response".to_string()),
+                    },
+                );
+                Ok(AsyncActionPayload::StartupAssistantSessionResolved { generation, result })
             },
         );
     }
@@ -195,6 +201,9 @@ impl App {
         let intent = self.lifecycle_intent();
         let lifecycle = self.lifecycle.clone();
         let selected = self.startup_lifecycle.clone();
+        let startup_generation = selected
+            .as_ref()
+            .map(|_| self.startup_background.generation);
         let worker_cwd = cwd.clone();
         // Route selection is structural: Code uses the closed Code-root API,
         // while generic attach can represent only Assistant/Computer.
@@ -268,6 +277,7 @@ impl App {
             requested_session_id,
             model_state_generation: self.active_model_state_generation,
             config_generation: self.config_snapshot.generation,
+            startup_generation,
             latch_error,
             continuations: vec![continuation],
         });
@@ -282,6 +292,14 @@ impl App {
             return;
         };
         if pending.action_id != action_id {
+            return;
+        }
+        if self.exit_requested
+            || pending
+                .startup_generation
+                .is_some_and(|generation| generation != self.startup_background.generation)
+        {
+            self.pending_runner_attach.take();
             return;
         }
         let identity_matches = pending.cwd == self.launch.cwd
@@ -389,7 +407,9 @@ impl App {
     pub(super) fn adopt_runner(&mut self, runner: Result<AgentRunner, String>) {
         let mut runner = runner;
         if let Ok(r) = &mut runner {
-            tracing::info!(target: cockpit_core::startup::TARGET, event = "session-ready", "startup");
+            if self.mark_startup_trace_milestone("session-ready") {
+                tracing::info!(target: cockpit_core::startup::TARGET, event = "session-ready", "startup");
+            }
             // The daemon, not the CLI parser, is authoritative after Attach.
             self.session_mode = Some(r.session_entry_mode);
             self.start_model_state_epoch(Some(r.session_id()), r.active_model_state.as_ref());
@@ -448,7 +468,9 @@ impl App {
             }
         }
         if runner.is_err() {
-            tracing::warn!(target: cockpit_core::startup::TARGET, event = "session-error", "startup");
+            if self.mark_startup_trace_milestone("session-error") {
+                tracing::warn!(target: cockpit_core::startup::TARGET, event = "session-error", "startup");
+            }
         }
         let refresh_skills = runner.is_ok();
         let attach_ids = runner.as_ref().ok().map(|r| {

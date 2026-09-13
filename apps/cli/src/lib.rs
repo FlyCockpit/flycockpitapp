@@ -993,7 +993,14 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         }
     }
 
-    if command_requires_workspace_trust(cli.command.as_ref()) {
+    let deferred_named_assistant_trust = interactive_shell
+        && matches!(
+            cli.command.as_ref(),
+            Some(Command::Assistants(
+                crate::cli::AssistantCommand::Chat { .. }
+            ))
+        );
+    if command_requires_workspace_trust(cli.command.as_ref()) && !deferred_named_assistant_trust {
         install_cli_trust_policy(cli.project.as_deref()).await?;
     }
 
@@ -1186,6 +1193,7 @@ const DEFERRED_INTERACTIVE_LOG_CAPACITY: usize = 256 * 1024;
 struct DeferredInteractiveLogWriter {
     log: DeferredInteractiveLog,
     bytes: Vec<u8>,
+    accepted: bool,
 }
 
 impl DeferredInteractiveLog {
@@ -1277,13 +1285,29 @@ impl tracing_subscriber::fmt::MakeWriter<'_> for DeferredInteractiveLog {
         DeferredInteractiveLogWriter {
             log: self.clone(),
             bytes: Vec::new(),
+            accepted: true,
+        }
+    }
+
+    fn make_writer_for(&self, metadata: &tracing::Metadata<'_>) -> Self::Writer {
+        // Before paint, retain only Cockpit's deliberately path/secret-free
+        // startup schema. Other targets resume their normal sink only after
+        // the completed-draw fence; arbitrary early diagnostics must never be
+        // persisted later as if they had crossed a redaction boundary.
+        DeferredInteractiveLogWriter {
+            log: self.clone(),
+            bytes: Vec::new(),
+            accepted: cockpit_core::startup::interactive_first_paint_completed()
+                || metadata.target() == cockpit_core::startup::TARGET,
         }
     }
 }
 
 impl Write for DeferredInteractiveLogWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.bytes.extend_from_slice(bytes);
+        if self.accepted {
+            self.bytes.extend_from_slice(bytes);
+        }
         Ok(bytes.len())
     }
 
@@ -1294,7 +1318,9 @@ impl Write for DeferredInteractiveLogWriter {
 
 impl Drop for DeferredInteractiveLogWriter {
     fn drop(&mut self) {
-        self.log.push_record(std::mem::take(&mut self.bytes));
+        if self.accepted {
+            self.log.push_record(std::mem::take(&mut self.bytes));
+        }
     }
 }
 
@@ -1704,6 +1730,26 @@ mod tests {
     }
 
     #[test]
+    fn deferred_interactive_log_drops_non_startup_records_before_redaction_is_ready() {
+        cockpit_core::startup::reset_interactive_first_paint();
+        let log = DeferredInteractiveLog::new(true);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(log.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "untrusted::early", token = "prepaint-canary", "diagnostic");
+            tracing::info!(target: cockpit_core::startup::TARGET, event = "shell-constructed", "startup");
+        });
+        let joined = String::from_utf8(log.records().concat()).unwrap();
+        assert!(joined.contains("shell-constructed"));
+        assert!(!joined.contains("prepaint-canary"));
+        assert!(!joined.contains("untrusted::early"));
+    }
+
+    #[test]
     fn interactive_dispatch_inventory_keeps_shell_and_line_routes_explicit() {
         let lib = include_str!("lib.rs");
         let tui = include_str!("commands/tui.rs");
@@ -1724,6 +1770,12 @@ mod tests {
         assert!(lib.contains("Some(Command::Setup(args)) => commands::setup::run(args).await"));
         assert!(
             lib.contains("Some(Command::Provider(sub)) => commands::providers::run(sub).await")
+        );
+        assert!(
+            lib.contains(
+                "command_requires_workspace_trust(cli.command.as_ref()) && !deferred_named_assistant_trust"
+            ),
+            "named Assistant chat must reach its safe shell before generic trust composition"
         );
 
         let lib_production = lib.split("mod production_path_ratchet;").next().unwrap();

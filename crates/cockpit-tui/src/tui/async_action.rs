@@ -554,16 +554,28 @@ pub enum AsyncActionPayload {
     StartupOnboardingBootstrap {
         generation: u64,
         snapshot: Option<cockpit_proto::OnboardingBootstrapSnapshot>,
-        lifecycle: crate::tui::agent_runner::SelectedLifecycle,
+    },
+    StartupLifecycleResolved {
+        generation: u64,
+        result: Result<crate::tui::agent_runner::SelectedLifecycle, String>,
     },
     StartupLifetimePolicy {
         generation: u64,
-        background_agents: bool,
+        result: Result<bool, String>,
+    },
+    StartupOnboardingFailed {
+        generation: u64,
+        error: String,
     },
     StartupWorkspace(crate::tui::app::StartupWorkspaceCompletion),
+    StartupWorkspaceFailed {
+        generation: u64,
+        snapshot: Option<cockpit_proto::OnboardingBootstrapSnapshot>,
+        error: String,
+    },
     StartupAssistantSessionResolved {
         generation: u64,
-        session_id: uuid::Uuid,
+        result: Result<uuid::Uuid, String>,
     },
     StartupClipboardReconciled {
         generation: u64,

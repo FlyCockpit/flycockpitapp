@@ -67,6 +67,45 @@ fn app_new_is_a_safe_shell_and_defers_all_startup_work() {
 }
 
 #[test]
+fn first_event_loop_wake_is_fenced_before_every_service_and_first_draw() {
+    let source = include_str!("mod.rs");
+    let wake = source
+        .split("async fn service_event_loop_wake(")
+        .nth(1)
+        .expect("event-loop wake implementation");
+    let fence = wake
+        .find("if !self.first_paint_completed")
+        .expect("prepaint wake fence");
+    for service in [
+        "self.ensure_session_for_display()",
+        "self.sync_repo_status()",
+        "self.drain_async_actions()",
+        "self.service_first_run_flow()",
+        "self.maybe_service_new_session(terminal)",
+    ] {
+        assert!(
+            fence < wake.find(service).expect("inventoried wake service"),
+            "`{service}` moved ahead of the completed-draw fence"
+        );
+    }
+}
+
+#[test]
+fn startup_trace_milestones_are_one_shot_across_retries() {
+    let mut app = App::new(None, false);
+    for event in [
+        "lifetime-policy-error",
+        "lifecycle-error",
+        "onboarding-error",
+        "trust-error",
+        "session-error",
+    ] {
+        assert!(app.mark_startup_trace_milestone(event));
+        assert!(!app.mark_startup_trace_milestone(event));
+    }
+}
+
+#[test]
 fn every_interactive_entry_constructs_the_same_zero_io_shell() {
     let tmp = tempfile::tempdir().unwrap();
     reset_startup_counters();
@@ -97,6 +136,14 @@ fn every_interactive_entry_constructs_the_same_zero_io_shell() {
             None,
             lifecycle.clone(),
         ),
+        App::new_composed_with_session_mode(
+            None,
+            false,
+            cockpit_proto::SessionEntryMode::Code,
+            super::StartupWorkspaceTrust::Decided,
+            None,
+            lifecycle.clone(),
+        ),
         App::new_composed_with_named_assistant(
             None,
             false,
@@ -113,7 +160,7 @@ fn every_interactive_entry_constructs_the_same_zero_io_shell() {
             lifecycle,
         ),
     ];
-    entries[0].configure_onboarding_launch(false, true);
+    entries[3].configure_onboarding_launch(false, true);
 
     for app in &entries {
         assert!(!app.first_paint_completed);
@@ -231,11 +278,12 @@ async fn exit_before_lifetime_policy_completion_closes_unstarted_lifecycle_work(
     assert!(requests.recv().await.is_none());
 }
 
-async fn run_startup_trace_case(background_agents: bool, resolution_ephemeral: bool) -> String {
-    let namespace = tempfile::tempdir().unwrap();
-    for name in ["config", "data", "state", "runtime", "workspace"] {
-        std::fs::create_dir(namespace.path().join(name)).unwrap();
-    }
+async fn run_startup_trace_case(
+    workspace: &std::path::Path,
+    runtime: &std::path::Path,
+    background_agents: bool,
+    resolution_ephemeral: bool,
+) -> String {
     let trace = TraceBuffer::default();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
@@ -299,7 +347,7 @@ async fn run_startup_trace_case(background_agents: bool, resolution_ephemeral: b
         sensitive_guard.abort();
     });
     let mut app = App::new_composed_with_session_mode(
-        Some(&namespace.path().join("workspace")),
+        Some(workspace),
         false,
         cockpit_proto::SessionEntryMode::Code,
         super::StartupWorkspaceTrust::Decided,
@@ -324,23 +372,29 @@ async fn run_startup_trace_case(background_agents: bool, resolution_ephemeral: b
             LifecycleIntent::AttachOrEphemeral
         }
     );
-    let onboarding_notify = app.async_actions.notifier();
-    let onboarding_completion = onboarding_notify.notified();
+    let lifecycle_notify = app.async_actions.notifier();
+    let lifecycle_completion = lifecycle_notify.notified();
     request
         .reply
         .send(Ok(cockpit_client::LifecycleResolution {
             endpoint,
             owns_daemon: background_agents,
             ephemeral_owner: resolution_ephemeral,
-            socket: namespace.path().join("runtime/fake-owner.sock"),
+            socket: runtime.join("fake-owner.sock"),
             startup_notice: None,
             promoted_from_ephemeral: false,
         }))
         .unwrap();
+    lifecycle_completion.await;
+    assert!(app.drain_async_actions());
+
+    let onboarding_notify = app.async_actions.notifier();
+    let onboarding_completion = onboarding_notify.notified();
     onboarding_completion.await;
+    assert!(app.drain_async_actions());
+
     let workspace_notify = app.async_actions.notifier();
     let workspace_completion = workspace_notify.notified();
-    assert!(app.drain_async_actions());
     workspace_completion.await;
     assert!(app.drain_async_actions());
     assert!(
@@ -352,17 +406,61 @@ async fn run_startup_trace_case(background_agents: bool, resolution_ephemeral: b
 
     let output = String::from_utf8(trace.0.lock().unwrap().clone()).unwrap();
     assert!(
-        !output.contains(&namespace.path().display().to_string()),
-        "startup trace leaked its temporary namespace: {output}"
+        !output.contains(&workspace.display().to_string())
+            && !output.contains(&runtime.display().to_string()),
+        "startup trace leaked an isolated path: {output}"
     );
     output
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn startup_trace_harness_orders_default_and_configured_false_without_real_services() {
-    for trace in [
-        run_startup_trace_case(true, false).await,
-        run_startup_trace_case(false, true).await,
+    const CHILD: &str = "COCKPIT_STARTUP_TRACE_HARNESS_CHILD";
+    const WORKSPACE: &str = "COCKPIT_STARTUP_TRACE_HARNESS_WORKSPACE";
+    if std::env::var_os(CHILD).is_none() {
+        let namespace = tempfile::tempdir().unwrap();
+        for name in ["config", "data", "state", "runtime", "workspace"] {
+            std::fs::create_dir(namespace.path().join(name)).unwrap();
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .env(CHILD, "1")
+            .env(WORKSPACE, namespace.path().join("workspace"))
+            .env("XDG_CONFIG_HOME", namespace.path().join("config"))
+            .env("XDG_DATA_HOME", namespace.path().join("data"))
+            .env("XDG_STATE_HOME", namespace.path().join("state"))
+            .env("XDG_RUNTIME_DIR", namespace.path().join("runtime"))
+            .args([
+                "--exact",
+                "tui::app::startup_first_paint_tests::startup_trace_harness_orders_default_and_configured_false_without_real_services",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "isolated harness failed: {stderr}");
+        assert!(!stderr.contains(&namespace.path().display().to_string()));
+        for case in ["default_true", "configured_false"] {
+            assert!(
+                stderr.contains(&format!("startup-trace-{case}:")),
+                "missing captured {case} stderr trace: {stderr}"
+            );
+        }
+        return;
+    }
+
+    assert!(std::env::var_os("HOME").is_none());
+    let workspace = std::path::PathBuf::from(std::env::var_os(WORKSPACE).unwrap());
+    let runtime = std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+    for (case, trace) in [
+        (
+            "default_true",
+            run_startup_trace_case(&workspace, &runtime, true, false).await,
+        ),
+        (
+            "configured_false",
+            run_startup_trace_case(&workspace, &runtime, false, true).await,
+        ),
     ] {
         let mut cursor = 0;
         for event in [
@@ -379,7 +477,17 @@ async fn startup_trace_harness_orders_default_and_configured_false_without_real_
                 .unwrap_or_else(|| panic!("missing `{event}` in startup trace: {trace}"));
             cursor += relative + event.len();
         }
+        if case == "default_true" {
+            assert!(trace.contains("selected_lifetime=\"persistent\""));
+            assert!(trace.contains("actual_lifetime=\"persistent\""));
+            assert!(trace.contains("outcome=\"spawned\""));
+        } else {
+            assert!(trace.contains("selected_lifetime=\"ephemeral\""));
+            assert!(trace.contains("actual_lifetime=\"ephemeral\""));
+            assert!(trace.contains("outcome=\"reused\""));
+        }
         assert!(!trace.contains("fake-owner.sock"));
+        eprintln!("startup-trace-{case}:{trace}");
     }
 }
 
@@ -494,6 +602,139 @@ async fn stale_clipboard_reconciliation_completion_is_ui_inert() {
 }
 
 #[test]
+fn blocked_export_recovery_cannot_block_first_draw_or_input_ready() {
+    let mut app = App::new(None, false);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    app.after_completed_draw_with_policy(std::future::pending());
+    app.schedule_startup_export_recovery(std::future::pending());
+
+    assert!(app.first_paint_completed);
+    assert_eq!(app.async_actions.pending_count(), 2);
+    assert!(app.startup_lifecycle.is_none());
+    assert!(app.agent_runner.is_none());
+}
+
+#[test]
+fn export_recovery_completion_after_exit_is_ui_inert() {
+    use crate::tui::async_action::{
+        AsyncActionId, AsyncActionKind, AsyncActionPayload, AsyncActionResult,
+    };
+
+    let mut app = App::new(None, false);
+    app.exit_requested = true;
+    app.apply_async_action_result(AsyncActionResult {
+        id: AsyncActionId::from_raw_for_test(87),
+        kind: AsyncActionKind::Internal("startup.export_recovery"),
+        presentation_stale: false,
+        payload: Ok(AsyncActionPayload::StartupExportRecovery {
+            generation: app.startup_background.generation,
+        }),
+    });
+
+    assert!(app.exit_requested);
+    assert!(app.toast.is_none());
+    assert!(app.agent_runner.is_none());
+    assert!(app.onboarding_snapshot.is_none());
+}
+
+#[test]
+fn exit_rejects_every_late_startup_stage_completion() {
+    use crate::tui::async_action::{
+        AsyncActionId, AsyncActionKind, AsyncActionPayload, AsyncActionResult,
+    };
+
+    let (lifecycle, mut lifecycle_requests) = cockpit_client::LifecycleClient::channel(1);
+    let (connections, _connection_requests) = tokio::sync::mpsc::channel(1);
+    let (sensitive, _sensitive_requests) = tokio::sync::mpsc::channel(1);
+    let selected = crate::tui::agent_runner::SelectedLifecycle {
+        endpoint: cockpit_client::ClientEndpoint::InProcess(
+            cockpit_client::InProcessEndpoint::new(connections, sensitive),
+        ),
+        owns_daemon: true,
+        ephemeral_owner: false,
+        socket: std::path::PathBuf::from("late-owner.sock"),
+        startup_notice: None,
+        promoted_from_ephemeral: false,
+    };
+    let mut app = App::new_composed_with_session_mode(
+        None,
+        false,
+        cockpit_proto::SessionEntryMode::Code,
+        super::StartupWorkspaceTrust::Decided,
+        None,
+        lifecycle,
+    );
+    let generation = app.startup_background.generation;
+    let original_cwd = app.launch.cwd.clone();
+    app.exit_requested = true;
+    let result = |id, kind, payload| AsyncActionResult {
+        id: AsyncActionId::from_raw_for_test(id),
+        kind,
+        presentation_stale: false,
+        payload: Ok(payload),
+    };
+
+    app.apply_async_action_result(result(
+        91,
+        AsyncActionKind::Blocking("startup.lifetime-policy"),
+        AsyncActionPayload::StartupLifetimePolicy {
+            generation,
+            result: Ok(false),
+        },
+    ));
+    app.apply_async_action_result(result(
+        92,
+        AsyncActionKind::Internal("startup.lifecycle"),
+        AsyncActionPayload::StartupLifecycleResolved {
+            generation,
+            result: Ok(selected),
+        },
+    ));
+    app.apply_async_action_result(result(
+        93,
+        AsyncActionKind::DaemonRpc("onboarding.bootstrap"),
+        AsyncActionPayload::StartupOnboardingBootstrap {
+            generation,
+            snapshot: Some(startup_snapshot(2)),
+        },
+    ));
+    app.apply_async_action_result(result(
+        94,
+        AsyncActionKind::DaemonRpc("assistant.resolve"),
+        AsyncActionPayload::StartupAssistantSessionResolved {
+            generation,
+            result: Ok(uuid::Uuid::now_v7()),
+        },
+    ));
+    let late_workspace = std::path::PathBuf::from("late-workspace");
+    app.apply_async_action_result(result(
+        95,
+        AsyncActionKind::DaemonRpc("startup.workspace"),
+        AsyncActionPayload::StartupWorkspace(super::StartupWorkspaceCompletion {
+            generation,
+            opened: late_workspace.clone(),
+            root: cockpit_config::trust::TrustRoot {
+                opened_path: late_workspace.clone(),
+                root: late_workspace,
+                kind: cockpit_config::trust::TrustRootKind::Directory,
+            },
+            mode: Some(cockpit_proto::WorkspaceTrustMode::Trust),
+            config_generation: 8,
+            snapshot: Some(startup_snapshot(3)),
+        }),
+    ));
+
+    assert!(!app.ephemeral_preference);
+    assert!(app.startup_lifecycle.is_none());
+    assert!(app.onboarding_snapshot.is_none());
+    assert_eq!(app.launch.cwd, original_cwd);
+    assert!(app.launch.session_id.is_none());
+    assert!(app.toast.is_none());
+    assert!(lifecycle_requests.try_recv().is_err());
+}
+
+#[test]
 fn onboarding_completion_requires_matching_generation_run_and_revision() {
     use crate::tui::async_action::{
         AsyncActionId, AsyncActionKind, AsyncActionPayload, AsyncActionResult,
@@ -546,4 +787,108 @@ fn pre_session_submission_retains_one_id_and_replacement_cannot_consume_it() {
     assert_ne!(first.1, replacement.1);
     assert_eq!(app.composer.display_text(), "keep this draft");
     assert!(app.agent_runner.is_none());
+}
+
+#[test]
+fn unset_daemon_trust_keeps_project_and_session_unavailable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    app.first_paint_completed = true;
+    let snapshot = startup_snapshot(7);
+    let root = cockpit_config::trust::TrustRoot {
+        opened_path: tmp.path().to_path_buf(),
+        root: tmp.path().to_path_buf(),
+        kind: cockpit_config::trust::TrustRootKind::Directory,
+    };
+
+    app.apply_startup_workspace_completion(super::StartupWorkspaceCompletion {
+        generation: app.startup_background.generation,
+        opened: tmp.path().to_path_buf(),
+        root,
+        mode: None,
+        config_generation: 11,
+        snapshot: Some(snapshot),
+    });
+
+    assert!(!app.startup_background.workspace_ready);
+    assert!(app.startup_pending_trust.is_some());
+    assert_eq!(
+        app.startup_modal_on_top(),
+        Some(super::StartupModal::WorkspaceTrust)
+    );
+    assert!(app.onboarding_snapshot.is_none());
+    assert!(app.agent_runner.is_none());
+    assert!(!app.config_snapshot.from_daemon);
+    assert_eq!(app.config_snapshot.generation, 11);
+    cockpit_config::trust::clear_runtime_policy_for_tests();
+}
+
+#[tokio::test]
+async fn every_shell_entry_keeps_lifecycle_pending_behind_policy() {
+    let (lifecycle, mut requests) = cockpit_client::LifecycleClient::channel(8);
+    let session_id = uuid::Uuid::now_v7();
+    let mut entries = vec![
+        App::new_composed_with_session_mode(
+            None,
+            false,
+            cockpit_proto::SessionEntryMode::Code,
+            super::StartupWorkspaceTrust::Decided,
+            None,
+            lifecycle.clone(),
+        ),
+        App::new_composed_with_session_mode(
+            None,
+            false,
+            cockpit_proto::SessionEntryMode::Computer,
+            super::StartupWorkspaceTrust::Decided,
+            None,
+            lifecycle.clone(),
+        ),
+        App::new_composed_with_session_mode(
+            None,
+            false,
+            cockpit_proto::SessionEntryMode::Assistant,
+            super::StartupWorkspaceTrust::Decided,
+            None,
+            lifecycle.clone(),
+        ),
+        App::new_composed_with_session_mode(
+            None,
+            false,
+            cockpit_proto::SessionEntryMode::Code,
+            super::StartupWorkspaceTrust::Decided,
+            None,
+            lifecycle.clone(),
+        ),
+        App::new_composed_with_named_assistant(
+            None,
+            false,
+            "named".to_string(),
+            None,
+            lifecycle.clone(),
+        ),
+        App::new_composed_with_session(
+            None,
+            false,
+            super::StartupWorkspaceTrust::Decided,
+            session_id,
+            None,
+            lifecycle,
+        ),
+    ];
+    entries[3].configure_onboarding_launch(false, true);
+
+    for app in &mut entries {
+        app.first_paint_completed = true;
+        app.start_startup_background_tasks_with_policy(std::future::pending());
+    }
+    tokio::task::yield_now().await;
+
+    assert!(requests.try_recv().is_err());
+    for app in entries {
+        assert_eq!(app.async_actions.pending_count(), 1);
+        assert!(app.startup_lifecycle.is_none());
+        assert!(!app.startup_background.workspace_ready);
+        assert!(app.agent_runner.is_none());
+    }
 }

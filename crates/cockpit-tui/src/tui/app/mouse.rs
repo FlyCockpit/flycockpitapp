@@ -28,6 +28,14 @@ impl App {
             .or(self.session_rail.compact_area())
             .is_some_and(|area| point_in(area, col, row))
     }
+
+    /// Rail hits are frame-scoped and sit below every body-owning modal.
+    /// `Overlay::None` is not enough: settings/wizard live on `Dialog`.
+    pub(super) fn session_rail_owns_pointer(&self, col: u16, row: u16) -> bool {
+        self.pointer_over_session_rail(col, row)
+            && matches!(self.overlay, Overlay::None)
+            && !self.dialog.is_active()
+    }
 }
 
 impl App {
@@ -94,9 +102,7 @@ impl App {
             return;
         }
         if matches!(mouse.kind, MouseEventKind::Moved) {
-            if self.pointer_over_session_rail(mouse.column, mouse.row)
-                && matches!(self.overlay, Overlay::None)
-            {
+            if self.session_rail_owns_pointer(mouse.column, mouse.row) {
                 self.link_registry.clear_hover();
                 self.hovered_suggestion = None;
                 self.hovered_control_chip = None;
@@ -145,14 +151,9 @@ impl App {
             self.pending_link_activation = None;
         }
         // Overlay/compact rails paint over the transcript. Hits in that rect
-        // belong to the rail, not to hidden links or pin/fork chips.
-        if self.pointer_over_session_rail(mouse.column, mouse.row)
-            && matches!(self.overlay, Overlay::None)
-            && !(self.mouse_capture
-                && self
-                    .dialog
-                    .settings_pointer_contains(mouse.column, mouse.row))
-        {
+        // belong to the rail, not to hidden links or pin/fork chips. Body-owning
+        // dialogs (settings/wizard) outrank the rail for every event kind.
+        if self.session_rail_owns_pointer(mouse.column, mouse.row) {
             self.link_registry.clear_hover();
             self.link_pointer_gesture.cancel();
             self.pending_link_activation = None;

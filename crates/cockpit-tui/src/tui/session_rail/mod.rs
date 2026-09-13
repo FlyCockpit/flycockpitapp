@@ -473,6 +473,20 @@ impl SessionRail {
         self.pointer_capture = capture;
     }
 
+    /// Drop last-frame pointer geometry. Hit-testing a rail that was not
+    /// painted this frame steals hover/clicks from body-owning surfaces
+    /// (settings, wizard, overlays) that reuse `Overlay::None`.
+    pub fn begin_frame(&mut self) {
+        self.card_hits.clear();
+        self.action_hits.clear();
+        self.list_area = None;
+        self.preview_area = None;
+        self.search_area = None;
+        self.compact_area = None;
+        self.rail_area = None;
+        self.confirm_buttons.begin_frame(self.pointer_capture, 1);
+    }
+
     pub fn set_project_scope(
         &mut self,
         worktree_root: Option<&std::path::Path>,

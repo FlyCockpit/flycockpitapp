@@ -62,14 +62,7 @@ impl SessionRail {
         frame_width: u16,
     ) {
         self.last_frame_width = frame_width;
-        self.card_hits.clear();
-        self.action_hits.clear();
-        self.list_area = None;
-        self.preview_area = None;
-        self.search_area = None;
-        self.compact_area = None;
-        self.rail_area = None;
-        self.confirm_buttons.begin_frame(self.pointer_capture, 1);
+        self.begin_frame();
 
         let mode = RailLayoutMode::from_width(frame_width);
         if let Some(area) = overlay {

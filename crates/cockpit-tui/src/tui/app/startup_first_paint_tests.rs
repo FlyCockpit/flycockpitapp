@@ -981,6 +981,15 @@ fn sibling_runner_and_slash_paths_block_before_workspace_ready() {
     app.composer.set("!pwd".to_string());
     assert!(!app.complete_or_submit());
     assert!(app.async_actions.pending_count() == 0);
+
+    app.open_scratchpad_pane();
+    assert!(!matches!(app.overlay, super::Overlay::Notes(_)));
+    assert_eq!(app.async_actions.pending_count(), 0);
+
+    app.composer.set("@src".to_string());
+    app.reset_at_window();
+    assert!(!app.at_suggestions_loading);
+    assert_eq!(app.async_actions.pending_count(), 0);
 }
 
 #[test]

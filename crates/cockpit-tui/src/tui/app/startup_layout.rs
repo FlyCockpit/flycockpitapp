@@ -1070,8 +1070,9 @@ impl App {
             && !self.startup_background.workspace_ready
     }
 
-    /// Gate runner attach, slash/`!` dispatch, and other project-touching paths
-    /// behind the accepted-workspace fence. Returns `false` when blocked.
+    /// Gate runner attach, slash/`!` dispatch, scratchpad/notes RPC,
+    /// `@`-autocomplete project walks, and other project-touching paths behind
+    /// the accepted-workspace fence. Returns `false` when blocked.
     pub(super) fn guard_startup_workspace_effects(&mut self) -> bool {
         if !self.blocks_startup_workspace_effects() {
             return true;

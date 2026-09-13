@@ -1818,6 +1818,15 @@ impl App {
                 .abort_key(&AsyncActionKey::new("autocomplete.files"));
             return;
         };
+        if !self.guard_startup_workspace_effects() {
+            self.at_cache.borrow_mut().take();
+            self.at_suggestions_loading = false;
+            self.at_suggestions_loaded_query = None;
+            self.at_suggestions_error = None;
+            self.async_actions
+                .abort_key(&AsyncActionKey::new("autocomplete.files"));
+            return;
+        }
         let cwd = self.launch.cwd.clone();
         let usage_tags = self.usage_tags.clone();
         let session_allow = self.gitignore_session_allow.clone();

@@ -1,7 +1,6 @@
 use super::App;
 use crate::tui::agent_runner::GuidanceEstimate;
 use cockpit_client::LifecycleIntent;
-use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Default)]

@@ -6830,10 +6830,12 @@ mod render_history_spacing_tests {
 
     fn banner_top_row(buffer: &ratatui::buffer::Buffer, chat: ratatui::layout::Rect) -> usize {
         // The session rail also uses a rounded box. The launch banner lives
-        // in the chat pane, not on the rail's left-edge border.
+        // in the chat pane, not on the rail's left-edge border. The row is
+        // pane-relative: the three-row chat header sits above the pane, so
+        // the pane no longer starts at the body's top row.
         (chat.y..chat.bottom())
             .find(|&y| (chat.x..chat.right()).any(|x| buffer[(x, y)].symbol() == "╭"))
-            .map(usize::from)
+            .map(|y| usize::from(y - chat.y))
             .expect("launch banner top border")
     }
 
@@ -6945,7 +6947,9 @@ mod render_history_spacing_tests {
         let rects = app.geometry().layout(Rect::new(0, 0, WIDTH, HEIGHT));
 
         assert_eq!(top, chat.height as usize - banner_height);
-        assert!(top + banner_height <= rects.suggestions.y as usize);
+        // `top` is pane-relative; compare the banner's absolute bottom
+        // against the suggestions popup's absolute top row.
+        assert!(chat.y as usize + top + banner_height <= rects.suggestions.y as usize);
     }
 
     #[test]

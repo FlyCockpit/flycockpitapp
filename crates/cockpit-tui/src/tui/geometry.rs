@@ -95,9 +95,18 @@ pub struct PaneRects {
 
 impl PaneGeometry {
     /// Stable launch-banner reference height: the frame minus only the
-    /// permanent status row and the minimum bordered input box.
+    /// permanent chrome — the status row, the minimum bordered input box,
+    /// and the three-row chat header that sits above the history pane
+    /// whenever the body is tall enough to host it.
     pub const fn baseline_body_height(frame_height: u16) -> u16 {
-        frame_height.saturating_sub(STATUS_HEIGHT + MIN_INPUT_CONTENT + INPUT_BORDER)
+        let body = frame_height.saturating_sub(STATUS_HEIGHT + MIN_INPUT_CONTENT + INPUT_BORDER);
+        // The header renders only when the body is taller than it; the
+        // baseline must match the pane the banner actually centers in.
+        if body > crate::tui::chat_header::CHAT_HEADER_HEIGHT {
+            body - crate::tui::chat_header::CHAT_HEADER_HEIGHT
+        } else {
+            body
+        }
     }
     /// Build the geometry for an app frame.
     ///
@@ -291,13 +300,19 @@ mod tests {
 
     #[test]
     fn baseline_body_height_subtracts_only_permanent_chrome() {
-        assert_eq!(PaneGeometry::baseline_body_height(24), 20);
+        // Status row + minimum bordered input + the permanent three-row
+        // chat header (subtracted only while the body can host the header).
+        assert_eq!(PaneGeometry::baseline_body_height(24), 17);
+        assert_eq!(PaneGeometry::baseline_body_height(40), 33);
+        // Bodies no taller than the header keep every row: the header is
+        // skipped, so nothing is carved.
+        assert_eq!(PaneGeometry::baseline_body_height(7), 3);
         assert_eq!(PaneGeometry::baseline_body_height(4), 0);
         assert_eq!(PaneGeometry::baseline_body_height(2), 0);
 
         let transient_heights = [0, 1, 3, 6, 8, u16::MAX];
         for _transient in transient_heights {
-            assert_eq!(PaneGeometry::baseline_body_height(40), 36);
+            assert_eq!(PaneGeometry::baseline_body_height(40), 33);
         }
     }
 

@@ -57,6 +57,17 @@ impl App {
         {
             self.toast = None;
         }
+        // The header `more` popover closes on any left press outside its
+        // rect and outside the header rows that own it — regardless of what
+        // the press then hits. This must run BEFORE every owner that may
+        // consume the press and return (the rail, registered buttons, the
+        // settings pointer, pickers): a press on any of those is still an
+        // outside press for this floating chrome. The press itself keeps
+        // routing to whatever it hit; presses inside the popover (its rows
+        // are registered buttons) and inside the header are exempt.
+        if self.mouse_capture && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.close_chat_header_popover_on_outside_press(mouse.column, mouse.row);
+        }
         // The full-screen onboarding shell owns the whole screen while
         // active: its native surfaces consume their events, engine screens
         // route pointer input to the embedded settings dialog, and nothing
@@ -297,12 +308,6 @@ impl App {
         }
         if self.mouse_capture {
             self.update_queue_pointer(mouse);
-        }
-        // The header `more` popover closes on any press outside its rect
-        // and outside the header rows that own it; the press itself keeps
-        // routing to whatever it hit.
-        if self.mouse_capture && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            self.close_chat_header_popover_on_outside_press(mouse.column, mouse.row);
         }
         if self.mouse_capture
             && let Some(outcome) = self.dialog.handle_settings_pointer(mouse)

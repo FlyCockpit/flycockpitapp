@@ -56,7 +56,7 @@ pub(crate) fn is_package_child_installation(row: &AgentInstallationRow) -> bool 
 }
 
 const MAX_AGENT_MARKDOWN_BYTES: usize = 1024 * 1024;
-const MAX_AGENT_PACKAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_AGENT_PACKAGE_BYTES: usize = crate::agents::MAX_PACKAGE_BYTES as usize;
 /// Hook files share the bounded retained-workspace config policy.  Keep this
 /// explicit at the acquisition boundary: parser errors may be warnings, but
 /// an oversized capability-backed source is not safe to read or publish.

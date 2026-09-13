@@ -507,6 +507,52 @@ fn interrupted_settlement_excludes_provider_journal_owned_receipts() {
 }
 
 #[test]
+fn authored_package_files_json_limit_holds_hex_encoded_canonical_packages() {
+    use cockpit_db::db::authored_agent_packages::{
+        MAX_AUTHORED_PACKAGE_FILES_JSON_BYTES, MAX_AUTHORED_PACKAGE_FILES_JSON_WRAP_BYTES,
+        MAX_CANONICAL_AGENT_PACKAGE_BYTES,
+    };
+    assert_eq!(MAX_CANONICAL_AGENT_PACKAGE_BYTES, 4 * 1024 * 1024);
+    assert_eq!(
+        MAX_AUTHORED_PACKAGE_FILES_JSON_BYTES,
+        MAX_CANONICAL_AGENT_PACKAGE_BYTES
+            .saturating_mul(2)
+            .saturating_add(MAX_AUTHORED_PACKAGE_FILES_JSON_WRAP_BYTES)
+    );
+    let sql = include_str!("../src/db/migrations/0001_initial.sql");
+    let files_check = sql
+        .split("CREATE TABLE authored_agent_package_journals")
+        .nth(1)
+        .and_then(|tail| tail.split("review_json").next())
+        .and_then(|body| body.split("package_files_json").nth(1))
+        .expect("package_files_json check");
+    assert!(
+        files_check.contains(&format!(
+            "length(CAST(package_files_json AS BLOB)) <= {MAX_AUTHORED_PACKAGE_FILES_JSON_BYTES}"
+        )),
+        "SQL CHECK must match MAX_AUTHORED_PACKAGE_FILES_JSON_BYTES={MAX_AUTHORED_PACKAGE_FILES_JSON_BYTES}: {files_check}"
+    );
+    let ownership = include_str!("../schema-ownership.toml");
+    let authored = ownership
+        .split("\"authored_agent_package_journals\"")
+        .nth(1)
+        .and_then(|tail| tail.split("\"authored_agent_package_drafts\"").next())
+        .expect("authored journal ownership");
+    assert!(
+        authored.contains("hex-encoded canonical package files including markdown"),
+        "ownership must declare that package_files_json stores markdown for recovery"
+    );
+    assert!(
+        authored.contains("resolved sidecar selection including provider handles"),
+        "ownership must declare that sidecar_intent_json stores resolved handles for recovery"
+    );
+    assert!(
+        authored.contains("credentials are never stored"),
+        "ownership must keep the credential exclusion"
+    );
+}
+
+#[test]
 fn assistant_mutation_recovery_is_keyed_identity_only_and_receipt_fenced() {
     let sql = include_str!("../src/db/migrations/0001_initial.sql");
     let declaration = sql

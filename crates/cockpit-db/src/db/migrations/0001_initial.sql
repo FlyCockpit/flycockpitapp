@@ -8302,7 +8302,9 @@ CREATE INDEX idx_onboarding_agent_publication_journals_previous
 -- re-validating live policy or onboarding identity, then finishes a
 -- matching local operation from the terminal receipt. Onboarding callers
 -- journal here too; the row is not tied to local_operation_receipts so a
--- nested wizard apply can still record intent.
+-- nested wizard apply can still record intent. package_files_json stores
+-- hex-encoded canonical package files (4 MiB raw, doubled by hex, plus JSON
+-- wrapping); its 10 MiB cap must remain derived from that package contract.
 CREATE TABLE authored_agent_package_journals (
     owner_digest           TEXT NOT NULL,
     client_operation_id    TEXT NOT NULL,
@@ -8329,7 +8331,7 @@ CREATE TABLE authored_agent_package_journals (
     package_files_json     TEXT NOT NULL CHECK (
         json_valid(package_files_json)
         AND json_type(package_files_json) = 'object'
-        AND length(CAST(package_files_json AS BLOB)) <= 1048576
+        AND length(CAST(package_files_json AS BLOB)) <= 10485760
     ),
     review_json            TEXT NOT NULL CHECK (
         json_valid(review_json)

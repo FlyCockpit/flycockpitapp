@@ -12,6 +12,17 @@ use super::Db;
 pub const AUTHORED_PACKAGE_SETTLEMENT_PENDING: &str = "publication_pending";
 pub const AUTHORED_PACKAGE_SETTLEMENT_TERMINAL: &str = "terminal";
 
+/// Canonical whole-tree agent package cap, in raw file bytes. Must stay equal
+/// to `cockpit_core::agents::MAX_PACKAGE_BYTES`.
+pub const MAX_CANONICAL_AGENT_PACKAGE_BYTES: usize = 4 * 1024 * 1024;
+/// JSON object wrapping and relative-path keys around hex-encoded file bytes.
+pub const MAX_AUTHORED_PACKAGE_FILES_JSON_WRAP_BYTES: usize = 2 * 1024 * 1024;
+/// Durable hex-encoded package-file map. Hex doubles canonical package bytes;
+/// the wrap budget covers JSON syntax and closed-namespace relative paths.
+pub const MAX_AUTHORED_PACKAGE_FILES_JSON_BYTES: usize = MAX_CANONICAL_AGENT_PACKAGE_BYTES
+    .saturating_mul(2)
+    .saturating_add(MAX_AUTHORED_PACKAGE_FILES_JSON_WRAP_BYTES);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthoredAgentPackageJournalRow {
     pub owner_digest: String,
@@ -106,6 +117,10 @@ impl Db {
             ensure!(
                 row.terminal_response_json.is_none() && row.installation_id.is_none(),
                 "authored package intent must not carry a terminal receipt"
+            );
+            ensure!(
+                json_valid_len(&row.package_files_json, MAX_AUTHORED_PACKAGE_FILES_JSON_BYTES),
+                "authored package files JSON exceeds the durable intent limit"
             );
             let intended = row.clone();
             let changed = conn.execute(

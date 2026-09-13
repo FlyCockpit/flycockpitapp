@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, ensure};
 use cockpit_db::db::authored_agent_packages::{
     AUTHORED_PACKAGE_SETTLEMENT_PENDING, AUTHORED_PACKAGE_SETTLEMENT_TERMINAL,
-    AuthoredAgentPackageJournalRow,
+    AuthoredAgentPackageJournalRow, MAX_AUTHORED_PACKAGE_FILES_JSON_BYTES,
 };
 use cockpit_proto::{
     AgentAuthoringProjection, ApplyAuthoredAgentPackageOutcome, ApplyAuthoredAgentPackageReceipt,
@@ -197,7 +197,13 @@ pub async fn recover_authored_agent_package_journals(ctx: &DaemonContext) -> Res
             recovered = recovered.saturating_add(1);
             continue;
         }
-        if finish_matching_local_operation(ctx, &row).await? {
+        let Some(json) = row.terminal_response_json.as_deref() else {
+            anyhow::bail!(
+                "authored package journal {} is terminal without a receipt",
+                row.client_operation_id
+            );
+        };
+        if finish_matching_local_operation(ctx, &row, json).await? {
             recovered = recovered.saturating_add(1);
         }
     }
@@ -326,7 +332,7 @@ async fn complete_pending_authored_journal(
         if let Some(json) = journal.terminal_response_json.as_deref()
             && let Ok(Response::AuthoredAgentPackage(outcome)) = serde_json::from_str(json)
         {
-            let _ = finish_matching_local_operation(ctx, &journal).await?;
+            let _ = finish_matching_local_operation(ctx, &journal, json).await?;
             return Ok(outcome);
         }
         anyhow::bail!("authored package journal terminal receipt is not a package outcome");
@@ -440,21 +446,19 @@ async fn settle_authored_outcome(
             journal.owner_digest.clone(),
             journal.client_operation_id.clone(),
             installation_id,
-            terminal_response_json,
+            terminal_response_json.clone(),
         )
         .await
         .context("finishing authored package journal")?;
-    let _ = finish_matching_local_operation(ctx, journal).await?;
+    let _ = finish_matching_local_operation(ctx, journal, &terminal_response_json).await?;
     Ok(outcome)
 }
 
 async fn finish_matching_local_operation(
     ctx: &DaemonContext,
     journal: &AuthoredAgentPackageJournalRow,
+    terminal_response_json: &str,
 ) -> Result<bool> {
-    let Some(json) = journal.terminal_response_json.as_ref() else {
-        return Ok(false);
-    };
     let hash: [u8; 32] = journal
         .request_hash
         .as_slice()
@@ -476,7 +480,7 @@ async fn finish_matching_local_operation(
                     hash,
                     journal.fencing_generation,
                     "terminal_success".into(),
-                    json.clone(),
+                    terminal_response_json.to_owned(),
                 )
                 .await
                 .context("finishing authored package local operation from journal")?;
@@ -487,13 +491,21 @@ async fn finish_matching_local_operation(
 }
 
 fn encode_package_files(files: &BTreeMap<String, Vec<u8>>) -> Result<String> {
+    let raw_bytes: u64 = files
+        .values()
+        .map(|bytes| bytes.len() as u64)
+        .fold(0_u64, u64::saturating_add);
+    ensure!(
+        raw_bytes <= crate::agents::MAX_PACKAGE_BYTES,
+        "authored package files exceed the canonical package limit"
+    );
     let encoded = files
         .iter()
         .map(|(path, bytes)| (path.clone(), crate::intel::hex_lower(bytes)))
         .collect::<BTreeMap<_, _>>();
     let json = serde_json::to_string(&encoded).context("encoding authored package files")?;
     ensure!(
-        json.len() <= 1_048_576,
+        json.len() <= MAX_AUTHORED_PACKAGE_FILES_JSON_BYTES,
         "authored package files exceed the durable intent limit"
     );
     Ok(json)
@@ -567,6 +579,10 @@ fn unknown_receipt(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{decode_package_files, encode_package_files};
+
     #[test]
     fn authored_package_intent_precedes_every_publication_effect() {
         let source = include_str!("agent_authoring.rs");
@@ -614,6 +630,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn recovery_completes_pending_journals_without_rechecking_live_policy() {
         let source = include_str!("agent_authoring.rs");
         let recover = source
@@ -623,6 +640,10 @@ mod tests {
             .expect("authored recovery");
         assert!(recover.contains("AUTHORED_PACKAGE_SETTLEMENT_PENDING"));
         assert!(recover.contains("complete_pending_authored_journal"));
+        assert!(
+            recover.contains("finish_matching_local_operation(ctx, &row, json)"),
+            "already-terminal recovery must settle the matching local operation from the durable receipt"
+        );
         let complete = source
             .split("async fn complete_pending_authored_journal")
             .nth(1)
@@ -635,8 +656,96 @@ mod tests {
         assert!(complete.contains("publish_authored_sidecar_config"));
         assert!(complete.contains("set_default_agent_installation"));
         assert!(complete.contains("cas_authored_agent_package_draft"));
+        assert!(complete.contains("settle_authored_outcome"));
         assert!(!complete.contains("expected_policy_revision"));
         assert!(!complete.contains("PolicyRevisionConflict"));
         assert!(!complete.contains("onboarding_snapshot"));
+    }
+
+    #[test]
+    fn complete_forward_settles_the_matching_local_operation_from_the_persisted_receipt() {
+        let source = include_str!("agent_authoring.rs");
+        let settle = source
+            .split("async fn settle_authored_outcome")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("async fn finish_matching_local_operation")
+                    .next()
+            })
+            .expect("settle authored outcome");
+        assert!(settle.contains("finish_authored_agent_package_journal"));
+        assert!(
+            settle
+                .contains("finish_matching_local_operation(ctx, journal, &terminal_response_json)"),
+            "complete-forward must settle the local operation from the JSON just persisted, not the pre-write journal snapshot"
+        );
+        assert!(
+            !settle.contains("journal.terminal_response_json"),
+            "the in-memory pending journal still has terminal_response_json: None"
+        );
+        let finish = source
+            .split("async fn finish_matching_local_operation")
+            .nth(1)
+            .and_then(|tail| tail.split("fn encode_package_files").next())
+            .expect("finish matching local operation");
+        assert!(
+            !finish.contains("journal.terminal_response_json"),
+            "local-operation settlement must take the durable terminal payload as an argument"
+        );
+        assert!(finish.contains("terminal_response_json.to_owned()"));
+    }
+
+    #[test]
+    fn durable_intent_capacity_matches_hex_encoded_canonical_packages() {
+        use cockpit_db::db::authored_agent_packages::{
+            MAX_AUTHORED_PACKAGE_FILES_JSON_BYTES, MAX_AUTHORED_PACKAGE_FILES_JSON_WRAP_BYTES,
+            MAX_CANONICAL_AGENT_PACKAGE_BYTES,
+        };
+        assert_eq!(
+            MAX_CANONICAL_AGENT_PACKAGE_BYTES,
+            crate::agents::MAX_PACKAGE_BYTES as usize
+        );
+        assert_eq!(
+            MAX_AUTHORED_PACKAGE_FILES_JSON_BYTES,
+            MAX_CANONICAL_AGENT_PACKAGE_BYTES
+                .saturating_mul(2)
+                .saturating_add(MAX_AUTHORED_PACKAGE_FILES_JSON_WRAP_BYTES)
+        );
+        assert!(
+            include_str!("agent_installation.rs").contains(
+                "const MAX_AGENT_PACKAGE_BYTES: usize = crate::agents::MAX_PACKAGE_BYTES as usize"
+            ),
+            "installation authority must share the canonical package byte cap"
+        );
+        let mut files = BTreeMap::new();
+        files.insert("agent.md".into(), vec![b'x'; 512 * 1024]);
+        let json = encode_package_files(&files)
+            .expect("a 512 KiB canonical file must fit after hex encoding");
+        assert!(
+            json.len() > 1_048_576,
+            "hex encoding of 512 KiB exceeds the former 1 MiB journal cap"
+        );
+        assert!(json.len() <= MAX_AUTHORED_PACKAGE_FILES_JSON_BYTES);
+        assert_eq!(decode_package_files(&json).unwrap(), files);
+
+        let mut full = BTreeMap::new();
+        full.insert(
+            "agent.md".into(),
+            vec![b'y'; crate::agents::MAX_PACKAGE_BYTES as usize],
+        );
+        let full_json = encode_package_files(&full)
+            .expect("a canonical 4 MiB package must journal after hex encoding");
+        assert!(full_json.len() <= MAX_AUTHORED_PACKAGE_FILES_JSON_BYTES);
+        assert_eq!(decode_package_files(&full_json).unwrap(), full);
+
+        let mut oversize = BTreeMap::new();
+        oversize.insert(
+            "agent.md".into(),
+            vec![b'z'; crate::agents::MAX_PACKAGE_BYTES as usize + 1],
+        );
+        assert!(
+            encode_package_files(&oversize).is_err(),
+            "durable intent must not accept a package above the canonical tree cap"
+        );
     }
 }

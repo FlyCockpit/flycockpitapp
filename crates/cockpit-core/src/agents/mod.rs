@@ -81,7 +81,9 @@ pub use vnext::{
 
 const MAX_MARKDOWN_BYTES: u64 = 1024 * 1024;
 /// Whole-tree cap for an agent definition package (`agents/<name>/`).
-const MAX_PACKAGE_BYTES: u64 = 4 * 1024 * 1024;
+/// Durable authored-package journals must be able to store this payload after
+/// hex encoding; keep `cockpit_db` `MAX_CANONICAL_AGENT_PACKAGE_BYTES` equal.
+pub(crate) const MAX_PACKAGE_BYTES: u64 = 4 * 1024 * 1024;
 pub(crate) const MAX_PACKAGE_ENTRIES: usize =
     cockpit_host::private_fs::MAX_NOFOLLOW_DIRECTORY_TREE_ENTRIES;
 pub(crate) const MAX_PACKAGE_DEPTH: usize =

@@ -260,6 +260,21 @@ impl App {
         if self.mouse_capture {
             self.update_queue_pointer(mouse);
         }
+        // The header `more` popover closes on any press outside its rect
+        // and outside the header rows that own it; the press itself keeps
+        // routing to whatever it hit.
+        if self.mouse_capture && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.close_chat_header_popover_on_outside_press(mouse.column, mouse.row);
+        }
+        #[cfg(test)]
+        if self.mouse_capture && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            eprintln!(
+                "DBG close-check ran: open={} rect={:?} layout={:?}",
+                self.chat_header_more_open,
+                self.chat_header_more_rect,
+                self.chat_header_layout.as_ref().map(|l| l.area)
+            );
+        }
         if self.mouse_capture
             && let Some(outcome) = self.dialog.handle_settings_pointer(mouse)
         {
@@ -723,6 +738,14 @@ impl App {
                         crate::tui::chrome::FooterControl::Model => self.open_model_picker(),
                     }
                 }
+            }
+            crate::tui::button::ButtonDispatch::HeaderPill(kind) => {
+                self.cancel_mouse_gesture(self.event_loop_monotonic_now);
+                self.activate_header_pill(kind);
+            }
+            crate::tui::button::ButtonDispatch::HeaderMore => {
+                self.cancel_mouse_gesture(self.event_loop_monotonic_now);
+                self.toggle_chat_header_more();
             }
             crate::tui::button::ButtonDispatch::PersistentNoticeCopy => {
                 self.copy_persistent_notice_fix_command();

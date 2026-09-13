@@ -1,3 +1,4 @@
+use crate::tui::chat_header::HeaderPillKind;
 use crate::tui::chrome::FooterControl;
 use crate::tui::settings::pointer_actions::SettingsPointerAction;
 use crate::tui::settings::shell::SettingsHeaderAction;
@@ -13,6 +14,8 @@ pub(crate) enum ButtonId {
     SettingsHeader(SettingsHeaderAction),
     Settings(SettingsPointerAction),
     Footer(FooterControl),
+    HeaderPill(HeaderPillKind),
+    HeaderMore,
     TranscriptPin {
         seq: i64,
     },

@@ -1397,6 +1397,9 @@ impl App {
 
     pub(super) fn render(&mut self, frame: &mut ratatui::Frame) {
         let geom = self.geometry();
+        // The chat header records its layout when it renders this frame;
+        // reset first so pill activation cannot target a stale frame.
+        self.chat_header_layout = None;
         let frame_key = (
             frame.area().width,
             frame.area().height,
@@ -1422,12 +1425,13 @@ impl App {
             self.dialog
                 .render(frame, rects.body, &mut self.link_registry);
         } else if self.question_dialog.is_some() {
-            // Answering dialog (GOALS §3b): a compact, bottom-anchored
+            // Answering dialog (GOALS §3b): a compact, Bottom-anchored
             // overlay above the status row. History stays visible above
             // it (codex bottom-pane style), so render the chat into `body`
             // and the dialog into the `compact` slot. The dialog owns the
             // cursor while it's open.
-            self.render_chat_history_pane(frame, rects.body);
+            let body = self.render_chat_header(frame, rects.body);
+            self.render_chat_history_pane(frame, body);
             self.paint_transcript_control_buttons(frame);
             if let Some(dialog) = self.question_dialog.as_mut() {
                 // Sync both body regions' scroll viewports to the real
@@ -1545,6 +1549,7 @@ impl App {
                     let chat_rect = self.render_pane(frame, chat_body);
                     match chat_rect {
                         Some(chat) => {
+                            let chat = self.render_chat_header(frame, chat);
                             self.render_chat_history_pane(frame, chat);
                             self.paint_transcript_control_buttons(frame);
                         }
@@ -1603,6 +1608,9 @@ impl App {
                 }
             }
         }
+        // The collapsed-pill `more` popover floats over the transcript,
+        // above the status row. Painted only when the header rendered.
+        self.paint_chat_header_more_popover(frame);
         self.render_status(frame, rects.status);
 
         // Toast sits on top of the status line. Rendered before the
@@ -4555,6 +4563,9 @@ impl App {
         // the right-hand chrome
         // while a write/edit implicit acquire is blocked on a contended lock. Additive — never
         // displaces a fixed slot, the same pattern as the ☕ glyph.
+        // The path/git summary and the async-schedule strip moved to the
+        // three-row chat header (`chat_header`): the footer no longer
+        // duplicates them.
         let mut right = chrome::waiting_for_lock_spans(self.waiting_for_lock.as_ref());
         right.extend(chrome::side_glyph_spans(self.side_conversation.is_some()));
         #[cfg(feature = "remote")]
@@ -4563,7 +4574,6 @@ impl App {
             right.extend(chrome::connector_spans(self.connector_disclosure.as_ref()));
         }
         right.extend(chrome::caffeinate_glyph_spans(self.caffeinate_active));
-        right.extend(chrome::status_line_spans(&self.launch));
         let status = chrome::left_status(
             &self.launch,
             &self.agent_path,
@@ -4585,17 +4595,9 @@ impl App {
             setup_label,
             Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
         ));
-        // Transient async-schedule strip (GOALS §22): only when ≥1 scheduled
-        // task is active, appended to the bottom-left so the fixed chrome
-        // (model/agent) is undisturbed.
-        if !self.active_schedules.is_empty() {
-            let scheduled: Vec<(String, String, u64)> = self
-                .active_schedules
-                .values()
-                .map(|j| (j.kind.clone(), j.label.clone(), j.iteration))
-                .collect();
-            left.extend(chrome::schedule_strip_spans(&scheduled));
-        }
+        // The transient async-schedule strip (GOALS §22) moved to the chat
+        // header's task/timer activity pills; `/schedule`, `/ps`, and
+        // `/stop` remain the authoritative task/timer surfaces.
         if let Some(hint) = self.copy_pick_target_hint() {
             left.push(Span::styled(" · ", Style::default().fg(DIVIDER_DIM)));
             left.push(Span::styled(

@@ -23,6 +23,7 @@ pub mod banner_box;
 pub(crate) mod button;
 pub(crate) mod capability_gate;
 pub mod chat;
+pub mod chat_header;
 pub mod chrome;
 pub mod composer;
 pub mod context_menu;

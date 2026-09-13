@@ -55,6 +55,10 @@ pub(crate) fn button_inventory() -> Vec<InventoryAssignment> {
     );
     push_button(&mut out, "footer", ButtonId::Footer(FooterControl::Agent));
     push_button(&mut out, "footer", ButtonId::Footer(FooterControl::Model));
+    for kind in crate::tui::chat_header::HeaderPillKind::ALL {
+        push_button(&mut out, "header", ButtonId::HeaderPill(kind));
+    }
+    push_button(&mut out, "header", ButtonId::HeaderMore);
     push_button(&mut out, "transcript", ButtonId::TranscriptPin { seq: 0 });
     push_button(&mut out, "transcript", ButtonId::TranscriptUnpin { seq: 0 });
     push_button(&mut out, "transcript", ButtonId::TranscriptFork { seq: 0 });
@@ -288,6 +292,7 @@ pub(crate) fn button_id_family(id: &ButtonId) -> &'static str {
         ButtonId::SettingsHeader(_) => "settings_header",
         ButtonId::Settings(_) => "settings",
         ButtonId::Footer(_) => "footer",
+        ButtonId::HeaderPill(_) | ButtonId::HeaderMore => "header",
         ButtonId::TranscriptPin { .. }
         | ButtonId::TranscriptUnpin { .. }
         | ButtonId::TranscriptFork { .. } => "transcript",

@@ -175,7 +175,7 @@ async fn acquire_daemon_redaction_table(
     let env_snapshot_for_capture = env_snapshot.clone();
     authority
         .acquire(key, purpose, move || {
-            let store = crate::credentials::CredentialStore::from_vault(capture_vault)?;
+            let store = crate::credentials::CredentialStore::from_vault(capture_vault.clone())?;
             let capture_inputs = crate::redact::coverage_bindings::DaemonGlobalCoverageInputs {
                 environment: &env_snapshot_for_capture,
                 vault_revision,
@@ -5615,7 +5615,7 @@ pub(crate) async fn boot_ready_with_db(
         .context("loading config for daemon boot redaction")?;
     let boot_policy_digest =
         crate::redact::coverage_bindings::redact_config_digest(&boot_extended.redact);
-    let boot_command_cache = registry.command_secret_cache();
+    let boot_command_cache = crate::secret_command::CommandSecretCache::with_subprocess_executor();
     let boot_coverage_inputs = crate::redact::coverage_bindings::DaemonGlobalCoverageInputs {
         environment: &boot_env_snapshot,
         vault_revision,
@@ -5658,7 +5658,7 @@ pub(crate) async fn boot_ready_with_db(
             boot_key,
             crate::redact::coverage_authority::CoverageScope::DaemonGlobalBootstrap,
             move || {
-                let store = crate::credentials::CredentialStore::from_vault(capture_vault)?;
+                let store = crate::credentials::CredentialStore::from_vault(capture_vault.clone())?;
                 let capture_inputs = crate::redact::coverage_bindings::DaemonGlobalCoverageInputs {
                     environment: &boot_env_snapshot_for_capture,
                     vault_revision,

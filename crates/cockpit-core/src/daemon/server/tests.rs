@@ -43042,21 +43042,22 @@ async fn global_vault_mutation_revokes_coverage() {
         binding(7),
         binding(8),
     );
+    let revisions = crate::redact::coverage_bindings::OwnedSourceRevisions {
+        environment: binding(3),
+        credential_vault: binding(4),
+        policy: binding(5),
+        sealed: binding(6),
+        override_revision: binding(7),
+        machine_sources: binding(8),
+    };
     let admission = authority
-        .acquire(key, CoverageScope::DaemonGlobalRefresh, || {
+        .acquire(key, CoverageScope::DaemonGlobalRefresh, move || {
             Ok(CoverageBuild::from_complete_table(
                 RedactionTable::empty().with_forced_literal(
                     "global-vault-coverage-canary".into(),
                     "$test:global-vault".into(),
                 )?,
-                crate::redact::coverage_bindings::OwnedSourceRevisions {
-                    environment: binding(3),
-                    credential_vault: binding(4),
-                    policy: binding(5),
-                    sealed: binding(6),
-                    override_revision: binding(7),
-                    machine_sources: binding(8),
-                },
+                revisions,
             ))
         })
         .await

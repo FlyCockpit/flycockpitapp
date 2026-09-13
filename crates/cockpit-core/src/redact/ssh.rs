@@ -65,7 +65,7 @@ pub(super) fn collect_ssh_key_candidates_with_fence(
         };
         let mut paths = read_dir
             .map(|entry| {
-                entry.map_err(|error| {
+                entry.map(|entry| entry.path()).map_err(|error| {
                     anyhow::anyhow!("configured SSH source is unavailable during capture: {error}")
                 })
             })

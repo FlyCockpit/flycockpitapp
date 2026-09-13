@@ -264,7 +264,8 @@ impl ClientPrincipal {
                 material.extend_from_slice(&local.peer_pid.to_le_bytes());
                 material.extend_from_slice(&local.peer_uid.to_le_bytes());
                 material.extend_from_slice(&local.peer_gid.to_le_bytes());
-                material.extend_from_slice(&(local.peer_process_start as u64).to_le_bytes());
+                material.extend_from_slice(&local.peer_process_start.primary.to_le_bytes());
+                material.extend_from_slice(&local.peer_process_start.secondary.to_le_bytes());
                 material.push(u8::from(local.role.is_owner_class()));
                 material
             }

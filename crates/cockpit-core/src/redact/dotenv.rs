@@ -20,11 +20,11 @@ use super::*;
 /// `WalkBuilder::max_depth` (via `walkdir`) counts the root as depth 0, its
 /// direct children as depth 1, and so on — so `Some(8)` yields entries up
 /// to eight levels below `cwd` and stops descending past that.
-pub(super) fn dotenv_max_depth(in_git_repo: bool) -> Option<usize> {
+pub(crate) fn dotenv_max_depth(in_git_repo: bool) -> Option<usize> {
     if in_git_repo { None } else { Some(8) }
 }
 
-pub(super) fn matched_dotenv_paths(
+pub(crate) fn matched_dotenv_paths(
     cwd: &Path,
     patterns: &[String],
     extra: &[PathBuf],
@@ -112,7 +112,7 @@ fn collect_explicit_dotenv_paths(extra: &[PathBuf], out: &mut Vec<PathBuf>) -> R
     Ok(())
 }
 
-pub(super) fn dotenv_scan_start_is_unbounded(cwd: &Path) -> bool {
+pub(crate) fn dotenv_scan_start_is_unbounded(cwd: &Path) -> bool {
     if cwd.parent().is_none() {
         return true;
     }

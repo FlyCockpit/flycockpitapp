@@ -503,20 +503,24 @@ async fn refresh_redaction_for_turn(
         cockpit_proto::EnvSnapshotSource::SessionWorker,
         env.clone(),
     );
-    let sealed_records = session
-        .db
-        .machine_scoped_sealed_redaction_records()
-        .await
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let sealed_records = match session.db.machine_scoped_sealed_redaction_records().await {
+        Ok(records) => records,
+        Err(error) => return RedactionRefreshOutcome::Refused(error.to_string()),
+    };
     let sealed_binding = crate::redact::coverage_bindings::sealed_records_binding(&sealed_records);
     let principal = crate::daemon::principal::ClientPrincipal::owner();
-    let command_cache = session
-        .command_secret_cache()
-        .ok_or_else(|| anyhow::anyhow!("coverage_unavailable"))?;
-    let vault_revision = session
-        .secret_vault()
-        .current_inventory_generation()
-        .map_err(|error| anyhow::anyhow!("reading redaction vault revision: {error}"))?;
+    let command_cache = match session.command_secret_cache() {
+        Some(cache) => cache,
+        None => return RedactionRefreshOutcome::Refused("coverage_unavailable".to_string()),
+    };
+    let vault_revision = match session.secret_vault().current_inventory_generation() {
+        Ok(revision) => revision,
+        Err(error) => {
+            return RedactionRefreshOutcome::Refused(format!(
+                "reading redaction vault revision: {error}"
+            ));
+        }
+    };
     let env_snapshot_for_capture = environment.clone();
     let publish_vault = session.secret_vault().clone();
     let publish_db = session.db.clone();
@@ -565,6 +569,7 @@ async fn refresh_redaction_for_turn(
     {
         Ok(admission) => admission
             .consume_at_async_sink(|new_table| {
+                let new_table = new_table.clone();
                 let session = session_for_sink.clone();
                 let accumulated_redact = accumulated_redact.clone();
                 let interrupts = interrupts.clone();
@@ -576,7 +581,7 @@ async fn refresh_redaction_for_turn(
                     // adoption. The guard is released before the driver `.await` below.
                     let _redaction_guard = interrupts.lock_redaction_table_write().await;
                     let base = current_redaction(&accumulated_redact);
-                    match base.union(new_table) {
+                    match base.union(&new_table) {
                         Ok(unioned) => {
                             let unioned = std::sync::Arc::new(unioned);
                             match session.persist_redaction_table(&unioned) {

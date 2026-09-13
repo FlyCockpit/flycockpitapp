@@ -192,23 +192,21 @@ impl SessionCoverageInputs<'_> {
     }
 }
 
-pub(crate) async fn snapshot_session_capture_inputs(
-    session: &crate::session::Session,
-    principal: &ClientPrincipal,
+pub(crate) async fn snapshot_session_capture_inputs<'a>(
+    session: &'a crate::session::Session,
+    principal: &'a ClientPrincipal,
     owner_authorization_revision: i64,
-    workspace_root: &Path,
-    environment: &EnvSnapshot,
-    policy_digest: &str,
+    workspace_root: &'a Path,
+    environment: &'a EnvSnapshot,
+    command_cache: &'a crate::secret_command::CommandSecretCache,
+    policy_digest: &'a str,
     override_revision: u64,
-    redact_config: &RedactConfig,
-) -> anyhow::Result<SessionCoverageInputs<'_>> {
+    redact_config: &'a RedactConfig,
+) -> anyhow::Result<SessionCoverageInputs<'a>> {
     let vault_revision = session
         .secret_vault()
         .current_inventory_generation()
         .map_err(|error| anyhow::anyhow!("reading redaction vault revision: {error}"))?;
-    let command_cache = session
-        .command_secret_cache()
-        .ok_or_else(|| anyhow::anyhow!("coverage_unavailable: command secret cache missing"))?;
     let sealed_records = session.db.machine_scoped_sealed_redaction_records().await?;
     let sealed = sealed_records_binding(&sealed_records);
     Ok(SessionCoverageInputs {
@@ -293,11 +291,11 @@ impl SessionCoveragePublishOwners {
             .block_on(self.db.machine_scoped_sealed_redaction_records())
             .map_err(|error| anyhow::anyhow!("reading sealed redaction records: {error}"))?;
         let sealed = sealed_records_binding(&sealed_records);
-        let environment = self.live.environment()?;
-        let policy_digest = self.live.policy_digest();
-        let override_revision = self.live.override_revision();
-        let redact_config = self.live.redact_config();
-        let workspace_root = self.live.workspace_root();
+        let environment = (self.live.environment)()?;
+        let policy_digest = (self.live.policy_digest)();
+        let override_revision = (self.live.override_revision)();
+        let redact_config = (self.live.redact_config)();
+        let workspace_root = (self.live.workspace_root)();
         Ok(OwnedSourceRevisions {
             environment: CoverageBinding::derive(b"environment", environment.digest().as_bytes()),
             credential_vault: credential_vault_binding(vault_revision, &self.command_cache),
@@ -342,16 +340,16 @@ impl DaemonGlobalCoveragePublishOwners {
             .vault
             .current_inventory_generation()
             .map_err(|error| anyhow::anyhow!("reading redaction vault revision: {error}"))?;
-        let environment = self.live.environment()?;
-        let policy_digest = self.live.policy_digest();
-        let override_revision = self.live.override_revision();
-        let redact_config = self.live.redact_config();
-        let source_root = self.live.source_root();
+        let environment = (self.live.environment)()?;
+        let policy_digest = (self.live.policy_digest)();
+        let override_revision = (self.live.override_revision)();
+        let redact_config = (self.live.redact_config)();
+        let source_root = (self.live.source_root)();
         Ok(OwnedSourceRevisions {
             environment: CoverageBinding::derive(b"environment", environment.digest().as_bytes()),
             credential_vault: credential_vault_binding(vault_revision, &self.command_cache),
             policy: CoverageBinding::derive(b"policy", policy_digest.as_bytes()),
-            sealed: self.live.sealed(),
+            sealed: (self.live.sealed)(),
             override_revision: CoverageBinding::derive(
                 b"override",
                 &override_revision.to_le_bytes(),

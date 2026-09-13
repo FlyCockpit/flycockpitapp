@@ -670,7 +670,9 @@ impl RedactionCoverageAuthority {
         let cancelled = flight.waiters.load(std::sync::atomic::Ordering::Acquire) == 0;
         let result = match permit {
             Some(_permit) if !cancelled => match tokio::task::spawn_blocking(capture).await {
-                Ok(Ok(build)) if flight.waiters.load(std::sync::atomic::Ordering::Acquire) > 0 => {
+                Ok(Ok(mut build))
+                    if flight.waiters.load(std::sync::atomic::Ordering::Acquire) > 0 =>
+                {
                     // A blocking capture cannot be force-aborted safely, but
                     // losing its final waiter makes the result inert. Fence
                     // publication again after the completed-capture boundary

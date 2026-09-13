@@ -279,14 +279,15 @@ async fn coverage_limits_are_identical_in_persistent_ephemeral_and_inprocess_mod
         assert_eq!(captures.load(Ordering::SeqCst), 2);
 
         let oversize_parts = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5];
+        let oversize_boundary = boundary_for(oversize_parts);
         let oversize_key = key(oversize_parts);
         assert!(matches!(
             authority
-                .acquire(oversize_key, CoverageScope::SessionSubmission, || {
+                .acquire(oversize_key, CoverageScope::SessionSubmission, move || {
                     Ok(CoverageBuild::from_complete_table_and_artifact_bytes(
                         RedactionTable::empty(),
                         COVERAGE_LIMITS.artifact_bytes_per_generation + 1,
-                        boundary_for(oversize_parts),
+                        oversize_boundary,
                     ))
                 })
                 .await,
@@ -473,7 +474,8 @@ fn complete_capture_keeps_hidden_ignored_extra_and_symlink_sources() {
 async fn owner_unsupported_source_diagnostic_is_bound_authorized_and_deduplicated() {
     let authority = RedactionCoverageAuthority::default();
     let captures = Arc::new(AtomicUsize::new(0));
-    let key = key([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    let base = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    let key = key(base);
     let owner = authority
         .acquire(
             key.clone(),
@@ -552,7 +554,8 @@ async fn owner_unsupported_source_diagnostic_is_bound_authorized_and_deduplicate
 async fn accepted_operation_reuses_one_capture_across_submission_driver_and_inference() {
     let authority = RedactionCoverageAuthority::default();
     let captures = Arc::new(AtomicUsize::new(0));
-    let key = key([9, 8, 7, 6, 5, 4, 3, 2, 1, 10]);
+    let base = [9, 8, 7, 6, 5, 4, 3, 2, 1, 10];
+    let key = key(base);
     for purpose in [
         CoverageScope::SessionSubmission,
         CoverageScope::DriverTurn,
@@ -676,6 +679,7 @@ async fn external_mutation_before_completed_scan_boundary_retries_or_refuses() {
     ));
 
     let captures = Arc::new(AtomicUsize::new(0));
+    let base = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
     authority
         .acquire(
             source_key,

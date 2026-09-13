@@ -2014,7 +2014,13 @@ export const activeSubagentSchema = z
 export type ActiveSubagent = z.infer<typeof activeSubagentSchema>;
 export const envSnapshotMetaSchema = z
   .object({
-    source: z.enum(["daemon_start", "tui_shell", "tui_process_fallback", "explicit_cli"]),
+    source: z.enum([
+      "daemon_start",
+      "tui_shell",
+      "tui_process_fallback",
+      "explicit_cli",
+      "session_worker",
+    ]),
     digest: z.string(),
     key_count: z.number().int().nonnegative(),
     path_entry_count: z.number().int().nonnegative(),

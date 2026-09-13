@@ -331,7 +331,7 @@ impl EntryClass {
                 .saturating_add(
                     identity
                         .record_id
-                        .map(|record_id| record_id.as_str().len())
+                        .map(|record_id| record_id.to_string().len())
                         .unwrap_or(0),
                 )
                 .saturating_add(std::mem::size_of::<
@@ -444,7 +444,7 @@ impl RedactionEntry {
 
 #[cfg(test)]
 use self::dotenv::*;
-use self::dotenv::{collect_env_file_candidates, consume_marked_value, matched_dotenv_paths};
+use self::dotenv::{collect_env_file_candidates, consume_marked_value};
 use self::protected::{ProtectedPaths, is_existing_absolute_path};
 use self::ssh::collect_ssh_key_candidates;
 #[cfg(test)]

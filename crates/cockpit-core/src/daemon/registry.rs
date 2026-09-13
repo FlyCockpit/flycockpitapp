@@ -1137,6 +1137,10 @@ impl SessionRegistry {
         crate::sync::lock_or_recover(&self.inner.command_secret_cache).clone()
     }
 
+    pub(crate) fn config_source(&self) -> &crate::daemon::config_source::ConfigSource {
+        &self.inner.config_source
+    }
+
     /// Pre-resolve (execute-once) every command-backed secret referenced by
     /// `providers_cfg`'s headers into the daemon cache, reading argv specs
     /// through the session's OWNER-SCOPED provider store — so only command names
@@ -2503,6 +2507,7 @@ impl SessionRegistry {
             redact_config: &extended_cfg.redact,
         };
         let coverage_key = coverage_inputs.coverage_key();
+        let capture_policy_digest = policy_digest.clone();
         let env_snapshot_for_capture = env_snapshot.clone();
         let publish_vault = session.secret_vault().clone();
         let publish_db = session.db.clone();
@@ -2568,7 +2573,7 @@ impl SessionRegistry {
                         environment: &env_snapshot_for_capture,
                         vault_revision,
                         command_cache: &command_cache,
-                        policy_digest: &policy_digest,
+                        policy_digest: &capture_policy_digest,
                         sealed: sealed_binding,
                         override_revision: 0,
                         redact_config: &config,

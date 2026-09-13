@@ -3627,17 +3627,18 @@ impl Driver {
             Ok(admission) => {
                 let table = match admission
                     .consume_at_async_sink(|new_table| {
+                        let new_table = new_table.clone();
                         let interrupts = self.interrupts.clone();
                         let session = self.session.clone();
                         let redact = self.redact.clone();
                         async move {
                             match interrupts
-                                .refresh_union_redaction(&session, new_table)
+                                .refresh_union_redaction(&session, &new_table)
                                 .await
                             {
                                 Ok(Some(table)) => Ok(table),
                                 Ok(None) => {
-                                    let table = redact.union(new_table)?;
+                                    let table = redact.union(&new_table)?;
                                     let table = Arc::new(table);
                                     session.persist_redaction_table(&table)?;
                                     Ok(table)

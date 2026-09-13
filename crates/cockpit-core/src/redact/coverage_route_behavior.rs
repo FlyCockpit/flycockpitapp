@@ -193,13 +193,14 @@ pub(crate) mod tests {
             override_revision: boundary.override_revision,
             machine_sources: boundary.machine_sources,
         };
+        let publish_revisions = mismatched.clone();
         let result = authority
             .acquire(key(base), CoverageScope::SessionSubmission, move || {
                 captures.fetch_add(1, Ordering::SeqCst);
                 let table = RedactionTable::empty()
                     .with_forced_literal(CANARY.to_string(), "$test:coverage".to_string())?;
                 Ok(CoverageBuild::from_complete_table(table, boundary)
-                    .with_publish_fence(Box::new(|_| Ok(mismatched.clone()))))
+                    .with_publish_fence(Box::new(move |_| Ok(publish_revisions.clone()))))
             })
             .await;
         assert!(matches!(result, Err(CoverageError::Invalidated)));

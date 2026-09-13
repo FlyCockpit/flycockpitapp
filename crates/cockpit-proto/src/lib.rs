@@ -304,6 +304,7 @@ pub enum EnvSnapshotSource {
     TuiShell,
     TuiProcessFallback,
     ExplicitCli,
+    SessionWorker,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

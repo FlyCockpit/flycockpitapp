@@ -191,6 +191,14 @@ pub struct ApplyAuthoredAgentPackageRequest {
     pub package: AuthoredAgentPackageDraft,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub onboarding: Option<AuthoredAgentOnboardingCorrelation>,
+    /// When true, canonicalize the package and return its review without
+    /// recording publication intent or mutating installation state.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub validate_only: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,6 +244,7 @@ pub struct ApplyAuthoredAgentPackageReceipt {
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ApplyAuthoredAgentPackageOutcome {
     Receipt(ApplyAuthoredAgentPackageReceipt),
+    Review(AuthoredAgentReview),
     PolicyRevisionConflict {
         projection: AgentAuthoringProjection,
     },

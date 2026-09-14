@@ -18495,6 +18495,7 @@ async fn handle_serialized_request_impl(
                         expected_policy_revision: prepared.snapshot.policy_revision.clone(),
                         package: prepared.draft.clone(),
                         onboarding,
+                        validate_only: false,
                     };
                     let authored_request_hash = local_operation_request_hash(&authored_request)?;
                     match crate::daemon::agent_authoring::apply_package_under_publication_lock(

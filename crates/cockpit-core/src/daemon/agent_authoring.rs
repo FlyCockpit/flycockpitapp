@@ -107,6 +107,9 @@ pub async fn apply_package_under_publication_lock(
             });
         }
     };
+    if request.validate_only {
+        return Ok(ApplyAuthoredAgentPackageOutcome::Review(package.review));
+    }
     let now = crate::workspace_lease::now_unix_ms();
     let current_draft = ctx
         .db

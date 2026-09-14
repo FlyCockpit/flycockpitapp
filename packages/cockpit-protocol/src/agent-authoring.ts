@@ -148,6 +148,7 @@ export const applyAuthoredAgentPackageRequestSchema = z
       })
       .strict()
       .optional(),
+    validate_only: z.boolean().optional(),
   })
   .strict();
 export type ApplyAuthoredAgentPackageRequest = z.infer<
@@ -195,6 +196,7 @@ export const applyAuthoredAgentPackageReceiptSchema = z
 
 export const applyAuthoredAgentPackageOutcomeSchema = z.discriminatedUnion("outcome", [
   applyAuthoredAgentPackageReceiptSchema.extend({ outcome: z.literal("receipt") }),
+  authoredAgentReviewSchema.extend({ outcome: z.literal("review") }),
   z
     .object({
       outcome: z.literal("policy_revision_conflict"),

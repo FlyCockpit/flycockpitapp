@@ -392,9 +392,11 @@ impl App {
         }
         if let Some(Ok(runner)) = self.agent_runner.as_ref() {
             let epoch = runner.attachment_epoch();
-            self.invalidate_composer_control_ownership(true, true);
-            self.abandon_epoch_bound_control_receipts();
+            // Advance visibility before snapshot refreshes so post-reconnect
+            // fetches stamp the live epoch rather than the abandoned one.
             self.visible_attachment_epoch = epoch;
+            self.invalidate_composer_control_ownership(true, true);
+            self.abandon_epoch_bound_control_receipts(super::ControlEpochAbandonment::SameSession);
         }
     }
 
@@ -4157,8 +4159,12 @@ mod tests {
             .map(|(body, _)| body)
             .expect("flush_same_session_resync_event_buffer follows adopt");
         assert!(
-            body.contains("self.abandon_epoch_bound_control_receipts()"),
+            body.contains("self.abandon_epoch_bound_control_receipts("),
             "visible-epoch adoption must settle owners whose receipts are epoch-stamped"
+        );
+        assert!(
+            body.contains("ControlEpochAbandonment::SameSession"),
+            "visible-epoch adoption is a same-session reconnect, not a silent drain"
         );
     }
 

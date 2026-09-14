@@ -218,7 +218,9 @@ impl App {
             crate::tui::tools_pane::ToolsOutcome::Close => {}
             crate::tui::tools_pane::ToolsOutcome::Pending => {}
             crate::tui::tools_pane::ToolsOutcome::RefreshSnapshot => {
-                self.request_session_setup_snapshot_refresh();
+                if let Some(correlation) = self.request_session_setup_snapshot_refresh() {
+                    self.bind_tool_surface_snapshot_wait(correlation);
+                }
             }
             crate::tui::tools_pane::ToolsOutcome::Apply {
                 override_json,
@@ -813,38 +815,69 @@ impl App {
     /// Completions for `send_control_request` are stamped with the sending
     /// attachment epoch and dropped once visibility advances. Drain those
     /// owners here so reconnect, resync, or session-switch cannot leave them
-    /// pending with no remaining settlement path. Model-selection slots stay
-    /// for the existing cancel+retry path; displayed tool-surface state
-    /// reconverges from a daemon snapshot rather than a local draft.
-    pub(super) fn abandon_epoch_bound_control_receipts(&mut self) {
+    /// pending with no remaining settlement path. Every `ControlApplied`
+    /// variant is classified by `epoch_abandon_action`; adding a variant
+    /// without an arm is a compile error.
+    pub(super) fn abandon_epoch_bound_control_receipts(
+        &mut self,
+        reason: super::ControlEpochAbandonment,
+    ) {
         let pending = std::mem::take(&mut self.pending_control_requests);
         let mut refresh_snapshot = false;
+        let interruption = match reason {
+            super::ControlEpochAbandonment::SameSession => "reconnect",
+            super::ControlEpochAbandonment::SessionTransition => "session change",
+            super::ControlEpochAbandonment::TerminalDisconnect => "the daemon connection ending",
+        };
         for (_, request) in pending {
-            match request.applied {
-                ControlApplied::ModelSelection { .. } => {
-                    // `pending_model_selection` is cancelled/retried by
-                    // `start_model_state_epoch`. The request id is gone so a
-                    // late Applied cannot confirm.
-                }
-                ControlApplied::ToolSurfaceOverride { .. }
-                | ControlApplied::PrimaryAgentSwitch { .. } => {
+            match request.applied.epoch_abandon_action(reason) {
+                super::ControlEpochAbandonAction::Silent
+                | super::ControlEpochAbandonAction::ModelSelection => {}
+                super::ControlEpochAbandonAction::RefreshSnapshot => {
                     refresh_snapshot = true;
                 }
-                ControlApplied::ResponseMetricsTokenizer { confirm_id } => {
-                    if let Some(tok) = self.pending_tokenizer_confirm.take() {
+                super::ControlEpochAbandonAction::FailTokenizer => {
+                    if let ControlApplied::ResponseMetricsTokenizer { confirm_id } = request.applied
+                        && let Some(tok) = self.pending_tokenizer_confirm.take()
+                    {
                         let outcome = tok.on_response(confirm_id, 0, false, Some("refresh_failed"));
                         self.apply_tokenizer_confirm_outcome(outcome);
                     }
                 }
-                ControlApplied::None
-                | ControlApplied::Multireview { .. }
-                | ControlApplied::ScheduleCancel { .. }
-                | ControlApplied::ModelFavorite { .. }
-                | ControlApplied::PinContext { .. }
-                | ControlApplied::RepairResume
-                | ControlApplied::ExitGuardStatus
-                | ControlApplied::ExitAfterStoppingWork
-                | ControlApplied::ExitAfterBackgroundPromotion => {}
+                super::ControlEpochAbandonAction::DaemonOwnedNotice => {
+                    self.push_plain(format!(
+                        "{}: confirmation was interrupted by {interruption}; daemon state is authoritative",
+                        request.label
+                    ));
+                }
+                super::ControlEpochAbandonAction::DropFollowOn => {
+                    self.push_plain(format!(
+                        "{}: was not confirmed; retry after {interruption}",
+                        request.label
+                    ));
+                }
+                super::ControlEpochAbandonAction::ParkRepairResume => {
+                    self.parked_control_follow_ons.repair_resume = true;
+                }
+                super::ControlEpochAbandonAction::ParkExitGuard => {
+                    self.parked_control_follow_ons.exit_guard = true;
+                }
+                super::ControlEpochAbandonAction::ParkExitAfterStop => {
+                    self.parked_control_follow_ons.exit_after_stop = true;
+                }
+                super::ControlEpochAbandonAction::ParkExitAfterBackground => {
+                    self.parked_control_follow_ons.exit_after_background = true;
+                }
+                super::ControlEpochAbandonAction::CompleteExitLocally => {
+                    self.exit_requested = true;
+                }
+                super::ControlEpochAbandonAction::CompleteExitAfterBackground => {
+                    self.exit_notice = Some(format!(
+                        "This session is still running in the background; reattach with {}",
+                        self.exit_reattach_command()
+                    ));
+                    self.exit_requested = true;
+                }
             }
         }
         if let Overlay::Tools(pane) = &mut self.overlay
@@ -852,8 +885,74 @@ impl App {
         {
             refresh_snapshot = true;
         }
-        if refresh_snapshot {
-            self.request_session_setup_snapshot_refresh();
+        if refresh_snapshot && let Some(correlation) = self.request_session_setup_snapshot_refresh()
+        {
+            self.begin_tool_surface_snapshot_wait(correlation);
+        }
+    }
+
+    pub(super) fn retry_parked_control_follow_ons(&mut self) {
+        let parked = std::mem::take(&mut self.parked_control_follow_ons);
+        let has_runner = self
+            .agent_runner
+            .as_ref()
+            .is_some_and(|runner| runner.is_ok());
+        if parked.repair_resume {
+            let session_id = self
+                .agent_runner
+                .as_ref()
+                .and_then(|runner| runner.as_ref().ok())
+                .map(|runner| runner.session_id())
+                .or(self.launch.session_id);
+            if let Some(session_id) = session_id {
+                self.send_daemon_request(
+                    "/resume",
+                    cockpit_proto::Request::RepairResume { session_id },
+                    ControlApplied::RepairResume,
+                );
+            } else {
+                self.push_plain(
+                    "/resume: repair confirmation was interrupted; retry /resume repair"
+                        .to_string(),
+                );
+            }
+        }
+        if parked.exit_guard {
+            if has_runner {
+                self.send_daemon_request(
+                    "exit check",
+                    cockpit_proto::Request::ExitGuardStatus,
+                    ControlApplied::ExitGuardStatus,
+                );
+            } else {
+                self.exit_requested = true;
+            }
+        }
+        if parked.exit_after_stop {
+            if has_runner {
+                self.send_daemon_request(
+                    "stop all",
+                    cockpit_proto::Request::CancelAllSessionWork,
+                    ControlApplied::ExitAfterStoppingWork,
+                );
+            } else {
+                self.exit_requested = true;
+            }
+        }
+        if parked.exit_after_background {
+            if has_runner {
+                self.send_daemon_request(
+                    "run in background",
+                    cockpit_proto::Request::PromoteToPersistent,
+                    ControlApplied::ExitAfterBackgroundPromotion,
+                );
+            } else {
+                self.exit_notice = Some(format!(
+                    "This session is still running in the background; reattach with {}",
+                    self.exit_reattach_command()
+                ));
+                self.exit_requested = true;
+            }
         }
     }
 
@@ -1130,7 +1229,9 @@ impl App {
 
     pub(super) fn cancel_model_controls_for_terminal_link(&mut self) {
         self.invalidate_composer_control_ownership(true, false);
-        self.abandon_epoch_bound_control_receipts();
+        self.abandon_epoch_bound_control_receipts(
+            super::ControlEpochAbandonment::TerminalDisconnect,
+        );
         if let Some(pending) = self.cancel_model_controls_for_runner_epoch() {
             tracing::warn!(
                 session_id = ?pending.session_id,
@@ -1187,7 +1288,9 @@ impl App {
                 if let Overlay::Tools(pane) = &mut self.overlay {
                     pane.mark_session_override_awaiting_snapshot();
                 }
-                self.request_session_setup_snapshot_refresh();
+                if let Some(correlation) = self.request_session_setup_snapshot_refresh() {
+                    self.begin_tool_surface_snapshot_wait(correlation);
+                }
             }
             ControlApplied::Multireview { kickoff } => {
                 self.push_plain(MULTIREVIEW_TOKEN_BURN_WARNING.to_string());

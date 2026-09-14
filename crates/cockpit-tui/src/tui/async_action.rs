@@ -428,7 +428,10 @@ pub enum AsyncActionPayload {
     },
     Skills(crate::tui::skills_pane::SkillsPaneFetchResult),
     InventoryBundle(cockpit_proto::Response),
-    SessionSetupSnapshot(cockpit_proto::Response),
+    SessionSetupSnapshot {
+        response: cockpit_proto::Response,
+        correlation: crate::tui::app::SessionSetupSnapshotCorrelation,
+    },
     AgentTreeSnapshot {
         tree: Box<cockpit_proto::Response>,
         attention: Box<cockpit_proto::Response>,

@@ -447,6 +447,164 @@ pub(crate) enum ControlApplied {
     },
 }
 
+/// Why epoch-stamped control receipts are being drained. Completeness of
+/// `ControlApplied::epoch_abandon_action` is the settlement bound: every
+/// variant must declare a follow-on for each of these reasons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlEpochAbandonment {
+    SameSession,
+    SessionTransition,
+    TerminalDisconnect,
+}
+
+/// Client follow-on required when a `ControlApplied` receipt is drained
+/// without its Applied path. Exhaustive over `ControlApplied`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlEpochAbandonAction {
+    /// No client follow-on (toggles, interrupts, cancelled-exit).
+    Silent,
+    /// `pending_model_selection` is cancelled/retried by the model epoch.
+    ModelSelection,
+    /// Displayed agent/tool-surface state reconverges from a daemon snapshot.
+    RefreshSnapshot,
+    /// Fail the tokenizer confirm slot closed.
+    FailTokenizer,
+    /// Daemon owns the durable bit; drop the confirmation toast with notice.
+    DaemonOwnedNotice,
+    /// Client follow-on must not run on this epoch (kickoff, repair, …).
+    DropFollowOn,
+    ParkRepairResume,
+    ParkExitGuard,
+    ParkExitAfterStop,
+    ParkExitAfterBackground,
+    CompleteExitLocally,
+    CompleteExitAfterBackground,
+}
+
+impl ControlApplied {
+    /// Completeness bound for epoch abandonment. A new variant that does not
+    /// appear here is a compile error; do not add a wildcard arm.
+    pub(crate) fn epoch_abandon_action(
+        &self,
+        reason: ControlEpochAbandonment,
+    ) -> ControlEpochAbandonAction {
+        match self {
+            Self::None => ControlEpochAbandonAction::Silent,
+            Self::ModelSelection { .. } => ControlEpochAbandonAction::ModelSelection,
+            Self::PrimaryAgentSwitch { .. } | Self::ToolSurfaceOverride { .. } => {
+                ControlEpochAbandonAction::RefreshSnapshot
+            }
+            Self::ResponseMetricsTokenizer { .. } => ControlEpochAbandonAction::FailTokenizer,
+            Self::ScheduleCancel { .. } | Self::ModelFavorite { .. } | Self::PinContext { .. } => {
+                ControlEpochAbandonAction::DaemonOwnedNotice
+            }
+            Self::Multireview { .. } => ControlEpochAbandonAction::DropFollowOn,
+            Self::RepairResume => match reason {
+                ControlEpochAbandonment::SameSession => ControlEpochAbandonAction::ParkRepairResume,
+                ControlEpochAbandonment::SessionTransition
+                | ControlEpochAbandonment::TerminalDisconnect => {
+                    ControlEpochAbandonAction::DropFollowOn
+                }
+            },
+            Self::ExitGuardStatus => match reason {
+                ControlEpochAbandonment::TerminalDisconnect => {
+                    ControlEpochAbandonAction::CompleteExitLocally
+                }
+                ControlEpochAbandonment::SameSession
+                | ControlEpochAbandonment::SessionTransition => {
+                    ControlEpochAbandonAction::ParkExitGuard
+                }
+            },
+            Self::ExitAfterStoppingWork => match reason {
+                ControlEpochAbandonment::TerminalDisconnect => {
+                    ControlEpochAbandonAction::CompleteExitLocally
+                }
+                ControlEpochAbandonment::SameSession
+                | ControlEpochAbandonment::SessionTransition => {
+                    ControlEpochAbandonAction::ParkExitAfterStop
+                }
+            },
+            Self::ExitAfterBackgroundPromotion => match reason {
+                ControlEpochAbandonment::TerminalDisconnect => {
+                    ControlEpochAbandonAction::CompleteExitAfterBackground
+                }
+                ControlEpochAbandonment::SameSession
+                | ControlEpochAbandonment::SessionTransition => {
+                    ControlEpochAbandonAction::ParkExitAfterBackground
+                }
+            },
+        }
+    }
+}
+
+/// Follow-ons parked when an epoch-stamped receipt is drained so reconnect
+/// or the next model-state epoch can re-issue them on the live channel.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ParkedControlFollowOns {
+    pub repair_resume: bool,
+    pub exit_guard: bool,
+    pub exit_after_stop: bool,
+    pub exit_after_background: bool,
+}
+
+impl ParkedControlFollowOns {
+    pub(crate) fn is_pending(&self) -> bool {
+        self.repair_resume || self.exit_guard || self.exit_after_stop || self.exit_after_background
+    }
+}
+
+/// Correlation stamped onto a session-setup snapshot fetch at request time.
+/// Tool-surface pending may settle only from a `Refresh` whose generation,
+/// session, and attachment epoch match the post-mutation wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionSetupSnapshotCorrelation {
+    pub generation: u64,
+    pub session_id: Option<uuid::Uuid>,
+    pub attachment_epoch: u64,
+    pub source: SessionSetupSnapshotSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionSetupSnapshotSource {
+    /// `GetSessionSetupSnapshot` refresh. May settle tool-surface pending.
+    Refresh,
+    /// Add-MCP or other mutation result sharing the snapshot payload shape.
+    UnrelatedMutation,
+}
+
+impl SessionSetupSnapshotCorrelation {
+    pub(crate) fn refresh(
+        generation: u64,
+        session_id: Option<uuid::Uuid>,
+        attachment_epoch: u64,
+    ) -> Self {
+        Self {
+            generation,
+            session_id,
+            attachment_epoch,
+            source: SessionSetupSnapshotSource::Refresh,
+        }
+    }
+
+    pub(crate) fn unrelated_mutation() -> Self {
+        Self {
+            generation: 0,
+            session_id: None,
+            attachment_epoch: 0,
+            source: SessionSetupSnapshotSource::UnrelatedMutation,
+        }
+    }
+
+    pub(crate) fn allows_tool_surface_settle(self, wait: Self) -> bool {
+        matches!(self.source, SessionSetupSnapshotSource::Refresh)
+            && matches!(wait.source, SessionSetupSnapshotSource::Refresh)
+            && self.generation >= wait.generation
+            && self.session_id.is_some()
+            && self.session_id == wait.session_id
+            && self.attachment_epoch == wait.attachment_epoch
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum StartupWorkspaceTrust {
     Decided,
@@ -2510,6 +2668,11 @@ pub struct App {
     pub(super) pending_agent_switch_log: Option<PendingAgentSwitchLog>,
     /// TUI-issued daemon control requests awaiting a response-bearing ack.
     pub(super) pending_control_requests: HashMap<ControlRequestId, PendingControlRequest>,
+    /// Follow-ons parked by epoch abandonment until the live channel retries.
+    pub(super) parked_control_follow_ons: ParkedControlFollowOns,
+    /// Generation stamped onto `session_setup.snapshot` refreshes so a
+    /// post-mutation tool-surface wait can reject older/unrelated snapshots.
+    pub(super) next_session_setup_snapshot_generation: u64,
     pub(super) pending_model_selection: Option<PendingModelSelection>,
     pub(super) prepared_slot_models: Vec<(String, String)>,
     pub(super) prepared_slot_default: Option<(String, String)>,
@@ -4032,6 +4195,8 @@ impl App {
 
             pending_agent_switch_log: None,
             pending_control_requests: HashMap::new(),
+            parked_control_follow_ons: ParkedControlFollowOns::default(),
+            next_session_setup_snapshot_generation: 0,
             pending_model_selection: None,
             prepared_slot_models: Vec::new(),
             prepared_slot_default: None,

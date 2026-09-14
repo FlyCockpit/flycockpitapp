@@ -2,7 +2,9 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, oneshot};
 
-use super::{App, ControlApplied};
+use super::{
+    App, ControlApplied, ControlEpochAbandonAction, ControlEpochAbandonment, PendingControlRequest,
+};
 use crate::tui::agent_runner::{
     AgentRunner, ControlRequest, QueuedTurnEvent, TestRunnerOverrides, control_response_outcome,
 };
@@ -501,4 +503,232 @@ fn tool_call_view_toggle_is_local_and_preserves_history() {
     app.handle_tool_calls_command("show");
     assert!(!app.hide_tool_calls);
     assert_eq!(app.history.len(), history_len);
+}
+
+fn sample_control_applied() -> Vec<ControlApplied> {
+    vec![
+        ControlApplied::None,
+        ControlApplied::ModelSelection {
+            selection_id: uuid::Uuid::nil(),
+        },
+        ControlApplied::PrimaryAgentSwitch {
+            name: "Build".to_string(),
+        },
+        ControlApplied::ToolSurfaceOverride { cache_break: false },
+        ControlApplied::Multireview {
+            kickoff: "kickoff".to_string(),
+        },
+        ControlApplied::ScheduleCancel {
+            command: "/cron-cancel".to_string(),
+            job_id: "job".to_string(),
+        },
+        ControlApplied::ModelFavorite {
+            provider: "openai".to_string(),
+            model: "gpt-test".to_string(),
+            favorite: true,
+        },
+        ControlApplied::PinContext {
+            text: "pin".to_string(),
+        },
+        ControlApplied::RepairResume,
+        ControlApplied::ExitGuardStatus,
+        ControlApplied::ExitAfterStoppingWork,
+        ControlApplied::ExitAfterBackgroundPromotion,
+        ControlApplied::ResponseMetricsTokenizer {
+            confirm_id: uuid::Uuid::nil(),
+        },
+    ]
+}
+
+#[test]
+fn epoch_abandon_action_is_exhaustive_for_every_control_applied() {
+    use ControlEpochAbandonAction as Action;
+    use ControlEpochAbandonment as Reason;
+
+    let expected = |applied: &ControlApplied, reason: Reason| -> Action {
+        match applied {
+            ControlApplied::None => Action::Silent,
+            ControlApplied::ModelSelection { .. } => Action::ModelSelection,
+            ControlApplied::PrimaryAgentSwitch { .. }
+            | ControlApplied::ToolSurfaceOverride { .. } => Action::RefreshSnapshot,
+            ControlApplied::ResponseMetricsTokenizer { .. } => Action::FailTokenizer,
+            ControlApplied::ScheduleCancel { .. }
+            | ControlApplied::ModelFavorite { .. }
+            | ControlApplied::PinContext { .. } => Action::DaemonOwnedNotice,
+            ControlApplied::Multireview { .. } => Action::DropFollowOn,
+            ControlApplied::RepairResume => match reason {
+                Reason::SameSession => Action::ParkRepairResume,
+                Reason::SessionTransition | Reason::TerminalDisconnect => Action::DropFollowOn,
+            },
+            ControlApplied::ExitGuardStatus => match reason {
+                Reason::TerminalDisconnect => Action::CompleteExitLocally,
+                Reason::SameSession | Reason::SessionTransition => Action::ParkExitGuard,
+            },
+            ControlApplied::ExitAfterStoppingWork => match reason {
+                Reason::TerminalDisconnect => Action::CompleteExitLocally,
+                Reason::SameSession | Reason::SessionTransition => Action::ParkExitAfterStop,
+            },
+            ControlApplied::ExitAfterBackgroundPromotion => match reason {
+                Reason::TerminalDisconnect => Action::CompleteExitAfterBackground,
+                Reason::SameSession | Reason::SessionTransition => Action::ParkExitAfterBackground,
+            },
+        }
+    };
+
+    for applied in sample_control_applied() {
+        for reason in [
+            Reason::SameSession,
+            Reason::SessionTransition,
+            Reason::TerminalDisconnect,
+        ] {
+            assert_eq!(
+                applied.epoch_abandon_action(reason),
+                expected(&applied, reason),
+                "{applied:?} abandoned for {reason:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn epoch_abandonment_drops_multireview_kickoff_without_dispatching() {
+    let mut app = app();
+    let (control_tx, mut control_rx) = mpsc::channel(4);
+    let (input_tx, mut input_rx) = mpsc::channel(4);
+    app.agent_runner = Some(Ok(AgentRunner::stub_with_channels(control_tx, input_tx)));
+    app.pending_control_requests.insert(
+        ControlRequestId(1),
+        PendingControlRequest::new(
+            "/multireview",
+            ControlApplied::Multireview {
+                kickoff: "kickoff".to_string(),
+            },
+        ),
+    );
+
+    app.abandon_epoch_bound_control_receipts(ControlEpochAbandonment::SameSession);
+
+    assert!(app.pending_control_requests.is_empty());
+    assert!(input_rx.try_recv().is_err(), "kickoff must not dispatch");
+    assert!(control_rx.try_recv().is_err(), "SetAgent is not re-issued");
+    assert!(
+        history_lines(&app)
+            .iter()
+            .any(|line| line.contains("/multireview") && line.contains("not confirmed")),
+        "dropped follow-on must be visible: {:?}",
+        history_lines(&app)
+    );
+    assert!(!app.busy);
+}
+
+#[test]
+fn epoch_abandonment_parks_repair_resume_on_same_session_and_retries() {
+    let mut app = app();
+    let (record_tx, _record_rx) = mpsc::channel(1);
+    let (control_tx, mut control_rx) = mpsc::channel(4);
+    install_runner(&mut app, record_tx, control_tx);
+    app.pending_control_requests.insert(
+        ControlRequestId(1),
+        PendingControlRequest::new("/resume", ControlApplied::RepairResume),
+    );
+
+    app.abandon_epoch_bound_control_receipts(ControlEpochAbandonment::SameSession);
+    assert!(app.pending_control_requests.is_empty());
+    assert!(app.parked_control_follow_ons.repair_resume);
+    assert!(
+        history_lines(&app).is_empty(),
+        "parked repair does not dispatch retry submissions itself: {:?}",
+        history_lines(&app)
+    );
+
+    app.retry_parked_control_follow_ons();
+    let retried = control_rx.try_recv().expect("repair is re-issued");
+    assert!(matches!(retried.request, Request::RepairResume { .. }));
+    assert!(!app.parked_control_follow_ons.repair_resume);
+}
+
+#[test]
+fn epoch_abandonment_drops_repair_resume_on_session_transition() {
+    let mut app = app();
+    app.pending_control_requests.insert(
+        ControlRequestId(1),
+        PendingControlRequest::new("/resume", ControlApplied::RepairResume),
+    );
+    app.abandon_epoch_bound_control_receipts(ControlEpochAbandonment::SessionTransition);
+    assert!(app.pending_control_requests.is_empty());
+    assert!(!app.parked_control_follow_ons.repair_resume);
+    assert!(
+        history_lines(&app)
+            .iter()
+            .any(|line| line.contains("/resume") && line.contains("not confirmed")),
+        "{:?}",
+        history_lines(&app)
+    );
+}
+
+#[test]
+fn epoch_abandonment_notices_daemon_owned_confirmations() {
+    let mut app = app();
+    app.pending_control_requests.insert(
+        ControlRequestId(1),
+        PendingControlRequest::new(
+            "/pin-context",
+            ControlApplied::PinContext {
+                text: "keep".to_string(),
+            },
+        ),
+    );
+    app.abandon_epoch_bound_control_receipts(ControlEpochAbandonment::SessionTransition);
+    assert!(
+        history_lines(&app)
+            .iter()
+            .any(|line| { line.contains("/pin-context") && line.contains("session change") }),
+        "{:?}",
+        history_lines(&app)
+    );
+}
+
+#[test]
+fn epoch_abandonment_completes_exit_on_terminal_disconnect() {
+    let mut app = app();
+    app.pending_control_requests.insert(
+        ControlRequestId(1),
+        PendingControlRequest::new("stop all", ControlApplied::ExitAfterStoppingWork),
+    );
+    app.abandon_epoch_bound_control_receipts(ControlEpochAbandonment::TerminalDisconnect);
+    assert!(app.exit_requested);
+    assert!(app.pending_control_requests.is_empty());
+    assert!(!app.parked_control_follow_ons.exit_after_stop);
+}
+
+#[test]
+fn epoch_abandonment_parks_exit_guard_until_model_epoch_retries() {
+    let mut app = app();
+    let (record_tx, _record_rx) = mpsc::channel(1);
+    let (control_tx, mut control_rx) = mpsc::channel(4);
+    install_runner(&mut app, record_tx, control_tx);
+    app.pending_control_requests.insert(
+        ControlRequestId(1),
+        PendingControlRequest::new("exit check", ControlApplied::ExitGuardStatus),
+    );
+
+    app.start_model_state_epoch(app.launch.session_id, None);
+    let retried = control_rx.try_recv().expect("exit check is re-issued");
+    assert!(matches!(retried.request, Request::ExitGuardStatus));
+}
+
+#[test]
+fn epoch_abandon_action_source_has_no_wildcard() {
+    let source = include_str!("mod.rs");
+    let body = source
+        .split_once("fn epoch_abandon_action")
+        .expect("epoch_abandon_action")
+        .1
+        .split_once("\n}\n")
+        .map(|(body, _)| body)
+        .expect("epoch_abandon_action body");
+    assert!(
+        !body.contains("_ =>"),
+        "epoch abandonment must stay exhaustive over ControlApplied"
+    );
 }

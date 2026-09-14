@@ -377,9 +377,28 @@ fn tools_snapshot(tools: &[(&str, &str)]) -> cockpit_proto::SessionSetupSnapshot
 }
 
 fn apply_tools_snapshot(app: &mut App, tools: &[(&str, &str)]) {
-    app.apply_session_setup_snapshot_response(cockpit_proto::Response::SessionSetupSnapshot {
-        snapshot: tools_snapshot(tools),
-    });
+    let correlation = match &app.overlay {
+        Overlay::Tools(pane) => pane.session_override_wait(),
+        _ => None,
+    };
+    let session_id = correlation
+        .and_then(|correlation| correlation.session_id)
+        .or_else(|| {
+            app.agent_runner
+                .as_ref()
+                .and_then(|runner| runner.as_ref().ok())
+                .map(|runner| runner.session_id())
+        });
+    let mut snapshot = tools_snapshot(tools);
+    if let Some(session_id) = session_id {
+        snapshot.session_id = session_id.to_string();
+    }
+    let response = cockpit_proto::Response::SessionSetupSnapshot { snapshot };
+    if let Some(correlation) = correlation {
+        app.apply_session_setup_snapshot_response_correlated(response, correlation);
+    } else {
+        app.apply_session_setup_snapshot_response(response);
+    }
 }
 
 #[test]
@@ -941,6 +960,19 @@ fn header_tools_pill_reconciles_tool_surface_override() {
             .map(|pending| pending.applied.clone()),
         Some(super::ControlApplied::ToolSurfaceOverride { cache_break: false })
     );
+    apply_tools_snapshot(&mut app, &[("premature", "enabled")]);
+    let Overlay::Tools(pane) = &app.overlay else {
+        panic!("tools overlay");
+    };
+    assert!(
+        pane.session_override_pending(),
+        "a snapshot that arrives before Applied cannot confirm pending ownership"
+    );
+    assert_eq!(
+        pane.original_selection(),
+        &original,
+        "a pre-Applied snapshot must not restore or replace the daemon baseline"
+    );
 
     apply_control_applied(&mut app, ControlRequestId(1));
     assert!(
@@ -1109,6 +1141,93 @@ fn header_tools_reconnect_discards_stale_receipt_and_reconciles_snapshot() {
     );
     assert_eq!(pane.original_selection().tools, vec!["bash".to_string()]);
     assert_eq!(pane.original_selection(), pane.draft_selection());
+}
+
+#[test]
+fn header_tools_uncorrelated_snapshots_do_not_confirm_pending_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, mut control_rx) = app_with_runner(&tmp);
+    app.activate_header_pill(HeaderPillKind::Tool);
+    app.handle_tools_outcome(ToolsOutcome::Apply {
+        override_json: "{}".to_string(),
+        persist_session: true,
+        cache_break: false,
+        monty_nudge: None,
+    });
+    let _ = control_rx.try_recv();
+    apply_control_applied(&mut app, ControlRequestId(1));
+    let Overlay::Tools(pane) = &app.overlay else {
+        panic!("tools overlay");
+    };
+    let wait = pane
+        .session_override_wait()
+        .expect("applied mutation waits for a correlated snapshot");
+    let original = pane.original_selection().clone();
+    let session_id = wait.session_id.expect("refresh is session-bound");
+
+    let mut stale = tools_snapshot(&[("stale", "enabled")]);
+    stale.session_id = session_id.to_string();
+    app.apply_session_setup_snapshot_response_correlated(
+        cockpit_proto::Response::SessionSetupSnapshot { snapshot: stale },
+        super::SessionSetupSnapshotCorrelation::refresh(
+            wait.generation.saturating_sub(1),
+            Some(session_id),
+            wait.attachment_epoch,
+        ),
+    );
+    let Overlay::Tools(pane) = &app.overlay else {
+        panic!("tools overlay");
+    };
+    assert!(
+        pane.session_override_pending(),
+        "an older snapshot generation must not confirm the post-mutation wait"
+    );
+    assert_eq!(pane.original_selection(), &original);
+
+    let mut add_mcp = tools_snapshot(&[("mcp", "enabled")]);
+    add_mcp.session_id = session_id.to_string();
+    app.apply_session_setup_snapshot_response(cockpit_proto::Response::SessionSetupSnapshot {
+        snapshot: add_mcp,
+    });
+    let Overlay::Tools(pane) = &app.overlay else {
+        panic!("tools overlay");
+    };
+    assert!(
+        pane.session_override_pending(),
+        "Add-MCP and other unrelated snapshots must not confirm tool-surface pending"
+    );
+    assert_eq!(pane.original_selection(), &original);
+
+    let mut wrong_epoch = tools_snapshot(&[("epoch", "enabled")]);
+    wrong_epoch.session_id = session_id.to_string();
+    app.apply_session_setup_snapshot_response_correlated(
+        cockpit_proto::Response::SessionSetupSnapshot {
+            snapshot: wrong_epoch,
+        },
+        super::SessionSetupSnapshotCorrelation::refresh(
+            wait.generation,
+            Some(session_id),
+            wait.attachment_epoch.wrapping_add(1),
+        ),
+    );
+    let Overlay::Tools(pane) = &app.overlay else {
+        panic!("tools overlay");
+    };
+    assert!(
+        pane.session_override_pending(),
+        "a snapshot stamped for another attachment epoch must not confirm"
+    );
+    assert_eq!(pane.original_selection(), &original);
+
+    apply_tools_snapshot(&mut app, &[("bash", "enabled")]);
+    let Overlay::Tools(pane) = &app.overlay else {
+        panic!("tools overlay");
+    };
+    assert!(
+        !pane.session_override_pending(),
+        "the post-mutation correlated snapshot is the remaining settlement path"
+    );
+    assert_eq!(pane.original_selection().tools, vec!["bash".to_string()]);
 }
 
 #[test]

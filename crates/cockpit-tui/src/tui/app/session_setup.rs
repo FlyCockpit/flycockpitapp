@@ -325,10 +325,21 @@ impl App {
                             agent: None,
                         })
                         .await
-                        .map(crate::tui::async_action::AsyncActionPayload::SessionSetupSnapshot)
+                        .map(|response| {
+                            crate::tui::async_action::AsyncActionPayload::SessionSetupSnapshot {
+                                response,
+                                correlation:
+                                    super::SessionSetupSnapshotCorrelation::unrelated_mutation(),
+                            }
+                        })
                         .map_err(|error| error.to_string());
                 }
-                Ok(crate::tui::async_action::AsyncActionPayload::SessionSetupSnapshot(response))
+                Ok(
+                    crate::tui::async_action::AsyncActionPayload::SessionSetupSnapshot {
+                        response,
+                        correlation: super::SessionSetupSnapshotCorrelation::unrelated_mutation(),
+                    },
+                )
             },
         );
     }
@@ -407,7 +418,12 @@ impl App {
                     })
                     .await
                     .map_err(|error| error.to_string())?;
-                Ok(crate::tui::async_action::AsyncActionPayload::SessionSetupSnapshot(response))
+                Ok(
+                    crate::tui::async_action::AsyncActionPayload::SessionSetupSnapshot {
+                        response,
+                        correlation: super::SessionSetupSnapshotCorrelation::unrelated_mutation(),
+                    },
+                )
             },
         );
     }
@@ -423,8 +439,11 @@ impl App {
 
     /// Schedule an async `GetSessionSetupSnapshot` fetch for the attached
     /// session. A no-op (with a fixed error surfaced in the pane) when there is
-    /// no attached runner, since the snapshot is daemon-owned.
-    pub(super) fn request_session_setup_snapshot_refresh(&mut self) {
+    /// no attached runner, since the snapshot is daemon-owned. The returned
+    /// correlation is the only token that may settle tool-surface pending.
+    pub(super) fn request_session_setup_snapshot_refresh(
+        &mut self,
+    ) -> Option<super::SessionSetupSnapshotCorrelation> {
         let Some(Ok(runner)) = self.agent_runner.as_ref() else {
             let message = "Session setup is only available once attached to a session.";
             if let Overlay::SessionSetup(pane) = &mut self.overlay {
@@ -436,10 +455,19 @@ impl App {
             if let Overlay::Tools(pane) = &mut self.overlay {
                 pane.note_snapshot_refresh_error(message);
             }
-            return;
+            return None;
         };
         let attached = runner.attached_request_binding();
         let session_id = attached.session_id();
+        self.next_session_setup_snapshot_generation = self
+            .next_session_setup_snapshot_generation
+            .wrapping_add(1)
+            .max(1);
+        let correlation = super::SessionSetupSnapshotCorrelation::refresh(
+            self.next_session_setup_snapshot_generation,
+            Some(session_id),
+            self.visible_attachment_epoch,
+        );
         self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::DaemonRpc(SESSION_SETUP_SNAPSHOT_ACTION),
             crate::tui::async_action::AsyncActionPolicy::Replace(
@@ -450,17 +478,54 @@ impl App {
                     .request(cockpit_proto::Request::GetSessionSetupSnapshot { session_id })
                     .await
                     .map_err(|error| error.to_string())?;
-                Ok(crate::tui::async_action::AsyncActionPayload::SessionSetupSnapshot(response))
+                Ok(
+                    crate::tui::async_action::AsyncActionPayload::SessionSetupSnapshot {
+                        response,
+                        correlation,
+                    },
+                )
             },
         );
+        Some(correlation)
+    }
+
+    pub(super) fn bind_tool_surface_snapshot_wait(
+        &mut self,
+        correlation: super::SessionSetupSnapshotCorrelation,
+    ) {
+        if let Overlay::Tools(pane) = &mut self.overlay {
+            pane.require_snapshot_correlation(correlation);
+        }
+    }
+
+    pub(super) fn begin_tool_surface_snapshot_wait(
+        &mut self,
+        correlation: super::SessionSetupSnapshotCorrelation,
+    ) {
+        if let Overlay::Tools(pane) = &mut self.overlay {
+            pane.begin_snapshot_wait(correlation);
+        }
     }
 
     /// Apply a completed `GetSessionSetupSnapshot` response into open
     /// session-setup, model-picker, and tools surfaces. Inert if those
-    /// overlays were closed or already replaced.
+    /// overlays were closed or already replaced. Unrelated mutation
+    /// snapshots (Add-MCP) must pass `unrelated_mutation` so they cannot
+    /// settle tool-surface pending.
     pub(super) fn apply_session_setup_snapshot_response(
         &mut self,
         response: cockpit_proto::Response,
+    ) {
+        self.apply_session_setup_snapshot_response_correlated(
+            response,
+            super::SessionSetupSnapshotCorrelation::unrelated_mutation(),
+        );
+    }
+
+    pub(super) fn apply_session_setup_snapshot_response_correlated(
+        &mut self,
+        response: cockpit_proto::Response,
+        correlation: super::SessionSetupSnapshotCorrelation,
     ) {
         let snapshot = match response {
             cockpit_proto::Response::SessionSetupSnapshot { snapshot } => snapshot,
@@ -524,10 +589,23 @@ impl App {
                     })
             });
         }
+        let current_session = self
+            .agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok())
+            .map(|runner| runner.session_id())
+            .or(self.launch.session_id);
+        let snapshot_session = uuid::Uuid::parse_str(&snapshot.session_id).ok();
+        let identity_matches = current_session.is_some()
+            && snapshot_session == current_session
+            && correlation.session_id == current_session
+            && correlation.attachment_epoch == self.visible_attachment_epoch;
+        let incoming = identity_matches.then_some(correlation);
         if let Overlay::Tools(pane) = &mut self.overlay {
-            pane.reconcile_from_daemon(crate::tui::session_setup::tool_selection_from_snapshot(
-                &snapshot,
-            ));
+            pane.reconcile_from_daemon(
+                crate::tui::session_setup::tool_selection_from_snapshot(&snapshot),
+                incoming.as_ref(),
+            );
         }
         if let Overlay::ModelPicker(picker) = &mut self.overlay {
             picker.set_active_slot_models(
@@ -967,5 +1045,42 @@ mod tests {
         app.prepare_session_setup_for_resume(false);
         assert!(!app.session_setup_collapsed);
         assert!(app.session_setup_inline_visible());
+    }
+
+    #[test]
+    fn session_setup_snapshot_refresh_stamps_correlation_into_payload() {
+        let source = include_str!("session_setup.rs");
+        let body = source
+            .split_once("fn request_session_setup_snapshot_refresh")
+            .expect("request_session_setup_snapshot_refresh")
+            .1
+            .split_once("fn bind_tool_surface_snapshot_wait")
+            .map(|(body, _)| body)
+            .expect("bind_tool_surface_snapshot_wait follows refresh");
+        assert!(
+            body.contains("SessionSetupSnapshotCorrelation::refresh"),
+            "snapshot refresh must stamp generation/session/epoch"
+        );
+        assert!(
+            body.contains("correlation"),
+            "snapshot payload must carry the request-time correlation"
+        );
+        let apply = include_str!("async_actions.rs");
+        let snapshot_arm = apply
+            .split("DaemonRpc(\"session_setup.snapshot\")")
+            .nth(1)
+            .expect("snapshot arm");
+        let add_mcp_arm = apply
+            .split("DaemonRpc(\"session_setup.add_mcp\")")
+            .nth(1)
+            .expect("add_mcp arm");
+        assert!(
+            snapshot_arm.contains("apply_session_setup_snapshot_response_correlated"),
+            "GetSessionSetupSnapshot completions must apply with their stamped correlation"
+        );
+        assert!(
+            add_mcp_arm.contains("apply_session_setup_snapshot_response(response)"),
+            "Add-MCP completions must not use the tool-surface settlement path"
+        );
     }
 }

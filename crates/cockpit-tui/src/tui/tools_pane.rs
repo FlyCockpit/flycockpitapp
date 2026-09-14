@@ -51,6 +51,9 @@ pub(crate) struct ToolsPane {
     /// Session `SetToolSurfaceOverride` is in flight; the pane stays open
     /// until the daemon receipt reconciles displayed/selectable state.
     session_override_pending: bool,
+    /// Post-mutation snapshot wait. Pending ownership settles only from a
+    /// refresh whose generation/session/epoch match this fence.
+    session_override_wait: Option<crate::tui::app::SessionSetupSnapshotCorrelation>,
 }
 
 #[derive(Debug)]
@@ -115,6 +118,7 @@ impl ToolsPane {
 
     pub(crate) fn mark_session_override_pending(&mut self) {
         self.session_override_pending = true;
+        self.session_override_wait = None;
         self.status = Some("Applying session tool surface…".to_string());
         self.confirm = None;
     }
@@ -134,8 +138,40 @@ impl ToolsPane {
         if !self.session_override_pending {
             return false;
         }
+        self.session_override_wait = None;
         self.status = Some("reattached; refreshing daemon tool surface…".to_string());
         true
+    }
+
+    /// Arm pending ownership so only a snapshot requested after Applied or
+    /// epoch abandonment can settle it. Opportunistic refreshes must not
+    /// call this while the mutation is still in flight.
+    pub(crate) fn begin_snapshot_wait(
+        &mut self,
+        correlation: crate::tui::app::SessionSetupSnapshotCorrelation,
+    ) {
+        if !self.session_override_pending {
+            return;
+        }
+        self.session_override_wait = Some(correlation);
+    }
+
+    /// A later refresh for the same session/epoch may settle once wait is
+    /// armed. Does not arm wait from a pre-Applied refresh.
+    pub(crate) fn require_snapshot_correlation(
+        &mut self,
+        correlation: crate::tui::app::SessionSetupSnapshotCorrelation,
+    ) {
+        if !self.session_override_pending {
+            return;
+        }
+        match self.session_override_wait {
+            Some(existing)
+                if existing.session_id == correlation.session_id
+                    && existing.attachment_epoch == correlation.attachment_epoch => {}
+            Some(_) => self.session_override_wait = Some(correlation),
+            None => {}
+        }
     }
 
     pub(crate) fn note_snapshot_refresh_error(&mut self, message: impl Into<String>) {
@@ -150,10 +186,21 @@ impl ToolsPane {
 
     /// Confirmed tool-surface state is the daemon snapshot, never a locally
     /// promoted draft. In-progress unsaved edits keep their draft; `original`
-    /// still tracks the latest daemon baseline.
-    pub(crate) fn reconcile_from_daemon(&mut self, selection: ToolSurfaceSelection) {
+    /// still tracks the latest daemon baseline. Pending ownership settles
+    /// only from a snapshot correlated to the post-mutation wait.
+    pub(crate) fn reconcile_from_daemon(
+        &mut self,
+        selection: ToolSurfaceSelection,
+        incoming: Option<&crate::tui::app::SessionSetupSnapshotCorrelation>,
+    ) {
         if self.session_override_pending {
             if matches!(self.in_flight, Some(ToolsPending::SaveAgent { .. })) {
+                return;
+            }
+            let settle = incoming
+                .zip(self.session_override_wait.as_ref())
+                .is_some_and(|(incoming, wait)| incoming.allows_tool_surface_settle(*wait));
+            if !settle {
                 return;
             }
             self.in_flight = None;
@@ -169,6 +216,7 @@ impl ToolsPane {
         }
         if self.session_override_pending {
             self.session_override_pending = false;
+            self.session_override_wait = None;
             self.status = Some("session tool surface confirmed".to_string());
             self.row_errors.clear();
             self.confirm = None;
@@ -180,6 +228,7 @@ impl ToolsPane {
             return;
         }
         self.session_override_pending = false;
+        self.session_override_wait = None;
         self.draft = ToolSurfaceDraft::from_selection(self.original.clone());
         self.status = Some(message);
         self.confirm = None;
@@ -188,6 +237,13 @@ impl ToolsPane {
     #[cfg(test)]
     pub(crate) fn session_override_pending(&self) -> bool {
         self.session_override_pending
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_override_wait(
+        &self,
+    ) -> Option<crate::tui::app::SessionSetupSnapshotCorrelation> {
+        self.session_override_wait
     }
 
     #[cfg(test)]
@@ -241,6 +297,7 @@ impl ToolsPane {
                 project_root,
             }),
             session_override_pending: false,
+            session_override_wait: None,
         })
     }
 
@@ -970,6 +1027,7 @@ mod tests {
             pending_effect: None,
             in_flight: None,
             session_override_pending: false,
+            session_override_wait: None,
         }
     }
 
@@ -1119,7 +1177,31 @@ mod tests {
             tools: vec!["read".to_string(), "skill".to_string()],
             tool_tiers: BTreeMap::new(),
         };
-        pane.reconcile_from_daemon(daemon.clone());
+        let session_id = uuid::Uuid::from_u128(1);
+        let wait =
+            crate::tui::app::SessionSetupSnapshotCorrelation::refresh(2, Some(session_id), 0);
+        pane.begin_snapshot_wait(wait);
+        pane.reconcile_from_daemon(
+            daemon.clone(),
+            Some(&crate::tui::app::SessionSetupSnapshotCorrelation::refresh(
+                1,
+                Some(session_id),
+                0,
+            )),
+        );
+        assert!(
+            pane.has_unsettled_local_authority(),
+            "an older snapshot generation must not confirm pending ownership"
+        );
+        pane.reconcile_from_daemon(
+            daemon.clone(),
+            Some(&crate::tui::app::SessionSetupSnapshotCorrelation::unrelated_mutation()),
+        );
+        assert!(
+            pane.has_unsettled_local_authority(),
+            "an Add-MCP or other unrelated snapshot must not confirm pending ownership"
+        );
+        pane.reconcile_from_daemon(daemon.clone(), Some(&wait));
         assert!(!pane.has_unsettled_local_authority());
         assert_eq!(pane.original, daemon);
         assert_eq!(pane.draft.selection(), &daemon);

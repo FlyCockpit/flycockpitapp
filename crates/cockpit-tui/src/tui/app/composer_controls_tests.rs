@@ -824,10 +824,14 @@ fn persist_as_default_is_atomic_set_active_model() {
 #[test]
 fn approval_and_sandbox_pills_are_capability_gated() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app(&tmp);
-    app.sandbox_mode = SandboxMode::Refuse;
-    app.activate_composer_pill(ComposerControlKind::Sandbox);
-    let picker = app.composer_controls.picker.as_ref().expect("sandbox");
+    let mut untrusted = app(&tmp);
+    untrusted.sandbox_mode = SandboxMode::Refuse;
+    untrusted.activate_composer_pill(ComposerControlKind::Sandbox);
+    let picker = untrusted
+        .composer_controls
+        .picker
+        .as_ref()
+        .expect("sandbox");
     assert!(
         picker
             .status_text
@@ -845,9 +849,13 @@ fn approval_and_sandbox_pills_are_capability_gated() {
             .all(|item| !item.selectable),
         "refused sandbox offers no local bypass"
     );
-    app.approval_mode = ApprovalMode::Manual;
-    app.activate_composer_pill(ComposerControlKind::Approval);
-    let picker = app.composer_controls.picker.as_ref().expect("approval");
+    untrusted.approval_mode = ApprovalMode::Manual;
+    untrusted.activate_composer_pill(ComposerControlKind::Approval);
+    let picker = untrusted
+        .composer_controls
+        .picker
+        .as_ref()
+        .expect("approval");
     let items: Vec<_> = picker
         .categories
         .iter()

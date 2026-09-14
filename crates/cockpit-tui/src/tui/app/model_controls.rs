@@ -752,9 +752,9 @@ impl App {
                 self.refuse_tool_surface_override(message.clone());
             }
             if let Some(pending) = self.clear_pending_model_selection(selection_id) {
-                self.show_failed_model_selection(pending, message);
+                self.show_failed_model_selection(pending, message.clone());
             } else if !tool_surface_override {
-                self.push_plain(message);
+                self.push_plain(message.clone());
             }
             if self.composer_controls.dispatch_armed {
                 self.refuse_unbound_composer_control(
@@ -764,6 +764,13 @@ impl App {
             }
             return;
         };
+        // Clone the send handles before mutating `self`. Binding the composer
+        // request takes `&mut self`, which cannot overlap the `runner` borrow.
+        let control_tx = runner.control_tx.clone();
+        let events = runner.events.clone();
+        let event_notify = runner.event_notify.clone();
+        let session_id = runner.session_id();
+        let attachment_epoch = runner.attachment_epoch();
         self.next_control_request_seq = self.next_control_request_seq.saturating_add(1);
         let request_id = ControlRequestId(self.next_control_request_seq);
         self.pending_control_requests.insert(
@@ -772,12 +779,12 @@ impl App {
         );
         self.bind_composer_control_request(request_id);
         let result = agent_runner::send_control_request(
-            &runner.control_tx,
-            &runner.events,
-            &runner.event_notify,
+            &control_tx,
+            &events,
+            &event_notify,
             request_id,
-            runner.session_id(),
-            runner.attachment_epoch(),
+            session_id,
+            attachment_epoch,
             req,
         );
         if let Err(reason) = result {
@@ -794,9 +801,9 @@ impl App {
                 self.refuse_tool_surface_override(message.clone());
             }
             if let Some(pending) = self.clear_pending_model_selection(selection_id) {
-                self.show_failed_model_selection(pending, message);
+                self.show_failed_model_selection(pending, message.clone());
             } else if !tool_surface_override {
-                self.push_plain(message);
+                self.push_plain(message.clone());
             }
             self.refuse_composer_control_for_request(
                 request_id,

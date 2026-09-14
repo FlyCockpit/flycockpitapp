@@ -11049,15 +11049,52 @@ async fn handle_serialized_request_impl(
                     .map_err(internal)?;
                 return Ok(Response::AuthoredAgentPackage(outcome));
             }
+            let _publication_guard = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
             let settlement_owner = settings_capability_owner(state);
             let request_hash = local_operation_request_hash(&request)?;
-            prepare_authored_apply_local_operation_retry(
-                ctx,
-                &settlement_owner,
-                &request.client_operation_id,
-                request_hash,
-            )
-            .await?;
+            let existing_settlement = ctx
+                .db
+                .local_operation_settlement(
+                    settlement_owner.clone(),
+                    request.client_operation_id.clone(),
+                )
+                .await
+                .map_err(internal)?;
+            if matches!(
+                &existing_settlement,
+                Some(crate::db::local_operation_receipts::LocalOperationSettlement::Pending(_))
+            ) {
+                return Err(conflict(
+                    "an exact duplicate local operation is already executing; query its settlement",
+                ));
+            }
+            if existing_settlement.is_some() {
+                match begin_local_operation(
+                    ctx,
+                    &settlement_owner,
+                    &request.client_operation_id,
+                    "apply_authored_agent_package",
+                    request_hash,
+                )
+                .await?
+                {
+                    LocalOperationStart::Replay(response) => return Ok(response),
+                    LocalOperationStart::Execute(_) => {
+                        return Err(internal(anyhow::anyhow!(
+                            "terminal authored package operation reopened unexpectedly"
+                        )));
+                    }
+                }
+            }
+            if let Some(outcome) =
+                crate::daemon::agent_authoring::preflight_package_under_publication_lock(
+                    ctx, &request,
+                )
+                .await
+                .map_err(internal)?
+            {
+                return Ok(Response::AuthoredAgentPackage(outcome));
+            }
             let fencing_generation = match begin_local_operation(
                 ctx,
                 &settlement_owner,
@@ -11070,7 +11107,7 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Replay(response) => return Ok(response),
                 LocalOperationStart::Execute(generation) => generation,
             };
-            let outcome = crate::daemon::agent_authoring::apply_package(
+            let outcome = crate::daemon::agent_authoring::apply_package_under_publication_lock(
                 ctx,
                 request.clone(),
                 Some(crate::daemon::agent_authoring::AuthoredApplyFence {
@@ -19578,7 +19615,7 @@ fn agent_editor_lease_owner(state: &MutableClientState) -> String {
     stable_authenticated_principal(state)
 }
 
-fn settings_capability_owner(state: &MutableClientState) -> String {
+pub(super) fn settings_capability_owner(state: &MutableClientState) -> String {
     // Settings dialogs use short-lived daemon connections.  Bind the
     // unguessable capability to the authenticated principal, while the
     // capability record itself binds root, target identity and revision.
@@ -21688,7 +21725,7 @@ async fn provider_operation_journal_exists(
         .map_err(internal)
 }
 
-fn local_operation_request_hash<T: serde::Serialize>(
+pub(super) fn local_operation_request_hash<T: serde::Serialize>(
     request: &T,
 ) -> std::result::Result<[u8; 32], ErrorPayload> {
     let encoded = zeroize::Zeroizing::new(serde_json::to_vec(request).map_err(internal)?);
@@ -22187,63 +22224,6 @@ pub(super) async fn recover_assistant_mutation_journals(
         recovered = recovered.saturating_add(1);
     }
     Ok(recovered)
-}
-
-async fn prepare_authored_apply_local_operation_retry(
-    ctx: &DaemonContext,
-    owner: &str,
-    client_operation_id: &str,
-    request_hash: [u8; 32],
-) -> std::result::Result<(), ErrorPayload> {
-    let settlement = ctx
-        .db
-        .local_operation_settlement(owner.to_owned(), client_operation_id.to_owned())
-        .await
-        .map_err(internal)?;
-    let Some(crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(
-        identity,
-        json,
-    )) = settlement
-    else {
-        return Ok(());
-    };
-    if identity.request_hash.as_slice() == request_hash.as_slice() {
-        return Ok(());
-    }
-    let Ok(cockpit_proto::Response::AuthoredAgentPackage(outcome)) = serde_json::from_str(&json)
-    else {
-        return Err(conflict(
-            "client operation id was reused for a different request",
-        ));
-    };
-    let retryable = match outcome {
-        cockpit_proto::ApplyAuthoredAgentPackageOutcome::Rejected { .. } => true,
-        cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(receipt) => {
-            receipt.status == cockpit_proto::AuthoredAgentReceiptStatus::Rejected
-        }
-        _ => false,
-    };
-    if !retryable {
-        return Err(conflict(
-            "client operation id was reused for a different request",
-        ));
-    }
-    let reset = ctx
-        .db
-        .reset_terminal_local_operation_for_retry(
-            owner.to_owned(),
-            client_operation_id.to_owned(),
-            "apply_authored_agent_package".to_owned(),
-            request_hash,
-        )
-        .await
-        .map_err(internal)?;
-    if !reset {
-        return Err(conflict(
-            "client operation id was reused for a different request",
-        ));
-    }
-    Ok(())
 }
 
 async fn begin_local_operation(

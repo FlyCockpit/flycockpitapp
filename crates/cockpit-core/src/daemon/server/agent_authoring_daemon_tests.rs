@@ -336,8 +336,12 @@ async fn authored_agent_pending_journal_surfaces_exact_pending_receipt() {
         onboarding: None,
         validate_only: false,
     };
-    let fence = crate::daemon::agent_authoring::publication_fence_for_request(&request)
-        .expect("publication fence");
+    let fence = crate::daemon::agent_authoring::AuthoredApplyFence {
+        owner_digest: super::dispatch::settings_capability_owner(&state),
+        request_hash: super::dispatch::local_operation_request_hash(&request)
+            .expect("publication request hash"),
+        fencing_generation: 1,
+    };
     let providers = ctx.config_source().load(&ctx.canonical_cwd).unwrap().0;
     let catalog = crate::daemon::agent_catalog::preferred_catalog()
         .await
@@ -417,8 +421,12 @@ async fn authored_agent_unknown_settlement_without_durable_journal() {
         onboarding: None,
         validate_only: false,
     };
-    let fence = crate::daemon::agent_authoring::publication_fence_for_request(&request)
-        .expect("publication fence");
+    let fence = crate::daemon::agent_authoring::AuthoredApplyFence {
+        owner_digest: super::dispatch::settings_capability_owner(&state),
+        request_hash: super::dispatch::local_operation_request_hash(&request)
+            .expect("publication request hash"),
+        fencing_generation: 1,
+    };
     ctx.db
         .begin_local_operation(
             fence.owner_digest.clone(),

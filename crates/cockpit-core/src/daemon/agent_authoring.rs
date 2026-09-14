@@ -37,6 +37,23 @@ pub struct AuthoredApplyFence {
     pub fencing_generation: i64,
 }
 
+/// Validate every rejection gate that precedes durable publication.
+///
+/// The caller holds the daemon-wide config-publication lock across this
+/// preflight, local-operation reservation, and [`apply_package_under_publication_lock`].
+/// Canonical rejections therefore never become terminal local-operation
+/// receipts: the same logical client operation may be corrected and submitted
+/// again, while any operation that reaches a recoverable effect remains bound
+/// to one immutable request hash.
+pub async fn preflight_package_under_publication_lock(
+    ctx: &DaemonContext,
+    request: &ApplyAuthoredAgentPackageRequest,
+) -> Result<Option<ApplyAuthoredAgentPackageOutcome>> {
+    prepare_package(ctx, request)
+        .await
+        .map(|result| result.err())
+}
+
 pub async fn apply_package(
     ctx: &DaemonContext,
     request: ApplyAuthoredAgentPackageRequest,
@@ -57,82 +74,20 @@ pub async fn apply_package_under_publication_lock(
     if let Some(outcome) = replay_existing_journal(ctx, &request, &fence).await? {
         return Ok(outcome);
     }
-    let providers = ctx
-        .config_source()
-        .load(&ctx.canonical_cwd)
-        .context("loading daemon provider configuration")?
-        .0;
-    let catalog = crate::daemon::agent_catalog::preferred_catalog().await?;
-    let snapshot =
-        crate::onboarding_agent::policy_snapshot(&providers, catalog.origin, &catalog.revision);
-    if request.expected_policy_revision != snapshot.policy_revision
-        || request.package.policy_revision != snapshot.policy_revision
-    {
-        let projection = crate::onboarding_agent::authoring_projection(
-            &providers,
-            &catalog.index,
-            catalog.origin,
-            &catalog.revision,
-        )?;
-        return Ok(ApplyAuthoredAgentPackageOutcome::PolicyRevisionConflict { projection });
-    }
-    if let Some(correlation) = &request.onboarding {
-        let current = ctx.db.onboarding_snapshot().await?;
-        let live = current.as_ref().is_some_and(|row| {
-            row.run_id == correlation.run_id
-                && row.attempt_id == correlation.attempt_id
-                && row.revision == correlation.stage_revision
-                && row.stage == crate::db::onboarding::OnboardingStage::Agent
-        });
-        if !live {
-            return Ok(ApplyAuthoredAgentPackageOutcome::Rejected {
-                reason: AuthoredAgentRejectReason::StaleDraft,
-                message: "onboarding correlation does not match the active agent-stage run; query the exact operation instead of retrying create".into(),
-                projection: None,
-            });
-        }
-    }
-    let package = match crate::onboarding_agent::canonicalize_authored_package(
-        &request.package,
-        &snapshot,
-        &providers,
-        &catalog.index,
-    ) {
-        Ok(package) => package,
-        Err(error) => {
-            return Ok(ApplyAuthoredAgentPackageOutcome::Rejected {
-                reason: error.reason,
-                message: error.message,
-                projection: None,
-            });
-        }
+    let prepared = match prepare_package(ctx, &request).await? {
+        Ok(prepared) => prepared,
+        Err(outcome) => return Ok(outcome),
     };
     if request.validate_only {
-        return Ok(ApplyAuthoredAgentPackageOutcome::Review(package.review));
+        return Ok(ApplyAuthoredAgentPackageOutcome::Review(
+            prepared.package.review,
+        ));
     }
-    let now = crate::workspace_lease::now_unix_ms();
-    let current_draft = ctx
-        .db
-        .authored_agent_package_draft(request.package.name.clone())
-        .await
-        .context("loading authored draft revision")?;
-    let draft_matches = match (
-        request.package.draft_revision.as_deref(),
-        current_draft
-            .as_ref()
-            .map(|row| row.draft_revision.as_str()),
-    ) {
-        (None, None) => true,
-        (Some(expected), Some(actual)) => expected == actual,
-        _ => false,
-    };
-    if !draft_matches {
-        return Ok(ApplyAuthoredAgentPackageOutcome::Rejected {
-            reason: AuthoredAgentRejectReason::StaleDraft,
-            message: "authored draft revision does not match the last authoritative draft; edit/retry the current revision".into(),
-            projection: None,
-        });
-    }
+    let PreparedAuthoredPackage {
+        providers,
+        snapshot,
+        package,
+    } = prepared;
     let require_third_party = matches!(
         request.package.source.kind,
         cockpit_proto::AgentAuthoringSourceKind::ThirdParty
@@ -147,6 +102,7 @@ pub async fn apply_package_under_publication_lock(
     let package_files_json = encode_package_files(&package.files)?;
     let review_json =
         serde_json::to_string(&package.review).context("encoding authored package review")?;
+    let now = crate::workspace_lease::now_unix_ms();
     let intent = AuthoredAgentPackageJournalRow {
         owner_digest: fence.owner_digest.clone(),
         client_operation_id: request.client_operation_id.clone(),
@@ -189,6 +145,97 @@ pub async fn apply_package_under_publication_lock(
         .await
         .context("recording authored package publication intent")?;
     complete_pending_authored_journal(ctx, journal).await
+}
+
+struct PreparedAuthoredPackage {
+    providers: crate::config::providers::ProvidersConfig,
+    snapshot: cockpit_proto::AgentPolicySnapshot,
+    package: crate::onboarding_agent::CanonicalAuthoredPackage,
+}
+
+async fn prepare_package(
+    ctx: &DaemonContext,
+    request: &ApplyAuthoredAgentPackageRequest,
+) -> Result<std::result::Result<PreparedAuthoredPackage, ApplyAuthoredAgentPackageOutcome>> {
+    let providers = ctx
+        .config_source()
+        .load(&ctx.canonical_cwd)
+        .context("loading daemon provider configuration")?
+        .0;
+    let catalog = crate::daemon::agent_catalog::preferred_catalog().await?;
+    let snapshot =
+        crate::onboarding_agent::policy_snapshot(&providers, catalog.origin, &catalog.revision);
+    if request.expected_policy_revision != snapshot.policy_revision
+        || request.package.policy_revision != snapshot.policy_revision
+    {
+        let projection = crate::onboarding_agent::authoring_projection(
+            &providers,
+            &catalog.index,
+            catalog.origin,
+            &catalog.revision,
+        )?;
+        return Ok(Err(
+            ApplyAuthoredAgentPackageOutcome::PolicyRevisionConflict { projection },
+        ));
+    }
+    if let Some(correlation) = &request.onboarding {
+        let current = ctx.db.onboarding_snapshot().await?;
+        let live = current.as_ref().is_some_and(|row| {
+            row.run_id == correlation.run_id
+                && row.attempt_id == correlation.attempt_id
+                && row.revision == correlation.stage_revision
+                && row.stage == crate::db::onboarding::OnboardingStage::Agent
+        });
+        if !live {
+            return Ok(Err(ApplyAuthoredAgentPackageOutcome::Rejected {
+                reason: AuthoredAgentRejectReason::StaleDraft,
+                message: "onboarding correlation does not match the active agent-stage run; query the exact operation instead of retrying create".into(),
+                projection: None,
+            }));
+        }
+    }
+    let package = match crate::onboarding_agent::canonicalize_authored_package(
+        &request.package,
+        &snapshot,
+        &providers,
+        &catalog.index,
+    ) {
+        Ok(package) => package,
+        Err(error) => {
+            return Ok(Err(ApplyAuthoredAgentPackageOutcome::Rejected {
+                reason: error.reason,
+                message: error.message,
+                projection: None,
+            }));
+        }
+    };
+    let current_draft = ctx
+        .db
+        .authored_agent_package_draft(request.package.name.clone())
+        .await
+        .context("loading authored draft revision")?;
+    let draft_matches = match (
+        request.package.draft_revision.as_deref(),
+        current_draft
+            .as_ref()
+            .map(|row| row.draft_revision.as_str()),
+    ) {
+        (None, None) => true,
+        (Some(expected), Some(actual)) => expected == actual,
+        _ => false,
+    };
+    if !draft_matches {
+        return Ok(Err(ApplyAuthoredAgentPackageOutcome::Rejected {
+            reason: AuthoredAgentRejectReason::StaleDraft,
+            message: "authored draft revision does not match the last authoritative draft; edit/retry the current revision".into(),
+            projection: None,
+        }));
+    }
+    Ok(Ok(PreparedAuthoredPackage {
+        providers,
+        snapshot,
+        package,
+    }))
 }
 
 pub async fn recover_authored_agent_package_journals(ctx: &DaemonContext) -> Result<u64> {
@@ -359,12 +406,6 @@ fn empty_review(agent_name: &str) -> AuthoredAgentReview {
         trust_is_shared: true,
         trust_disclosure: crate::onboarding_agent::REVIEW_TRUST_DISCLOSURE.to_string(),
     }
-}
-
-pub(crate) fn publication_fence_for_request(
-    request: &ApplyAuthoredAgentPackageRequest,
-) -> Result<AuthoredApplyFence> {
-    publication_fence(request, None)
 }
 
 fn publication_fence(
@@ -725,20 +766,19 @@ mod tests {
     #[test]
     fn onboarding_and_rpc_apply_both_record_a_publication_fence() {
         let dispatch = include_str!("server/dispatch.rs");
-        let onboarding = dispatch
-            .split("apply_package_under_publication_lock")
+        let authored_apply = dispatch
+            .split("Request::ApplyAuthoredAgentPackage(request) =>")
             .nth(1)
-            .expect("onboarding authored apply");
+            .and_then(|tail| tail.split("Request::GetAuthoredAgentPackageReceipt").next())
+            .expect("shared authored apply RPC");
         assert!(
-            onboarding.contains("AuthoredApplyFence"),
-            "onboarding must journal authored publication under the owner fence"
+            authored_apply.contains("AuthoredApplyFence"),
+            "the shared onboarding/settings RPC must journal authored publication under the owner fence"
         );
         assert!(
-            !onboarding
-                .lines()
-                .take(20)
-                .any(|line| line.trim() == "None,"),
-            "onboarding must not skip the authored publication journal"
+            include_str!("agent_authoring.rs")
+                .contains("if let Some(correlation) = &request.onboarding"),
+            "the fenced shared RPC must retain onboarding correlation validation"
         );
     }
 

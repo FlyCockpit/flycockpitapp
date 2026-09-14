@@ -1449,7 +1449,7 @@ mod tests {
 
     #[test]
     fn nested_trust_confirmation_is_scoped_per_definition() {
-        let providers = providers_with("exact-a", Some(ModelTrust::Untrusted));
+        let providers = providers_with("exact-a", None);
         let snapshot = snapshot_for(&providers);
         let mut package = draft("helper", &[("vendor", "exact-a", true)], true);
         package.policy_revision = snapshot.policy_revision.clone();

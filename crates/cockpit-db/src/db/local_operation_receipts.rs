@@ -178,52 +178,6 @@ impl Db {
         .await
     }
 
-    /// Reopen a terminal local operation so the same client operation id can
-    /// dispatch a revised request after an explicit rejected outcome.
-    pub async fn reset_terminal_local_operation_for_retry(
-        &self,
-        owner_digest: String,
-        client_operation_id: String,
-        operation_kind: String,
-        request_hash: [u8; 32],
-    ) -> Result<bool> {
-        self.transaction(move |conn| {
-            let now = chrono::Utc::now().timestamp_millis();
-            let existing: Option<(String, Vec<u8>, String, i64)> = conn.query_row(
-                "SELECT operation_kind,request_hash,state,fencing_generation FROM local_operation_receipts WHERE owner_digest=?1 AND client_operation_id=?2",
-                params![owner_digest, client_operation_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()?;
-            let Some((kind, hash, state, generation)) = existing else {
-                return Ok(false);
-            };
-            if kind != operation_kind || hash.as_slice() == request_hash.as_slice() {
-                return Ok(false);
-            }
-            if state != "terminal_success" {
-                return Ok(false);
-            }
-            let next = generation
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("local operation fencing generation exhausted"))?;
-            let changed = conn.execute(
-                "UPDATE local_operation_receipts SET operation_kind=?3,request_hash=?4,state='executing',fencing_generation=?5,execution_started_at_unix_ms=?6,execution_expires_at_unix_ms=?7,terminal_outcome_json=NULL,updated_at_unix_ms=?6 WHERE owner_digest=?1 AND client_operation_id=?2 AND state='terminal_success'",
-                params![
-                    owner_digest,
-                    client_operation_id,
-                    operation_kind,
-                    request_hash.as_slice(),
-                    next,
-                    now,
-                    now.saturating_add(EXECUTION_LEASE_MS),
-                ],
-            )?;
-            Ok(changed == 1)
-        })
-        .await
-    }
-
     pub async fn finish_local_operation(
         &self,
         owner_digest: String,

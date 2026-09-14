@@ -555,17 +555,14 @@ fn authored_package_files_json_limit_holds_hex_encoded_canonical_packages() {
 }
 
 #[test]
-fn onboarding_publication_journal_owns_nested_authored_identity() {
+fn legacy_onboarding_publication_journal_is_absent_after_rpc_convergence() {
     let sql = include_str!("../src/db/migrations/0001_initial.sql");
-    let declaration = sql
-        .split("CREATE TABLE onboarding_agent_publication_journals")
-        .nth(1)
-        .and_then(|tail| tail.split(");").next())
-        .expect("onboarding publication journal");
     assert!(
-        declaration.contains("authored_owner_digest"),
-        "crash recovery must persist the nested authored journal owner"
+        !sql.contains("CREATE TABLE onboarding_agent_publication_journals"),
+        "the removed ApplySetupWizard bridge must not leave an ownerless publication table"
     );
+    let ownership = include_str!("../schema-ownership.toml");
+    assert!(!ownership.contains("\"onboarding_agent_publication_journals\""));
     let accessors = include_str!("../src/db/authored_agent_packages.rs");
     let production = accessors
         .split("#[cfg(test)]")

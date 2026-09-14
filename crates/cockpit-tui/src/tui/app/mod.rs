@@ -220,6 +220,8 @@ mod control_request_tests;
 mod first_run_daemon_tests;
 #[cfg(test)]
 mod first_run_tests;
+#[cfg(test)]
+mod onboarding_route_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FooterPickerKind {
@@ -2183,6 +2185,11 @@ pub struct App {
     /// Opaque operation IDs issued by this startup generation. Onboarding
     /// reducers consume an ID exactly once only after its receipt correlates.
     pending_startup_onboarding_operations: HashMap<crate::tui::async_action::AsyncActionId, String>,
+    /// Stable client operation id for onboarding agent create/reconcile.
+    onboarding_agent_operation_id: Option<String>,
+    /// Receipt that arrived before the agent authoring screen mounted.
+    pending_startup_agent_authoring_receipt:
+        Option<(String, cockpit_proto::ApplyAuthoredAgentPackageReceipt)>,
     startup_background: StartupBackground,
     /// Non-blocking projection of the latest complete dependency snapshot.
     /// Startup never probes here; Settings owns background refreshes.
@@ -2840,6 +2847,12 @@ pub struct App {
     pub(super) onboarding_shell: Option<Box<crate::tui::onboarding::OnboardingShell>>,
     onboarding_skip: bool,
     onboarding_force: bool,
+    /// When set by `cockpit setup <wizard>`, open that wizard in the shell
+    /// after the bootstrap projection lands.
+    pending_setup_wizard: Option<String>,
+    /// When set by `cockpit provider add <template>`, seed the provider engine
+    /// after the provider stage mounts.
+    pending_provider_add_template: Option<String>,
     /// Occupancy fence: the user explicitly closed the shell (Cancel /
     /// completion exit). Late authority results and concurrent-client
     /// broadcasts still update [`Self::onboarding_snapshot`] but must not
@@ -3964,6 +3977,8 @@ impl App {
             completed_async_actions: Vec::new(),
             skills_pane_generation: 0,
             pending_startup_onboarding_operations: HashMap::new(),
+            onboarding_agent_operation_id: None,
+            pending_startup_agent_authoring_receipt: None,
             startup_background: StartupBackground {
                 daemon_socket: None,
                 daemon_endpoint: None,
@@ -4185,6 +4200,8 @@ impl App {
             onboarding_shell: None,
             onboarding_skip: false,
             onboarding_force: false,
+            pending_setup_wizard: None,
+            pending_provider_add_template: None,
             onboarding_dismissed: false,
             side_conversation: None,
             daemon_draining: false,

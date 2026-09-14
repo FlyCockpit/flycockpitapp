@@ -832,8 +832,8 @@ describe("cockpit-proto daemon wire schemas", () => {
     );
   });
 
-  it("config_refreshed_typescript_mirror_is_current", () => {
-    expect(PROTOCOL_VERSION).toBe(24);
+  it("config_refreshed_typescript_mirror_is_v1", () => {
+    expect(PROTOCOL_VERSION).toBe(1);
     expect(responseEnvelopeSchema.parse(responsesFixture.config_refreshed)).toEqual(
       responsesFixture.config_refreshed,
     );
@@ -875,7 +875,7 @@ describe("cockpit-proto daemon wire schemas", () => {
   });
 
   it("mirrors non-optional session favorite on list and applied receipts", () => {
-    expect(PROTOCOL_VERSION).toBe(24);
+    expect(PROTOCOL_VERSION).toBe(1);
     const request = {
       v: PROTOCOL_VERSION,
       kind: "req" as const,

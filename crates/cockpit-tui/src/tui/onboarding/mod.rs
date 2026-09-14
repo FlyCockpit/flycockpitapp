@@ -20,6 +20,7 @@
 //! the `COCKPIT_REDUCE_MOTION` / `REDUCE_MOTION` controls select the
 //! deterministic static alternative.
 
+pub(crate) mod agent;
 mod search;
 mod secure_store;
 
@@ -119,6 +120,7 @@ pub(crate) enum OnboardingScreen {
     Welcome,
     SecureStore(Box<SecureStoreScreen>),
     ProviderSearch(Box<ProviderSearchScreen>),
+    AgentAuthoring(Box<agent::AgentAuthoringScreen>),
     Engine(EngineStage),
     Complete { summary: String, cursor: usize },
 }
@@ -130,6 +132,7 @@ pub(crate) enum OnboardingScreenKind {
     Welcome,
     SecureStore,
     ProviderSearch,
+    AgentAuthoring,
     Engine,
     Complete,
 }
@@ -142,6 +145,7 @@ impl std::fmt::Debug for OnboardingScreen {
             Self::Welcome => formatter.write_str("Welcome"),
             Self::SecureStore(_) => formatter.write_str("SecureStore([REDACTED])"),
             Self::ProviderSearch(_) => formatter.write_str("ProviderSearch"),
+            Self::AgentAuthoring(_) => formatter.write_str("AgentAuthoring"),
             Self::Engine(stage) => formatter.debug_tuple("Engine").field(stage).finish(),
             Self::Complete { .. } => formatter.write_str("Complete"),
         }
@@ -166,6 +170,9 @@ pub(crate) enum OnboardingShellAction {
     /// Close the shell preserving committed daemon progress; discard only
     /// local unsaved text.
     Close,
+    /// Agent authoring preview/apply/refresh intents for the app daemon
+    /// bridge.
+    AgentAuthoring(agent::AgentAuthoringShellAction),
 }
 
 impl std::fmt::Debug for OnboardingShellAction {
@@ -185,6 +192,10 @@ impl std::fmt::Debug for OnboardingShellAction {
                 .finish(),
             Self::ReturnToCompletion => formatter.write_str("ReturnToCompletion"),
             Self::Close => formatter.write_str("Close"),
+            Self::AgentAuthoring(action) => formatter
+                .debug_tuple("AgentAuthoring")
+                .field(action)
+                .finish(),
         }
     }
 }
@@ -423,11 +434,74 @@ impl OnboardingShell {
         matches!(self.screen, OnboardingScreen::Engine(current) if current == stage)
     }
 
+    pub(crate) fn screen_is_agent_authoring(&self) -> bool {
+        matches!(self.screen, OnboardingScreen::AgentAuthoring(_))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_agent_authoring_phase(&self) -> Option<agent::Phase> {
+        match &self.screen {
+            OnboardingScreen::AgentAuthoring(screen) => Some(screen.test_phase()),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_agent_authoring_status(&self) -> Option<String> {
+        match &self.screen {
+            OnboardingScreen::AgentAuthoring(screen) => screen.test_status().map(str::to_owned),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn agent_authoring_settlement(
+        &self,
+        run_id: uuid::Uuid,
+        attempt_id: uuid::Uuid,
+        stage_revision: u64,
+        config_generation: u64,
+    ) -> Option<cockpit_proto::OnboardingStageSettlement> {
+        match &self.screen {
+            OnboardingScreen::AgentAuthoring(screen) => {
+                screen.stage_settlement(run_id, attempt_id, stage_revision, config_generation)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn take_agent_authoring_action(
+        &mut self,
+    ) -> Option<agent::AgentAuthoringShellAction> {
+        match &mut self.screen {
+            OnboardingScreen::AgentAuthoring(screen) => screen.take_pending_action(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn apply_agent_authoring_outcome(
+        &mut self,
+        outcome: cockpit_proto::ApplyAuthoredAgentPackageOutcome,
+    ) {
+        if let OnboardingScreen::AgentAuthoring(screen) = &mut self.screen {
+            screen.apply_outcome(outcome);
+        }
+    }
+
+    pub(crate) fn replace_agent_authoring_projection(
+        &mut self,
+        projection: cockpit_proto::AgentAuthoringProjection,
+    ) {
+        if let OnboardingScreen::AgentAuthoring(screen) = &mut self.screen {
+            screen.replace_projection(projection);
+        }
+    }
+
     pub(crate) fn screen_kind(&self) -> OnboardingScreenKind {
         match &self.screen {
             OnboardingScreen::Welcome => OnboardingScreenKind::Welcome,
             OnboardingScreen::SecureStore(_) => OnboardingScreenKind::SecureStore,
             OnboardingScreen::ProviderSearch(_) => OnboardingScreenKind::ProviderSearch,
+            OnboardingScreen::AgentAuthoring(_) => OnboardingScreenKind::AgentAuthoring,
             OnboardingScreen::Engine(_) => OnboardingScreenKind::Engine,
             OnboardingScreen::Complete { .. } => OnboardingScreenKind::Complete,
         }
@@ -468,6 +542,19 @@ impl OnboardingShell {
     /// this when the mount happens so the shell presents it.
     pub(crate) fn present_engine(&mut self, stage: EngineStage) {
         self.screen = OnboardingScreen::Engine(stage);
+        self.escape = None;
+    }
+
+    /// Mount the nested agent authoring editor for the onboarding agent stage.
+    pub(crate) fn present_agent_authoring(
+        &mut self,
+        projection: cockpit_proto::AgentAuthoringProjection,
+        client_operation_id: String,
+    ) {
+        self.screen = OnboardingScreen::AgentAuthoring(Box::new(agent::AgentAuthoringScreen::new(
+            projection,
+            client_operation_id,
+        )));
         self.escape = None;
     }
 
@@ -685,6 +772,15 @@ impl OnboardingShell {
                     .handle_key(key)
                     .map(OnboardingShellAction::SelectTemplate)
             }
+            OnboardingScreen::AgentAuthoring(screen) => {
+                if matches!(key.code, KeyCode::Esc) {
+                    self.open_escape_menu(engine);
+                    return None;
+                }
+                screen
+                    .handle_key(key)
+                    .map(OnboardingShellAction::AgentAuthoring)
+            }
             OnboardingScreen::Complete { cursor, .. } => {
                 match key.code {
                     KeyCode::Esc => {
@@ -826,6 +922,22 @@ impl OnboardingShell {
                     None => PointerOutcome::ignored(),
                 }
             }
+            OnboardingScreen::AgentAuthoring(screen) => {
+                if screen.handle_mouse(mouse) {
+                    if let Some(action) = screen.take_pending_action() {
+                        PointerOutcome::acted(OnboardingShellAction::AgentAuthoring(action))
+                    } else {
+                        PointerOutcome::consumed()
+                    }
+                } else if matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ) {
+                    PointerOutcome::consumed()
+                } else {
+                    PointerOutcome::ignored()
+                }
+            }
             OnboardingScreen::Complete { cursor, .. } => {
                 if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                     return PointerOutcome::ignored();
@@ -856,6 +968,7 @@ impl OnboardingShell {
         match &mut self.screen {
             OnboardingScreen::ProviderSearch(screen) => screen.paste_query(text),
             OnboardingScreen::SecureStore(screen) => screen.paste(text),
+            OnboardingScreen::AgentAuthoring(screen) => screen.paste(text),
             _ => {}
         }
     }
@@ -902,6 +1015,9 @@ impl OnboardingShell {
             }
             OnboardingScreen::ProviderSearch(screen) => {
                 Self::render_search(frame, rows[1], screen, &mut self.list_row_rects);
+            }
+            OnboardingScreen::AgentAuthoring(screen) => {
+                screen.render(frame, rows[1]);
             }
             OnboardingScreen::Complete { summary, cursor } => {
                 Self::render_complete(frame, rows[1], summary, *cursor, &mut self.list_row_rects);
@@ -1225,6 +1341,7 @@ impl OnboardingShell {
             OnboardingScreen::Welcome => "any key: begin setup  esc: options",
             OnboardingScreen::SecureStore(screen) => screen.help_text(),
             OnboardingScreen::ProviderSearch(screen) => screen.help_text(),
+            OnboardingScreen::AgentAuthoring(screen) => screen.help_text(),
             OnboardingScreen::Engine(EngineStage::Provider) => {
                 "follow the provider wizard  esc: options"
             }

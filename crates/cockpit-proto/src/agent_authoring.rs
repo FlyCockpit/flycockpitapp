@@ -148,6 +148,8 @@ pub struct AuthoredSidecarDeclaration {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelTrustConfirmation {
+    /// Package-relative definition path, e.g. `agent.md` or `subagents/helper.md`.
+    pub grant_scope: String,
     pub provider_id: String,
     pub model_id: String,
     pub confirmed: bool,
@@ -191,6 +193,14 @@ pub struct ApplyAuthoredAgentPackageRequest {
     pub package: AuthoredAgentPackageDraft,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub onboarding: Option<AuthoredAgentOnboardingCorrelation>,
+    /// When true, canonicalize the package and return its review without
+    /// recording publication intent or mutating installation state.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub validate_only: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,6 +213,16 @@ pub struct AuthoredAgentReviewGrant {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthoredAgentReviewChild {
+    pub path: String,
+    pub grants: Vec<AuthoredAgentReviewGrant>,
+    pub tool_tier_preferences: Vec<(String, String)>,
+    pub interactive_subagents: bool,
+    pub goal_skeptics_label: String,
+    pub children: Vec<AuthoredAgentReviewChild>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthoredAgentReview {
     pub agent_name: String,
     pub grants: Vec<AuthoredAgentReviewGrant>,
@@ -211,10 +231,11 @@ pub struct AuthoredAgentReview {
     pub verification_label: Option<String>,
     pub interactive_subagents: bool,
     pub goal_skeptics_label: String,
-    pub children: Vec<String>,
+    pub children: Vec<AuthoredAgentReviewChild>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sidecars: Vec<String>,
     pub source: String,
+    pub make_default: bool,
     pub trust_is_shared: bool,
     pub trust_disclosure: String,
 }
@@ -229,6 +250,7 @@ pub struct ApplyAuthoredAgentPackageReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installation_id: Option<String>,
     pub default_selected: bool,
+    pub result_config_generation: u64,
     pub review: AuthoredAgentReview,
 }
 
@@ -236,6 +258,7 @@ pub struct ApplyAuthoredAgentPackageReceipt {
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ApplyAuthoredAgentPackageOutcome {
     Receipt(ApplyAuthoredAgentPackageReceipt),
+    Review(AuthoredAgentReview),
     PolicyRevisionConflict {
         projection: AgentAuthoringProjection,
     },

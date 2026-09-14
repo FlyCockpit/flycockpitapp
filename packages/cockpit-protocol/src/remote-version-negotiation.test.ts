@@ -373,10 +373,11 @@ describe("remote_version_upgrade_required_shape", () => {
       expect(err.serverAllowed, `upgrade case server_allowed: ${c.name}`).toEqual(
         c.expectedServerAllowed,
       );
-      // Envelope/transcript version 1, never the application constant (which is
-      // > 1 pre-release, so this rejects the old application-version leak).
+      // Envelope/transcript version 1. The launch cutover also makes the
+      // application protocol v1, so equality is coincidental rather than a
+      // second source for this field.
       expect(err.protocolVersion).toBe(1);
-      expect(err.protocolVersion).not.toBe(PROTOCOL_VERSION);
+      expect(err.protocolVersion).toBe(TRANSCRIPT_VERSION);
     }
   });
 
@@ -387,9 +388,10 @@ describe("remote_version_upgrade_required_shape", () => {
     expect(err.daemonSupported).toEqual([]);
     expect(err.serverAllowed).toEqual([]);
     expect(err.recommendedTupleId).toBeNull();
-    // Envelope version 1, never the application constant.
+    // Envelope version 1; it is fixed independently of the application
+    // protocol even while both values coincide after the launch cutover.
     expect(err.protocolVersion).toBe(1);
-    expect(err.protocolVersion).not.toBe(PROTOCOL_VERSION);
+    expect(err.protocolVersion).toBe(TRANSCRIPT_VERSION);
   });
 });
 

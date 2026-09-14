@@ -403,7 +403,7 @@ pub fn upgrade_required(
         // Envelope/transcript protocol version class — never the application
         // constant. Disclosing PROTOCOL_VERSION would leak the daemon's
         // application version to an unauthenticated peer.
-        protocol_version: 1,
+        protocol_version: u16::from(TRANSCRIPT_VERSION),
         upgrade_side,
         client_supported: filter_sort(inputs.client),
         daemon_supported: filter_sort(inputs.daemon),
@@ -419,7 +419,7 @@ pub fn invalid_input_error() -> UpgradeRequired {
         code: "remote_protocol_invalid",
         // Envelope/transcript protocol version class — never the application
         // constant.
-        protocol_version: 1,
+        protocol_version: u16::from(TRANSCRIPT_VERSION),
         upgrade_side: UpgradeSide::ServerPolicy,
         client_supported: Vec::new(),
         daemon_supported: Vec::new(),
@@ -1233,15 +1233,11 @@ mod tests {
         assert_eq!(err.upgrade_side, UpgradeSide::Multiple);
         assert_eq!(err.recommended_tuple_id, Some(V1_TUPLE_ID));
 
-        // Case 6: protocol_version is the fixed envelope version 1, NOT the
-        // application constant (which is > 1 pre-release, so this rejects the
-        // old leak).
+        // Case 6: protocol_version is the fixed envelope version 1. The launch
+        // cutover also makes the application protocol v1, so equality is
+        // coincidental rather than a second source for this field.
         assert_eq!(err.protocol_version, 1);
-        assert_ne!(
-            err.protocol_version,
-            u16::try_from(PROTOCOL_VERSION).unwrap(),
-            "upgrade error must not disclose the application PROTOCOL_VERSION"
-        );
+        assert_eq!(err.protocol_version, u16::from(TRANSCRIPT_VERSION));
     }
 
     #[test]
@@ -1253,12 +1249,9 @@ mod tests {
         assert!(err.daemon_supported.is_empty());
         assert!(err.server_allowed.is_empty());
         assert_eq!(err.recommended_tuple_id, None);
-        // Envelope version 1, never the application constant.
+        // Envelope version 1, fixed independently of the application protocol.
         assert_eq!(err.protocol_version, 1);
-        assert_ne!(
-            err.protocol_version,
-            u16::try_from(PROTOCOL_VERSION).unwrap()
-        );
+        assert_eq!(err.protocol_version, u16::from(TRANSCRIPT_VERSION));
     }
 
     #[test]

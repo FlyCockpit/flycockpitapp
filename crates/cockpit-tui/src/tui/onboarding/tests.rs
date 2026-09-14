@@ -873,10 +873,6 @@ fn setup_engine_stages_share_shell_chrome_at_narrow_and_wide_sizes() {
             cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
         ),
         (
-            OnboardingStage::Agent,
-            cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID,
-        ),
-        (
             OnboardingStage::Lifetime,
             cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
         ),

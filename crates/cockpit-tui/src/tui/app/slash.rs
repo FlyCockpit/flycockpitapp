@@ -828,7 +828,7 @@ const HIDDEN_SLASH_ALIASES: &[HiddenSlashAlias] = &[
     },
 ];
 
-fn slash_command_by_name(name: &str) -> Option<&'static SlashCommand> {
+pub(crate) fn slash_command_by_name(name: &str) -> Option<&'static SlashCommand> {
     SLASH_COMMANDS.iter().find(|c| c.name == name)
 }
 
@@ -868,32 +868,11 @@ fn run_settings(app: &mut App, _: &str) -> bool {
 
 fn run_setup(app: &mut App, args: &str) -> bool {
     let wizard_id = args.trim();
-    if wizard_id.is_empty() {
-        app.dialog = Dialog::open_setup(&app.launch.cwd);
-        return false;
-    }
-    let dialog = if wizard_id == cockpit_core::wizard::MODEL_WIZARD_ID {
-        Ok(Dialog::open_model_setup_choice(
-            &app.launch.cwd,
-            if app.pending_model_selection.is_none() {
-                app.launch.active_model.clone()
-            } else {
-                None
-            },
-            app.pending_model_selection.as_ref().map(|pending| {
-                (
-                    pending.requested.provider.clone(),
-                    pending.requested.model.clone(),
-                )
-            }),
-        ))
+    app.open_onboarding_setup(if wizard_id.is_empty() {
+        None
     } else {
-        Dialog::open_setup_wizard(&app.launch.cwd, wizard_id)
-    };
-    match dialog {
-        Ok(dialog) => app.dialog = dialog,
-        Err(error) => app.push_plain(format!("/setup: {error}")),
-    }
+        Some(wizard_id)
+    });
     false
 }
 
@@ -3721,7 +3700,7 @@ mod table_tests {
     }
 
     #[test]
-    fn setup_slash_opens_wizard_menu_and_provider() {
+    fn setup_slash_opens_onboarding_shell_and_provider() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cockpit_dir = tmp.path().join(".cockpit");
         std::fs::create_dir_all(&cockpit_dir).expect("create .cockpit");
@@ -3729,20 +3708,62 @@ mod table_tests {
         let cmd = *slash_command_by_name("setup").expect("/setup registry row");
         let mut app = App::new(Some(tmp.path()), false);
         app.dialog = Dialog::None;
+        app.apply_onboarding_bootstrap_snapshot(Some(cockpit_proto::OnboardingBootstrapSnapshot {
+            run_id: uuid::Uuid::new_v4(),
+            attempt_id: uuid::Uuid::new_v4(),
+            revision: 1,
+            stage: cockpit_proto::OnboardingStage::Provider,
+            bootstrap_state: cockpit_proto::OnboardingBootstrapState::Ready,
+            limited_mode: false,
+            lifetime_selection: None,
+            host_capabilities: cockpit_proto::HostCapabilitySnapshot::unpublished(),
+            last_receipt: None,
+        }));
 
         app.composer.set("/setup".to_string());
         app.execute_slash(cmd);
-        assert_eq!(app.dialog.test_page_name(), Some("wizard_menu"));
+        assert!(app.onboarding_shell.is_some());
+        assert_ne!(app.dialog.test_page_name(), Some("wizard_menu"));
 
         app.dialog = Dialog::None;
+        app.onboarding_shell = None;
+        app.apply_onboarding_bootstrap_snapshot(Some(cockpit_proto::OnboardingBootstrapSnapshot {
+            run_id: uuid::Uuid::new_v4(),
+            attempt_id: uuid::Uuid::new_v4(),
+            revision: 1,
+            stage: cockpit_proto::OnboardingStage::Complete,
+            bootstrap_state: cockpit_proto::OnboardingBootstrapState::Ready,
+            limited_mode: false,
+            lifetime_selection: None,
+            host_capabilities: cockpit_proto::HostCapabilitySnapshot::unpublished(),
+            last_receipt: None,
+        }));
         app.composer.set("/setup provider".to_string());
         app.execute_slash(cmd);
-        assert_eq!(app.dialog.test_page_name(), Some("Providers"));
-        assert_eq!(app.dialog.test_provider_surface(), Some("other"));
+        assert!(app.onboarding_shell.is_some());
+        assert_eq!(
+            app.onboarding_shell
+                .as_ref()
+                .map(|shell| shell.screen_kind()),
+            Some(crate::tui::onboarding::OnboardingScreenKind::ProviderSearch)
+        );
 
         app.dialog = Dialog::None;
+        app.onboarding_shell = None;
+        app.apply_onboarding_bootstrap_snapshot(Some(cockpit_proto::OnboardingBootstrapSnapshot {
+            run_id: uuid::Uuid::new_v4(),
+            attempt_id: uuid::Uuid::new_v4(),
+            revision: 1,
+            stage: cockpit_proto::OnboardingStage::Complete,
+            bootstrap_state: cockpit_proto::OnboardingBootstrapState::Ready,
+            limited_mode: false,
+            lifetime_selection: None,
+            host_capabilities: cockpit_proto::HostCapabilitySnapshot::unpublished(),
+            last_receipt: None,
+        }));
         app.composer.set("/setup security".to_string());
         app.execute_slash(cmd);
+        assert!(app.onboarding_shell.is_some());
         assert_eq!(app.dialog.test_page_name(), Some("security"));
     }
 

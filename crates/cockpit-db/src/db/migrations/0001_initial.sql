@@ -8282,23 +8282,6 @@ CREATE TABLE installation_operations (
     CHECK ((state = 'terminal') = (terminal_receipt_json IS NOT NULL))
 );
 
--- Cross-authority onboarding publication intent. Config preimages remain in
--- a daemon-private journal file; this row is the durable recovery owner that
--- restores those bytes, restores the prior default selection, removes only
--- the installation named by operation, and inverts the nested authored
--- journal addressed by (authored_owner_digest, operation_id).  The row and
--- private preimage are one recovery authority: neither is discarded while
--- compensation remains.
-CREATE TABLE onboarding_agent_publication_journals (
-    operation_id                 TEXT PRIMARY KEY,
-    backup_path                  TEXT NOT NULL,
-    previous_default_installation_id TEXT REFERENCES agent_installations(installation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
-    authored_owner_digest        TEXT NOT NULL CHECK (length(trim(authored_owner_digest)) > 0),
-    created_at_unix_ms           INTEGER NOT NULL
-);
-CREATE INDEX idx_onboarding_agent_publication_journals_previous
-    ON onboarding_agent_publication_journals (previous_default_installation_id);
-
 -- Durable authored-package publication intent. Inserted before any
 -- installation, sidecar, default-selection, or draft-CAS effect. Crash
 -- recovery completes the remaining effects from this row without

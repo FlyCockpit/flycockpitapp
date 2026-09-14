@@ -370,45 +370,6 @@ async fn validate_onboarding_stage_settlement(
             }
         }
         proto::OnboardingStage::Agent => {
-            if settlement.wizard_id.as_deref() == Some(crate::wizard::ONBOARDING_AGENT_WIZARD_ID) {
-                let (identity, response_json) = validate_terminal_local_operation_settlement(
-                    ctx,
-                    owner,
-                    &operation_id,
-                    "apply_setup_wizard",
-                )
-                .await?;
-                validate_settlement_request_hash(&identity)?;
-                let response: Response = serde_json::from_str(&response_json).map_err(internal)?;
-                return match response {
-                    Response::SetupWizardApplied {
-                        wizard_id: committed_wizard_id,
-                        changed,
-                        config_generation,
-                        ..
-                    } if committed_wizard_id == crate::wizard::ONBOARDING_AGENT_WIZARD_ID
-                        && changed
-                        && config_generation == settlement.config_generation =>
-                    {
-                        if ctx
-                            .db
-                            .default_agent_installation()
-                            .await
-                            .map_err(internal)?
-                            .is_some()
-                        {
-                            Ok(())
-                        } else {
-                            Err(bad_request(
-                                "agent onboarding advance requires a committed default installation",
-                            ))
-                        }
-                    }
-                    _ => Err(bad_request(
-                        "agent onboarding settlement does not match the requested advance",
-                    )),
-                };
-            }
             let (identity, response_json) = validate_terminal_local_operation_settlement(
                 ctx,
                 owner,
@@ -437,144 +398,6 @@ async fn validate_onboarding_stage_settlement(
             "onboarding settlement correlation is only valid for provider, model, or agent advance",
         )),
     }
-}
-
-/// An onboarding apply owns only the installation whose UUID is the fresh
-/// inner operation key it minted. Installation may instead return an existing
-/// same-source object; cleanup must never infer ownership from an answer or a
-/// returned receipt identity.
-async fn cleanup_owned_onboarding_installation(
-    ctx: &DaemonContext,
-    operation_id: uuid::Uuid,
-) -> anyhow::Result<()> {
-    match ctx
-        .db
-        .delete_agent_installation(operation_id, crate::workspace_lease::now_unix_ms())
-        .await?
-    {
-        cockpit_db::db::agent_installations::DeleteAgentInstallationOutcome::Tombstoned
-        | cockpit_db::db::agent_installations::DeleteAgentInstallationOutcome::Deleted
-        | cockpit_db::db::agent_installations::DeleteAgentInstallationOutcome::AlreadyDeleted
-        | cockpit_db::db::agent_installations::DeleteAgentInstallationOutcome::NotFound => Ok(()),
-    }
-}
-
-/// Release a completed journal.  Delete the durable intent before its private
-/// preimage: a death after the row is gone can leave an orphaned private file,
-/// but can never leave boot recovery blocked on a preimage that was already
-/// destroyed.
-async fn settle_onboarding_publication_journal(
-    ctx: &DaemonContext,
-    operation_id: uuid::Uuid,
-    backup: &std::path::Path,
-) -> anyhow::Result<()> {
-    let operation = operation_id.to_string();
-    ctx.db
-        .write(move |conn| {
-            let deleted = conn.execute(
-                "DELETE FROM onboarding_agent_publication_journals WHERE operation_id=?1",
-                rusqlite::params![operation],
-            )?;
-            anyhow::ensure!(
-                deleted == 1,
-                "onboarding publication journal disappeared before settlement"
-            );
-            Ok(())
-        })
-        .await?;
-    if let Err(error) = crate::wizard::OnboardingConfigRollback::discard_durable_journal(backup) {
-        // The SQLite intent is already gone, so this private preimage can no
-        // longer block recovery. It is an orphan eligible for later private
-        // state collection, not a reason to report a completed publication as
-        // failed or recreate recovery ownership.
-        tracing::warn!(%error, path = %backup.display(), "onboarding publication journal preimage orphaned after settlement");
-    }
-    Ok(())
-}
-
-async fn compensate_onboarding_agent_publication(
-    ctx: &DaemonContext,
-    operation_id: uuid::Uuid,
-    backup: &std::path::Path,
-    previous_default_installation_id: Option<uuid::Uuid>,
-    authored_owner_digest: String,
-) -> anyhow::Result<()> {
-    // Always attempt every inverse operation.  The journal remains intact on
-    // any failure, so startup can retry exactly this full compensation.
-    // Invert the nested authored journal first so a later crash cannot
-    // complete-forward an apply this compensation is rolling back.
-    let authored = ctx
-        .db
-        .compensate_authored_agent_package_journal(authored_owner_digest, operation_id.to_string())
-        .await;
-    let config = crate::wizard::OnboardingConfigRollback::restore_durable_journal(backup);
-    let installation = cleanup_owned_onboarding_installation(ctx, operation_id).await;
-    let default = ctx
-        .db
-        .restore_default_agent_installation(
-            previous_default_installation_id,
-            crate::workspace_lease::now_unix_ms(),
-        )
-        .await;
-    if let (Ok(()), Ok(()), Ok(()), Ok(())) = (&config, &installation, &default, &authored) {
-        return settle_onboarding_publication_journal(ctx, operation_id, backup).await;
-    }
-    Err(anyhow::anyhow!(
-        "onboarding publication compensation incomplete; config: {}; installation: {}; prior default: {}; authored journal: {}",
-        config
-            .err()
-            .map_or_else(|| "ok".to_string(), |error| format!("{error:#}")),
-        installation
-            .err()
-            .map_or_else(|| "ok".to_string(), |error| format!("{error:#}")),
-        default
-            .err()
-            .map_or_else(|| "ok".to_string(), |error| format!("{error:#}")),
-        authored
-            .err()
-            .map_or_else(|| "ok".to_string(), |error| format!("{error:#}")),
-    ))
-}
-
-/// Reconcile an interrupted onboarding publication before the daemon accepts
-/// clients. The intent is created before installation, so restoring its exact
-/// config preimage, prior DB default, operation-named installation, and nested
-/// authored journal (draft CAS included) exposes none of an interrupted plan.
-/// A missing/corrupt private journal fails closed and keeps the socket unpublished.
-pub(super) async fn recover_onboarding_agent_publication_journals(
-    ctx: &DaemonContext,
-) -> std::result::Result<(), ErrorPayload> {
-    let rows: Vec<(String, String, Option<String>, String)> = ctx
-        .db
-        .read(|conn| {
-            let mut statement = conn.prepare(
-                "SELECT operation_id,backup_path,previous_default_installation_id,authored_owner_digest FROM onboarding_agent_publication_journals ORDER BY created_at_unix_ms",
-            )?;
-            Ok(statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?)
-        })
-        .await
-        .map_err(internal)?;
-    for (operation, backup_path, previous_default, authored_owner_digest) in rows {
-        let operation_id = uuid::Uuid::parse_str(&operation)
-            .map_err(|error| internal(anyhow::Error::from(error)))?;
-        let backup = std::path::PathBuf::from(backup_path);
-        let previous_default = previous_default
-            .map(|value| uuid::Uuid::parse_str(&value))
-            .transpose()
-            .map_err(|error| internal(anyhow::Error::from(error)))?;
-        compensate_onboarding_agent_publication(
-            ctx,
-            operation_id,
-            &backup,
-            previous_default,
-            authored_owner_digest,
-        )
-        .await
-        .map_err(internal)?;
-    }
-    Ok(())
 }
 
 /// Recover the catalog `(provider_id, model_id)` whose identity digests match
@@ -11497,8 +11320,58 @@ async fn handle_serialized_request_impl(
             Ok(Response::AgentAuthoringProjection(projection))
         }
         Request::ApplyAuthoredAgentPackage(request) => {
+            if request.validate_only {
+                let outcome = crate::daemon::agent_authoring::apply_package(ctx, request, None)
+                    .await
+                    .map_err(internal)?;
+                return Ok(Response::AuthoredAgentPackage(outcome));
+            }
+            let _publication_guard = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
             let settlement_owner = settings_capability_owner(state);
             let request_hash = local_operation_request_hash(&request)?;
+            let existing_settlement = ctx
+                .db
+                .local_operation_settlement(
+                    settlement_owner.clone(),
+                    request.client_operation_id.clone(),
+                )
+                .await
+                .map_err(internal)?;
+            if matches!(
+                &existing_settlement,
+                Some(crate::db::local_operation_receipts::LocalOperationSettlement::Pending(_))
+            ) {
+                return Err(conflict(
+                    "an exact duplicate local operation is already executing; query its settlement",
+                ));
+            }
+            if existing_settlement.is_some() {
+                match begin_local_operation(
+                    ctx,
+                    &settlement_owner,
+                    &request.client_operation_id,
+                    "apply_authored_agent_package",
+                    request_hash,
+                )
+                .await?
+                {
+                    LocalOperationStart::Replay(response) => return Ok(response),
+                    LocalOperationStart::Execute(_) => {
+                        return Err(internal(anyhow::anyhow!(
+                            "terminal authored package operation reopened unexpectedly"
+                        )));
+                    }
+                }
+            }
+            if let Some(outcome) =
+                crate::daemon::agent_authoring::preflight_package_under_publication_lock(
+                    ctx, &request,
+                )
+                .await
+                .map_err(internal)?
+            {
+                return Ok(Response::AuthoredAgentPackage(outcome));
+            }
             let fencing_generation = match begin_local_operation(
                 ctx,
                 &settlement_owner,
@@ -11511,7 +11384,7 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Replay(response) => return Ok(response),
                 LocalOperationStart::Execute(generation) => generation,
             };
-            let outcome = crate::daemon::agent_authoring::apply_package(
+            let outcome = crate::daemon::agent_authoring::apply_package_under_publication_lock(
                 ctx,
                 request.clone(),
                 Some(crate::daemon::agent_authoring::AuthoredApplyFence {
@@ -11555,7 +11428,7 @@ async fn handle_serialized_request_impl(
             let receipt = crate::daemon::agent_authoring::receipt(ctx, &owner, query)
                 .await
                 .map_err(internal)?;
-            Ok(Response::AuthoredAgentPackageReceipt(Some(receipt)))
+            Ok(Response::AuthoredAgentPackageReceipt(receipt))
         }
 
         Request::CreateAssistantSession {
@@ -18681,198 +18554,9 @@ async fn handle_serialized_request_impl(
                     cockpit_config::config::dirs::global_config_file().map_err(internal)?;
                 prepare_user_level_write_target(ctx, &global_config)?;
                 if wizard_id == crate::wizard::ONBOARDING_AGENT_WIZARD_ID {
-                    // Catalog I/O is deliberately outside the publication
-                    // boundary. Once it is resolved, the config snapshot used
-                    // to validate the plan and every config publication share
-                    // the daemon-wide serialization gate.
-                    let catalog_revision =
-                        crate::wizard::onboarding_catalog_revision_from_answers_json(&answers_json)
-                            .map_err(internal)?;
-                    // The renderer's catalog revision is an authority input,
-                    // not a hint. A live picker must never silently replay
-                    // against a newer `main` (or a different offline cache).
-                    let catalog = if catalog_revision
-                        == crate::daemon::agent_catalog::BUNDLED_CATALOG_REVISION
-                    {
-                        crate::daemon::agent_catalog::ResolvedAgentCatalog {
-                            revision: catalog_revision,
-                            origin: crate::daemon::agent_catalog::AgentCatalogOrigin::Cached,
-                            index: crate::daemon::agent_catalog::cached_catalog()
-                                .map_err(internal)?,
-                        }
-                    } else {
-                        crate::daemon::agent_catalog::fetch_catalog_at_revision(&catalog_revision)
-                            .await
-                            .map_err(internal)?
-                    };
-                    let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
-                    let prepared = crate::wizard::prepare_onboarding_agent_answers_for_catalog(
-                        &answers_json,
-                        catalog,
-                    )
-                    .map_err(internal)?;
-                    // Each apply attempt owns a fresh installation operation.
-                    // The outer setup RPC supplies its own replay fence; using
-                    // the answers as this inner idempotency key would replay a
-                    // prior installation and let a later failed publication
-                    // delete somebody else's already-successful result.
-                    let operation_key = uuid::Uuid::now_v7().to_string();
-                    let owned_installation_id = uuid::Uuid::parse_str(&operation_key)
-                        .expect("fresh UUID operation key parses");
-                    // Prepare the cross-authority rollback before *any*
-                    // installation side effect. A daemon death at every later
-                    // boundary is recovered before the socket is published.
-                    let _publication_rollback =
-                        crate::wizard::capture_onboarding_agent_config_for_providers(
-                            &prepared.draft,
-                            Some(&prepared.providers),
-                        )
-                        .map_err(internal)?;
-                    let previous_default_installation_id = ctx
-                        .db
-                        .default_agent_installation()
-                        .await
-                        .map_err(internal)?;
-                    let publication_backup = _publication_rollback
-                        .write_durable_journal(owned_installation_id)
-                        .map_err(internal)?;
-                    let journal_operation = operation_key.clone();
-                    let journal_backup = publication_backup.to_string_lossy().into_owned();
-                    let journal_previous_default =
-                        previous_default_installation_id.map(|id| id.to_string());
-                    let journal_authored_owner = settlement_owner.clone();
-                    if let Err(error) = ctx
-                        .db
-                        .write(move |conn| {
-                            conn.execute(
-                                "INSERT INTO onboarding_agent_publication_journals(operation_id,backup_path,previous_default_installation_id,authored_owner_digest,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5)",
-                                rusqlite::params![journal_operation,journal_backup,journal_previous_default,journal_authored_owner,crate::workspace_lease::now_unix_ms()],
-                            )?;
-                            Ok(())
-                        })
-                        .await
-                    {
-                        let _ = crate::wizard::OnboardingConfigRollback::discard_durable_journal(
-                            &publication_backup,
-                        );
-                        return Err(internal(error));
-                    }
-                    let onboarding =
-                        ctx.db
-                            .onboarding_snapshot()
-                            .await
-                            .ok()
-                            .flatten()
-                            .and_then(|row| {
-                                (row.stage == crate::db::onboarding::OnboardingStage::Agent).then(
-                                    || cockpit_proto::AuthoredAgentOnboardingCorrelation {
-                                        run_id: row.run_id,
-                                        attempt_id: row.attempt_id,
-                                        stage_revision: row.revision,
-                                    },
-                                )
-                            });
-                    let authored_request = cockpit_proto::ApplyAuthoredAgentPackageRequest {
-                        client_operation_id: operation_key.clone(),
-                        expected_policy_revision: prepared.snapshot.policy_revision.clone(),
-                        package: prepared.draft.clone(),
-                        onboarding,
-                    };
-                    let authored_request_hash = local_operation_request_hash(&authored_request)?;
-                    match crate::daemon::agent_authoring::apply_package_under_publication_lock(
-                        ctx,
-                        authored_request,
-                        Some(crate::daemon::agent_authoring::AuthoredApplyFence {
-                            owner_digest: settlement_owner.clone(),
-                            request_hash: authored_request_hash,
-                            fencing_generation,
-                        }),
-                    )
-                    .await
-                    {
-                        Ok(cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(receipt))
-                            if receipt.installation_id.is_some() => {}
-                        Ok(other) => {
-                            let compensation = compensate_onboarding_agent_publication(
-                                ctx,
-                                owned_installation_id,
-                                &publication_backup,
-                                previous_default_installation_id,
-                                settlement_owner.clone(),
-                            )
-                            .await;
-                            return Err(internal(match compensation {
-                                Ok(()) => anyhow::anyhow!(
-                                    "agent onboarding authored package was not committed: {other:?}"
-                                ),
-                                Err(recovery) => anyhow::anyhow!(
-                                    "agent onboarding authored package was not committed ({other:?}); recovery remains pending: {recovery:#}"
-                                ),
-                            }));
-                        }
-                        Err(error) => {
-                            let compensation = compensate_onboarding_agent_publication(
-                                ctx,
-                                owned_installation_id,
-                                &publication_backup,
-                                previous_default_installation_id,
-                                settlement_owner.clone(),
-                            )
-                            .await;
-                            return Err(internal(match compensation {
-                                Ok(()) => error,
-                                Err(recovery) => anyhow::anyhow!(
-                                    "agent onboarding authored package failed ({error:#}); recovery remains pending: {recovery:#}"
-                                ),
-                            }));
-                        }
-                    };
-                    // Trust/default-agent config remains a global policy write.
-                    // Package files, sidecar.json, bindings, and default
-                    // selection are already committed by the authored apply.
-                    match crate::wizard::publish_onboarding_agent_plan(&prepared) {
-                        Ok(_) => {}
-                        Err(error) => {
-                            let compensation = compensate_onboarding_agent_publication(
-                                ctx,
-                                owned_installation_id,
-                                &publication_backup,
-                                previous_default_installation_id,
-                                settlement_owner.clone(),
-                            )
-                            .await;
-                            return Err(internal(match compensation {
-                                Ok(()) => error,
-                                Err(recovery) => anyhow::anyhow!(
-                                    "agent onboarding config publication failed ({error:#}); recovery remains pending: {recovery:#}"
-                                ),
-                            }));
-                        }
-                    };
-                    // A complete publication is visible only after every
-                    // participant succeeds. Release the durable owner before
-                    // deleting its private preimage so re-entry can never be
-                    // blocked on an already-discarded recovery file.
-                    settle_onboarding_publication_journal(
-                        ctx,
-                        owned_installation_id,
-                        &publication_backup,
-                    )
-                    .await
-                    .map_err(internal)?;
-                    // The publication is durable and still inside the
-                    // daemon-wide publication gate: publish the config
-                    // generation the wizard settlement fence proves against.
-                    // A compensated apply never reaches this line, so the
-                    // counter never advances for a rolled-back plan.
-                    let config_generation = inventory::publish_committed_config_generation();
-                    return Ok(Response::SetupWizardApplied {
-                        wizard_id: wizard_id.clone(),
-                        changed: true,
-                        model_file_written: true,
-                        default_scope: Some("global".into()),
-                        config_generation,
-                    });
+                    return Err(bad_request(
+                        "the onboarding agent stage uses ApplyAuthoredAgentPackage, not ApplySetupWizard",
+                    ));
                 }
                 // Every generic wizard apply is a config publication: it
                 // shares the daemon-wide serialization gate with provider
@@ -20238,7 +19922,7 @@ fn agent_editor_lease_owner(state: &MutableClientState) -> String {
     stable_authenticated_principal(state)
 }
 
-fn settings_capability_owner(state: &MutableClientState) -> String {
+pub(super) fn settings_capability_owner(state: &MutableClientState) -> String {
     // Settings dialogs use short-lived daemon connections.  Bind the
     // unguessable capability to the authenticated principal, while the
     // capability record itself binds root, target identity and revision.
@@ -22348,7 +22032,7 @@ async fn provider_operation_journal_exists(
         .map_err(internal)
 }
 
-fn local_operation_request_hash<T: serde::Serialize>(
+pub(super) fn local_operation_request_hash<T: serde::Serialize>(
     request: &T,
 ) -> std::result::Result<[u8; 32], ErrorPayload> {
     let encoded = zeroize::Zeroizing::new(serde_json::to_vec(request).map_err(internal)?);

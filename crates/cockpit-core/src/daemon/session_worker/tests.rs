@@ -330,7 +330,10 @@ fn coverage_map_has_no_unclassified_builder_refresh_or_empty_admission() {
             _ => unclassified.push(format!("{path_text}:{line}:{matched}")),
         }
     }
-    assert_eq!(authority_internal, 2, "authority capture funnel changed");
+    // #390's final route inventory has three authority-owned complete-capture
+    // shapes: session+sealed, daemon-global without sealed, and detached
+    // session without sealed. They all remain inside this one authority file.
+    assert_eq!(authority_internal, 3, "authority capture funnel changed");
     assert_eq!(
         raw_export, 1,
         "raw export must be the sole typed raw branch"

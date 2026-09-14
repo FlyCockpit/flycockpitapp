@@ -147,6 +147,28 @@ impl fmt::Debug for RedactionCoverageKey {
 }
 
 impl RedactionCoverageKey {
+    fn same_lineage(&self, other: &Self) -> bool {
+        self.principal == other.principal
+            && self.owner_authorization == other.owner_authorization
+            && self.session == other.session
+            && self.workspace == other.workspace
+    }
+
+    /// Refresh mutable owned-source revisions while retaining the daemon-bound
+    /// principal, authorization, session, and workspace identity. Callers
+    /// derive `current` from live inputs; they cannot reconstruct the retained
+    /// authorization identity from a numeric guess at a later turn.
+    pub(crate) fn with_current_owned_revisions(&self, current: &Self) -> Self {
+        let mut refreshed = self.clone();
+        refreshed.environment = current.environment;
+        refreshed.credential_vault = current.credential_vault;
+        refreshed.policy = current.policy;
+        refreshed.sealed = current.sealed;
+        refreshed.override_revision = current.override_revision;
+        refreshed.machine_sources = current.machine_sources;
+        refreshed
+    }
+
     pub(crate) fn matches_owned_revisions(
         &self,
         revisions: &super::coverage_bindings::OwnedSourceRevisions,
@@ -258,6 +280,7 @@ pub(crate) struct CoverageTableBinding {
     authority: Weak<Inner>,
     generation_id: Uuid,
     epoch: u64,
+    generation_order: u64,
     key_revision: u64,
     key: RedactionCoverageKey,
     live_binding: Option<LiveCurrentBindingGuard>,
@@ -278,6 +301,7 @@ impl Clone for CoverageTableBinding {
             authority: self.authority.clone(),
             generation_id: self.generation_id,
             epoch: self.epoch,
+            generation_order: self.generation_order,
             key_revision: self.key_revision,
             key: self.key.clone(),
             live_binding,
@@ -287,32 +311,39 @@ impl Clone for CoverageTableBinding {
 
 impl CoverageTableBinding {
     pub(crate) fn same_generation(&self, other: &Self) -> bool {
-        self.generation_id == other.generation_id
+        self.authority.ptr_eq(&other.authority)
+            && self.key == other.key
+            && self.generation_id == other.generation_id
             && self.epoch == other.epoch
+            && self.generation_order == other.generation_order
             && self.key_revision == other.key_revision
     }
 
-    pub(crate) fn same_coverage_key(&self, other: &Self) -> bool {
-        self.key == other.key
-    }
-
     pub(crate) fn binding_ordering(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        if !self.same_coverage_key(other) {
+        // A repeated opaque generation id must describe precisely the same
+        // authority, key material, and counters. Anything else is forged or
+        // ambiguous and cannot participate in an ordered historical fold.
+        if self.generation_id == other.generation_id {
+            return self
+                .same_generation(other)
+                .then_some(std::cmp::Ordering::Equal);
+        }
+        // Mutable source revisions may legitimately differ across historical
+        // generations, but principal/session/workspace authority may not.
+        if !self.authority.ptr_eq(&other.authority) || !self.key.same_lineage(&other.key) {
             return None;
         }
-        match self.epoch.cmp(&other.epoch) {
-            std::cmp::Ordering::Equal => {}
-            order => return Some(order),
-        }
-        match self.key_revision.cmp(&other.key_revision) {
-            std::cmp::Ordering::Equal => {
-                if self.same_generation(other) {
-                    Some(std::cmp::Ordering::Equal)
-                } else {
-                    None
-                }
-            }
-            order => Some(order),
+        let order = (self.epoch, self.generation_order, self.key_revision).cmp(&(
+            other.epoch,
+            other.generation_order,
+            other.key_revision,
+        ));
+        if order == std::cmp::Ordering::Equal {
+            // Generation order is authority-unique. Equal counters paired
+            // with distinct ids cannot be assigned trustworthy provenance.
+            None
+        } else {
+            Some(order)
         }
     }
 
@@ -429,6 +460,7 @@ pub(crate) struct RedactionCoverageGeneration {
     id: Uuid,
     key: RedactionCoverageKey,
     epoch: u64,
+    generation_order: u64,
     key_revision: u64,
     table: Arc<RedactionTable>,
     artifact_bytes: usize,
@@ -447,11 +479,18 @@ impl fmt::Debug for RedactionCoverageGeneration {
 }
 
 impl RedactionCoverageGeneration {
-    fn new(key: RedactionCoverageKey, epoch: u64, key_revision: u64, build: CoverageBuild) -> Self {
+    fn new(
+        key: RedactionCoverageKey,
+        epoch: u64,
+        generation_order: u64,
+        key_revision: u64,
+        build: CoverageBuild,
+    ) -> Self {
         Self {
             id: Uuid::now_v7(),
             key,
             epoch,
+            generation_order,
             key_revision,
             table: build.table,
             artifact_bytes: build.artifact_bytes,
@@ -488,6 +527,7 @@ struct Resident {
 
 struct State {
     epoch: u64,
+    next_generation_order: u64,
     closed: bool,
     queued: usize,
     allocated_flights: usize,
@@ -528,6 +568,7 @@ impl RedactionCoverageAuthority {
             inner: Arc::new(Inner {
                 state: Mutex::new(State {
                     epoch: 1,
+                    next_generation_order: 1,
                     closed: false,
                     queued: 0,
                     allocated_flights: 0,
@@ -785,9 +826,15 @@ impl RedactionCoverageAuthority {
         {
             return Err(CoverageError::Saturated);
         }
+        let generation_order = state.next_generation_order;
+        state.next_generation_order = state
+            .next_generation_order
+            .checked_add(1)
+            .ok_or(CoverageError::Unavailable)?;
         let generation = Arc::new(RedactionCoverageGeneration::new(
             key.clone(),
             state.epoch,
+            generation_order,
             flight_key_revision,
             build,
         ));
@@ -1093,6 +1140,7 @@ impl CoverageAdmission {
             authority: self.inner.clone(),
             generation_id: self.generation.id,
             epoch: self.generation.epoch,
+            generation_order: self.generation.generation_order,
             key_revision: self.generation.key_revision,
             key: self.generation.key.clone(),
             live_binding: None,

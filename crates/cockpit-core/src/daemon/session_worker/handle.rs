@@ -1927,7 +1927,6 @@ impl SessionWorkerHandle {
         use crate::redact::coverage_bindings::{
             SessionCoveragePublishLive, session_publish_owners,
         };
-        let session = self.session.clone();
         let config_snapshot = self.config_snapshot.clone();
         let env_overlay = self.env_overlay.clone();
         let project_root = self.project_root.clone();
@@ -1982,11 +1981,12 @@ impl SessionWorkerHandle {
         &self,
         purpose: crate::redact::coverage_authority::CoverageScope,
     ) -> anyhow::Result<crate::redact::coverage_authority::CoverageAdmission> {
-        let (authority, key, policy_digest) = self
+        let (authority, installed_key, _installed_policy_digest) = self
             .session
             .redaction_coverage()
             .ok_or_else(|| anyhow::anyhow!("coverage_unavailable"))?;
         let config = self.config_snapshot().extended.redact.clone();
+        let policy_digest = crate::redact::coverage_bindings::redact_config_digest(&config);
         let root = self.project_root.clone();
         let environment = crate::env_snapshot::EnvSnapshot::new(
             cockpit_proto::EnvSnapshotSource::SessionWorker,
@@ -2011,6 +2011,21 @@ impl SessionWorkerHandle {
             .secret_vault()
             .current_inventory_generation()
             .map_err(|error| anyhow::anyhow!("reading redaction vault revision: {error}"))?;
+        let current_key = crate::redact::coverage_bindings::SessionCoverageInputs {
+            principal: &principal,
+            owner_authorization_revision: trust_revision,
+            session_id,
+            workspace_root: &root,
+            environment: &environment,
+            vault_revision,
+            command_cache: &command_cache,
+            policy_digest: &policy_digest,
+            sealed: sealed_binding,
+            override_revision: 0,
+            redact_config: &config,
+        }
+        .coverage_key();
+        let key = installed_key.with_current_owned_revisions(&current_key);
         let store = self.session.credential_store()?;
         let sealed = self.session.machine_scoped_sealed_redactions().await?;
         let env = environment.vars().clone();
@@ -2021,8 +2036,9 @@ impl SessionWorkerHandle {
         let publish_fence = self
             .coverage_publish_owners(publish_vault, publish_db, publish_command_cache)
             .publish_fence();
-        authority
-            .acquire(key, purpose, move || {
+        let capture_policy_digest = policy_digest.clone();
+        let admission = authority
+            .acquire(key.clone(), purpose, move || {
                 let capture_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
                     principal: &principal,
                     owner_authorization_revision: trust_revision,
@@ -2031,7 +2047,7 @@ impl SessionWorkerHandle {
                     environment: &env_snapshot_for_capture,
                     vault_revision,
                     command_cache: &command_cache,
-                    policy_digest: &policy_digest,
+                    policy_digest: &capture_policy_digest,
                     sealed: sealed_binding,
                     override_revision: 0,
                     redact_config: &config,
@@ -2047,7 +2063,13 @@ impl SessionWorkerHandle {
                 Ok(build.with_publish_fence(publish_fence))
             })
             .await
-            .map_err(|error| anyhow::anyhow!(error.to_string()))
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        // The operation boundary has awaited a complete, fenced publication;
+        // advertise that generation before serving the sink so later
+        // mutations revoke the current key rather than a stale startup key.
+        self.session
+            .set_redaction_coverage(authority, key, policy_digest);
+        Ok(admission)
     }
 
     /// Delete a sealed value. Reached only from the daemon's `owner_only`

@@ -10,7 +10,7 @@ This inventory classifies every production `RedactionTable::scrub` boundary and 
 - Approval, rules, skills, and sandbox boundary: `crates/cockpit-core/src/approval/policy.rs`, `crates/cockpit-core/src/conversation_rules.rs`, `crates/cockpit-core/src/skills/mod.rs`, `crates/cockpit-core/src/mcp/network.rs`, `crates/cockpit-core/src/mcp/sandbox.rs`
 - Off machine: `crates/cockpit-core/src/session/export/mod.rs`, `crates/cockpit-core/src/daemon/org_sync.rs`, `crates/cockpit-core/src/daemon/remote_audit_upload.rs`
 - Session-worker persist path: `crates/cockpit-core/src/daemon/session_worker/mod.rs`, `crates/cockpit-core/src/daemon/session_worker/run.rs`, `crates/cockpit-core/src/engine/driver/mod.rs`, `crates/cockpit-core/src/engine/rehydrate.rs`, `crates/cockpit-core/src/session/recording.rs`
-- Core scrub entry points: `crates/cockpit-core/src/redact/mod.rs`
+- Core scrub entry points: `crates/cockpit-core/src/redact/mod.rs`, `crates/cockpit-core/src/redact/coverage_authority.rs`
 <!-- scrub-inventory:end -->
 
 ## Dispatch
@@ -64,6 +64,7 @@ This inventory classifies every production `RedactionTable::scrub` boundary and 
 ## Core scrub entry points
 
 - `crates/cockpit-core/src/redact/mod.rs`: defines the `scrub`, `scrub_cow`, and table behavior every boundary above uses. It is listed so changes to the scrub entry-point file stay visible in this inventory.
+- `crates/cockpit-core/src/redact/coverage_authority.rs`: constructs owner-only unsupported-source diagnostics through a generation-bound table, scrubbing the narrow display path before it can enter the status projection.
 
 ## Adjacent but different mechanisms
 

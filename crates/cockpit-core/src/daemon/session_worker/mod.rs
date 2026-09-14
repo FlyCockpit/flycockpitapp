@@ -483,7 +483,8 @@ async fn refresh_redaction_for_turn(
 ) -> RedactionRefreshOutcome {
     let mut cfg = base_redact;
     overrides.apply_to(&mut cfg);
-    let Some((authority, coverage_key, policy_digest)) = session.redaction_coverage() else {
+    let Some((authority, installed_key, _installed_policy_digest)) = session.redaction_coverage()
+    else {
         return RedactionRefreshOutcome::Refused("coverage_unavailable".to_string());
     };
     let store = match session.credential_store() {
@@ -508,6 +509,7 @@ async fn refresh_redaction_for_turn(
         Err(error) => return RedactionRefreshOutcome::Refused(error.to_string()),
     };
     let sealed_binding = crate::redact::coverage_bindings::sealed_records_binding(&sealed_records);
+    let policy_digest = crate::redact::coverage_bindings::redact_config_digest(&cfg);
     let principal = crate::daemon::principal::ClientPrincipal::owner();
     let command_cache = match session.command_secret_cache() {
         Some(cache) => cache,
@@ -521,6 +523,22 @@ async fn refresh_redaction_for_turn(
             ));
         }
     };
+    let current_key = crate::redact::coverage_bindings::SessionCoverageInputs {
+        principal: &principal,
+        owner_authorization_revision: 0,
+        session_id,
+        workspace_root: project_root,
+        environment: &environment,
+        vault_revision,
+        command_cache: &command_cache,
+        policy_digest: &policy_digest,
+        sealed: sealed_binding,
+        override_revision: 0,
+        redact_config: &cfg,
+    }
+    .coverage_key();
+    let coverage_key = installed_key.with_current_owned_revisions(&current_key);
+    let capture_policy_digest = policy_digest.clone();
     let env_snapshot_for_capture = environment.clone();
     let publish_vault = session.secret_vault().clone();
     let publish_db = session.db.clone();
@@ -537,7 +555,7 @@ async fn refresh_redaction_for_turn(
     .publish_fence();
     let refresh_result = match authority
         .acquire(
-            coverage_key,
+            coverage_key.clone(),
             crate::redact::coverage_authority::CoverageScope::SessionSubmission,
             move || {
                 let capture_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
@@ -548,7 +566,7 @@ async fn refresh_redaction_for_turn(
                     environment: &env_snapshot_for_capture,
                     vault_revision,
                     command_cache: &command_cache,
-                    policy_digest: &policy_digest,
+                    policy_digest: &capture_policy_digest,
                     sealed: sealed_binding,
                     override_revision: 0,
                     redact_config: &cfg,
@@ -579,6 +597,11 @@ async fn refresh_redaction_for_turn(
                         match session.persist_redaction_table(&unioned) {
                             Ok(()) => {
                                 set_current_redaction(&accumulated_redact, unioned.clone());
+                                session.set_redaction_coverage(
+                                    authority.clone(),
+                                    coverage_key,
+                                    policy_digest,
+                                );
                                 Ok(unioned)
                             }
                             Err(error) => Err(anyhow::anyhow!(error)),

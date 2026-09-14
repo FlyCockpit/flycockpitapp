@@ -144,10 +144,10 @@ pub(crate) async fn rebuild_model_for_credentials(
     // (b) Credential rotation revokes the old generation before the retry.
     // Reacquisition captures the refreshed owner-scoped store and sealed view
     // on the authority's bounded worker facility.
-    let (authority, coverage_key, policy_digest) = session
+    let (authority, installed_key, _installed_policy_digest) = session
         .redaction_coverage()
         .ok_or_else(|| anyhow::anyhow!("coverage_unavailable"))?;
-    authority.invalidate_key(&coverage_key);
+    authority.invalidate_key(&installed_key);
     let sealed = session.machine_scoped_sealed_redactions().await?;
     let capture_config = extended.redact.clone();
     let capture_root = session.project_root.clone();
@@ -159,6 +159,7 @@ pub(crate) async fn rebuild_model_for_credentials(
     );
     let sealed_records = session.db.machine_scoped_sealed_redaction_records().await?;
     let sealed_binding = crate::redact::coverage_bindings::sealed_records_binding(&sealed_records);
+    let policy_digest = crate::redact::coverage_bindings::redact_config_digest(&capture_config);
     let principal = crate::daemon::principal::ClientPrincipal::owner();
     let command_cache = session
         .command_secret_cache()
@@ -168,6 +169,22 @@ pub(crate) async fn rebuild_model_for_credentials(
         .current_inventory_generation()
         .map_err(|error| anyhow::anyhow!("reading redaction vault revision: {error}"))?;
     let session_id = session.id;
+    let current_key = crate::redact::coverage_bindings::SessionCoverageInputs {
+        principal: &principal,
+        owner_authorization_revision: 0,
+        session_id,
+        workspace_root: &capture_root,
+        environment: &environment,
+        vault_revision,
+        command_cache: &command_cache,
+        policy_digest: &policy_digest,
+        sealed: sealed_binding,
+        override_revision: 0,
+        redact_config: &capture_config,
+    }
+    .coverage_key();
+    let coverage_key = installed_key.with_current_owned_revisions(&current_key);
+    let capture_policy_digest = policy_digest.clone();
     let env_snapshot_for_capture = environment.clone();
     let publish_vault = session.secret_vault().clone();
     let publish_db = session.db.clone();
@@ -208,7 +225,7 @@ pub(crate) async fn rebuild_model_for_credentials(
     .publish_fence();
     let admission = authority
         .acquire(
-            coverage_key,
+            coverage_key.clone(),
             crate::redact::coverage_authority::CoverageScope::CredentialRetry,
             move || {
                 let capture_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
@@ -219,7 +236,7 @@ pub(crate) async fn rebuild_model_for_credentials(
                     environment: &env_snapshot_for_capture,
                     vault_revision,
                     command_cache: &command_cache,
-                    policy_digest: &policy_digest,
+                    policy_digest: &capture_policy_digest,
                     sealed: sealed_binding,
                     override_revision: 0,
                     redact_config: &capture_config,
@@ -239,6 +256,7 @@ pub(crate) async fn rebuild_model_for_credentials(
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let refreshed = admission
         .consume_at_sink(|refreshed_secrets| Ok(Arc::new(redact.union(&refreshed_secrets)?)))?;
+    session.set_redaction_coverage(authority, coverage_key, policy_digest);
     // (c) Rebuild a fresh client from the owner-scoped store under the refreshed
     // table. Same construction funnel as the model-swap path.
     let env_overlay = env_overlay.clone();

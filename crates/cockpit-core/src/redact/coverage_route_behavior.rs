@@ -131,7 +131,7 @@ pub(crate) mod tests {
         let authority = RedactionCoverageAuthority::default();
         let captures = Arc::new(AtomicUsize::new(0));
         let parts = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6];
-        authority
+        let result = authority
             .acquire(
                 key(parts),
                 CoverageScope::DriverTurn,
@@ -143,8 +143,11 @@ pub(crate) mod tests {
                 authority.invalidate();
                 assert!(table.ensure_binding_current().is_err());
                 Ok(())
-            })
-            .expect("one-shot sink reached");
+            });
+        // #390 requires the consuming lease to revalidate before its result
+        // escapes. The callback ran, but invalidation makes the operation's
+        // terminal result fail closed.
+        assert_eq!(result, Err(CoverageError::Invalidated));
     }
 
     pub(crate) async fn assert_resident_generation_survives_lru_while_admitted() {
@@ -232,16 +235,31 @@ pub(crate) mod tests {
             .install_table()
             .expect("right sink");
         assert!(left.union(&right).is_err());
+
+        // Authority-local epoch/revision counters are not a shared clock. Even
+        // an identical source key from another authority is incomparable.
+        let foreign_authority = RedactionCoverageAuthority::default();
+        let foreign = foreign_authority
+            .acquire(
+                key(left_parts),
+                CoverageScope::SessionSubmission,
+                capture(captures, left_parts),
+            )
+            .await
+            .expect("foreign capture")
+            .install_table()
+            .expect("foreign sink");
+        assert!(left.union(&foreign).is_err());
     }
 
     pub(crate) async fn assert_union_adopts_newer_binding_not_right_operand() {
         let authority = RedactionCoverageAuthority::default();
         let captures = Arc::new(AtomicUsize::new(0));
         let parts = [3, 3, 3, 3, 3, 3, 3, 3, 3, 3];
-        let key = key(parts);
+        let coverage_key = key(parts);
         let older = authority
             .acquire(
-                key.clone(),
+                coverage_key.clone(),
                 CoverageScope::SessionSubmission,
                 capture(captures.clone(), parts),
             )
@@ -249,10 +267,10 @@ pub(crate) mod tests {
             .expect("older capture")
             .install_table()
             .expect("older sink");
-        authority.invalidate_key(&key);
+        authority.invalidate_key(&coverage_key);
         let newer = authority
             .acquire(
-                key,
+                coverage_key,
                 CoverageScope::DriverTurn,
                 capture(captures.clone(), parts),
             )
@@ -281,6 +299,31 @@ pub(crate) mod tests {
                 .coverage_binding()
                 .expect("reverse binding")
                 .binding_ordering(&newer_binding),
+            Some(std::cmp::Ordering::Equal)
+        );
+
+        // Issue #390's generation-safe historical-fold contract permits
+        // newer mutable source revisions within the same immutable
+        // principal/session/workspace lineage. The union must adopt that
+        // generation even though its complete source key differs.
+        let revised_parts = [3, 3, 3, 3, 4, 4, 4, 4, 4, 4];
+        let revised = authority
+            .acquire(
+                key(revised_parts),
+                CoverageScope::RedactedExport,
+                capture(captures, revised_parts),
+            )
+            .await
+            .expect("revised capture")
+            .install_table()
+            .expect("revised sink");
+        let revised_binding = revised.coverage_binding().expect("revised binding");
+        let folded = older.union(&revised).expect("historical revision fold");
+        assert_eq!(
+            folded
+                .coverage_binding()
+                .expect("folded binding")
+                .binding_ordering(&revised_binding),
             Some(std::cmp::Ordering::Equal)
         );
     }

@@ -13523,10 +13523,12 @@ pub(super) async fn run_worker(
                         .read()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone();
-                    let new_table = if let Some((authority, coverage_key, policy_digest)) =
-                        session.redaction_coverage()
+                    let new_table = if let Some((
+                        authority,
+                        installed_key,
+                        _installed_policy_digest,
+                    )) = session.redaction_coverage()
                     {
-                        authority.invalidate_key(&coverage_key);
                         match session.credential_store() {
                             Ok(store) => match session.machine_scoped_sealed_redactions().await {
                                 Ok(sealed) => match session
@@ -13559,6 +13561,30 @@ pub(super) async fn run_worker(
                                                         "reading redaction vault revision: {error}"
                                                     )),
                                                     Ok(vault_revision) => {
+                                                        let policy_digest = crate::redact::coverage_bindings::redact_config_digest(
+                                                            &effective_redact,
+                                                        );
+                                                        let current_key = crate::redact::coverage_bindings::SessionCoverageInputs {
+                                                            principal: &principal,
+                                                            owner_authorization_revision: 0,
+                                                            session_id,
+                                                            workspace_root: &root,
+                                                            environment: &environment,
+                                                            vault_revision,
+                                                            command_cache: &command_cache,
+                                                            policy_digest: &policy_digest,
+                                                            sealed: sealed_binding,
+                                                            override_revision: 0,
+                                                            redact_config: &effective_redact,
+                                                        }
+                                                        .coverage_key();
+                                                        let coverage_key = installed_key
+                                                            .with_current_owned_revisions(
+                                                                &current_key,
+                                                            );
+                                                        authority.invalidate_key(&installed_key);
+                                                        let capture_policy_digest =
+                                                            policy_digest.clone();
                                                         let env = session_env.clone();
                                                         let env_snapshot_for_capture =
                                                             environment.clone();
@@ -13580,7 +13606,7 @@ pub(super) async fn run_worker(
                                                             .publish_fence();
                                                         match authority
                                                             .acquire(
-                                                                coverage_key,
+                                                                coverage_key.clone(),
                                                                 crate::redact::coverage_authority::CoverageScope::RedactionOverride,
                                                                 move || {
                                                                     let capture_inputs =
@@ -13592,7 +13618,7 @@ pub(super) async fn run_worker(
                                                                             environment: &env_snapshot_for_capture,
                                                                             vault_revision,
                                                                             command_cache: &command_cache,
-                                                                            policy_digest: &policy_digest,
+                                                                            policy_digest: &capture_policy_digest,
                                                                             sealed: sealed_binding,
                                                                             override_revision: 0,
                                                                             redact_config: &capture_redact,
@@ -13643,6 +13669,11 @@ pub(super) async fn run_worker(
                                                                                         set_current_redaction(
                                                                                             &redaction,
                                                                                             unioned.clone(),
+                                                                                        );
+                                                                                        session.set_redaction_coverage(
+                                                                                            authority.clone(),
+                                                                                            coverage_key,
+                                                                                            policy_digest,
                                                                                         );
                                                                                         Ok(unioned)
                                                                                     }

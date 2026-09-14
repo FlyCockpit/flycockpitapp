@@ -1534,14 +1534,13 @@ impl RedactionTable {
                 Some(std::cmp::Ordering::Less) => Some(right.clone()),
                 None => anyhow::bail!("coverage binding mismatch across union operands"),
             },
-            (Some(binding), None) if other.is_union_identity_operand() => Some(binding.clone()),
-            (None, Some(binding)) if self.is_union_identity_operand() => Some(binding.clone()),
-            (None, None)
-                if self.is_union_identity_operand() && other.is_union_identity_operand() =>
-            {
-                None
-            }
-            _ => anyhow::bail!("coverage binding mismatch across union operands"),
+            // Unbound operands are monotonic additions: persisted historical
+            // tables, protected-history literals, and freshly parsed approved
+            // files can only add scrub candidates. They therefore adopt the
+            // bound operand's generation without weakening its coverage. Two
+            // bound operands are handled above and remain lineage-checked.
+            (Some(binding), None) | (None, Some(binding)) => Some(binding.clone()),
+            (None, None) => None,
         };
         Ok(merged)
     }
@@ -1978,13 +1977,6 @@ impl RedactionTable {
             .saturating_add(unsupported_path_bytes)
             .saturating_add(conflict_string_bytes)
             .saturating_add(protected_path_bytes)
-    }
-
-    fn is_union_identity_operand(&self) -> bool {
-        self.entries.is_empty()
-            && self.unsupported_files.is_empty()
-            && self.protected_path_conflicts.is_empty()
-            && self.protected.is_empty()
     }
 
     /// This table with the config-level opt-out (`redact.enabled = false`)

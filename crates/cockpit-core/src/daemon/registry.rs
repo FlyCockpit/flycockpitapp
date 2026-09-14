@@ -2490,7 +2490,13 @@ impl SessionRegistry {
             .context("listing machine-scoped sealed redaction records")?;
         let sealed_binding =
             crate::redact::coverage_bindings::sealed_records_binding(&sealed_records);
-        let policy_digest = workspace_layer.digest.clone();
+        // Coverage provenance describes the redaction policy itself.  The
+        // retained workspace-layer digest has a wider domain (providers and
+        // unrelated settings), so using it here can never match the publish
+        // fence's live redaction-policy digest and makes a fresh worker's
+        // first publication spuriously unavailable.
+        let policy_digest =
+            crate::redact::coverage_bindings::redact_config_digest(&extended_cfg.redact);
         let command_cache = self.command_secret_cache();
         let principal = crate::daemon::principal::ClientPrincipal::owner();
         let coverage_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {

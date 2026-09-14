@@ -81,9 +81,25 @@ pub(crate) fn matched_dotenv_paths(
                 !(entry.file_type().is_some_and(|t| t.is_dir()) && entry.file_name() == ".git")
             });
         for entry in builder.build() {
-            let entry = entry.map_err(|error| {
-                anyhow::anyhow!("dotenv discovery failed during capture: {error}")
-            })?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error)
+                    if error
+                        .io_error()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    // Dotenv sources are optional. A workspace or candidate
+                    // disappearing before discovery means there is no dotenv
+                    // input for this capture; permission and traversal errors
+                    // remain hard failures below.
+                    continue;
+                }
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "dotenv discovery failed during capture: {error}"
+                    ));
+                }
+            };
             if entry.file_type().is_some_and(|t| t.is_file()) {
                 out.push(entry.into_path());
             }
@@ -99,14 +115,38 @@ pub(crate) fn matched_dotenv_paths(
 
 fn collect_explicit_dotenv_paths(extra: &[PathBuf], out: &mut Vec<PathBuf>) -> Result<()> {
     for path in extra {
-        match std::fs::metadata(path) {
-            Ok(metadata) if metadata.is_file() => out.push(path.clone()),
-            Ok(_) => {}
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 return Err(anyhow::anyhow!(
                     "configured dotenv source is unavailable during capture: {error}"
                 ));
             }
+            Ok(metadata) if metadata.file_type().is_symlink() => match std::fs::metadata(path) {
+                Ok(target) if target.is_file() => {
+                    std::fs::File::open(path).map_err(|error| {
+                        anyhow::anyhow!(
+                            "configured dotenv source is unavailable during capture: {error}"
+                        )
+                    })?;
+                    out.push(path.clone());
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "configured dotenv source is unavailable during capture: {error}"
+                    ));
+                }
+            },
+            Ok(metadata) if metadata.is_file() => {
+                std::fs::File::open(path).map_err(|error| {
+                    anyhow::anyhow!(
+                        "configured dotenv source is unavailable during capture: {error}"
+                    )
+                })?;
+                out.push(path.clone());
+            }
+            Ok(_) => {}
         }
     }
     Ok(())
@@ -478,6 +518,32 @@ mod case_variant_tests {
         perms.set_mode(0o000);
         std::fs::set_permissions(&secret, perms).unwrap();
         let result = super::matched_dotenv_paths(dir.path(), &[], std::slice::from_ref(&secret));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn absent_workspace_and_extra_dotenv_are_benign() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let absent_root = dir.path().join("virtual-workspace");
+        let absent_extra = dir.path().join("optional.env");
+        let paths = super::matched_dotenv_paths(
+            &absent_root,
+            &default_dotenv_patterns(),
+            std::slice::from_ref(&absent_extra),
+        )
+        .expect("absent optional dotenv sources are not capture failures");
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn broken_extra_dotenv_symlink_fails_discovery() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let broken = dir.path().join("broken.env");
+        symlink(dir.path().join("missing-target.env"), &broken).unwrap();
+        let result = super::matched_dotenv_paths(dir.path(), &[], std::slice::from_ref(&broken));
         assert!(result.is_err());
     }
 

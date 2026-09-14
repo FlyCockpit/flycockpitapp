@@ -3498,7 +3498,8 @@ impl Driver {
             Ok(store) => store,
             Err(error) => return Self::refuse_unredacted_send(tx, error).await,
         };
-        let Some((authority, coverage_key, policy_digest)) = self.session.redaction_coverage()
+        let Some((authority, installed_key, _installed_policy_digest)) =
+            self.session.redaction_coverage()
         else {
             return Self::refuse_unredacted_send(tx, "coverage_unavailable").await;
         };
@@ -3521,6 +3522,7 @@ impl Driver {
         };
         let sealed_binding =
             crate::redact::coverage_bindings::sealed_records_binding(&sealed_records);
+        let policy_digest = crate::redact::coverage_bindings::redact_config_digest(&cfg);
         let principal = crate::daemon::principal::ClientPrincipal::owner();
         let command_cache = match self.session.command_secret_cache() {
             Some(cache) => cache,
@@ -3531,11 +3533,26 @@ impl Driver {
             Err(error) => return Self::refuse_unredacted_send(tx, error).await,
         };
         let session_id = self.session.id;
+        let current_key = crate::redact::coverage_bindings::SessionCoverageInputs {
+            principal: &principal,
+            owner_authorization_revision: 0,
+            session_id,
+            workspace_root: &cwd,
+            environment: &environment,
+            vault_revision,
+            command_cache: &command_cache,
+            policy_digest: &policy_digest,
+            sealed: sealed_binding,
+            override_revision: 0,
+            redact_config: &cfg,
+        }
+        .coverage_key();
+        let coverage_key = installed_key.with_current_owned_revisions(&current_key);
+        let capture_policy_digest = policy_digest.clone();
         let env_snapshot_for_capture = environment.clone();
         let publish_vault = self.session.secret_vault().clone();
         let publish_db = self.session.db.clone();
         let publish_command_cache = command_cache.clone();
-        let session_for_publish = self.session.clone();
         let config_for_publish = self.config.clone();
         let env_overlay_for_publish = self.stack[0].agent.env_overlay.clone();
         let cwd_for_publish = cwd.clone();
@@ -3595,7 +3612,7 @@ impl Driver {
         .publish_fence();
         match authority
             .acquire(
-                coverage_key,
+                coverage_key.clone(),
                 crate::redact::coverage_authority::CoverageScope::DriverTurn,
                 move || {
                     let capture_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
@@ -3606,7 +3623,7 @@ impl Driver {
                         environment: &env_snapshot_for_capture,
                         vault_revision,
                         command_cache: &command_cache,
-                        policy_digest: &policy_digest,
+                        policy_digest: &capture_policy_digest,
                         sealed: sealed_binding,
                         override_revision: 0,
                         redact_config: &cfg,
@@ -3646,6 +3663,11 @@ impl Driver {
                     }
                     Err(error) => return Self::refuse_unredacted_send(tx, error).await,
                 };
+                // Publish the session's current generation only after its
+                // accumulated table has been unioned and persisted. Future
+                // owned mutations then revoke exactly this installed key.
+                self.session
+                    .set_redaction_coverage(authority.clone(), coverage_key, policy_digest);
                 for path in table.unsupported_files() {
                     if self.redaction_unsupported_notified.insert(path.clone()) {
                         let _ = tx

@@ -817,6 +817,7 @@ fn test_driver_with_url_and_grant_in(
             ),
         ),
     );
+    bind_test_redaction_coverage(&driver);
     bind_test_session_root(&mut driver);
     let hub = Arc::new(crate::engine::interrupt::InterruptHub::detached());
     let grant_store = crate::approval::store::GrantStore::new(
@@ -833,6 +834,57 @@ fn test_driver_with_url_and_grant_in(
         hub,
     )));
     (driver, tmp)
+}
+
+/// Standalone drivers enter through the same coverage ownership contract as a
+/// daemon-created worker. The authority performs the real capture on the first
+/// turn; this helper supplies only the daemon-owned key and source owners that
+/// production session startup installs before a driver can run.
+fn bind_test_redaction_coverage(driver: &Driver) {
+    let command_cache = crate::secret_command::CommandSecretCache::with_subprocess_executor();
+    driver
+        .session
+        .set_command_secret_cache(Some(command_cache.clone()));
+    let config = driver.config.extended().redact;
+    let policy_digest = crate::redact::coverage_bindings::redact_config_digest(&config);
+    let environment = crate::env_snapshot::EnvSnapshot::new(
+        cockpit_proto::EnvSnapshotSource::SessionWorker,
+        driver.stack[0]
+            .agent
+            .env_overlay
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone(),
+    );
+    let vault_revision = driver
+        .session
+        .secret_vault()
+        .current_inventory_generation()
+        .expect("test session vault inventory revision");
+    // `create_for_test` has just created this isolated session and the machine
+    // vault has no sealed records yet. The driver re-derives this binding from
+    // the database at every turn, so later mutations follow the production
+    // invalidation/republication path.
+    let sealed = crate::redact::coverage_bindings::sealed_records_binding(&[]);
+    let principal = crate::daemon::principal::ClientPrincipal::owner();
+    let inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+        principal: &principal,
+        owner_authorization_revision: 0,
+        session_id: driver.session.id,
+        workspace_root: &driver.cwd,
+        environment: &environment,
+        vault_revision,
+        command_cache: &command_cache,
+        policy_digest: &policy_digest,
+        sealed,
+        override_revision: 0,
+        redact_config: &config,
+    };
+    driver.session.set_redaction_coverage(
+        crate::redact::coverage_authority::RedactionCoverageAuthority::default(),
+        inputs.coverage_key(),
+        policy_digest,
+    );
 }
 
 /// Standalone driver tests do not go through the worker's deferred root

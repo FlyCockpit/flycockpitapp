@@ -3055,8 +3055,10 @@ mod oauth_store_tests {
             .and_then(|body| body.split("async fn ").next())
             .expect("DocsAsk implementation");
         assert!(docs.contains("CoverageScope::DocsAsk"));
-        assert!(docs.contains("consume_at_sink"));
-        assert!(docs.contains("use_at_sink"));
+        // #390 requires the lease to span the awaited model sink. The async
+        // consuming API is the stronger boundary; a synchronous `use_at_sink`
+        // check before the await would leave a stale-generation window.
+        assert!(docs.contains("consume_at_async_sink"));
         assert!(!docs.contains("RedactionTable::build"));
     }
 
@@ -6326,55 +6328,6 @@ async fn handle_serialized_request_impl(
     // oracle that distinguishes requests the principal could never invoke.
     require_compiled_product_domain(&request)?;
     match request {
-        Request::GetRedactionCoverageStatus { session_id } => {
-            let owner = state.principal.has_owner_level_authority();
-            if let Some(session_id) = session_id {
-                let handle = ctx
-                    .registry
-                    .live_handle(session_id)
-                    .ok_or_else(|| ErrorPayload {
-                        code: ErrorCode::UnknownSession,
-                        message: "redaction coverage is unavailable for that session".into(),
-                    })?;
-                let admission = handle
-                    .acquire_redaction_coverage(
-                        crate::redact::coverage_authority::CoverageScope::DebugContext,
-                    )
-                    .await
-                    .map_err(internal)?;
-                let root = handle.project_root.clone();
-                admission
-                    .use_at_sink(|table| {
-                        Ok(Response::RedactionCoverageStatus(
-                            proto::RedactionCoverageStatusProjection {
-                                state: proto::RedactionCoverageState::Ready,
-                                owner_diagnostic: None,
-                                rendered_context: owner
-                                    .then(|| render_debug_context(&root, &table)),
-                            },
-                        ))
-                    })
-                    .map_err(internal)
-            } else {
-                acquire_daemon_redaction_table(
-                    ctx.registry.coverage_authority().clone(),
-                    ctx.config_source(),
-                    &ctx.secret_vault,
-                    &ctx.registry.command_secret_cache(),
-                    crate::redact::coverage_authority::CoverageScope::DebugContext,
-                )
-                .await
-                .map(|table| {
-                    Response::RedactionCoverageStatus(proto::RedactionCoverageStatusProjection {
-                        state: proto::RedactionCoverageState::Ready,
-                        owner_diagnostic: None,
-                        rendered_context: owner
-                            .then(|| render_debug_context(&ctx.canonical_cwd, &table)),
-                    })
-                })
-                .map_err(internal)
-            }
-        }
         Request::RenderInputPrediction {
             session_id,
             turns,
@@ -10454,6 +10407,12 @@ async fn handle_serialized_request_impl(
         Request::ListAssistants => Err(ErrorPayload {
             code: ErrorCode::Internal,
             message: "concurrent request `list_assistants` reached serialized dispatch".to_string(),
+        }),
+        Request::GetRedactionCoverageStatus { .. } => Err(ErrorPayload {
+            code: ErrorCode::Internal,
+            message:
+                "concurrent request `get_redaction_coverage_status` reached serialized dispatch"
+                    .to_string(),
         }),
         Request::SetPrimaryAssistantSoulEditMode { soul_edit_mode } => {
             if ctx.is_ephemeral_lifetime() {
@@ -20260,6 +20219,55 @@ async fn handle_concurrent_request_impl(
     #[cfg(test)]
     apply_concurrent_request_test_hook(&request).await;
     match request {
+        Request::GetRedactionCoverageStatus { session_id } => {
+            let owner = shared.principal.has_owner_level_authority();
+            if let Some(session_id) = session_id {
+                let handle = ctx
+                    .registry
+                    .live_handle(session_id)
+                    .ok_or_else(|| ErrorPayload {
+                        code: ErrorCode::UnknownSession,
+                        message: "redaction coverage is unavailable for that session".into(),
+                    })?;
+                let admission = handle
+                    .acquire_redaction_coverage(
+                        crate::redact::coverage_authority::CoverageScope::DebugContext,
+                    )
+                    .await
+                    .map_err(internal)?;
+                let root = handle.project_root.clone();
+                admission
+                    .use_at_sink(|table| {
+                        Ok(Response::RedactionCoverageStatus(
+                            proto::RedactionCoverageStatusProjection {
+                                state: proto::RedactionCoverageState::Ready,
+                                owner_diagnostic: None,
+                                rendered_context: owner
+                                    .then(|| render_debug_context(&root, &table)),
+                            },
+                        ))
+                    })
+                    .map_err(internal)
+            } else {
+                acquire_daemon_redaction_table(
+                    ctx.registry.coverage_authority().clone(),
+                    ctx.config_source(),
+                    &ctx.secret_vault,
+                    &ctx.registry.command_secret_cache(),
+                    crate::redact::coverage_authority::CoverageScope::DebugContext,
+                )
+                .await
+                .map(|table| {
+                    Response::RedactionCoverageStatus(proto::RedactionCoverageStatusProjection {
+                        state: proto::RedactionCoverageState::Ready,
+                        owner_diagnostic: None,
+                        rendered_context: owner
+                            .then(|| render_debug_context(&ctx.canonical_cwd, &table)),
+                    })
+                })
+                .map_err(internal)
+            }
+        }
         Request::CleanManagedWorkspaceLease {
             session_id,
             owner_agent_instance_id,
@@ -32223,7 +32231,7 @@ pub(super) async fn export_session_data(
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let trust = crate::config::trust::resolve_workspace_trust_policy_from_db(
+        let trust = crate::config::trust::resolve_historical_workspace_trust_policy_from_db(
             &ctx.db,
             &session.project_root,
         )

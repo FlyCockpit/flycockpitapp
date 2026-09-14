@@ -1275,8 +1275,14 @@ impl Session {
         allow_unbound_test_fixture_project_id: bool,
     ) -> Result<Self> {
         let project_root = if initialize_workspace_scratch {
-            canonical_workspace_root(&project_root)
-                .context("canonicalizing persisted session workspace root")?
+            match std::fs::symlink_metadata(&project_root) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => project_root,
+                Err(error) => {
+                    return Err(error).context("inspecting persisted session workspace root");
+                }
+                Ok(_) => canonical_workspace_root(&project_root)
+                    .context("canonicalizing persisted session workspace root")?,
+            }
         } else {
             // Test-support project ids are derived from a stable path spelling
             // rather than a host directory identity, and are never published

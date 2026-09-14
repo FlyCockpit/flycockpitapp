@@ -19,20 +19,39 @@ fn snapshot(stage: cockpit_proto::OnboardingStage) -> cockpit_proto::OnboardingB
 
 #[test]
 fn named_setup_wizard_inventory_covers_registry_rows() {
-    let mut expected = cockpit_core::wizard::registry()
+    let mut expected = cockpit_core::wizard::named_setup_wizard_ids()
         .into_iter()
-        .map(|descriptor| descriptor.id.to_string())
+        .map(str::to_string)
         .collect::<Vec<_>>();
     expected.sort();
-    let mut rows = vec![
-        cockpit_core::wizard::PROVIDER_WIZARD_ID.to_string(),
-        cockpit_core::wizard::SECURITY_WIZARD_ID.to_string(),
-        cockpit_core::wizard::MODEL_WIZARD_ID.to_string(),
-    ];
-    rows.sort();
+    let startup = include_str!("startup_layout.rs");
+    let open_onboarding = startup
+        .split("pub(super) fn open_onboarding_setup")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("fn mount_setup_wizard_in_onboarding_shell")
+                .next()
+        })
+        .expect("open_onboarding_setup");
+    let wizard_constant = |id: &str| match id {
+        cockpit_core::wizard::PROVIDER_WIZARD_ID => "PROVIDER_WIZARD_ID",
+        cockpit_core::wizard::SECURITY_WIZARD_ID => "SECURITY_WIZARD_ID",
+        cockpit_core::wizard::MODEL_WIZARD_ID => "MODEL_WIZARD_ID",
+        cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID => "ONBOARDING_MODEL_WIZARD_ID",
+        cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID => "ONBOARDING_PROFILE_WIZARD_ID",
+        cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID => "ONBOARDING_LIFETIME_WIZARD_ID",
+        cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID => "ONBOARDING_AGENT_WIZARD_ID",
+        other => panic!("unknown setup wizard id `{other}`"),
+    };
+    let mut routed = cockpit_core::wizard::named_setup_wizard_ids()
+        .into_iter()
+        .filter(|wizard_id| open_onboarding.contains(wizard_constant(wizard_id)))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    routed.sort();
     assert_eq!(
-        expected, rows,
-        "update the route table when adding setup wizards"
+        expected, routed,
+        "every named setup wizard must route through open_onboarding_setup"
     );
 }
 

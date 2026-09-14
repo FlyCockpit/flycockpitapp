@@ -263,8 +263,8 @@ fn agent_authoring_phase(app: &App) -> Option<crate::tui::onboarding::agent::Pha
         .and_then(|shell| shell.test_agent_authoring_phase())
 }
 
-fn sync_config_generation_after_agent_apply(app: &mut App) {
-    app.sync_config_generation_after_authored_agent_apply();
+fn sync_config_generation_after_agent_apply(app: &mut App, generation: u64) {
+    app.sync_config_generation_after_authored_agent_apply(generation);
 }
 
 fn settle_agent_via_real_daemon_rpc(app: &mut App) {
@@ -360,15 +360,18 @@ fn settle_agent_via_real_daemon_rpc(app: &mut App) {
         Ok(other) => panic!("unexpected apply response: {other:?}"),
         Err(error) => panic!("apply failed: {error}"),
     };
-    match &apply {
+    let generation = match &apply {
         cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(receipt)
-            if receipt.status == cockpit_proto::AuthoredAgentReceiptStatus::Committed => {}
+            if receipt.status == cockpit_proto::AuthoredAgentReceiptStatus::Committed =>
+        {
+            receipt.result_config_generation
+        }
         other => panic!("apply did not commit: {other:?}"),
-    }
+    };
     if let Some(shell) = app.onboarding_shell.as_mut() {
         shell.apply_agent_authoring_outcome(apply);
     }
-    sync_config_generation_after_agent_apply(app);
+    sync_config_generation_after_agent_apply(app, generation);
     pump_onboarding(
         app,
         |app| agent_authoring_phase(app) == Some(crate::tui::onboarding::agent::Phase::Success),

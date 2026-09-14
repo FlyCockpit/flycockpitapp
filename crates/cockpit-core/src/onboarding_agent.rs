@@ -391,6 +391,7 @@ pub fn committed_receipt(
         policy_revision: snapshot.policy_revision.clone(),
         installation_id,
         default_selected,
+        result_config_generation: crate::daemon::server::inventory::current_config_generation(),
         review: package.review.clone(),
     }
 }
@@ -1001,6 +1002,7 @@ fn review_from_definition(
             .map(|sidecar| format!("{}/{}", sidecar.provider_id, sidecar.model_id))
             .collect(),
         source: draft.source.source_locator.clone(),
+        make_default: draft.make_default,
         trust_is_shared: true,
         trust_disclosure: REVIEW_TRUST_DISCLOSURE.to_string(),
     }

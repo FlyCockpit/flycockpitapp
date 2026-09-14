@@ -143,12 +143,15 @@ impl App {
     /// After a committed authored-agent apply, the daemon publishes sidecar
     /// config and bumps the inventory generation. Keep the held snapshot in
     /// sync so onboarding settlement fences match the authority.
-    pub(super) fn sync_config_generation_after_authored_agent_apply(&mut self) {
-        let generation = cockpit_core::daemon::published_config_generation();
+    pub(super) fn sync_config_generation_after_authored_agent_apply(&mut self, generation: u64) {
         self.config_snapshot.generation = self.config_snapshot.generation.max(generation);
         self.config_snapshot
             .providers
             .set_resolution_generation(self.config_snapshot.generation);
+    }
+
+    fn onboarding_agent_operation_id_for_run(run_id: uuid::Uuid) -> String {
+        format!("onboarding-agent-{run_id}")
     }
 
     fn maybe_open_pending_setup_wizard(&mut self) {
@@ -266,9 +269,33 @@ impl App {
                     None,
                 );
             }
+            Some(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID) => {
+                self.mount_onboarding_wizard(
+                    cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID,
+                    None,
+                    None,
+                );
+            }
+            Some(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID) => {
+                self.mount_onboarding_wizard(
+                    cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+                    None,
+                    None,
+                );
+            }
+            Some(cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID) => {
+                self.mount_onboarding_wizard(
+                    cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
+                    None,
+                    Some("Choose what happens when the last Cockpit window closes.".to_string()),
+                );
+            }
+            Some(cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID) => {
+                self.mount_onboarding_agent_authoring();
+            }
             Some(other) => {
                 self.push_plain(format!(
-                    "Unknown setup wizard `{other}`; run `/setup` to reopen onboarding."
+                    "Unknown setup wizard `{other}`; run `/setup` to list named wizards."
                 ));
             }
         }
@@ -1202,9 +1229,12 @@ impl App {
     }
 
     fn mount_onboarding_agent_authoring(&mut self) {
+        let Some(snapshot) = self.onboarding_snapshot.clone() else {
+            return;
+        };
         let operation_id = self
             .onboarding_agent_operation_id
-            .get_or_insert_with(|| format!("onboarding-agent-{}", uuid::Uuid::new_v4()))
+            .get_or_insert_with(|| Self::onboarding_agent_operation_id_for_run(snapshot.run_id))
             .clone();
         if self
             .onboarding_shell
@@ -1213,7 +1243,58 @@ impl App {
         {
             return;
         }
+        self.request_agent_authoring_receipt(operation_id.clone());
         self.request_agent_authoring_projection(operation_id);
+    }
+
+    fn request_agent_authoring_receipt(&mut self, client_operation_id: String) {
+        let lifecycle = self.lifecycle.clone();
+        let selected_endpoint = self
+            .startup_lifecycle
+            .as_ref()
+            .map(|selected| selected.endpoint.clone());
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let pending_request_id = request_id.clone();
+        let started = self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::DaemonRpc("agent_authoring.receipt"),
+            crate::tui::async_action::AsyncActionPolicy::Replace(
+                crate::tui::async_action::AsyncActionKey::new("agent_authoring.receipt"),
+            ),
+            async move {
+                let endpoint =
+                    onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref()).await?;
+                let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let response = client
+                    .request(cockpit_proto::Request::GetAuthoredAgentPackageReceipt(
+                        cockpit_proto::AuthoredAgentPackageReceiptQuery {
+                            client_operation_id,
+                        },
+                    ))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                match response {
+                    Ok(cockpit_proto::Response::AuthoredAgentPackageReceipt(Some(receipt))) => {
+                        Ok(crate::tui::async_action::AsyncActionPayload::StartupAgentAuthoringReceipt {
+                            request_id,
+                            receipt,
+                        })
+                    }
+                    Ok(cockpit_proto::Response::AuthoredAgentPackageReceipt(None)) => {
+                        Ok(crate::tui::async_action::AsyncActionPayload::StartupAgentAuthoringReceiptMiss {
+                            request_id,
+                        })
+                    }
+                    Ok(other) => Err(format!("unexpected agent authoring receipt: {other:?}")),
+                    Err(error) => Err(error.to_string()),
+                }
+            },
+        );
+        if let crate::tui::async_action::AsyncActionStart::Started(id) = started {
+            self.pending_startup_onboarding_operations
+                .insert(id, pending_request_id);
+        }
     }
 
     fn request_agent_authoring_projection(&mut self, client_operation_id: String) {
@@ -1279,18 +1360,26 @@ impl App {
         let pending_request_id = request_id.clone();
         let operation_id = self
             .onboarding_agent_operation_id
-            .get_or_insert_with(|| format!("onboarding-agent-{}", uuid::Uuid::new_v4()))
+            .get_or_insert_with(|| Self::onboarding_agent_operation_id_for_run(snapshot.run_id))
             .clone();
-        let (validate_only, package, replace_key) = match action {
-            AgentAuthoringAction::PreviewPackage(package) => {
-                (true, package, "agent_authoring.preview")
-            }
+        let (validate_only, package, replace_key, rpc_operation_id) = match action {
+            AgentAuthoringAction::PreviewPackage(package) => (
+                true,
+                package,
+                "agent_authoring.preview",
+                format!("{operation_id}-preview"),
+            ),
             AgentAuthoringAction::ApplyPackage {
                 client_operation_id,
                 package,
             } => {
                 let _ = client_operation_id;
-                (false, package, "agent_authoring.apply")
+                (
+                    false,
+                    package,
+                    "agent_authoring.apply",
+                    operation_id.clone(),
+                )
             }
             AgentAuthoringAction::RefreshProjection => {
                 self.request_agent_authoring_projection(operation_id);
@@ -1303,7 +1392,7 @@ impl App {
             stage_revision: snapshot.revision,
         };
         let request = cockpit_proto::ApplyAuthoredAgentPackageRequest {
-            client_operation_id: operation_id,
+            client_operation_id: rpc_operation_id,
             expected_policy_revision: package.policy_revision.clone(),
             package,
             onboarding: Some(correlation),

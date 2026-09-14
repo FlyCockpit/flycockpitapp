@@ -45,6 +45,7 @@ pub struct ChildAuthoringDraft {
     pub route_grants: Vec<RouteGrantDraft>,
     pub default_route_index: usize,
     pub tool_tiers: BTreeMap<String, ToolTier>,
+    pub children: Vec<ChildAuthoringDraft>,
 }
 
 /// Editable agent authoring state for the onboarding TUI.
@@ -237,23 +238,15 @@ pub fn build_package_draft(
             bail!("remote sidecar egress confirmation is required");
         }
     }
+    validate_child_tree(&draft.children)?;
 
     let (source, name, body) = resolve_source(projection, draft)?;
+    validate_authored_agent_name(&name)?;
     let frontmatter = build_frontmatter(projection, draft, &name)?;
     let yaml = serde_yaml::to_string(&frontmatter)?;
     let markdown = format!("---\n{}---\n{body}", yaml.trim_start_matches("---\n"));
 
-    let children = draft
-        .children
-        .iter()
-        .map(|child| build_child_markdown(projection, child))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .map(|(relative_path, markdown)| AuthoredAgentChild {
-            relative_path,
-            markdown,
-        })
-        .collect();
+    let children = collect_child_package_files(projection, &draft.children)?;
 
     let sidecars = draft
         .sidecar_route_index
@@ -475,12 +468,81 @@ fn build_frontmatter(
     })
 }
 
+fn validate_authored_agent_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty()
+            && !name.contains('/')
+            && !name.contains('\\')
+            && !name.contains('.')
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
+        "authored agent name must be ASCII alphanumeric with '-' or '_' only"
+    );
+    Ok(())
+}
+
+fn validate_child_tree(children: &[ChildAuthoringDraft]) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for child in children {
+        let slug = child_slug(child);
+        ensure!(seen.insert(slug.clone()), "duplicate child name `{slug}`");
+        validate_authored_agent_name(&slug)?;
+        validate_child_tree(&child.children)?;
+    }
+    Ok(())
+}
+
+fn collect_child_package_files(
+    projection: &AgentAuthoringProjection,
+    children: &[ChildAuthoringDraft],
+) -> Result<Vec<AuthoredAgentChild>> {
+    let mut files = Vec::new();
+    for child in children {
+        files.extend(collect_child_package_files_recursive(
+            projection, child, "",
+        )?);
+    }
+    Ok(files)
+}
+
+fn collect_child_package_files_recursive(
+    projection: &AgentAuthoringProjection,
+    child: &ChildAuthoringDraft,
+    parent_prefix: &str,
+) -> Result<Vec<AuthoredAgentChild>> {
+    let (relative_path, markdown) = build_child_markdown(projection, child, parent_prefix)?;
+    let mut files = vec![AuthoredAgentChild {
+        relative_path,
+        markdown,
+    }];
+    let slug = child_slug(child);
+    let nested_prefix = if parent_prefix.is_empty() {
+        slug
+    } else {
+        format!("{parent_prefix}/{slug}")
+    };
+    for nested in &child.children {
+        files.extend(collect_child_package_files_recursive(
+            projection,
+            nested,
+            &nested_prefix,
+        )?);
+    }
+    Ok(files)
+}
+
 fn build_child_markdown(
     projection: &AgentAuthoringProjection,
     child: &ChildAuthoringDraft,
+    parent_prefix: &str,
 ) -> Result<(String, String)> {
     let name = child_slug(child);
-    let relative_path = format!("subagents/{name}.md");
+    let relative_path = if parent_prefix.is_empty() {
+        format!("subagents/{name}.md")
+    } else {
+        format!("subagents/{parent_prefix}/{name}.md")
+    };
     let models = child
         .route_grants
         .iter()
@@ -518,7 +580,23 @@ fn build_child_markdown(
                 models,
             },
         )]),
-        delegation: None,
+        delegation: if child.children.is_empty() {
+            None
+        } else {
+            let allowed_children = child
+                .children
+                .iter()
+                .map(|nested| AllowedChild::portable_ref(&child_slug(nested)))
+                .collect();
+            Some(DelegationPolicy {
+                allowed_children,
+                max_descendant_depth: Some(2),
+                max_concurrent_children: Some(3),
+                targets: vec![DelegationTarget::SameRoot],
+                default_child: child.children.first().map(|nested| child_slug(nested)),
+                interactive_subagents: false,
+            })
+        },
         questions: None,
         verification: None,
         allowed_knowledge_bases: None,
@@ -561,6 +639,7 @@ pub fn default_child_draft(projection: &AgentAuthoringProjection) -> ChildAuthor
         route_grants,
         default_route_index: 0,
         tool_tiers: child_default_tool_tiers(),
+        children: Vec::new(),
     }
 }
 

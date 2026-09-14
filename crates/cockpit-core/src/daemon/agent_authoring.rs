@@ -413,6 +413,7 @@ async fn complete_pending_authored_journal(
         )
         .await;
     }
+    let result_config_generation = crate::daemon::server::inventory::current_config_generation();
     let mut receipt = ApplyAuthoredAgentPackageReceipt {
         client_operation_id: journal.client_operation_id.clone(),
         receipt_id: uuid::Uuid::now_v7(),
@@ -421,6 +422,7 @@ async fn complete_pending_authored_journal(
         policy_revision: journal.policy_revision.clone(),
         installation_id: installation_id.clone(),
         default_selected: journal.make_default,
+        result_config_generation,
         review,
     };
     if let Ok(id) = uuid::Uuid::parse_str(&operation_id) {
@@ -562,6 +564,7 @@ fn unknown_receipt(
         policy_revision: String::new(),
         installation_id: None,
         default_selected: false,
+        result_config_generation: 0,
         review: AuthoredAgentReview {
             agent_name: String::new(),
             grants: Vec::new(),
@@ -574,6 +577,7 @@ fn unknown_receipt(
             children: Vec::new(),
             sidecars: Vec::new(),
             source: String::new(),
+            make_default: false,
             trust_is_shared: true,
             trust_disclosure: crate::onboarding_agent::REVIEW_TRUST_DISCLOSURE.to_string(),
         },

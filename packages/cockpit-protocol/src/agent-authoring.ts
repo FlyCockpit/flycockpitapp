@@ -176,6 +176,7 @@ export const authoredAgentReviewSchema = z
     children: z.array(z.string()),
     sidecars: z.array(z.string()).optional(),
     source: z.string(),
+    make_default: z.boolean(),
     trust_is_shared: z.boolean(),
     trust_disclosure: z.string(),
   })
@@ -190,6 +191,7 @@ export const applyAuthoredAgentPackageReceiptSchema = z
     policy_revision: z.string(),
     installation_id: z.string().optional(),
     default_selected: z.boolean(),
+    result_config_generation: z.number().int().nonnegative(),
     review: authoredAgentReviewSchema,
   })
   .strict();

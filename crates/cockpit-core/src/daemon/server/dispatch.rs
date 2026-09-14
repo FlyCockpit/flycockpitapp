@@ -400,144 +400,6 @@ async fn validate_onboarding_stage_settlement(
     }
 }
 
-/// An onboarding apply owns only the installation whose UUID is the fresh
-/// inner operation key it minted. Installation may instead return an existing
-/// same-source object; cleanup must never infer ownership from an answer or a
-/// returned receipt identity.
-async fn cleanup_owned_onboarding_installation(
-    ctx: &DaemonContext,
-    operation_id: uuid::Uuid,
-) -> anyhow::Result<()> {
-    match ctx
-        .db
-        .delete_agent_installation(operation_id, crate::workspace_lease::now_unix_ms())
-        .await?
-    {
-        cockpit_db::db::agent_installations::DeleteAgentInstallationOutcome::Tombstoned
-        | cockpit_db::db::agent_installations::DeleteAgentInstallationOutcome::Deleted
-        | cockpit_db::db::agent_installations::DeleteAgentInstallationOutcome::AlreadyDeleted
-        | cockpit_db::db::agent_installations::DeleteAgentInstallationOutcome::NotFound => Ok(()),
-    }
-}
-
-/// Release a completed journal.  Delete the durable intent before its private
-/// preimage: a death after the row is gone can leave an orphaned private file,
-/// but can never leave boot recovery blocked on a preimage that was already
-/// destroyed.
-async fn settle_onboarding_publication_journal(
-    ctx: &DaemonContext,
-    operation_id: uuid::Uuid,
-    backup: &std::path::Path,
-) -> anyhow::Result<()> {
-    let operation = operation_id.to_string();
-    ctx.db
-        .write(move |conn| {
-            let deleted = conn.execute(
-                "DELETE FROM onboarding_agent_publication_journals WHERE operation_id=?1",
-                rusqlite::params![operation],
-            )?;
-            anyhow::ensure!(
-                deleted == 1,
-                "onboarding publication journal disappeared before settlement"
-            );
-            Ok(())
-        })
-        .await?;
-    if let Err(error) = crate::wizard::OnboardingConfigRollback::discard_durable_journal(backup) {
-        // The SQLite intent is already gone, so this private preimage can no
-        // longer block recovery. It is an orphan eligible for later private
-        // state collection, not a reason to report a completed publication as
-        // failed or recreate recovery ownership.
-        tracing::warn!(%error, path = %backup.display(), "onboarding publication journal preimage orphaned after settlement");
-    }
-    Ok(())
-}
-
-async fn compensate_onboarding_agent_publication(
-    ctx: &DaemonContext,
-    operation_id: uuid::Uuid,
-    backup: &std::path::Path,
-    previous_default_installation_id: Option<uuid::Uuid>,
-    authored_owner_digest: String,
-) -> anyhow::Result<()> {
-    // Always attempt every inverse operation.  The journal remains intact on
-    // any failure, so startup can retry exactly this full compensation.
-    // Invert the nested authored journal first so a later crash cannot
-    // complete-forward an apply this compensation is rolling back.
-    let authored = ctx
-        .db
-        .compensate_authored_agent_package_journal(authored_owner_digest, operation_id.to_string())
-        .await;
-    let config = crate::wizard::OnboardingConfigRollback::restore_durable_journal(backup);
-    let installation = cleanup_owned_onboarding_installation(ctx, operation_id).await;
-    let default = ctx
-        .db
-        .restore_default_agent_installation(
-            previous_default_installation_id,
-            crate::workspace_lease::now_unix_ms(),
-        )
-        .await;
-    if let (Ok(()), Ok(()), Ok(()), Ok(())) = (&config, &installation, &default, &authored) {
-        return settle_onboarding_publication_journal(ctx, operation_id, backup).await;
-    }
-    Err(anyhow::anyhow!(
-        "onboarding publication compensation incomplete; config: {}; installation: {}; prior default: {}; authored journal: {}",
-        config
-            .err()
-            .map_or_else(|| "ok".to_string(), |error| format!("{error:#}")),
-        installation
-            .err()
-            .map_or_else(|| "ok".to_string(), |error| format!("{error:#}")),
-        default
-            .err()
-            .map_or_else(|| "ok".to_string(), |error| format!("{error:#}")),
-        authored
-            .err()
-            .map_or_else(|| "ok".to_string(), |error| format!("{error:#}")),
-    ))
-}
-
-/// Reconcile an interrupted onboarding publication before the daemon accepts
-/// clients. The intent is created before installation, so restoring its exact
-/// config preimage, prior DB default, operation-named installation, and nested
-/// authored journal (draft CAS included) exposes none of an interrupted plan.
-/// A missing/corrupt private journal fails closed and keeps the socket unpublished.
-pub(super) async fn recover_onboarding_agent_publication_journals(
-    ctx: &DaemonContext,
-) -> std::result::Result<(), ErrorPayload> {
-    let rows: Vec<(String, String, Option<String>, String)> = ctx
-        .db
-        .read(|conn| {
-            let mut statement = conn.prepare(
-                "SELECT operation_id,backup_path,previous_default_installation_id,authored_owner_digest FROM onboarding_agent_publication_journals ORDER BY created_at_unix_ms",
-            )?;
-            Ok(statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?)
-        })
-        .await
-        .map_err(internal)?;
-    for (operation, backup_path, previous_default, authored_owner_digest) in rows {
-        let operation_id = uuid::Uuid::parse_str(&operation)
-            .map_err(|error| internal(anyhow::Error::from(error)))?;
-        let backup = std::path::PathBuf::from(backup_path);
-        let previous_default = previous_default
-            .map(|value| uuid::Uuid::parse_str(&value))
-            .transpose()
-            .map_err(|error| internal(anyhow::Error::from(error)))?;
-        compensate_onboarding_agent_publication(
-            ctx,
-            operation_id,
-            &backup,
-            previous_default,
-            authored_owner_digest,
-        )
-        .await
-        .map_err(internal)?;
-    }
-    Ok(())
-}
-
 /// Recover the catalog `(provider_id, model_id)` whose identity digests match
 /// the proposal scope. Session and persistent rules are keyed by that create
 /// identity, not by the session `active_model`: a computer-capable child
@@ -11181,6 +11043,12 @@ async fn handle_serialized_request_impl(
             Ok(Response::AgentAuthoringProjection(projection))
         }
         Request::ApplyAuthoredAgentPackage(request) => {
+            if request.validate_only {
+                let outcome = crate::daemon::agent_authoring::apply_package(ctx, request, None)
+                    .await
+                    .map_err(internal)?;
+                return Ok(Response::AuthoredAgentPackage(outcome));
+            }
             let settlement_owner = settings_capability_owner(state);
             let request_hash = local_operation_request_hash(&request)?;
             let fencing_generation = match begin_local_operation(

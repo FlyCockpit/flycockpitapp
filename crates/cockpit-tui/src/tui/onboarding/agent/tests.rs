@@ -5,6 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
+use cockpit_core::authoring_draft::build_package_draft;
 use cockpit_proto::{
     AGENT_AUTHORING_DTO_VERSION, AgentAuthoringCatalogOrigin, AgentAuthoringCompatibleRoute,
     AgentAuthoringProjection, AgentAuthoringSource, AgentAuthoringSourceKind, AgentPolicyRoute,
@@ -84,6 +85,7 @@ fn sample_review() -> AuthoredAgentReview {
         children: vec![],
         sidecars: vec![],
         source: "catalog/frontier@rev".into(),
+        make_default: true,
         trust_is_shared: true,
         trust_disclosure: "Trust classification is shared global provider/model policy.".into(),
     }
@@ -252,21 +254,20 @@ fn invalid_nested_depth_surfaces_canonical_failure() {
             route_grants: vec![cockpit_core::authoring_draft::RouteGrantDraft { enabled: true }],
             default_route_index: 0,
             tool_tiers: Default::default(),
+            children: vec![],
         },
         cockpit_core::authoring_draft::ChildAuthoringDraft {
             name: "child-a".into(),
             route_grants: vec![cockpit_core::authoring_draft::RouteGrantDraft { enabled: true }],
             default_route_index: 0,
             tool_tiers: Default::default(),
+            children: vec![],
         },
     ];
-    screen.cursor = screen.draft.children.len() + 1;
-    screen.handle_key(key(KeyCode::Enter));
+    let error = build_package_draft(&screen.projection, &screen.draft)
+        .expect_err("duplicate child names must fail canonical package construction");
     assert!(
-        screen
-            .status
-            .as_deref()
-            .is_some_and(|status| !status.is_empty()),
-        "duplicate child names must surface a canonical validation failure"
+        error.to_string().contains("duplicate child name"),
+        "expected duplicate child validation, got: {error}"
     );
 }

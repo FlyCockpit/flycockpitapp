@@ -6100,10 +6100,6 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup typed-settings journal recovery failed")?;
-    dispatch::recover_onboarding_agent_publication_journals(ctx)
-        .await
-        .map_err(|error| anyhow::anyhow!(error.message))
-        .context("startup onboarding-agent publication recovery failed")?;
     #[cfg(feature = "extended")]
     {
         let recovered_image_config =

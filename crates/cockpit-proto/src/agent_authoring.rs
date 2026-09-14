@@ -223,6 +223,7 @@ pub struct AuthoredAgentReview {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sidecars: Vec<String>,
     pub source: String,
+    pub make_default: bool,
     pub trust_is_shared: bool,
     pub trust_disclosure: String,
 }
@@ -237,6 +238,7 @@ pub struct ApplyAuthoredAgentPackageReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installation_id: Option<String>,
     pub default_selected: bool,
+    pub result_config_generation: u64,
     pub review: AuthoredAgentReview,
 }
 

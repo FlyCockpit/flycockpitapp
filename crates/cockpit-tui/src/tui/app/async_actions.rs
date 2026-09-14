@@ -1289,6 +1289,30 @@ impl App {
                     Ok(_) | Err(_) => {}
                 }
             }
+            AsyncActionKind::DaemonRpc("agent_authoring.receipt") => {
+                let pending_request_id = self
+                    .pending_startup_onboarding_operations
+                    .remove(&result.id);
+                match result.payload {
+                    Ok(AsyncActionPayload::StartupAgentAuthoringReceipt {
+                        request_id,
+                        receipt,
+                    }) if pending_request_id.as_deref() == Some(&request_id) => {
+                        if receipt.result_config_generation > 0 {
+                            self.sync_config_generation_after_authored_agent_apply(
+                                receipt.result_config_generation,
+                            );
+                        }
+                        if let Some(shell) = self.onboarding_shell.as_mut() {
+                            shell.apply_agent_authoring_outcome(
+                                cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(receipt),
+                            );
+                        }
+                    }
+                    Ok(AsyncActionPayload::StartupAgentAuthoringReceiptMiss { .. }) => {}
+                    Ok(_) | Err(_) => {}
+                }
+            }
             AsyncActionKind::DaemonRpc("agent_authoring.projection") => {
                 let pending_request_id = self
                     .pending_startup_onboarding_operations
@@ -1337,7 +1361,14 @@ impl App {
                                         == cockpit_proto::AuthoredAgentReceiptStatus::Committed
                                 )
                             {
-                                self.sync_config_generation_after_authored_agent_apply();
+                                if let cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(
+                                    receipt,
+                                ) = &outcome
+                                {
+                                    self.sync_config_generation_after_authored_agent_apply(
+                                        receipt.result_config_generation,
+                                    );
+                                }
                             }
                             if let Some(shell) = self.onboarding_shell.as_mut() {
                                 shell.apply_agent_authoring_outcome(outcome);

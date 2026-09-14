@@ -11,13 +11,10 @@ use anyhow::{Context, Result, anyhow};
 mod apply;
 
 pub use apply::{
-    ModelAnswersOutcome, OnboardingConfigRollback, PreparedOnboardingAgent, apply_model_answers,
-    apply_security_answers, apply_security_answers_with_caps, apply_setup_wizard_answers,
-    apply_setup_wizard_answers_authoritative, capture_onboarding_agent_config,
-    capture_onboarding_agent_config_for_providers, compose_wizard_host_capabilities,
-    descriptor_for_cwd, descriptor_for_cwd_with_caps, model_descriptor_for_cwd,
-    onboarding_model_descriptor_for_cwd, prepare_onboarding_agent_answers,
-    prepare_onboarding_agent_answers_for_catalog, publish_onboarding_agent_plan,
+    ModelAnswersOutcome, apply_model_answers, apply_security_answers,
+    apply_security_answers_with_caps, apply_setup_wizard_answers,
+    apply_setup_wizard_answers_authoritative, compose_wizard_host_capabilities, descriptor_for_cwd,
+    descriptor_for_cwd_with_caps, model_descriptor_for_cwd, onboarding_model_descriptor_for_cwd,
     security_config_path,
 };
 
@@ -582,6 +579,21 @@ pub fn registry() -> Vec<WizardDescriptor> {
         provider_descriptor(),
         security_descriptor(),
         model_descriptor_for_config(&crate::config::providers::ProvidersConfig::default()),
+    ]
+}
+
+/// Every named wizard id accepted by `cockpit setup <wizard>` and `/setup
+/// <wizard>`. The route-inventory test fails when a new id is added without a
+/// shell adapter row.
+pub fn named_setup_wizard_ids() -> Vec<&'static str> {
+    vec![
+        PROVIDER_WIZARD_ID,
+        SECURITY_WIZARD_ID,
+        MODEL_WIZARD_ID,
+        ONBOARDING_MODEL_WIZARD_ID,
+        ONBOARDING_PROFILE_WIZARD_ID,
+        ONBOARDING_LIFETIME_WIZARD_ID,
+        ONBOARDING_AGENT_WIZARD_ID,
     ]
 }
 

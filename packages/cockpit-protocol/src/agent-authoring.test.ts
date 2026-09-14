@@ -76,6 +76,7 @@ describe("agent authoring wire projection", () => {
         package_digest: "b".repeat(64),
         policy_revision: "a".repeat(64),
         default_selected: true,
+        result_config_generation: 2,
         review: {
           agent_name: "helper",
           grants: [
@@ -92,6 +93,7 @@ describe("agent authoring wire projection", () => {
           goal_skeptics_label: "Goal skeptics off",
           children: [],
           source: "authored/helper",
+          make_default: true,
           trust_is_shared: true,
           trust_disclosure:
             "Trust classification is shared global provider/model policy, not a per-agent override.",

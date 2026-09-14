@@ -221,6 +221,7 @@ fn settle_onboarding_agent_stage(app: &mut App) {
         children: vec![],
         sidecars: vec![],
         source: "catalog/frontier@rev".into(),
+        make_default: true,
         trust_is_shared: true,
         trust_disclosure: "Trust classification is shared global provider/model policy.".into(),
     };
@@ -235,6 +236,7 @@ fn settle_onboarding_agent_stage(app: &mut App) {
                 policy_revision: "agent-policy-rev".into(),
                 installation_id: Some("install-1".into()),
                 default_selected: true,
+                result_config_generation: 1,
                 review,
             },
         ));

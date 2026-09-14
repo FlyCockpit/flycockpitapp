@@ -44,8 +44,11 @@ pub type AgentAuthoringShellAction = AgentAuthoringAction;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
     SourceIdentity,
+    ThirdPartyLocator,
+    ThirdPartyTrust,
     ModelGrants,
     ModelTrust,
+    SidecarEgress,
     Optimizations,
     ToolTiers,
     SubagentsList,
@@ -270,8 +273,11 @@ impl AgentAuthoringScreen {
     fn phase_title(&self) -> &'static str {
         match self.phase {
             Phase::SourceIdentity => "Agent source and name",
+            Phase::ThirdPartyLocator => "Third-party source locator",
+            Phase::ThirdPartyTrust => "Third-party publisher trust",
             Phase::ModelGrants => "Model grants and default",
             Phase::ModelTrust => "Model trust confirmation",
+            Phase::SidecarEgress => "Remote sidecar egress",
             Phase::Optimizations => "Optimizations and verification",
             Phase::ToolTiers => "Tool tiers",
             Phase::SubagentsList => "Subagents",
@@ -299,9 +305,15 @@ impl AgentAuthoringScreen {
 
     pub fn help_text(&self) -> &'static str {
         match self.phase {
-            Phase::SourceIdentity | Phase::SubagentEdit(SubagentPhase::Identity) => {
-                "type name  enter: continue  esc: back"
+            Phase::SourceIdentity
+            | Phase::ThirdPartyLocator
+            | Phase::SubagentEdit(SubagentPhase::Identity) => {
+                "type text  enter: continue  esc: back"
             }
+            Phase::ThirdPartyTrust | Phase::SidecarEgress => {
+                "space: confirm  enter: continue  esc: back"
+            }
+            Phase::SubagentsList => "↑/↓ select  d: delete  enter: continue  esc: back",
             Phase::Review => "enter: create  r: refresh preview  esc: edit",
             Phase::Create | Phase::Pending | Phase::Unknown => "enter: submit create  esc: review",
             Phase::Success => "enter: continue setup",
@@ -329,6 +341,10 @@ impl AgentAuthoringScreen {
                 None
             }
             KeyCode::Char('r') if self.phase == Phase::Review => self.request_preview(),
+            KeyCode::Char('d') if self.phase == Phase::SubagentsList => {
+                self.delete_selected_subagent();
+                None
+            }
             KeyCode::Char(ch)
                 if matches!(
                     self.phase,
@@ -340,6 +356,12 @@ impl AgentAuthoringScreen {
                 self.name_field.paste(ch.encode_utf8(&mut encoded));
                 None
             }
+            KeyCode::Char(ch) if self.phase == Phase::ThirdPartyLocator => {
+                let ch = crate::tui::textfield::normalize_shift_char(&key, ch);
+                let mut encoded = [0u8; 4];
+                self.third_party_field.paste(ch.encode_utf8(&mut encoded));
+                None
+            }
             KeyCode::Backspace
                 if matches!(
                     self.phase,
@@ -347,6 +369,11 @@ impl AgentAuthoringScreen {
                 ) =>
             {
                 self.name_field
+                    .handle_key(KeyEvent::new(KeyCode::Backspace, key.modifiers));
+                None
+            }
+            KeyCode::Backspace if self.phase == Phase::ThirdPartyLocator => {
+                self.third_party_field
                     .handle_key(KeyEvent::new(KeyCode::Backspace, key.modifiers));
                 None
             }
@@ -374,12 +401,32 @@ impl AgentAuthoringScreen {
     }
 
     pub fn paste(&mut self, text: &str) {
-        if matches!(
-            self.phase,
-            Phase::SourceIdentity | Phase::SubagentEdit(SubagentPhase::Identity)
-        ) {
-            self.name_field.paste(text);
+        match self.phase {
+            Phase::SourceIdentity | Phase::SubagentEdit(SubagentPhase::Identity) => {
+                self.name_field.paste(text);
+            }
+            Phase::ThirdPartyLocator => {
+                self.third_party_field.paste(text);
+            }
+            _ => {}
         }
+    }
+
+    fn delete_selected_subagent(&mut self) {
+        if self.cursor == 0 || self.cursor > self.draft.children.len() {
+            return;
+        }
+        self.draft.children.remove(self.cursor - 1);
+        self.cursor = self.cursor.saturating_sub(1);
+        self.review = None;
+        self.review_policy_revision = None;
+    }
+
+    fn sidecar_egress_required(&self) -> bool {
+        self.draft
+            .sidecar_route_index
+            .and_then(|index| self.projection.policy.routes.get(index))
+            .is_some_and(|route| route.remote_sidecar_egress_required)
     }
 
     fn move_cursor(&mut self, delta: isize) {
@@ -401,7 +448,8 @@ impl AgentAuthoringScreen {
 
     fn visible_row_count(&self) -> usize {
         match self.phase {
-            Phase::SourceIdentity => self.projection.sources.len().max(1) + 1,
+            Phase::SourceIdentity => self.projection.sources.len().max(1) + 2,
+            Phase::ThirdPartyLocator | Phase::ThirdPartyTrust | Phase::SidecarEgress => 1,
             Phase::ModelGrants | Phase::SubagentEdit(SubagentPhase::ModelGrants) => {
                 self.projection.policy.routes.len()
             }
@@ -415,7 +463,7 @@ impl AgentAuthoringScreen {
             }
             Phase::SubagentsList => self.draft.children.len() + 2,
             Phase::Review => self.review_lines().len(),
-            Phase::Create => 2,
+            Phase::Create => 1,
             Phase::Success => 1,
             _ => 1,
         }
@@ -433,8 +481,17 @@ impl AgentAuthoringScreen {
                     }
                 }
             }
+            Phase::SourceIdentity if self.cursor == self.projection.sources.len() + 1 => {
+                self.draft.source_selection = SourceSelection::ThirdParty;
+            }
             Phase::SourceIdentity => {
                 self.draft.source_selection = SourceSelection::Authored;
+            }
+            Phase::ThirdPartyTrust => {
+                self.draft.third_party_trust_confirmed = !self.draft.third_party_trust_confirmed;
+            }
+            Phase::SidecarEgress => {
+                self.draft.sidecar_egress_confirmed = !self.draft.sidecar_egress_confirmed;
             }
             Phase::ModelGrants => {
                 let cursor = self.cursor;
@@ -482,11 +539,6 @@ impl AgentAuthoringScreen {
                     self.begin_edit_subagent(index);
                 }
             }
-            Phase::Create => {
-                if self.cursor == 0 {
-                    self.draft.make_default = !self.draft.make_default;
-                }
-            }
             _ => {}
         }
     }
@@ -505,12 +557,27 @@ impl AgentAuthoringScreen {
         self.status = None;
         match self.phase {
             Phase::SourceIdentity if self.editing_root() => None,
+            Phase::ThirdPartyLocator => {
+                self.phase = Phase::SourceIdentity;
+                None
+            }
+            Phase::ThirdPartyTrust => {
+                self.phase = Phase::ThirdPartyLocator;
+                None
+            }
+            Phase::SidecarEgress => {
+                self.phase = Phase::ModelTrust;
+                None
+            }
             Phase::SourceIdentity => {
                 self.cancel_subagent_edit();
                 None
             }
             Phase::ModelGrants if self.editing_root() => {
-                self.phase = Phase::SourceIdentity;
+                self.phase = match self.draft.source_selection {
+                    SourceSelection::ThirdParty => Phase::ThirdPartyTrust,
+                    _ => Phase::SourceIdentity,
+                };
                 None
             }
             Phase::ModelGrants => {
@@ -522,7 +589,9 @@ impl AgentAuthoringScreen {
                 None
             }
             Phase::Optimizations => {
-                self.phase = if self
+                self.phase = if self.sidecar_egress_required() {
+                    Phase::SidecarEgress
+                } else if self
                     .draft
                     .pending_trust_route_indices(&self.projection)
                     .is_empty()
@@ -577,11 +646,28 @@ impl AgentAuthoringScreen {
         match self.phase {
             Phase::SourceIdentity => {
                 self.draft.name = self.name_field.text().trim().to_string();
-                if self.editing_root() {
+                if self.draft.source_selection == SourceSelection::ThirdParty {
+                    self.third_party_field.set(&self.draft.third_party_locator);
+                    self.phase = Phase::ThirdPartyLocator;
+                } else if self.editing_root() {
                     self.phase = Phase::ModelGrants;
                 } else {
                     self.phase = Phase::SubagentEdit(SubagentPhase::ModelGrants);
                 }
+                None
+            }
+            Phase::ThirdPartyLocator => {
+                self.draft.third_party_locator = self.third_party_field.text().trim().to_string();
+                self.phase = Phase::ThirdPartyTrust;
+                None
+            }
+            Phase::ThirdPartyTrust => {
+                if !self.draft.third_party_trust_confirmed {
+                    self.status =
+                        Some("Confirm third-party publisher trust before continuing.".into());
+                    return None;
+                }
+                self.phase = Phase::ModelGrants;
                 None
             }
             Phase::ModelGrants => {
@@ -618,6 +704,18 @@ impl AgentAuthoringScreen {
                     .is_empty()
                 {
                     self.status = Some("Confirm trust for every enabled unset model.".into());
+                    return None;
+                }
+                self.phase = if self.editing_root() && self.sidecar_egress_required() {
+                    Phase::SidecarEgress
+                } else {
+                    Phase::Optimizations
+                };
+                None
+            }
+            Phase::SidecarEgress => {
+                if !self.draft.sidecar_egress_confirmed {
+                    self.status = Some("Confirm remote sidecar egress before continuing.".into());
                     return None;
                 }
                 self.phase = Phase::Optimizations;
@@ -816,12 +914,23 @@ impl AgentAuthoringScreen {
                     "off"
                 }
             )));
+            lines.push(Line::from(format!("Source: {}", review.source)));
+            if !review.sidecars.is_empty() {
+                lines.push(Line::from(format!(
+                    "Sidecars: {}",
+                    review.sidecars.join(", ")
+                )));
+            }
             if !review.children.is_empty() {
                 lines.push(Line::from(format!(
                     "Children: {}",
                     review.children.join(", ")
                 )));
             }
+            lines.push(Line::from(format!(
+                "Make default: {}",
+                if review.make_default { "yes" } else { "no" }
+            )));
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
                 review.trust_disclosure.clone(),
@@ -925,6 +1034,49 @@ impl AgentAuthoringScreen {
                     ),
                     Span::styled("Custom authored agent", selected),
                 ]));
+                lines.push(Line::from(vec![
+                    Span::raw(
+                        if self.draft.source_selection == SourceSelection::ThirdParty {
+                            "▸"
+                        } else {
+                            " "
+                        },
+                    ),
+                    Span::styled("Third-party pinned source", selected),
+                ]));
+            }
+            Phase::ThirdPartyLocator => {
+                lines.push(Line::from(format!(
+                    "Locator: {}",
+                    self.third_party_field.text()
+                )));
+            }
+            Phase::ThirdPartyTrust => {
+                lines.push(Line::from(format!(
+                    "{} Confirm third-party publisher trust",
+                    if self.draft.third_party_trust_confirmed {
+                        "✓"
+                    } else {
+                        " "
+                    }
+                )));
+            }
+            Phase::SidecarEgress => {
+                if let Some(index) = self.draft.sidecar_route_index {
+                    let route = &self.projection.policy.routes[index];
+                    lines.push(Line::from(format!(
+                        "Remote sidecar: {}/{}",
+                        route.provider_id, route.model_id
+                    )));
+                }
+                lines.push(Line::from(format!(
+                    "{} Confirm remote sidecar egress",
+                    if self.draft.sidecar_egress_confirmed {
+                        "✓"
+                    } else {
+                        " "
+                    }
+                )));
             }
             Phase::ModelGrants | Phase::SubagentEdit(SubagentPhase::ModelGrants) => {
                 let grants = if let Some(child) = self.current_child() {
@@ -1034,11 +1186,15 @@ impl AgentAuthoringScreen {
                 lines.push(Line::from(format!("Name: {}", self.name_field.text())));
             }
             Phase::Create => {
-                lines.push(opt_line(
-                    0,
-                    self.cursor,
-                    &format!("Replace default agent: {}", on_off(self.draft.make_default)),
-                ));
+                let make_default = self
+                    .review
+                    .as_ref()
+                    .map(|review| review.make_default)
+                    .unwrap_or(self.draft.make_default);
+                lines.push(Line::from(format!(
+                    "Make default agent: {}",
+                    on_off(make_default)
+                )));
                 lines.push(Line::from("Enter submits the stable create operation."));
             }
             Phase::Pending => {

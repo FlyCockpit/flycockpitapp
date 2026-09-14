@@ -596,6 +596,13 @@ pub enum AsyncActionPayload {
         request_id: String,
         projection: cockpit_proto::AgentAuthoringProjection,
     },
+    StartupAgentAuthoringReceipt {
+        request_id: String,
+        receipt: cockpit_proto::ApplyAuthoredAgentPackageReceipt,
+    },
+    StartupAgentAuthoringReceiptMiss {
+        request_id: String,
+    },
     StartupAgentAuthoringOutcome {
         request_id: String,
         outcome: Result<cockpit_proto::ApplyAuthoredAgentPackageOutcome, String>,

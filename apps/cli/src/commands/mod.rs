@@ -117,6 +117,42 @@ impl fmt::Display for RemovedCommandError {
 
 impl std::error::Error for RemovedCommandError {}
 
+/// Non-interactive onboarding entrypoints must fail before any mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InteractiveOnboardingRequired {
+    message: String,
+}
+
+impl InteractiveOnboardingRequired {
+    pub fn setup() -> Self {
+        Self {
+            message:
+                "cockpit setup requires an interactive stdin; run `cockpit` and use /setup instead"
+                    .into(),
+        }
+    }
+
+    pub fn provider_add() -> Self {
+        Self {
+            message:
+                "cockpit provider add requires an interactive stdin; run `cockpit` and use /setup provider instead"
+                    .into(),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for InteractiveOnboardingRequired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for InteractiveOnboardingRequired {}
+
 pub mod acp;
 pub mod agent;
 pub mod ask;

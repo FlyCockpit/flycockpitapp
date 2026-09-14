@@ -163,6 +163,38 @@ impl App {
         false
     }
 
+    fn snapshot_matches_named_wizard_stage(
+        wizard_id: &str,
+        stage: cockpit_proto::OnboardingStage,
+    ) -> bool {
+        if cockpit_core::wizard::named_setup_wizard_allows_complete_stage(wizard_id)
+            && stage == cockpit_proto::OnboardingStage::Complete
+        {
+            return true;
+        }
+        cockpit_core::wizard::named_setup_wizard_authoritative_stage(wizard_id)
+            .map(|required| stage == required)
+            .unwrap_or(true)
+    }
+
+    fn focus_named_setup_wizard(&mut self, wizard_id: &str) -> bool {
+        let snapshot = self
+            .onboarding_snapshot
+            .clone()
+            .expect("named setup wizard routes require an authoritative onboarding snapshot");
+        if !Self::snapshot_matches_named_wizard_stage(wizard_id, snapshot.stage) {
+            if snapshot.stage == cockpit_proto::OnboardingStage::Complete {
+                self.push_plain(format!(
+                    "`{wizard_id}` requires an active onboarding run at its authoritative stage."
+                ));
+                return false;
+            }
+            self.reopen_onboarding_shell(&snapshot);
+            return false;
+        }
+        true
+    }
+
     fn maybe_open_pending_setup_wizard(&mut self) {
         if !self.startup_background.workspace_ready {
             return;
@@ -257,6 +289,9 @@ impl App {
                 ) {
                     return;
                 }
+                if !self.focus_named_setup_wizard(cockpit_core::wizard::SECURITY_WIZARD_ID) {
+                    return;
+                }
                 self.mount_named_setup_wizard_in_onboarding_shell(
                     cockpit_core::wizard::SECURITY_WIZARD_ID,
                     None,
@@ -266,6 +301,9 @@ impl App {
                 if !self.require_onboarding_snapshot_for_named_route(
                     cockpit_core::wizard::MODEL_WIZARD_ID,
                 ) {
+                    return;
+                }
+                if !self.focus_named_setup_wizard(cockpit_core::wizard::MODEL_WIZARD_ID) {
                     return;
                 }
                 self.mount_named_setup_wizard_in_onboarding_shell(
@@ -279,6 +317,10 @@ impl App {
                 ) {
                     return;
                 }
+                if !self.focus_named_setup_wizard(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID)
+                {
+                    return;
+                }
                 self.mount_named_setup_wizard_in_onboarding_shell(
                     cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID,
                     None,
@@ -288,6 +330,11 @@ impl App {
                 if !self.require_onboarding_snapshot_for_named_route(
                     cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
                 ) {
+                    return;
+                }
+                if !self
+                    .focus_named_setup_wizard(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID)
+                {
                     return;
                 }
                 self.mount_named_setup_wizard_in_onboarding_shell(
@@ -301,6 +348,11 @@ impl App {
                 ) {
                     return;
                 }
+                if !self
+                    .focus_named_setup_wizard(cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID)
+                {
+                    return;
+                }
                 self.mount_named_setup_wizard_in_onboarding_shell(
                     cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
                     None,
@@ -310,6 +362,10 @@ impl App {
                 if !self.require_onboarding_snapshot_for_named_route(
                     cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID,
                 ) {
+                    return;
+                }
+                if !self.focus_named_setup_wizard(cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID)
+                {
                     return;
                 }
                 self.mount_onboarding_agent_authoring();

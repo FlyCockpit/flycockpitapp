@@ -586,6 +586,28 @@ pub fn named_setup_wizard_ids() -> Vec<&'static str> {
     ]
 }
 
+/// Onboarding stage a named wizard must be focused to during first-run.
+/// Post-onboarding wizards that also work at `Complete` return `None`.
+pub fn named_setup_wizard_authoritative_stage(
+    wizard_id: &str,
+) -> Option<cockpit_proto::OnboardingStage> {
+    match wizard_id {
+        ONBOARDING_PROFILE_WIZARD_ID => Some(cockpit_proto::OnboardingStage::Profile),
+        ONBOARDING_MODEL_WIZARD_ID => Some(cockpit_proto::OnboardingStage::Model),
+        ONBOARDING_LIFETIME_WIZARD_ID => Some(cockpit_proto::OnboardingStage::Lifetime),
+        ONBOARDING_AGENT_WIZARD_ID => Some(cockpit_proto::OnboardingStage::Agent),
+        _ => None,
+    }
+}
+
+/// Named wizards that may mount as a post-onboarding detour at `Complete`.
+pub fn named_setup_wizard_allows_complete_stage(wizard_id: &str) -> bool {
+    matches!(
+        wizard_id,
+        PROVIDER_WIZARD_ID | SECURITY_WIZARD_ID | MODEL_WIZARD_ID
+    )
+}
+
 /// The small durable profile step shown on every fresh-install onboarding.
 /// An empty name is a deliberate skip, not an omitted screen.
 pub fn onboarding_profile_descriptor() -> WizardDescriptor {

@@ -7174,12 +7174,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recv_salvages_out_of_range_request() {
+    async fn recv_rejects_out_of_range_request() {
         let (a, b) = duplex(4096);
         let mut left = ProtoStream::new(a);
         let mut right = ProtoStream::new(b);
 
-        // Bypass the helper to inject a bad version.
         let id = Uuid::new_v4();
         let bad = serde_json::json!({
             "v": 999,
@@ -7191,16 +7190,21 @@ mod tests {
         let line = serde_json::to_string(&bad).unwrap();
         left.framed.send(line).await.unwrap();
         match right.recv().await.unwrap().expect("frame") {
-            RecvFrame::Envelope(envelope) => {
-                assert_eq!(envelope.v, 999);
-                assert!(matches!(envelope.body, Body::Request { id: got_id, .. } if got_id == id));
+            RecvFrame::VersionMismatch {
+                v,
+                kind,
+                id: got_id,
+            } => {
+                assert_eq!(v, 999);
+                assert_eq!(kind, "req");
+                assert_eq!(got_id, Some(id));
             }
-            other => panic!("expected envelope without version gating, got {other:?}"),
+            other => panic!("expected exact-version rejection, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn recv_salvages_out_of_range_event_without_id() {
+    async fn recv_rejects_out_of_range_event_without_id() {
         let (a, b) = duplex(4096);
         let mut left = ProtoStream::new(a);
         let mut right = ProtoStream::new(b);
@@ -7216,18 +7220,17 @@ mod tests {
             .await
             .unwrap();
         match right.recv().await.unwrap().expect("frame") {
-            RecvFrame::Envelope(envelope) => {
-                assert_eq!(envelope.v, 999);
-                assert!(matches!(envelope.body, Body::Event { .. }));
+            RecvFrame::VersionMismatch { v, kind, id } => {
+                assert_eq!(v, 999);
+                assert_eq!(kind, "evt");
+                assert!(id.is_none());
             }
-            other => panic!("expected envelope without version gating, got {other:?}"),
+            other => panic!("expected exact-version rejection, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn v10_only_request_is_not_sent_to_v9_daemon() {
-        // Pre-launch wire handling does not version-gate frames: the receiver
-        // decodes the payload and leaves execution policy to the daemon.
+    async fn v10_only_request_is_rejected_by_exact_version_gate() {
         let (a, b) = duplex(4096);
         let mut v9_sender = ProtoStream::with_version(a, 9);
         let mut v9_receiver = ProtoStream::with_version(b, 9);
@@ -7244,14 +7247,12 @@ mod tests {
             .expect("sender stamps the negotiated version without a payload gate");
         assert!(matches!(
             v9_receiver.recv().await.unwrap(),
-            Some(RecvFrame::Envelope(_))
+            Some(RecvFrame::VersionMismatch { v: 9, .. })
         ));
     }
 
     #[tokio::test]
-    async fn v17_provider_credential_receipt_is_not_sent_to_v9_daemon() {
-        // Same pre-launch contract as the request test above: version labels
-        // are carried on the envelope but do not suppress decode.
+    async fn v17_provider_credential_receipt_is_rejected_by_exact_version_gate() {
         let (a, b) = duplex(4096);
         let mut v9_sender = ProtoStream::with_version(a, 9);
         let mut v9_receiver = ProtoStream::with_version(b, 9);
@@ -7277,7 +7278,7 @@ mod tests {
             .expect("sender stamps the negotiated version without a payload gate");
         assert!(matches!(
             v9_receiver.recv().await.unwrap(),
-            Some(RecvFrame::Envelope(_))
+            Some(RecvFrame::VersionMismatch { v: 9, .. })
         ));
     }
 
@@ -7307,7 +7308,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             receiver.recv().await.unwrap(),
-            Some(RecvFrame::Envelope(_))
+            Some(RecvFrame::VersionMismatch { v: 9, .. })
         ));
     }
 
@@ -7341,7 +7342,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             receiver.recv().await.unwrap(),
-            Some(RecvFrame::Envelope(_))
+            Some(RecvFrame::VersionMismatch { v: 9, .. })
         ));
     }
 
@@ -7351,8 +7352,6 @@ mod tests {
         let mut sender = ProtoStream::with_version(a, 9);
         let mut receiver = ProtoStream::with_version(b, 9);
         let id = Uuid::new_v4();
-        // The base list_sessions tag is v9-compatible, but the
-        // assistant_id filter field is a v10-only extended shape.
         let forged = Envelope {
             v: 9,
             body: Body::Request {
@@ -7376,7 +7375,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             receiver.recv().await.unwrap(),
-            Some(RecvFrame::Envelope(_))
+            Some(RecvFrame::VersionMismatch { v: 9, .. })
         ));
     }
 
@@ -7406,7 +7405,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             receiver.recv().await.unwrap(),
-            Some(RecvFrame::Envelope(_))
+            Some(RecvFrame::VersionMismatch { v: 9, .. })
         ));
     }
 
@@ -7430,7 +7429,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             receiver.recv().await.unwrap(),
-            Some(RecvFrame::Envelope(_))
+            Some(RecvFrame::VersionMismatch { v: 9, .. })
         ));
     }
 
@@ -7451,7 +7450,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             receiver.recv().await.unwrap(),
-            Some(RecvFrame::Envelope(_))
+            Some(RecvFrame::VersionMismatch { v: 10, .. })
         ));
     }
 

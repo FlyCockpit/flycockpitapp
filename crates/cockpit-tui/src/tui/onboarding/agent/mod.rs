@@ -66,6 +66,7 @@ pub(crate) enum Phase {
 enum SubagentPhase {
     Identity,
     ModelGrants,
+    ModelTrust,
     ToolTiers,
     SubagentsList,
 }
@@ -258,6 +259,19 @@ impl AgentAuthoringScreen {
         if self.draft.default_route_index >= count && count > 0 {
             self.draft.default_route_index = 0;
         }
+        if let Some(child) = self.editing_child.as_mut() {
+            Self::resize_child_route_state(child, count);
+        }
+    }
+
+    fn resize_child_route_state(child: &mut ChildAuthoringDraft, count: usize) {
+        child
+            .route_grants
+            .resize(count, RouteGrantDraft { enabled: false });
+        child.trust_confirmations.resize(count, false);
+        if child.default_route_index >= count && count > 0 {
+            child.default_route_index = 0;
+        }
     }
 
     fn editing_root(&self) -> bool {
@@ -285,6 +299,7 @@ impl AgentAuthoringScreen {
             Phase::SubagentsList => "Subagents",
             Phase::SubagentEdit(SubagentPhase::Identity) => "Subagent name",
             Phase::SubagentEdit(SubagentPhase::ModelGrants) => "Subagent models",
+            Phase::SubagentEdit(SubagentPhase::ModelTrust) => "Subagent model trust",
             Phase::SubagentEdit(SubagentPhase::ToolTiers) => "Subagent tools",
             Phase::Review => "Review agent package",
             Phase::Create => "Create agent",
@@ -459,6 +474,10 @@ impl AgentAuthoringScreen {
                 .draft
                 .pending_trust_route_indices(&self.projection)
                 .len(),
+            Phase::SubagentEdit(SubagentPhase::ModelTrust) => self
+                .current_child()
+                .map(|child| child.pending_trust_route_indices(&self.projection).len())
+                .unwrap_or(0),
             Phase::Optimizations => 4,
             Phase::ToolTiers | Phase::SubagentEdit(SubagentPhase::ToolTiers) => {
                 tool_surface_catalog().len()
@@ -503,6 +522,14 @@ impl AgentAuthoringScreen {
                 let cursor = self.cursor;
                 if let Some(child) = self.current_child_mut() {
                     toggle_route_grant(&mut child.route_grants, cursor);
+                }
+            }
+            Phase::SubagentEdit(SubagentPhase::ModelTrust) => {
+                if let Some(child) = self.current_child_mut() {
+                    let pending = child.pending_trust_route_indices(&self.projection);
+                    if let Some(index) = pending.get(self.cursor) {
+                        child.trust_confirmations[*index] = !child.trust_confirmations[*index];
+                    }
                 }
             }
             Phase::ModelTrust => {
@@ -636,8 +663,20 @@ impl AgentAuthoringScreen {
                 self.phase = Phase::SubagentEdit(SubagentPhase::Identity);
                 None
             }
-            Phase::SubagentEdit(SubagentPhase::ToolTiers) => {
+            Phase::SubagentEdit(SubagentPhase::ModelTrust) => {
                 self.phase = Phase::SubagentEdit(SubagentPhase::ModelGrants);
+                None
+            }
+            Phase::SubagentEdit(SubagentPhase::ToolTiers) => {
+                if let Some(child) = self.current_child()
+                    && !child
+                        .pending_trust_route_indices(&self.projection)
+                        .is_empty()
+                {
+                    self.phase = Phase::SubagentEdit(SubagentPhase::ModelTrust);
+                } else {
+                    self.phase = Phase::SubagentEdit(SubagentPhase::ModelGrants);
+                }
                 None
             }
             Phase::SubagentEdit(SubagentPhase::SubagentsList) => {
@@ -710,9 +749,30 @@ impl AgentAuthoringScreen {
                     } else {
                         Phase::ModelTrust
                     };
+                } else if let Some(child) = self.current_child() {
+                    self.phase = if child
+                        .pending_trust_route_indices(&self.projection)
+                        .is_empty()
+                    {
+                        Phase::SubagentEdit(SubagentPhase::ToolTiers)
+                    } else {
+                        Phase::SubagentEdit(SubagentPhase::ModelTrust)
+                    };
                 } else {
                     self.phase = Phase::SubagentEdit(SubagentPhase::ToolTiers);
                 }
+                None
+            }
+            Phase::SubagentEdit(SubagentPhase::ModelTrust) => {
+                if let Some(child) = self.current_child()
+                    && !child
+                        .pending_trust_route_indices(&self.projection)
+                        .is_empty()
+                {
+                    self.status = Some("Confirm trust for every enabled unset model.".into());
+                    return None;
+                }
+                self.phase = Phase::SubagentEdit(SubagentPhase::ToolTiers);
                 None
             }
             Phase::ModelTrust => {
@@ -781,8 +841,17 @@ impl AgentAuthoringScreen {
                         self.status = Some("Enable at least one model grant.".into());
                         return None;
                     }
+                    self.phase = if child
+                        .pending_trust_route_indices(&self.projection)
+                        .is_empty()
+                    {
+                        Phase::SubagentEdit(SubagentPhase::ToolTiers)
+                    } else {
+                        Phase::SubagentEdit(SubagentPhase::ModelTrust)
+                    };
+                } else {
+                    self.phase = Phase::SubagentEdit(SubagentPhase::ToolTiers);
                 }
-                self.phase = Phase::SubagentEdit(SubagentPhase::ToolTiers);
                 None
             }
             Phase::SubagentEdit(SubagentPhase::ToolTiers) => {
@@ -931,10 +1000,14 @@ impl AgentAuthoringScreen {
     }
 
     fn begin_edit_subagent(&mut self, index: usize) {
-        let child = self.draft.children.get(index).cloned();
+        let mut child = self.draft.children.get(index).cloned();
         if child.is_none() {
             return;
         }
+        Self::resize_child_route_state(
+            child.as_mut().expect("child"),
+            self.projection.policy.routes.len(),
+        );
         self.subagent_stack.push(SubagentStackFrame {
             parent: self.draft.clone(),
             child_path: vec![index],
@@ -1232,6 +1305,21 @@ impl AgentAuthoringScreen {
                         route.model_id,
                         trust_label(route.trust)
                     )));
+                }
+            }
+            Phase::SubagentEdit(SubagentPhase::ModelTrust) => {
+                if let Some(child) = self.current_child() {
+                    for index in child.pending_trust_route_indices(&self.projection) {
+                        let route = &self.projection.policy.routes[index];
+                        let confirmed = child.trust_confirmations[index];
+                        lines.push(Line::from(format!(
+                            "{} Confirm {}/{} as {}",
+                            if confirmed { "✓" } else { " " },
+                            route.provider_id,
+                            route.model_id,
+                            trust_label(route.trust)
+                        )));
+                    }
                 }
             }
             Phase::Optimizations => {

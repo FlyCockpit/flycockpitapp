@@ -22210,14 +22210,24 @@ async fn prepare_authored_apply_local_operation_retry(
     if identity.request_hash.as_slice() == request_hash.as_slice() {
         return Ok(());
     }
-    let Ok(cockpit_proto::Response::AuthoredAgentPackage(
-        cockpit_proto::ApplyAuthoredAgentPackageOutcome::Rejected { .. },
-    )) = serde_json::from_str(&json)
+    let Ok(cockpit_proto::Response::AuthoredAgentPackage(outcome)) = serde_json::from_str(&json)
     else {
         return Err(conflict(
             "client operation id was reused for a different request",
         ));
     };
+    let retryable = match outcome {
+        cockpit_proto::ApplyAuthoredAgentPackageOutcome::Rejected { .. } => true,
+        cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(receipt) => {
+            receipt.status == cockpit_proto::AuthoredAgentReceiptStatus::Rejected
+        }
+        _ => false,
+    };
+    if !retryable {
+        return Err(conflict(
+            "client operation id was reused for a different request",
+        ));
+    }
     let reset = ctx
         .db
         .reset_terminal_local_operation_for_retry(

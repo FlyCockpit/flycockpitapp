@@ -1303,10 +1303,14 @@ impl App {
                                 receipt.result_config_generation,
                             );
                         }
-                        if let Some(shell) = self.onboarding_shell.as_mut() {
+                        if let Some(shell) = self.onboarding_shell.as_mut()
+                            && shell.screen_is_agent_authoring()
+                        {
                             shell.apply_agent_authoring_outcome(
                                 cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(receipt),
                             );
+                        } else {
+                            self.pending_startup_agent_authoring_receipt = Some(receipt);
                         }
                     }
                     Ok(AsyncActionPayload::StartupAgentAuthoringReceiptMiss { .. }) => {}
@@ -1326,6 +1330,15 @@ impl App {
                         self.onboarding_agent_operation_id = Some(client_operation_id.clone());
                         if let Some(shell) = self.onboarding_shell.as_mut() {
                             shell.present_agent_authoring(projection, client_operation_id);
+                            if let Some(receipt) =
+                                self.pending_startup_agent_authoring_receipt.take()
+                            {
+                                shell.apply_agent_authoring_outcome(
+                                    cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(
+                                        receipt,
+                                    ),
+                                );
+                            }
                         }
                     }
                     Err(error) => {

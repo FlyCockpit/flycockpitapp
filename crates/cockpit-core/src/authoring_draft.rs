@@ -44,6 +44,7 @@ pub struct ChildAuthoringDraft {
     pub name: String,
     pub route_grants: Vec<RouteGrantDraft>,
     pub default_route_index: usize,
+    pub trust_confirmations: Vec<bool>,
     pub tool_tiers: BTreeMap<String, ToolTier>,
     pub children: Vec<ChildAuthoringDraft>,
 }
@@ -147,6 +148,32 @@ impl AgentAuthoringDraft {
     }
 }
 
+impl ChildAuthoringDraft {
+    pub fn pending_trust_route_indices(&self, projection: &AgentAuthoringProjection) -> Vec<usize> {
+        self.route_grants
+            .iter()
+            .enumerate()
+            .filter_map(|(index, grant)| {
+                if !grant.enabled {
+                    return None;
+                }
+                let route = projection.policy.routes.get(index)?;
+                if route.confirmation_required
+                    && !self
+                        .trust_confirmations
+                        .get(index)
+                        .copied()
+                        .unwrap_or(false)
+                {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
 fn preferred_sidecar_route_index(projection: &AgentAuthoringProjection) -> Option<usize> {
     projection
         .policy
@@ -238,7 +265,7 @@ pub fn build_package_draft(
             bail!("remote sidecar egress confirmation is required");
         }
     }
-    validate_child_tree(&draft.children, 1)?;
+    validate_child_tree(&draft.children, projection, 1)?;
 
     let (source, name, body) = resolve_source(projection, draft)?;
     validate_authored_agent_name(&name)?;
@@ -261,24 +288,16 @@ pub fn build_package_draft(
         })
         .unwrap_or_default();
 
-    let model_trust_confirmations = enabled
-        .iter()
-        .filter_map(|index| {
-            let route = projection.policy.routes.get(*index)?;
-            if !route.confirmation_required {
-                return None;
-            }
-            Some(ModelTrustConfirmation {
-                provider_id: route.provider_id.clone(),
-                model_id: route.model_id.clone(),
-                confirmed: draft
-                    .trust_confirmations
-                    .get(*index)
-                    .copied()
-                    .unwrap_or(false),
-            })
-        })
-        .collect();
+    let mut model_trust_confirmations = collect_model_trust_confirmations(
+        projection,
+        &draft.route_grants,
+        &draft.trust_confirmations,
+    );
+    append_child_model_trust_confirmations(
+        projection,
+        &draft.children,
+        &mut model_trust_confirmations,
+    );
 
     Ok(AuthoredAgentPackageDraft {
         dto_version: AGENT_AUTHORING_DTO_VERSION,
@@ -484,7 +503,51 @@ fn validate_authored_agent_name(name: &str) -> Result<()> {
 
 const AUTHORED_MAX_DESCENDANT_DEPTH: u16 = 2;
 
-fn validate_child_tree(children: &[ChildAuthoringDraft], depth: u16) -> Result<()> {
+fn collect_model_trust_confirmations(
+    projection: &AgentAuthoringProjection,
+    route_grants: &[RouteGrantDraft],
+    trust_confirmations: &[bool],
+) -> Vec<ModelTrustConfirmation> {
+    route_grants
+        .iter()
+        .enumerate()
+        .filter_map(|(index, grant)| {
+            if !grant.enabled {
+                return None;
+            }
+            let route = projection.policy.routes.get(index)?;
+            if !route.confirmation_required {
+                return None;
+            }
+            Some(ModelTrustConfirmation {
+                provider_id: route.provider_id.clone(),
+                model_id: route.model_id.clone(),
+                confirmed: trust_confirmations.get(index).copied().unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+fn append_child_model_trust_confirmations(
+    projection: &AgentAuthoringProjection,
+    children: &[ChildAuthoringDraft],
+    out: &mut Vec<ModelTrustConfirmation>,
+) {
+    for child in children {
+        out.extend(collect_model_trust_confirmations(
+            projection,
+            &child.route_grants,
+            &child.trust_confirmations,
+        ));
+        append_child_model_trust_confirmations(projection, &child.children, out);
+    }
+}
+
+fn validate_child_tree(
+    children: &[ChildAuthoringDraft],
+    projection: &AgentAuthoringProjection,
+    depth: u16,
+) -> Result<()> {
     ensure!(
         depth <= AUTHORED_MAX_DESCENDANT_DEPTH,
         "subagent tree exceeds the canonical max descendant depth of {AUTHORED_MAX_DESCENDANT_DEPTH}"
@@ -494,7 +557,15 @@ fn validate_child_tree(children: &[ChildAuthoringDraft], depth: u16) -> Result<(
         let slug = child_slug(child);
         ensure!(seen.insert(slug.clone()), "duplicate child name `{slug}`");
         validate_authored_agent_name(&slug)?;
-        validate_child_tree(&child.children, depth.saturating_add(1))?;
+        for index in child.pending_trust_route_indices(projection) {
+            let route = &projection.policy.routes[index];
+            bail!(
+                "model trust confirmation is required for subagent `{slug}` route {}/{}",
+                route.provider_id,
+                route.model_id
+            );
+        }
+        validate_child_tree(&child.children, projection, depth.saturating_add(1))?;
     }
     Ok(())
 }
@@ -644,6 +715,7 @@ pub fn default_child_draft(projection: &AgentAuthoringProjection) -> ChildAuthor
         name: "runner".to_string(),
         route_grants,
         default_route_index: 0,
+        trust_confirmations: vec![false; route_count],
         tool_tiers: child_default_tool_tiers(),
         children: Vec::new(),
     }

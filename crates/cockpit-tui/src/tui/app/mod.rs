@@ -2187,6 +2187,9 @@ pub struct App {
     pending_startup_onboarding_operations: HashMap<crate::tui::async_action::AsyncActionId, String>,
     /// Stable client operation id for onboarding agent create/reconcile.
     onboarding_agent_operation_id: Option<String>,
+    /// Receipt that arrived before the agent authoring screen mounted.
+    pending_startup_agent_authoring_receipt:
+        Option<cockpit_proto::ApplyAuthoredAgentPackageReceipt>,
     startup_background: StartupBackground,
     /// Non-blocking projection of the latest complete dependency snapshot.
     /// Startup never probes here; Settings owns background refreshes.
@@ -3975,6 +3978,7 @@ impl App {
             skills_pane_generation: 0,
             pending_startup_onboarding_operations: HashMap::new(),
             onboarding_agent_operation_id: None,
+            pending_startup_agent_authoring_receipt: None,
             startup_background: StartupBackground {
                 daemon_socket: None,
                 daemon_endpoint: None,

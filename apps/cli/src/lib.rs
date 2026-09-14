@@ -805,6 +805,8 @@ fn error_exit_code(err: &anyhow::Error) -> u8 {
         commands::REMOVED_COMMAND_EXIT_CODE
     } else if err.is::<commands::CommandUsageError>() {
         commands::USAGE_EXIT_CODE
+    } else if err.is::<commands::InteractiveOnboardingRequired>() {
+        commands::USAGE_EXIT_CODE
     } else if let Some(error) = err.downcast_ref::<commands::agent::AgentCommandError>() {
         error.exit_code()
     } else {
@@ -925,6 +927,8 @@ fn error_stderr_line(err: &anyhow::Error) -> String {
         format!("error: {}", removed.message())
     } else if let Some(usage) = err.downcast_ref::<commands::CommandUsageError>() {
         format!("error: {}", usage.message())
+    } else if let Some(required) = err.downcast_ref::<commands::InteractiveOnboardingRequired>() {
+        format!("error: {}", required.message())
     } else {
         format!("Error: {err:?}")
     }
@@ -1017,6 +1021,17 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         match std::env::current_dir() {
             Ok(cwd) => engine::model::enable_debug_last_message(cwd.join(".lastmessage")),
             Err(e) => tracing::warn!(error = %e, "--debug-last-message: cwd unavailable"),
+        }
+    }
+
+    if let Some(Command::Setup(_)) = cli.command.as_ref() {
+        if !interactive_shell {
+            return Err(commands::InteractiveOnboardingRequired::setup().into());
+        }
+    }
+    if let Some(Command::Provider(crate::cli::ProvidersCommand::Add(_))) = cli.command.as_ref() {
+        if !interactive_shell {
+            return Err(commands::InteractiveOnboardingRequired::provider_add().into());
         }
     }
 
@@ -1799,8 +1814,12 @@ mod tests {
             "named setup wizards must route through the TUI shell when stdin is a TTY"
         );
         assert!(
-            lib.contains("Some(Command::Setup(args)) => commands::setup::run(args).await"),
+            lib.contains("InteractiveOnboardingRequired::setup()"),
             "non-interactive setup must keep the typed InteractiveOnboardingRequired path"
+        );
+        assert!(
+            lib.contains("InteractiveOnboardingRequired::provider_add()"),
+            "non-interactive provider add must keep the typed InteractiveOnboardingRequired path"
         );
         assert!(
             lib.contains("Command::Provider(crate::cli::ProvidersCommand::Add(args))"),

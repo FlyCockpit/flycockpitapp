@@ -17,15 +17,19 @@ fn snapshot(stage: cockpit_proto::OnboardingStage) -> cockpit_proto::OnboardingB
     }
 }
 
+fn snapshot_for_named_wizard(wizard_id: &str) -> cockpit_proto::OnboardingBootstrapSnapshot {
+    let stage = cockpit_core::wizard::named_setup_wizard_authoritative_stage(wizard_id)
+        .unwrap_or(cockpit_proto::OnboardingStage::Complete);
+    snapshot(stage)
+}
+
 #[test]
 fn named_setup_wizards_mount_inside_onboarding_shell() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     for wizard_id in cockpit_core::wizard::named_setup_wizard_ids() {
         let mut app = App::new(Some(tmp.path()), false);
-        app.apply_onboarding_bootstrap_snapshot(Some(snapshot(
-            cockpit_proto::OnboardingStage::Complete,
-        )));
+        app.apply_onboarding_bootstrap_snapshot(Some(snapshot_for_named_wizard(wizard_id)));
         app.open_onboarding_setup(Some(wizard_id));
         assert!(
             app.onboarding_shell.is_some(),
@@ -38,7 +42,9 @@ fn named_setup_wizards_mount_inside_onboarding_shell() {
                     .map(|shell| shell.screen_kind()),
                 Some(crate::tui::onboarding::OnboardingScreenKind::ProviderSearch)
             );
-        } else if wizard_id != cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID {
+        } else if wizard_id == cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID {
+            // Agent authoring mounts asynchronously after the projection RPC.
+        } else {
             assert_eq!(
                 app.onboarding_shell
                     .as_ref()
@@ -47,6 +53,28 @@ fn named_setup_wizards_mount_inside_onboarding_shell() {
                 "wizard `{wizard_id}` must present through the shell engine"
             );
         }
+    }
+}
+
+#[test]
+fn named_setup_wizard_rejects_stale_complete_stage_for_first_run_wizards() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    for wizard_id in [
+        cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID,
+        cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID,
+        cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+        cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
+    ] {
+        let mut app = App::new(Some(tmp.path()), false);
+        app.apply_onboarding_bootstrap_snapshot(Some(snapshot(
+            cockpit_proto::OnboardingStage::Complete,
+        )));
+        app.open_onboarding_setup(Some(wizard_id));
+        assert!(
+            app.onboarding_shell.is_none(),
+            "wizard `{wizard_id}` must not mount against a Complete snapshot"
+        );
     }
 }
 
@@ -181,7 +209,7 @@ fn provider_add_cli_dispatch_routes_through_shell_adapter() {
     );
     let providers = include_str!("../../../../../apps/cli/src/commands/providers.rs");
     assert!(
-        providers.contains("cockpit provider add requires an interactive stdin"),
+        providers.contains("InteractiveOnboardingRequired::provider_add()"),
         "non-interactive provider add must fail before any mutation"
     );
 }

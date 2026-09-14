@@ -1,5 +1,7 @@
 use anyhow::{Result, anyhow, bail};
 
+use crate::commands::InteractiveOnboardingRequired;
+
 use crate::cli::{
     ProviderAddArgs, ProviderLoginArgs, ProviderLogoutArgs, ProvidersCommand, ProvidersUsageArgs,
 };
@@ -35,9 +37,7 @@ pub async fn run(cmd: ProvidersCommand) -> Result<()> {
 
 async fn add(args: ProviderAddArgs) -> Result<()> {
     if !std::io::stdin().is_terminal() {
-        bail!(
-            "cockpit provider add requires an interactive stdin; run `cockpit` and use /setup provider instead"
-        );
+        return Err(InteractiveOnboardingRequired::provider_add().into());
     }
     crate::commands::setup::run_provider_add(args.template).await
 }

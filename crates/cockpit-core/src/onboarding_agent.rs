@@ -268,7 +268,7 @@ pub fn canonicalize_authored_package(
     let files = canonical_file_map(draft)?;
     let definition = crate::agents::load_workspace_package_from_files(&draft.name, files.clone())
         .map_err(map_package_error)?;
-    validate_grants(&definition, snapshot, &draft.model_trust_confirmations)?;
+    validate_definition_grants_tree(&definition, snapshot, &draft.model_trust_confirmations)?;
     let digest = hex_digest(&crate::agents::package_digest_preimage(&files));
     let review = review_from_definition(&definition, snapshot, draft, &digest, &files);
     Ok(CanonicalAuthoredPackage {
@@ -626,6 +626,18 @@ fn validate_source_kind(
         AgentAuthoringSourceKind::BundledFrontier
         | AgentAuthoringSourceKind::FirstPartyCatalog
         | AgentAuthoringSourceKind::Authored => {}
+    }
+    Ok(())
+}
+
+fn validate_definition_grants_tree(
+    definition: &AgentDef,
+    snapshot: &AgentPolicySnapshot,
+    confirmations: &[ModelTrustConfirmation],
+) -> Result<(), AuthoredPackageRejection> {
+    validate_grants(definition, snapshot, confirmations)?;
+    for child in definition.private_subagents.values() {
+        validate_definition_grants_tree(child, snapshot, confirmations)?;
     }
     Ok(())
 }

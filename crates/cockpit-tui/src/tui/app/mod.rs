@@ -20,6 +20,9 @@ mod btw_pane;
 mod chat_header;
 #[cfg(test)]
 mod chat_header_tests;
+mod composer_controls;
+#[cfg(test)]
+mod composer_controls_tests;
 mod config_reload;
 mod copy_actions;
 mod events;
@@ -169,12 +172,6 @@ const RUN_CAPTURE_POLL: Duration = Duration::from_millis(10);
 /// steady stream of slow presses interrupts repeatedly and never exits.
 pub(super) const CTRL_C_EXIT_WINDOW: Duration = Duration::from_millis(500);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct FooterHitArea {
-    control: crate::tui::chrome::FooterControl,
-    rect: Rect,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ConfigDriftState {
     config_provider: Option<String>,
@@ -222,11 +219,6 @@ mod first_run_daemon_tests;
 mod first_run_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FooterPickerKind {
-    Agent,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SuggestionBoxKind {
     At,
     Slash,
@@ -242,44 +234,6 @@ pub(super) struct SuggestionBoxTarget {
 pub(super) struct SuggestionBoxRowHit {
     target: SuggestionBoxTarget,
     rect: Rect,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct FooterPickerRowHit {
-    kind: FooterPickerKind,
-    index: usize,
-    rect: Rect,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct FooterAgentPicker {
-    entries: Vec<String>,
-    cursor: usize,
-}
-
-impl FooterAgentPicker {
-    fn new(current: &str, entries: Vec<String>) -> Self {
-        let cursor = entries.iter().position(|name| name == current).unwrap_or(0);
-        Self { entries, cursor }
-    }
-
-    fn selected_agent(&self) -> Option<&str> {
-        self.entries.get(self.cursor).map(String::as_str)
-    }
-
-    fn next(&mut self) {
-        self.cursor = crate::tui::nav::wrap_next(self.cursor, self.entries.len());
-    }
-
-    fn prev(&mut self) {
-        self.cursor = crate::tui::nav::wrap_prev(self.cursor, self.entries.len());
-    }
-
-    fn select(&mut self, index: usize) {
-        if index < self.entries.len() {
-            self.cursor = index;
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -487,11 +441,6 @@ pub enum StartupWorkspaceTrust {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StartupModal {
     WorkspaceTrust,
-}
-
-fn footer_agent_picker_height(picker: Option<&FooterAgentPicker>) -> u16 {
-    let rows = picker.map(|p| p.entries.len()).unwrap_or(0).min(12) as u16;
-    rows + 4
 }
 
 #[cfg(test)]
@@ -2534,21 +2483,13 @@ pub struct App {
     pub(super) chat_header_more_open: bool,
     /// Absolute rect of the open `more` popover (for outside-click close).
     pub(super) chat_header_more_rect: Option<ratatui::layout::Rect>,
-    /// Footer control selected by mouse; arrow/enter keys operate on it until
-    /// Esc or ordinary typing clears it.
-    pub(super) footer_selection: Option<crate::tui::chrome::FooterControl>,
-    /// Footer control currently under the mouse, used only for hover styling.
-    pub(super) hovered_footer_control: Option<crate::tui::chrome::FooterControl>,
-    /// Absolute hit rectangles recorded by the last status render.
-    pub(super) footer_hit_areas: Vec<FooterHitArea>,
+    /// Composer bottom-border pills, hierarchical pickers, and Send/Queue.
+    pub(super) composer_controls: composer_controls::ComposerControlUi,
     pub(super) button_registry: crate::tui::button::ButtonRegistry,
     pub(super) row_registry: crate::tui::button::RowControlRegistry,
     pub(super) button_surface_generation: u64,
     pub(super) last_button_frame_key: Option<(u16, u16, bool, bool)>,
-    /// Agent picker opened from the footer agent segment.
-    pub(super) footer_agent_picker: Option<FooterAgentPicker>,
-    /// Absolute row hit rectangles recorded by the last footer picker render.
-    pub(super) footer_picker_row_hits: Vec<FooterPickerRowHit>,
+
     /// Mutable confirmation row for rapid agent switching before the next turn.
     pub(super) pending_agent_switch_log: Option<PendingAgentSwitchLog>,
     /// TUI-issued daemon control requests awaiting a response-bearing ack.
@@ -4067,15 +4008,12 @@ impl App {
             chat_header_layout: None,
             chat_header_more_open: false,
             chat_header_more_rect: None,
-            footer_selection: None,
-            hovered_footer_control: None,
-            footer_hit_areas: Vec::new(),
+            composer_controls: composer_controls::ComposerControlUi::default(),
             button_registry: crate::tui::button::ButtonRegistry::default(),
             row_registry: crate::tui::button::RowControlRegistry::default(),
             button_surface_generation: 0,
             last_button_frame_key: None,
-            footer_agent_picker: None,
-            footer_picker_row_hits: Vec::new(),
+
             pending_agent_switch_log: None,
             pending_control_requests: HashMap::new(),
             pending_model_selection: None,

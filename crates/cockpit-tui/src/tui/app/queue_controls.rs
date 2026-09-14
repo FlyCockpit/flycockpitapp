@@ -23,16 +23,16 @@ impl App {
 
     pub(super) fn queue_box_toggle_label(&self) -> &'static str {
         if self.queue_has_held() {
-            "steer all"
+            "Steer"
         } else {
-            "hold all"
+            "Held"
         }
     }
 
     pub(super) fn queue_item_toggle_label(class: QueueDeliveryClass) -> &'static str {
         match class {
-            QueueDeliveryClass::Steering => "hold",
-            QueueDeliveryClass::Held => "steer",
+            QueueDeliveryClass::Steering => "Held",
+            QueueDeliveryClass::Held => "Steer",
         }
     }
 
@@ -45,6 +45,7 @@ impl App {
                 .is_some_and(|hover| match hover {
                     crate::tui::button::ButtonId::QueueSendNow { item_id }
                     | crate::tui::button::ButtonId::QueueToggleClass { item_id }
+                    | crate::tui::button::ButtonId::QueueSetClass { item_id, .. }
                     | crate::tui::button::ButtonId::QueueEdit { item_id }
                     | crate::tui::button::ButtonId::QueueCancel { item_id } => *item_id == Some(id),
                     _ => false,
@@ -171,6 +172,23 @@ impl App {
         self.send_queue_request(Request::SendNowQueuedUserMessage {
             queue_item_id: item_id,
         });
+    }
+
+    pub(super) fn queue_action_set_class(
+        &mut self,
+        item_id: Option<Uuid>,
+        delivery_class: QueueDeliveryClass,
+    ) {
+        match item_id {
+            Some(id) => {
+                self.send_queue_request(Request::SetQueuedUserMessageClass {
+                    queue_item_id: id,
+                    delivery_class,
+                    replacement: None,
+                });
+            }
+            None => self.queue_promote_all(delivery_class),
+        }
     }
 
     pub(super) fn queue_action_toggle(&mut self, item_id: Option<Uuid>) {
@@ -630,7 +648,15 @@ mod tests {
         let mut app = App::new(Some(tmp.path()), false);
         app.queue.push(item("held", QueueDeliveryClass::Held));
         app.queue.push(item("steer", QueueDeliveryClass::Steering));
-        assert_eq!(app.queue_box_toggle_label(), "steer all");
+        assert_eq!(app.queue_box_toggle_label(), "Steer");
+        assert_eq!(
+            App::queue_item_toggle_label(QueueDeliveryClass::Held),
+            "Steer"
+        );
+        assert_eq!(
+            App::queue_item_toggle_label(QueueDeliveryClass::Steering),
+            "Held"
+        );
         app.queue_action_toggle(None);
         let mut queue = app.queue.clone();
         for item in &mut queue {
@@ -642,7 +668,7 @@ mod tests {
                 .iter()
                 .all(|item| item.delivery_class == QueueDeliveryClass::Steering)
         );
-        assert_eq!(app.queue_box_toggle_label(), "hold all");
+        assert_eq!(app.queue_box_toggle_label(), "Held");
     }
 
     #[test]
@@ -1020,11 +1046,38 @@ mod tests {
         let mut app = App::new(Some(tmp.path()), false);
         app.config_snapshot.extended.queued_messages_as_steering = false;
         app.queue.push(item("held", QueueDeliveryClass::Held));
+        app.handle_empty_composer_enter();
         app.queue_promote_all(QueueDeliveryClass::Steering);
         let mut queue = app.queue.clone();
         queue[0].delivery_class = QueueDeliveryClass::Steering;
         apply_snapshot(&mut app, queue);
         assert_eq!(app.queue[0].delivery_class, QueueDeliveryClass::Steering);
+    }
+
+    #[test]
+    fn empty_enter_ladder_held_then_send_now() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        assert!(app.queue.is_empty());
+        app.handle_empty_composer_enter();
+        assert!(app.queue.is_empty());
+
+        let held = item("held", QueueDeliveryClass::Held);
+        let steer = item("steer", QueueDeliveryClass::Steering);
+        let held_id = held.id;
+        let steer_id = steer.id;
+        app.queue.extend([held, steer]);
+        app.handle_empty_composer_enter();
+        assert_eq!(app.queue[0].id, held_id);
+        assert_eq!(app.queue[1].id, steer_id);
+        assert_eq!(app.queue[0].delivery_class, QueueDeliveryClass::Held);
+        assert_eq!(app.queue[1].delivery_class, QueueDeliveryClass::Steering);
+
+        app.queue[0].delivery_class = QueueDeliveryClass::Steering;
+        app.handle_empty_composer_enter();
+        assert_eq!(app.queue[0].id, held_id);
+        assert_eq!(app.queue[1].id, steer_id);
+        assert!(!app.queue.iter().any(|item| item.send_now));
     }
 
     #[test]

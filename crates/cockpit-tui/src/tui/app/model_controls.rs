@@ -74,33 +74,6 @@ impl App {
         self.swap_primary_agent(&next);
     }
 
-    pub(super) fn open_footer_agent_picker(&mut self) {
-        let order = self.inventory_agent_names();
-        let current = self
-            .agent_path
-            .first()
-            .map(String::as_str)
-            .unwrap_or(self.launch.agent_name.as_str());
-        self.footer_agent_picker = Some(FooterAgentPicker::new(current, order));
-    }
-
-    pub(super) fn commit_footer_agent_picker(&mut self, picker: &FooterAgentPicker) {
-        if self.agent_path.len() > 1 {
-            self.push_plain(
-                "Agent switch is disabled while an interactive subagent is active.".to_string(),
-            );
-            self.footer_agent_picker = Some(picker.clone());
-            return;
-        }
-        if let Some(name) = picker.selected_agent() {
-            self.footer_agent_picker = None;
-            self.footer_selection = None;
-            self.swap_primary_agent(name);
-        } else {
-            self.footer_agent_picker = Some(picker.clone());
-        }
-    }
-
     pub(super) fn open_model_picker(&mut self) {
         self.default_model_picker_mode = false;
         self.open_model_picker_highlighting(None);
@@ -136,8 +109,6 @@ impl App {
             self.current_model_selection_retry()
                 .map(|retry| retry.requested.clone())
         });
-        self.footer_selection = None;
-        self.footer_agent_picker = None;
         match crate::tui::model_picker::ModelPickerDialog::open_with_failures(
             self.config_snapshot.providers.clone(),
             self.launch.active_model.clone(),
@@ -190,8 +161,6 @@ impl App {
     }
 
     pub(super) fn open_model_picker_for_provider(&mut self, provider: &str) {
-        self.footer_selection = None;
-        self.footer_agent_picker = None;
         match crate::tui::model_picker::ModelPickerDialog::open_for_provider_with_failures(
             self.config_snapshot.providers.clone(),
             provider,
@@ -625,36 +594,6 @@ impl App {
         self.push_plain(message);
     }
 
-    pub(super) fn cycle_footer_model(&mut self, forward: bool) {
-        match crate::tui::model_picker::cycle_active_favorite(
-            &self.config_snapshot.providers,
-            self.active_model_selection.as_ref(),
-            &self.usage_models,
-            forward,
-        ) {
-            Ok(Some(active)) => {
-                let provider = active.provider.clone();
-                let model = active.model.clone();
-                if self.notify_active_model_selected(
-                    active,
-                    false,
-                    cockpit_proto::ActiveModelSwitchTrigger::Cycle,
-                ) {
-                    self.push_plain(format!("/model: selecting {provider}/{model} ★"));
-                }
-            }
-            Ok(None) => {
-                self.push_plain(
-                    "No other favorite model to cycle to; open `/model` for the full list."
-                        .to_string(),
-                );
-            }
-            Err(e) => {
-                self.push_plain(format!("/model: {e}"));
-            }
-        }
-    }
-
     pub(super) fn open_quick_dialog(&mut self) {
         let models = crate::tui::model_picker::ordered_model_choices_from_inventory(
             &self.inventory_models(),
@@ -694,8 +633,6 @@ impl App {
                 })
                 .unwrap_or_default(),
         };
-        self.footer_selection = None;
-        self.footer_agent_picker = None;
         self.overlay = Overlay::Quick(crate::tui::quick_dialog::QuickDialog::open(current, models));
     }
 
@@ -771,16 +708,6 @@ impl App {
                 cockpit_proto::ActiveModelSwitchTrigger::Quick,
             );
         }
-    }
-
-    pub(super) fn footer_cycle_agent(&mut self) {
-        if self.agent_path.len() > 1 {
-            self.push_plain(
-                "Agent cycle is disabled while an interactive subagent is active.".to_string(),
-            );
-            return;
-        }
-        self.cycle_primary_agent();
     }
 
     pub(super) fn send_daemon_request(
@@ -870,12 +797,17 @@ impl App {
                     self.apply_tokenizer_confirm_outcome(outcome);
                 } else {
                     self.apply_control_success(pending.applied);
+                    self.apply_composer_control_outcome(None);
                 }
             }
-            ControlRequestOutcome::Applied => self.apply_control_success(pending.applied),
+            ControlRequestOutcome::Applied => {
+                self.apply_control_success(pending.applied);
+                self.apply_composer_control_outcome(None);
+            }
             ControlRequestOutcome::HostCapabilities { snapshot } => {
                 self.apply_host_capabilities(*snapshot);
                 self.apply_control_success(pending.applied);
+                self.apply_composer_control_outcome(None);
             }
             ControlRequestOutcome::ExitGuardStatus {
                 ephemeral_owner,
@@ -918,6 +850,7 @@ impl App {
                     } else {
                         self.push_plain(message);
                     }
+                    self.apply_composer_control_outcome(Some(&error));
                 }
             }
             ControlRequestOutcome::NotDelivered(reason) => {

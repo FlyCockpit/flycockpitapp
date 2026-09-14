@@ -776,13 +776,14 @@ pub struct ExtendedConfig {
     #[serde(rename = "intelCentralityRanking", default = "default_true")]
     pub intel_centrality_ranking: bool,
 
-    /// When true (the default), a message submitted while a run is in
-    /// flight is classed `steering` and injects at the focused agent's
-    /// next turn boundary. When false, it is classed `held` until the
-    /// run completes; Enter on an empty composer then promotes the
-    /// whole queue to steering. Per-message and box-level toggles
-    /// override this default. Behavioral, not a TUI chrome setting.
-    #[serde(rename = "queuedMessagesAsSteering", default = "default_true")]
+    /// When true, a message submitted while a run is in flight is classed
+    /// `steering` and injects at the focused agent's next turn boundary.
+    /// When false (the default), it is classed `held` until the run
+    /// completes. An omitted field and [`ExtendedConfig::default`] are
+    /// Held. Explicit `true` is the Steering opt-in. Per-message and
+    /// box-level toggles override this default. Behavioral, not a TUI
+    /// chrome setting.
+    #[serde(rename = "queuedMessagesAsSteering", default)]
     pub queued_messages_as_steering: bool,
 
     /// Directory names pruned from intel index walks at every depth. When
@@ -1964,7 +1965,7 @@ impl Default for ExtendedConfig {
             hint_tool_call_corrections: false,
             text_embedded_recovery: TextEmbeddedRecovery::default(),
             intel_centrality_ranking: default_true(),
-            queued_messages_as_steering: default_true(),
+            queued_messages_as_steering: false,
             intel: IntelConfig::default(),
         }
     }

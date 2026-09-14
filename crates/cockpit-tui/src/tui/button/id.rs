@@ -1,5 +1,5 @@
 use crate::tui::chat_header::HeaderPillKind;
-use crate::tui::chrome::FooterControl;
+use crate::tui::composer_controls::ComposerControlKind;
 use crate::tui::settings::pointer_actions::SettingsPointerAction;
 use crate::tui::settings::shell::SettingsHeaderAction;
 
@@ -13,7 +13,11 @@ pub(crate) enum ButtonKind {
 pub(crate) enum ButtonId {
     SettingsHeader(SettingsHeaderAction),
     Settings(SettingsPointerAction),
-    Footer(FooterControl),
+    ComposerPill(ComposerControlKind),
+    ComposerSend,
+    ComposerPickerRow {
+        index: usize,
+    },
     HeaderPill(HeaderPillKind),
     HeaderMore,
     TranscriptPin {
@@ -30,6 +34,10 @@ pub(crate) enum ButtonId {
     },
     QueueToggleClass {
         item_id: Option<uuid::Uuid>,
+    },
+    QueueSetClass {
+        item_id: Option<uuid::Uuid>,
+        class: cockpit_proto::QueueDeliveryClass,
     },
     QueueEdit {
         item_id: Option<uuid::Uuid>,

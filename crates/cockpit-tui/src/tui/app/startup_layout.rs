@@ -1460,8 +1460,6 @@ impl App {
             settings::DIALOG_HEIGHT
         } else if self.overlay.dialog_height() > 0 {
             self.overlay.dialog_height()
-        } else if self.footer_agent_picker.is_some() {
-            footer_agent_picker_height(self.footer_agent_picker.as_ref())
         } else {
             0
         };

@@ -3747,13 +3747,13 @@ pub struct ActiveSubagent {
     pub label: String,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueueDeliveryClass {
     /// Delivered at the focused agent's next turn boundary (mid-run).
-    #[default]
     Steering,
-    /// Delivered after the run completes.
+    /// Delivered after the run completes. The public missing/default class.
+    #[default]
     Held,
 }
 
@@ -3787,9 +3787,9 @@ pub struct QueueItem {
     pub display_text: Option<String>,
     #[serde(default)]
     pub target: QueueTarget,
-    /// Per-message delivery class. Defaults to steering so older wire
-    /// snapshots and struct literals stay valid; enqueue overwrites this
-    /// from `queuedMessagesAsSteering`.
+    /// Per-message delivery class. A missing field deserializes as Held,
+    /// matching the public default; enqueue overwrites this from
+    /// `queuedMessagesAsSteering` unless the caller set an override.
     #[serde(default)]
     pub delivery_class: QueueDeliveryClass,
     /// True after the item has been escalated for the next safe boundary.
@@ -7124,7 +7124,8 @@ mod tests {
             "target": { "id": "root", "agent": "Build", "depth": 0 }
         }))
         .unwrap();
-        assert_eq!(missing_class.delivery_class, QueueDeliveryClass::Steering);
+        assert_eq!(missing_class.delivery_class, QueueDeliveryClass::Held);
+        assert_eq!(QueueDeliveryClass::default(), QueueDeliveryClass::Held);
         assert!(!missing_class.send_now);
 
         let request = Envelope::request(

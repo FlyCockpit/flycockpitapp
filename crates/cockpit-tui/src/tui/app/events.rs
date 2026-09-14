@@ -391,7 +391,11 @@ impl App {
             return;
         }
         if let Some(Ok(runner)) = self.agent_runner.as_ref() {
-            self.visible_attachment_epoch = runner.attachment_epoch();
+            let epoch = runner.attachment_epoch();
+            if epoch != self.visible_attachment_epoch {
+                self.bump_composer_control_generation();
+            }
+            self.visible_attachment_epoch = epoch;
         }
     }
 

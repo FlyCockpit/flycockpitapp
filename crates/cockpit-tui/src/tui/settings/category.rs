@@ -784,11 +784,13 @@ impl SettingId {
                  model."
             }
             SettingId::QueuedMessagesAsSteering => {
-                "How Enter during a run classifies a queued message. On (default) \
-                 classes it `steering` so it injects at the focused agent's next \
-                 turn boundary. Off classes it `held` until the run completes; \
-                 Enter on an empty composer then promotes the whole queue to \
-                 steering. Per-message and box-level toggles override this."
+                "How Enter during a run classifies a queued message. Off (default) \
+                 classes it `held` until the run completes. On is the explicit \
+                 steering opt-in: the message injects at the focused agent's next \
+                 turn boundary. Empty-composer Enter never submits text: an empty \
+                 queue is a no-op; otherwise Held items promote to Steering first, \
+                 and only a steering-only queue then requests Send now. Per-message \
+                 and box-level toggles override this."
             }
             SettingId::ShellCompression => {
                 "Filter and compress bash output before it enters the model's \
@@ -2103,8 +2105,8 @@ impl SettingsCx {
             S::PredictNextMessage => predict_next_message_label(e.predict_next_message).to_string(),
             S::QueuedMessagesAsSteering => on_off(
                 e.queued_messages_as_steering,
-                "on (default — enter during a run steers the next turn)",
-                "off (enter during a run holds until completion)",
+                "on (enter during a run steers the next turn)",
+                "off (default — enter during a run holds until completion)",
             ),
             S::ShellCompression => shell_compression_label(e.shell_compression).to_string(),
             S::CommandProfileRust => command_profile_enabled_value(

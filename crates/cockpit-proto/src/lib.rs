@@ -56,8 +56,8 @@ pub use agent_authoring::{
     ApplyAuthoredAgentPackageReceipt, ApplyAuthoredAgentPackageRequest, AuthoredAgentChild,
     AuthoredAgentOnboardingCorrelation, AuthoredAgentPackageDraft,
     AuthoredAgentPackageReceiptQuery, AuthoredAgentReceiptStatus, AuthoredAgentRejectReason,
-    AuthoredAgentReview, AuthoredAgentReviewGrant, AuthoredAgentSource, AuthoredSidecarDeclaration,
-    ModelTrustConfirmation,
+    AuthoredAgentReview, AuthoredAgentReviewChild, AuthoredAgentReviewGrant, AuthoredAgentSource,
+    AuthoredSidecarDeclaration, ModelTrustConfirmation,
 };
 pub use agent_installation::{
     AGENT_INSTALLATION_DTO_VERSION, AgentInstallationBeginV1, AgentInstallationBindingOutcomeV1,
@@ -1358,7 +1358,7 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// daemon-owned setup inventory, bounded base64 media previews, the
 /// rolling-precompaction resume choice, and knowledge-dream completion
 /// receipts including ordered all-KB runs.
-pub const PROTOCOL_VERSION: u32 = 25;
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1444,14 +1444,8 @@ pub const PENDING_ATTACHMENT_TTL_SECS: u64 = 10 * 60;
 pub const IMAGE_ATTACHMENT_MIME_PNG: &str = "image/png";
 pub const IMAGE_PART_SENTINEL: &str = "\u{0}<cockpit-image-part>\u{0}";
 
-pub fn is_protocol_compatible(v: u32) -> bool {
-    v == PROTOCOL_VERSION
-}
-
-pub fn version_mismatch_message(v: u32) -> String {
-    format!(
-        "wire protocol version mismatch: peer sent v{v}, this binary speaks v{PROTOCOL_VERSION} only"
-    )
+pub fn is_protocol_compatible(_v: u32) -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1477,12 +1471,6 @@ impl NegotiatedProtocol {
     }
 
     pub fn from_hello(hello: &DaemonHello) -> std::result::Result<Self, ErrorPayload> {
-        if hello.protocol_version != PROTOCOL_VERSION {
-            return Err(ErrorPayload {
-                code: ErrorCode::ProtocolVersion,
-                message: incompatible_daemon_protocol_message(hello.protocol_version),
-            });
-        }
         Ok(Self {
             version: PROTOCOL_VERSION,
             daemon_version: hello.daemon_version.clone(),
@@ -4153,18 +4141,6 @@ where
                 .and_then(serde_json::Value::as_u64)
                 .and_then(|n| u32::try_from(n).ok())
                 .context("deserializing envelope: missing or invalid v")?;
-            if v != PROTOCOL_VERSION {
-                let kind = value
-                    .get("kind")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let id = value
-                    .get("id")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|raw| Uuid::parse_str(raw).ok());
-                return Ok(Some(RecvFrame::VersionMismatch { v, kind, id }));
-            }
             let kind = value
                 .get("kind")
                 .and_then(serde_json::Value::as_str)
@@ -7191,16 +7167,11 @@ mod tests {
         let line = serde_json::to_string(&bad).unwrap();
         left.framed.send(line).await.unwrap();
         match right.recv().await.unwrap().expect("frame") {
-            RecvFrame::VersionMismatch {
-                v,
-                kind,
-                id: got_id,
-            } => {
-                assert_eq!(v, 999);
-                assert_eq!(kind, "req");
-                assert_eq!(got_id, Some(id));
+            RecvFrame::Envelope(envelope) => {
+                assert_eq!(envelope.v, 999);
+                assert!(matches!(envelope.body, Body::Request { id: got_id, .. } if got_id == id));
             }
-            other => panic!("expected version mismatch, got {other:?}"),
+            other => panic!("expected envelope without version gating, got {other:?}"),
         }
     }
 
@@ -7221,23 +7192,18 @@ mod tests {
             .await
             .unwrap();
         match right.recv().await.unwrap().expect("frame") {
-            RecvFrame::VersionMismatch { v, kind, id } => {
-                assert_eq!(v, 999);
-                assert_eq!(kind, "evt");
-                assert_eq!(id, None);
+            RecvFrame::Envelope(envelope) => {
+                assert_eq!(envelope.v, 999);
+                assert!(matches!(envelope.body, Body::Event { .. }));
             }
-            other => panic!("expected version mismatch, got {other:?}"),
+            other => panic!("expected envelope without version gating, got {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn v10_only_request_is_not_sent_to_v9_daemon() {
-        // Fold-time schema (review-loop(#308) cycle 2) removed the prerelease
-        // per-payload send gates: the sender stamps its negotiated version
-        // and never rejects a payload by kind. The protection is the
-        // receiver's exact-version check: a v9-labeled frame is classified
-        // as a version mismatch and the payload never executes on a v9
-        // connection.
+        // Pre-launch wire handling does not version-gate frames: the receiver
+        // decodes the payload and leaves execution policy to the daemon.
         let (a, b) = duplex(4096);
         let mut v9_sender = ProtoStream::with_version(a, 9);
         let mut v9_receiver = ProtoStream::with_version(b, 9);
@@ -7252,21 +7218,16 @@ mod tests {
             .send(&request)
             .await
             .expect("sender stamps the negotiated version without a payload gate");
-        match v9_receiver.recv().await.unwrap().expect("frame") {
-            RecvFrame::VersionMismatch { v, kind, id } => {
-                assert_eq!(v, 9);
-                assert_eq!(kind, "req");
-                assert!(id.is_some());
-            }
-            other => panic!("expected version mismatch, got {other:?}"),
-        }
+        assert!(matches!(
+            v9_receiver.recv().await.unwrap(),
+            Some(RecvFrame::Envelope(_))
+        ));
     }
 
     #[tokio::test]
     async fn v17_provider_credential_receipt_is_not_sent_to_v9_daemon() {
-        // Same fold-time contract as the v10 request gate above: the sender
-        // stamps the negotiated version; the receiver's exact-version check
-        // keeps the credential receipt off every v9 connection.
+        // Same pre-launch contract as the request test above: version labels
+        // are carried on the envelope but do not suppress decode.
         let (a, b) = duplex(4096);
         let mut v9_sender = ProtoStream::with_version(a, 9);
         let mut v9_receiver = ProtoStream::with_version(b, 9);
@@ -7290,14 +7251,10 @@ mod tests {
             .send(&response)
             .await
             .expect("sender stamps the negotiated version without a payload gate");
-        match v9_receiver.recv().await.unwrap().expect("frame") {
-            RecvFrame::VersionMismatch { v, kind, id } => {
-                assert_eq!(v, 9);
-                assert_eq!(kind, "res");
-                assert!(id.is_some());
-            }
-            other => panic!("expected version mismatch, got {other:?}"),
-        }
+        assert!(matches!(
+            v9_receiver.recv().await.unwrap(),
+            Some(RecvFrame::Envelope(_))
+        ));
     }
 
     #[tokio::test]
@@ -7326,7 +7283,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             receiver.recv().await.unwrap(),
-            Some(RecvFrame::VersionMismatch { v: 9, id: Some(actual), .. }) if actual == id
+            Some(RecvFrame::Envelope(_))
         ));
     }
 
@@ -7360,7 +7317,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             receiver.recv().await.unwrap(),
-            Some(RecvFrame::VersionMismatch { v: 9, id: Some(actual), .. }) if actual == id
+            Some(RecvFrame::Envelope(_))
         ));
     }
 
@@ -7395,7 +7352,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             receiver.recv().await.unwrap(),
-            Some(RecvFrame::VersionMismatch { v: 9, id: Some(actual), .. }) if actual == id
+            Some(RecvFrame::Envelope(_))
         ));
     }
 
@@ -7425,7 +7382,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             receiver.recv().await.unwrap(),
-            Some(RecvFrame::VersionMismatch { v: 9, id: Some(actual), .. }) if actual == id
+            Some(RecvFrame::Envelope(_))
         ));
     }
 
@@ -7449,7 +7406,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             receiver.recv().await.unwrap(),
-            Some(RecvFrame::VersionMismatch { v: 9, id: Some(actual), .. }) if actual == id
+            Some(RecvFrame::Envelope(_))
         ));
     }
 
@@ -7470,7 +7427,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             receiver.recv().await.unwrap(),
-            Some(RecvFrame::VersionMismatch { v: 10, .. })
+            Some(RecvFrame::Envelope(_))
         ));
     }
 
@@ -7511,20 +7468,20 @@ mod tests {
     }
 
     #[test]
-    fn is_protocol_compatible_requires_exact_protocol_version() {
+    fn is_protocol_compatible_accepts_every_prerelease_version() {
         assert!(is_protocol_compatible(PROTOCOL_VERSION));
-        assert!(!is_protocol_compatible(PROTOCOL_VERSION + 1));
-        assert!(!is_protocol_compatible(PROTOCOL_VERSION - 1));
+        assert!(is_protocol_compatible(PROTOCOL_VERSION + 1));
+        assert!(is_protocol_compatible(PROTOCOL_VERSION - 1));
     }
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 25);
+        assert_eq!(PROTOCOL_VERSION, 1);
         let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
-                .expect("current v24 config_refreshed fixture")
+                .expect("current v1 config_refreshed fixture")
                 .clone(),
         )
         .unwrap();
@@ -7539,16 +7496,16 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 25);
+        assert_eq!(PROTOCOL_VERSION, 1);
         let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
                 .get(response_name)
-                .unwrap_or_else(|| panic!("current v24 {response_name} fixture"));
+                .unwrap_or_else(|| panic!("current v1 {response_name} fixture"));
             assert_eq!(
                 response["data"]["goal"]["max_verification_attempts"], 4,
-                "current v24 {response_name} must freeze the inclusive verification cap"
+                "current v1 {response_name} must freeze the inclusive verification cap"
             );
             serde_json::from_value::<Response>(response.clone()).unwrap_or_else(|error| {
                 panic!("current v24 {response_name} must deserialize: {error}")

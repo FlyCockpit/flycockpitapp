@@ -24,6 +24,7 @@ use cockpit_core::authoring_draft::{
 use cockpit_proto::{
     AgentAuthoringProjection, ApplyAuthoredAgentPackageOutcome, ApplyAuthoredAgentPackageReceipt,
     AuthoredAgentPackageDraft, AuthoredAgentReceiptStatus, AuthoredAgentReview,
+    AuthoredAgentReviewChild,
 };
 
 /// Daemon intents produced by the agent authoring reducer.
@@ -66,6 +67,7 @@ enum SubagentPhase {
     Identity,
     ModelGrants,
     ToolTiers,
+    SubagentsList,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,7 +81,7 @@ enum SubagentsFocus {
 #[derive(Debug, Clone)]
 struct SubagentStackFrame {
     parent: AgentAuthoringDraft,
-    child_index: usize,
+    child_path: Vec<usize>,
     phase: SubagentPhase,
 }
 
@@ -510,6 +512,9 @@ impl AgentAuthoringScreen {
                         !self.draft.trust_confirmations[*index];
                 }
             }
+            Phase::Create => {
+                self.draft.make_default = !self.draft.make_default;
+            }
             Phase::Optimizations => match self.cursor {
                 0 => {
                     self.draft.interactive_subagents = !self.draft.interactive_subagents;
@@ -529,6 +534,15 @@ impl AgentAuthoringScreen {
                 let cursor = self.cursor;
                 if let Some(child) = self.current_child_mut() {
                     cycle_tool_tier(&mut child.tool_tiers, cursor);
+                }
+            }
+            Phase::SubagentEdit(SubagentPhase::SubagentsList) => {
+                if self.cursor == 0 {
+                    self.begin_add_nested_subagent();
+                } else if let Some(child) = self.editing_child.as_ref()
+                    && self.cursor <= child.children.len()
+                {
+                    self.begin_edit_nested_subagent(self.cursor - 1);
                 }
             }
             Phase::SubagentsList => {
@@ -624,6 +638,10 @@ impl AgentAuthoringScreen {
             }
             Phase::SubagentEdit(SubagentPhase::ToolTiers) => {
                 self.phase = Phase::SubagentEdit(SubagentPhase::ModelGrants);
+                None
+            }
+            Phase::SubagentEdit(SubagentPhase::SubagentsList) => {
+                self.phase = Phase::SubagentEdit(SubagentPhase::ToolTiers);
                 None
             }
             Phase::Review => {
@@ -768,6 +786,11 @@ impl AgentAuthoringScreen {
                 None
             }
             Phase::SubagentEdit(SubagentPhase::ToolTiers) => {
+                self.phase = Phase::SubagentEdit(SubagentPhase::SubagentsList);
+                self.cursor = 0;
+                None
+            }
+            Phase::SubagentEdit(SubagentPhase::SubagentsList) => {
                 self.commit_subagent_edit();
                 None
             }
@@ -814,11 +837,87 @@ impl AgentAuthoringScreen {
         }
     }
 
-    fn begin_add_subagent(&mut self) {
+    fn child_at_path(draft: &AgentAuthoringDraft, path: &[usize]) -> Option<&ChildAuthoringDraft> {
+        let mut current = draft.children.get(path.first()?)?;
+        for index in path.iter().skip(1) {
+            current = current.children.get(*index)?;
+        }
+        Some(current)
+    }
+
+    fn child_slot_at_path(
+        draft: &mut AgentAuthoringDraft,
+        path: &[usize],
+    ) -> Option<&mut ChildAuthoringDraft> {
+        let mut current = draft.children.get_mut(path.first()?)?;
+        for index in path.iter().skip(1) {
+            current = current.children.get_mut(*index)?;
+        }
+        Some(current)
+    }
+
+    fn begin_add_nested_subagent(&mut self) {
+        let Some(parent_path) = self
+            .subagent_stack
+            .last()
+            .map(|frame| frame.child_path.clone())
+        else {
+            return;
+        };
         let child = default_child_draft(&self.projection);
+        if let Some(parent) = Self::child_slot_at_path(&mut self.draft, &parent_path) {
+            parent.children.push(child);
+            let child_path = parent_path
+                .iter()
+                .chain([&parent.children.len() - 1])
+                .copied()
+                .collect();
+            self.subagent_stack.push(SubagentStackFrame {
+                parent: self.draft.clone(),
+                child_path,
+                phase: SubagentPhase::Identity,
+            });
+            self.editing_child = Self::child_at_path(&self.draft, &child_path).cloned();
+            self.subagents_focus = SubagentsFocus::Add;
+            self.phase = Phase::SubagentEdit(SubagentPhase::Identity);
+            self.cursor = 0;
+            self.name_field.set("helper");
+        }
+    }
+
+    fn begin_edit_nested_subagent(&mut self, index: usize) {
+        let Some(parent_path) = self
+            .subagent_stack
+            .last()
+            .map(|frame| frame.child_path.clone())
+        else {
+            return;
+        };
+        let child_path = parent_path.iter().chain([&index]).copied().collect();
+        let child = Self::child_at_path(&self.draft, &child_path).cloned();
+        if child.is_none() {
+            return;
+        }
         self.subagent_stack.push(SubagentStackFrame {
             parent: self.draft.clone(),
-            child_index: self.draft.children.len(),
+            child_path,
+            phase: SubagentPhase::Identity,
+        });
+        self.editing_child = child;
+        self.subagents_focus = SubagentsFocus::Edit;
+        self.phase = Phase::SubagentEdit(SubagentPhase::Identity);
+        self.cursor = 0;
+        if let Some(child) = &self.editing_child {
+            self.name_field.set(&child.name);
+        }
+    }
+
+    fn begin_add_subagent(&mut self) {
+        let child = default_child_draft(&self.projection);
+        let child_path = vec![self.draft.children.len()];
+        self.subagent_stack.push(SubagentStackFrame {
+            parent: self.draft.clone(),
+            child_path,
             phase: SubagentPhase::Identity,
         });
         self.draft.children.push(child);
@@ -836,7 +935,7 @@ impl AgentAuthoringScreen {
         }
         self.subagent_stack.push(SubagentStackFrame {
             parent: self.draft.clone(),
-            child_index: index,
+            child_path: vec![index],
             phase: SubagentPhase::Identity,
         });
         self.editing_child = child;
@@ -853,13 +952,23 @@ impl AgentAuthoringScreen {
             child.name = self.name_field.text().trim().to_string();
             if let Some(frame) = self.subagent_stack.pop() {
                 self.draft = frame.parent;
-                if let Some(slot) = self.draft.children.get_mut(frame.child_index) {
+                if let Some(slot) = Self::child_slot_at_path(&mut self.draft, &frame.child_path) {
                     *slot = child;
+                }
+                if frame.child_path.len() == 1 {
+                    self.phase = Phase::SubagentsList;
+                    self.subagents_focus = SubagentsFocus::List;
+                } else {
+                    let parent_path = frame
+                        .child_path
+                        .split_last()
+                        .map(|(last, prefix)| (prefix.to_vec(), *last))
+                        .unwrap_or((Vec::new(), 0));
+                    self.editing_child = Self::child_at_path(&self.draft, &parent_path.0).cloned();
+                    self.phase = Phase::SubagentEdit(SubagentPhase::SubagentsList);
                 }
             }
         }
-        self.phase = Phase::SubagentsList;
-        self.subagents_focus = SubagentsFocus::List;
         self.review = None;
         self.review_policy_revision = None;
     }
@@ -922,10 +1031,10 @@ impl AgentAuthoringScreen {
                 )));
             }
             if !review.children.is_empty() {
-                lines.push(Line::from(format!(
-                    "Children: {}",
-                    review.children.join(", ")
-                )));
+                lines.push(Line::from("Children:"));
+                for child in &review.children {
+                    lines.extend(review_child_lines(child, 1));
+                }
             }
             lines.push(Line::from(format!(
                 "Make default: {}",
@@ -1257,6 +1366,20 @@ fn cycle_tool_tier(tiers: &mut std::collections::BTreeMap<String, ToolTier>, cur
             .unwrap_or(legal[0]);
         tiers.insert(item.name.to_string(), next);
     }
+}
+
+fn review_child_lines(child: &AuthoredAgentReviewChild, indent: usize) -> Vec<Line<'static>> {
+    let prefix = "  ".repeat(indent);
+    let mut lines = vec![Line::from(format!(
+        "{prefix}{} · grants={} · tools={}",
+        child.path,
+        child.grants.len(),
+        child.tool_tier_preferences.len()
+    ))];
+    for nested in &child.children {
+        lines.extend(review_child_lines(nested, indent + 1));
+    }
+    lines
 }
 
 fn trust_label(trust: cockpit_proto::AgentPolicyTrustClassification) -> &'static str {

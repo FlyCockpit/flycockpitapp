@@ -217,56 +217,134 @@ pub async fn receipt(
     ctx: &DaemonContext,
     owner: &str,
     query: AuthoredAgentPackageReceiptQuery,
-) -> Result<ApplyAuthoredAgentPackageReceipt> {
+) -> Result<Option<ApplyAuthoredAgentPackageReceipt>> {
     if let Some(journal) = ctx
         .db
         .authored_agent_package_journal(owner.to_owned(), query.client_operation_id.clone())
         .await?
-        && let Some(json) = journal.terminal_response_json.as_deref()
-        && let Ok(Response::AuthoredAgentPackage(ApplyAuthoredAgentPackageOutcome::Receipt(
-            receipt,
-        ))) = serde_json::from_str(json)
     {
-        return Ok(receipt);
+        if let Some(json) = journal.terminal_response_json.as_deref() {
+            return Ok(Some(receipt_from_terminal_json(
+                &query.client_operation_id,
+                json,
+            )?));
+        }
+        if journal.settlement_phase == AUTHORED_PACKAGE_SETTLEMENT_PENDING {
+            return Ok(Some(pending_receipt_from_journal(&journal)));
+        }
     }
     let Some(settlement) = ctx
         .db
         .local_operation_settlement(owner.to_owned(), query.client_operation_id.clone())
         .await?
     else {
-        return Ok(unknown_receipt(&query.client_operation_id, None));
+        return Ok(None);
     };
     match settlement {
         crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(
             identity,
             json,
-        ) if identity.operation_kind == "apply_authored_agent_package" => {
-            match serde_json::from_str::<Response>(&json) {
-                Ok(Response::AuthoredAgentPackage(ApplyAuthoredAgentPackageOutcome::Receipt(
-                    receipt,
-                ))) => Ok(receipt),
-                Ok(Response::AuthoredAgentPackage(
-                    ApplyAuthoredAgentPackageOutcome::Rejected { .. },
-                )) => Ok(unknown_receipt(&query.client_operation_id, None)),
-                _ => Ok(unknown_receipt(&query.client_operation_id, None)),
-            }
-        }
+        ) if identity.operation_kind == "apply_authored_agent_package" => Ok(Some(
+            receipt_from_terminal_json(&query.client_operation_id, &json)?,
+        )),
         crate::db::local_operation_receipts::LocalOperationSettlement::Pending(_) => {
             if let Some(journal) = ctx
                 .db
                 .authored_agent_package_journal(owner.to_owned(), query.client_operation_id.clone())
                 .await?
-                && let Some(json) = journal.terminal_response_json.as_deref()
-                && let Ok(Response::AuthoredAgentPackage(
-                    ApplyAuthoredAgentPackageOutcome::Receipt(receipt),
-                )) = serde_json::from_str(json)
             {
-                return Ok(receipt);
+                return Ok(Some(pending_receipt_from_journal(&journal)));
             }
-            Ok(unknown_receipt(&query.client_operation_id, None))
+            Ok(Some(unknown_receipt(&query.client_operation_id, None)))
         }
-        _ => Ok(unknown_receipt(&query.client_operation_id, None)),
+        crate::db::local_operation_receipts::LocalOperationSettlement::TerminalError(_, json)
+        | crate::db::local_operation_receipts::LocalOperationSettlement::TerminalCancelled(
+            _,
+            json,
+        ) => Ok(Some(receipt_from_terminal_json(
+            &query.client_operation_id,
+            &json,
+        )?)),
+        _ => Ok(Some(unknown_receipt(&query.client_operation_id, None))),
     }
+}
+
+fn receipt_from_terminal_json(
+    client_operation_id: &str,
+    json: &str,
+) -> Result<ApplyAuthoredAgentPackageReceipt> {
+    match serde_json::from_str::<Response>(json)? {
+        Response::AuthoredAgentPackage(ApplyAuthoredAgentPackageOutcome::Receipt(receipt)) => {
+            Ok(receipt)
+        }
+        Response::AuthoredAgentPackage(ApplyAuthoredAgentPackageOutcome::Rejected {
+            reason,
+            message,
+            ..
+        }) => Ok(rejected_receipt(client_operation_id, reason, message)),
+        other => anyhow::bail!("authored package terminal payload is not a receipt: {other:?}"),
+    }
+}
+
+fn pending_receipt_from_journal(
+    journal: &AuthoredAgentPackageJournalRow,
+) -> ApplyAuthoredAgentPackageReceipt {
+    let review = serde_json::from_str::<AuthoredAgentReview>(&journal.review_json)
+        .unwrap_or_else(|_| empty_review(&journal.agent_name));
+    ApplyAuthoredAgentPackageReceipt {
+        client_operation_id: journal.client_operation_id.clone(),
+        receipt_id: uuid::Uuid::nil(),
+        status: AuthoredAgentReceiptStatus::Pending,
+        package_digest: journal.package_digest.clone(),
+        policy_revision: journal.policy_revision.clone(),
+        installation_id: journal.installation_id.clone(),
+        default_selected: journal.default_selected,
+        result_config_generation: 0,
+        review,
+    }
+}
+
+fn rejected_receipt(
+    client_operation_id: &str,
+    _reason: AuthoredAgentRejectReason,
+    _message: String,
+) -> ApplyAuthoredAgentPackageReceipt {
+    ApplyAuthoredAgentPackageReceipt {
+        client_operation_id: client_operation_id.to_string(),
+        receipt_id: uuid::Uuid::nil(),
+        status: AuthoredAgentReceiptStatus::Rejected,
+        package_digest: String::new(),
+        policy_revision: String::new(),
+        installation_id: None,
+        default_selected: false,
+        result_config_generation: 0,
+        review: empty_review(""),
+    }
+}
+
+fn empty_review(agent_name: &str) -> AuthoredAgentReview {
+    AuthoredAgentReview {
+        agent_name: agent_name.to_string(),
+        grants: Vec::new(),
+        tool_tier_preferences: Vec::new(),
+        verification_label: None,
+        interactive_subagents: false,
+        goal_skeptics_label: crate::agents::GoalSkepticsPolicy::Off
+            .review_label()
+            .to_string(),
+        children: Vec::new(),
+        sidecars: Vec::new(),
+        source: String::new(),
+        make_default: false,
+        trust_is_shared: true,
+        trust_disclosure: crate::onboarding_agent::REVIEW_TRUST_DISCLOSURE.to_string(),
+    }
+}
+
+pub(crate) fn publication_fence_for_request(
+    request: &ApplyAuthoredAgentPackageRequest,
+) -> Result<AuthoredApplyFence> {
+    publication_fence(request, None)
 }
 
 fn publication_fence(
@@ -281,7 +359,7 @@ fn publication_fence(
     let owner_digest = request
         .onboarding
         .as_ref()
-        .map(|row| format!("onboarding:{}", row.run_id))
+        .map(|row| format!("onboarding:{}", row.attempt_id))
         .unwrap_or_else(|| "authored-unfenced".to_string());
     Ok(AuthoredApplyFence {
         owner_digest,

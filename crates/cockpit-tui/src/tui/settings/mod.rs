@@ -6272,6 +6272,16 @@ impl Dialog {
             cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID => {
                 Some(cockpit_core::wizard::onboarding_lifetime_descriptor())
             }
+            cockpit_core::wizard::SECURITY_WIZARD_ID | cockpit_core::wizard::MODEL_WIZARD_ID => {
+                cockpit_core::wizard::descriptor_for_cwd(wizard_id, &global_root).or_else(|| {
+                    (wizard_id == cockpit_core::wizard::MODEL_WIZARD_ID).then_some(
+                        cockpit_core::wizard::model_descriptor_for_cwd(
+                            &global_root,
+                            preselected_model,
+                        ),
+                    )
+                })
+            }
             other => return Err(format!("unknown onboarding wizard `{other}`")),
         }
         .ok_or_else(|| format!("could not build onboarding wizard `{wizard_id}`"))?;
@@ -10128,10 +10138,6 @@ fn apply_setup_wizard_daemon_completion(
                 } else {
                     parts.join(" ")
                 }
-            } else if wizard.run.descriptor().id == cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID
-            {
-                "Installed the pinned agent and saved its model, trust, tool tiers, default, and sidecar settings."
-                    .to_string()
             } else if wizard.run.descriptor().id
                 == cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID
             {

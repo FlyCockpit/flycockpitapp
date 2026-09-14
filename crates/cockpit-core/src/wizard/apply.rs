@@ -95,9 +95,6 @@ pub fn descriptor_for_cwd_with_caps(
     if id == crate::wizard::ONBOARDING_PROFILE_WIZARD_ID {
         return Some(crate::wizard::onboarding_profile_descriptor());
     }
-    if id == crate::wizard::ONBOARDING_AGENT_WIZARD_ID {
-        return None;
-    }
     if id == crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID {
         return Some(crate::wizard::onboarding_lifetime_descriptor());
     }
@@ -156,7 +153,6 @@ pub fn apply_setup_wizard_answers(
             | crate::wizard::MODEL_WIZARD_ID
             | crate::wizard::ONBOARDING_MODEL_WIZARD_ID
             | crate::wizard::ONBOARDING_PROFILE_WIZARD_ID
-            | crate::wizard::ONBOARDING_AGENT_WIZARD_ID
             | crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID
     ) {
         return Err(anyhow!("unsupported setup wizard `{wizard_id}`"));
@@ -198,7 +194,6 @@ pub async fn apply_setup_wizard_answers_authoritative(
             | crate::wizard::MODEL_WIZARD_ID
             | crate::wizard::ONBOARDING_MODEL_WIZARD_ID
             | crate::wizard::ONBOARDING_PROFILE_WIZARD_ID
-            | crate::wizard::ONBOARDING_AGENT_WIZARD_ID
             | crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID
     ) {
         return Err(anyhow!("unsupported setup wizard `{wizard_id}`"));

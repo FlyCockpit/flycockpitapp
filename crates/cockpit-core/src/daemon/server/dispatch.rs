@@ -11107,7 +11107,7 @@ async fn handle_serialized_request_impl(
             let receipt = crate::daemon::agent_authoring::receipt(ctx, &owner, query)
                 .await
                 .map_err(internal)?;
-            Ok(Response::AuthoredAgentPackageReceipt(Some(receipt)))
+            Ok(Response::AuthoredAgentPackageReceipt(receipt))
         }
 
         Request::CreateAssistantSession {

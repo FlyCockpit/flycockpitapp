@@ -29,23 +29,38 @@ fn named_setup_wizard_inventory_covers_registry_rows() {
         .split("pub(super) fn open_onboarding_setup")
         .nth(1)
         .and_then(|tail| {
-            tail.split("fn mount_setup_wizard_in_onboarding_shell")
+            tail.split("fn mount_named_setup_wizard_in_onboarding_shell")
                 .next()
         })
         .expect("open_onboarding_setup");
-    let wizard_constant = |id: &str| match id {
-        cockpit_core::wizard::PROVIDER_WIZARD_ID => "PROVIDER_WIZARD_ID",
-        cockpit_core::wizard::SECURITY_WIZARD_ID => "SECURITY_WIZARD_ID",
-        cockpit_core::wizard::MODEL_WIZARD_ID => "MODEL_WIZARD_ID",
-        cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID => "ONBOARDING_MODEL_WIZARD_ID",
-        cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID => "ONBOARDING_PROFILE_WIZARD_ID",
-        cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID => "ONBOARDING_LIFETIME_WIZARD_ID",
-        cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID => "ONBOARDING_AGENT_WIZARD_ID",
+    let wizard_match_arm = |id: &str| match id {
+        cockpit_core::wizard::PROVIDER_WIZARD_ID => {
+            "Some(cockpit_core::wizard::PROVIDER_WIZARD_ID)"
+        }
+        cockpit_core::wizard::SECURITY_WIZARD_ID => {
+            "Some(cockpit_core::wizard::SECURITY_WIZARD_ID)"
+        }
+        cockpit_core::wizard::MODEL_WIZARD_ID => "Some(cockpit_core::wizard::MODEL_WIZARD_ID)",
+        cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID => {
+            "Some(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID)"
+        }
+        cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID => {
+            "Some(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID)"
+        }
+        cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID => {
+            "Some(cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID)"
+        }
+        cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID => {
+            "Some(cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID)"
+        }
         other => panic!("unknown setup wizard id `{other}`"),
     };
     let mut routed = cockpit_core::wizard::named_setup_wizard_ids()
         .into_iter()
-        .filter(|wizard_id| open_onboarding.contains(wizard_constant(wizard_id)))
+        .filter(|wizard_id| {
+            let arm = wizard_match_arm(wizard_id);
+            open_onboarding.contains(arm) && !open_onboarding.contains(&format!("// {arm}"))
+        })
         .map(str::to_string)
         .collect::<Vec<_>>();
     routed.sort();

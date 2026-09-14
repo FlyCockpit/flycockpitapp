@@ -165,6 +165,28 @@ export const authoredAgentReviewGrantSchema = z
   })
   .strict();
 
+export const authoredAgentReviewChildSchema: z.ZodType<AuthoredAgentReviewChild> = z.lazy(() =>
+  z
+    .object({
+      path: z.string(),
+      grants: z.array(authoredAgentReviewGrantSchema),
+      tool_tier_preferences: z.array(z.tuple([z.string(), z.string()])),
+      interactive_subagents: z.boolean(),
+      goal_skeptics_label: z.string(),
+      children: z.array(authoredAgentReviewChildSchema),
+    })
+    .strict(),
+);
+
+export type AuthoredAgentReviewChild = {
+  path: string;
+  grants: z.infer<typeof authoredAgentReviewGrantSchema>[];
+  tool_tier_preferences: [string, string][];
+  interactive_subagents: boolean;
+  goal_skeptics_label: string;
+  children: AuthoredAgentReviewChild[];
+};
+
 export const authoredAgentReviewSchema = z
   .object({
     agent_name: z.string(),
@@ -173,7 +195,7 @@ export const authoredAgentReviewSchema = z
     verification_label: z.string().optional(),
     interactive_subagents: z.boolean(),
     goal_skeptics_label: z.string(),
-    children: z.array(z.string()),
+    children: z.array(authoredAgentReviewChildSchema),
     sidecars: z.array(z.string()).optional(),
     source: z.string(),
     make_default: z.boolean(),

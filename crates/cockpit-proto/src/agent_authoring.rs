@@ -211,6 +211,16 @@ pub struct AuthoredAgentReviewGrant {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthoredAgentReviewChild {
+    pub path: String,
+    pub grants: Vec<AuthoredAgentReviewGrant>,
+    pub tool_tier_preferences: Vec<(String, String)>,
+    pub interactive_subagents: bool,
+    pub goal_skeptics_label: String,
+    pub children: Vec<AuthoredAgentReviewChild>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthoredAgentReview {
     pub agent_name: String,
     pub grants: Vec<AuthoredAgentReviewGrant>,
@@ -219,7 +229,7 @@ pub struct AuthoredAgentReview {
     pub verification_label: Option<String>,
     pub interactive_subagents: bool,
     pub goal_skeptics_label: String,
-    pub children: Vec<String>,
+    pub children: Vec<AuthoredAgentReviewChild>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sidecars: Vec<String>,
     pub source: String,

@@ -15,8 +15,8 @@ use cockpit_proto::{
     AgentAuthoringProjection, AgentAuthoringSource, AgentAuthoringSourceKind, AgentPolicyRoute,
     AgentPolicySnapshot, AgentPolicyTrustClassification, ApplyAuthoredAgentPackageReceipt,
     AuthoredAgentPackageDraft, AuthoredAgentReceiptStatus, AuthoredAgentRejectReason,
-    AuthoredAgentReview, AuthoredAgentReviewGrant, AuthoredAgentSource, AuthoredSidecarDeclaration,
-    ModelTrustConfirmation,
+    AuthoredAgentReview, AuthoredAgentReviewChild, AuthoredAgentReviewGrant, AuthoredAgentSource,
+    AuthoredSidecarDeclaration, ModelTrustConfirmation,
 };
 use sha2::{Digest, Sha256};
 
@@ -197,12 +197,40 @@ pub fn authoring_projection(
     })
 }
 
+pub fn validate_authored_agent_name(name: &str) -> Result<(), AuthoredPackageRejection> {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('.')
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(AuthoredPackageRejection::new(
+            AuthoredAgentRejectReason::InvalidNestedGraph,
+            "authored agent name must be ASCII alphanumeric with '-' or '_' only",
+        ));
+    }
+    Ok(())
+}
+
 pub fn canonicalize_authored_package(
     draft: &AuthoredAgentPackageDraft,
     snapshot: &AgentPolicySnapshot,
     providers: &ProvidersConfig,
     catalog: &AgentCatalogIndex,
 ) -> Result<CanonicalAuthoredPackage, AuthoredPackageRejection> {
+    validate_authored_agent_name(&draft.name)?;
+    for child in &draft.children {
+        if let Some(name) = child
+            .relative_path
+            .strip_prefix("subagents/")
+            .and_then(|rest| rest.strip_suffix(".md"))
+            .and_then(|rest| rest.rsplit('/').next())
+        {
+            validate_authored_agent_name(name)?;
+        }
+    }
     if draft.dto_version != AGENT_AUTHORING_DTO_VERSION {
         return Err(AuthoredPackageRejection::new(
             AuthoredAgentRejectReason::IncompletePackage,
@@ -242,7 +270,7 @@ pub fn canonicalize_authored_package(
         .map_err(map_package_error)?;
     validate_grants(&definition, snapshot, &draft.model_trust_confirmations)?;
     let digest = hex_digest(&crate::agents::package_digest_preimage(&files));
-    let review = review_from_definition(&definition, snapshot, draft, &digest);
+    let review = review_from_definition(&definition, snapshot, draft, &digest, &files);
     Ok(CanonicalAuthoredPackage {
         files,
         digest,
@@ -931,6 +959,7 @@ fn review_from_definition(
     snapshot: &AgentPolicySnapshot,
     draft: &AuthoredAgentPackageDraft,
     _digest: &str,
+    files: &BTreeMap<String, Vec<u8>>,
 ) -> AuthoredAgentReview {
     let frontmatter = definition.definition_frontmatter();
     let grants = frontmatter
@@ -991,11 +1020,7 @@ fn review_from_definition(
         verification_label,
         interactive_subagents,
         goal_skeptics_label: goal_skeptics.review_label().to_string(),
-        children: draft
-            .children
-            .iter()
-            .map(|child| child.relative_path.clone())
-            .collect(),
+        children: review_children_from_package_files(draft, snapshot, &files),
         sidecars: draft
             .sidecars
             .iter()
@@ -1006,6 +1031,133 @@ fn review_from_definition(
         trust_is_shared: true,
         trust_disclosure: REVIEW_TRUST_DISCLOSURE.to_string(),
     }
+}
+
+fn review_children_from_package_files(
+    draft: &AuthoredAgentPackageDraft,
+    snapshot: &AgentPolicySnapshot,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Vec<AuthoredAgentReviewChild> {
+    draft
+        .children
+        .iter()
+        .filter_map(|child| {
+            review_child_from_markdown(&child.relative_path, &child.markdown, snapshot, files)
+        })
+        .collect()
+}
+
+fn review_child_from_markdown(
+    path: &str,
+    markdown: &str,
+    snapshot: &AgentPolicySnapshot,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Option<AuthoredAgentReviewChild> {
+    let child_name = path
+        .strip_prefix("subagents/")
+        .and_then(|rest| rest.strip_suffix(".md"))
+        .unwrap_or(path);
+    let child_def = crate::agents::load_workspace_package_from_files(child_name, {
+        let mut scoped = BTreeMap::from([(
+            crate::agents::PACKAGE_ROOT_FILE.to_string(),
+            markdown.as_bytes().to_vec(),
+        )]);
+        for (rel, bytes) in files {
+            if rel.starts_with("subagents/")
+                && rel
+                    .strip_prefix("subagents/")
+                    .is_some_and(|rest| rest.starts_with(&format!("{child_name}/")))
+            {
+                scoped.insert(rel.clone(), bytes.clone());
+            }
+        }
+        scoped
+    });
+    let child_def = match child_def {
+        Ok(def) => def,
+        Err(_) => return None,
+    };
+    let frontmatter = child_def.definition_frontmatter()?;
+    let grants = frontmatter
+        .model_slots
+        .get("primary")
+        .map(|slot| {
+            slot.models
+                .iter()
+                .map(|grant| {
+                    let route = snapshot.routes.iter().find(|route| {
+                        route.provider_id == grant.provider_id && route.model_id == grant.model_id
+                    });
+                    AuthoredAgentReviewGrant {
+                        provider_id: grant.provider_id.clone(),
+                        model_id: grant.model_id.clone(),
+                        is_default: grant.default || slot.default_model() == Some(grant),
+                        trust: route
+                            .map(|route| route.trust)
+                            .unwrap_or(AgentPolicyTrustClassification::Unset),
+                        trust_is_shared: true,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let tool_tier_preferences = frontmatter
+        .tool_tier_preferences
+        .iter()
+        .map(|(tool, tier)| (tool.clone(), tier.label().to_string()))
+        .collect();
+    let interactive_subagents = child_def
+        .vnext
+        .as_ref()
+        .is_some_and(|vnext| vnext.delegation.interactive_subagents);
+    let goal_skeptics = child_def
+        .vnext
+        .as_ref()
+        .and_then(|vnext| vnext.verification.as_ref())
+        .map(|policy| policy.goal_skeptics)
+        .unwrap_or(GoalSkepticsPolicy::Off);
+    let nested = child_def
+        .vnext
+        .as_ref()
+        .map(|vnext| {
+            vnext
+                .delegation
+                .allowed_children
+                .iter()
+                .filter_map(|allowed| {
+                    let portable_ref = match allowed {
+                        crate::agents::AllowedChild::PortableRef { portable_agent_ref } => {
+                            portable_agent_ref.as_str()
+                        }
+                        _ => return None,
+                    };
+                    files
+                        .iter()
+                        .find(|(rel, _)| {
+                            rel.strip_prefix("subagents/")
+                                .and_then(|rest| rest.strip_suffix(".md"))
+                                .is_some_and(|rest| {
+                                    rest == portable_agent_ref
+                                        || rest.ends_with(&format!("/{portable_agent_ref}"))
+                                })
+                        })
+                        .and_then(|(rel, bytes)| {
+                            std::str::from_utf8(bytes).ok().and_then(|markdown| {
+                                review_child_from_markdown(rel, markdown, snapshot, files)
+                            })
+                        })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(AuthoredAgentReviewChild {
+        path: path.to_string(),
+        grants,
+        tool_tier_preferences,
+        interactive_subagents,
+        goal_skeptics_label: goal_skeptics.review_label().to_string(),
+        children: nested,
+    })
 }
 
 #[cfg(test)]

@@ -2176,11 +2176,15 @@ fn load_package_from_files(
         if rel == PACKAGE_ROOT_FILE || rel == PACKAGE_MCP_FILE || rel == PACKAGE_SIDECAR_FILE {
             continue;
         }
-        if let Some(child) = rel
+        if let Some(child_path) = rel
             .strip_prefix(&format!("{PACKAGE_SUBAGENTS_DIR}/"))
-            .filter(|rest| !rest.is_empty() && !rest.contains('/'))
+            .filter(|rest| !rest.is_empty())
             .and_then(|rest| rest.strip_suffix(".md"))
         {
+            let child = child_path
+                .rsplit('/')
+                .next()
+                .context("private subagent path is empty")?;
             if child == name {
                 bail!(
                     "agent package `{name}` ({}) has a private subagent that reuses the package name",
@@ -2189,7 +2193,7 @@ fn load_package_from_files(
             }
             let child_text = std::str::from_utf8(bytes).map_err(|e| {
                 anyhow::anyhow!(
-                    "agent package `{name}` private subagent `{child}` is not UTF-8: {e}"
+                    "agent package `{name}` private subagent `{child_path}` is not UTF-8: {e}"
                 )
             })?;
             let child_def = parse_agent_with_scope(
@@ -2197,7 +2201,8 @@ fn load_package_from_files(
                 child,
                 agent_dir
                     .join(PACKAGE_SUBAGENTS_DIR)
-                    .join(format!("{child}.md")),
+                    .join(child_path)
+                    .with_extension("md"),
                 scope,
             )?;
             if child_def.mode == AgentMode::Primary {
@@ -2225,19 +2230,17 @@ fn load_package_from_files(
                 );
             }
             if private_subagents
-                .insert(child.to_string(), child_def)
+                .insert(child_path.to_string(), child_def)
                 .is_some()
             {
                 bail!(
-                    "agent package `{name}` ({}) has duplicate private subagent `{child}`",
+                    "agent package `{name}` ({}) has duplicate private subagent `{child_path}`",
                     agent_dir.display()
                 );
             }
             continue;
         }
         if rel.contains('/') {
-            // Nested support files (mcp.json already skipped) are digested
-            // but not interpreted by this stage.
             continue;
         }
         if let Some(key) = rel.strip_suffix(".md").filter(|k| !k.is_empty()) {

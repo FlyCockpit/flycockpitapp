@@ -586,7 +586,15 @@ fn build_child_markdown(
             let allowed_children = child
                 .children
                 .iter()
-                .map(|nested| AllowedChild::portable_ref(&child_slug(nested)))
+                .map(|nested| {
+                    let slug = child_slug(nested);
+                    let portable_ref = if parent_prefix.is_empty() {
+                        slug
+                    } else {
+                        format!("{parent_prefix}/{slug}")
+                    };
+                    AllowedChild::portable_ref(&portable_ref)
+                })
                 .collect();
             Some(DelegationPolicy {
                 allowed_children,

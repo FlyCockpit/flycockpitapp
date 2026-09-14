@@ -150,8 +150,17 @@ impl App {
             .set_resolution_generation(self.config_snapshot.generation);
     }
 
-    fn onboarding_agent_operation_id_for_run(run_id: uuid::Uuid) -> String {
-        format!("onboarding-agent-{run_id}")
+    fn onboarding_agent_operation_id_for_attempt(attempt_id: uuid::Uuid) -> String {
+        format!("onboarding-agent-{attempt_id}")
+    }
+
+    fn require_onboarding_snapshot_for_named_route(&mut self, wizard_id: &str) -> bool {
+        if self.onboarding_snapshot.is_some() {
+            return true;
+        }
+        self.pending_setup_wizard = Some(wizard_id.to_string());
+        self.start_onboarding_bootstrap_fetch();
+        false
     }
 
     fn maybe_open_pending_setup_wizard(&mut self) {
@@ -211,22 +220,17 @@ impl App {
                 }
             }
             Some(cockpit_core::wizard::PROVIDER_WIZARD_ID) => {
+                if !self.require_onboarding_snapshot_for_named_route(
+                    cockpit_core::wizard::PROVIDER_WIZARD_ID,
+                ) {
+                    return;
+                }
                 if self.onboarding_snapshot.as_ref().is_some_and(|snapshot| {
                     snapshot.stage == cockpit_proto::OnboardingStage::Complete
                 }) {
-                    let snapshot = self.onboarding_snapshot.clone().unwrap_or_else(|| {
-                        cockpit_proto::OnboardingBootstrapSnapshot {
-                            run_id: uuid::Uuid::new_v4(),
-                            attempt_id: uuid::Uuid::new_v4(),
-                            revision: 0,
-                            stage: cockpit_proto::OnboardingStage::Complete,
-                            bootstrap_state: cockpit_proto::OnboardingBootstrapState::Ready,
-                            limited_mode: false,
-                            lifetime_selection: None,
-                            host_capabilities: self.host_capabilities.clone(),
-                            last_receipt: None,
-                        }
-                    });
+                    let snapshot = self.onboarding_snapshot.clone().expect(
+                        "named provider route requires an authoritative onboarding snapshot",
+                    );
                     if self.onboarding_shell.is_none() {
                         self.onboarding_shell =
                             Some(Box::new(crate::tui::onboarding::OnboardingShell::new(
@@ -241,30 +245,30 @@ impl App {
                         shell.begin_completion_provider_detour(None);
                     }
                 } else {
-                    let snapshot = self.onboarding_snapshot.clone().unwrap_or_else(|| {
-                        cockpit_proto::OnboardingBootstrapSnapshot {
-                            run_id: uuid::Uuid::new_v4(),
-                            attempt_id: uuid::Uuid::new_v4(),
-                            revision: 0,
-                            stage: cockpit_proto::OnboardingStage::Provider,
-                            bootstrap_state: cockpit_proto::OnboardingBootstrapState::Ready,
-                            limited_mode: false,
-                            lifetime_selection: None,
-                            host_capabilities: self.host_capabilities.clone(),
-                            last_receipt: None,
-                        }
-                    });
+                    let snapshot = self.onboarding_snapshot.clone().expect(
+                        "named provider route requires an authoritative onboarding snapshot",
+                    );
                     self.reopen_onboarding_shell(&snapshot);
                 }
             }
             Some(cockpit_core::wizard::SECURITY_WIZARD_ID) => {
-                self.mount_setup_wizard_in_onboarding_shell(
+                if !self.require_onboarding_snapshot_for_named_route(
+                    cockpit_core::wizard::SECURITY_WIZARD_ID,
+                ) {
+                    return;
+                }
+                self.mount_named_setup_wizard_in_onboarding_shell(
                     cockpit_core::wizard::SECURITY_WIZARD_ID,
                     None,
                 );
             }
             Some(cockpit_core::wizard::MODEL_WIZARD_ID) => {
-                self.mount_setup_wizard_in_onboarding_shell(
+                if !self.require_onboarding_snapshot_for_named_route(
+                    cockpit_core::wizard::MODEL_WIZARD_ID,
+                ) {
+                    return;
+                }
+                self.mount_named_setup_wizard_in_onboarding_shell(
                     cockpit_core::wizard::MODEL_WIZARD_ID,
                     None,
                 );
@@ -301,31 +305,22 @@ impl App {
         }
     }
 
-    fn mount_setup_wizard_in_onboarding_shell(
+    fn mount_named_setup_wizard_in_onboarding_shell(
         &mut self,
         wizard_id: &str,
         preselected_model: Option<(&str, &str)>,
     ) {
-        let snapshot = self.onboarding_snapshot.clone().unwrap_or_else(|| {
-            cockpit_proto::OnboardingBootstrapSnapshot {
-                run_id: uuid::Uuid::new_v4(),
-                attempt_id: uuid::Uuid::new_v4(),
-                revision: 0,
-                stage: cockpit_proto::OnboardingStage::Complete,
-                bootstrap_state: cockpit_proto::OnboardingBootstrapState::Ready,
-                limited_mode: false,
-                lifetime_selection: None,
-                host_capabilities: self.host_capabilities.clone(),
-                last_receipt: None,
-            }
-        });
+        let snapshot = self
+            .onboarding_snapshot
+            .clone()
+            .expect("named setup wizard routes require an authoritative onboarding snapshot");
         if self.onboarding_shell.is_none() {
             self.onboarding_shell = Some(Box::new(crate::tui::onboarding::OnboardingShell::new(
                 &snapshot,
                 crate::tui::onboarding::reduced_motion_enabled(),
             )));
         }
-        match Dialog::open_setup_wizard(&self.launch.cwd, wizard_id) {
+        match Dialog::onboarding_wizard_engine(wizard_id, preselected_model, None) {
             Ok(dialog) => {
                 self.dialog = dialog;
                 if let Some(shell) = self.onboarding_shell.as_mut() {
@@ -339,9 +334,8 @@ impl App {
                         _ => crate::tui::onboarding::EngineStage::Model,
                     });
                 }
-                let _ = preselected_model;
             }
-            Err(error) => self.push_plain(format!("/setup: {error}")),
+            Err(error) => self.show_toast(error, super::ToastKind::Error),
         }
     }
 
@@ -518,6 +512,12 @@ impl App {
             self.onboarding_snapshot = snapshot;
             self.start_onboarding_ready_construction_retry();
             return;
+        }
+        if let (Some(incoming), Some(recorded)) =
+            (snapshot.as_ref(), self.onboarding_snapshot.as_ref())
+            && incoming.attempt_id != recorded.attempt_id
+        {
+            self.onboarding_agent_operation_id = None;
         }
         self.onboarding_snapshot = snapshot;
         if let Some(snapshot) = self.onboarding_snapshot.clone() {
@@ -1234,7 +1234,9 @@ impl App {
         };
         let operation_id = self
             .onboarding_agent_operation_id
-            .get_or_insert_with(|| Self::onboarding_agent_operation_id_for_run(snapshot.run_id))
+            .get_or_insert_with(|| {
+                Self::onboarding_agent_operation_id_for_attempt(snapshot.attempt_id)
+            })
             .clone();
         if self
             .onboarding_shell
@@ -1360,7 +1362,9 @@ impl App {
         let pending_request_id = request_id.clone();
         let operation_id = self
             .onboarding_agent_operation_id
-            .get_or_insert_with(|| Self::onboarding_agent_operation_id_for_run(snapshot.run_id))
+            .get_or_insert_with(|| {
+                Self::onboarding_agent_operation_id_for_attempt(snapshot.attempt_id)
+            })
             .clone();
         let (validate_only, package, replace_key, rpc_operation_id) = match action {
             AgentAuthoringAction::PreviewPackage(package) => (

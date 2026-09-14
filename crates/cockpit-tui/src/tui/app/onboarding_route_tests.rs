@@ -25,26 +25,6 @@ fn snapshot_for_named_wizard(wizard_id: &str) -> cockpit_proto::OnboardingBootst
 
 #[test]
 fn named_setup_wizard_table_is_exhaustive() {
-    use std::collections::BTreeSet;
-
-    let ids = BTreeSet::from_iter(cockpit_core::wizard::named_setup_wizard_ids());
-    let expected = [
-        cockpit_core::wizard::PROVIDER_WIZARD_ID,
-        cockpit_core::wizard::SECURITY_WIZARD_ID,
-        cockpit_core::wizard::MODEL_WIZARD_ID,
-        cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID,
-        cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
-        cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
-        cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID,
-    ];
-    assert_eq!(ids.len(), expected.len());
-    for wizard_id in expected {
-        assert!(
-            ids.contains(wizard_id),
-            "named setup wizard table must include `{wizard_id}`"
-        );
-    }
-
     let startup = include_str!("startup_layout.rs");
     let open_setup = startup
         .split("pub(super) fn open_onboarding_setup")
@@ -54,17 +34,7 @@ fn named_setup_wizard_table_is_exhaustive() {
                 .next()
         })
         .expect("open_onboarding_setup");
-    for wizard_id in &ids {
-        let constant = match *wizard_id {
-            cockpit_core::wizard::PROVIDER_WIZARD_ID => "PROVIDER_WIZARD_ID",
-            cockpit_core::wizard::SECURITY_WIZARD_ID => "SECURITY_WIZARD_ID",
-            cockpit_core::wizard::MODEL_WIZARD_ID => "MODEL_WIZARD_ID",
-            cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID => "ONBOARDING_MODEL_WIZARD_ID",
-            cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID => "ONBOARDING_PROFILE_WIZARD_ID",
-            cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID => "ONBOARDING_LIFETIME_WIZARD_ID",
-            cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID => "ONBOARDING_AGENT_WIZARD_ID",
-            other => panic!("unexpected wizard id `{other}`"),
-        };
+    for (wizard_id, constant) in cockpit_core::wizard::named_setup_wizard_const_names() {
         assert!(
             open_setup.contains(&format!("Some(cockpit_core::wizard::{constant})")),
             "open_onboarding_setup must handle `{wizard_id}`"

@@ -18,13 +18,48 @@ pub use apply::{
     security_config_path,
 };
 
-pub const PROVIDER_WIZARD_ID: &str = "provider";
-pub const SECURITY_WIZARD_ID: &str = "security";
-pub const MODEL_WIZARD_ID: &str = "model";
-pub const ONBOARDING_MODEL_WIZARD_ID: &str = "onboarding-model";
-pub const ONBOARDING_PROFILE_WIZARD_ID: &str = "onboarding-profile";
-pub const ONBOARDING_AGENT_WIZARD_ID: &str = "onboarding-agent";
-pub const ONBOARDING_LIFETIME_WIZARD_ID: &str = "onboarding-lifetime";
+macro_rules! named_setup_wizard_rows {
+    ($(
+        $const:ident = $id:literal,
+        stage: $stage:expr,
+        complete: $allows_complete:literal
+    ),* $(,)?) => {
+        $(pub const $const: &str = $id;)*
+        const NAMED_SETUP_WIZARD_TABLE: &[(
+            &str,
+            Option<cockpit_proto::OnboardingStage>,
+            bool,
+        )] = &[$(($const, $stage, $allows_complete)),*];
+        /// `(wizard id, `stringify!` of the owning `*_WIZARD_ID` constant)`.
+        pub fn named_setup_wizard_const_names() -> &'static [(&'static str, &'static str)] {
+            &[$(($const, stringify!($const))),*]
+        }
+    };
+}
+
+named_setup_wizard_rows! {
+    PROVIDER_WIZARD_ID = "provider",
+    stage: None,
+    complete: true,
+    SECURITY_WIZARD_ID = "security",
+    stage: None,
+    complete: true,
+    MODEL_WIZARD_ID = "model",
+    stage: None,
+    complete: true,
+    ONBOARDING_MODEL_WIZARD_ID = "onboarding-model",
+    stage: Some(cockpit_proto::OnboardingStage::Model),
+    complete: false,
+    ONBOARDING_PROFILE_WIZARD_ID = "onboarding-profile",
+    stage: Some(cockpit_proto::OnboardingStage::Profile),
+    complete: false,
+    ONBOARDING_LIFETIME_WIZARD_ID = "onboarding-lifetime",
+    stage: Some(cockpit_proto::OnboardingStage::Lifetime),
+    complete: false,
+    ONBOARDING_AGENT_WIZARD_ID = "onboarding-agent",
+    stage: Some(cockpit_proto::OnboardingStage::Agent),
+    complete: false,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectOption {
@@ -570,35 +605,6 @@ pub fn registry() -> Vec<WizardDescriptor> {
         model_descriptor_for_config(&crate::config::providers::ProvidersConfig::default()),
     ]
 }
-
-/// Every named wizard id accepted by `cockpit setup <wizard>` and `/setup
-/// <wizard>`. The route-inventory test fails when a new id is added without a
-/// shell adapter row.
-const NAMED_SETUP_WIZARD_TABLE: &[(&str, Option<cockpit_proto::OnboardingStage>, bool)] = &[
-    (PROVIDER_WIZARD_ID, None, true),
-    (SECURITY_WIZARD_ID, None, true),
-    (MODEL_WIZARD_ID, None, true),
-    (
-        ONBOARDING_MODEL_WIZARD_ID,
-        Some(cockpit_proto::OnboardingStage::Model),
-        false,
-    ),
-    (
-        ONBOARDING_PROFILE_WIZARD_ID,
-        Some(cockpit_proto::OnboardingStage::Profile),
-        false,
-    ),
-    (
-        ONBOARDING_LIFETIME_WIZARD_ID,
-        Some(cockpit_proto::OnboardingStage::Lifetime),
-        false,
-    ),
-    (
-        ONBOARDING_AGENT_WIZARD_ID,
-        Some(cockpit_proto::OnboardingStage::Agent),
-        false,
-    ),
-];
 
 pub fn named_setup_wizard_ids() -> Vec<&'static str> {
     NAMED_SETUP_WIZARD_TABLE
@@ -2405,6 +2411,17 @@ fn provider_after_save_branch(run: &WizardRun, _: &WizardAnswer) -> Option<&'sta
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn named_setup_wizard_inventory_ratchet_matches_table() {
+        use std::collections::BTreeSet;
+
+        let ids = BTreeSet::from_iter(named_setup_wizard_ids());
+        let const_names =
+            BTreeSet::from_iter(named_setup_wizard_const_names().iter().map(|(id, _)| *id));
+        assert_eq!(ids, const_names);
+        assert_eq!(ids.len(), named_setup_wizard_const_names().len());
+    }
+
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;

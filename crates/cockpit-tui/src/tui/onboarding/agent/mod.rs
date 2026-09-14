@@ -259,6 +259,10 @@ impl AgentAuthoringScreen {
         if self.draft.default_route_index >= count && count > 0 {
             self.draft.default_route_index = 0;
         }
+        cockpit_core::authoring_draft::reconcile_route_grant_default(
+            &self.draft.route_grants,
+            &mut self.draft.default_route_index,
+        );
         if let Some(child) = self.editing_child.as_mut() {
             Self::resize_child_route_state(child, count);
         }
@@ -272,6 +276,10 @@ impl AgentAuthoringScreen {
         if child.default_route_index >= count && count > 0 {
             child.default_route_index = 0;
         }
+        cockpit_core::authoring_draft::reconcile_route_grant_default(
+            &child.route_grants,
+            &mut child.default_route_index,
+        );
     }
 
     fn editing_root(&self) -> bool {
@@ -517,7 +525,7 @@ impl AgentAuthoringScreen {
             }
             Phase::ModelGrants => {
                 let cursor = self.cursor;
-                toggle_route_grant(
+                cockpit_core::authoring_draft::toggle_route_grant_draft(
                     &mut self.draft.route_grants,
                     cursor,
                     &mut self.draft.default_route_index,
@@ -526,7 +534,7 @@ impl AgentAuthoringScreen {
             Phase::SubagentEdit(SubagentPhase::ModelGrants) => {
                 let cursor = self.cursor;
                 if let Some(child) = self.current_child_mut() {
-                    toggle_route_grant(
+                    cockpit_core::authoring_draft::toggle_route_grant_draft(
                         &mut child.route_grants,
                         cursor,
                         &mut child.default_route_index,
@@ -1468,24 +1476,6 @@ fn opt_line(index: usize, cursor: usize, label: &str) -> Line<'static> {
 
 fn on_off(value: bool) -> &'static str {
     if value { "on" } else { "off" }
-}
-
-fn toggle_route_grant(
-    grants: &mut [RouteGrantDraft],
-    cursor: usize,
-    default_route_index: &mut usize,
-) {
-    if let Some(grant) = grants.get_mut(cursor) {
-        let was_default = cursor == *default_route_index;
-        grant.enabled = !grant.enabled;
-        if !grant.enabled && was_default {
-            if let Some(next_default) = grants.iter().position(|entry| entry.enabled) {
-                *default_route_index = next_default;
-            }
-        } else if grant.enabled && grants.iter().filter(|entry| entry.enabled).count() == 1 {
-            *default_route_index = cursor;
-        }
-    }
 }
 
 fn cycle_tool_tier(tiers: &mut std::collections::BTreeMap<String, ToolTier>, cursor: usize) {

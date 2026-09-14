@@ -122,6 +122,33 @@ fn advance_to_create(screen: &mut AgentAuthoringScreen) {
 }
 
 #[test]
+fn model_grant_toggle_replaces_disabled_default() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "op-1".into());
+    screen.handle_key(key(KeyCode::Enter));
+    assert!(matches!(screen.phase, Phase::ModelGrants));
+    screen.cursor = 1;
+    screen.handle_key(key(KeyCode::Char(' ')));
+    assert!(screen.draft.route_grants[0].enabled);
+    assert!(screen.draft.route_grants[1].enabled);
+    screen.cursor = 0;
+    screen.handle_key(key(KeyCode::Char(' ')));
+    assert!(!screen.draft.route_grants[0].enabled);
+    assert!(screen.draft.route_grants[1].enabled);
+    assert_eq!(screen.draft.default_route_index, 1);
+}
+
+#[test]
+fn model_grant_toggle_refuses_disabling_sole_enabled_default() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "op-1".into());
+    screen.handle_key(key(KeyCode::Enter));
+    assert!(matches!(screen.phase, Phase::ModelGrants));
+    screen.cursor = 0;
+    screen.handle_key(key(KeyCode::Char(' ')));
+    assert!(screen.draft.route_grants[0].enabled);
+    assert_eq!(screen.draft.default_route_index, 0);
+}
+
+#[test]
 fn default_replacement_toggle_on_create_screen() {
     let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "op-1".into());
     advance_to_create(&mut screen);

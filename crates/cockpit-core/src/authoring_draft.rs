@@ -148,6 +148,45 @@ impl AgentAuthoringDraft {
     }
 }
 
+/// Keep `default_route_index` aligned with an enabled grant when any exist.
+pub fn reconcile_route_grant_default(grants: &[RouteGrantDraft], default_route_index: &mut usize) {
+    if grants
+        .get(*default_route_index)
+        .is_some_and(|grant| grant.enabled)
+    {
+        return;
+    }
+    if let Some(index) = grants.iter().position(|grant| grant.enabled) {
+        *default_route_index = index;
+    }
+}
+
+/// Toggle the route grant at `cursor`, updating `default_route_index`.
+/// The sole remaining enabled grant cannot be disabled.
+pub fn toggle_route_grant_draft(
+    grants: &mut [RouteGrantDraft],
+    cursor: usize,
+    default_route_index: &mut usize,
+) {
+    let enabled_count = grants.iter().filter(|entry| entry.enabled).count();
+    let Some(grant) = grants.get_mut(cursor) else {
+        return;
+    };
+    if grant.enabled && enabled_count <= 1 {
+        return;
+    }
+    let was_default = cursor == *default_route_index;
+    grant.enabled = !grant.enabled;
+    if !grant.enabled && was_default {
+        if let Some(next_default) = grants.iter().position(|entry| entry.enabled) {
+            *default_route_index = next_default;
+        }
+    } else if grant.enabled && grants.iter().filter(|entry| entry.enabled).count() == 1 {
+        *default_route_index = cursor;
+    }
+    reconcile_route_grant_default(grants, default_route_index);
+}
+
 impl ChildAuthoringDraft {
     pub fn pending_trust_route_indices(&self, projection: &AgentAuthoringProjection) -> Vec<usize> {
         self.route_grants
@@ -828,5 +867,30 @@ mod tests {
         assert_eq!(package.policy_revision, "rev-test");
         assert!(package.make_default);
         assert!(package.markdown.contains("exact-b"));
+    }
+
+    #[test]
+    fn toggle_route_grant_draft_replaces_disabled_default() {
+        let mut grants = vec![
+            RouteGrantDraft { enabled: true },
+            RouteGrantDraft { enabled: true },
+        ];
+        let mut default_route_index = 0;
+        toggle_route_grant_draft(&mut grants, 0, &mut default_route_index);
+        assert!(!grants[0].enabled);
+        assert!(grants[1].enabled);
+        assert_eq!(default_route_index, 1);
+    }
+
+    #[test]
+    fn toggle_route_grant_draft_refuses_disabling_sole_enabled_grant() {
+        let mut grants = vec![
+            RouteGrantDraft { enabled: true },
+            RouteGrantDraft { enabled: false },
+        ];
+        let mut default_route_index = 0;
+        toggle_route_grant_draft(&mut grants, 0, &mut default_route_index);
+        assert!(grants[0].enabled);
+        assert_eq!(default_route_index, 0);
     }
 }

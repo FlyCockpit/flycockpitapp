@@ -108,9 +108,9 @@ pub use host_capabilities::{
 pub use launch::{LaunchBundle, LaunchInfo, RepoStatus};
 pub use onboarding::{
     ApplyOnboardingSecureIntent, ApplyOnboardingTransition, BeginOrReopenOnboarding,
-    LockedBootstrapHello, OnboardingBootstrapEvent, OnboardingBootstrapSnapshot,
-    OnboardingBootstrapState, OnboardingReceiptQuery, OnboardingReceiptStatus,
-    OnboardingSecurePlacement, OnboardingStage, OnboardingStageSettlement,
+    LockedBootstrapHello, MAX_SENSITIVE_ONBOARDING_PASSPHRASE_BYTES, OnboardingBootstrapEvent,
+    OnboardingBootstrapSnapshot, OnboardingBootstrapState, OnboardingReceiptQuery,
+    OnboardingReceiptStatus, OnboardingSecurePlacement, OnboardingStage, OnboardingStageSettlement,
     OnboardingTransitionKind, OnboardingTransitionReceipt, OnboardingTransitionResult,
     SensitiveOnboardingIntentError, SensitiveOnboardingIntentFrame,
     SensitiveOnboardingIntentResponse, SensitiveOnboardingPassphrase,
@@ -1344,19 +1344,24 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v24 adds daemon-rendered redaction coverage,
-/// input-prediction, and tag-preview projections alongside the onboarding-facing
-/// agent authoring projection and atomic authored-package apply/receipt family
-/// and v23's durable logical-conversation favorites
-/// (`SetSessionFavorite` / `SessionFavoriteApplied` and the resolved-root
-/// `SessionSummary.favorite` bit), daemon-authoritative onboarding
-/// (`BeginOrReopenOnboarding` / `ApplyOnboardingTransition` and bootstrap
-/// snapshots), first-class assistant-thread creation and durable lineage
-/// projections, the V2 tagged ingress envelope, queued-message delivery
-/// classes, local queue controls, MCP credential profiles, agent-dimensioned
-/// MCP scopes on the attached-session and daemon-owned setup inventory,
-/// bounded base64 media previews, the rolling-precompaction resume choice,
-/// and knowledge-dream completion receipts including ordered all-KB runs.
+/// Current wire schema version. v24 makes the daemon-authoritative
+/// `SetupWizardApplied.config_generation` a required field carrying the
+/// apply's post-commit published generation (wizard onboarding settlements
+/// prove stage advancement against the receipt itself, with no compatibility
+/// window for daemons predating the field), adds daemon-rendered redaction
+/// coverage, input-prediction, and tag-preview projections, and adds the
+/// onboarding-facing agent authoring projection with the atomic
+/// authored-package apply/receipt family. On top of v23's durable
+/// logical-conversation favorites (`SetSessionFavorite` /
+/// `SessionFavoriteApplied` and the resolved-root `SessionSummary.favorite`
+/// bit), daemon-authoritative onboarding (`BeginOrReopenOnboarding` /
+/// `ApplyOnboardingTransition` and bootstrap snapshots), first-class
+/// assistant-thread creation and durable lineage projections, the V2 tagged
+/// ingress envelope, queued-message delivery classes, local queue controls,
+/// MCP credential profiles, agent-dimensioned MCP scopes on the
+/// attached-session and daemon-owned setup inventory, bounded base64 media
+/// previews, the rolling-precompaction resume choice, and knowledge-dream
+/// completion receipts including ordered all-KB runs.
 pub const PROTOCOL_VERSION: u32 = 24;
 
 /// Version string the daemon advertises to clients on attach/status.

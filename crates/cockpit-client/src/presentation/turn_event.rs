@@ -68,6 +68,12 @@ pub enum TurnEvent {
     HostCapabilitiesChanged {
         snapshot: Box<cockpit_proto::HostCapabilitySnapshot>,
     },
+    /// The daemon onboarding authority advanced: this client or a concurrent
+    /// one committed a transition (or the bootstrap state changed). The
+    /// broadcast carries no state; consumers re-fetch the authoritative
+    /// bootstrap snapshot and apply it through their occupancy/correlation
+    /// gates.
+    OnboardingBootstrapChanged,
     /// Model inference started; nothing has been emitted yet. The TUI
     /// shows a "Thinking…" placeholder until the first text delta
     /// arrives. Fires once per round-trip; also fires before reasoning-

@@ -758,6 +758,16 @@ impl App {
             return false;
         }
 
+        // Header activity pills: ←/→ cycle, Enter opens the pill's
+        // authoritative surface, Esc clears. Selection is set by a pill
+        // click; any other ordinary key falls through to the composer.
+        // Internally gated on `header_chrome_interactive` — while a
+        // body-owning modal/overlay is on top (or the header did not
+        // render), keys fall through to that surface instead.
+        if self.handle_header_pill_key(&key) {
+            return false;
+        }
+
         // Escape with an active selection: clear the selection and
         // swallow the key. Ordering: ahead of dialog routing because
         // the selection lives on App-state and isn't visible to the
@@ -787,6 +797,13 @@ impl App {
                 return self.apply_workspace_trust_choice(root, mode);
             }
             return false;
+        }
+
+        // Full-screen onboarding shell: while active it owns every key —
+        // native screens handle their own input and engine stages route to
+        // the embedded settings dialog (still `self.dialog`).
+        if self.onboarding_shell.is_some() {
+            return self.handle_onboarding_shell_key(key);
         }
 
         // Answering dialog (GOALS §3b) — same modal rule. It replaces the
@@ -3261,15 +3278,30 @@ impl App {
         let cfg = self.config_snapshot.providers.clone();
         self.submit_after_model_selection = true;
         if cfg.providers.is_empty() {
-            let onboarding = self
-                .onboarding_snapshot
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.stage != cockpit_proto::OnboardingStage::Complete);
-            self.dialog = if onboarding {
-                Dialog::open_onboarding_provider_add(&self.launch.cwd, Some(status))
-            } else {
-                Dialog::open_providers_add_with_status(&self.launch.cwd, Some(status))
-            };
+            match self.onboarding_snapshot.clone() {
+                Some(snapshot) if snapshot.stage != cockpit_proto::OnboardingStage::Complete => {
+                    // Surface the full-screen shell at the authoritative
+                    // stage; the message stays in the composer.
+                    self.reopen_onboarding_shell(&snapshot);
+                }
+                Some(_) | None if self.onboarding_skip => {
+                    self.dialog =
+                        Dialog::open_providers_add_with_status(&self.launch.cwd, Some(status));
+                }
+                None => {
+                    // The post-first-paint authority fetch has not settled.
+                    // Never guess first-run completion by resurrecting the
+                    // generic settings page; preserve the draft and let the
+                    // authoritative snapshot choose the surface.
+                    self.push_plain(
+                        "Waiting for the daemon onboarding checkpoint; your draft is preserved.",
+                    );
+                }
+                Some(_) => {
+                    self.dialog =
+                        Dialog::open_providers_add_with_status(&self.launch.cwd, Some(status));
+                }
+            }
             return;
         }
         // Missing selection/configuration is recovered through `/model`, not
@@ -3783,6 +3815,19 @@ impl App {
         // is). The "which field is focused" logic stays inside each component.
         if let Some(dialog) = self.question_dialog.as_mut() {
             dialog.paste(&data);
+            return;
+        }
+        if self.onboarding_shell.is_some() {
+            // Engine stages keep the dialog's field focus; native shell
+            // screens take the paste themselves.
+            if self.onboarding_shell.as_ref().is_some_and(|shell| {
+                shell.screen_kind() == crate::tui::onboarding::OnboardingScreenKind::Engine
+            }) && self.dialog.is_active()
+            {
+                self.dialog.paste(&data);
+            } else if let Some(shell) = self.onboarding_shell.as_mut() {
+                shell.paste(&data);
+            }
             return;
         }
         if self.dialog.is_active() {
@@ -4373,7 +4418,7 @@ fn find_spec(till: bool, forward: bool) -> FindSpec {
     }
 }
 
-fn is_modifier_only(key: &KeyEvent) -> bool {
+pub(super) fn is_modifier_only(key: &KeyEvent) -> bool {
     matches!(
         key.code,
         KeyCode::Modifier(_) | KeyCode::CapsLock | KeyCode::NumLock | KeyCode::ScrollLock

@@ -230,7 +230,10 @@ const SENSITIVE_ONBOARDING_INTENT_MAGIC: &[u8; 8] = b"COBSI001";
 const SENSITIVE_ONBOARDING_RESPONSE_MAGIC: &[u8; 8] = b"COBSR001";
 const MAX_SENSITIVE_ONBOARDING_OPERATION_ID_BYTES: usize = 128;
 const MAX_SENSITIVE_ONBOARDING_CAPABILITY_BYTES: usize = 512;
-const MAX_SENSITIVE_ONBOARDING_PASSPHRASE_BYTES: usize = 64 * 1024;
+/// Wire limit for the one-shot passphrase ingress. Ingestion surfaces (the
+/// TUI secure-store screen) enforce the same cap *before* buffering so an
+/// oversized paste is rejected at ingress instead of after allocation.
+pub const MAX_SENSITIVE_ONBOARDING_PASSPHRASE_BYTES: usize = 64 * 1024;
 
 /// Decoded local-only secure-intent frame. The owner capability remains bound
 /// to the authenticated same-owner OS peer that obtained it; possession of the

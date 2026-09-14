@@ -130,6 +130,24 @@ async fn onboarding_stage_fence(
         .ok_or_else(|| bad_request("no onboarding run exists"))
 }
 
+/// Announce a committed onboarding authority change daemon-global. The event
+/// carries correlation only (run/attempt/revision/state — no config, paths,
+/// or free text, so the redactor passes it through untouched); consumers
+/// re-fetch the authoritative snapshot through their read-only refresh.
+fn broadcast_onboarding_bootstrap(
+    ctx: &DaemonContext,
+    snapshot: &proto::OnboardingBootstrapSnapshot,
+) {
+    ctx.broadcast_global(proto::Event::OnboardingBootstrap(
+        proto::OnboardingBootstrapEvent {
+            run_id: snapshot.run_id,
+            attempt_id: snapshot.attempt_id,
+            revision: snapshot.revision,
+            state: snapshot.bootstrap_state,
+        },
+    ));
+}
+
 fn validate_onboarding_settlement_checkpoint(
     settlement: &proto::OnboardingStageSettlement,
     run_id: uuid::Uuid,
@@ -327,8 +345,12 @@ async fn validate_onboarding_stage_settlement(
                     wizard_id: committed_wizard_id,
                     changed,
                     model_file_written,
+                    config_generation,
                     ..
-                } if committed_wizard_id == wizard_id && (changed || model_file_written) => {
+                } if committed_wizard_id == wizard_id
+                    && (changed || model_file_written)
+                    && config_generation == settlement.config_generation =>
+                {
                     let global =
                         cockpit_config::config::dirs::global_config_file().map_err(internal)?;
                     let providers = crate::config::providers::ConfigDoc::load(&global)
@@ -362,9 +384,11 @@ async fn validate_onboarding_stage_settlement(
                     Response::SetupWizardApplied {
                         wizard_id: committed_wizard_id,
                         changed,
+                        config_generation,
                         ..
                     } if committed_wizard_id == crate::wizard::ONBOARDING_AGENT_WIZARD_ID
-                        && changed =>
+                        && changed
+                        && config_generation == settlement.config_generation =>
                     {
                         if ctx
                             .db
@@ -6652,6 +6676,10 @@ async fn handle_serialized_request_impl(
                 .begin_or_reopen(request, capabilities)
                 .await
                 .map_err(onboarding_error)?;
+            // Every committed authority change is announced daemon-global so
+            // concurrent clients follow it through the read-only refresh; a
+            // fresh attempt supersedes their cached run/attempt/revision.
+            broadcast_onboarding_bootstrap(ctx, &snapshot);
             Ok(Response::OnboardingTransition(
                 cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
             ))
@@ -6703,6 +6731,10 @@ async fn handle_serialized_request_impl(
                     .await
                     .map_err(onboarding_error)?
             };
+            // A committed transition (settled or ordinary) changes the
+            // authority every attached client projects; announce it so they
+            // re-read instead of waiting for their own next RPC.
+            broadcast_onboarding_bootstrap(ctx, &snapshot);
             Ok(Response::OnboardingTransition(
                 cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
             ))
@@ -18823,13 +18855,27 @@ async fn handle_serialized_request_impl(
                     )
                     .await
                     .map_err(internal)?;
+                    // The publication is durable and still inside the
+                    // daemon-wide publication gate: publish the config
+                    // generation the wizard settlement fence proves against.
+                    // A compensated apply never reaches this line, so the
+                    // counter never advances for a rolled-back plan.
+                    let config_generation = inventory::publish_committed_config_generation();
                     return Ok(Response::SetupWizardApplied {
                         wizard_id: wizard_id.clone(),
                         changed: true,
                         model_file_written: true,
                         default_scope: Some("global".into()),
+                        config_generation,
                     });
                 }
+                // Every generic wizard apply is a config publication: it
+                // shares the daemon-wide serialization gate with provider
+                // mutations so a wizard write cannot interleave with a
+                // concurrent provider CAS, and its receipt carries the
+                // post-apply published generation the onboarding settlement
+                // fence requires.
+                let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
                 let result = crate::wizard::apply_setup_wizard_answers_authoritative(
                     std::path::Path::new(&project_root),
                     &wizard_id,
@@ -18837,11 +18883,21 @@ async fn handle_serialized_request_impl(
                 )
                 .await
                 .map_err(internal)?;
+                // Publish only when the apply durably changed config: a
+                // no-op receipt keeps the current generation, and the
+                // settlement fence then correctly refuses to advance a
+                // stage on an apply that committed nothing.
+                let config_generation = if result.0 || result.1 {
+                    inventory::publish_committed_config_generation()
+                } else {
+                    inventory::current_config_generation()
+                };
                 Ok(Response::SetupWizardApplied {
                     wizard_id: wizard_id.clone(),
                     changed: result.0,
                     model_file_written: result.1,
                     default_scope: result.2,
+                    config_generation,
                 })
             };
             match mutation.await {

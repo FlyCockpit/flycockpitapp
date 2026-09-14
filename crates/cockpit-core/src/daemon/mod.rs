@@ -1888,7 +1888,7 @@ fn spawn_owned_in_process_daemon(
                                 {
                                     return Ok(());
                                 }
-                                loop {
+                                let ctx = loop {
                                     tokio::select! {
                                         _ = &mut shutdown_request => return Ok(()),
                                         changed = ready.changed() => {
@@ -1898,7 +1898,14 @@ fn spawn_owned_in_process_daemon(
                                             }
                                         }
                                     }
-                                }
+                                };
+                                // The locked bootstrap handed off to its
+                                // ready context: publish it through the
+                                // in-process registry so discover/connect
+                                // reconnects observe the running daemon
+                                // instead of re-entering a spawn path.
+                                let _ = server::register_in_process_context(ctx.clone());
+                                ctx
                             }
                         };
                         #[cfg(not(test))]
@@ -1968,20 +1975,24 @@ pub(crate) async fn boot_in_process(
 #[cfg(any(test, feature = "test-support"))]
 #[must_use]
 pub struct TestPersistentDaemon {
-    ctx: std::sync::Arc<server::DaemonContext>,
+    /// The ready context once this daemon completed its ready construction.
+    /// A production-first-run daemon still awaiting its secure-store choice
+    /// owns no ready context; its locked endpoint registration is the
+    /// connection point until the vault materializes.
+    ctx: Option<std::sync::Arc<server::DaemonContext>>,
     _owner: Option<InProcessDaemonGuard>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl TestPersistentDaemon {
-    pub fn context(&self) -> &std::sync::Arc<server::DaemonContext> {
-        &self.ctx
+    pub fn context(&self) -> Option<&std::sync::Arc<server::DaemonContext>> {
+        self.ctx.as_ref()
     }
 }
 
 #[cfg(any(test, feature = "test-support"))]
 struct TestPersistentBootReady {
-    ctx: std::sync::Arc<server::DaemonContext>,
+    ctx: Option<std::sync::Arc<server::DaemonContext>>,
     force: shutdown::ShutdownSignal,
 }
 
@@ -2029,7 +2040,7 @@ fn spawn_owned_test_persistent_daemon(
                             let _endpoint = server::register_in_process_context(ctx.clone());
                             Ok::<_, anyhow::Error>(TestPersistentBootReady {
                                 force: ctx.shutdown_signal().clone(),
-                                ctx,
+                                ctx: Some(ctx),
                             })
                         }
                         .await;
@@ -2047,10 +2058,16 @@ fn spawn_owned_test_persistent_daemon(
                             }))
                             .is_err()
                         {
-                            return shutdown_in_process_context(ready.ctx, Vec::new()).await;
+                            let ctx = ready
+                                .ctx
+                                .expect("the fixed-config shortcut always boots ready");
+                            return shutdown_in_process_context(ctx, Vec::new()).await;
                         }
                         let _ = shutdown_request.await;
-                        shutdown_in_process_context(ready.ctx, Vec::new()).await
+                        let ctx = ready
+                            .ctx
+                            .expect("the fixed-config shortcut always boots ready");
+                        shutdown_in_process_context(ctx, Vec::new()).await
                     })
                 });
             let _ = completion.send(result);
@@ -2074,7 +2091,10 @@ async fn boot_test_persistent_daemon_with_source(
 ) -> Result<TestPersistentDaemon> {
     let paths = DaemonPaths::resolve_canonical()?;
     if let Some(ctx) = server::in_process_context(&paths.socket) {
-        return Ok(TestPersistentDaemon { ctx, _owner: None });
+        return Ok(TestPersistentDaemon {
+            ctx: Some(ctx),
+            _owner: None,
+        });
     }
     let (boot, shutdown, completion, supervisor) =
         spawn_owned_test_persistent_daemon(paths, source)?;
@@ -2096,6 +2116,171 @@ async fn boot_test_persistent_daemon_with_source(
     })
 }
 
+/// Boot an in-process test daemon that reproduces the production first-run
+/// chain instead of shortcutting to a ready context: the real default
+/// database under the isolated home, the production layered config source,
+/// and — while no vault authority exists — the locked bootstrap allowlist.
+/// The secure-store intent materializes a real vault through the locked
+/// admission path and hands the owner off to its ready context, exactly like
+/// a fresh install. Real-daemon onboarding tests use this so the RPCs that
+/// must commit before any vault exists (the sensitive secure-store intent
+/// and the locked-scoped onboarding profile settlement) have a daemon on
+/// which they are committable; tests that merely need an immediately-ready
+/// daemon keep
+/// [`enable_in_process_auto_promote_with_production_config`].
+#[cfg(any(test, feature = "test-support"))]
+async fn boot_production_first_run_test_persistent_daemon() -> Result<TestPersistentDaemon> {
+    let paths = DaemonPaths::resolve_canonical()?;
+    if let Some(ctx) = server::in_process_context(&paths.socket) {
+        return Ok(TestPersistentDaemon {
+            ctx: Some(ctx),
+            _owner: None,
+        });
+    }
+    if server::registered_in_process_endpoint(&paths.socket).is_some() {
+        // A daemon this fixture already booted is registered at the canonical
+        // socket — either still locked or already ready. Reconnect to it
+        // rather than booting a second owner over the same home.
+        return Ok(TestPersistentDaemon {
+            ctx: None,
+            _owner: None,
+        });
+    }
+    let (boot, shutdown, completion, supervisor) =
+        spawn_owned_production_first_run_test_daemon(paths.clone())?;
+    let mut pending = PendingInProcessBoot {
+        shutdown: Some(shutdown),
+        supervisor: Some(supervisor),
+    };
+    let ready = boot
+        .await
+        .context("in-process production first-run daemon owner stopped during boot")??;
+    Ok(TestPersistentDaemon {
+        ctx: ready.ctx,
+        _owner: Some(InProcessDaemonGuard {
+            shutdown: pending.shutdown.take(),
+            force: ready.force,
+            completion: Some(completion),
+            supervisor: pending.supervisor.take(),
+        }),
+    })
+}
+
+/// Owner-thread boot for [`boot_production_first_run_test_persistent_daemon`]:
+/// `server::boot` against the real default database, a locked in-process
+/// registration while no vault authority exists, and the ready-context
+/// registration once the secure-store intent materializes the vault.
+#[cfg(any(test, feature = "test-support"))]
+fn spawn_owned_production_first_run_test_daemon(
+    paths: DaemonPaths,
+) -> Result<(
+    tokio::sync::oneshot::Receiver<Result<TestPersistentBootReady>>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<Result<()>>,
+    std::thread::JoinHandle<()>,
+)> {
+    let (booted, boot) = tokio::sync::oneshot::channel();
+    let (shutdown, mut shutdown_request) = tokio::sync::oneshot::channel();
+    let (completion, completed) = tokio::sync::oneshot::channel();
+    let supervisor = std::thread::Builder::new()
+        .name("cockpit-test-production-first-run-daemon".to_string())
+        // The production boot builds the full SQLite schema and, once the
+        // secure-store intent lands, the entire ready service graph on this
+        // same thread; keep the isolated owner independent of the host test
+        // thread's comparatively small default stack.
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("building production first-run test daemon runtime")
+                .and_then(|runtime| {
+                    runtime.block_on(async move {
+                        let services =
+                            match server::boot(paths.clone(), terminal::default_host_factory())
+                                .await
+                            {
+                                Ok(services) => services,
+                                Err(error) => {
+                                    let _ = booted.send(Err(anyhow::anyhow!("{error:#}")));
+                                    return Ok(());
+                                }
+                            };
+                        match services {
+                            server::BootServices::Ready(ready) => {
+                                let ctx = std::sync::Arc::new(ready.context);
+                                let _endpoint = server::register_in_process_context(ctx.clone());
+                                let force = ctx.shutdown_signal().clone();
+                                if booted
+                                    .send(Ok(TestPersistentBootReady {
+                                        ctx: Some(ctx.clone()),
+                                        force,
+                                    }))
+                                    .is_err()
+                                {
+                                    let result = shutdown_in_process_context(ctx, Vec::new()).await;
+                                    server::unregister_in_process_context(&paths.socket);
+                                    return result;
+                                }
+                                let _ = shutdown_request.await;
+                                let result = shutdown_in_process_context(ctx, Vec::new()).await;
+                                server::unregister_in_process_context(&paths.socket);
+                                result
+                            }
+                            server::BootServices::Locked(locked) => {
+                                let (endpoint, mut ready) =
+                                    server::locked_in_process_endpoint(std::sync::Arc::new(locked));
+                                server::register_locked_in_process_context(&paths.socket, endpoint);
+                                let force = shutdown::ShutdownSignal::new();
+                                if booted
+                                    .send(Ok(TestPersistentBootReady {
+                                        ctx: None,
+                                        force: force.clone(),
+                                    }))
+                                    .is_err()
+                                {
+                                    server::unregister_in_process_context(&paths.socket);
+                                    return Ok(());
+                                }
+                                let ctx = loop {
+                                    tokio::select! {
+                                        _ = &mut shutdown_request => {
+                                            // Still locked: no ready context
+                                            // was constructed, so teardown is
+                                            // only the registration retire.
+                                            server::unregister_in_process_context(&paths.socket);
+                                            return Ok(());
+                                        }
+                                        changed = ready.changed() => {
+                                            changed.context(
+                                                "locked in-process ready authority stopped",
+                                            )?;
+                                            if let Some(ctx) = ready.borrow_and_update().clone() {
+                                                break ctx;
+                                            }
+                                        }
+                                    }
+                                };
+                                // The secure-store intent materialized the
+                                // vault and published the ready context:
+                                // replace the locked registration so
+                                // discovery observes a running daemon from
+                                // now on.
+                                let _ = server::register_in_process_context(ctx.clone());
+                                let _ = shutdown_request.await;
+                                let result = shutdown_in_process_context(ctx, Vec::new()).await;
+                                server::unregister_in_process_context(&paths.socket);
+                                result
+                            }
+                        }
+                    })
+                });
+            let _ = completion.send(result);
+        })
+        .context("spawning production first-run test daemon owner thread")?;
+    Ok((boot, shutdown, completed, supervisor))
+}
+
 /// Test seam for first-run persistent promotion.
 /// boots an in-process canonical daemon instead of spawning a child.
 #[cfg(any(test, feature = "test-support"))]
@@ -2104,6 +2289,10 @@ static IN_PROCESS_AUTO_PROMOTE: std::sync::atomic::AtomicBool =
 
 #[cfg(any(test, feature = "test-support"))]
 static IN_PROCESS_AUTO_PROMOTE_PRODUCTION_CONFIG: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(test, feature = "test-support"))]
+static IN_PROCESS_AUTO_PROMOTE_PRODUCTION_FIRST_RUN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(any(test, feature = "test-support"))]
@@ -2118,6 +2307,8 @@ impl Drop for InProcessAutoPromoteGuard {
     fn drop(&mut self) {
         IN_PROCESS_AUTO_PROMOTE.store(false, std::sync::atomic::Ordering::SeqCst);
         IN_PROCESS_AUTO_PROMOTE_PRODUCTION_CONFIG.store(false, std::sync::atomic::Ordering::SeqCst);
+        IN_PROCESS_AUTO_PROMOTE_PRODUCTION_FIRST_RUN
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         *AUTO_PROMOTED_DAEMON
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
@@ -2141,6 +2332,20 @@ pub fn enable_in_process_auto_promote_with_production_config() -> InProcessAutoP
     InProcessAutoPromoteGuard
 }
 
+/// Test seam equivalent to [`enable_in_process_auto_promote`] whose daemon
+/// boots the production first-run chain: the real default database, the
+/// locked bootstrap allowlist while no vault authority exists, and the ready
+/// handoff when the secure-store intent materializes the vault. Real-daemon
+/// onboarding tests must use this — on an immediately-ready daemon every
+/// construction path has already committed a vault authority, so the
+/// secure-store intent is uncommittable there by design.
+#[cfg(any(test, feature = "test-support"))]
+pub fn enable_in_process_auto_promote_production_first_run() -> InProcessAutoPromoteGuard {
+    IN_PROCESS_AUTO_PROMOTE_PRODUCTION_FIRST_RUN.store(true, std::sync::atomic::Ordering::SeqCst);
+    IN_PROCESS_AUTO_PROMOTE.store(true, std::sync::atomic::Ordering::SeqCst);
+    InProcessAutoPromoteGuard
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn in_process_auto_promote_enabled() -> bool {
     IN_PROCESS_AUTO_PROMOTE.load(std::sync::atomic::Ordering::SeqCst)
@@ -2148,15 +2353,28 @@ pub(crate) fn in_process_auto_promote_enabled() -> bool {
 
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn auto_promote_in_process_persistent() -> Result<u32> {
-    let ctx = if IN_PROCESS_AUTO_PROMOTE_PRODUCTION_CONFIG.load(std::sync::atomic::Ordering::SeqCst)
+    let daemon = if IN_PROCESS_AUTO_PROMOTE_PRODUCTION_FIRST_RUN
+        .load(std::sync::atomic::Ordering::SeqCst)
     {
+        let booted = boot_production_first_run_test_persistent_daemon().await?;
+        booted
+    } else if IN_PROCESS_AUTO_PROMOTE_PRODUCTION_CONFIG.load(std::sync::atomic::Ordering::SeqCst) {
         boot_test_persistent_daemon_with_source(config_source::ConfigSource::production()).await?
     } else {
         boot_test_persistent_daemon().await?
     };
-    *AUTO_PROMOTED_DAEMON
+    // Only the first promotion owns the daemon. While a production
+    // first-run daemon is still locked, discovery cannot see a ready
+    // context, so every lifecycle resolution re-enters this seam and
+    // reconnects to the registered endpoint; replacing the stored owner
+    // with one of those non-owner handles would drop the real owner guard
+    // and tear the daemon down mid-bootstrap.
+    let mut promoted = AUTO_PROMOTED_DAEMON
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ctx);
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if promoted.is_none() {
+        *promoted = Some(daemon);
+    }
     Ok(std::process::id())
 }
 

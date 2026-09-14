@@ -17,6 +17,9 @@ mod attach_lifecycle;
 mod attention;
 mod blocking_operations;
 mod btw_pane;
+mod chat_header;
+#[cfg(test)]
+mod chat_header_tests;
 mod config_reload;
 mod copy_actions;
 mod events;
@@ -213,6 +216,8 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 mod auth_failure_recovery_tests;
 #[cfg(test)]
 mod control_request_tests;
+#[cfg(test)]
+mod first_run_daemon_tests;
 #[cfg(test)]
 mod first_run_tests;
 
@@ -698,11 +703,8 @@ impl App {
             }
             self.apply_onboarding_bootstrap_snapshot(startup.snapshot);
             self.start_post_trust_cleanup();
-        } else {
-            if pending.mode == cockpit_config::WorkspaceTrustMode::Trust {
-                self.resync_config_after_local_write();
-            }
-            self.maybe_open_add_provider_wizard();
+        } else if pending.mode == cockpit_config::WorkspaceTrustMode::Trust {
+            self.resync_config_after_local_write();
         }
     }
 }
@@ -2522,6 +2524,16 @@ pub struct App {
     pub(super) config_drift: Option<ConfigDriftState>,
     /// Root primary plus active interactive subagent path for footer chrome.
     pub(super) agent_path: Vec<String>,
+    /// Header activity pill selected (by mouse click or ←/→ while a pill is
+    /// selected); Enter activates its authoritative surface, Esc clears.
+    pub(super) header_pill_selection: Option<crate::tui::chat_header::HeaderPillKind>,
+    /// Planned three-row chat-header layout recorded by the last render.
+    /// `None` when the header did not render this frame.
+    pub(super) chat_header_layout: Option<crate::tui::chat_header::ChatHeaderLayout>,
+    /// Whether the collapsed-pill `more` popover is open.
+    pub(super) chat_header_more_open: bool,
+    /// Absolute rect of the open `more` popover (for outside-click close).
+    pub(super) chat_header_more_rect: Option<ratatui::layout::Rect>,
     /// Footer control selected by mouse; arrow/enter keys operate on it until
     /// Esc or ordinary typing clears it.
     pub(super) footer_selection: Option<crate::tui::chrome::FooterControl>,
@@ -2822,11 +2834,18 @@ pub struct App {
     pub(super) connector_disclosure: Option<cockpit_proto::ConnectorDisclosure>,
     has_no_providers_at_startup: bool,
     onboarding_snapshot: Option<cockpit_proto::OnboardingBootstrapSnapshot>,
-    /// Presentation-only completion choice. Durable stage ownership remains
-    /// exclusively in `onboarding_snapshot`; this flag never acts as a reducer.
-    onboarding_completion_visible: bool,
+    /// Full-screen onboarding shell. `None` unless the daemon snapshot says
+    /// an onboarding run is in flight; the shell is the only onboarding
+    /// renderer and the snapshot is its exclusive stage authority.
+    pub(super) onboarding_shell: Option<Box<crate::tui::onboarding::OnboardingShell>>,
     onboarding_skip: bool,
     onboarding_force: bool,
+    /// Occupancy fence: the user explicitly closed the shell (Cancel /
+    /// completion exit). Late authority results and concurrent-client
+    /// broadcasts still update [`Self::onboarding_snapshot`] but must not
+    /// reopen the surface; only explicit re-entry (the no-provider send
+    /// guard) clears the flag.
+    pub(super) onboarding_dismissed: bool,
     /// An open `/side` side conversation, or `None` in the main session. While
     /// `Some`, the TUI is bound to an ephemeral throwaway fork: the chrome
     /// shows the side indicator with `/side end` guidance, and the fork is
@@ -4044,6 +4063,10 @@ impl App {
             cache_cold: true,
             config_drift: None,
             agent_path: initial_agent_path,
+            header_pill_selection: None,
+            chat_header_layout: None,
+            chat_header_more_open: false,
+            chat_header_more_rect: None,
             footer_selection: None,
             hovered_footer_control: None,
             footer_hit_areas: Vec::new(),
@@ -4159,9 +4182,10 @@ impl App {
             connector_disclosure,
             has_no_providers_at_startup,
             onboarding_snapshot: None,
-            onboarding_completion_visible: false,
+            onboarding_shell: None,
             onboarding_skip: false,
             onboarding_force: false,
+            onboarding_dismissed: false,
             side_conversation: None,
             daemon_draining: false,
             predict_setting,
@@ -4556,7 +4580,11 @@ impl App {
         changed |= self.tick_ctrl_c_window();
         changed |= self.check_pending_link_activation();
         changed |= self.dialog.tick();
-        changed |= self.service_first_run_flow();
+        changed |= self
+            .onboarding_shell
+            .as_mut()
+            .is_some_and(|shell| shell.tick());
+        changed |= self.service_onboarding_shell();
         // Auto-close the embedded pane when its child has exited
         // (GOALS §1i — e.g. `:q`).
         self.service_pane();

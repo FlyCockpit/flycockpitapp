@@ -57,6 +57,55 @@ impl App {
         {
             self.toast = None;
         }
+        // The header `more` popover closes on any left press outside its
+        // rect and outside the header rows that own it — regardless of what
+        // the press then hits. This must run BEFORE every owner that may
+        // consume the press and return (the rail, registered buttons, the
+        // settings pointer, pickers): a press on any of those is still an
+        // outside press for this floating chrome. The press itself keeps
+        // routing to whatever it hit; presses inside the popover (its rows
+        // are registered buttons) and inside the header are exempt.
+        if self.mouse_capture && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.close_chat_header_popover_on_outside_press(mouse.column, mouse.row);
+        }
+        // The full-screen onboarding shell owns the whole screen while
+        // active: its native surfaces consume their events, engine screens
+        // route pointer input to the embedded settings dialog, and nothing
+        // underneath (chat rows, links, footer) reacts.
+        if self.startup_modal_on_top() != Some(StartupModal::WorkspaceTrust)
+            && self.onboarding_shell.is_some()
+        {
+            let outcome = self
+                .onboarding_shell
+                .as_mut()
+                .expect("shell presence checked above")
+                .handle_mouse(mouse);
+            if outcome.consumed {
+                self.apply_onboarding_shell_action(outcome.action);
+                return;
+            }
+            let engine_screen = self.onboarding_shell.as_ref().is_some_and(|shell| {
+                shell.screen_kind() == crate::tui::onboarding::OnboardingScreenKind::Engine
+            });
+            if engine_screen {
+                self.hovered_suggestion = None;
+                self.hovered_control_chip = None;
+                self.hovered_affordance = None;
+                self.hovered_footer_control = None;
+                if matches!(mouse.kind, MouseEventKind::Moved) && !self.mouse_capture {
+                    return;
+                }
+                let _ = self.dialog.handle_settings_pointer(mouse);
+                // Pointer input can navigate the engine off its Add page
+                // (its own Done/Back affordances); apply the same abandon
+                // reconciliation the keyboard path runs so both input
+                // paths share one state machine.
+                if let Some(shell) = self.onboarding_shell.as_mut() {
+                    shell.reconcile_provider_engine(&self.dialog);
+                }
+            }
+            return;
+        }
         // The keys overlay is visually topmost and therefore owns pointer
         // input before links or settings targets underneath it.
         if let Some(overlay) = self.keys_overlay.as_mut() {
@@ -723,6 +772,14 @@ impl App {
                         crate::tui::chrome::FooterControl::Model => self.open_model_picker(),
                     }
                 }
+            }
+            crate::tui::button::ButtonDispatch::HeaderPill(kind) => {
+                self.cancel_mouse_gesture(self.event_loop_monotonic_now);
+                self.activate_header_pill(kind);
+            }
+            crate::tui::button::ButtonDispatch::HeaderMore => {
+                self.cancel_mouse_gesture(self.event_loop_monotonic_now);
+                self.toggle_chat_header_more();
             }
             crate::tui::button::ButtonDispatch::PersistentNoticeCopy => {
                 self.copy_persistent_notice_fix_command();

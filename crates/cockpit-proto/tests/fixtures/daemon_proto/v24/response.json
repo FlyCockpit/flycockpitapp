@@ -2243,7 +2243,8 @@
       "wizard_id": "model",
       "changed": true,
       "model_file_written": false,
-      "default_scope": null
+      "default_scope": null,
+      "config_generation": 9
     },
     "response": "setup_wizard_applied"
   },

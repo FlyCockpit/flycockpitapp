@@ -1343,7 +1343,7 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v24 makes the daemon-authoritative
+/// Current wire schema version. Launch v1 includes the daemon-authoritative
 /// `SetupWizardApplied.config_generation` a required field carrying the
 /// apply's post-commit published generation (wizard onboarding settlements
 /// prove stage advancement against the receipt itself, with no compatibility
@@ -7434,7 +7434,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v10_request_is_rejected_after_the_current_only_v24_cutover() {
+    async fn v10_request_is_rejected_after_the_current_only_v1_cutover() {
         let (a, b) = duplex(4096);
         let mut sender = ProtoStream::with_version(a, 10);
         let mut receiver = ProtoStream::with_version(b, 10);
@@ -7531,7 +7531,7 @@ mod tests {
                 "current v1 {response_name} must freeze the inclusive verification cap"
             );
             serde_json::from_value::<Response>(response.clone()).unwrap_or_else(|error| {
-                panic!("current v24 {response_name} must deserialize: {error}")
+                panic!("current v1 {response_name} must deserialize: {error}")
             });
         }
     }
@@ -7544,13 +7544,13 @@ mod tests {
                 serde_json::from_value(fixture[response_name]["data"]["assistant"].clone())
                     .unwrap();
             validate_assistant_summary(&summary).unwrap_or_else(|error| {
-                panic!("current v24 {response_name} assistant identity is invalid: {error}")
+                panic!("current v1 {response_name} assistant identity is invalid: {error}")
             });
         }
         let summary: AssistantSummary =
             serde_json::from_value(fixture["assistants"]["data"]["assistants"][0].clone()).unwrap();
         validate_assistant_summary(&summary)
-            .expect("current v24 assistant inventory must carry bounded opaque revisions");
+            .expect("current v1 assistant inventory must carry bounded opaque revisions");
         assert_eq!(fixture["assistants"]["data"]["config_generation"], 7);
         assert_eq!(
             fixture["agent_inventory"]["data"]["config_generation"],
@@ -7636,7 +7636,7 @@ mod tests {
         ] {
             assert!(
                 mcp[field].is_string(),
-                "current v24 MCP CAS fixture must carry {field}"
+                "current v1 MCP CAS fixture must carry {field}"
             );
         }
         assert_eq!(mcp["expected_revision"].as_str().map(str::len), Some(64));
@@ -7686,7 +7686,7 @@ mod tests {
         ] {
             assert!(
                 requests[tag]["params"]["client_operation_id"].is_string(),
-                "current v24 fixture must carry an operation id for {tag}"
+                "current v1 fixture must carry an operation id for {tag}"
             );
         }
         let responses = proto_fixture_files::read_fixture("response.json");

@@ -1,5 +1,8 @@
 import { z } from "zod";
 
+/** JSON-number projection of Rust `u64`; unsafe integers cannot round-trip exactly in JS. */
+const safeU64NumberSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+
 export const agentAuthoringDtoVersionSchema = z.literal(1);
 
 export const agentAuthoringCatalogOriginSchema = z.enum(["bundled", "cached", "live"]);
@@ -40,7 +43,7 @@ export const agentPolicyRouteSchema = z
     model_id: z.string(),
     trust: agentPolicyTrustClassificationSchema,
     confirmation_required: z.boolean(),
-    trust_is_shared: z.literal(true),
+    trust_is_shared: z.boolean(),
     capabilities: z.array(z.string()),
     location: z.string().optional(),
     auto_prune: z.boolean(),
@@ -51,7 +54,7 @@ export const agentPolicyRouteSchema = z
 
 export const agentPolicySnapshotSchema = z
   .object({
-    policy_revision: z.string().min(1),
+    policy_revision: z.string(),
     routes: z.array(agentPolicyRouteSchema),
     catalog_origin: agentAuthoringCatalogOriginSchema,
     catalog_revision: z.string(),
@@ -82,7 +85,7 @@ export const agentAuthoringProjectionSchema = z
     dto_version: agentAuthoringDtoVersionSchema,
     policy: agentPolicySnapshotSchema,
     sources: z.array(agentAuthoringSourceSchema),
-    review_trust_disclosure: z.string().min(1),
+    review_trust_disclosure: z.string(),
   })
   .strict();
 export type AgentAuthoringProjection = z.infer<typeof agentAuthoringProjectionSchema>;
@@ -92,7 +95,7 @@ export const authoredAgentSourceSchema = z
     kind: agentAuthoringSourceKindSchema,
     source_locator: z.string(),
     pin: z.string().optional(),
-    third_party_trust_confirmed: z.boolean().optional(),
+    third_party_trust_confirmed: z.boolean(),
   })
   .strict();
 
@@ -123,14 +126,14 @@ export const modelTrustConfirmationSchema = z
 export const authoredAgentPackageDraftSchema = z
   .object({
     dto_version: agentAuthoringDtoVersionSchema,
-    name: z.string().min(1),
-    markdown: z.string().min(1),
+    name: z.string(),
+    markdown: z.string(),
     source: authoredAgentSourceSchema,
-    children: z.array(authoredAgentChildSchema).optional(),
+    children: z.array(authoredAgentChildSchema).nonempty().optional(),
     mcp_json: z.string().optional(),
-    sidecars: z.array(authoredSidecarDeclarationSchema).optional(),
-    policy_revision: z.string().min(1),
-    model_trust_confirmations: z.array(modelTrustConfirmationSchema).optional(),
+    sidecars: z.array(authoredSidecarDeclarationSchema).nonempty().optional(),
+    policy_revision: z.string(),
+    model_trust_confirmations: z.array(modelTrustConfirmationSchema).nonempty().optional(),
     make_default: z.boolean(),
     draft_revision: z.string().optional(),
   })
@@ -138,18 +141,18 @@ export const authoredAgentPackageDraftSchema = z
 
 export const applyAuthoredAgentPackageRequestSchema = z
   .object({
-    client_operation_id: z.string().min(1),
-    expected_policy_revision: z.string().min(1),
+    client_operation_id: z.string(),
+    expected_policy_revision: z.string(),
     package: authoredAgentPackageDraftSchema,
     onboarding: z
       .object({
         run_id: z.string().uuid(),
         attempt_id: z.string().uuid(),
-        stage_revision: z.number().int().nonnegative(),
+        stage_revision: safeU64NumberSchema,
       })
       .strict()
       .optional(),
-    validate_only: z.boolean().optional(),
+    validate_only: z.literal(true).optional(),
   })
   .strict();
 export type ApplyAuthoredAgentPackageRequest = z.infer<
@@ -162,7 +165,7 @@ export const authoredAgentReviewGrantSchema = z
     model_id: z.string(),
     is_default: z.boolean(),
     trust: agentPolicyTrustClassificationSchema,
-    trust_is_shared: z.literal(true),
+    trust_is_shared: z.boolean(),
   })
   .strict();
 
@@ -197,7 +200,7 @@ export const authoredAgentReviewSchema = z
     interactive_subagents: z.boolean(),
     goal_skeptics_label: z.string(),
     children: z.array(authoredAgentReviewChildSchema),
-    sidecars: z.array(z.string()).optional(),
+    sidecars: z.array(z.string()).nonempty().optional(),
     source: z.string(),
     make_default: z.boolean(),
     trust_is_shared: z.boolean(),
@@ -214,7 +217,7 @@ export const applyAuthoredAgentPackageReceiptSchema = z
     policy_revision: z.string(),
     installation_id: z.string().optional(),
     default_selected: z.boolean(),
-    result_config_generation: z.number().int().nonnegative(),
+    result_config_generation: safeU64NumberSchema,
     review: authoredAgentReviewSchema,
   })
   .strict();
@@ -240,6 +243,6 @@ export const applyAuthoredAgentPackageOutcomeSchema = z.discriminatedUnion("outc
 
 export const authoredAgentPackageReceiptQuerySchema = z
   .object({
-    client_operation_id: z.string().min(1),
+    client_operation_id: z.string(),
   })
   .strict();

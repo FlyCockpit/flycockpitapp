@@ -3,7 +3,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "ack",
-    "v": 24
+    "v": 1
   },
   "app_flag": {
     "data": {
@@ -14,7 +14,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "app_flag",
-    "v": 24
+    "v": 1
   },
   "app_flag_seen": {
     "data": {
@@ -25,7 +25,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "app_flag_seen",
-    "v": 24
+    "v": 1
   },
   "assistant_session_resolved": {
     "data": {
@@ -59,7 +59,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "assistant_session_resolved",
-    "v": 24
+    "v": 1
   },
   "attached": {
     "data": {
@@ -175,7 +175,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "attached",
-    "v": 24
+    "v": 1
   },
   "bulk_transfer_chunk": {
     "data": {
@@ -186,7 +186,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "bulk_transfer_chunk",
-    "v": 24
+    "v": 1
   },
   "bulk_transfer_chunk_accepted": {
     "data": {
@@ -198,7 +198,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "bulk_transfer_chunk_accepted",
-    "v": 24
+    "v": 1
   },
   "config_refreshed": {
     "data": {
@@ -208,7 +208,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "config_refreshed",
-    "v": 24
+    "v": 1
   },
   "export_session_data": {
     "data": {
@@ -230,7 +230,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "export_session_data",
-    "v": 24
+    "v": 1
   },
   "forked": {
     "data": {
@@ -242,7 +242,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "forked",
-    "v": 24
+    "v": 1
   },
   "fs_list": {
     "data": {
@@ -263,7 +263,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_list",
-    "v": 24
+    "v": 1
   },
   "fs_read": {
     "data": {
@@ -275,7 +275,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_read",
-    "v": 24
+    "v": 1
   },
   "fs_stat": {
     "data": {
@@ -293,7 +293,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_stat",
-    "v": 24
+    "v": 1
   },
   "fs_write": {
     "data": {
@@ -302,7 +302,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_write",
-    "v": 24
+    "v": 1
   },
   "git_diff_file": {
     "data": {
@@ -312,7 +312,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "git_diff_file",
-    "v": 24
+    "v": 1
   },
   "git_status": {
     "data": {
@@ -325,7 +325,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "git_status",
-    "v": 24
+    "v": 1
   },
   "history_page": {
     "data": {
@@ -344,7 +344,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "history_page",
-    "v": 24
+    "v": 1
   },
   "inventory_bundle": {
     "data": {
@@ -393,7 +393,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "inventory_bundle",
-    "v": 24
+    "v": 1
   },
   "restart_decision": {
     "data": {
@@ -403,7 +403,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "restart_decision",
-    "v": 24
+    "v": 1
   },
   "run_invocation_cancel_result": {
     "data": {
@@ -418,7 +418,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "run_invocation_cancel_result",
-    "v": 24
+    "v": 1
   },
   "run_invocation_status": {
     "data": {
@@ -437,7 +437,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "run_invocation_status",
-    "v": 24
+    "v": 1
   },
   "session_messages": {
     "data": {
@@ -455,7 +455,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "session_messages",
-    "v": 24
+    "v": 1
   },
   "assistant_inbox": {
     "data": {
@@ -478,7 +478,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "assistant_inbox",
-    "v": 24
+    "v": 1
   },
   "sessions": {
     "data": {
@@ -517,7 +517,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "sessions",
-    "v": 24
+    "v": 1
   },
   "startup_disclosures": {
     "data": {
@@ -534,7 +534,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "startup_disclosures",
-    "v": 24
+    "v": 1
   },
   "stats_rollup": {
     "data": {
@@ -628,7 +628,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "stats_rollup",
-    "v": 24
+    "v": 1
   },
   "subagent_history_page": {
     "data": {
@@ -649,7 +649,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "subagent_history_page",
-    "v": 24
+    "v": 1
   },
   "user_message_queued": {
     "data": {
@@ -687,7 +687,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "user_message_queued",
-    "v": 24
+    "v": 1
   },
   "workspace_trust_set": {
     "data": {
@@ -696,7 +696,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "workspace_trust_set",
-    "v": 24
+    "v": 1
   },
   "workspace_history_scope": {
     "data": {
@@ -706,7 +706,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "workspace_history_scope",
-    "v": 24
+    "v": 1
   },
   "agent_tree_page": {
     "data": {
@@ -727,7 +727,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "agent_tree_page",
-    "v": 24
+    "v": 1
   },
   "agent_attention_page": {
     "data": {
@@ -756,7 +756,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "agent_attention_page",
-    "v": 24
+    "v": 1
   },
   "agent_decision_steered": {
     "data": {
@@ -768,7 +768,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "agent_decision_steered",
-    "v": 24
+    "v": 1
   },
   "session_setup_snapshot": {
     "data": {
@@ -877,7 +877,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "session_setup_snapshot",
-    "v": 24
+    "v": 1
   },
   "guidance_proposals": {
     "data": {
@@ -894,7 +894,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "guidance_proposals",
-    "v": 24
+    "v": 1
   },
   "guidance_enablement_trace": {
     "data": {
@@ -909,7 +909,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "guidance_enablement_trace",
-    "v": 24
+    "v": 1
   },
   "storage_report": {
     "data": {
@@ -934,7 +934,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "storage_report",
-    "v": 24
+    "v": 1
   },
   "storage_cleanup_preview": {
     "data": {
@@ -954,7 +954,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "storage_cleanup_preview",
-    "v": 24
+    "v": 1
   },
   "storage_cleanup_completed": {
     "data": {
@@ -963,7 +963,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "storage_cleanup_completed",
-    "v": 24
+    "v": 1
   },
   "guidance_proposal_reviewed": {
     "data": {
@@ -972,10 +972,10 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "guidance_proposal_reviewed",
-    "v": 24
+    "v": 1
   },
   "code_root_created": {
-    "v": 24,
+    "v": 1,
     "kind": "res",
     "id": "11111111-1111-4111-8111-111111111111",
     "response": "code_root_created",
@@ -1091,7 +1091,7 @@
     }
   },
   "code_root_attached": {
-    "v": 24,
+    "v": 1,
     "kind": "res",
     "id": "11111111-1111-4111-8111-111111111111",
     "response": "code_root_attached",
@@ -1207,14 +1207,14 @@
     }
   },
   "code_root_attachment_closed": {
-    "v": 24,
+    "v": 1,
     "kind": "res",
     "id": "11111111-1111-4111-8111-111111111111",
     "response": "code_root_attachment_closed",
     "data": "closed"
   },
   "code_roots_discovered": {
-    "v": 24,
+    "v": 1,
     "kind": "res",
     "id": "11111111-1111-4111-8111-111111111111",
     "response": "code_roots_discovered",
@@ -1223,7 +1223,7 @@
     }
   },
   "code_root_read": {
-    "v": 24,
+    "v": 1,
     "kind": "res",
     "id": "11111111-1111-4111-8111-111111111111",
     "response": "code_root_read",
@@ -1333,7 +1333,7 @@
     }
   },
   "code_root_deliveries": {
-    "v": 24,
+    "v": 1,
     "kind": "res",
     "id": "11111111-1111-4111-8111-111111111111",
     "response": "code_root_deliveries",
@@ -1343,7 +1343,7 @@
     }
   },
   "code_root_deliveries_acked": {
-    "v": 24,
+    "v": 1,
     "kind": "res",
     "id": "11111111-1111-4111-8111-111111111111",
     "response": "code_root_deliveries_acked",
@@ -1352,11 +1352,119 @@
     }
   },
   "code_root_interrupt_resolved": {
-    "v": 24,
+    "v": 1,
     "kind": "res",
     "id": "11111111-1111-4111-8111-111111111111",
     "response": "code_root_interrupt_resolved",
     "data": "accepted"
+  },
+  "agent_authoring_projection": {
+    "v": 1,
+    "kind": "res",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "response": "agent_authoring_projection",
+    "data": {
+      "dto_version": 1,
+      "policy": {
+        "policy_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "routes": [
+          {
+            "provider_id": "vendor",
+            "model_id": "exact-a",
+            "trust": "untrusted",
+            "confirmation_required": true,
+            "trust_is_shared": false,
+            "capabilities": ["text_generation"],
+            "location": "remote",
+            "auto_prune": true,
+            "sidecar_eligible": false,
+            "remote_sidecar_egress_required": false
+          }
+        ],
+        "catalog_origin": "bundled",
+        "catalog_revision": "464140ba6ee9e1669ef1c3f37d82de8c7edd83d7",
+        "bundled_frontier_slug": "frontier-coding"
+      },
+      "sources": [
+        {
+          "kind": "bundled_frontier",
+          "slug": "frontier-coding",
+          "display_name": "Frontier coding",
+          "source_locator": "FlyCockpit/agents@464140ba6ee9e1669ef1c3f37d82de8c7edd83d7:frontier-coding",
+          "compatible_routes": [
+            {
+              "provider_id": "vendor",
+              "model_id": "exact-a"
+            }
+          ]
+        }
+      ],
+      "review_trust_disclosure": "Trust classification is shared global provider/model policy, not a per-agent override."
+    }
+  },
+  "authored_agent_package": {
+    "v": 1,
+    "kind": "res",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "response": "authored_agent_package",
+    "data": {
+      "outcome": "review",
+      "agent_name": "helper",
+      "grants": [
+        {
+          "provider_id": "vendor",
+          "model_id": "exact-a",
+          "is_default": true,
+          "trust": "untrusted",
+          "trust_is_shared": false
+        }
+      ],
+      "tool_tier_preferences": [],
+      "interactive_subagents": false,
+      "goal_skeptics_label": "Goal skeptics off",
+      "children": [
+        {
+          "path": "subagents/reviewer.md",
+          "grants": [],
+          "tool_tier_preferences": [["shell", "read_only"]],
+          "interactive_subagents": false,
+          "goal_skeptics_label": "Goal skeptics on",
+          "children": []
+        }
+      ],
+      "source": "authored/helper",
+      "make_default": true,
+      "trust_is_shared": false,
+      "trust_disclosure": "Trust classification is shared global provider/model policy, not a per-agent override."
+    }
+  },
+  "authored_agent_package_receipt": {
+    "v": 1,
+    "kind": "res",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "response": "authored_agent_package_receipt",
+    "data": {
+      "client_operation_id": "authored-package-apply",
+      "receipt_id": "22222222-2222-4222-8222-222222222222",
+      "status": "committed",
+      "package_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "policy_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "installation_id": "33333333-3333-4333-8333-333333333333",
+      "default_selected": true,
+      "result_config_generation": 8,
+      "review": {
+        "agent_name": "helper",
+        "grants": [],
+        "tool_tier_preferences": [],
+        "interactive_subagents": false,
+        "goal_skeptics_label": "Goal skeptics off",
+        "children": [],
+        "source": "authored/helper",
+        "make_default": true,
+        "trust_is_shared": true,
+        "trust_disclosure": "Trust classification is shared global provider/model policy, not a per-agent override."
+      }
+    }
   },
   "session_favorite_applied": {
     "data": {
@@ -1367,6 +1475,6 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "session_favorite_applied",
-    "v": 24
+    "v": 1
   }
 }

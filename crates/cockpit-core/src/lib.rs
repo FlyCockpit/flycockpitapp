@@ -19,6 +19,7 @@ pub mod approval;
 pub mod assistants;
 pub mod audio_transcription;
 pub mod auth;
+pub mod authoring_draft;
 pub mod auto_title;
 pub mod banner;
 pub mod browser;

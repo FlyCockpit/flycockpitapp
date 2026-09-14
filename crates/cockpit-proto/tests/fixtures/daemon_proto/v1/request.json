@@ -1,4 +1,33 @@
 {
+  "apply_onboarding_transition": {
+    "params": {
+      "attempt_id": "22222222-2222-4222-8222-222222222222",
+      "client_operation_id": "onboarding-transition",
+      "expected_revision": 3,
+      "run_id": "11111111-1111-4111-8111-111111111111",
+      "transition": "advance"
+    },
+    "request": "apply_onboarding_transition"
+  },
+  "begin_or_reopen_onboarding": {
+    "params": {
+      "client_operation_id": "onboarding-begin",
+      "expected_revision": 2,
+      "reentry": true
+    },
+    "request": "begin_or_reopen_onboarding"
+  },
+  "get_onboarding_bootstrap_snapshot": {
+    "request": "get_onboarding_bootstrap_snapshot"
+  },
+  "get_onboarding_transition_receipt": {
+    "params": {
+      "attempt_id": "22222222-2222-4222-8222-222222222222",
+      "client_operation_id": "onboarding-transition",
+      "run_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "get_onboarding_transition_receipt"
+  },
   "get_app_flag": {
     "params": {
       "key": "daemon_autostart_notice"
@@ -557,6 +586,7 @@
   "list_sessions": {
     "params": {
       "compaction_lineage_root_id": "11111111-1111-4111-8111-111111111111",
+      "include_archived": false,
       "parent_session_id": "11111111-1111-4111-8111-111111111111",
       "project_id": "project_id-fixture"
     },
@@ -952,6 +982,13 @@
       "enabled": true
     },
     "request": "set_longcache"
+  },
+  "set_session_favorite": {
+    "params": {
+      "favorite": true,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "set_session_favorite"
   },
   "set_model_favorite": {
     "params": {
@@ -1684,6 +1721,7 @@
   },
   "apply_setup_wizard": {
     "params": {
+      "client_operation_id": "fixture-operation",
       "project_root": "/tmp/project",
       "wizard_id": "security",
       "answers_json": "{}"
@@ -2399,6 +2437,42 @@
       "client_request_id": "11111111-1111-4111-8111-111111111111",
       "selected_choice": "allow_once",
       "attention_id": "22222222-2222-4222-8222-222222222222"
+    }
+  },
+  "get_agent_authoring_projection": {
+    "request": "get_agent_authoring_projection"
+  },
+  "apply_authored_agent_package": {
+    "request": "apply_authored_agent_package",
+    "params": {
+      "client_operation_id": "authored-package-apply",
+      "expected_policy_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "package": {
+        "dto_version": 1,
+        "name": "helper",
+        "markdown": "---\nschemaVersion: 1\nagentId: authored/helper\nroles: [code]\ndescription: Helper\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n    models:\n      - providerId: vendor\n        modelId: exact-a\n        default: true\n---\nbody\n",
+        "source": {
+          "kind": "authored",
+          "source_locator": "authored/helper",
+          "third_party_trust_confirmed": false
+        },
+        "policy_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "model_trust_confirmations": [
+          {
+            "grant_scope": "agent.md",
+            "provider_id": "vendor",
+            "model_id": "exact-a",
+            "confirmed": true
+          }
+        ],
+        "make_default": true
+      }
+    }
+  },
+  "get_authored_agent_package_receipt": {
+    "request": "get_authored_agent_package_receipt",
+    "params": {
+      "client_operation_id": "authored-package-apply"
     }
   }
 }

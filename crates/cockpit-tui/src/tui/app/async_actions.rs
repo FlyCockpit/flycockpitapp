@@ -1289,6 +1289,132 @@ impl App {
                     Ok(_) | Err(_) => {}
                 }
             }
+            AsyncActionKind::DaemonRpc("agent_authoring.receipt") => {
+                let pending_request_id = self
+                    .pending_startup_onboarding_operations
+                    .remove(&result.id);
+                match result.payload {
+                    Ok(AsyncActionPayload::StartupAgentAuthoringReceipt {
+                        request_id,
+                        receipt,
+                    }) if pending_request_id.as_deref() == Some(&request_id) => {
+                        if receipt.result_config_generation > 0 {
+                            self.sync_config_generation_after_authored_agent_apply(
+                                receipt.result_config_generation,
+                            );
+                        }
+                        let operation_id = receipt.client_operation_id.clone();
+                        if let Some(shell) = self.onboarding_shell.as_mut()
+                            && shell.screen_is_agent_authoring()
+                            && self.onboarding_agent_operation_id.as_deref()
+                                == Some(operation_id.as_str())
+                        {
+                            shell.apply_agent_authoring_outcome(
+                                cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(receipt),
+                            );
+                        } else {
+                            self.pending_startup_agent_authoring_receipt =
+                                Some((operation_id, receipt));
+                        }
+                    }
+                    Ok(AsyncActionPayload::StartupAgentAuthoringReceiptMiss { .. }) => {}
+                    Ok(_) | Err(_) => {}
+                }
+            }
+            AsyncActionKind::DaemonRpc("agent_authoring.projection") => {
+                let pending_request_id = self
+                    .pending_startup_onboarding_operations
+                    .remove(&result.id);
+                match result.payload {
+                    Ok(AsyncActionPayload::StartupAgentAuthoringProjection {
+                        client_operation_id,
+                        request_id,
+                        projection,
+                    }) if pending_request_id.as_deref() == Some(&request_id) => {
+                        self.onboarding_agent_operation_id = Some(client_operation_id.clone());
+                        if let Some(shell) = self.onboarding_shell.as_mut() {
+                            shell.present_agent_authoring(projection, client_operation_id.clone());
+                            if let Some((pending_operation_id, receipt)) =
+                                self.pending_startup_agent_authoring_receipt.take()
+                                && pending_operation_id == client_operation_id
+                            {
+                                shell.apply_agent_authoring_outcome(
+                                    cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(
+                                        receipt,
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.show_toast(
+                            format!("Agent authoring projection unavailable: {error}"),
+                            crate::tui::app::ToastKind::Error,
+                        );
+                    }
+                    Ok(_) => self.show_toast(
+                        "Agent authoring projection returned an invalid payload",
+                        crate::tui::app::ToastKind::Error,
+                    ),
+                }
+            }
+            AsyncActionKind::DaemonRpc(
+                label @ ("agent_authoring.preview" | "agent_authoring.apply"),
+            ) => {
+                let pending_request_id = self
+                    .pending_startup_onboarding_operations
+                    .remove(&result.id);
+                match result.payload {
+                    Ok(AsyncActionPayload::StartupAgentAuthoringOutcome {
+                        request_id,
+                        outcome,
+                    }) if pending_request_id.as_deref() == Some(&request_id) => match outcome {
+                        Ok(outcome) => {
+                            if label == "agent_authoring.apply"
+                                && matches!(
+                                    &outcome,
+                                    cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(
+                                        receipt
+                                    ) if receipt.status
+                                        == cockpit_proto::AuthoredAgentReceiptStatus::Committed
+                                )
+                            {
+                                if let cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(
+                                    receipt,
+                                ) = &outcome
+                                {
+                                    self.sync_config_generation_after_authored_agent_apply(
+                                        receipt.result_config_generation,
+                                    );
+                                }
+                            }
+                            if let Some(shell) = self.onboarding_shell.as_mut() {
+                                shell.apply_agent_authoring_outcome(outcome);
+                            }
+                        }
+                        Err(error) => {
+                            self.show_toast(
+                                format!(
+                                    "Agent authoring {} failed: {error}",
+                                    if label == "agent_authoring.preview" {
+                                        "preview"
+                                    } else {
+                                        "create"
+                                    }
+                                ),
+                                crate::tui::app::ToastKind::Error,
+                            );
+                        }
+                    },
+                    Err(error) => {
+                        self.show_toast(
+                            format!("Agent authoring request failed: {error}"),
+                            crate::tui::app::ToastKind::Error,
+                        );
+                    }
+                    Ok(_) => {}
+                }
+            }
             AsyncActionKind::DaemonRpc("startup.workspace") => match result.payload {
                 Ok(AsyncActionPayload::StartupWorkspace(completion)) => {
                     self.apply_startup_workspace_completion(completion);

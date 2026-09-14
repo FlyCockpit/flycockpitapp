@@ -450,6 +450,10 @@ const ENV_ALLOWLIST: &[&str] = &[
     "COLORTERM",
     "OS",
     "OSTYPE",
+    // Package-manager frontend selection is a public execution mode. Treating
+    // its common `noninteractive` value as a secret corrupts fixed denial
+    // messages and other ordinary model context without protecting data.
+    "DEBIAN_FRONTEND",
 ];
 
 /// Prefix-matched allowlist entries — any env var whose name starts

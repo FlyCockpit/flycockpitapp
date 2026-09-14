@@ -3227,8 +3227,9 @@ impl App {
                     self.reopen_onboarding_shell(&snapshot);
                 }
                 Some(_) | None if self.onboarding_skip => {
-                    self.dialog =
-                        Dialog::open_providers_add_with_status(&self.launch.cwd, Some(status));
+                    self.push_plain(
+                        "Onboarding is skipped for this launch (`--skip-setup`); add a provider in an interactive session with `/setup provider`.",
+                    );
                 }
                 None => {
                     // The post-first-paint authority fetch has not settled.

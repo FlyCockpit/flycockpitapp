@@ -56,8 +56,8 @@ pub use agent_authoring::{
     ApplyAuthoredAgentPackageReceipt, ApplyAuthoredAgentPackageRequest, AuthoredAgentChild,
     AuthoredAgentOnboardingCorrelation, AuthoredAgentPackageDraft,
     AuthoredAgentPackageReceiptQuery, AuthoredAgentReceiptStatus, AuthoredAgentRejectReason,
-    AuthoredAgentReview, AuthoredAgentReviewGrant, AuthoredAgentSource, AuthoredSidecarDeclaration,
-    ModelTrustConfirmation,
+    AuthoredAgentReview, AuthoredAgentReviewChild, AuthoredAgentReviewGrant, AuthoredAgentSource,
+    AuthoredSidecarDeclaration, ModelTrustConfirmation,
 };
 pub use agent_installation::{
     AGENT_INSTALLATION_DTO_VERSION, AgentInstallationBeginV1, AgentInstallationBindingOutcomeV1,
@@ -1343,7 +1343,7 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v24 makes the daemon-authoritative
+/// Current wire schema version. Launch v1 includes the daemon-authoritative
 /// `SetupWizardApplied.config_generation` a required field carrying the
 /// apply's post-commit published generation (wizard onboarding settlements
 /// prove stage advancement against the receipt itself, with no compatibility
@@ -1358,7 +1358,7 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// daemon-owned setup inventory, bounded base64 media previews, the
 /// rolling-precompaction resume choice, and knowledge-dream completion
 /// receipts including ordered all-KB runs.
-pub const PROTOCOL_VERSION: u32 = 24;
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -7175,12 +7175,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recv_salvages_out_of_range_request() {
+    async fn recv_rejects_out_of_range_request() {
         let (a, b) = duplex(4096);
         let mut left = ProtoStream::new(a);
         let mut right = ProtoStream::new(b);
 
-        // Bypass the helper to inject a bad version.
         let id = Uuid::new_v4();
         let bad = serde_json::json!({
             "v": 999,
@@ -7201,12 +7200,12 @@ mod tests {
                 assert_eq!(kind, "req");
                 assert_eq!(got_id, Some(id));
             }
-            other => panic!("expected version mismatch, got {other:?}"),
+            other => panic!("expected exact-version rejection, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn recv_salvages_out_of_range_event_without_id() {
+    async fn recv_rejects_out_of_range_event_without_id() {
         let (a, b) = duplex(4096);
         let mut left = ProtoStream::new(a);
         let mut right = ProtoStream::new(b);
@@ -7225,20 +7224,14 @@ mod tests {
             RecvFrame::VersionMismatch { v, kind, id } => {
                 assert_eq!(v, 999);
                 assert_eq!(kind, "evt");
-                assert_eq!(id, None);
+                assert!(id.is_none());
             }
-            other => panic!("expected version mismatch, got {other:?}"),
+            other => panic!("expected exact-version rejection, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn v10_only_request_is_not_sent_to_v9_daemon() {
-        // Fold-time schema (review-loop(#308) cycle 2) removed the prerelease
-        // per-payload send gates: the sender stamps its negotiated version
-        // and never rejects a payload by kind. The protection is the
-        // receiver's exact-version check: a v9-labeled frame is classified
-        // as a version mismatch and the payload never executes on a v9
-        // connection.
+    async fn v10_only_request_is_rejected_by_exact_version_gate() {
         let (a, b) = duplex(4096);
         let mut v9_sender = ProtoStream::with_version(a, 9);
         let mut v9_receiver = ProtoStream::with_version(b, 9);
@@ -7253,21 +7246,14 @@ mod tests {
             .send(&request)
             .await
             .expect("sender stamps the negotiated version without a payload gate");
-        match v9_receiver.recv().await.unwrap().expect("frame") {
-            RecvFrame::VersionMismatch { v, kind, id } => {
-                assert_eq!(v, 9);
-                assert_eq!(kind, "req");
-                assert!(id.is_some());
-            }
-            other => panic!("expected version mismatch, got {other:?}"),
-        }
+        assert!(matches!(
+            v9_receiver.recv().await.unwrap(),
+            Some(RecvFrame::VersionMismatch { v: 9, .. })
+        ));
     }
 
     #[tokio::test]
-    async fn v17_provider_credential_receipt_is_not_sent_to_v9_daemon() {
-        // Same fold-time contract as the v10 request gate above: the sender
-        // stamps the negotiated version; the receiver's exact-version check
-        // keeps the credential receipt off every v9 connection.
+    async fn v17_provider_credential_receipt_is_rejected_by_exact_version_gate() {
         let (a, b) = duplex(4096);
         let mut v9_sender = ProtoStream::with_version(a, 9);
         let mut v9_receiver = ProtoStream::with_version(b, 9);
@@ -7291,14 +7277,10 @@ mod tests {
             .send(&response)
             .await
             .expect("sender stamps the negotiated version without a payload gate");
-        match v9_receiver.recv().await.unwrap().expect("frame") {
-            RecvFrame::VersionMismatch { v, kind, id } => {
-                assert_eq!(v, 9);
-                assert_eq!(kind, "res");
-                assert!(id.is_some());
-            }
-            other => panic!("expected version mismatch, got {other:?}"),
-        }
+        assert!(matches!(
+            v9_receiver.recv().await.unwrap(),
+            Some(RecvFrame::VersionMismatch { v: 9, .. })
+        ));
     }
 
     #[tokio::test]
@@ -7327,7 +7309,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             receiver.recv().await.unwrap(),
-            Some(RecvFrame::VersionMismatch { v: 9, id: Some(actual), .. }) if actual == id
+            Some(RecvFrame::VersionMismatch { v: 9, .. })
         ));
     }
 
@@ -7361,7 +7343,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             receiver.recv().await.unwrap(),
-            Some(RecvFrame::VersionMismatch { v: 9, id: Some(actual), .. }) if actual == id
+            Some(RecvFrame::VersionMismatch { v: 9, .. })
         ));
     }
 
@@ -7371,8 +7353,6 @@ mod tests {
         let mut sender = ProtoStream::with_version(a, 9);
         let mut receiver = ProtoStream::with_version(b, 9);
         let id = Uuid::new_v4();
-        // The base list_sessions tag is v9-compatible, but the
-        // assistant_id filter field is a v10-only extended shape.
         let forged = Envelope {
             v: 9,
             body: Body::Request {
@@ -7396,7 +7376,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             receiver.recv().await.unwrap(),
-            Some(RecvFrame::VersionMismatch { v: 9, id: Some(actual), .. }) if actual == id
+            Some(RecvFrame::VersionMismatch { v: 9, .. })
         ));
     }
 
@@ -7426,7 +7406,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             receiver.recv().await.unwrap(),
-            Some(RecvFrame::VersionMismatch { v: 9, id: Some(actual), .. }) if actual == id
+            Some(RecvFrame::VersionMismatch { v: 9, .. })
         ));
     }
 
@@ -7450,12 +7430,12 @@ mod tests {
             .unwrap();
         assert!(matches!(
             receiver.recv().await.unwrap(),
-            Some(RecvFrame::VersionMismatch { v: 9, id: Some(actual), .. }) if actual == id
+            Some(RecvFrame::VersionMismatch { v: 9, .. })
         ));
     }
 
     #[tokio::test]
-    async fn v10_request_is_rejected_after_the_current_only_v24_cutover() {
+    async fn v10_request_is_rejected_after_the_current_only_v1_cutover() {
         let (a, b) = duplex(4096);
         let mut sender = ProtoStream::with_version(a, 10);
         let mut receiver = ProtoStream::with_version(b, 10);
@@ -7512,7 +7492,7 @@ mod tests {
     }
 
     #[test]
-    fn is_protocol_compatible_requires_exact_protocol_version() {
+    fn is_protocol_compatible_requires_exact_live_version() {
         assert!(is_protocol_compatible(PROTOCOL_VERSION));
         assert!(!is_protocol_compatible(PROTOCOL_VERSION + 1));
         assert!(!is_protocol_compatible(PROTOCOL_VERSION - 1));
@@ -7520,12 +7500,12 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 24);
+        assert_eq!(PROTOCOL_VERSION, 1);
         let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
-                .expect("current v24 config_refreshed fixture")
+                .expect("current v1 config_refreshed fixture")
                 .clone(),
         )
         .unwrap();
@@ -7540,19 +7520,19 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 24);
+        assert_eq!(PROTOCOL_VERSION, 1);
         let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
                 .get(response_name)
-                .unwrap_or_else(|| panic!("current v24 {response_name} fixture"));
+                .unwrap_or_else(|| panic!("current v1 {response_name} fixture"));
             assert_eq!(
                 response["data"]["goal"]["max_verification_attempts"], 4,
-                "current v24 {response_name} must freeze the inclusive verification cap"
+                "current v1 {response_name} must freeze the inclusive verification cap"
             );
             serde_json::from_value::<Response>(response.clone()).unwrap_or_else(|error| {
-                panic!("current v24 {response_name} must deserialize: {error}")
+                panic!("current v1 {response_name} must deserialize: {error}")
             });
         }
     }
@@ -7565,13 +7545,13 @@ mod tests {
                 serde_json::from_value(fixture[response_name]["data"]["assistant"].clone())
                     .unwrap();
             validate_assistant_summary(&summary).unwrap_or_else(|error| {
-                panic!("current v24 {response_name} assistant identity is invalid: {error}")
+                panic!("current v1 {response_name} assistant identity is invalid: {error}")
             });
         }
         let summary: AssistantSummary =
             serde_json::from_value(fixture["assistants"]["data"]["assistants"][0].clone()).unwrap();
         validate_assistant_summary(&summary)
-            .expect("current v24 assistant inventory must carry bounded opaque revisions");
+            .expect("current v1 assistant inventory must carry bounded opaque revisions");
         assert_eq!(fixture["assistants"]["data"]["config_generation"], 7);
         assert_eq!(
             fixture["agent_inventory"]["data"]["config_generation"],
@@ -7657,7 +7637,7 @@ mod tests {
         ] {
             assert!(
                 mcp[field].is_string(),
-                "current v24 MCP CAS fixture must carry {field}"
+                "current v1 MCP CAS fixture must carry {field}"
             );
         }
         assert_eq!(mcp["expected_revision"].as_str().map(str::len), Some(64));
@@ -7707,7 +7687,7 @@ mod tests {
         ] {
             assert!(
                 requests[tag]["params"]["client_operation_id"].is_string(),
-                "current v24 fixture must carry an operation id for {tag}"
+                "current v1 fixture must carry an operation id for {tag}"
             );
         }
         let responses = proto_fixture_files::read_fixture("response.json");

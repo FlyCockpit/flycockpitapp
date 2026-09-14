@@ -25,7 +25,7 @@
     },
     "event": "active_model_state",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "agent_idle": {
     "data": {
@@ -38,7 +38,7 @@
     },
     "event": "agent_idle",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "approval_mode_state": {
     "data": {
@@ -47,7 +47,7 @@
     },
     "event": "approval_mode_state",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "assistant_display_attempt_reset": {
     "data": {
@@ -59,7 +59,7 @@
     },
     "event": "assistant_display_attempt_reset",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "assistant_display_complete": {
     "data": {
@@ -78,7 +78,7 @@
     },
     "event": "assistant_display_complete",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "assistant_display_error": {
     "data": {
@@ -91,7 +91,7 @@
     },
     "event": "assistant_display_error",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "assistant_display_reasoning_delta": {
     "data": {
@@ -102,7 +102,7 @@
     },
     "event": "assistant_display_reasoning_delta",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "assistant_display_text_delta": {
     "data": {
@@ -113,7 +113,7 @@
     },
     "event": "assistant_display_text_delta",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "assistant_text": {
     "data": {
@@ -125,7 +125,7 @@
     },
     "event": "assistant_text",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "assistant_text_delta": {
     "data": {
@@ -135,7 +135,7 @@
     },
     "event": "assistant_text_delta",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "backup_used": {
     "data": {
@@ -147,7 +147,7 @@
     },
     "event": "backup_used",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "caffeinate_state": {
     "data": {
@@ -157,7 +157,7 @@
     },
     "event": "caffeinate_state",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "command_capability_unavailable": {
     "data": {
@@ -167,7 +167,7 @@
     },
     "event": "command_capability_unavailable",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "compact_ready": {
     "data": {
@@ -187,7 +187,7 @@
     },
     "event": "compact_ready",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "config_snapshot": {
     "data": {
@@ -470,7 +470,7 @@
     },
     "event": "config_snapshot",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "connector_status": {
     "data": {
@@ -483,7 +483,7 @@
     },
     "event": "connector_status",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "context_projection": {
     "data": {
@@ -493,7 +493,7 @@
     },
     "event": "context_projection",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "daemon_draining": {
     "data": {
@@ -501,7 +501,7 @@
     },
     "event": "daemon_draining",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "daemon_lifetime_changed": {
     "data": {
@@ -509,7 +509,7 @@
     },
     "event": "daemon_lifetime_changed",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "default_model_update_result": {
     "data": {
@@ -529,7 +529,7 @@
     },
     "event": "default_model_update_result",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "delegation_recursion_state": {
     "data": {
@@ -539,7 +539,7 @@
     },
     "event": "delegation_recursion_state",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "env_drift_warning": {
     "data": {
@@ -569,7 +569,7 @@
     },
     "event": "env_drift_warning",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "event_stream_lagged": {
     "data": {
@@ -578,7 +578,7 @@
     },
     "event": "event_stream_lagged",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "foreground_input_target": {
     "data": {
@@ -592,7 +592,7 @@
     },
     "event": "foreground_input_target",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "gitignore_allow": {
     "data": {
@@ -601,7 +601,7 @@
     },
     "event": "gitignore_allow",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "goal_supervision_progress": {
     "data": {
@@ -611,7 +611,7 @@
     },
     "event": "goal_supervision_progress",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "history_replay": {
     "data": {
@@ -639,7 +639,7 @@
     },
     "event": "history_replay",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "host_capabilities_changed": {
     "data": {
@@ -672,7 +672,7 @@
     },
     "event": "host_capabilities_changed",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "inference_failed": {
     "data": {
@@ -689,7 +689,7 @@
     },
     "event": "inference_failed",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "inference_succeeded": {
     "data": {
@@ -699,7 +699,7 @@
     },
     "event": "inference_succeeded",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "inference_warning": {
     "data": {
@@ -712,7 +712,7 @@
     },
     "event": "inference_warning",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "interrupt_queue_changed": {
     "data": {
@@ -722,7 +722,7 @@
     },
     "event": "interrupt_queue_changed",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "interrupt_raised": {
     "data": {
@@ -828,7 +828,7 @@
     },
     "event": "interrupt_raised",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "interrupt_interrupted": {
     "data": {
@@ -837,7 +837,7 @@
     },
     "event": "interrupt_interrupted",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "interrupt_resolved": {
     "data": {
@@ -857,7 +857,7 @@
     },
     "event": "interrupt_resolved",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "image_control_config_changed": {
     "data": {
@@ -910,7 +910,7 @@
     },
     "event": "image_control_config_changed",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "longcache_state": {
     "data": {
@@ -920,7 +920,7 @@
     },
     "event": "longcache_state",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "lsp_notice": {
     "data": {
@@ -928,7 +928,7 @@
     },
     "event": "lsp_notice",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "model_selection_result": {
     "data": {
@@ -982,7 +982,7 @@
     },
     "event": "model_selection_result",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "nested_turn": {
     "data": {
@@ -1000,7 +1000,7 @@
     },
     "event": "nested_turn",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "notice": {
     "data": {
@@ -1009,7 +1009,7 @@
     },
     "event": "notice",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "osc52_protocol_violation": {
     "data": {
@@ -1018,7 +1018,7 @@
     },
     "event": "osc52_protocol_violation",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "paused_work_available": {
     "data": {
@@ -1038,7 +1038,7 @@
     },
     "event": "paused_work_available",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "preflight_started": {
     "data": {
@@ -1047,7 +1047,7 @@
     },
     "event": "preflight_started",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "preflight_state": {
     "data": {
@@ -1056,7 +1056,7 @@
     },
     "event": "preflight_state",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "primary_swapped": {
     "data": {
@@ -1065,7 +1065,7 @@
     },
     "event": "primary_swapped",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "pruned": {
     "data": {
@@ -1079,7 +1079,7 @@
     },
     "event": "pruned",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "queue_updated": {
     "data": {
@@ -1103,7 +1103,7 @@
     },
     "event": "queue_updated",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "queued_user_messages_folded": {
     "data": {
@@ -1130,7 +1130,7 @@
     },
     "event": "queued_user_messages_folded",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "reasoning_delta": {
     "data": {
@@ -1140,7 +1140,7 @@
     },
     "event": "reasoning_delta",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "reconnecting": {
     "data": {
@@ -1153,7 +1153,7 @@
     },
     "event": "reconnecting",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "redaction_state": {
     "data": {
@@ -1164,7 +1164,7 @@
     },
     "event": "redaction_state",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "resource_clear": {
     "data": {
@@ -1180,7 +1180,7 @@
     },
     "event": "resource_clear",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "resource_start": {
     "data": {
@@ -1197,7 +1197,7 @@
     },
     "event": "resource_start",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "resource_wait": {
     "data": {
@@ -1214,7 +1214,7 @@
     },
     "event": "resource_wait",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "sandbox_escalation_state": {
     "data": {
@@ -1223,7 +1223,7 @@
     },
     "event": "sandbox_escalation_state",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "sandbox_state": {
     "data": {
@@ -1240,7 +1240,7 @@
     },
     "event": "sandbox_state",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "sandbox_unavailable": {
     "data": {
@@ -1250,7 +1250,7 @@
     },
     "event": "sandbox_unavailable",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "schedule_completed": {
     "data": {
@@ -1262,7 +1262,7 @@
     },
     "event": "schedule_completed",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "schedule_note": {
     "data": {
@@ -1272,7 +1272,7 @@
     },
     "event": "schedule_note",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "schedule_progress": {
     "data": {
@@ -1281,7 +1281,7 @@
     },
     "event": "schedule_progress",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "schedule_started": {
     "data": {
@@ -1292,7 +1292,7 @@
     },
     "event": "schedule_started",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "session_driver_failed": {
     "data": {
@@ -1301,7 +1301,7 @@
     },
     "event": "session_driver_failed",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "session_ended": {
     "data": {
@@ -1310,7 +1310,7 @@
     },
     "event": "session_ended",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "session_persist_failed": {
     "data": {
@@ -1320,7 +1320,7 @@
     },
     "event": "session_persist_failed",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "skill_auto_injected": {
     "data": {
@@ -1330,7 +1330,7 @@
     },
     "event": "skill_auto_injected",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "subagent_report": {
     "data": {
@@ -1347,7 +1347,7 @@
     },
     "event": "subagent_report",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "subagent_routing": {
     "data": {
@@ -1364,7 +1364,7 @@
     },
     "event": "subagent_routing",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "subagent_spawned": {
     "data": {
@@ -1383,7 +1383,7 @@
     },
     "event": "subagent_spawned",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "subagent_compacted": {
     "data": {
@@ -1402,7 +1402,7 @@
     },
     "event": "subagent_compacted",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "tandem_state": {
     "data": {
@@ -1412,7 +1412,7 @@
     },
     "event": "tandem_state",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "terminal_clipboard": {
     "data": {
@@ -1421,7 +1421,7 @@
     },
     "event": "terminal_clipboard",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "terminal_closed": {
     "data": {
@@ -1431,7 +1431,7 @@
     },
     "event": "terminal_closed",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "terminal_output": {
     "data": {
@@ -1440,7 +1440,7 @@
     },
     "event": "terminal_output",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "terminal_viewers": {
     "data": {
@@ -1449,7 +1449,7 @@
     },
     "event": "terminal_viewers",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "thinking_started": {
     "data": {
@@ -1459,7 +1459,7 @@
     },
     "event": "thinking_started",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "tool_end": {
     "data": {
@@ -1474,7 +1474,7 @@
     },
     "event": "tool_end",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "tool_error": {
     "data": {
@@ -1488,7 +1488,7 @@
     },
     "event": "tool_error",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "tool_progress": {
     "data": {
@@ -1500,7 +1500,7 @@
     },
     "event": "tool_progress",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "tool_start": {
     "data": {
@@ -1514,7 +1514,7 @@
     },
     "event": "tool_start",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "usage": {
     "data": {
@@ -1527,7 +1527,7 @@
     },
     "event": "usage",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "user_message_recorded": {
     "data": {
@@ -1538,7 +1538,7 @@
     },
     "event": "user_message_recorded",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "user_message_removed": {
     "data": {
@@ -1548,7 +1548,7 @@
     },
     "event": "user_message_removed",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "user_message_retracted": {
     "data": {
@@ -1557,7 +1557,7 @@
     },
     "event": "user_message_retracted",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "user_messages_terminated": {
     "data": {
@@ -1567,7 +1567,7 @@
     },
     "event": "user_messages_terminated",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "waiting_for_lock": {
     "data": {
@@ -1578,7 +1578,7 @@
     },
     "event": "waiting_for_lock",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "agent_tree_changed": {
     "data": {
@@ -1590,7 +1590,7 @@
     },
     "event": "agent_tree_changed",
     "kind": "evt",
-    "v": 24
+    "v": 1
   },
   "workspace_trust_reconciliation": {
     "data": {
@@ -1600,6 +1600,6 @@
     },
     "event": "workspace_trust_reconciliation",
     "kind": "evt",
-    "v": 24
+    "v": 1
   }
 }

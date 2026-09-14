@@ -93,6 +93,20 @@ pub(crate) const PACKAGE_SUBAGENTS_DIR: &str = "subagents";
 pub(crate) const PACKAGE_MCP_FILE: &str = "mcp.json";
 pub(crate) const PACKAGE_SIDECAR_FILE: &str = "sidecar.json";
 
+pub(crate) fn is_reserved_package_file(path: &str) -> bool {
+    path == PACKAGE_ROOT_FILE || path == PACKAGE_MCP_FILE || path == PACKAGE_SIDECAR_FILE
+}
+
+/// Package-relative path for a nested definition's model-trust grant scope.
+pub(crate) fn package_child_grant_scope(parent_scope: &str, child_name: &str) -> String {
+    if parent_scope == PACKAGE_ROOT_FILE {
+        format!("{PACKAGE_SUBAGENTS_DIR}/{child_name}.md")
+    } else {
+        let parent_dir = parent_scope.strip_suffix(".md").unwrap_or(parent_scope);
+        format!("{parent_dir}/{child_name}.md")
+    }
+}
+
 /// Unified per-agent capabilities. The four issue-#75 tool-posture grants and
 /// the computer-use declaration share one closed set; host policy still
 /// decides whether a declared capability is executable. Wire names are the
@@ -2129,6 +2143,40 @@ pub(crate) fn load_workspace_package_from_files(
     )
 }
 
+fn assemble_nested_private_subagents(
+    parsed: BTreeMap<String, AgentDef>,
+) -> BTreeMap<String, AgentDef> {
+    let mut assembled = parsed
+        .iter()
+        .map(|(path, def)| (path.clone(), def.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for def in assembled.values_mut() {
+        def.private_subagents = BTreeMap::new();
+    }
+    let mut nested_paths = assembled
+        .keys()
+        .filter(|path| path.contains('/'))
+        .cloned()
+        .collect::<Vec<_>>();
+    nested_paths.sort_by_key(|path| path.chars().filter(|ch| *ch == '/').count());
+    nested_paths.reverse();
+    for path in nested_paths {
+        let Some((parent_path, child_name)) = path.rsplit_once('/') else {
+            continue;
+        };
+        let child = assembled
+            .remove(&path)
+            .expect("nested private subagent path must exist");
+        assembled
+            .get_mut(parent_path)
+            .expect("nested private subagent parent must exist")
+            .private_subagents
+            .insert(child_name.to_string(), child);
+    }
+    assembled.retain(|path, _| !path.contains('/'));
+    assembled
+}
+
 fn load_package_from_files(
     agent_dir: &Path,
     name: &str,
@@ -2176,11 +2224,15 @@ fn load_package_from_files(
         if rel == PACKAGE_ROOT_FILE || rel == PACKAGE_MCP_FILE || rel == PACKAGE_SIDECAR_FILE {
             continue;
         }
-        if let Some(child) = rel
+        if let Some(child_path) = rel
             .strip_prefix(&format!("{PACKAGE_SUBAGENTS_DIR}/"))
-            .filter(|rest| !rest.is_empty() && !rest.contains('/'))
+            .filter(|rest| !rest.is_empty())
             .and_then(|rest| rest.strip_suffix(".md"))
         {
+            let child = child_path
+                .rsplit('/')
+                .next()
+                .context("private subagent path is empty")?;
             if child == name {
                 bail!(
                     "agent package `{name}` ({}) has a private subagent that reuses the package name",
@@ -2189,7 +2241,7 @@ fn load_package_from_files(
             }
             let child_text = std::str::from_utf8(bytes).map_err(|e| {
                 anyhow::anyhow!(
-                    "agent package `{name}` private subagent `{child}` is not UTF-8: {e}"
+                    "agent package `{name}` private subagent `{child_path}` is not UTF-8: {e}"
                 )
             })?;
             let child_def = parse_agent_with_scope(
@@ -2197,7 +2249,8 @@ fn load_package_from_files(
                 child,
                 agent_dir
                     .join(PACKAGE_SUBAGENTS_DIR)
-                    .join(format!("{child}.md")),
+                    .join(child_path)
+                    .with_extension("md"),
                 scope,
             )?;
             if child_def.mode == AgentMode::Primary {
@@ -2225,19 +2278,17 @@ fn load_package_from_files(
                 );
             }
             if private_subagents
-                .insert(child.to_string(), child_def)
+                .insert(child_path.to_string(), child_def)
                 .is_some()
             {
                 bail!(
-                    "agent package `{name}` ({}) has duplicate private subagent `{child}`",
+                    "agent package `{name}` ({}) has duplicate private subagent `{child_path}`",
                     agent_dir.display()
                 );
             }
             continue;
         }
         if rel.contains('/') {
-            // Nested support files (mcp.json already skipped) are digested
-            // but not interpreted by this stage.
             continue;
         }
         if let Some(key) = rel.strip_suffix(".md").filter(|k| !k.is_empty()) {
@@ -2252,7 +2303,7 @@ fn load_package_from_files(
     base.source = agent_dir.to_path_buf();
     base.prompt_overrides = overrides;
     base.package_files = Some(files);
-    base.private_subagents = private_subagents;
+    base.private_subagents = assemble_nested_private_subagents(private_subagents);
     if let Some(bytes) = base
         .package_files
         .as_ref()
@@ -2346,12 +2397,13 @@ pub(crate) fn encode_package_sidecar_file(
     .context("encoding sidecar.json")
 }
 
-/// Closed relative-path namespace for a canonical agent package. Write
-/// boundaries must use this even if an upper layer already filtered the map.
-pub(crate) fn validate_package_relative_path(path: &str) -> Result<()> {
-    if path == PACKAGE_ROOT_FILE || path == PACKAGE_MCP_FILE || path == PACKAGE_SIDECAR_FILE {
-        return Ok(());
-    }
+/// Closed relative-path namespace for a nested package markdown file. Reserved
+/// canonical files must never appear as child paths.
+pub(crate) fn validate_package_child_relative_path(path: &str) -> Result<()> {
+    ensure!(
+        !is_reserved_package_file(path),
+        "package path `{path}` reuses a reserved canonical package file"
+    );
     let valid = path.starts_with(&format!("{PACKAGE_SUBAGENTS_DIR}/"))
         && path.ends_with(".md")
         && !path.contains('\\')
@@ -2364,6 +2416,15 @@ pub(crate) fn validate_package_relative_path(path: &str) -> Result<()> {
         "package path `{path}` is outside the canonical agent package namespace"
     );
     Ok(())
+}
+
+/// Closed relative-path namespace for a canonical agent package. Write
+/// boundaries must use this even if an upper layer already filtered the map.
+pub(crate) fn validate_package_relative_path(path: &str) -> Result<()> {
+    if is_reserved_package_file(path) {
+        return Ok(());
+    }
+    validate_package_child_relative_path(path)
 }
 
 fn collect_package_files(agent_dir: &Path) -> Result<BTreeMap<String, Vec<u8>>> {

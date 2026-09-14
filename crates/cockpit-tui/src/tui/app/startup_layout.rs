@@ -174,7 +174,7 @@ impl App {
         }
         cockpit_core::wizard::named_setup_wizard_authoritative_stage(wizard_id)
             .map(|required| stage == required)
-            .unwrap_or(true)
+            .unwrap_or(false)
     }
 
     fn focus_named_setup_wizard(&mut self, wizard_id: &str) -> bool {
@@ -596,6 +596,7 @@ impl App {
             && incoming.attempt_id != recorded.attempt_id
         {
             self.onboarding_agent_operation_id = None;
+            self.pending_startup_agent_authoring_receipt = None;
         }
         self.onboarding_snapshot = snapshot;
         if let Some(snapshot) = self.onboarding_snapshot.clone() {

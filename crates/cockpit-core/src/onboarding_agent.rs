@@ -248,12 +248,14 @@ pub fn canonicalize_authored_package(
     reject_trust_copy(&draft.markdown)?;
     for child in &draft.children {
         reject_trust_copy(&child.markdown)?;
-        crate::agents::validate_package_relative_path(&child.relative_path).map_err(|error| {
-            AuthoredPackageRejection::new(
-                AuthoredAgentRejectReason::InvalidNestedGraph,
-                error.to_string(),
-            )
-        })?;
+        crate::agents::validate_package_child_relative_path(&child.relative_path).map_err(
+            |error| {
+                AuthoredPackageRejection::new(
+                    AuthoredAgentRejectReason::InvalidNestedGraph,
+                    error.to_string(),
+                )
+            },
+        )?;
     }
     require_wire_provider_tokens(draft, providers)?;
     let derived_kind = derive_source_kind(&draft.source, &draft.name, snapshot, catalog)?;
@@ -268,7 +270,12 @@ pub fn canonicalize_authored_package(
     let files = canonical_file_map(draft)?;
     let definition = crate::agents::load_workspace_package_from_files(&draft.name, files.clone())
         .map_err(map_package_error)?;
-    validate_definition_grants_tree(&definition, snapshot, &draft.model_trust_confirmations)?;
+    validate_definition_grants_tree(
+        &definition,
+        snapshot,
+        &draft.model_trust_confirmations,
+        crate::agents::PACKAGE_ROOT_FILE,
+    )?;
     let digest = hex_digest(&crate::agents::package_digest_preimage(&files));
     let review = review_from_definition(&definition, snapshot, draft, &digest, &files);
     Ok(CanonicalAuthoredPackage {
@@ -395,6 +402,7 @@ pub fn draft_from_selection(
         sidecars: selection.sidecar.into_iter().collect(),
         policy_revision: snapshot.policy_revision.clone(),
         model_trust_confirmations: vec![ModelTrustConfirmation {
+            grant_scope: crate::agents::PACKAGE_ROOT_FILE.to_string(),
             provider_id: selection.default_model_provider,
             model_id: selection.default_model,
             confirmed: selection.model_trust_confirmed,
@@ -634,10 +642,12 @@ fn validate_definition_grants_tree(
     definition: &AgentDef,
     snapshot: &AgentPolicySnapshot,
     confirmations: &[ModelTrustConfirmation],
+    grant_scope: &str,
 ) -> Result<(), AuthoredPackageRejection> {
-    validate_grants(definition, snapshot, confirmations)?;
-    for child in definition.private_subagents.values() {
-        validate_definition_grants_tree(child, snapshot, confirmations)?;
+    validate_grants(definition, snapshot, confirmations, grant_scope)?;
+    for (child_name, child) in &definition.private_subagents {
+        let child_scope = crate::agents::package_child_grant_scope(grant_scope, child_name);
+        validate_definition_grants_tree(child, snapshot, confirmations, &child_scope)?;
     }
     Ok(())
 }
@@ -646,6 +656,7 @@ fn validate_grants(
     definition: &AgentDef,
     snapshot: &AgentPolicySnapshot,
     confirmations: &[ModelTrustConfirmation],
+    grant_scope: &str,
 ) -> Result<(), AuthoredPackageRejection> {
     let Some(frontmatter) = definition.definition_frontmatter() else {
         return Err(AuthoredPackageRejection::new(
@@ -711,7 +722,8 @@ fn validate_grants(
         }
         if route.confirmation_required {
             let confirmed = confirmations.iter().any(|confirmation| {
-                confirmation.provider_id == grant.provider_id
+                confirmation.grant_scope == grant_scope
+                    && confirmation.provider_id == grant.provider_id
                     && confirmation.model_id == grant.model_id
                     && confirmation.confirmed
             });
@@ -812,12 +824,14 @@ fn canonical_file_map(
                 format!("duplicate child path `{}`", child.relative_path),
             ));
         }
-        crate::agents::validate_package_relative_path(&child.relative_path).map_err(|error| {
-            AuthoredPackageRejection::new(
-                AuthoredAgentRejectReason::InvalidNestedGraph,
-                error.to_string(),
-            )
-        })?;
+        crate::agents::validate_package_child_relative_path(&child.relative_path).map_err(
+            |error| {
+                AuthoredPackageRejection::new(
+                    AuthoredAgentRejectReason::InvalidNestedGraph,
+                    error.to_string(),
+                )
+            },
+        )?;
         files.insert(
             child.relative_path.clone(),
             child.markdown.as_bytes().to_vec(),
@@ -1236,6 +1250,7 @@ mod tests {
             model_trust_confirmations: grants
                 .iter()
                 .map(|(provider, model, _)| ModelTrustConfirmation {
+                    grant_scope: crate::agents::PACKAGE_ROOT_FILE.to_string(),
                     provider_id: (*provider).to_string(),
                     model_id: (*model).to_string(),
                     confirmed,
@@ -1406,6 +1421,63 @@ mod tests {
         package.children[0].markdown = "not a definition".into();
         let err = canonicalize(&package, &snapshot, &providers).unwrap_err();
         assert_eq!(err.reason, AuthoredAgentRejectReason::InvalidNestedGraph);
+    }
+
+    #[test]
+    fn rejects_reserved_child_package_paths() {
+        let providers = providers_with("exact-a", Some(ModelTrust::Untrusted));
+        let snapshot = snapshot_for(&providers);
+        for reserved in [
+            crate::agents::PACKAGE_ROOT_FILE,
+            crate::agents::PACKAGE_MCP_FILE,
+            crate::agents::PACKAGE_SIDECAR_FILE,
+        ] {
+            let mut package = draft("helper", &[("vendor", "exact-a", true)], true);
+            package.policy_revision = snapshot.policy_revision.clone();
+            package.children.push(AuthoredAgentChild {
+                relative_path: reserved.to_string(),
+                markdown: markdown("nested", &[("vendor", "exact-a", true)]),
+            });
+            let err = canonicalize(&package, &snapshot, &providers).unwrap_err();
+            assert_eq!(
+                err.reason,
+                AuthoredAgentRejectReason::InvalidNestedGraph,
+                "reserved child path `{reserved}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_trust_confirmation_is_scoped_per_definition() {
+        let providers = providers_with("exact-a", Some(ModelTrust::Untrusted));
+        let snapshot = snapshot_for(&providers);
+        let mut package = draft("helper", &[("vendor", "exact-a", true)], true);
+        package.policy_revision = snapshot.policy_revision.clone();
+        package.children.push(AuthoredAgentChild {
+            relative_path: "subagents/reviewer.md".into(),
+            markdown: markdown("reviewer", &[("vendor", "exact-a", true)]),
+        });
+        package.model_trust_confirmations = vec![ModelTrustConfirmation {
+            grant_scope: crate::agents::PACKAGE_ROOT_FILE.to_string(),
+            provider_id: "vendor".into(),
+            model_id: "exact-a".into(),
+            confirmed: true,
+        }];
+        let err = canonicalize(&package, &snapshot, &providers).unwrap_err();
+        assert_eq!(
+            err.reason,
+            AuthoredAgentRejectReason::OmittedModelTrustConfirmation
+        );
+
+        package
+            .model_trust_confirmations
+            .push(ModelTrustConfirmation {
+                grant_scope: "subagents/reviewer.md".into(),
+                provider_id: "vendor".into(),
+                model_id: "exact-a".into(),
+                confirmed: true,
+            });
+        canonicalize(&package, &snapshot, &providers).unwrap();
     }
 
     #[test]

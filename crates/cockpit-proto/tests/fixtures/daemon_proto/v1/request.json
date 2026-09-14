@@ -2459,6 +2459,7 @@
         "policy_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "model_trust_confirmations": [
           {
+            "grant_scope": "agent.md",
             "provider_id": "vendor",
             "model_id": "exact-a",
             "confirmed": true

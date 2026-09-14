@@ -516,12 +516,20 @@ impl AgentAuthoringScreen {
             }
             Phase::ModelGrants => {
                 let cursor = self.cursor;
-                toggle_route_grant(&mut self.draft.route_grants, cursor);
+                toggle_route_grant(
+                    &mut self.draft.route_grants,
+                    cursor,
+                    &mut self.draft.default_route_index,
+                );
             }
             Phase::SubagentEdit(SubagentPhase::ModelGrants) => {
                 let cursor = self.cursor;
                 if let Some(child) = self.current_child_mut() {
-                    toggle_route_grant(&mut child.route_grants, cursor);
+                    toggle_route_grant(
+                        &mut child.route_grants,
+                        cursor,
+                        &mut child.default_route_index,
+                    );
                 }
             }
             Phase::SubagentEdit(SubagentPhase::ModelTrust) => {
@@ -1290,7 +1298,7 @@ impl AgentAuthoringScreen {
                 }
                 lines.push(Line::default());
                 lines.push(Line::from(Span::styled(
-                    "Space toggles grants; default follows the first enabled route.",
+                    "Space toggles grants; disabling the default selects another enabled route.",
                     muted,
                 )));
             }
@@ -1448,9 +1456,21 @@ fn on_off(value: bool) -> &'static str {
     if value { "on" } else { "off" }
 }
 
-fn toggle_route_grant(grants: &mut [RouteGrantDraft], cursor: usize) {
+fn toggle_route_grant(
+    grants: &mut [RouteGrantDraft],
+    cursor: usize,
+    default_route_index: &mut usize,
+) {
     if let Some(grant) = grants.get_mut(cursor) {
+        let was_default = cursor == *default_route_index;
         grant.enabled = !grant.enabled;
+        if !grant.enabled && was_default {
+            if let Some(next_default) = grants.iter().position(|entry| entry.enabled) {
+                *default_route_index = next_default;
+            }
+        } else if grant.enabled && grants.iter().filter(|entry| entry.enabled).count() == 1 {
+            *default_route_index = cursor;
+        }
     }
 }
 

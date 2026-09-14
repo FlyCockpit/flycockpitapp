@@ -574,16 +574,37 @@ pub fn registry() -> Vec<WizardDescriptor> {
 /// Every named wizard id accepted by `cockpit setup <wizard>` and `/setup
 /// <wizard>`. The route-inventory test fails when a new id is added without a
 /// shell adapter row.
-pub fn named_setup_wizard_ids() -> Vec<&'static str> {
-    vec![
-        PROVIDER_WIZARD_ID,
-        SECURITY_WIZARD_ID,
-        MODEL_WIZARD_ID,
+const NAMED_SETUP_WIZARD_TABLE: &[(&str, Option<cockpit_proto::OnboardingStage>, bool)] = &[
+    (PROVIDER_WIZARD_ID, None, true),
+    (SECURITY_WIZARD_ID, None, true),
+    (MODEL_WIZARD_ID, None, true),
+    (
         ONBOARDING_MODEL_WIZARD_ID,
+        Some(cockpit_proto::OnboardingStage::Model),
+        false,
+    ),
+    (
         ONBOARDING_PROFILE_WIZARD_ID,
+        Some(cockpit_proto::OnboardingStage::Profile),
+        false,
+    ),
+    (
         ONBOARDING_LIFETIME_WIZARD_ID,
+        Some(cockpit_proto::OnboardingStage::Lifetime),
+        false,
+    ),
+    (
         ONBOARDING_AGENT_WIZARD_ID,
-    ]
+        Some(cockpit_proto::OnboardingStage::Agent),
+        false,
+    ),
+];
+
+pub fn named_setup_wizard_ids() -> Vec<&'static str> {
+    NAMED_SETUP_WIZARD_TABLE
+        .iter()
+        .map(|(id, _, _)| *id)
+        .collect()
 }
 
 /// Onboarding stage a named wizard must be focused to during first-run.
@@ -591,21 +612,19 @@ pub fn named_setup_wizard_ids() -> Vec<&'static str> {
 pub fn named_setup_wizard_authoritative_stage(
     wizard_id: &str,
 ) -> Option<cockpit_proto::OnboardingStage> {
-    match wizard_id {
-        ONBOARDING_PROFILE_WIZARD_ID => Some(cockpit_proto::OnboardingStage::Profile),
-        ONBOARDING_MODEL_WIZARD_ID => Some(cockpit_proto::OnboardingStage::Model),
-        ONBOARDING_LIFETIME_WIZARD_ID => Some(cockpit_proto::OnboardingStage::Lifetime),
-        ONBOARDING_AGENT_WIZARD_ID => Some(cockpit_proto::OnboardingStage::Agent),
-        _ => None,
-    }
+    NAMED_SETUP_WIZARD_TABLE
+        .iter()
+        .find(|(id, _, _)| *id == wizard_id)
+        .and_then(|(_, stage, _)| *stage)
 }
 
 /// Named wizards that may mount as a post-onboarding detour at `Complete`.
 pub fn named_setup_wizard_allows_complete_stage(wizard_id: &str) -> bool {
-    matches!(
-        wizard_id,
-        PROVIDER_WIZARD_ID | SECURITY_WIZARD_ID | MODEL_WIZARD_ID
-    )
+    NAMED_SETUP_WIZARD_TABLE
+        .iter()
+        .find(|(id, _, _)| *id == wizard_id)
+        .map(|(_, _, allows_complete)| *allows_complete)
+        .unwrap_or(false)
 }
 
 /// The small durable profile step shown on every fresh-install onboarding.

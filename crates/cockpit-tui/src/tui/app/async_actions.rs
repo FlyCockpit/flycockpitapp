@@ -1303,14 +1303,18 @@ impl App {
                                 receipt.result_config_generation,
                             );
                         }
+                        let operation_id = receipt.client_operation_id.clone();
                         if let Some(shell) = self.onboarding_shell.as_mut()
                             && shell.screen_is_agent_authoring()
+                            && self.onboarding_agent_operation_id.as_deref()
+                                == Some(operation_id.as_str())
                         {
                             shell.apply_agent_authoring_outcome(
                                 cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(receipt),
                             );
                         } else {
-                            self.pending_startup_agent_authoring_receipt = Some(receipt);
+                            self.pending_startup_agent_authoring_receipt =
+                                Some((operation_id, receipt));
                         }
                     }
                     Ok(AsyncActionPayload::StartupAgentAuthoringReceiptMiss { .. }) => {}
@@ -1329,9 +1333,10 @@ impl App {
                     }) if pending_request_id.as_deref() == Some(&request_id) => {
                         self.onboarding_agent_operation_id = Some(client_operation_id.clone());
                         if let Some(shell) = self.onboarding_shell.as_mut() {
-                            shell.present_agent_authoring(projection, client_operation_id);
-                            if let Some(receipt) =
+                            shell.present_agent_authoring(projection, client_operation_id.clone());
+                            if let Some((pending_operation_id, receipt)) =
                                 self.pending_startup_agent_authoring_receipt.take()
+                                && pending_operation_id == client_operation_id
                             {
                                 shell.apply_agent_authoring_outcome(
                                     cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(

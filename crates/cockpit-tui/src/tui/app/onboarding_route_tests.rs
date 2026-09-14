@@ -24,6 +24,55 @@ fn snapshot_for_named_wizard(wizard_id: &str) -> cockpit_proto::OnboardingBootst
 }
 
 #[test]
+fn named_setup_wizard_table_is_exhaustive() {
+    use std::collections::BTreeSet;
+
+    let ids = BTreeSet::from_iter(cockpit_core::wizard::named_setup_wizard_ids());
+    let expected = [
+        cockpit_core::wizard::PROVIDER_WIZARD_ID,
+        cockpit_core::wizard::SECURITY_WIZARD_ID,
+        cockpit_core::wizard::MODEL_WIZARD_ID,
+        cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID,
+        cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
+        cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
+        cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID,
+    ];
+    assert_eq!(ids.len(), expected.len());
+    for wizard_id in expected {
+        assert!(
+            ids.contains(wizard_id),
+            "named setup wizard table must include `{wizard_id}`"
+        );
+    }
+
+    let startup = include_str!("startup_layout.rs");
+    let open_setup = startup
+        .split("pub(super) fn open_onboarding_setup")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("fn mount_named_setup_wizard_in_onboarding_shell")
+                .next()
+        })
+        .expect("open_onboarding_setup");
+    for wizard_id in &ids {
+        let constant = match wizard_id.as_str() {
+            cockpit_core::wizard::PROVIDER_WIZARD_ID => "PROVIDER_WIZARD_ID",
+            cockpit_core::wizard::SECURITY_WIZARD_ID => "SECURITY_WIZARD_ID",
+            cockpit_core::wizard::MODEL_WIZARD_ID => "MODEL_WIZARD_ID",
+            cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID => "ONBOARDING_MODEL_WIZARD_ID",
+            cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID => "ONBOARDING_PROFILE_WIZARD_ID",
+            cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID => "ONBOARDING_LIFETIME_WIZARD_ID",
+            cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID => "ONBOARDING_AGENT_WIZARD_ID",
+            other => panic!("unexpected wizard id `{other}`"),
+        };
+        assert!(
+            open_setup.contains(&format!("Some(cockpit_core::wizard::{constant})")),
+            "open_onboarding_setup must handle `{wizard_id}`"
+        );
+    }
+}
+
+#[test]
 fn named_setup_wizards_mount_inside_onboarding_shell() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
@@ -75,6 +124,35 @@ fn named_setup_wizard_rejects_stale_complete_stage_for_first_run_wizards() {
             app.onboarding_shell.is_none(),
             "wizard `{wizard_id}` must not mount against a Complete snapshot"
         );
+    }
+}
+
+#[test]
+fn post_onboarding_wizards_reject_active_onboarding_stages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    for wizard_id in [
+        cockpit_core::wizard::SECURITY_WIZARD_ID,
+        cockpit_core::wizard::MODEL_WIZARD_ID,
+    ] {
+        for stage in [
+            cockpit_proto::OnboardingStage::Welcome,
+            cockpit_proto::OnboardingStage::Profile,
+            cockpit_proto::OnboardingStage::SecureStore,
+            cockpit_proto::OnboardingStage::Provider,
+            cockpit_proto::OnboardingStage::Model,
+            cockpit_proto::OnboardingStage::Lifetime,
+            cockpit_proto::OnboardingStage::Agent,
+        ] {
+            let mut app = App::new(Some(tmp.path()), false);
+            app.apply_onboarding_bootstrap_snapshot(Some(snapshot(stage)));
+            app.open_onboarding_setup(Some(wizard_id));
+            assert_ne!(
+                app.dialog.test_page_name(),
+                Some(wizard_id),
+                "wizard `{wizard_id}` must not mount during active onboarding stage `{stage:?}`"
+            );
+        }
     }
 }
 

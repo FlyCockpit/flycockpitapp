@@ -292,10 +292,12 @@ pub fn build_package_draft(
         projection,
         &draft.route_grants,
         &draft.trust_confirmations,
+        crate::agents::PACKAGE_ROOT_FILE,
     );
     append_child_model_trust_confirmations(
         projection,
         &draft.children,
+        "",
         &mut model_trust_confirmations,
     );
 
@@ -507,6 +509,7 @@ fn collect_model_trust_confirmations(
     projection: &AgentAuthoringProjection,
     route_grants: &[RouteGrantDraft],
     trust_confirmations: &[bool],
+    grant_scope: &str,
 ) -> Vec<ModelTrustConfirmation> {
     route_grants
         .iter()
@@ -520,6 +523,7 @@ fn collect_model_trust_confirmations(
                 return None;
             }
             Some(ModelTrustConfirmation {
+                grant_scope: grant_scope.to_string(),
                 provider_id: route.provider_id.clone(),
                 model_id: route.model_id.clone(),
                 confirmed: trust_confirmations.get(index).copied().unwrap_or(false),
@@ -531,15 +535,28 @@ fn collect_model_trust_confirmations(
 fn append_child_model_trust_confirmations(
     projection: &AgentAuthoringProjection,
     children: &[ChildAuthoringDraft],
+    parent_prefix: &str,
     out: &mut Vec<ModelTrustConfirmation>,
 ) {
     for child in children {
+        let slug = child_slug(child);
+        let grant_scope = if parent_prefix.is_empty() {
+            format!("subagents/{slug}.md")
+        } else {
+            format!("subagents/{parent_prefix}/{slug}.md")
+        };
         out.extend(collect_model_trust_confirmations(
             projection,
             &child.route_grants,
             &child.trust_confirmations,
+            &grant_scope,
         ));
-        append_child_model_trust_confirmations(projection, &child.children, out);
+        let nested_prefix = if parent_prefix.is_empty() {
+            slug
+        } else {
+            format!("{parent_prefix}/{slug}")
+        };
+        append_child_model_trust_confirmations(projection, &child.children, &nested_prefix, out);
     }
 }
 

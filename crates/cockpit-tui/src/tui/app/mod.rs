@@ -2189,7 +2189,7 @@ pub struct App {
     onboarding_agent_operation_id: Option<String>,
     /// Receipt that arrived before the agent authoring screen mounted.
     pending_startup_agent_authoring_receipt:
-        Option<cockpit_proto::ApplyAuthoredAgentPackageReceipt>,
+        Option<(String, cockpit_proto::ApplyAuthoredAgentPackageReceipt)>,
     startup_background: StartupBackground,
     /// Non-blocking projection of the latest complete dependency snapshot.
     /// Startup never probes here; Settings owns background refreshes.

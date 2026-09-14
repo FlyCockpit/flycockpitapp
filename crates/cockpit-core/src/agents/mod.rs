@@ -93,6 +93,20 @@ pub(crate) const PACKAGE_SUBAGENTS_DIR: &str = "subagents";
 pub(crate) const PACKAGE_MCP_FILE: &str = "mcp.json";
 pub(crate) const PACKAGE_SIDECAR_FILE: &str = "sidecar.json";
 
+pub(crate) fn is_reserved_package_file(path: &str) -> bool {
+    path == PACKAGE_ROOT_FILE || path == PACKAGE_MCP_FILE || path == PACKAGE_SIDECAR_FILE
+}
+
+/// Package-relative path for a nested definition's model-trust grant scope.
+pub(crate) fn package_child_grant_scope(parent_scope: &str, child_name: &str) -> String {
+    if parent_scope == PACKAGE_ROOT_FILE {
+        format!("{PACKAGE_SUBAGENTS_DIR}/{child_name}.md")
+    } else {
+        let parent_dir = parent_scope.strip_suffix(".md").unwrap_or(parent_scope);
+        format!("{parent_dir}/{child_name}.md")
+    }
+}
+
 /// Unified per-agent capabilities. The four issue-#75 tool-posture grants and
 /// the computer-use declaration share one closed set; host policy still
 /// decides whether a declared capability is executable. Wire names are the
@@ -2383,12 +2397,13 @@ pub(crate) fn encode_package_sidecar_file(
     .context("encoding sidecar.json")
 }
 
-/// Closed relative-path namespace for a canonical agent package. Write
-/// boundaries must use this even if an upper layer already filtered the map.
-pub(crate) fn validate_package_relative_path(path: &str) -> Result<()> {
-    if path == PACKAGE_ROOT_FILE || path == PACKAGE_MCP_FILE || path == PACKAGE_SIDECAR_FILE {
-        return Ok(());
-    }
+/// Closed relative-path namespace for a nested package markdown file. Reserved
+/// canonical files must never appear as child paths.
+pub(crate) fn validate_package_child_relative_path(path: &str) -> Result<()> {
+    ensure!(
+        !is_reserved_package_file(path),
+        "package path `{path}` reuses a reserved canonical package file"
+    );
     let valid = path.starts_with(&format!("{PACKAGE_SUBAGENTS_DIR}/"))
         && path.ends_with(".md")
         && !path.contains('\\')
@@ -2401,6 +2416,15 @@ pub(crate) fn validate_package_relative_path(path: &str) -> Result<()> {
         "package path `{path}` is outside the canonical agent package namespace"
     );
     Ok(())
+}
+
+/// Closed relative-path namespace for a canonical agent package. Write
+/// boundaries must use this even if an upper layer already filtered the map.
+pub(crate) fn validate_package_relative_path(path: &str) -> Result<()> {
+    if is_reserved_package_file(path) {
+        return Ok(());
+    }
+    validate_package_child_relative_path(path)
 }
 
 fn collect_package_files(agent_dir: &Path) -> Result<BTreeMap<String, Vec<u8>>> {

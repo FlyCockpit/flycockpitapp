@@ -113,6 +113,7 @@ export const authoredSidecarDeclarationSchema = z
 
 export const modelTrustConfirmationSchema = z
   .object({
+    grant_scope: z.string(),
     provider_id: z.string(),
     model_id: z.string(),
     confirmed: z.boolean(),

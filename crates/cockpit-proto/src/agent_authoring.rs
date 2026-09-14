@@ -148,6 +148,8 @@ pub struct AuthoredSidecarDeclaration {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelTrustConfirmation {
+    /// Package-relative definition path, e.g. `agent.md` or `subagents/helper.md`.
+    pub grant_scope: String,
     pub provider_id: String,
     pub model_id: String,
     pub confirmed: bool,

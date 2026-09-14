@@ -728,6 +728,12 @@ impl App {
             } else {
                 self.push_plain(message);
             }
+            if self.composer_controls.dispatch_armed {
+                self.refuse_unbound_composer_control(
+                    &message,
+                    super::composer_controls::ComposerPickerStatus::Unavailable,
+                );
+            }
             return;
         };
         self.next_control_request_seq = self.next_control_request_seq.saturating_add(1);
@@ -739,6 +745,7 @@ impl App {
                 applied,
             },
         );
+        self.bind_composer_control_request(request_id);
         let result = agent_runner::send_control_request(
             &runner.control_tx,
             &runner.events,
@@ -762,6 +769,11 @@ impl App {
             } else {
                 self.push_plain(message);
             }
+            self.refuse_composer_control_for_request(
+                request_id,
+                &message,
+                super::composer_controls::ComposerPickerStatus::Unavailable,
+            );
         }
     }
 
@@ -797,17 +809,17 @@ impl App {
                     self.apply_tokenizer_confirm_outcome(outcome);
                 } else {
                     self.apply_control_success(pending.applied);
-                    self.apply_composer_control_outcome(None);
+                    self.apply_composer_control_outcome(request_id, None, false);
                 }
             }
             ControlRequestOutcome::Applied => {
                 self.apply_control_success(pending.applied);
-                self.apply_composer_control_outcome(None);
+                self.apply_composer_control_outcome(request_id, None, false);
             }
             ControlRequestOutcome::HostCapabilities { snapshot } => {
                 self.apply_host_capabilities(*snapshot);
                 self.apply_control_success(pending.applied);
-                self.apply_composer_control_outcome(None);
+                self.apply_composer_control_outcome(request_id, None, false);
             }
             ControlRequestOutcome::ExitGuardStatus {
                 ephemeral_owner,
@@ -850,7 +862,7 @@ impl App {
                     } else {
                         self.push_plain(message);
                     }
-                    self.apply_composer_control_outcome(Some(&error));
+                    self.apply_composer_control_outcome(request_id, Some(&error), false);
                 }
             }
             ControlRequestOutcome::NotDelivered(reason) => {
@@ -872,6 +884,7 @@ impl App {
                     } else {
                         self.push_plain(message);
                     }
+                    self.apply_composer_control_outcome(request_id, Some(&message), true);
                 }
             }
         }

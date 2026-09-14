@@ -5,8 +5,11 @@
 //! `[Send]` (idle) / `[Queue]` (working) action. Compact, export, and tools
 //! never appear here: those stay at their transcript/header/slash surfaces.
 //!
-//! Layout is planned before paint so pill order, hit regions, and narrow-width
-//! elision have one source of truth. Every label is built from daemon/launch
+//! Layout is planned before paint so pill order, hit regions, and label
+//! compression have one source of truth. The five required pills are never
+//! omitted at the probe widths; labels compress (full → compact → glyph)
+//! before Send/Queue is dropped, and only a degenerate width may elide from
+//! the right as a last resort. Every label is built from daemon/launch
 //! state; the pills are presentation, not local writers.
 
 use ratatui::layout::Rect;
@@ -49,6 +52,26 @@ impl ComposerControlKind {
             Self::Sandbox => "sandbox",
         }
     }
+
+    /// Stable one-character label used when compact names still overflow.
+    pub(crate) fn glyph_label(self) -> &'static str {
+        match self {
+            Self::Agent => "A",
+            Self::Model => "M",
+            Self::Effort => "E",
+            Self::Approval => "P",
+            Self::Sandbox => "S",
+        }
+    }
+}
+
+/// Which label set the planner selected for this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ComposerLabelTier {
+    #[default]
+    Full,
+    Compact,
+    Glyph,
 }
 
 /// One frame's composer-control input snapshot. Built from App state; pure data.
@@ -102,10 +125,11 @@ pub(crate) struct ComposerControlLayout {
     /// Right-side Send/Queue action, when it fits.
     pub send_button: Option<Rect>,
     /// Kinds that did not fit this frame (elided from the right of the
-    /// cluster). Never includes a pill that was drawn.
+    /// cluster). Empty at the probe widths; only a degenerate interior
+    /// may omit a required pill.
     pub omitted: Vec<ComposerControlKind>,
-    /// Whether compact labels were selected.
-    pub compact: bool,
+    /// Label compression selected for this frame.
+    pub tier: ComposerLabelTier,
 }
 
 impl ComposerControlLayout {
@@ -131,12 +155,22 @@ fn pill_width(label: &str) -> u16 {
     display_width(&bracketed_label(label))
 }
 
-fn cluster_width(labels: &[&str]) -> u16 {
+fn cluster_width_with_gap(labels: &[&str], gap: u16) -> u16 {
     if labels.is_empty() {
         return 0;
     }
     let sum: u16 = labels.iter().map(|l| pill_width(l)).sum();
-    sum.saturating_add((labels.len().saturating_sub(1) as u16).saturating_mul(CLUSTER_GAP))
+    sum.saturating_add((labels.len().saturating_sub(1) as u16).saturating_mul(gap))
+}
+
+fn glyph_labels() -> [&'static str; 5] {
+    [
+        ComposerControlKind::Agent.glyph_label(),
+        ComposerControlKind::Model.glyph_label(),
+        ComposerControlKind::Effort.glyph_label(),
+        ComposerControlKind::Approval.glyph_label(),
+        ComposerControlKind::Sandbox.glyph_label(),
+    ]
 }
 
 pub fn send_label(working: bool) -> &'static str {
@@ -148,9 +182,10 @@ pub fn send_label(working: bool) -> &'static str {
 ///
 /// Pills occupy the left of the bottom border in ALL order; Send/Queue is
 /// right-aligned. When the full labels overflow the remaining budget,
-/// compact labels are used. If those still overflow, pills elide from the
-/// right (sandbox first) so the left-to-right order of whatever remains is
-/// unchanged. Compact/export/tools are never planned here.
+/// compact then glyph labels are used. Send/Queue is dropped only after
+/// glyph labels still cannot keep all five pills. A degenerate interior
+/// may elide from the right as a last resort. Compact/export/tools are
+/// never planned here.
 pub(crate) fn plan_composer_controls(
     state: &ComposerControlState,
     area: Rect,
@@ -160,50 +195,132 @@ pub(crate) fn plan_composer_controls(
         ..ComposerControlLayout::default()
     };
     if area.width < 2 || area.height == 0 {
+        layout.omitted.extend(ComposerControlKind::ALL);
         return layout;
     }
     let y = area.y.saturating_add(area.height.saturating_sub(1));
     let send = send_label(state.working);
     let send_w = pill_width(send);
-    // Opening corner, send, closing corner, one gap before send.
-    let send_fits = area.width >= send_w.saturating_add(2);
-    if send_fits {
+    let send_fits_space = area.width >= send_w.saturating_add(2);
+    let full = state.full_labels();
+    let compact = state.compact_labels();
+    let glyph = glyph_labels();
+    for (labels, tier, include_send, gap) in [
+        (full.as_slice(), ComposerLabelTier::Full, true, CLUSTER_GAP),
+        (
+            compact.as_slice(),
+            ComposerLabelTier::Compact,
+            true,
+            CLUSTER_GAP,
+        ),
+        (
+            glyph.as_slice(),
+            ComposerLabelTier::Glyph,
+            true,
+            CLUSTER_GAP,
+        ),
+        (
+            glyph.as_slice(),
+            ComposerLabelTier::Glyph,
+            false,
+            CLUSTER_GAP,
+        ),
+        (glyph.as_slice(), ComposerLabelTier::Glyph, false, 0),
+    ] {
+        if include_send && !send_fits_space {
+            continue;
+        }
+        let send_reserve = if include_send {
+            send_w.saturating_add(1)
+        } else {
+            0
+        };
+        let budget = area.width.saturating_sub(2).saturating_sub(send_reserve);
+        if cluster_width_with_gap(labels, gap) > budget {
+            continue;
+        }
+        return place_pills(
+            layout,
+            labels,
+            tier,
+            include_send.then_some((send_w, y)),
+            gap,
+            y,
+        );
+    }
+
+    // Degenerate last resort: glyph labels, no send, elide from the right.
+    let budget = area.width.saturating_sub(2);
+    let mut keep = glyph.len();
+    while keep > 0 && cluster_width_with_gap(&glyph[..keep], 0) > budget {
+        keep -= 1;
+    }
+    place_pills_truncated(layout, &glyph, keep, y)
+}
+
+fn place_pills(
+    mut layout: ComposerControlLayout,
+    labels: &[&str],
+    tier: ComposerLabelTier,
+    send: Option<(u16, u16)>,
+    gap: u16,
+    y: u16,
+) -> ComposerControlLayout {
+    let area = layout.area;
+    if let Some((send_w, send_y)) = send {
         let send_x = area
             .x
             .saturating_add(area.width.saturating_sub(1))
             .saturating_sub(send_w);
         layout.send_button = Some(Rect {
             x: send_x,
-            y,
+            y: send_y,
             width: send_w,
             height: 1,
         });
     }
-    let send_reserve = if send_fits {
-        send_w.saturating_add(1)
-    } else {
-        0
-    };
-    // Interior after the left corner, before the send gap/action/right corner.
-    let budget = area.width.saturating_sub(2).saturating_sub(send_reserve);
-    let full = state.full_labels();
-    let compact = state.compact_labels();
-    let (labels, used_compact) = if cluster_width(&full) <= budget {
-        (full, false)
-    } else {
-        (compact, true)
-    };
-    layout.compact = used_compact;
-
-    let mut keep = labels.len();
-    while keep > 0 && cluster_width(&labels[..keep]) > budget {
-        keep -= 1;
-    }
-    let mut x = area.x.saturating_add(1);
+    layout.tier = tier;
     let end = layout
         .send_button
-        .map(|rect| rect.x.saturating_sub(CLUSTER_GAP))
+        .map(|rect| rect.x.saturating_sub(gap.max(1)))
         .unwrap_or_else(|| area.x.saturating_add(area.width.saturating_sub(1)));
+    let mut x = area.x.saturating_add(1);
+    for (i, kind) in ComposerControlKind::ALL.iter().copied().enumerate() {
+        let Some(label) = labels.get(i) else {
+            layout.omitted.push(kind);
+            continue;
+        };
+        let w = pill_width(label);
+        if x.saturating_add(w) > end {
+            layout.omitted.push(kind);
+            continue;
+        }
+        layout.pill_buttons.push((
+            kind,
+            Rect {
+                x,
+                y,
+                width: w,
+                height: 1,
+            },
+        ));
+        x = x.saturating_add(w).saturating_add(gap);
+    }
+    layout
+}
+
+fn place_pills_truncated(
+    mut layout: ComposerControlLayout,
+    labels: &[&str],
+    keep: usize,
+    y: u16,
+) -> ComposerControlLayout {
+    layout.tier = ComposerLabelTier::Glyph;
+    let mut x = layout.area.x.saturating_add(1);
+    let end = layout
+        .area
+        .x
+        .saturating_add(layout.area.width.saturating_sub(1));
     for (i, kind) in ComposerControlKind::ALL.iter().copied().enumerate() {
         if i >= keep {
             layout.omitted.push(kind);
@@ -223,7 +340,7 @@ pub(crate) fn plan_composer_controls(
                 height: 1,
             },
         ));
-        x = x.saturating_add(w).saturating_add(CLUSTER_GAP);
+        x = x.saturating_add(w);
     }
     layout
 }
@@ -329,21 +446,35 @@ mod tests {
     }
 
     #[test]
-    fn narrow_width_elides_from_the_right_preserving_order() {
+    fn narrow_width_keeps_all_five_pills_in_order() {
         let layout = plan_composer_controls(&state(), Rect::new(0, 0, 40, 3));
         let kinds = layout.active_kinds();
-        assert!(!kinds.is_empty(), "at least agent survives");
-        assert_eq!(kinds.first().copied(), Some(ComposerControlKind::Agent));
-        for window in kinds.windows(2) {
-            assert!(window[0] < window[1], "elision keeps ALL order");
-        }
-        for omitted in &layout.omitted {
-            assert!(
-                kinds.iter().all(|k| k < omitted),
-                "omitted {omitted:?} is to the right of visible pills"
-            );
-        }
+        assert_eq!(kinds, ComposerControlKind::ALL);
+        assert!(layout.omitted.is_empty());
+        assert_eq!(layout.tier, ComposerLabelTier::Glyph);
         assert!(layout.send_button.is_some());
+        let mut x = 0;
+        for (kind, rect) in &layout.pill_buttons {
+            assert_eq!(rect.y, 2);
+            assert!(rect.x >= x, "{kind:?} overlaps previous");
+            x = rect.x + rect.width;
+        }
+        let send = layout.send_button.expect("send fits next to glyphs");
+        assert!(send.x > layout.pill_buttons.last().unwrap().1.x);
+    }
+
+    #[test]
+    fn probe_widths_keep_all_five_pills_in_order() {
+        for width in COMPOSER_CONTROL_PROBE_WIDTHS {
+            let layout = plan_composer_controls(&state(), Rect::new(0, 0, width, 3));
+            assert_eq!(
+                layout.active_kinds(),
+                ComposerControlKind::ALL,
+                "width {width}"
+            );
+            assert!(layout.omitted.is_empty(), "width {width}");
+            assert!(layout.send_button.is_some(), "width {width}");
+        }
     }
 
     #[test]

@@ -144,10 +144,12 @@ fn composer_bottom_border_has_five_pills_then_send_at_wide_and_narrow() {
             !border.to_lowercase().contains("tools"),
             "no tools on bottom border at {width}: {border:?}"
         );
-        if width >= 80 {
-            assert_eq!(kinds, ComposerControlKind::ALL.to_vec(), "wide {width}");
-            assert!(border.contains("[Send]") || border.contains("Send"));
-        }
+        assert_eq!(
+            kinds,
+            ComposerControlKind::ALL.to_vec(),
+            "all five pills at {width}"
+        );
+        assert!(border.contains("[Send]") || border.contains("Send"));
     }
 }
 
@@ -236,19 +238,133 @@ fn composer_picker_discards_stale_generation_and_session() {
     assert!(app.composer_controls.picker.is_none());
     assert_ne!(app.composer_controls.generation, prior_generation);
     app.activate_composer_pill(ComposerControlKind::Approval);
+    let request_id = ControlRequestId(7);
     app.composer_controls.pending = Some(super::composer_controls::PendingComposerMutation {
         generation: prior_generation,
         session_id: app.launch.session_id,
         attachment_epoch: app.visible_attachment_epoch,
         kind: ComposerControlKind::Approval,
+        request_id: Some(request_id),
     });
-    app.apply_composer_control_outcome(None);
+    app.apply_composer_control_outcome(request_id, None, false);
     assert!(
         app.composer_controls.picker.as_ref().is_some_and(|p| p
             .status_text
             .as_deref()
             .is_some_and(|text| text.contains("Stale"))),
         "late result from a prior generation is discarded"
+    );
+}
+
+#[test]
+fn composer_mutation_waits_for_originating_request_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _control_rx) = app_with_runner(&tmp);
+    app.activate_composer_pill(ComposerControlKind::Approval);
+    app.handle_key(press(KeyCode::Enter));
+    let pending = app
+        .composer_controls
+        .pending
+        .clone()
+        .expect("approval mutation is pending");
+    let request_id = pending.request_id.expect("pending is bound to a request");
+    assert_eq!(
+        app.composer_controls
+            .picker
+            .as_ref()
+            .map(|picker| picker.status),
+        Some(super::composer_controls::ComposerPickerStatus::Loading)
+    );
+
+    app.send_daemon_request(
+        "/preflight",
+        Request::SetPreflight {
+            enabled: Some(true),
+        },
+        super::ControlApplied::None,
+    );
+    app.apply_event(
+        cockpit_client::presentation::TurnEvent::ControlRequestFinished {
+            request_id: ControlRequestId(request_id.0.saturating_add(1)),
+            outcome: ControlRequestOutcome::Applied,
+        },
+    );
+    assert!(
+        app.composer_controls.pending.is_some(),
+        "an unrelated applied request must not confirm the composer mutation"
+    );
+    assert_eq!(
+        app.composer_controls
+            .picker
+            .as_ref()
+            .map(|picker| picker.status),
+        Some(super::composer_controls::ComposerPickerStatus::Loading)
+    );
+
+    app.apply_event(
+        cockpit_client::presentation::TurnEvent::ControlRequestFinished {
+            request_id,
+            outcome: ControlRequestOutcome::Applied,
+        },
+    );
+    assert!(app.composer_controls.pending.is_none());
+    assert!(app.composer_controls.picker.is_none());
+}
+
+#[test]
+fn composer_dispatch_failure_clears_applying_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    app.activate_composer_pill(ComposerControlKind::Approval);
+    app.handle_key(press(KeyCode::Enter));
+    assert!(
+        app.composer_controls.pending.is_none(),
+        "failed dispatch must not leave a pending mutation"
+    );
+    let picker = app
+        .composer_controls
+        .picker
+        .as_ref()
+        .expect("picker stays open");
+    assert_eq!(
+        picker.status,
+        super::composer_controls::ComposerPickerStatus::Unavailable
+    );
+    assert!(
+        picker
+            .status_text
+            .as_deref()
+            .is_some_and(|text| text.contains("start a session") || text.contains("not delivered")),
+        "refused/unavailable copy, got {:?}",
+        picker.status_text
+    );
+
+    let (mut app, _control_rx) = app_with_runner(&tmp);
+    app.activate_composer_pill(ComposerControlKind::Approval);
+    app.handle_key(press(KeyCode::Enter));
+    let request_id = app
+        .composer_controls
+        .pending
+        .as_ref()
+        .and_then(|pending| pending.request_id)
+        .expect("bound request");
+    app.apply_event(
+        cockpit_client::presentation::TurnEvent::ControlRequestFinished {
+            request_id,
+            outcome: ControlRequestOutcome::NotDelivered(
+                cockpit_client::presentation::ControlRequestNotDelivered::ChannelClosed,
+            ),
+        },
+    );
+    assert!(app.composer_controls.pending.is_none());
+    let picker = app
+        .composer_controls
+        .picker
+        .as_ref()
+        .expect("picker stays open");
+    assert_eq!(
+        picker.status,
+        super::composer_controls::ComposerPickerStatus::Unavailable
     );
 }
 
@@ -362,14 +478,51 @@ fn approval_and_sandbox_pills_are_capability_gated() {
     app.approval_mode = ApprovalMode::Manual;
     app.activate_composer_pill(ComposerControlKind::Approval);
     let picker = app.composer_controls.picker.as_ref().expect("approval");
-    let labels: Vec<_> = picker
+    let items: Vec<_> = picker
         .categories
         .iter()
-        .flat_map(|c| c.items.iter().map(|i| i.label.as_str()))
+        .flat_map(|c| c.items.iter())
         .collect();
-    assert!(labels.contains(&"manual"));
-    assert!(labels.contains(&"auto"));
-    assert!(labels.contains(&"yolo"));
+    assert!(
+        items
+            .iter()
+            .any(|item| item.label == "manual" && item.selectable)
+    );
+    assert!(
+        items
+            .iter()
+            .any(|item| item.label == "auto" && !item.selectable),
+        "auto must stay trust-gated without a trusted workspace: {:?}",
+        items
+            .iter()
+            .map(|item| (&item.label, item.selectable, &item.hint))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        items
+            .iter()
+            .any(|item| item.label == "yolo" && !item.selectable),
+        "yolo must stay trust-gated without a trusted workspace"
+    );
+
+    let tmp_trusted = tempfile::tempdir().unwrap();
+    cockpit_config::trust::with_workspace_trust_policy(
+        super::trusted_workspace_policy_for_tests(tmp_trusted.path()),
+        || {
+            let mut trusted = app(&tmp_trusted);
+            trusted.activate_composer_pill(ComposerControlKind::Approval);
+            let picker = trusted.composer_controls.picker.as_ref().expect("approval");
+            assert!(
+                picker
+                    .categories
+                    .iter()
+                    .flat_map(|c| &c.items)
+                    .filter(|item| item.label == "auto" || item.label == "yolo")
+                    .all(|item| item.selectable),
+                "trusted workspace may select auto/yolo"
+            );
+        },
+    );
 }
 
 #[test]
@@ -491,32 +644,130 @@ fn queue_item_and_box_controls_have_mouse_and_key_parity() {
     assert!(!queue_ui.to_lowercase().contains("mid-tool kill"));
 }
 
-#[test]
-fn empty_composer_enter_is_the_safe_ladder() {
+fn runner_with_attached_rx() -> (
+    crate::tui::agent_runner::AgentRunner,
+    mpsc::Receiver<crate::tui::agent_runner::AttachedRequest>,
+) {
+    let (attached_request_tx, attached_request_rx) = mpsc::channel(8);
+    let runner = crate::tui::agent_runner::AgentRunner::test_fixture(
+        crate::tui::agent_runner::TestRunnerOverrides {
+            attached_request_tx: Some(attached_request_tx),
+            ..Default::default()
+        },
+    );
+    (runner, attached_request_rx)
+}
+
+async fn take_and_ack_queue_request(
+    app: &mut App,
+    rx: &mut mpsc::Receiver<crate::tui::agent_runner::AttachedRequest>,
+) -> Request {
+    for _ in 0..40 {
+        app.drain_async_actions();
+        if let Ok(attached) = rx.try_recv() {
+            let request = attached.request;
+            let _ = attached.response_tx.send(Ok(cockpit_proto::Response::Ack));
+            tokio::task::yield_now().await;
+            app.drain_async_actions();
+            return request;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("queue control RPC was not delivered")
+}
+
+#[tokio::test]
+async fn empty_composer_enter_is_the_safe_ladder() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app(&tmp);
+    let (mut app, mut attached_rx) = {
+        let mut app = app(&tmp);
+        let (runner, rx) = runner_with_attached_rx();
+        app.agent_runner = Some(Ok(runner));
+        (app, rx)
+    };
+
     app.handle_empty_composer_enter();
-    assert!(app.queue.is_empty(), "empty queue is a no-op");
+    tokio::task::yield_now().await;
+    app.drain_async_actions();
+    assert!(attached_rx.try_recv().is_err(), "empty queue emits no RPC");
+    assert!(app.queue.is_empty());
 
     let held = queue_item("held", QueueDeliveryClass::Held);
+    let held_id = held.id;
+    let held_target = held.target.clone();
     app.queue.push(held);
     app.handle_empty_composer_enter();
-    // Promote is requested; snapshot application is daemon-owned.
+    let request = take_and_ack_queue_request(&mut app, &mut attached_rx).await;
+    match request {
+        Request::PromoteQueuedUserMessages { delivery_class } => {
+            assert_eq!(delivery_class, QueueDeliveryClass::Steering);
+        }
+        other => panic!("held-only must promote, got {other:?}"),
+    }
+    assert_eq!(app.queue[0].id, held_id);
+    assert_eq!(app.queue[0].target, held_target);
     assert_eq!(app.queue[0].delivery_class, QueueDeliveryClass::Held);
 
-    app.queue[0].delivery_class = QueueDeliveryClass::Steering;
+    app.queue.clear();
+    let steer = queue_item("steer", QueueDeliveryClass::Steering);
+    let steer_id = steer.id;
+    let steer_target = steer.target.clone();
+    app.queue.push(steer);
     app.handle_empty_composer_enter();
-    assert_eq!(app.queue[0].id, app.queue[0].id);
+    let request = take_and_ack_queue_request(&mut app, &mut attached_rx).await;
+    match request {
+        Request::SendNowQueuedUserMessage { queue_item_id } => {
+            assert_eq!(queue_item_id, None, "box-level send-now has no item id");
+        }
+        other => panic!("steering-only must send-now, got {other:?}"),
+    }
+    assert_eq!(app.queue[0].id, steer_id);
+    assert_eq!(app.queue[0].target, steer_target);
     assert_eq!(app.queue[0].delivery_class, QueueDeliveryClass::Steering);
+    assert!(!app.queue[0].send_now);
 
     let mixed_held = queue_item("h", QueueDeliveryClass::Held);
     let mixed_steer = queue_item("s", QueueDeliveryClass::Steering);
-    let held_id = mixed_held.id;
-    let steer_id = mixed_steer.id;
+    let mixed_held_id = mixed_held.id;
+    let mixed_steer_id = mixed_steer.id;
+    let mixed_held_target = mixed_held.target.clone();
+    let mixed_steer_target = mixed_steer.target.clone();
     app.queue = vec![mixed_held, mixed_steer];
     app.handle_empty_composer_enter();
-    assert_eq!(app.queue[0].id, held_id);
-    assert_eq!(app.queue[1].id, steer_id);
+    let request = take_and_ack_queue_request(&mut app, &mut attached_rx).await;
+    match request {
+        Request::PromoteQueuedUserMessages { delivery_class } => {
+            assert_eq!(delivery_class, QueueDeliveryClass::Steering);
+        }
+        other => panic!("mixed queue must promote, got {other:?}"),
+    }
+    assert!(
+        attached_rx.try_recv().is_err(),
+        "mixed queue must not also request send-now"
+    );
+    assert_eq!(app.queue[0].id, mixed_held_id);
+    assert_eq!(app.queue[1].id, mixed_steer_id);
+    assert_eq!(app.queue[0].target, mixed_held_target);
+    assert_eq!(app.queue[1].target, mixed_steer_target);
+    assert_eq!(app.queue[0].delivery_class, QueueDeliveryClass::Held);
+    assert_eq!(app.queue[1].delivery_class, QueueDeliveryClass::Steering);
+
+    app.queue[0].delivery_class = QueueDeliveryClass::Steering;
+    app.handle_empty_composer_enter();
+    let request = take_and_ack_queue_request(&mut app, &mut attached_rx).await;
+    assert!(matches!(
+        request,
+        Request::SendNowQueuedUserMessage {
+            queue_item_id: None
+        }
+    ));
+    assert_eq!(app.queue[0].id, mixed_held_id);
+    assert_eq!(app.queue[1].id, mixed_steer_id);
+    assert!(
+        app.queue
+            .iter()
+            .all(|item| item.delivery_class == QueueDeliveryClass::Steering && !item.send_now)
+    );
 }
 
 #[test]

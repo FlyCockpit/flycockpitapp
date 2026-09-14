@@ -1040,44 +1040,120 @@ mod tests {
         assert_eq!(app.queue[0].text, "two");
     }
 
-    #[test]
-    fn setting_off_empty_enter_promotes_held_queue() {
+    fn runner_with_attached_rx() -> (
+        crate::tui::agent_runner::AgentRunner,
+        tokio::sync::mpsc::Receiver<crate::tui::agent_runner::AttachedRequest>,
+    ) {
+        let (attached_request_tx, attached_request_rx) = tokio::sync::mpsc::channel(8);
+        let runner = crate::tui::agent_runner::AgentRunner::test_fixture(
+            crate::tui::agent_runner::TestRunnerOverrides {
+                attached_request_tx: Some(attached_request_tx),
+                ..Default::default()
+            },
+        );
+        (runner, attached_request_rx)
+    }
+
+    async fn take_and_ack_queue_request(
+        app: &mut App,
+        rx: &mut tokio::sync::mpsc::Receiver<crate::tui::agent_runner::AttachedRequest>,
+    ) -> Request {
+        for _ in 0..40 {
+            app.drain_async_actions();
+            if let Ok(attached) = rx.try_recv() {
+                let request = attached.request;
+                let _ = attached.response_tx.send(Ok(cockpit_proto::Response::Ack));
+                tokio::task::yield_now().await;
+                app.drain_async_actions();
+                return request;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("queue control RPC was not delivered")
+    }
+
+    #[tokio::test]
+    async fn setting_off_empty_enter_promotes_held_queue() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
+        let (runner, mut attached_rx) = runner_with_attached_rx();
+        app.agent_runner = Some(Ok(runner));
         app.config_snapshot.extended.queued_messages_as_steering = false;
-        app.queue.push(item("held", QueueDeliveryClass::Held));
+        let held = item("held", QueueDeliveryClass::Held);
+        let held_id = held.id;
+        let held_target = held.target.clone();
+        app.queue.push(held);
         app.handle_empty_composer_enter();
-        app.queue_promote_all(QueueDeliveryClass::Steering);
+        match take_and_ack_queue_request(&mut app, &mut attached_rx).await {
+            Request::PromoteQueuedUserMessages { delivery_class } => {
+                assert_eq!(delivery_class, QueueDeliveryClass::Steering);
+            }
+            other => panic!("expected promote, got {other:?}"),
+        }
+        assert_eq!(app.queue[0].id, held_id);
+        assert_eq!(app.queue[0].target, held_target);
+        assert_eq!(app.queue[0].delivery_class, QueueDeliveryClass::Held);
         let mut queue = app.queue.clone();
         queue[0].delivery_class = QueueDeliveryClass::Steering;
         apply_snapshot(&mut app, queue);
         assert_eq!(app.queue[0].delivery_class, QueueDeliveryClass::Steering);
+        assert_eq!(app.queue[0].id, held_id);
     }
 
-    #[test]
-    fn empty_enter_ladder_held_then_send_now() {
+    #[tokio::test]
+    async fn empty_enter_ladder_held_then_send_now() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
+        let (runner, mut attached_rx) = runner_with_attached_rx();
+        app.agent_runner = Some(Ok(runner));
         assert!(app.queue.is_empty());
         app.handle_empty_composer_enter();
+        tokio::task::yield_now().await;
+        app.drain_async_actions();
+        assert!(attached_rx.try_recv().is_err(), "empty queue is a no-op");
         assert!(app.queue.is_empty());
 
         let held = item("held", QueueDeliveryClass::Held);
         let steer = item("steer", QueueDeliveryClass::Steering);
         let held_id = held.id;
         let steer_id = steer.id;
+        let held_target = held.target.clone();
+        let steer_target = steer.target.clone();
         app.queue.extend([held, steer]);
         app.handle_empty_composer_enter();
+        match take_and_ack_queue_request(&mut app, &mut attached_rx).await {
+            Request::PromoteQueuedUserMessages { delivery_class } => {
+                assert_eq!(delivery_class, QueueDeliveryClass::Steering);
+            }
+            other => panic!("mixed queue must promote first, got {other:?}"),
+        }
+        assert!(
+            attached_rx.try_recv().is_err(),
+            "mixed queue must not send-now on the first empty Enter"
+        );
         assert_eq!(app.queue[0].id, held_id);
         assert_eq!(app.queue[1].id, steer_id);
+        assert_eq!(app.queue[0].target, held_target);
+        assert_eq!(app.queue[1].target, steer_target);
         assert_eq!(app.queue[0].delivery_class, QueueDeliveryClass::Held);
         assert_eq!(app.queue[1].delivery_class, QueueDeliveryClass::Steering);
 
         app.queue[0].delivery_class = QueueDeliveryClass::Steering;
         app.handle_empty_composer_enter();
+        match take_and_ack_queue_request(&mut app, &mut attached_rx).await {
+            Request::SendNowQueuedUserMessage { queue_item_id } => {
+                assert_eq!(queue_item_id, None);
+            }
+            other => panic!("steering-only queue must send-now, got {other:?}"),
+        }
         assert_eq!(app.queue[0].id, held_id);
         assert_eq!(app.queue[1].id, steer_id);
         assert!(!app.queue.iter().any(|item| item.send_now));
+        assert!(
+            app.queue
+                .iter()
+                .all(|item| item.delivery_class == QueueDeliveryClass::Steering)
+        );
     }
 
     #[test]

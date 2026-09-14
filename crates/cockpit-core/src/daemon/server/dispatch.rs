@@ -14644,6 +14644,21 @@ async fn handle_serialized_request_impl(
             {
                 return Ok(response);
             }
+            let trust = match crate::config::trust::resolve_workspace_trust_policy_from_db(
+                &ctx.db,
+                &att.handle.project_root,
+            )
+            .await
+            {
+                Ok(policy) => Some(policy.mode),
+                Err(error) => return Err(workspace_trust_error(error)),
+            };
+            if let Some(reason) = mode.session_set_block_reason(trust) {
+                return Err(ErrorPayload {
+                    code: ErrorCode::WorkspaceTrust,
+                    message: reason,
+                });
+            }
             let mode = att.handle.set_approval_mode(mode);
             let response = Response::ApprovalModeState { mode };
             finish_nonrepeatable_response!(remote_operation, ctx, "set_approval_mode", response)

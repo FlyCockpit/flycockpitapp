@@ -4,9 +4,10 @@
 use super::input::is_modifier_only;
 use super::*;
 use crate::tui::composer_controls::{
-    ComposerControlKind, ComposerControlLayout, ComposerControlState, plan_composer_controls,
-    send_label,
+    ComposerControlKind, ComposerControlLayout, ComposerControlState, ComposerLabelTier,
+    plan_composer_controls, send_label,
 };
+use cockpit_client::presentation::ControlRequestId;
 use cockpit_config::extended::ApprovalMode;
 use cockpit_config::providers::{ActiveModelRef, ActiveReasoningEffort, ThinkingMode};
 use cockpit_core::daemon::session_worker::{sandbox_mode_available, sandbox_mode_selectable};
@@ -31,6 +32,10 @@ pub(super) struct ComposerControlUi {
     pub layout: Option<ComposerControlLayout>,
     pub picker_rect: Option<Rect>,
     pub pending: Option<PendingComposerMutation>,
+    /// Set while a composer commit is dispatching so `send_daemon_request`
+    /// binds the originating `ControlRequestId` and failure paths refuse
+    /// this pending mutation instead of an unrelated in-flight request.
+    pub dispatch_armed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +44,7 @@ pub(super) struct PendingComposerMutation {
     pub session_id: Option<Uuid>,
     pub attachment_epoch: u64,
     pub kind: ComposerControlKind,
+    pub request_id: Option<ControlRequestId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +141,7 @@ impl App {
         self.composer_controls.picker = None;
         self.composer_controls.picker_rect = None;
         self.composer_controls.pending = None;
+        self.composer_controls.dispatch_armed = false;
         self.composer_controls.selection = None;
     }
 
@@ -220,10 +227,13 @@ impl App {
 
         use crate::tui::button::{ButtonDispatch, ButtonId, ButtonSpec};
         let selected = self.composer_controls.selection;
-        let labels = if layout.compact {
-            state.compact_labels_owned()
-        } else {
-            state.full_labels_owned()
+        let labels = match layout.tier {
+            ComposerLabelTier::Full => state.full_labels_owned(),
+            ComposerLabelTier::Compact => state.compact_labels_owned(),
+            ComposerLabelTier::Glyph => ComposerControlKind::ALL
+                .iter()
+                .map(|kind| kind.glyph_label().to_string())
+                .collect(),
         };
         for (kind, rect) in &layout.pill_buttons {
             let idx = ComposerControlKind::ALL
@@ -431,6 +441,7 @@ impl App {
         self.composer_controls.picker = None;
         self.composer_controls.picker_rect = None;
         self.composer_controls.pending = None;
+        self.composer_controls.dispatch_armed = false;
     }
 
     pub(super) fn activate_composer_pill(&mut self, kind: ComposerControlKind) {
@@ -673,17 +684,26 @@ impl App {
     }
 
     fn fill_approval_picker(&self, picker: &mut ComposerPicker) {
+        let trust =
+            cockpit_config::trust::current_workspace_trust_policy().map(|policy| policy.mode);
         let items = [ApprovalMode::Manual, ApprovalMode::Auto, ApprovalMode::Yolo]
             .into_iter()
-            .map(|mode| ComposerPickerItem {
-                id: mode.as_str().to_string(),
-                label: mode.as_str().to_string(),
-                hint: if mode == self.approval_mode {
+            .map(|mode| {
+                let selectable = mode.session_set_allowed(trust);
+                let hint = if !selectable {
+                    mode.session_set_block_reason(trust)
+                        .unwrap_or_else(|| "requires workspace trust".to_string())
+                } else if mode == self.approval_mode {
                     "current".to_string()
                 } else {
                     String::new()
-                },
-                selectable: true,
+                };
+                ComposerPickerItem {
+                    id: mode.as_str().to_string(),
+                    label: mode.as_str().to_string(),
+                    hint,
+                    selectable,
+                }
             })
             .collect();
         picker.categories.push(ComposerPickerCategory {
@@ -904,7 +924,9 @@ impl App {
             session_id: picker.session_id,
             attachment_epoch: picker.attachment_epoch,
             kind,
+            request_id: None,
         });
+        self.composer_controls.dispatch_armed = true;
         self.composer_controls.picker = Some(picker);
         match kind {
             ComposerControlKind::Agent => {
@@ -936,11 +958,20 @@ impl App {
             ComposerControlKind::Effort => self.commit_effort_item(&item.id),
             ComposerControlKind::Approval => {
                 if let Ok(mode) = item.id.parse::<ApprovalModeParse>() {
-                    self.send_daemon_request(
-                        "approval",
-                        cockpit_proto::Request::SetApprovalMode { mode: mode.0 },
-                        ControlApplied::None,
-                    );
+                    let trust = cockpit_config::trust::current_workspace_trust_policy()
+                        .map(|policy| policy.mode);
+                    if let Some(reason) = mode.0.session_set_block_reason(trust) {
+                        self.refuse_unbound_composer_control(
+                            &reason,
+                            ComposerPickerStatus::Unavailable,
+                        );
+                    } else {
+                        self.send_daemon_request(
+                            "approval",
+                            cockpit_proto::Request::SetApprovalMode { mode: mode.0 },
+                            ControlApplied::None,
+                        );
+                    }
                 }
             }
             ComposerControlKind::Sandbox => {
@@ -966,10 +997,12 @@ impl App {
                             picker.status_text = Some(instruct.display());
                         }
                         self.composer_controls.pending = None;
+                        self.composer_controls.dispatch_armed = false;
                     }
                 }
             }
         }
+        self.finish_composer_control_dispatch();
     }
 
     fn commit_effort_item(&mut self, id: &str) {
@@ -1012,7 +1045,79 @@ impl App {
         );
     }
 
-    pub(super) fn apply_composer_control_outcome(&mut self, rejected: Option<&str>) {
+    pub(super) fn bind_composer_control_request(&mut self, request_id: ControlRequestId) {
+        if !self.composer_controls.dispatch_armed {
+            return;
+        }
+        if let Some(pending) = self.composer_controls.pending.as_mut()
+            && pending.request_id.is_none()
+        {
+            pending.request_id = Some(request_id);
+        }
+        self.composer_controls.dispatch_armed = false;
+    }
+
+    pub(super) fn refuse_composer_control_for_request(
+        &mut self,
+        request_id: ControlRequestId,
+        message: &str,
+        status: ComposerPickerStatus,
+    ) {
+        let matches = self
+            .composer_controls
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.request_id == Some(request_id));
+        if matches || self.composer_controls.dispatch_armed {
+            self.refuse_unbound_composer_control(message, status);
+        }
+    }
+
+    pub(super) fn refuse_unbound_composer_control(
+        &mut self,
+        message: &str,
+        status: ComposerPickerStatus,
+    ) {
+        self.composer_controls.dispatch_armed = false;
+        self.composer_controls.pending = None;
+        if let Some(picker) = self.composer_controls.picker.as_mut() {
+            picker.status = status;
+            picker.status_text = Some(message.to_string());
+        }
+    }
+
+    fn finish_composer_control_dispatch(&mut self) {
+        if !self.composer_controls.dispatch_armed {
+            return;
+        }
+        self.composer_controls.dispatch_armed = false;
+        if self
+            .composer_controls
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.request_id.is_none())
+        {
+            self.refuse_unbound_composer_control(
+                "Control request was not delivered.",
+                ComposerPickerStatus::Unavailable,
+            );
+        }
+    }
+
+    pub(super) fn apply_composer_control_outcome(
+        &mut self,
+        request_id: ControlRequestId,
+        rejected: Option<&str>,
+        unavailable: bool,
+    ) {
+        let matches_request = self
+            .composer_controls
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.request_id == Some(request_id));
+        if !matches_request {
+            return;
+        }
         let Some(pending) = self.composer_controls.pending.take() else {
             return;
         };
@@ -1031,7 +1136,11 @@ impl App {
         }
         if let Some(error) = rejected {
             if let Some(picker) = self.composer_controls.picker.as_mut() {
-                picker.status = ComposerPickerStatus::Refused;
+                picker.status = if unavailable {
+                    ComposerPickerStatus::Unavailable
+                } else {
+                    ComposerPickerStatus::Refused
+                };
                 picker.status_text = Some(error.to_string());
             }
             return;

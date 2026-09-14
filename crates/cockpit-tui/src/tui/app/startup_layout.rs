@@ -119,12 +119,172 @@ impl App {
     }
 
     pub fn configure_onboarding_launch(&mut self, skip: bool, force: bool) {
+        self.configure_onboarding_launch_with_setup_wizard(skip, force, None);
+    }
+
+    pub fn configure_onboarding_launch_with_setup_wizard(
+        &mut self,
+        skip: bool,
+        force: bool,
+        setup_wizard: Option<String>,
+    ) {
         self.onboarding_skip = skip;
         self.onboarding_force = force;
+        self.pending_setup_wizard = setup_wizard;
         if skip {
             self.onboarding_snapshot = None;
             self.onboarding_shell = None;
             self.dialog = crate::tui::settings::Dialog::None;
+        }
+    }
+
+    /// After a committed authored-agent apply, the daemon publishes sidecar
+    /// config and bumps the inventory generation. Keep the held snapshot in
+    /// sync so onboarding settlement fences match the authority.
+    pub(super) fn sync_config_generation_after_authored_agent_apply(&mut self) {
+        let generation = cockpit_core::daemon::published_config_generation();
+        self.config_snapshot.generation = self.config_snapshot.generation.max(generation);
+        self.config_snapshot
+            .providers
+            .set_resolution_generation(self.config_snapshot.generation);
+    }
+
+    fn maybe_open_pending_setup_wizard(&mut self) {
+        if !self.startup_background.workspace_ready {
+            return;
+        }
+        if let Some(wizard) = self.pending_setup_wizard.take() {
+            self.open_onboarding_setup(Some(&wizard));
+        }
+    }
+
+    /// Route `/setup` and equivalent interactive onboarding entrypoints through
+    /// the full-screen shell instead of the legacy settings-modal wizards.
+    pub(super) fn open_onboarding_setup(&mut self, wizard_id: Option<&str>) {
+        if self.onboarding_skip {
+            self.push_plain("Onboarding is skipped for this launch (`--skip-setup`).");
+            return;
+        }
+        self.onboarding_dismissed = false;
+        self.onboarding_force = wizard_id.is_none();
+        match wizard_id {
+            None => {
+                if self.onboarding_shell.is_none() {
+                    if let Some(snapshot) = self.onboarding_snapshot.clone() {
+                        self.reopen_onboarding_shell(&snapshot);
+                    } else {
+                        self.start_onboarding_bootstrap_fetch();
+                    }
+                }
+            }
+            Some(cockpit_core::wizard::PROVIDER_WIZARD_ID) => {
+                if self.onboarding_snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot.stage == cockpit_proto::OnboardingStage::Complete
+                }) {
+                    let snapshot = self.onboarding_snapshot.clone().unwrap_or_else(|| {
+                        cockpit_proto::OnboardingBootstrapSnapshot {
+                            run_id: uuid::Uuid::new_v4(),
+                            attempt_id: uuid::Uuid::new_v4(),
+                            revision: 0,
+                            stage: cockpit_proto::OnboardingStage::Complete,
+                            bootstrap_state: cockpit_proto::OnboardingBootstrapState::Ready,
+                            limited_mode: false,
+                            lifetime_selection: None,
+                            host_capabilities: self.host_capabilities.clone(),
+                            last_receipt: None,
+                        }
+                    });
+                    if self.onboarding_shell.is_none() {
+                        self.onboarding_shell =
+                            Some(Box::new(crate::tui::onboarding::OnboardingShell::new(
+                                &snapshot,
+                                crate::tui::onboarding::reduced_motion_enabled(),
+                            )));
+                        if let Some(shell) = self.onboarding_shell.as_mut() {
+                            shell.present_completion("Cockpit is ready.".to_string());
+                            shell.begin_completion_provider_detour(None);
+                        }
+                    } else if let Some(shell) = self.onboarding_shell.as_mut() {
+                        shell.begin_completion_provider_detour(None);
+                    }
+                } else {
+                    let snapshot = self.onboarding_snapshot.clone().unwrap_or_else(|| {
+                        cockpit_proto::OnboardingBootstrapSnapshot {
+                            run_id: uuid::Uuid::new_v4(),
+                            attempt_id: uuid::Uuid::new_v4(),
+                            revision: 0,
+                            stage: cockpit_proto::OnboardingStage::Provider,
+                            bootstrap_state: cockpit_proto::OnboardingBootstrapState::Ready,
+                            limited_mode: false,
+                            lifetime_selection: None,
+                            host_capabilities: self.host_capabilities.clone(),
+                            last_receipt: None,
+                        }
+                    });
+                    self.reopen_onboarding_shell(&snapshot);
+                }
+            }
+            Some(cockpit_core::wizard::SECURITY_WIZARD_ID) => {
+                self.mount_setup_wizard_in_onboarding_shell(
+                    cockpit_core::wizard::SECURITY_WIZARD_ID,
+                    None,
+                );
+            }
+            Some(cockpit_core::wizard::MODEL_WIZARD_ID) => {
+                self.mount_setup_wizard_in_onboarding_shell(
+                    cockpit_core::wizard::MODEL_WIZARD_ID,
+                    None,
+                );
+            }
+            Some(other) => {
+                self.push_plain(format!(
+                    "Unknown setup wizard `{other}`; run `/setup` to reopen onboarding."
+                ));
+            }
+        }
+    }
+
+    fn mount_setup_wizard_in_onboarding_shell(
+        &mut self,
+        wizard_id: &str,
+        preselected_model: Option<(&str, &str)>,
+    ) {
+        let snapshot = self.onboarding_snapshot.clone().unwrap_or_else(|| {
+            cockpit_proto::OnboardingBootstrapSnapshot {
+                run_id: uuid::Uuid::new_v4(),
+                attempt_id: uuid::Uuid::new_v4(),
+                revision: 0,
+                stage: cockpit_proto::OnboardingStage::Complete,
+                bootstrap_state: cockpit_proto::OnboardingBootstrapState::Ready,
+                limited_mode: false,
+                lifetime_selection: None,
+                host_capabilities: self.host_capabilities.clone(),
+                last_receipt: None,
+            }
+        });
+        if self.onboarding_shell.is_none() {
+            self.onboarding_shell = Some(Box::new(crate::tui::onboarding::OnboardingShell::new(
+                &snapshot,
+                crate::tui::onboarding::reduced_motion_enabled(),
+            )));
+        }
+        match Dialog::open_setup_wizard(&self.launch.cwd, wizard_id) {
+            Ok(dialog) => {
+                self.dialog = dialog;
+                if let Some(shell) = self.onboarding_shell.as_mut() {
+                    shell.present_engine(match wizard_id {
+                        cockpit_core::wizard::SECURITY_WIZARD_ID => {
+                            crate::tui::onboarding::EngineStage::Profile
+                        }
+                        cockpit_core::wizard::MODEL_WIZARD_ID => {
+                            crate::tui::onboarding::EngineStage::Model
+                        }
+                        _ => crate::tui::onboarding::EngineStage::Model,
+                    });
+                }
+                let _ = preselected_model;
+            }
+            Err(error) => self.push_plain(format!("/setup: {error}")),
         }
     }
 
@@ -308,6 +468,7 @@ impl App {
         } else {
             self.onboarding_shell = None;
         }
+        self.maybe_open_pending_setup_wizard();
     }
 
     /// Activate, update, or retire the full-screen onboarding shell so it

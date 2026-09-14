@@ -6265,7 +6265,9 @@ impl Dialog {
                 ))
             }
             cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID => {
-                cockpit_core::wizard::descriptor_for_cwd(wizard_id, &global_root)
+                return Err(
+                    "the onboarding agent stage uses the nested agent authoring editor".into(),
+                );
             }
             cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID => {
                 Some(cockpit_core::wizard::onboarding_lifetime_descriptor())
@@ -6407,6 +6409,15 @@ impl Dialog {
             Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)
                 if wizard.run.descriptor().id == wizard_id && wizard.run.is_complete()
         )
+    }
+
+    pub(crate) fn setup_wizard_settled_config_generation(&self) -> Option<u64> {
+        match self {
+            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard) => {
+                wizard.settled_config_generation
+            }
+            _ => None,
+        }
     }
 
     pub fn setup_wizard_is_complete_any(&self, wizard_ids: &[&str]) -> bool {

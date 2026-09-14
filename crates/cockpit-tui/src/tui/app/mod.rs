@@ -220,6 +220,8 @@ mod control_request_tests;
 mod first_run_daemon_tests;
 #[cfg(test)]
 mod first_run_tests;
+#[cfg(test)]
+mod onboarding_route_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FooterPickerKind {
@@ -2842,6 +2844,9 @@ pub struct App {
     pub(super) onboarding_shell: Option<Box<crate::tui::onboarding::OnboardingShell>>,
     onboarding_skip: bool,
     onboarding_force: bool,
+    /// When set by `cockpit setup <wizard>`, open that wizard in the shell
+    /// after the bootstrap projection lands.
+    pending_setup_wizard: Option<String>,
     /// Occupancy fence: the user explicitly closed the shell (Cancel /
     /// completion exit). Late authority results and concurrent-client
     /// broadcasts still update [`Self::onboarding_snapshot`] but must not
@@ -4188,6 +4193,7 @@ impl App {
             onboarding_shell: None,
             onboarding_skip: false,
             onboarding_force: false,
+            pending_setup_wizard: None,
             onboarding_dismissed: false,
             side_conversation: None,
             daemon_draining: false,

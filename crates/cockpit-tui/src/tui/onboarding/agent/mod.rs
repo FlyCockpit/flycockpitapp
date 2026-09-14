@@ -287,6 +287,16 @@ impl AgentAuthoringScreen {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_phase(&self) -> Phase {
+        self.phase
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_status(&self) -> Option<&str> {
+        self.status.as_deref()
+    }
+
     pub fn help_text(&self) -> &'static str {
         match self.phase {
             Phase::SourceIdentity | Phase::SubagentEdit(SubagentPhase::Identity) => {
@@ -632,6 +642,9 @@ impl AgentAuthoringScreen {
             Phase::SubagentsList => {
                 if self.cursor == 0 {
                     self.begin_add_subagent();
+                    None
+                } else if self.cursor <= self.draft.children.len() {
+                    self.begin_edit_subagent(self.cursor - 1);
                     None
                 } else {
                     self.request_preview()
@@ -1011,6 +1024,11 @@ impl AgentAuthoringScreen {
                         &format!("Edit {}", child.name),
                     ));
                 }
+                lines.push(opt_line(
+                    self.draft.children.len() + 1,
+                    self.cursor,
+                    "Review agent package",
+                ));
             }
             Phase::SubagentEdit(SubagentPhase::Identity) => {
                 lines.push(Line::from(format!("Name: {}", self.name_field.text())));

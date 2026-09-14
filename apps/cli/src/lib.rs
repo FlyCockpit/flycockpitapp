@@ -941,7 +941,7 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         && (tui_mode_for_command(cli.command.as_ref()).is_some()
             || matches!(
                 cli.command.as_ref(),
-                Some(Command::Setup(crate::cli::SetupArgs { wizard: None }))
+                Some(Command::Setup(_))
                     | Some(Command::Assistants(
                         crate::cli::AssistantCommand::Chat { .. }
                     ))
@@ -966,24 +966,25 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
             cli.skip_setup,
             false,
             cli.debug_last_message,
+            None,
         )
         .await;
     }
 
-    if matches!(
-        cli.command.as_ref(),
-        Some(Command::Setup(crate::cli::SetupArgs { wizard: None }))
-    ) {
-        return commands::tui::run_mode(
-            cli.project.as_deref(),
-            cli.no_sandbox,
-            commands::tui::SessionMode::Code,
-            Some(launch_start),
-            false,
-            true,
-            cli.debug_last_message,
-        )
-        .await;
+    if let Some(Command::Setup(args)) = cli.command.as_ref() {
+        if interactive_shell {
+            return commands::tui::run_mode(
+                cli.project.as_deref(),
+                cli.no_sandbox,
+                commands::tui::SessionMode::Code,
+                Some(launch_start),
+                cli.skip_setup,
+                args.wizard.is_none(),
+                cli.debug_last_message,
+                args.wizard.clone(),
+            )
+            .await;
+        }
     }
 
     if cli.debug_last_message && !interactive_shell {
@@ -1758,7 +1759,7 @@ mod tests {
             "None | Some(Command::Code)",
             "Some(Command::Assistant)",
             "Some(Command::Computer)",
-            "Some(Command::Setup(crate::cli::SetupArgs { wizard: None }))",
+            "Some(Command::Setup(_))",
             "AssistantCommand::Chat { name }",
             "run_with_session",
         ] {
@@ -1767,7 +1768,14 @@ mod tests {
                 "interactive route `{route}` is missing from the dispatch inventory"
             );
         }
-        assert!(lib.contains("Some(Command::Setup(args)) => commands::setup::run(args).await"));
+        assert!(
+            lib.contains("Some(Command::Setup(args))") && lib.contains("interactive_shell"),
+            "named setup wizards must route through the TUI shell when stdin is a TTY"
+        );
+        assert!(
+            lib.contains("Some(Command::Setup(args)) => commands::setup::run(args).await"),
+            "non-interactive setup must keep the typed InteractiveOnboardingRequired path"
+        );
         assert!(
             lib.contains("Some(Command::Provider(sub)) => commands::providers::run(sub).await")
         );

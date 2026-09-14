@@ -1328,6 +1328,17 @@ impl App {
                         outcome,
                     }) if pending_request_id.as_deref() == Some(&request_id) => match outcome {
                         Ok(outcome) => {
+                            if label == "agent_authoring.apply"
+                                && matches!(
+                                    &outcome,
+                                    cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(
+                                        receipt
+                                    ) if receipt.status
+                                        == cockpit_proto::AuthoredAgentReceiptStatus::Committed
+                                )
+                            {
+                                self.sync_config_generation_after_authored_agent_apply();
+                            }
                             if let Some(shell) = self.onboarding_shell.as_mut() {
                                 shell.apply_agent_authoring_outcome(outcome);
                             }

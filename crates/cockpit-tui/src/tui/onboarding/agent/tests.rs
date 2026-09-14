@@ -228,3 +228,45 @@ fn apply_uses_stable_client_operation_id() {
         }) if client_operation_id == "stable-op"
     ));
 }
+
+#[test]
+fn invalid_nested_depth_surfaces_canonical_failure() {
+    let mut projection = sample_projection("rev-a");
+    projection.policy.routes = vec![AgentPolicyRoute {
+        provider_id: "vendor".into(),
+        model_id: "exact-a".into(),
+        trust: AgentPolicyTrustClassification::Trusted,
+        confirmation_required: false,
+        trust_is_shared: true,
+        capabilities: vec!["text_generation".into()],
+        location: Some("remote".into()),
+        auto_prune: false,
+        sidecar_eligible: false,
+        remote_sidecar_egress_required: false,
+    }];
+    let mut screen = AgentAuthoringScreen::new(projection, "op-depth".into());
+    advance_to_subagents(&mut screen);
+    screen.draft.children = vec![
+        cockpit_core::authoring_draft::ChildAuthoringDraft {
+            name: "child-a".into(),
+            route_grants: vec![cockpit_core::authoring_draft::RouteGrantDraft { enabled: true }],
+            default_route_index: 0,
+            tool_tiers: Default::default(),
+        },
+        cockpit_core::authoring_draft::ChildAuthoringDraft {
+            name: "child-a".into(),
+            route_grants: vec![cockpit_core::authoring_draft::RouteGrantDraft { enabled: true }],
+            default_route_index: 0,
+            tool_tiers: Default::default(),
+        },
+    ];
+    screen.cursor = screen.draft.children.len() + 1;
+    screen.handle_key(key(KeyCode::Enter));
+    assert!(
+        screen
+            .status
+            .as_deref()
+            .is_some_and(|status| !status.is_empty()),
+        "duplicate child names must surface a canonical validation failure"
+    );
+}

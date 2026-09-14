@@ -438,6 +438,22 @@ impl OnboardingShell {
         matches!(self.screen, OnboardingScreen::AgentAuthoring(_))
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_agent_authoring_phase(&self) -> Option<agent::Phase> {
+        match &self.screen {
+            OnboardingScreen::AgentAuthoring(screen) => Some(screen.test_phase()),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_agent_authoring_status(&self) -> Option<String> {
+        match &self.screen {
+            OnboardingScreen::AgentAuthoring(screen) => screen.test_status().map(str::to_owned),
+            _ => None,
+        }
+    }
+
     pub(crate) fn agent_authoring_settlement(
         &self,
         run_id: uuid::Uuid,

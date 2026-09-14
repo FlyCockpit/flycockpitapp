@@ -74,6 +74,10 @@ impl ToolSurfaceDraft {
         }
     }
 
+    pub(crate) fn from_selection(selection: ToolSurfaceSelection) -> Self {
+        Self { selection }
+    }
+
     pub(crate) fn selection(&self) -> &ToolSurfaceSelection {
         &self.selection
     }

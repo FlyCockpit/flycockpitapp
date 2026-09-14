@@ -33635,6 +33635,52 @@ async fn set_approval_mode_updates_session_and_broadcasts() {
 }
 
 #[tokio::test]
+async fn set_approval_mode_auto_and_yolo_require_workspace_trust() {
+    let ctx = test_ctx();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (mut state, _session_id) = attached_state(&ctx, tmp.path()).await;
+    let root = tmp.path().canonicalize().unwrap();
+    ctx.db
+        .set_workspace_trust(
+            &root,
+            crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+        )
+        .await
+        .unwrap();
+
+    for mode in [
+        crate::config::extended::ApprovalMode::Auto,
+        crate::config::extended::ApprovalMode::Yolo,
+    ] {
+        let err = handle_request(Request::SetApprovalMode { mode }, &mut state, &ctx)
+            .await
+            .expect_err("auto/yolo require trust");
+        assert_eq!(err.code, ErrorCode::WorkspaceTrust);
+        assert!(
+            err.message.contains("trusted workspace"),
+            "unexpected refusal for {mode:?}: {}",
+            err.message
+        );
+    }
+
+    let response = handle_request(
+        Request::SetApprovalMode {
+            mode: crate::config::extended::ApprovalMode::Manual,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("manual remains available without trust");
+    match response {
+        Response::ApprovalModeState { mode } => {
+            assert_eq!(mode, crate::config::extended::ApprovalMode::Manual);
+        }
+        other => panic!("expected ApprovalModeState, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn set_sandbox_escalation_updates_session_and_broadcasts() {
     let ctx = test_ctx();
     let tmp = tempfile::TempDir::new().unwrap();

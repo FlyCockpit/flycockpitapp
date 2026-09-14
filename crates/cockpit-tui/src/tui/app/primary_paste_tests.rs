@@ -7,7 +7,7 @@ use crossterm::event::{
 };
 use ratatui::layout::Rect;
 
-use super::{App, FooterHitArea, Overlay};
+use super::{App, Overlay};
 use crate::clipboard::PlatformKind;
 use crate::tui::context_menu::ContextMenu;
 use crate::tui::keys_overlay::{KeyContext, KeysOverlay};
@@ -411,10 +411,7 @@ fn primary_paste_platform_gate() {
         (
             "footer",
             Box::new(|app| {
-                app.footer_hit_areas.push(FooterHitArea {
-                    control: crate::tui::chrome::FooterControl::Agent,
-                    rect: Rect::new(0, 26, 20, 1),
-                });
+                app.composer_controls.picker_rect = Some(ratatui::layout::Rect::new(0, 26, 20, 1));
             }),
         ),
     ] {

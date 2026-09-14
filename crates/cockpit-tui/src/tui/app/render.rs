@@ -1417,9 +1417,6 @@ impl App {
         self.session_rail.set_pointer_capture(self.mouse_capture);
         self.session_rail.begin_frame();
         let rects = geom.layout(frame.area());
-        if self.footer_agent_picker.is_none() {
-            self.footer_picker_row_hits.clear();
-        }
 
         if self.startup_modal_on_top() == Some(StartupModal::WorkspaceTrust) {
             self.dialog
@@ -1459,10 +1456,6 @@ impl App {
                 Overlay::Multireview(dialog) => {
                     dialog.render(frame, rects.body);
                     self.overlay = Overlay::Multireview(dialog);
-                }
-                other if self.footer_agent_picker.is_some() => {
-                    self.overlay = other;
-                    self.render_footer_agent_picker(frame, rects.body);
                 }
                 Overlay::Stats(mut pane) => {
                     pane.render(frame, rects.body);
@@ -1568,6 +1561,7 @@ impl App {
                         self.render_status_indicator(frame, rects.indicator);
                     }
                     let cursor_pos = self.render_input(frame, rects.input);
+                    self.paint_composer_picker(frame);
                     if geom.queue > 0 {
                         self.render_queue(frame, rects.queue);
                     } else {
@@ -2008,14 +2002,14 @@ impl App {
                 push_header(&mut lines, &format!("{}{}", target.agent, suffix));
             }
             if !steering.is_empty() {
-                push_header(&mut lines, "steering · next turn");
+                push_header(&mut lines, "Steer · next safe boundary");
                 for msg in steering {
                     let line = push_item(&mut lines, msg);
                     row_meta.push((line, msg.id, msg.delivery_class));
                 }
             }
             if !held.is_empty() {
-                push_header(&mut lines, "after completion");
+                push_header(&mut lines, "Held · after completion");
                 for msg in held {
                     let line = push_item(&mut lines, msg);
                     row_meta.push((line, msg.id, msg.delivery_class));
@@ -2056,12 +2050,29 @@ impl App {
                 ButtonDispatch::QueueEdit { item_id: None },
             ),
             (
-                self.queue_box_toggle_label(),
-                ButtonId::QueueToggleClass { item_id: None },
-                ButtonDispatch::QueueToggleClass { item_id: None },
+                "Held",
+                ButtonId::QueueSetClass {
+                    item_id: None,
+                    class: cockpit_proto::QueueDeliveryClass::Held,
+                },
+                ButtonDispatch::QueueSetClass {
+                    item_id: None,
+                    class: cockpit_proto::QueueDeliveryClass::Held,
+                },
             ),
             (
-                "send now",
+                "Steer",
+                ButtonId::QueueSetClass {
+                    item_id: None,
+                    class: cockpit_proto::QueueDeliveryClass::Steering,
+                },
+                ButtonDispatch::QueueSetClass {
+                    item_id: None,
+                    class: cockpit_proto::QueueDeliveryClass::Steering,
+                },
+            ),
+            (
+                "Send now",
                 ButtonId::QueueSendNow { item_id: None },
                 ButtonDispatch::QueueSendNow { item_id: None },
             ),
@@ -2097,7 +2108,7 @@ impl App {
             return;
         }
         use crate::tui::button::{ButtonDispatch, ButtonId, ButtonSpec};
-        let toggle = Self::queue_item_toggle_label(class);
+        let _ = class;
         let mut x = content_area.x.saturating_add(content_area.width);
         for (label, button_id, dispatch) in [
             (
@@ -2111,12 +2122,29 @@ impl App {
                 ButtonDispatch::QueueEdit { item_id: Some(id) },
             ),
             (
-                toggle,
-                ButtonId::QueueToggleClass { item_id: Some(id) },
-                ButtonDispatch::QueueToggleClass { item_id: Some(id) },
+                "Held",
+                ButtonId::QueueSetClass {
+                    item_id: Some(id),
+                    class: cockpit_proto::QueueDeliveryClass::Held,
+                },
+                ButtonDispatch::QueueSetClass {
+                    item_id: Some(id),
+                    class: cockpit_proto::QueueDeliveryClass::Held,
+                },
             ),
             (
-                "send now",
+                "Steer",
+                ButtonId::QueueSetClass {
+                    item_id: Some(id),
+                    class: cockpit_proto::QueueDeliveryClass::Steering,
+                },
+                ButtonDispatch::QueueSetClass {
+                    item_id: Some(id),
+                    class: cockpit_proto::QueueDeliveryClass::Steering,
+                },
+            ),
+            (
+                "Send now",
                 ButtonId::QueueSendNow { item_id: Some(id) },
                 ButtonDispatch::QueueSendNow { item_id: Some(id) },
             ),
@@ -3473,7 +3501,7 @@ impl App {
         let shell_mode = self.composer.text().starts_with('!');
         let border_color = Self::input_border_color(self.busy, shell_mode);
         let mut input_block = Block::default()
-            .borders(Borders::ALL)
+            .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border_color));
         if let Some(label) = self.history_position_label() {
@@ -3492,7 +3520,12 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             )));
         }
-        let input_inner = input_block.inner(area);
+        let input_inner = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
 
         let prefix_width = input_prefix_width();
         let indent: String = " ".repeat(prefix_width);
@@ -3626,10 +3659,10 @@ impl App {
         // No `Wrap` modifier — the lines we just emitted are already
         // visual rows. Letting Paragraph::wrap re-wrap them would
         // desync the cursor again.
-        let para = Paragraph::new(lines)
-            .block(input_block)
-            .scroll((scroll_y, 0));
-        frame.render_widget(para, area);
+        frame.render_widget(&input_block, area);
+        let para = Paragraph::new(lines).scroll((scroll_y, 0));
+        frame.render_widget(para, input_inner);
+        self.paint_composer_control_deck(frame, area, Style::default().fg(border_color));
 
         // Vim visual-mode selection highlight: invert each selected cell
         // (REVERSED), mirroring `apply_selection_highlight`'s approach for
@@ -4492,87 +4525,7 @@ impl App {
         }
     }
 
-    fn render_footer_agent_picker(&mut self, frame: &mut ratatui::Frame, area: Rect) {
-        self.footer_picker_row_hits.clear();
-        let Some(picker) = self.footer_agent_picker.as_ref() else {
-            return;
-        };
-        let block = Block::default().borders(Borders::ALL).title(" agent ");
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        let current = self
-            .agent_path
-            .first()
-            .map(String::as_str)
-            .unwrap_or(self.launch.agent_name.as_str());
-        let window = layout[0].height as usize;
-        let offset =
-            crate::tui::nav::windowed_scroll(picker.cursor, 0, picker.entries.len(), window.max(1));
-        let mut lines = Vec::new();
-        for (idx, name) in picker.entries.iter().enumerate().skip(offset).take(window) {
-            let highlighted = idx == picker.cursor;
-            let marker = if highlighted { "▸ " } else { "  " };
-            let style = if highlighted {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            let mut spans = vec![
-                Span::raw(marker.to_string()),
-                Span::styled(name.clone(), style),
-            ];
-            if name == current {
-                spans.push(Span::raw("  "));
-                spans.push(Span::styled("[current]".to_string(), muted));
-            }
-            lines.push(Line::from(spans));
-            let row = layout[0].y + lines.len() as u16 - 1;
-            if row < layout[0].y + layout[0].height {
-                self.footer_picker_row_hits.push(super::FooterPickerRowHit {
-                    kind: super::FooterPickerKind::Agent,
-                    index: idx,
-                    rect: Rect::new(layout[0].x, row, layout[0].width, 1),
-                });
-            }
-        }
-        if lines.is_empty() {
-            lines.push(Line::from(Span::styled("(no agents)".to_string(), muted)));
-        }
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "↑/↓  enter: switch  esc: cancel".to_string(),
-                muted,
-            ))),
-            layout[1],
-        );
-    }
-
     pub(super) fn render_status(&mut self, frame: &mut ratatui::Frame, area: Rect) {
-        // Caffeination glyph (☕) leads the right-hand chrome while active,
-        // driven by the daemon-broadcast state (GOALS §1a). Additive to the
-        // right-hand transient stack — never displaces another slot.
-        // Side-conversation indicator (`/side`) leads the right-hand chrome
-        // while a throwaway side conversation is open, ahead of the ☕ glyph.
-        // Additive to the right-hand transient stack — never displaces
-        // another slot.
-        // Plan-status indicator (`plan-status-chrome-and-resolver.md`) leads
-        // the right-hand chrome when this project has unfinished plans, driven
-        // by daemon-broadcast state. Additive to the right-hand transient
-        // stack (GOALS §1a) — never displaces another slot, the same pattern
-        // as the ☕ glyph.
-        // Transient "waiting for lock" indicator
-        // (`readlock-wait-and-lock-expiry.md` historical prompt slug) leads
-        // the right-hand chrome
-        // while a write/edit implicit acquire is blocked on a contended lock. Additive — never
-        // displaces a fixed slot, the same pattern as the ☕ glyph.
-        // The path/git summary and the async-schedule strip moved to the
-        // three-row chat header (`chat_header`): the footer no longer
-        // duplicates them.
         let mut right = chrome::waiting_for_lock_spans(self.waiting_for_lock.as_ref());
         right.extend(chrome::side_glyph_spans(self.side_conversation.is_some()));
         #[cfg(feature = "remote")]
@@ -4581,19 +4534,14 @@ impl App {
             right.extend(chrome::connector_spans(self.connector_disclosure.as_ref()));
         }
         right.extend(chrome::caffeinate_glyph_spans(self.caffeinate_active));
-        let status = chrome::left_status(
-            &self.launch,
-            &self.agent_path,
-            self.hovered_footer_control.or(self.footer_selection),
-            self.sandbox_mode,
-            self.sandbox_escalation_enabled,
-            chrome::LongcacheStatus::new(self.longcache_enabled, self.longcache_supported),
-        );
+        let status = chrome::left_status(chrome::LongcacheStatus::new(
+            self.longcache_enabled,
+            self.longcache_supported,
+        ));
         let mut left = status.spans;
-        // Textual setup label is intentionally not color-only. This reports
-        // the daemon-confirmed immutable entry contract, never local CLI
-        // intent or broad authority state.
-        left.push(Span::styled(" · ", Style::default().fg(DIVIDER_DIM)));
+        if !left.is_empty() {
+            left.push(Span::styled(" · ", Style::default().fg(DIVIDER_DIM)));
+        }
         let setup_label = self
             .session_mode
             .map(|mode| format!("Setup: {}", mode.display_name()))
@@ -4602,9 +4550,6 @@ impl App {
             setup_label,
             Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
         ));
-        // The transient async-schedule strip (GOALS §22) moved to the chat
-        // header's task/timer activity pills; `/schedule`, `/ps`, and
-        // `/stop` remain the authoritative task/timer surfaces.
         if let Some(hint) = self.copy_pick_target_hint() {
             left.push(Span::styled(" · ", Style::default().fg(DIVIDER_DIM)));
             left.push(Span::styled(
@@ -4612,7 +4557,7 @@ impl App {
                 Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
             ));
         }
-        if self.footer_selection.is_some() {
+        if self.composer_controls.selection.is_some() {
             left.push(Span::styled(" · ", Style::default().fg(DIVIDER_DIM)));
             left.push(Span::styled(
                 "←/→ cycle · enter choose · esc clear".to_string(),
@@ -4633,62 +4578,8 @@ impl App {
             .min(area.width);
         let bottom =
             Layout::horizontal([Constraint::Min(0), Constraint::Length(right_width)]).split(area);
-        self.footer_hit_areas = status
-            .hits
-            .into_iter()
-            .filter_map(|hit| {
-                let start = hit.start.min(bottom[0].width);
-                let end = hit.end.min(bottom[0].width);
-                (end > start).then_some(super::FooterHitArea {
-                    control: hit.control,
-                    rect: Rect::new(bottom[0].x + start, bottom[0].y, end - start, 1),
-                })
-            })
-            .collect();
         frame.render_widget(Paragraph::new(Line::from(left)), bottom[0]);
         frame.render_widget(Paragraph::new(Line::from(right)), bottom[1]);
-        self.paint_footer_buttons(frame);
-    }
-
-    fn paint_footer_buttons(&mut self, frame: &mut ratatui::Frame<'_>) {
-        use crate::tui::button::{ButtonDispatch, ButtonId, ButtonSpec};
-        let hits = self.footer_hit_areas.clone();
-        let focused = self.footer_selection;
-        for hit in hits {
-            let (id, dispatch, label) = match hit.control {
-                crate::tui::chrome::FooterControl::Agent => {
-                    let path = if self.agent_path.is_empty() {
-                        vec![self.launch.agent_name.clone()]
-                    } else {
-                        self.agent_path.clone()
-                    };
-                    let label = path
-                        .iter()
-                        .map(|name| crate::tui::history::agent_display_label(name).to_string())
-                        .collect::<Vec<_>>()
-                        .join(" › ");
-                    (
-                        ButtonId::Footer(crate::tui::chrome::FooterControl::Agent),
-                        ButtonDispatch::Footer(crate::tui::chrome::FooterControl::Agent),
-                        label,
-                    )
-                }
-                crate::tui::chrome::FooterControl::Model => {
-                    let Some((provider, model)) = &self.launch.active_model else {
-                        continue;
-                    };
-                    (
-                        ButtonId::Footer(crate::tui::chrome::FooterControl::Model),
-                        ButtonDispatch::Footer(crate::tui::chrome::FooterControl::Model),
-                        format!("{provider}/{model}"),
-                    )
-                }
-            };
-            let spec = ButtonSpec::new(id, label, dispatch).focused(focused == Some(hit.control));
-            let _ = self
-                .button_registry
-                .paint(frame, hit.rect.x, hit.rect.y, hit.rect.width, spec);
-        }
     }
 }
 
@@ -10727,7 +10618,8 @@ mod prediction_ghost_context_indicator_tests {
         let mut send_now = queued_item("urgent held", QueueTarget::root("Build"));
         send_now.delivery_class = QueueDeliveryClass::Held;
         send_now.send_now = true;
-        let steering = queued_item("steering", QueueTarget::root("Build"));
+        let mut steering = queued_item("steering", QueueTarget::root("Build"));
+        steering.delivery_class = QueueDeliveryClass::Steering;
         let held_id = held.id;
         let send_now_id = send_now.id;
         let steering_id = steering.id;
@@ -10747,12 +10639,14 @@ mod prediction_ghost_context_indicator_tests {
         let child = QueueTarget::child("builder", 1, "call-1", "default");
         app.foreground_input_target = Some(child.clone());
 
-        let root_steering = queued_item("root steering", root.clone());
+        let mut root_steering = queued_item("root steering", root.clone());
+        root_steering.delivery_class = QueueDeliveryClass::Steering;
         let mut child_held = queued_item("child held", child.clone());
         child_held.delivery_class = QueueDeliveryClass::Held;
         let mut root_held = queued_item("root held", root);
         root_held.delivery_class = QueueDeliveryClass::Held;
-        let child_steering = queued_item("child steering", child);
+        let mut child_steering = queued_item("child steering", child);
+        child_steering.delivery_class = QueueDeliveryClass::Steering;
         let expected = vec![
             child_steering.id,
             child_held.id,
@@ -10912,11 +10806,11 @@ mod prediction_ghost_context_indicator_tests {
         let buf = render_queue_buffer(&mut app, 48, height);
         let rows: Vec<String> = (0..height).map(|y| row_text(&buf, y, 48)).collect();
         let joined = rows.join("\n");
-        assert!(joined.contains("steering · next turn"), "{joined}");
-        assert!(joined.contains("after completion"), "{joined}");
+        assert!(joined.contains("Steer · next safe boundary"), "{joined}");
+        assert!(joined.contains("Held · after completion"), "{joined}");
         let steer_header = rows
             .iter()
-            .position(|row| row.contains("steering · next turn"))
+            .position(|row| row.contains("Steer · next safe boundary"))
             .expect("steering header");
         let first_idx = rows
             .iter()
@@ -10954,8 +10848,8 @@ mod prediction_ghost_context_indicator_tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        assert!(before.contains("steering · next turn"));
-        assert!(!before.contains("after completion"));
+        assert!(before.contains("Steer · next safe boundary"));
+        assert!(!before.contains("Held · after completion"));
 
         app.queue[0].delivery_class = QueueDeliveryClass::Held;
         let after = {
@@ -10966,8 +10860,8 @@ mod prediction_ghost_context_indicator_tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        assert!(after.contains("after completion"));
-        assert!(!after.contains("steering · next turn"));
+        assert!(after.contains("Held · after completion"));
+        assert!(!after.contains("Steer · next safe boundary"));
         assert!(after.contains("toggle me"));
     }
 

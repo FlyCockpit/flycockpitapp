@@ -63,9 +63,9 @@ impl App {
             return PrimaryPasteLayer::Chat;
         }
         if self
-            .footer_hit_areas
-            .iter()
-            .any(|hit| super::mouse::point_in(hit.rect, mouse.column, mouse.row))
+            .composer_controls
+            .picker_rect
+            .is_some_and(|rect| super::mouse::point_in(rect, mouse.column, mouse.row))
         {
             return PrimaryPasteLayer::Footer;
         }

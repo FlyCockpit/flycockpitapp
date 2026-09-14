@@ -67,6 +67,7 @@ impl App {
         // are registered buttons) and inside the header are exempt.
         if self.mouse_capture && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             self.close_chat_header_popover_on_outside_press(mouse.column, mouse.row);
+            self.close_composer_picker_on_outside_press(mouse.column, mouse.row);
         }
         // The full-screen onboarding shell owns the whole screen while
         // active: its native surfaces consume their events, engine screens
@@ -91,7 +92,6 @@ impl App {
                 self.hovered_suggestion = None;
                 self.hovered_control_chip = None;
                 self.hovered_affordance = None;
-                self.hovered_footer_control = None;
                 if matches!(mouse.kind, MouseEventKind::Moved) && !self.mouse_capture {
                     return;
                 }
@@ -156,7 +156,6 @@ impl App {
                 self.hovered_suggestion = None;
                 self.hovered_control_chip = None;
                 self.hovered_affordance = None;
-                self.hovered_footer_control = None;
                 if self.mouse_capture {
                     let _ = self.session_rail.handle_mouse(mouse);
                 }
@@ -175,14 +174,12 @@ impl App {
                 self.hovered_suggestion = None;
                 self.hovered_control_chip = None;
                 self.hovered_affordance = None;
-                self.hovered_footer_control = None;
                 return;
             }
             if self.mouse_capture && self.dialog.handle_settings_pointer(mouse).is_some() {
                 self.hovered_suggestion = None;
                 self.hovered_control_chip = None;
                 self.hovered_affordance = None;
-                self.hovered_footer_control = None;
                 return;
             }
             self.update_hovered_affordance(&mouse);
@@ -190,9 +187,7 @@ impl App {
                 self.hovered_suggestion = None;
                 self.hovered_control_chip = None;
                 self.hovered_affordance = None;
-                self.hovered_footer_control = None;
             }
-            self.update_hovered_footer_control(mouse.column, mouse.row);
             return;
         }
         if !self.mouse_capture {
@@ -326,31 +321,6 @@ impl App {
             }
             return;
         }
-        if self.mouse_capture
-            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && self.footer_agent_picker.is_some()
-        {
-            if let Some(hit) = self
-                .footer_picker_row_hits
-                .iter()
-                .find(|hit| point_in(hit.rect, mouse.column, mouse.row))
-                .cloned()
-            {
-                match hit.kind {
-                    FooterPickerKind::Agent => {
-                        let mut commit = None;
-                        if let Some(picker) = self.footer_agent_picker.as_mut() {
-                            picker.select(hit.index);
-                            commit = Some(picker.clone());
-                        }
-                        if let Some(picker) = commit {
-                            self.commit_footer_agent_picker(&picker);
-                        }
-                    }
-                }
-            }
-            return;
-        }
         // The `/sealed` no-echo overlay is modal: a left-click dismisses it,
         // which cancels the pending write and drops the minted capability (or
         // hides a recover reveal). Handled before the `&mut self.overlay` match
@@ -452,32 +422,6 @@ impl App {
             self.handle_primary_paste_middle_down(&mouse);
             return;
         }
-        if self.mouse_capture
-            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && let Some(hit) = self
-                .footer_hit_areas
-                .iter()
-                .find(|hit| {
-                    mouse.row >= hit.rect.y
-                        && mouse.row < hit.rect.y + hit.rect.height
-                        && mouse.column >= hit.rect.x
-                        && mouse.column < hit.rect.x + hit.rect.width
-                })
-                .cloned()
-        {
-            self.cancel_mouse_gesture(self.event_loop_monotonic_now);
-            let already_selected = self.footer_selection == Some(hit.control);
-            self.footer_selection = Some(hit.control);
-            self.footer_agent_picker = None;
-            if already_selected {
-                match hit.control {
-                    crate::tui::chrome::FooterControl::Agent => self.open_footer_agent_picker(),
-                    crate::tui::chrome::FooterControl::Model => self.open_model_picker(),
-                }
-            }
-            return;
-        }
-
         // Right-click in chat area opens the context menu.
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
             && self.mouse_in_chat_area(&mouse)
@@ -761,17 +705,17 @@ impl App {
 
     pub(super) fn dispatch_button(&mut self, dispatch: crate::tui::button::ButtonDispatch) {
         match dispatch {
-            crate::tui::button::ButtonDispatch::Footer(control) => {
+            crate::tui::button::ButtonDispatch::ComposerPill(kind) => {
                 self.cancel_mouse_gesture(self.event_loop_monotonic_now);
-                let already_selected = self.footer_selection == Some(control);
-                self.footer_selection = Some(control);
-                self.footer_agent_picker = None;
-                if already_selected {
-                    match control {
-                        crate::tui::chrome::FooterControl::Agent => self.open_footer_agent_picker(),
-                        crate::tui::chrome::FooterControl::Model => self.open_model_picker(),
-                    }
-                }
+                self.activate_composer_pill(kind);
+            }
+            crate::tui::button::ButtonDispatch::ComposerSend => {
+                self.cancel_mouse_gesture(self.event_loop_monotonic_now);
+                self.activate_composer_send();
+            }
+            crate::tui::button::ButtonDispatch::ComposerPickerRow { index } => {
+                self.cancel_mouse_gesture(self.event_loop_monotonic_now);
+                self.commit_composer_picker_row(index);
             }
             crate::tui::button::ButtonDispatch::HeaderPill(kind) => {
                 self.cancel_mouse_gesture(self.event_loop_monotonic_now);
@@ -802,6 +746,9 @@ impl App {
             }
             crate::tui::button::ButtonDispatch::QueueToggleClass { item_id } => {
                 self.queue_action_toggle(item_id);
+            }
+            crate::tui::button::ButtonDispatch::QueueSetClass { item_id, class } => {
+                self.queue_action_set_class(item_id, class);
             }
             crate::tui::button::ButtonDispatch::QueueEdit { item_id } => {
                 self.queue_action_edit(item_id);
@@ -839,23 +786,6 @@ impl App {
             | crate::tui::button::ButtonDispatch::SettingsHeader(_)
             | crate::tui::button::ButtonDispatch::Settings(_) => {}
         }
-    }
-
-    fn update_hovered_footer_control(&mut self, column: u16, row: u16) {
-        if !self.mouse_capture {
-            self.hovered_footer_control = None;
-            return;
-        }
-        self.hovered_footer_control = self
-            .footer_hit_areas
-            .iter()
-            .find(|hit| {
-                row >= hit.rect.y
-                    && row < hit.rect.y + hit.rect.height
-                    && column >= hit.rect.x
-                    && column < hit.rect.x + hit.rect.width
-            })
-            .map(|hit| hit.control);
     }
 
     /// Route a mouse event to the embedded pane (GOALS §1i). Returns
@@ -986,7 +916,7 @@ impl App {
             || self.context_menu.is_some()
             || self.keys_overlay.is_some()
             || matches!(self.overlay, Overlay::ModelPicker(_))
-            || self.footer_agent_picker.is_some()
+            || self.composer_controls.picker.is_some()
             || matches!(
                 self.overlay,
                 Overlay::Stats(_)

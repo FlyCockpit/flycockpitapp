@@ -83,7 +83,7 @@ pub const HERMETIC_ENV_KEYS: [&str; 10] = [
 
 const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_DAEMON_TIMEOUT: Duration = Duration::from_secs(90);
-const READY_RUNNER_STATUS: &str = "[Build] · [local/scripted]";
+const READY_RUNNER_STATUS: &str = "[Build]─[local/scripted]";
 
 /// Sole profile variation. `RemoteOsc52` adds one literal SSH variable to
 /// the PTY child only.

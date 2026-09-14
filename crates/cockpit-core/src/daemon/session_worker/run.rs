@@ -10829,7 +10829,7 @@ pub(super) async fn run_worker(
                                     text: submission.text.clone(),
                                     display_text: submission.display_text.clone(),
                                     target: queue_target_to_proto(target),
-                                    delivery_class: proto::QueueDeliveryClass::default(),
+                                    delivery_class: submission.delivery_class,
                                     send_now: false,
                                 },
                                 queue,

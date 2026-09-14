@@ -583,6 +583,7 @@ impl App {
                 state.generation,
             );
         }
+        self.retry_parked_control_follow_ons();
     }
 
     /// Drop outgoing active-model projection and daemon config chrome the same
@@ -653,6 +654,14 @@ impl App {
         present_notice: bool,
     ) {
         let previous_session_id = self.launch.session_id;
+        self.invalidate_composer_control_ownership(true, false);
+        let reason = match (previous_session_id, new_session_id) {
+            (Some(previous), Some(next)) if previous == next => {
+                super::ControlEpochAbandonment::SameSession
+            }
+            _ => super::ControlEpochAbandonment::SessionTransition,
+        };
+        self.abandon_epoch_bound_control_receipts(reason);
         if let Some(pending) = self.cancel_model_controls_for_runner_epoch() {
             let reason = match new_session_id {
                 Some(session_id) if previous_session_id == Some(session_id) => "runner reconnect",

@@ -804,18 +804,24 @@ fn append_gitignore_allow_targets_project_and_dedups() {
     assert_eq!(cfg.name.as_deref(), Some("Chris"));
 }
 
-/// `queuedMessagesAsSteering` defaults to `true` (absent in config) and
-/// round-trips its camelCase serde name when set.
+/// `queuedMessagesAsSteering` defaults to `false` (Held). An omitted field
+/// and `ExtendedConfig::default()` are Held; explicit `true` is the
+/// Steering opt-in; explicit `false` is Held. The camelCase serde name
+/// round-trips.
 #[test]
 fn queued_messages_as_steering_global_default_and_rename() {
     let cfg: ExtendedConfig = serde_json::from_str("{}").unwrap();
-    assert!(cfg.queued_messages_as_steering);
-    assert!(ExtendedConfig::default().queued_messages_as_steering);
+    assert!(!cfg.queued_messages_as_steering);
+    assert!(!ExtendedConfig::default().queued_messages_as_steering);
     let off: ExtendedConfig =
         serde_json::from_str(r#"{"queuedMessagesAsSteering":false}"#).unwrap();
     assert!(!off.queued_messages_as_steering);
+    let on: ExtendedConfig = serde_json::from_str(r#"{"queuedMessagesAsSteering":true}"#).unwrap();
+    assert!(on.queued_messages_as_steering);
     let json = serde_json::to_string(&off).unwrap();
     assert!(json.contains("\"queuedMessagesAsSteering\":false"));
+    let on_json = serde_json::to_string(&on).unwrap();
+    assert!(on_json.contains("\"queuedMessagesAsSteering\":true"));
 }
 
 /// `hintToolCallCorrections` defaults to `false` (absent in config) and

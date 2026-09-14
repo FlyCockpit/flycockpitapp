@@ -14,6 +14,16 @@ fn compact(tokens: impl ToTokens) -> String {
     tokens.to_token_stream().to_string().replace(' ', "")
 }
 
+fn is_composer_authority_type(ty: &syn::Type) -> bool {
+    let text = compact(ty);
+    ["RegisteredComposer", "PasteRegistry"]
+        .iter()
+        .any(|name| text.contains(name))
+        || text
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .any(|token| token == "Composer")
+}
+
 fn cfg_test(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
         attr.path().is_ident("cfg")
@@ -771,9 +781,7 @@ fn app_is_the_only_production_registered_composer_owner_and_constructor() {
     let authority = fields
         .named
         .iter()
-        .filter(|field| {
-            compact(&field.ty).contains("Composer") || compact(&field.ty).contains("PasteRegistry")
-        })
+        .filter(|field| is_composer_authority_type(&field.ty))
         .collect::<Vec<_>>();
     assert_eq!(authority.len(), 1);
     assert_eq!(authority[0].ident.as_ref().unwrap(), "composer");

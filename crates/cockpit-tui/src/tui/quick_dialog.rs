@@ -339,7 +339,13 @@ impl QuickDialog {
                 }
             }
             Tab::Permissions => {
-                self.staged_approval_mode = Some(approval_options()[self.cursors[self.tab]]);
+                let mode = approval_options()[self.cursors[self.tab]];
+                if let Some(reason) = approval_mode_block_reason(mode) {
+                    self.status = Some(reason);
+                } else {
+                    self.staged_approval_mode = Some(mode);
+                    self.status = None;
+                }
             }
             Tab::Cache => {
                 let retention = retention_options()[self.cursors[self.tab]];
@@ -477,13 +483,20 @@ impl QuickDialog {
                 .iter()
                 .enumerate()
                 .map(|(i, mode)| {
+                    let disabled = !mode.session_set_allowed(current_session_trust_mode());
+                    let description = if disabled {
+                        approval_mode_block_reason(*mode)
+                            .unwrap_or_else(|| approval_description(*mode).to_string())
+                    } else {
+                        approval_description(*mode).to_string()
+                    };
                     self.option_line(
                         i,
                         mode.as_str(),
-                        approval_description(*mode),
+                        &description,
                         self.current.approval_mode == *mode,
                         self.staged_approval_mode == Some(*mode),
-                        false,
+                        disabled,
                     )
                 })
                 .collect(),
@@ -744,6 +757,14 @@ fn approval_description(mode: ApprovalMode) -> &'static str {
         ApprovalMode::Auto => "utility model can approve anything that leaves the sandbox",
         ApprovalMode::Yolo => "runs without approval prompts",
     }
+}
+
+fn current_session_trust_mode() -> Option<cockpit_config::WorkspaceTrustMode> {
+    cockpit_config::trust::current_workspace_trust_policy().map(|policy| policy.mode)
+}
+
+fn approval_mode_block_reason(mode: ApprovalMode) -> Option<String> {
+    mode.session_set_block_reason(current_session_trust_mode())
 }
 
 #[cfg(test)]

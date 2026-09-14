@@ -26,6 +26,7 @@ pub mod chat;
 pub mod chat_header;
 pub mod chrome;
 pub mod composer;
+pub(crate) mod composer_controls;
 pub mod context_menu;
 pub mod context_pane;
 pub mod dialog;

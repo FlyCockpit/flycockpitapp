@@ -1469,7 +1469,9 @@ fn model_choice_items(snapshot: &SessionSetupSnapshotV1) -> Vec<ModelChoiceItem>
     items
 }
 
-fn tool_selection_from_snapshot(snapshot: &SessionSetupSnapshotV1) -> ToolSurfaceSelection {
+pub(crate) fn tool_selection_from_snapshot(
+    snapshot: &SessionSetupSnapshotV1,
+) -> ToolSurfaceSelection {
     let mut tools = Vec::new();
     let mut tool_tiers = std::collections::BTreeMap::new();
     for tool in &snapshot.tools {

@@ -1697,12 +1697,12 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
     );
     app.pending_control_requests.insert(
         cockpit_client::presentation::ControlRequestId(77),
-        super::PendingControlRequest {
-            label: "/quick".to_string(),
-            applied: super::ControlApplied::ModelSelection {
+        super::PendingControlRequest::new(
+            "/quick",
+            super::ControlApplied::ModelSelection {
                 selection_id: old_selection_id,
             },
-        },
+        ),
     );
 
     let automatically_retried = matches!(
@@ -1966,12 +1966,12 @@ fn session_switch_drains_queued_old_epoch_events_before_authoritative_attach() {
     );
     app.pending_control_requests.insert(
         cockpit_client::presentation::ControlRequestId(88),
-        super::PendingControlRequest {
-            label: "/quick".to_string(),
-            applied: super::ControlApplied::ModelSelection {
+        super::PendingControlRequest::new(
+            "/quick",
+            super::ControlApplied::ModelSelection {
                 selection_id: old_selection_id,
             },
-        },
+        ),
     );
     event_queue
         .lock()

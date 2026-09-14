@@ -1581,8 +1581,11 @@ impl App {
                 _ => {}
             },
             AsyncActionKind::DaemonRpc("session_setup.snapshot") => match result.payload {
-                Ok(AsyncActionPayload::SessionSetupSnapshot(response)) => {
-                    self.apply_session_setup_snapshot_response(response);
+                Ok(AsyncActionPayload::SessionSetupSnapshot {
+                    response,
+                    correlation,
+                }) => {
+                    self.apply_session_setup_snapshot_response_correlated(response, correlation);
                 }
                 Err(error) => {
                     self.apply_session_setup_snapshot_error(error);
@@ -1591,7 +1594,7 @@ impl App {
             },
             AsyncActionKind::DaemonRpc("session_setup.add_mcp")
             | AsyncActionKind::DaemonRpc("session_setup.add_mcp_agent") => match result.payload {
-                Ok(AsyncActionPayload::SessionSetupSnapshot(response)) => {
+                Ok(AsyncActionPayload::SessionSetupSnapshot { response, .. }) => {
                     self.apply_session_setup_snapshot_response(response);
                 }
                 Err(error) => {
@@ -1635,7 +1638,9 @@ impl App {
             AsyncActionKind::DaemonRpc("agent_tree.override_model_choices") => {
                 // Supplementary to the effective settings: on success populate the
                 // Model section; a failure leaves it empty (no error surfaced).
-                if let Ok(AsyncActionPayload::SessionSetupSnapshot(response)) = result.payload {
+                if let Ok(AsyncActionPayload::SessionSetupSnapshot { response, .. }) =
+                    result.payload
+                {
                     self.apply_agent_override_model_choices(response);
                 }
             }

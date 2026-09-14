@@ -433,6 +433,9 @@ impl App {
             if let Some(pane) = self.session_setup_inline.as_mut() {
                 pane.set_error(message);
             }
+            if let Overlay::Tools(pane) = &mut self.overlay {
+                pane.note_snapshot_refresh_error(message);
+            }
             return;
         };
         let attached = runner.attached_request_binding();
@@ -452,8 +455,9 @@ impl App {
         );
     }
 
-    /// Apply a completed `GetSessionSetupSnapshot` response into the open
-    /// overlay. Inert if the overlay was closed or already replaced.
+    /// Apply a completed `GetSessionSetupSnapshot` response into open
+    /// session-setup, model-picker, and tools surfaces. Inert if those
+    /// overlays were closed or already replaced.
     pub(super) fn apply_session_setup_snapshot_response(
         &mut self,
         response: cockpit_proto::Response,
@@ -520,6 +524,11 @@ impl App {
                     })
             });
         }
+        if let Overlay::Tools(pane) = &mut self.overlay {
+            pane.reconcile_from_daemon(crate::tui::session_setup::tool_selection_from_snapshot(
+                &snapshot,
+            ));
+        }
         if let Overlay::ModelPicker(picker) = &mut self.overlay {
             picker.set_active_slot_models(
                 self.prepared_slot_models.clone(),
@@ -542,7 +551,10 @@ impl App {
             pane.set_error(message.clone());
         }
         if let Some(pane) = self.session_setup_inline.as_mut() {
-            pane.set_error(message);
+            pane.set_error(message.clone());
+        }
+        if let Overlay::Tools(pane) = &mut self.overlay {
+            pane.note_snapshot_refresh_error(message);
         }
     }
 

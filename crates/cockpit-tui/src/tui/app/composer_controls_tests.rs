@@ -347,6 +347,41 @@ fn snapshot_refresh_pending(app: &App) -> bool {
         ))
 }
 
+fn tools_snapshot(tools: &[(&str, &str)]) -> cockpit_proto::SessionSetupSnapshotV1 {
+    cockpit_proto::SessionSetupSnapshotV1 {
+        dto_version: cockpit_proto::SESSION_SETUP_DTO_VERSION,
+        session_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        config_generation: 1,
+        revision: 1,
+        selected_installation_id: None,
+        candidates: Vec::new(),
+        resolved_agent: Some("Build".to_string()),
+        last_used_agent: None,
+        available_agents: Vec::new(),
+        root_agent_instance_id: None,
+        override_revision: 0,
+        root_foreground: true,
+        model: Default::default(),
+        tools: tools
+            .iter()
+            .map(|(name, tier)| cockpit_proto::SessionSetupToolV1 {
+                name: (*name).to_string(),
+                tier: (*tier).to_string(),
+                locked: false,
+                legal_tiers: vec!["enabled".into(), "discoverable".into(), "disabled".into()],
+                family: "test".into(),
+            })
+            .collect(),
+        mcps: Vec::new(),
+    }
+}
+
+fn apply_tools_snapshot(app: &mut App, tools: &[(&str, &str)]) {
+    app.apply_session_setup_snapshot_response(cockpit_proto::Response::SessionSetupSnapshot {
+        snapshot: tools_snapshot(tools),
+    });
+}
+
 #[test]
 fn composer_picker_discards_stale_generation_and_session() {
     let tmp = tempfile::tempdir().unwrap();
@@ -917,11 +952,33 @@ fn header_tools_pill_reconciles_tool_surface_override() {
         panic!("tools overlay");
     };
     assert!(
+        pane.session_override_pending(),
+        "applied receipt must not confirm from the local draft"
+    );
+    assert_eq!(
+        pane.original_selection(),
+        &original,
+        "applied receipt must not promote the local draft"
+    );
+
+    apply_tools_snapshot(&mut app, &[("bash", "enabled"), ("read", "discoverable")]);
+    let Overlay::Tools(pane) = &app.overlay else {
+        panic!("tools overlay");
+    };
+    assert!(
         !pane.session_override_pending(),
-        "applied receipt confirms the header tools surface"
+        "daemon snapshot is the header tools confirmation"
+    );
+    assert_eq!(
+        pane.original_selection().tools,
+        vec!["bash".to_string(), "read".to_string()]
+    );
+    assert_eq!(
+        pane.original_selection().tool_tiers.get("read").copied(),
+        Some(ToolTier::Discoverable)
     );
     assert_eq!(pane.original_selection(), pane.draft_selection());
-    assert_eq!(pane.original_selection(), &original);
+    let confirmed = pane.original_selection().clone();
 
     app.handle_tools_outcome(ToolsOutcome::Apply {
         override_json: "{}".to_string(),
@@ -968,11 +1025,90 @@ fn header_tools_pill_reconciles_tool_surface_override() {
         pane.original_selection(),
         "refusal leaves confirmed tool-surface state intact"
     );
-    assert_eq!(pane.original_selection(), &original);
+    assert_eq!(pane.original_selection(), &confirmed);
     assert_eq!(
         app.launch.active_model,
         Some(("openai".to_string(), "gpt-test".to_string()))
     );
+}
+
+#[test]
+fn header_tools_reconnect_discards_stale_receipt_and_reconciles_snapshot() {
+    use std::sync::atomic::Ordering;
+
+    use crate::tui::agent_runner::{GLOBAL_ATTACHMENT_EPOCH, QueuedTurnEvent};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, mut control_rx) = app_with_runner(&tmp);
+    app.activate_header_pill(HeaderPillKind::Tool);
+    app.handle_tools_outcome(ToolsOutcome::Apply {
+        override_json: "{}".to_string(),
+        persist_session: true,
+        cache_break: false,
+        monty_nudge: None,
+    });
+    let _ = control_rx.try_recv();
+    let Overlay::Tools(pane) = &app.overlay else {
+        panic!("tools overlay");
+    };
+    let original = pane.original_selection().clone();
+    assert!(pane.session_override_pending());
+    let old_epoch = app.visible_attachment_epoch;
+    let request_id = ControlRequestId(1);
+
+    {
+        let runner = app.agent_runner.as_ref().unwrap().as_ref().unwrap();
+        runner
+            .attachment_epoch
+            .store(old_epoch + 1, Ordering::Release);
+        let mut events = runner.events.lock().unwrap();
+        events.push(QueuedTurnEvent {
+            attachment_epoch: GLOBAL_ATTACHMENT_EPOCH,
+            event: cockpit_client::presentation::TurnEvent::DaemonLinkReconnected {
+                active_model_state: None,
+            },
+        });
+        events.push(QueuedTurnEvent {
+            attachment_epoch: old_epoch,
+            event: cockpit_client::presentation::TurnEvent::ControlRequestFinished {
+                request_id,
+                outcome: ControlRequestOutcome::Applied,
+            },
+        });
+    }
+    app.drain_agent_events();
+    assert_eq!(app.visible_attachment_epoch, old_epoch + 1);
+    assert!(
+        !app.pending_control_requests.contains_key(&request_id),
+        "old-epoch tool receipts must be abandoned when visibility advances"
+    );
+    let Overlay::Tools(pane) = &app.overlay else {
+        panic!("tools overlay");
+    };
+    assert!(
+        pane.session_override_pending(),
+        "reconnect must keep the pane pending until the daemon snapshot arrives"
+    );
+    assert_eq!(
+        pane.original_selection(),
+        &original,
+        "reconnect must not promote the local draft"
+    );
+    assert!(
+        snapshot_refresh_pending(&app),
+        "reconnect must refresh tool-surface state from the daemon"
+    );
+
+    apply_tools_snapshot(&mut app, &[("bash", "enabled")]);
+    let Overlay::Tools(pane) = &app.overlay else {
+        panic!("tools overlay");
+    };
+    assert!(
+        !pane.session_override_pending(),
+        "snapshot after reconnect is the remaining settlement path"
+    );
+    assert_eq!(pane.original_selection().tools, vec!["bash".to_string()]);
+    assert_eq!(pane.original_selection(), pane.draft_selection());
 }
 
 #[test]

@@ -974,10 +974,14 @@ impl App {
                 if let Some(outcome) = pane.handle_key(key) {
                     match &outcome {
                         crate::tui::tools_pane::ToolsOutcome::Pending
+                        | crate::tui::tools_pane::ToolsOutcome::RefreshSnapshot
                         | crate::tui::tools_pane::ToolsOutcome::Apply { .. } => {
                             self.overlay = Overlay::Tools(pane);
-                            if matches!(outcome, crate::tui::tools_pane::ToolsOutcome::Apply { .. })
-                            {
+                            if matches!(
+                                outcome,
+                                crate::tui::tools_pane::ToolsOutcome::Apply { .. }
+                                    | crate::tui::tools_pane::ToolsOutcome::RefreshSnapshot
+                            ) {
                                 self.handle_tools_outcome(outcome);
                             }
                         }

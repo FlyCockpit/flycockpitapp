@@ -217,6 +217,9 @@ impl App {
         match outcome {
             crate::tui::tools_pane::ToolsOutcome::Close => {}
             crate::tui::tools_pane::ToolsOutcome::Pending => {}
+            crate::tui::tools_pane::ToolsOutcome::RefreshSnapshot => {
+                self.request_session_setup_snapshot_refresh();
+            }
             crate::tui::tools_pane::ToolsOutcome::Apply {
                 override_json,
                 persist_session,
@@ -735,6 +738,7 @@ impl App {
         req: cockpit_proto::Request,
         applied: ControlApplied,
     ) {
+        let tool_surface_override = matches!(applied, ControlApplied::ToolSurfaceOverride { .. });
         let Some(Ok(runner)) = self.agent_runner.as_ref() else {
             let message =
                 Self::control_not_delivered_message(label, ControlRequestNotDelivered::NoRunner);
@@ -742,9 +746,12 @@ impl App {
                 ControlApplied::ModelSelection { selection_id } => Some(selection_id),
                 _ => None,
             };
+            if tool_surface_override {
+                self.refuse_tool_surface_override(message.clone());
+            }
             if let Some(pending) = self.clear_pending_model_selection(selection_id) {
                 self.show_failed_model_selection(pending, message);
-            } else {
+            } else if !tool_surface_override {
                 self.push_plain(message);
             }
             if self.composer_controls.dispatch_armed {
@@ -772,17 +779,21 @@ impl App {
             req,
         );
         if let Err(reason) = result {
-            let selection_id =
-                self.pending_control_requests
-                    .remove(&request_id)
-                    .and_then(|pending| match pending.applied {
-                        ControlApplied::ModelSelection { selection_id } => Some(selection_id),
-                        _ => None,
-                    });
+            let removed = self.pending_control_requests.remove(&request_id);
+            let tool_surface_override = removed.as_ref().is_some_and(|pending| {
+                matches!(pending.applied, ControlApplied::ToolSurfaceOverride { .. })
+            });
+            let selection_id = removed.and_then(|pending| match pending.applied {
+                ControlApplied::ModelSelection { selection_id } => Some(selection_id),
+                _ => None,
+            });
             let message = Self::control_not_delivered_message(label, reason);
+            if tool_surface_override {
+                self.refuse_tool_surface_override(message.clone());
+            }
             if let Some(pending) = self.clear_pending_model_selection(selection_id) {
                 self.show_failed_model_selection(pending, message);
-            } else {
+            } else if !tool_surface_override {
                 self.push_plain(message);
             }
             self.refuse_composer_control_for_request(
@@ -796,6 +807,53 @@ impl App {
     pub(super) fn fence_pending_control_request(&mut self, request_id: ControlRequestId) {
         if let Some(pending) = self.pending_control_requests.get_mut(&request_id) {
             pending.fenced = true;
+        }
+    }
+
+    /// Completions for `send_control_request` are stamped with the sending
+    /// attachment epoch and dropped once visibility advances. Drain those
+    /// owners here so reconnect, resync, or session-switch cannot leave them
+    /// pending with no remaining settlement path. Model-selection slots stay
+    /// for the existing cancel+retry path; displayed tool-surface state
+    /// reconverges from a daemon snapshot rather than a local draft.
+    pub(super) fn abandon_epoch_bound_control_receipts(&mut self) {
+        let pending = std::mem::take(&mut self.pending_control_requests);
+        let mut refresh_snapshot = false;
+        for (_, request) in pending {
+            match request.applied {
+                ControlApplied::ModelSelection { .. } => {
+                    // `pending_model_selection` is cancelled/retried by
+                    // `start_model_state_epoch`. The request id is gone so a
+                    // late Applied cannot confirm.
+                }
+                ControlApplied::ToolSurfaceOverride { .. }
+                | ControlApplied::PrimaryAgentSwitch { .. } => {
+                    refresh_snapshot = true;
+                }
+                ControlApplied::ResponseMetricsTokenizer { confirm_id } => {
+                    if let Some(tok) = self.pending_tokenizer_confirm.take() {
+                        let outcome = tok.on_response(confirm_id, 0, false, Some("refresh_failed"));
+                        self.apply_tokenizer_confirm_outcome(outcome);
+                    }
+                }
+                ControlApplied::None
+                | ControlApplied::Multireview { .. }
+                | ControlApplied::ScheduleCancel { .. }
+                | ControlApplied::ModelFavorite { .. }
+                | ControlApplied::PinContext { .. }
+                | ControlApplied::RepairResume
+                | ControlApplied::ExitGuardStatus
+                | ControlApplied::ExitAfterStoppingWork
+                | ControlApplied::ExitAfterBackgroundPromotion => {}
+            }
+        }
+        if let Overlay::Tools(pane) = &mut self.overlay
+            && pane.mark_session_override_refreshing()
+        {
+            refresh_snapshot = true;
+        }
+        if refresh_snapshot {
+            self.request_session_setup_snapshot_refresh();
         }
     }
 
@@ -1072,6 +1130,7 @@ impl App {
 
     pub(super) fn cancel_model_controls_for_terminal_link(&mut self) {
         self.invalidate_composer_control_ownership(true, false);
+        self.abandon_epoch_bound_control_receipts();
         if let Some(pending) = self.cancel_model_controls_for_runner_epoch() {
             tracing::warn!(
                 session_id = ?pending.session_id,
@@ -1126,7 +1185,7 @@ impl App {
                     self.push_plain(warning);
                 }
                 if let Overlay::Tools(pane) = &mut self.overlay {
-                    pane.confirm_session_override();
+                    pane.mark_session_override_awaiting_snapshot();
                 }
                 self.request_session_setup_snapshot_refresh();
             }

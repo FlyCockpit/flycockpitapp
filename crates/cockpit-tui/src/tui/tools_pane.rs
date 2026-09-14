@@ -22,6 +22,8 @@ pub(crate) enum ToolsSaveTarget {
 pub(crate) enum ToolsOutcome {
     Close,
     Pending,
+    /// Re-fetch the daemon tool-surface snapshot without submitting a mutation.
+    RefreshSnapshot,
     Apply {
         override_json: String,
         persist_session: bool,
@@ -117,15 +119,60 @@ impl ToolsPane {
         self.confirm = None;
     }
 
-    pub(crate) fn confirm_session_override(&mut self) {
+    /// An Applied receipt is not confirmation. Keep the pane pending until a
+    /// daemon snapshot reconverges displayed/selectable state.
+    pub(crate) fn mark_session_override_awaiting_snapshot(&mut self) {
         if !self.session_override_pending {
             return;
         }
-        self.session_override_pending = false;
-        self.original = self.draft.selection().clone();
-        self.status = Some("session tool surface confirmed".to_string());
-        self.row_errors.clear();
-        self.confirm = None;
+        self.status = Some("waiting for daemon tool surface…".to_string());
+    }
+
+    /// Epoch adoption dropped the in-flight receipt. Stay pending until the
+    /// replacement snapshot arrives; do not promote the local draft.
+    pub(crate) fn mark_session_override_refreshing(&mut self) -> bool {
+        if !self.session_override_pending {
+            return false;
+        }
+        self.status = Some("reattached; refreshing daemon tool surface…".to_string());
+        true
+    }
+
+    pub(crate) fn note_snapshot_refresh_error(&mut self, message: impl Into<String>) {
+        if !self.session_override_pending {
+            return;
+        }
+        self.status = Some(format!(
+            "{}; press Enter to refresh daemon tool surface",
+            message.into()
+        ));
+    }
+
+    /// Confirmed tool-surface state is the daemon snapshot, never a locally
+    /// promoted draft. In-progress unsaved edits keep their draft; `original`
+    /// still tracks the latest daemon baseline.
+    pub(crate) fn reconcile_from_daemon(&mut self, selection: ToolSurfaceSelection) {
+        if self.session_override_pending {
+            if matches!(self.in_flight, Some(ToolsPending::SaveAgent { .. })) {
+                return;
+            }
+            self.in_flight = None;
+            self.pending_effect = None;
+        } else if self.in_flight.is_some() {
+            return;
+        }
+        let no_local_edits = self.draft.selection() == &self.original;
+        let adopt_draft = self.session_override_pending || no_local_edits;
+        self.original = selection.clone();
+        if adopt_draft {
+            self.draft = ToolSurfaceDraft::from_selection(selection);
+        }
+        if self.session_override_pending {
+            self.session_override_pending = false;
+            self.status = Some("session tool surface confirmed".to_string());
+            self.row_errors.clear();
+            self.confirm = None;
+        }
     }
 
     pub(crate) fn refuse_session_override(&mut self, message: String) {
@@ -556,6 +603,8 @@ impl ToolsPane {
                 && self.in_flight.is_some()
             {
                 self.retry_settlement();
+            } else if key.code == KeyCode::Enter && self.session_override_pending {
+                return Some(ToolsOutcome::RefreshSnapshot);
             } else {
                 self.status = Some(
                     "tool settings operation is still pending; this pane cannot close yet"
@@ -1059,11 +1108,21 @@ mod tests {
         );
 
         pane.mark_session_override_pending();
-        let confirmed = pane.draft.selection().clone();
-        pane.confirm_session_override();
+        pane.mark_session_override_awaiting_snapshot();
+        assert!(pane.has_unsettled_local_authority());
+        assert_eq!(
+            pane.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Some(ToolsOutcome::RefreshSnapshot)
+        );
+        assert_eq!(pane.original, original);
+        let daemon = ToolSurfaceSelection {
+            tools: vec!["read".to_string(), "skill".to_string()],
+            tool_tiers: BTreeMap::new(),
+        };
+        pane.reconcile_from_daemon(daemon.clone());
         assert!(!pane.has_unsettled_local_authority());
-        assert_eq!(pane.original, confirmed);
-        assert_eq!(pane.draft.selection(), &confirmed);
+        assert_eq!(pane.original, daemon);
+        assert_eq!(pane.draft.selection(), &daemon);
     }
 
     #[test]

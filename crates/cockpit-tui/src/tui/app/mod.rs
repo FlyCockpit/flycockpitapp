@@ -416,7 +416,8 @@ pub(crate) enum ControlApplied {
         name: String,
     },
     /// Any `SetToolSurfaceOverride` receipt: cache-break warning (when set)
-    /// plus daemon snapshot reconciliation of every open tool-surface UI.
+    /// plus a daemon snapshot refresh. Open tool-surface UIs reconverge from
+    /// that snapshot; they must not promote a local draft on Applied.
     ToolSurfaceOverride {
         cache_break: bool,
     },

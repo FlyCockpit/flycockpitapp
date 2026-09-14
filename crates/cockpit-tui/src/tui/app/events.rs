@@ -393,6 +393,7 @@ impl App {
         if let Some(Ok(runner)) = self.agent_runner.as_ref() {
             let epoch = runner.attachment_epoch();
             self.invalidate_composer_control_ownership(true, true);
+            self.abandon_epoch_bound_control_receipts();
             self.visible_attachment_epoch = epoch;
         }
     }
@@ -4144,6 +4145,22 @@ mod tests {
     use super::*;
     use cockpit_proto::InferenceErrorClass;
     use serde_json::json;
+
+    #[test]
+    fn adopt_visible_attachment_epoch_abandons_stale_control_receipts() {
+        let source = include_str!("events.rs");
+        let body = source
+            .split_once("fn adopt_visible_attachment_epoch_from_runner")
+            .expect("adopt_visible_attachment_epoch_from_runner")
+            .1
+            .split_once("fn flush_same_session_resync_event_buffer")
+            .map(|(body, _)| body)
+            .expect("flush_same_session_resync_event_buffer follows adopt");
+        assert!(
+            body.contains("self.abandon_epoch_bound_control_receipts()"),
+            "visible-epoch adoption must settle owners whose receipts are epoch-stamped"
+        );
+    }
 
     #[test]
     fn every_successful_daemon_link_recovery_retries_pending_queue_edit() {

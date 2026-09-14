@@ -2183,6 +2183,8 @@ pub struct App {
     /// Opaque operation IDs issued by this startup generation. Onboarding
     /// reducers consume an ID exactly once only after its receipt correlates.
     pending_startup_onboarding_operations: HashMap<crate::tui::async_action::AsyncActionId, String>,
+    /// Stable client operation id for onboarding agent create/reconcile.
+    onboarding_agent_operation_id: Option<String>,
     startup_background: StartupBackground,
     /// Non-blocking projection of the latest complete dependency snapshot.
     /// Startup never probes here; Settings owns background refreshes.
@@ -3964,6 +3966,7 @@ impl App {
             completed_async_actions: Vec::new(),
             skills_pane_generation: 0,
             pending_startup_onboarding_operations: HashMap::new(),
+            onboarding_agent_operation_id: None,
             startup_background: StartupBackground {
                 daemon_socket: None,
                 daemon_endpoint: None,

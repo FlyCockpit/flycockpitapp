@@ -1289,6 +1289,72 @@ impl App {
                     Ok(_) | Err(_) => {}
                 }
             }
+            AsyncActionKind::DaemonRpc("agent_authoring.projection") => {
+                let pending_request_id = self
+                    .pending_startup_onboarding_operations
+                    .remove(&result.id);
+                match result.payload {
+                    Ok(AsyncActionPayload::StartupAgentAuthoringProjection {
+                        client_operation_id,
+                        request_id,
+                        projection,
+                    }) if pending_request_id.as_deref() == Some(&request_id) => {
+                        self.onboarding_agent_operation_id = Some(client_operation_id.clone());
+                        if let Some(shell) = self.onboarding_shell.as_mut() {
+                            shell.present_agent_authoring(projection, client_operation_id);
+                        }
+                    }
+                    Err(error) => {
+                        self.show_toast(
+                            format!("Agent authoring projection unavailable: {error}"),
+                            crate::tui::app::ToastKind::Error,
+                        );
+                    }
+                    Ok(_) => self.show_toast(
+                        "Agent authoring projection returned an invalid payload",
+                        crate::tui::app::ToastKind::Error,
+                    ),
+                }
+            }
+            AsyncActionKind::DaemonRpc(
+                label @ ("agent_authoring.preview" | "agent_authoring.apply"),
+            ) => {
+                let pending_request_id = self
+                    .pending_startup_onboarding_operations
+                    .remove(&result.id);
+                match result.payload {
+                    Ok(AsyncActionPayload::StartupAgentAuthoringOutcome {
+                        request_id,
+                        outcome,
+                    }) if pending_request_id.as_deref() == Some(&request_id) => match outcome {
+                        Ok(outcome) => {
+                            if let Some(shell) = self.onboarding_shell.as_mut() {
+                                shell.apply_agent_authoring_outcome(outcome);
+                            }
+                        }
+                        Err(error) => {
+                            self.show_toast(
+                                format!(
+                                    "Agent authoring {} failed: {error}",
+                                    if label == "agent_authoring.preview" {
+                                        "preview"
+                                    } else {
+                                        "create"
+                                    }
+                                ),
+                                crate::tui::app::ToastKind::Error,
+                            );
+                        }
+                    },
+                    Err(error) => {
+                        self.show_toast(
+                            format!("Agent authoring request failed: {error}"),
+                            crate::tui::app::ToastKind::Error,
+                        );
+                    }
+                    Ok(_) => {}
+                }
+            }
             AsyncActionKind::DaemonRpc("startup.workspace") => match result.payload {
                 Ok(AsyncActionPayload::StartupWorkspace(completion)) => {
                     self.apply_startup_workspace_completion(completion);

@@ -507,14 +507,8 @@ impl App {
                 );
             }
             OnboardingStage::Agent => {
-                self.mount_onboarding_wizard(
-                    cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID,
-                    None,
-                    Some(
-                        "Install an agent and confirm its model, tools, trust, and sidecar."
-                            .to_string(),
-                    ),
-                );
+                self.dialog = crate::tui::settings::Dialog::None;
+                self.mount_onboarding_agent_authoring();
             }
             OnboardingStage::Lifetime => {
                 self.mount_onboarding_wizard(
@@ -544,9 +538,6 @@ impl App {
                     shell.present_engine(match wizard_id {
                         cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID => {
                             crate::tui::onboarding::EngineStage::Profile
-                        }
-                        cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID => {
-                            crate::tui::onboarding::EngineStage::Agent
                         }
                         cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID => {
                             crate::tui::onboarding::EngineStage::Lifetime
@@ -1013,6 +1004,150 @@ impl App {
                 self.onboarding_shell = None;
                 self.dialog = crate::tui::settings::Dialog::None;
             }
+            Some(OnboardingShellAction::AgentAuthoring(action)) => {
+                self.dispatch_onboarding_agent_authoring(action);
+            }
+        }
+    }
+
+    fn mount_onboarding_agent_authoring(&mut self) {
+        let operation_id = self
+            .onboarding_agent_operation_id
+            .get_or_insert_with(|| format!("onboarding-agent-{}", uuid::Uuid::new_v4()))
+            .clone();
+        if self
+            .onboarding_shell
+            .as_ref()
+            .is_some_and(|shell| shell.screen_is_agent_authoring())
+        {
+            return;
+        }
+        self.request_agent_authoring_projection(operation_id);
+    }
+
+    fn request_agent_authoring_projection(&mut self, client_operation_id: String) {
+        let lifecycle = self.lifecycle.clone();
+        let selected_endpoint = self
+            .startup_lifecycle
+            .as_ref()
+            .map(|selected| selected.endpoint.clone());
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let pending_request_id = request_id.clone();
+        let started = self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::DaemonRpc("agent_authoring.projection"),
+            crate::tui::async_action::AsyncActionPolicy::Replace(
+                crate::tui::async_action::AsyncActionKey::new("agent_authoring.projection"),
+            ),
+            async move {
+                let endpoint =
+                    onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref()).await?;
+                let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let response = client
+                    .request(cockpit_proto::Request::GetAgentAuthoringProjection)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                match response {
+                    Ok(cockpit_proto::Response::AgentAuthoringProjection(projection)) => {
+                        Ok(crate::tui::async_action::AsyncActionPayload::StartupAgentAuthoringProjection {
+                            client_operation_id,
+                            request_id,
+                            projection,
+                        })
+                    }
+                    Ok(other) => Err(format!("unexpected agent authoring projection: {other:?}")),
+                    Err(error) => Err(error.to_string()),
+                }
+            },
+        );
+        if let crate::tui::async_action::AsyncActionStart::Started(id) = started {
+            self.pending_startup_onboarding_operations
+                .insert(id, pending_request_id);
+        }
+    }
+
+    fn dispatch_onboarding_agent_authoring(
+        &mut self,
+        action: crate::tui::onboarding::agent::AgentAuthoringShellAction,
+    ) {
+        use crate::tui::onboarding::agent::AgentAuthoringAction;
+        let Some(snapshot) = self.onboarding_snapshot.clone() else {
+            self.show_toast(
+                "Onboarding checkpoint is unavailable",
+                super::ToastKind::Error,
+            );
+            return;
+        };
+        let lifecycle = self.lifecycle.clone();
+        let selected_endpoint = self
+            .startup_lifecycle
+            .as_ref()
+            .map(|selected| selected.endpoint.clone());
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let pending_request_id = request_id.clone();
+        let operation_id = self
+            .onboarding_agent_operation_id
+            .get_or_insert_with(|| format!("onboarding-agent-{}", uuid::Uuid::new_v4()))
+            .clone();
+        let (validate_only, package, replace_key) = match action {
+            AgentAuthoringAction::PreviewPackage(package) => {
+                (true, package, "agent_authoring.preview")
+            }
+            AgentAuthoringAction::ApplyPackage {
+                client_operation_id,
+                package,
+            } => {
+                let _ = client_operation_id;
+                (false, package, "agent_authoring.apply")
+            }
+            AgentAuthoringAction::RefreshProjection => {
+                self.request_agent_authoring_projection(operation_id);
+                return;
+            }
+        };
+        let correlation = cockpit_proto::AuthoredAgentOnboardingCorrelation {
+            run_id: snapshot.run_id,
+            attempt_id: snapshot.attempt_id,
+            stage_revision: snapshot.revision,
+        };
+        let request = cockpit_proto::ApplyAuthoredAgentPackageRequest {
+            client_operation_id: operation_id,
+            expected_policy_revision: package.policy_revision.clone(),
+            package,
+            onboarding: Some(correlation),
+            validate_only,
+        };
+        let started = self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::DaemonRpc(replace_key),
+            crate::tui::async_action::AsyncActionPolicy::Replace(
+                crate::tui::async_action::AsyncActionKey::new(replace_key),
+            ),
+            async move {
+                let endpoint =
+                    onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref()).await?;
+                let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let response = client
+                    .request(cockpit_proto::Request::ApplyAuthoredAgentPackage(request))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                match response {
+                    Ok(cockpit_proto::Response::AuthoredAgentPackage(outcome)) => {
+                        Ok(crate::tui::async_action::AsyncActionPayload::StartupAgentAuthoringOutcome {
+                            request_id,
+                            outcome: Ok(outcome),
+                        })
+                    }
+                    Ok(other) => Err(format!("unexpected agent authoring response: {other:?}")),
+                    Err(error) => Err(error.to_string()),
+                }
+            },
+        );
+        if let crate::tui::async_action::AsyncActionStart::Started(id) = started {
+            self.pending_startup_onboarding_operations
+                .insert(id, pending_request_id);
         }
     }
 
@@ -1180,26 +1315,29 @@ impl App {
                 true
             }
             cockpit_proto::OnboardingStage::Agent => {
-                if !shell.screen_is_engine(crate::tui::onboarding::EngineStage::Agent)
-                    || !self
-                        .dialog
-                        .setup_wizard_is_complete(cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID)
-                {
-                    return false;
+                let (agent_action, settlement) = {
+                    let Some(shell) = self.onboarding_shell.as_mut() else {
+                        return false;
+                    };
+                    let action = shell.take_agent_authoring_action();
+                    let settlement = shell.agent_authoring_settlement(
+                        snapshot.run_id,
+                        snapshot.attempt_id,
+                        snapshot.revision,
+                        self.config_snapshot.generation,
+                    );
+                    (action, settlement)
+                };
+                if let Some(action) = agent_action {
+                    self.dispatch_onboarding_agent_authoring(action);
                 }
+                let Some(settlement) = settlement else {
+                    return false;
+                };
                 self.refresh_bootstrap_config_snapshot();
-                let settlement = self.dialog.onboarding_wizard_settlement(
-                    cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID,
-                    snapshot.run_id,
-                    snapshot.attempt_id,
-                    snapshot.revision,
-                );
-                if settlement.is_none() {
-                    return false;
-                }
                 self.request_onboarding_transition(
                     cockpit_proto::OnboardingTransitionKind::Advance,
-                    settlement,
+                    Some(settlement),
                 );
                 true
             }

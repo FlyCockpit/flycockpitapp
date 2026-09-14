@@ -161,6 +161,87 @@ fn shell_screen_kind(app: &App) -> Option<crate::tui::onboarding::OnboardingScre
         .map(|shell| shell.screen_kind())
 }
 
+fn settle_onboarding_agent_stage(app: &mut App) {
+    use cockpit_proto::{
+        AGENT_AUTHORING_DTO_VERSION, AgentAuthoringCatalogOrigin, AgentAuthoringCompatibleRoute,
+        AgentAuthoringProjection, AgentAuthoringSource, AgentAuthoringSourceKind, AgentPolicyRoute,
+        AgentPolicySnapshot, AgentPolicyTrustClassification, ApplyAuthoredAgentPackageOutcome,
+        ApplyAuthoredAgentPackageReceipt, AuthoredAgentReceiptStatus, AuthoredAgentReview,
+        AuthoredAgentReviewGrant,
+    };
+    let operation_id = "first-run-agent-op".to_string();
+    app.onboarding_agent_operation_id = Some(operation_id.clone());
+    let projection = AgentAuthoringProjection {
+        dto_version: AGENT_AUTHORING_DTO_VERSION,
+        policy: AgentPolicySnapshot {
+            policy_revision: "agent-policy-rev".into(),
+            routes: vec![AgentPolicyRoute {
+                provider_id: "p".into(),
+                model_id: "m".into(),
+                trust: AgentPolicyTrustClassification::Trusted,
+                confirmation_required: false,
+                trust_is_shared: true,
+                capabilities: vec!["text_generation".into()],
+                location: Some("remote".into()),
+                auto_prune: false,
+                sidecar_eligible: false,
+                remote_sidecar_egress_required: false,
+            }],
+            catalog_origin: AgentAuthoringCatalogOrigin::Cached,
+            catalog_revision: "catalog-rev".into(),
+            bundled_frontier_slug: "frontier".into(),
+        },
+        sources: vec![AgentAuthoringSource {
+            kind: AgentAuthoringSourceKind::BundledFrontier,
+            slug: Some("navigator".into()),
+            display_name: "Navigator".into(),
+            source_locator: Some("catalog/frontier@rev".into()),
+            compatible_routes: vec![AgentAuthoringCompatibleRoute {
+                provider_id: "p".into(),
+                model_id: "m".into(),
+            }],
+            definition_frontmatter_yaml: None,
+        }],
+        review_trust_disclosure: "Trust classification is shared global provider/model policy."
+            .into(),
+    };
+    let review = AuthoredAgentReview {
+        agent_name: "navigator".into(),
+        grants: vec![AuthoredAgentReviewGrant {
+            provider_id: "p".into(),
+            model_id: "m".into(),
+            is_default: true,
+            trust: AgentPolicyTrustClassification::Trusted,
+            trust_is_shared: true,
+        }],
+        tool_tier_preferences: vec![("read".into(), "enabled".into())],
+        verification_label: None,
+        interactive_subagents: true,
+        goal_skeptics_label: "off".into(),
+        children: vec![],
+        sidecars: vec![],
+        source: "catalog/frontier@rev".into(),
+        trust_is_shared: true,
+        trust_disclosure: "Trust classification is shared global provider/model policy.".into(),
+    };
+    if let Some(shell) = app.onboarding_shell.as_mut() {
+        shell.present_agent_authoring(projection, operation_id.clone());
+        shell.apply_agent_authoring_outcome(ApplyAuthoredAgentPackageOutcome::Receipt(
+            ApplyAuthoredAgentPackageReceipt {
+                client_operation_id: operation_id,
+                receipt_id: uuid::Uuid::from_u128(9),
+                status: AuthoredAgentReceiptStatus::Committed,
+                package_digest: "digest".into(),
+                policy_revision: "agent-policy-rev".into(),
+                installation_id: Some("install-1".into()),
+                default_selected: true,
+                review,
+            },
+        ));
+    }
+    app.config_snapshot.generation = 1;
+}
+
 fn type_into_search(app: &mut App, text: &str) {
     for ch in text.chars() {
         shell_key(app, KeyCode::Char(ch));
@@ -287,11 +368,11 @@ fn first_run_flow_completes_end_to_end() {
     app.dialog.test_mark_setup_complete("model-save");
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Agent);
+    settle_onboarding_agent_stage(&mut app);
     assert_eq!(
-        app.dialog.test_page_name(),
-        Some(cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID)
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::AgentAuthoring)
     );
-    app.dialog.test_mark_setup_complete("agent-install");
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Lifetime);
     assert_eq!(
@@ -346,7 +427,7 @@ fn completion_detour_ends_when_the_added_provider_settles() {
     app.dialog.test_mark_setup_complete("model-save");
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Agent);
-    app.dialog.test_mark_setup_complete("agent-install");
+    settle_onboarding_agent_stage(&mut app);
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Lifetime);
     app.dialog.test_mark_setup_complete("lifetime-save");
@@ -433,7 +514,7 @@ fn complete_authority_refresh_preserves_the_local_provider_detour() {
     app.dialog.test_mark_setup_complete("model-save");
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Agent);
-    app.dialog.test_mark_setup_complete("agent-install");
+    settle_onboarding_agent_stage(&mut app);
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Lifetime);
     app.dialog.test_mark_setup_complete("lifetime-save");
@@ -516,7 +597,7 @@ fn first_run_configuration_queues_held_draft_behind_selected_model() {
 
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Agent);
-    app.dialog.test_mark_setup_complete("agent-install");
+    settle_onboarding_agent_stage(&mut app);
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Lifetime);
     app.dialog.test_mark_setup_complete("lifetime-save");

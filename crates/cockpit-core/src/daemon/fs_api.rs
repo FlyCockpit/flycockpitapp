@@ -1004,7 +1004,7 @@ pub async fn apply_extended_config_patch(
         }),
     )
     .await?;
-    if let Err(error) = ctx.refresh_redaction_table() {
+    if let Err(error) = ctx.refresh_redaction_table().await {
         ctx.poison_redaction_publication(&error);
         if let Response::ExtendedConfigSaved { publication, .. } = &mut response {
             *publication = cockpit_proto::ConfigPublicationStatus::Degraded;

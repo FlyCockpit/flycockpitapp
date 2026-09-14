@@ -10149,7 +10149,7 @@ async fn owner_secret_write_does_not_ack_when_redaction_publication_fails() {
             .named_secret("publication-failure-name"),
         None
     );
-    ctx.refresh_redaction_table().unwrap();
+    ctx.refresh_redaction_table().await.unwrap();
     assert!(
         crate::daemon::current_redaction(&ctx.global_redaction)
             .scrub("publication-failure-value")
@@ -12324,7 +12324,7 @@ async fn owner_secret_redaction_failure_rolls_back_every_vault_namespace() {
         crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
     store.set_named_secret("rollback-named", "old-named-value");
     store.save().unwrap();
-    ctx.refresh_redaction_table().unwrap();
+    ctx.refresh_redaction_table().await.unwrap();
     ctx.set_force_daemon_redaction_refresh_failure(true);
     expect_failed(
         handle_request(
@@ -12356,7 +12356,7 @@ async fn owner_secret_redaction_failure_rolls_back_every_vault_namespace() {
         serde_json::json!({"api_key": "old-provider"}),
     );
     store.save().unwrap();
-    ctx.refresh_redaction_table().unwrap();
+    ctx.refresh_redaction_table().await.unwrap();
     ctx.set_force_daemon_redaction_refresh_failure(true);
     expect_failed(
         handle_request(
@@ -12382,7 +12382,7 @@ async fn owner_secret_redaction_failure_rolls_back_every_vault_namespace() {
             .contains("old-provider"),
         "failed provider replacement must preserve the prior redaction table"
     );
-    ctx.refresh_redaction_table().unwrap();
+    ctx.refresh_redaction_table().await.unwrap();
     ctx.set_force_daemon_redaction_refresh_failure(true);
     expect_failed(
         handle_request(
@@ -12432,7 +12432,7 @@ async fn owner_secret_redaction_failure_rolls_back_every_vault_namespace() {
         "failed account write must not publish its token to redaction"
     );
     crate::auth::flycockpit::store_credential_in_vault(ctx.secret_vault.clone(), &account).unwrap();
-    ctx.refresh_redaction_table().unwrap();
+    ctx.refresh_redaction_table().await.unwrap();
     ctx.set_force_daemon_redaction_refresh_failure(true);
     expect_failed(handle_request(Request::ClearFlycockpitCredential, &mut state, &ctx).await);
     assert_eq!(ctx.load_flycockpit_credential().unwrap(), Some(account));

@@ -218,6 +218,44 @@ async fn acquire_daemon_redaction_table(
         .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
+/// Bridge the two daemon APIs that are required to remain synchronous.
+///
+/// `block_in_place` panics on Tokio's current-thread runtime, which is also
+/// the runtime used by the persistent-daemon test harness. Keep the normal
+/// production path on its existing runtime, but give current-thread callers
+/// a dedicated runtime so acquisition can make progress while this thread is
+/// parked waiting for the synchronous publication contract.
+fn acquire_daemon_redaction_table_blocking(
+    authority: crate::redact::coverage_authority::RedactionCoverageAuthority,
+    config_source: crate::daemon::config_source::ConfigSource,
+    vault: Arc<crate::secure_key::SecretVault>,
+    command_cache: Arc<crate::secret_command::CommandSecretCache>,
+    purpose: crate::redact::coverage_authority::CoverageScope,
+) -> Result<Arc<RedactionTable>> {
+    let acquire = move || async move {
+        acquire_daemon_redaction_table(authority, &config_source, &vault, &command_cache, purpose)
+            .await
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(acquire()))
+        }
+        Ok(_) => std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("building daemon redaction publication runtime")?
+                .block_on(acquire())
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("daemon redaction publication worker panicked"))?,
+        Err(error) => {
+            Err(anyhow::anyhow!(error)
+                .context("coverage_unavailable: daemon runtime is not available"))
+        }
+    }
+}
+
 fn scrub_json_strings(value: &mut serde_json::Value, redact: &RedactionTable) {
     match value {
         serde_json::Value::String(s) => {
@@ -3375,29 +3413,20 @@ impl DaemonContext {
             let vault = publisher_vault
                 .upgrade()
                 .ok_or_else(|| "daemon vault is no longer available".to_string())?;
-            let runtime = tokio::runtime::Handle::try_current()
-                .map_err(|_| "coverage_unavailable: daemon runtime is not available".to_string())?;
-            tokio::task::block_in_place(|| {
-                runtime
-                    .block_on(async {
-                        let generation = vault
-                            .current_inventory_generation()
-                            .map_err(|error| error.to_string())?;
-                        let table = acquire_daemon_redaction_table(
-                            publisher_authority.clone(),
-                            &publisher_config,
-                            &vault,
-                            &publisher_cache,
-                            crate::redact::coverage_authority::CoverageScope::DaemonGlobalRefresh,
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
-                        set_current_redaction(&publisher_redaction, table);
-                        publisher_generation.store(generation, std::sync::atomic::Ordering::SeqCst);
-                        Ok(())
-                    })
-                    .map_err(|error: String| error)
-            })
+            let generation = vault
+                .current_inventory_generation()
+                .map_err(|error| error.to_string())?;
+            let table = acquire_daemon_redaction_table_blocking(
+                publisher_authority.clone(),
+                publisher_config.clone(),
+                vault,
+                publisher_cache.clone(),
+                crate::redact::coverage_authority::CoverageScope::DaemonGlobalRefresh,
+            )
+            .map_err(|error| error.to_string())?;
+            set_current_redaction(&publisher_redaction, table);
+            publisher_generation.store(generation, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
         }));
         #[cfg(debug_assertions)]
         let agent_installation_fixture =
@@ -3873,18 +3902,18 @@ impl DaemonContext {
     /// Publish the current vault-backed redaction table.  The test failpoint
     /// is kept at this boundary so local and remote owner mutations exercise
     /// identical publication-failure behavior.
-    pub(crate) fn publish_owner_redaction_table(&self) -> Result<()> {
+    pub(crate) async fn publish_owner_redaction_table(&self) -> Result<()> {
         #[cfg(test)]
         if self.redaction_refresh_failure.swap(false, Ordering::SeqCst) {
             anyhow::bail!("injected daemon redaction publication failure");
         }
-        self.refresh_redaction_table()
+        self.refresh_redaction_table().await
     }
 
     /// Apply one owner-vault mutation and publish its redaction table as one
     /// logical operation. Publication lives outside SQLite, so a failure is
     /// compensated by restoring the exact prior item bytes (or its absence).
-    pub(crate) fn mutate_owner_vault_item(
+    pub(crate) async fn mutate_owner_vault_item(
         &self,
         kind: cockpit_db::secret_vault::SecretVaultKind,
         item_id: &str,
@@ -3894,7 +3923,7 @@ impl DaemonContext {
             .secret_vault
             .mutate_item(kind, item_id, plaintext)
             .map_err(|error| anyhow::anyhow!(error))?;
-        if let Err(error) = self.publish_owner_redaction_table() {
+        if let Err(error) = self.publish_owner_redaction_table().await {
             return self
                 .restore_owner_vault_item(
                     kind,
@@ -3902,6 +3931,7 @@ impl DaemonContext {
                     &mutation.after,
                     mutation.prior.row.as_ref(),
                 )
+                .await
                 .map_err(|rollback| {
                     anyhow::anyhow!(
                         "redaction publication failed: {error}; vault rollback failed: {rollback}"
@@ -3953,13 +3983,15 @@ impl DaemonContext {
             })
             .await?;
 
-        if let Err(publication_error) = self.publish_owner_redaction_table() {
-            let rollback_vault = self.restore_owner_vault_item(
-                kind,
-                &item_id,
-                &mutation.after,
-                mutation.prior.row.as_ref(),
-            );
+        if let Err(publication_error) = self.publish_owner_redaction_table().await {
+            let rollback_vault = self
+                .restore_owner_vault_item(
+                    kind,
+                    &item_id,
+                    &mutation.after,
+                    mutation.prior.row.as_ref(),
+                )
+                .await;
             let db = self.db.clone();
             let restore_server_url = server_url.clone();
             let rollback_sync = db
@@ -3990,7 +4022,7 @@ impl DaemonContext {
         Ok(())
     }
 
-    fn restore_owner_vault_item(
+    async fn restore_owner_vault_item(
         &self,
         kind: cockpit_db::secret_vault::SecretVaultKind,
         item_id: &str,
@@ -4007,7 +4039,7 @@ impl DaemonContext {
         // The failed publication left a row newer than the one this request
         // produced. Refresh once so the daemon does not retain a stale
         // redaction snapshot, then fail closed rather than clobbering it.
-        let refresh_error = self.refresh_redaction_table().err();
+        let refresh_error = self.refresh_redaction_table().await.err();
         match refresh_error {
             Some(error) => anyhow::bail!(
                 "owner vault item changed concurrently; refusing redaction rollback and refresh failed: {error}"
@@ -4249,52 +4281,56 @@ impl DaemonContext {
             return;
         }
 
-        if let Err(error) = self.republish_global_redaction_sync(Some(event)) {
+        if let Err(error) = self.republish_global_redaction_blocking(event) {
             tracing::error!(%error, "daemon event refused while coverage is unavailable");
         }
     }
 
-    pub(crate) fn refresh_redaction_table(&self) -> Result<()> {
-        self.registry.coverage_authority().invalidate();
-        self.republish_global_redaction_sync(None)
+    fn republish_global_redaction_blocking(&self, event: proto::Event) -> Result<()> {
+        let generation = self
+            .secret_vault
+            .current_inventory_generation()
+            .context("reading daemon redaction source revision")?;
+        let table = acquire_daemon_redaction_table_blocking(
+            self.registry.coverage_authority().clone(),
+            self.config_source.clone(),
+            self.secret_vault.clone(),
+            self.registry.command_secret_cache(),
+            crate::redact::coverage_authority::CoverageScope::DaemonGlobalEvent,
+        )?;
+        set_current_redaction(&self.global_redaction, table.clone());
+        self.redaction_generation
+            .store(generation, std::sync::atomic::Ordering::SeqCst);
+        send_event(&self.global_events, &table, event);
+        Ok(())
     }
 
-    fn republish_global_redaction_sync(&self, event: Option<proto::Event>) -> Result<()> {
-        let runtime = tokio::runtime::Handle::try_current()
-            .context("coverage_unavailable: daemon runtime is not available")?;
+    pub(crate) async fn refresh_redaction_table(&self) -> Result<()> {
+        self.registry.coverage_authority().invalidate();
+        self.republish_global_redaction().await
+    }
+
+    async fn republish_global_redaction(&self) -> Result<()> {
         let authority = self.registry.coverage_authority().clone();
         let source = self.config_source.clone();
         let vault = self.secret_vault.clone();
         let command_cache = self.registry.command_secret_cache();
         let shared = self.global_redaction.clone();
         let published_generation = self.redaction_generation.clone();
-        let events = self.global_events.clone();
-        let purpose = if event.is_some() {
-            crate::redact::coverage_authority::CoverageScope::DaemonGlobalEvent
-        } else {
-            crate::redact::coverage_authority::CoverageScope::DaemonGlobalRefresh
-        };
-        tokio::task::block_in_place(|| {
-            runtime.block_on(async {
-                let generation = vault
-                    .current_inventory_generation()
-                    .context("reading daemon redaction source revision")?;
-                let table = acquire_daemon_redaction_table(
-                    authority,
-                    &source,
-                    &vault,
-                    &command_cache,
-                    purpose,
-                )
-                .await?;
-                set_current_redaction(&shared, table.clone());
-                published_generation.store(generation, std::sync::atomic::Ordering::SeqCst);
-                if let Some(event) = event {
-                    send_event(&events, &table, event);
-                }
-                Ok(())
-            })
-        })
+        let generation = vault
+            .current_inventory_generation()
+            .context("reading daemon redaction source revision")?;
+        let table = acquire_daemon_redaction_table(
+            authority,
+            &source,
+            &vault,
+            &command_cache,
+            crate::redact::coverage_authority::CoverageScope::DaemonGlobalRefresh,
+        )
+        .await?;
+        set_current_redaction(&shared, table.clone());
+        published_generation.store(generation, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 
     #[cfg(test)]

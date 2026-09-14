@@ -2040,7 +2040,7 @@ async fn commit_oauth_begin(
         })
         .await
         .map_err(internal)?;
-    if let Err(error) = ctx.publish_owner_redaction_table() {
+    if let Err(error) = ctx.publish_owner_redaction_table().await {
         ctx.poison_redaction_publication(&error);
         tracing::error!(%error, "OAuth begin committed but redaction publication failed; daemon poisoned");
     }
@@ -2180,7 +2180,7 @@ async fn commit_oauth_cancel(
         })
         .await
         .map_err(internal)?;
-    if delete_ready_flow && let Err(error) = ctx.publish_owner_redaction_table() {
+    if delete_ready_flow && let Err(error) = ctx.publish_owner_redaction_table().await {
         ctx.poison_redaction_publication(&error);
         tracing::error!(%error, "OAuth cancellation committed but redaction publication failed; daemon poisoned");
     }
@@ -5562,7 +5562,7 @@ async fn mutate_owner_vault_item_with_remote_ledger(
     // here would make the caller retry while replay returns that response, so
     // publication failure instead poisons and force-shuts the daemon before
     // it can serve another request with a stale redaction table.
-    if let Err(error) = ctx.publish_owner_redaction_table() {
+    if let Err(error) = ctx.publish_owner_redaction_table().await {
         ctx.poison_redaction_publication(&error);
     }
     Ok(response)
@@ -12246,7 +12246,7 @@ async fn handle_serialized_request_impl(
                 // reintroduce the per-event fork/scan storm. A rebuild failure
                 // must not be swallowed: retaining the stale table could
                 // disclose the secret, so poison the daemon.
-                if let Err(error) = ctx.refresh_redaction_table() {
+                if let Err(error) = ctx.refresh_redaction_table().await {
                     ctx.poison_redaction_publication(&error);
                     return Err(internal(error));
                 }
@@ -15306,6 +15306,7 @@ async fn handle_serialized_request_impl(
                         crate::auth::flycockpit::CREDENTIAL_KEY,
                         Some(&credential_bytes),
                     )
+                    .await
                     .map(|()| response)
                     .map_err(internal),
             };
@@ -15626,6 +15627,7 @@ async fn handle_serialized_request_impl(
                             &name,
                             Some(value.as_bytes()),
                         )
+                        .await
                         .map_err(internal)?;
                         Ok(Response::Ack)
                     }
@@ -15638,6 +15640,7 @@ async fn handle_serialized_request_impl(
                     &name,
                     Some(value.as_bytes()),
                 )
+                .await
                 .map_err(internal)?;
                 Ok(Response::Ack)
             }
@@ -15737,7 +15740,7 @@ async fn handle_serialized_request_impl(
                     })
                     .await
                     .map_err(internal)?;
-                if let Err(error) = ctx.publish_owner_redaction_table() {
+                if let Err(error) = ctx.publish_owner_redaction_table().await {
                     ctx.poison_redaction_publication(&error);
                     tracing::error!(%error, "subscription acknowledgement committed but redaction publication failed; daemon poisoned");
                 }
@@ -15798,6 +15801,7 @@ async fn handle_serialized_request_impl(
                             &name,
                             None,
                         )
+                        .await
                         .map_err(internal)?;
                         Ok(Response::Ack)
                     }
@@ -15810,6 +15814,7 @@ async fn handle_serialized_request_impl(
                     &name,
                     None,
                 )
+                .await
                 .map_err(internal)?;
                 Ok(Response::Ack)
             }
@@ -16829,7 +16834,7 @@ async fn handle_serialized_request_impl(
                     })
                     .await
                     .map_err(internal)?;
-                if let Err(error) = ctx.publish_owner_redaction_table() {
+                if let Err(error) = ctx.publish_owner_redaction_table().await {
                     ctx.poison_redaction_publication(&error);
                     tracing::error!(%error, "provider OAuth committed but redaction publication failed; daemon poisoned");
                 }
@@ -17907,7 +17912,7 @@ async fn handle_serialized_request_impl(
                     })
                     .await
                     .map_err(map_named_secret_tx_error)?;
-                if let Err(error) = ctx.publish_owner_redaction_table() {
+                if let Err(error) = ctx.publish_owner_redaction_table().await {
                     // Vault + ownership are committed. The exchange is one-shot,
                     // so rollback could orphan the already-authorized token;
                     // poison and fail closed until the daemon is restarted.
@@ -23249,7 +23254,7 @@ async fn commit_local_provider_credential(
     if matches!(
         &response,
         Response::ProviderCredentialCommitted { changed: true, .. }
-    ) && let Err(error) = ctx.publish_owner_redaction_table()
+    ) && let Err(error) = ctx.publish_owner_redaction_table().await
     {
         ctx.poison_redaction_publication(&error);
         return Err(internal(error));
@@ -23684,7 +23689,7 @@ async fn stage_and_recover_provider_batch(
         })
         .await
         .map_err(map_named_secret_tx_error)?;
-    if let Err(error) = ctx.publish_owner_redaction_table() {
+    if let Err(error) = ctx.publish_owner_redaction_table().await {
         let compensation = compensate_provider_batch_staging(ctx, &journal_id).await;
         ctx.poison_redaction_publication(&error);
         return match compensation {
@@ -25600,6 +25605,7 @@ async fn recover_provider_config_journals_inner(
                     &reference,
                     None,
                 )
+                .await
                 .map_err(internal)?;
             }
         }
@@ -25636,6 +25642,7 @@ async fn recover_provider_config_journals_inner(
                             &reference,
                             None,
                         )
+                        .await
                         .map_err(internal)?;
                     }
                 }
@@ -26516,7 +26523,7 @@ async fn provider_config_save_under_lock(
     // includes those newly-created values. A publication failure is a
     // fail-closed operation: compensate the staged rows and retire the
     // journal, then poison the daemon if compensation itself cannot complete.
-    if let Err(publication_error) = ctx.publish_owner_redaction_table() {
+    if let Err(publication_error) = ctx.publish_owner_redaction_table().await {
         let staged_names = staged
             .iter()
             .map(|(name, _)| name.clone())
@@ -27209,7 +27216,7 @@ async fn save_mcp_config(
         })
         .await
         .map_err(map_named_secret_tx_error)?;
-    if let Err(error) = ctx.publish_owner_redaction_table() {
+    if let Err(error) = ctx.publish_owner_redaction_table().await {
         compensate_mcp_staged_and_retire(ctx, &journal_id, &staged_mutations).await?;
         ctx.poison_redaction_publication(&error);
         return Err(internal(error));
@@ -28010,7 +28017,7 @@ async fn delete_owned_named_secret(
         })
         .await
         .map_err(internal)?;
-    if let Err(error) = ctx.publish_owner_redaction_table() {
+    if let Err(error) = ctx.publish_owner_redaction_table().await {
         ctx.poison_redaction_publication(&error);
         return Err(internal(error));
     }

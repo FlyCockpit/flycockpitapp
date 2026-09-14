@@ -55,7 +55,7 @@ fn named_setup_wizard_table_is_exhaustive() {
         })
         .expect("open_onboarding_setup");
     for wizard_id in &ids {
-        let constant = match wizard_id.as_str() {
+        let constant = match *wizard_id {
             cockpit_core::wizard::PROVIDER_WIZARD_ID => "PROVIDER_WIZARD_ID",
             cockpit_core::wizard::SECURITY_WIZARD_ID => "SECURITY_WIZARD_ID",
             cockpit_core::wizard::MODEL_WIZARD_ID => "MODEL_WIZARD_ID",

@@ -21,7 +21,7 @@ use crate::wizard::{
     descriptor_for_cwd_with_caps, provider_entry_from_answers, provider_id_answer,
     selected_provider_template,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::commands::InteractiveOnboardingRequired;
 

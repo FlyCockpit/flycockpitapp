@@ -2168,7 +2168,7 @@ fn assemble_nested_private_subagents(
             .remove(&path)
             .expect("nested private subagent path must exist");
         assembled
-            .entry(parent_path.to_string())
+            .get_mut(parent_path)
             .expect("nested private subagent parent must exist")
             .private_subagents
             .insert(child_name.to_string(), child);

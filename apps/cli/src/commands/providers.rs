@@ -1,3 +1,5 @@
+use std::io::IsTerminal;
+
 use anyhow::{Result, anyhow, bail};
 
 use crate::commands::InteractiveOnboardingRequired;

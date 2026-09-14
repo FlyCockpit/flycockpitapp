@@ -301,6 +301,7 @@ impl AgentAuthoringScreen {
             Phase::SubagentEdit(SubagentPhase::ModelGrants) => "Subagent models",
             Phase::SubagentEdit(SubagentPhase::ModelTrust) => "Subagent model trust",
             Phase::SubagentEdit(SubagentPhase::ToolTiers) => "Subagent tools",
+            Phase::SubagentEdit(SubagentPhase::SubagentsList) => "Subagent children",
             Phase::Review => "Review agent package",
             Phase::Create => "Create agent",
             Phase::Pending => "Create pending",
@@ -533,9 +534,14 @@ impl AgentAuthoringScreen {
                 }
             }
             Phase::SubagentEdit(SubagentPhase::ModelTrust) => {
+                let cursor = self.cursor;
+                let pending = self
+                    .editing_child
+                    .as_ref()
+                    .map(|child| child.pending_trust_route_indices(&self.projection))
+                    .unwrap_or_default();
                 if let Some(child) = self.current_child_mut() {
-                    let pending = child.pending_trust_route_indices(&self.projection);
-                    if let Some(index) = pending.get(self.cursor) {
+                    if let Some(index) = pending.get(cursor) {
                         child.trust_confirmations[*index] = !child.trust_confirmations[*index];
                     }
                 }
@@ -843,23 +849,24 @@ impl AgentAuthoringScreen {
                 None
             }
             Phase::SubagentEdit(SubagentPhase::ModelGrants) => {
-                if let Some(child) = self.current_child_mut() {
+                let next_phase = if let Some(child) = self.editing_child.as_ref() {
                     let enabled = child.route_grants.iter().filter(|g| g.enabled).count();
                     if enabled == 0 {
                         self.status = Some("Enable at least one model grant.".into());
                         return None;
                     }
-                    self.phase = if child
+                    if child
                         .pending_trust_route_indices(&self.projection)
                         .is_empty()
                     {
                         Phase::SubagentEdit(SubagentPhase::ToolTiers)
                     } else {
                         Phase::SubagentEdit(SubagentPhase::ModelTrust)
-                    };
+                    }
                 } else {
-                    self.phase = Phase::SubagentEdit(SubagentPhase::ToolTiers);
-                }
+                    Phase::SubagentEdit(SubagentPhase::ToolTiers)
+                };
+                self.phase = next_phase;
                 None
             }
             Phase::SubagentEdit(SubagentPhase::ToolTiers) => {
@@ -914,19 +921,22 @@ impl AgentAuthoringScreen {
         }
     }
 
-    fn child_at_path(draft: &AgentAuthoringDraft, path: &[usize]) -> Option<&ChildAuthoringDraft> {
-        let mut current = draft.children.get(path.first()?)?;
+    fn child_at_path<'a>(
+        draft: &'a AgentAuthoringDraft,
+        path: &[usize],
+    ) -> Option<&'a ChildAuthoringDraft> {
+        let mut current = draft.children.get(*path.first()?)?;
         for index in path.iter().skip(1) {
             current = current.children.get(*index)?;
         }
         Some(current)
     }
 
-    fn child_slot_at_path(
-        draft: &mut AgentAuthoringDraft,
+    fn child_slot_at_path<'a>(
+        draft: &'a mut AgentAuthoringDraft,
         path: &[usize],
-    ) -> Option<&mut ChildAuthoringDraft> {
-        let mut current = draft.children.get_mut(path.first()?)?;
+    ) -> Option<&'a mut ChildAuthoringDraft> {
+        let mut current = draft.children.get_mut(*path.first()?)?;
         for index in path.iter().skip(1) {
             current = current.children.get_mut(*index)?;
         }
@@ -947,15 +957,15 @@ impl AgentAuthoringScreen {
                 .iter()
                 .chain([&parent.children.len()])
                 .copied()
-                .collect();
-            self.subagent_stack.push(SubagentStackFrame {
-                parent: self.draft.clone(),
-                child_path,
-                phase: SubagentPhase::Identity,
-            });
+                .collect::<Vec<usize>>();
             if let Some(parent) = Self::child_slot_at_path(&mut self.draft, &parent_path) {
                 parent.children.push(child);
             }
+            self.subagent_stack.push(SubagentStackFrame {
+                parent: self.draft.clone(),
+                child_path: child_path.clone(),
+                phase: SubagentPhase::Identity,
+            });
             self.editing_child = Self::child_at_path(&self.draft, &child_path).cloned();
             self.subagents_focus = SubagentsFocus::Add;
             self.phase = Phase::SubagentEdit(SubagentPhase::Identity);
@@ -972,7 +982,11 @@ impl AgentAuthoringScreen {
         else {
             return;
         };
-        let child_path = parent_path.iter().chain([&index]).copied().collect();
+        let child_path = parent_path
+            .iter()
+            .chain([&index])
+            .copied()
+            .collect::<Vec<usize>>();
         let child = Self::child_at_path(&self.draft, &child_path).cloned();
         if child.is_none() {
             return;

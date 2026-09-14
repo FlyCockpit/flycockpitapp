@@ -775,6 +775,56 @@ mod tests {
     }
 
     #[test]
+    fn apply_reuses_terminal_journal_for_duplicate_client_operation_id() {
+        let source = include_str!("agent_authoring.rs");
+        let apply = source
+            .split("pub async fn apply_package_under_publication_lock")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("pub async fn recover_authored_agent_package_journals")
+                    .next()
+            })
+            .expect("apply under publication lock");
+        assert!(
+            apply.contains("replay_existing_journal"),
+            "duplicate create submits must query the durable receipt instead of minting a replacement operation"
+        );
+        assert!(
+            apply.contains("AUTHORED_PACKAGE_SETTLEMENT_PENDING"),
+            "pending journals must remain visible until the terminal receipt lands"
+        );
+    }
+
+    #[test]
+    fn receipt_query_never_mints_a_replacement_operation() {
+        let source = include_str!("agent_authoring.rs");
+        let receipt = source
+            .split("pub async fn receipt")
+            .nth(1)
+            .and_then(|tail| tail.split("fn encode_package_files").next())
+            .expect("receipt lookup");
+        assert!(receipt.contains("authored_agent_package_journal"));
+        assert!(!receipt.contains("begin_authored_agent_package_journal"));
+    }
+
+    #[test]
+    fn editor_lease_and_onboarding_create_share_exact_operation_settlement() {
+        let agent_management = include_str!("agent_management.rs");
+        assert!(
+            agent_management.contains("completion_operation_id"),
+            "editor lease settlement must bind to one stable client operation id"
+        );
+        assert!(
+            agent_management.contains("terminal_result_json"),
+            "editor lease settlement must replay the durable terminal receipt"
+        );
+        let apply = include_str!("agent_authoring.rs");
+        assert!(apply.contains("replay_existing_journal"));
+        assert!(apply.contains("set_default_agent_installation"));
+        assert!(apply.contains("finish_matching_local_operation"));
+    }
+
+    #[test]
     fn durable_intent_capacity_matches_hex_encoded_canonical_packages() {
         use cockpit_db::db::authored_agent_packages::{
             MAX_AUTHORED_PACKAGE_FILES_JSON_BYTES, MAX_AUTHORED_PACKAGE_FILES_JSON_WRAP_BYTES,

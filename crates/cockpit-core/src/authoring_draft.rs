@@ -158,7 +158,10 @@ fn default_tool_tiers() -> BTreeMap<String, ToolTier> {
     let mut tiers = BTreeMap::new();
     for tool in known_tool_names() {
         let legal = legal_tool_tiers(tool);
-        let tier = if crate::agents::is_safety_tool(tool) {
+        let tier = if crate::engine::builtin::author_tool_tier_preference_is_reserved(tool) {
+            // Host-owned placement tools must not appear in toolTierPreferences.
+            ToolTier::Disabled
+        } else if crate::agents::is_safety_tool(tool) {
             ToolTier::Enabled
         } else if legal.len() == 2 {
             ToolTier::Enabled
@@ -168,6 +171,19 @@ fn default_tool_tiers() -> BTreeMap<String, ToolTier> {
         tiers.insert(tool.to_string(), tier);
     }
     tiers
+}
+
+fn author_placeable_tool_tier_preferences(
+    tool_tiers: &BTreeMap<String, ToolTier>,
+) -> BTreeMap<String, ToolTier> {
+    tool_tiers
+        .iter()
+        .filter(|(tool, tier)| {
+            matches!(*tier, ToolTier::Enabled | ToolTier::Discoverable)
+                && !crate::engine::builtin::author_tool_tier_preference_is_reserved(tool)
+        })
+        .map(|(tool, tier)| (tool.clone(), *tier))
+        .collect()
 }
 
 fn child_default_tool_tiers() -> BTreeMap<String, ToolTier> {
@@ -382,12 +398,7 @@ fn build_frontmatter(
         })
         .collect::<Vec<_>>();
 
-    let mut tool_tier_preferences = draft
-        .tool_tiers
-        .iter()
-        .filter(|(_, tier)| matches!(*tier, ToolTier::Enabled | ToolTier::Discoverable))
-        .map(|(tool, tier)| (tool.clone(), *tier))
-        .collect::<BTreeMap<_, _>>();
+    let tool_tier_preferences = author_placeable_tool_tier_preferences(&draft.tool_tiers);
 
     let delegation = if draft.children.is_empty() {
         None
@@ -490,12 +501,7 @@ fn build_child_markdown(
         !models.is_empty(),
         "subagent `{name}` requires a model grant"
     );
-    let tool_tier_preferences = child
-        .tool_tiers
-        .iter()
-        .filter(|(_, tier)| matches!(*tier, ToolTier::Enabled | ToolTier::Discoverable))
-        .map(|(tool, tier)| (tool.clone(), *tier))
-        .collect();
+    let tool_tier_preferences = author_placeable_tool_tier_preferences(&child.tool_tiers);
     let frontmatter = AgentDefinitionFrontmatter {
         schema_version: SCHEMA_VERSION,
         agent_id: format!("authored/{name}"),
@@ -623,6 +629,18 @@ mod tests {
         let draft = AgentAuthoringDraft::from_projection(&projection);
         let err = build_package_draft(&projection, &draft).unwrap_err();
         assert!(err.to_string().contains("trust confirmation"));
+    }
+
+    #[test]
+    fn build_package_draft_omits_host_placement_tool_tier_preferences() {
+        let projection = sample_projection();
+        let mut draft = AgentAuthoringDraft::from_projection(&projection);
+        draft.trust_confirmations[0] = true;
+        let package = build_package_draft(&projection, &draft).unwrap();
+        assert!(
+            !package.markdown.contains("extract_audio:"),
+            "host-placement tools must not be written into toolTierPreferences"
+        );
     }
 
     #[test]

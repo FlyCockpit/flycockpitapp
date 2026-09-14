@@ -85,6 +85,14 @@ pub mod remote_project_resolver;
 #[cfg(feature = "extended")]
 pub mod scheduler;
 pub mod server;
+
+/// Current daemon-published configuration generation for client settlement
+/// correlation. Clients must read this from the daemon inventory, not infer it
+/// from local config reloads.
+pub fn published_config_generation() -> u64 {
+    server::inventory::current_config_generation()
+}
+
 #[cfg(feature = "remote")]
 pub mod session_continuity;
 pub(crate) mod session_setup_projection;

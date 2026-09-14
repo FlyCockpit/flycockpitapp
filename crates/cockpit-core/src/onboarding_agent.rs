@@ -921,6 +921,7 @@ pub fn publish_authored_sidecar_config(
     let mut extended = extended_doc.config();
     extended.image_sidecar = selection.clone();
     extended_doc.write(&extended)?;
+    crate::daemon::server::inventory::publish_committed_config_generation();
     Ok(())
 }
 

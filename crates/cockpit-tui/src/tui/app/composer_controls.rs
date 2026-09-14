@@ -136,13 +136,42 @@ impl ComposerPicker {
 }
 
 impl App {
-    pub(super) fn bump_composer_control_generation(&mut self) {
+    /// Generation-invalidate composer picker/pending ownership.
+    ///
+    /// A pending composer mutation is one claim over both the picker UI and
+    /// its bound `pending_control_requests` entry. Every close, reconnect,
+    /// session-generation, reset, terminal, and timeout path must call this
+    /// so a later receipt cannot apply confirmation side-effects and the
+    /// picker cannot remain on `Applying…`. When `refresh_if_fenced` is set
+    /// and an in-flight request was dropped, displayed pills reconverge from
+    /// daemon state instead of the discarded completion.
+    pub(super) fn invalidate_composer_control_ownership(
+        &mut self,
+        clear_selection: bool,
+        refresh_if_fenced: bool,
+    ) {
+        let request_id = self
+            .composer_controls
+            .pending
+            .take()
+            .and_then(|pending| pending.request_id);
+        self.composer_controls.dispatch_armed = false;
         self.composer_controls.generation = self.composer_controls.generation.wrapping_add(1);
         self.composer_controls.picker = None;
         self.composer_controls.picker_rect = None;
-        self.composer_controls.pending = None;
-        self.composer_controls.dispatch_armed = false;
-        self.composer_controls.selection = None;
+        if clear_selection {
+            self.composer_controls.selection = None;
+        }
+        if let Some(request_id) = request_id {
+            self.pending_control_requests.remove(&request_id);
+            if refresh_if_fenced {
+                self.request_session_setup_snapshot_refresh();
+            }
+        }
+    }
+
+    pub(super) fn bump_composer_control_generation(&mut self) {
+        self.invalidate_composer_control_ownership(true, true);
     }
 
     fn composer_mutation_matches(&self, pending: &PendingComposerMutation) -> bool {
@@ -270,7 +299,6 @@ impl App {
     pub(super) fn paint_composer_picker(&mut self, frame: &mut Frame<'_>) {
         self.composer_controls.picker_rect = None;
         if !self.composer_chrome_interactive() {
-            self.composer_controls.picker = None;
             return;
         }
         let Some(picker) = self.composer_controls.picker.clone() else {
@@ -435,13 +463,7 @@ impl App {
     }
 
     pub(super) fn close_composer_picker(&mut self) {
-        if self.composer_controls.picker.is_some() {
-            self.composer_controls.generation = self.composer_controls.generation.wrapping_add(1);
-        }
-        self.composer_controls.picker = None;
-        self.composer_controls.picker_rect = None;
-        self.composer_controls.pending = None;
-        self.composer_controls.dispatch_armed = false;
+        self.invalidate_composer_control_ownership(false, true);
     }
 
     pub(super) fn activate_composer_pill(&mut self, kind: ComposerControlKind) {
@@ -469,6 +491,9 @@ impl App {
     }
 
     pub(super) fn open_composer_picker(&mut self, kind: ComposerControlKind) {
+        if self.composer_controls.pending.is_some() {
+            self.invalidate_composer_control_ownership(false, true);
+        }
         let mut picker = ComposerPicker {
             generation: self.composer_controls.generation,
             session_id: self.launch.session_id,
@@ -769,8 +794,6 @@ impl App {
 
     pub(super) fn handle_composer_control_key(&mut self, key: KeyEvent) -> bool {
         if !self.composer_chrome_interactive() {
-            self.composer_controls.selection = None;
-            self.composer_controls.picker = None;
             return false;
         }
         if let Some(mut picker) = self.composer_controls.picker.take() {
@@ -1102,6 +1125,33 @@ impl App {
                 ComposerPickerStatus::Unavailable,
             );
         }
+    }
+
+    /// True when this receipt still sits in `composer_controls.pending` but
+    /// its generation/session/epoch no longer match. Callers must not apply
+    /// confirmation side-effects; displayed state reconverges from daemon.
+    pub(super) fn discard_stale_composer_control_receipt(
+        &mut self,
+        request_id: ControlRequestId,
+    ) -> bool {
+        let stale = self
+            .composer_controls
+            .pending
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.request_id == Some(request_id) && !self.composer_mutation_matches(pending)
+            });
+        if !stale {
+            return false;
+        }
+        self.composer_controls.pending = None;
+        self.composer_controls.dispatch_armed = false;
+        if let Some(picker) = self.composer_controls.picker.as_mut() {
+            picker.status = ComposerPickerStatus::Ready;
+            picker.status_text = Some("Stale result discarded.".to_string());
+        }
+        self.request_session_setup_snapshot_refresh();
+        true
     }
 
     pub(super) fn apply_composer_control_outcome(

@@ -149,10 +149,31 @@ impl App {
             .as_ref()
             .expect("expired pending selection exists")
             .selection_id;
+        let composer_owns_expired =
+            self.composer_controls
+                .pending
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.request_id.is_some_and(|request_id| {
+                        self.pending_control_requests
+                            .get(&request_id)
+                            .is_some_and(|request| {
+                                matches!(
+                                    request.applied,
+                                    ControlApplied::ModelSelection {
+                                        selection_id: pending_id
+                                    } if pending_id == selection_id
+                                )
+                            })
+                    })
+                });
         let pending = self
             .clear_pending_model_selection(Some(selection_id))
             .expect("expired pending selection exists");
         let pending = self.preserve_failed_model_selection(pending);
+        if composer_owns_expired {
+            self.invalidate_composer_control_ownership(true, true);
+        }
         self.push_plain(
             "The previous model selection timed out. Choose a model to retry; your queued message is retained."
                 .to_string(),
@@ -785,6 +806,19 @@ impl App {
         let Some(pending) = self.pending_control_requests.remove(&request_id) else {
             return;
         };
+        if self.discard_stale_composer_control_receipt(request_id) {
+            if let ControlApplied::ModelSelection { selection_id } = pending.applied
+                && matches!(
+                    outcome,
+                    ControlRequestOutcome::Rejected(_) | ControlRequestOutcome::NotDelivered(_)
+                )
+            {
+                if let Some(selection) = self.clear_pending_model_selection(Some(selection_id)) {
+                    let _ = self.preserve_failed_model_selection(selection);
+                }
+            }
+            return;
+        }
         let selection_id = match pending.applied {
             ControlApplied::ModelSelection { selection_id } => Some(selection_id),
             _ => None,
@@ -1009,6 +1043,7 @@ impl App {
     }
 
     pub(super) fn cancel_model_controls_for_terminal_link(&mut self) {
+        self.invalidate_composer_control_ownership(true, false);
         if let Some(pending) = self.cancel_model_controls_for_runner_epoch() {
             tracing::warn!(
                 session_id = ?pending.session_id,

@@ -392,9 +392,7 @@ impl App {
         }
         if let Some(Ok(runner)) = self.agent_runner.as_ref() {
             let epoch = runner.attachment_epoch();
-            if epoch != self.visible_attachment_epoch {
-                self.bump_composer_control_generation();
-            }
+            self.invalidate_composer_control_ownership(true, true);
             self.visible_attachment_epoch = epoch;
         }
     }

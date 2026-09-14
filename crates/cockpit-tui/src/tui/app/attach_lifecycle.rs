@@ -653,6 +653,7 @@ impl App {
         present_notice: bool,
     ) {
         let previous_session_id = self.launch.session_id;
+        self.invalidate_composer_control_ownership(true, false);
         if let Some(pending) = self.cancel_model_controls_for_runner_epoch() {
             let reason = match new_session_id {
                 Some(session_id) if previous_session_id == Some(session_id) => "runner reconnect",

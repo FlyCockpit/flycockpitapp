@@ -228,6 +228,82 @@ fn composer_picker_keyboard_and_mouse_parity() {
     );
 }
 
+fn arm_approval_mutation(app: &mut App) -> ControlRequestId {
+    app.activate_composer_pill(ComposerControlKind::Approval);
+    app.handle_key(press(KeyCode::Enter));
+    app.composer_controls
+        .pending
+        .as_ref()
+        .and_then(|pending| pending.request_id)
+        .expect("approval mutation bound to a control request")
+}
+
+fn install_agent_inventory(app: &mut App) {
+    app.inventory.snapshot = Some(super::inventory::InventorySnapshot {
+        selected_agent: "Build".to_string(),
+        agents: vec![
+            cockpit_proto::AgentSummary {
+                name: "Build".to_string(),
+                description: String::new(),
+                mode: String::new(),
+                source: String::new(),
+                builtin: true,
+            },
+            cockpit_proto::AgentSummary {
+                name: "Plan".to_string(),
+                description: String::new(),
+                mode: String::new(),
+                source: String::new(),
+                builtin: true,
+            },
+        ],
+        models: Vec::new(),
+        skills: Vec::new(),
+        session_generation: 0,
+        config_generation: 0,
+        inventory_generation: 0,
+    });
+}
+
+fn commit_plan_agent(app: &mut App) -> ControlRequestId {
+    app.activate_composer_pill(ComposerControlKind::Agent);
+    if let Some(picker) = app.composer_controls.picker.as_mut()
+        && let Some(idx) = picker
+            .categories
+            .get(picker.category)
+            .and_then(|category| category.items.iter().position(|item| item.id == "Plan"))
+    {
+        picker.cursor = idx;
+    }
+    app.handle_key(press(KeyCode::Enter));
+    app.composer_controls
+        .pending
+        .as_ref()
+        .and_then(|pending| pending.request_id)
+        .expect("agent mutation bound")
+}
+
+fn history_plain_lines(app: &App) -> Vec<&str> {
+    app.history
+        .iter()
+        .filter_map(|entry| match entry {
+            HistoryEntry::Plain { line } | HistoryEntry::CommandError { line } => {
+                Some(line.as_str())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn apply_control_applied(app: &mut App, request_id: ControlRequestId) {
+    app.apply_event(
+        cockpit_client::presentation::TurnEvent::ControlRequestFinished {
+            request_id,
+            outcome: ControlRequestOutcome::Applied,
+        },
+    );
+}
+
 #[test]
 fn composer_picker_discards_stale_generation_and_session() {
     let tmp = tempfile::tempdir().unwrap();
@@ -253,6 +329,130 @@ fn composer_picker_discards_stale_generation_and_session() {
             .as_deref()
             .is_some_and(|text| text.contains("Stale"))),
         "late result from a prior generation is discarded"
+    );
+}
+
+#[test]
+fn closing_composer_picker_fences_in_flight_control_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _control_rx) = app_with_runner(&tmp);
+    let request_id = arm_approval_mutation(&mut app);
+    assert!(app.pending_control_requests.contains_key(&request_id));
+    assert_eq!(
+        app.composer_controls
+            .picker
+            .as_ref()
+            .map(|picker| picker.status),
+        Some(super::composer_controls::ComposerPickerStatus::Loading)
+    );
+
+    app.close_composer_picker();
+    assert!(app.composer_controls.pending.is_none());
+    assert!(app.composer_controls.picker.is_none());
+    assert!(
+        !app.pending_control_requests.contains_key(&request_id),
+        "close must fence the in-flight request so a late receipt cannot confirm"
+    );
+    assert!(
+        app.async_actions
+            .has_pending_key(&crate::tui::async_action::AsyncActionKey::new(
+                "session_setup.snapshot"
+            )),
+        "close with an in-flight mutation must refresh from daemon state"
+    );
+
+    apply_control_applied(&mut app, request_id);
+    assert!(app.composer_controls.pending.is_none());
+    assert!(app.composer_controls.picker.is_none());
+
+    let (mut app, _control_rx) = app_with_runner(&tmp);
+    let request_id = arm_approval_mutation(&mut app);
+    app.bump_composer_control_generation();
+    assert!(app.composer_controls.pending.is_none());
+    assert!(app.composer_controls.picker.is_none());
+    assert!(
+        !app.pending_control_requests.contains_key(&request_id),
+        "generation bump must fence the in-flight request"
+    );
+    apply_control_applied(&mut app, request_id);
+    assert!(app.composer_controls.pending.is_none());
+
+    let (mut app, _control_rx) = app_with_runner(&tmp);
+    let request_id = arm_approval_mutation(&mut app);
+    app.activate_composer_pill(ComposerControlKind::Model);
+    assert!(
+        !app.pending_control_requests.contains_key(&request_id),
+        "opening another pill must fence the previous in-flight request"
+    );
+    apply_control_applied(&mut app, request_id);
+    assert!(
+        app.composer_controls
+            .pending
+            .as_ref()
+            .is_none_or(|pending| pending.request_id != Some(request_id))
+    );
+}
+
+#[test]
+fn session_reset_and_terminal_link_terminate_composer_pending() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _control_rx) = app_with_runner(&tmp);
+    let request_id = arm_approval_mutation(&mut app);
+    app.reset_session_live_state();
+    assert!(
+        app.composer_controls.pending.is_none(),
+        "session reset must not leave Applying…"
+    );
+    assert!(app.composer_controls.picker.is_none());
+    assert!(!app.pending_control_requests.contains_key(&request_id));
+    apply_control_applied(&mut app, request_id);
+    assert!(app.composer_controls.pending.is_none());
+    assert!(app.composer_controls.picker.is_none());
+
+    let (mut app, _control_rx) = app_with_runner(&tmp);
+    let request_id = arm_approval_mutation(&mut app);
+    app.apply_event(
+        cockpit_client::presentation::TurnEvent::DaemonLinkTerminal {
+            error: "protocol link ended".to_string(),
+        },
+    );
+    assert!(
+        app.composer_controls.pending.is_none(),
+        "terminal disconnect must not leave Applying…"
+    );
+    assert!(app.composer_controls.picker.is_none());
+    assert!(!app.pending_control_requests.contains_key(&request_id));
+    apply_control_applied(&mut app, request_id);
+    assert!(app.composer_controls.pending.is_none());
+    assert!(app.composer_controls.picker.is_none());
+}
+
+#[test]
+fn fenced_composer_agent_receipt_does_not_confirm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _control_rx) = app_with_runner(&tmp);
+    install_agent_inventory(&mut app);
+    let request_id = commit_plan_agent(&mut app);
+    app.close_composer_picker();
+    apply_control_applied(&mut app, request_id);
+    assert!(
+        history_plain_lines(&app)
+            .iter()
+            .all(|line| !line.contains("Switched primary agent")),
+        "a fenced composer agent receipt must not record confirmation: {:?}",
+        history_plain_lines(&app)
+    );
+
+    let (mut app, _control_rx) = app_with_runner(&tmp);
+    install_agent_inventory(&mut app);
+    let request_id = commit_plan_agent(&mut app);
+    apply_control_applied(&mut app, request_id);
+    assert!(
+        history_plain_lines(&app)
+            .iter()
+            .any(|line| line.contains("Switched primary agent to `Plan`")),
+        "a live composer agent receipt must still confirm: {:?}",
+        history_plain_lines(&app)
     );
 }
 

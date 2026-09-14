@@ -383,10 +383,10 @@ fn tools_warning_suppressed_on_no_cache_provider() {
     let request_id = cockpit_client::presentation::ControlRequestId(1);
     app.pending_control_requests.insert(
         request_id,
-        super::PendingControlRequest {
-            label: "/tools".to_string(),
-            applied: super::ControlApplied::CacheBreakWarning,
-        },
+        super::PendingControlRequest::new(
+            "/tools",
+            super::ControlApplied::ToolSurfaceOverride { cache_break: true },
+        ),
     );
 
     let before = app.history.len();

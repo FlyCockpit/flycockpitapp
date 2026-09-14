@@ -206,7 +206,7 @@ impl App {
                 cache_break_acknowledged: cache_break,
                 monty_nudge: None,
             },
-            ControlApplied::SessionSetupToolSurface { cache_break },
+            ControlApplied::ToolSurfaceOverride { cache_break },
         );
     }
 

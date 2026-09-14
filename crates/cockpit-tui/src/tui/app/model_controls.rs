@@ -223,11 +223,9 @@ impl App {
                 cache_break,
                 monty_nudge,
             } => {
-                let applied = if cache_break {
-                    ControlApplied::CacheBreakWarning
-                } else {
-                    ControlApplied::None
-                };
+                if persist_session && let Overlay::Tools(pane) = &mut self.overlay {
+                    pane.mark_session_override_pending();
+                }
                 self.send_daemon_request(
                     "/tools",
                     cockpit_proto::Request::SetToolSurfaceOverride {
@@ -236,7 +234,7 @@ impl App {
                         cache_break_acknowledged: cache_break,
                         monty_nudge,
                     },
-                    applied,
+                    ControlApplied::ToolSurfaceOverride { cache_break },
                 );
             }
         }
@@ -761,10 +759,7 @@ impl App {
         let request_id = ControlRequestId(self.next_control_request_seq);
         self.pending_control_requests.insert(
             request_id,
-            PendingControlRequest {
-                label: label.to_string(),
-                applied,
-            },
+            PendingControlRequest::new(label.to_string(), applied),
         );
         self.bind_composer_control_request(request_id);
         let result = agent_runner::send_control_request(
@@ -798,6 +793,12 @@ impl App {
         }
     }
 
+    pub(super) fn fence_pending_control_request(&mut self, request_id: ControlRequestId) {
+        if let Some(pending) = self.pending_control_requests.get_mut(&request_id) {
+            pending.fenced = true;
+        }
+    }
+
     pub(super) fn apply_control_request_outcome(
         &mut self,
         request_id: ControlRequestId,
@@ -806,19 +807,8 @@ impl App {
         let Some(pending) = self.pending_control_requests.remove(&request_id) else {
             return;
         };
-        if self.discard_stale_composer_control_receipt(request_id) {
-            if let ControlApplied::ModelSelection { selection_id } = pending.applied
-                && matches!(
-                    outcome,
-                    ControlRequestOutcome::Rejected(_) | ControlRequestOutcome::NotDelivered(_)
-                )
-            {
-                if let Some(selection) = self.clear_pending_model_selection(Some(selection_id)) {
-                    let _ = self.preserve_failed_model_selection(selection);
-                }
-            }
-            return;
-        }
+        let skip_confirmation =
+            pending.fenced || self.discard_stale_composer_control_receipt(request_id);
         let selection_id = match pending.applied {
             ControlApplied::ModelSelection { selection_id } => Some(selection_id),
             _ => None,
@@ -827,10 +817,8 @@ impl App {
             ControlApplied::ResponseMetricsTokenizer { confirm_id } => Some(confirm_id),
             _ => None,
         };
-        let refresh_session_setup_on_failure = matches!(
-            pending.applied,
-            ControlApplied::SessionSetupToolSurface { .. }
-        );
+        let refresh_tool_surface_on_failure =
+            matches!(pending.applied, ControlApplied::ToolSurfaceOverride { .. });
         match outcome {
             ControlRequestOutcome::ConfigRefreshed {
                 applied_generation,
@@ -841,24 +829,31 @@ impl App {
                 {
                     let outcome = tok.on_response(confirm_id, applied_generation, changed, None);
                     self.apply_tokenizer_confirm_outcome(outcome);
-                } else {
+                } else if !skip_confirmation {
                     self.apply_control_success(pending.applied);
                     self.apply_composer_control_outcome(request_id, None, false);
                 }
             }
             ControlRequestOutcome::Applied => {
-                self.apply_control_success(pending.applied);
-                self.apply_composer_control_outcome(request_id, None, false);
+                if !skip_confirmation {
+                    self.apply_control_success(pending.applied);
+                    self.apply_composer_control_outcome(request_id, None, false);
+                }
             }
             ControlRequestOutcome::HostCapabilities { snapshot } => {
                 self.apply_host_capabilities(*snapshot);
-                self.apply_control_success(pending.applied);
-                self.apply_composer_control_outcome(request_id, None, false);
+                if !skip_confirmation {
+                    self.apply_control_success(pending.applied);
+                    self.apply_composer_control_outcome(request_id, None, false);
+                }
             }
             ControlRequestOutcome::ExitGuardStatus {
                 ephemeral_owner,
                 has_live_work,
             } => {
+                if skip_confirmation {
+                    return;
+                }
                 if matches!(pending.applied, ControlApplied::ExitGuardStatus) {
                     self.apply_exit_guard_status(ephemeral_owner, has_live_work);
                 } else {
@@ -869,9 +864,8 @@ impl App {
                 }
             }
             ControlRequestOutcome::Rejected(error) => {
-                if refresh_session_setup_on_failure {
-                    self.request_session_setup_snapshot_refresh();
-                    self.set_session_setup_notice(format!(
+                if refresh_tool_surface_on_failure {
+                    self.refuse_tool_surface_override(format!(
                         "Tool surface update was refused: {error}"
                     ));
                 }
@@ -891,18 +885,19 @@ impl App {
                     self.apply_tokenizer_confirm_outcome(outcome);
                 } else {
                     let message = format!("{}: daemon rejected request: {error}", pending.label);
-                    if let Some(selection) = self.clear_pending_model_selection(selection_id) {
-                        self.show_failed_model_selection(selection, message);
-                    } else {
-                        self.push_plain(message);
-                    }
-                    self.apply_composer_control_outcome(request_id, Some(&error), false);
+                    self.finish_control_failure(
+                        skip_confirmation,
+                        selection_id,
+                        request_id,
+                        message,
+                        &error,
+                        false,
+                    );
                 }
             }
             ControlRequestOutcome::NotDelivered(reason) => {
-                if refresh_session_setup_on_failure {
-                    self.request_session_setup_snapshot_refresh();
-                    self.set_session_setup_notice(
+                if refresh_tool_surface_on_failure {
+                    self.refuse_tool_surface_override(
                         "Tool surface update was not delivered; restored daemon state.".to_string(),
                     );
                 }
@@ -913,14 +908,47 @@ impl App {
                     self.apply_tokenizer_confirm_outcome(outcome);
                 } else {
                     let message = Self::control_not_delivered_message(&pending.label, reason);
-                    if let Some(selection) = self.clear_pending_model_selection(selection_id) {
-                        self.show_failed_model_selection(selection, message);
-                    } else {
-                        self.push_plain(message);
-                    }
-                    self.apply_composer_control_outcome(request_id, Some(&message), true);
+                    self.finish_control_failure(
+                        skip_confirmation,
+                        selection_id,
+                        request_id,
+                        message.clone(),
+                        &message,
+                        true,
+                    );
                 }
             }
+        }
+    }
+
+    fn finish_control_failure(
+        &mut self,
+        skip_confirmation: bool,
+        selection_id: Option<uuid::Uuid>,
+        request_id: ControlRequestId,
+        message: String,
+        composer_error: &str,
+        unavailable: bool,
+    ) {
+        if skip_confirmation {
+            if let Some(selection) = self.clear_pending_model_selection(selection_id) {
+                let _ = self.preserve_failed_model_selection(selection);
+            }
+            return;
+        }
+        if let Some(selection) = self.clear_pending_model_selection(selection_id) {
+            self.show_failed_model_selection(selection, message);
+        } else {
+            self.push_plain(message);
+        }
+        self.apply_composer_control_outcome(request_id, Some(composer_error), unavailable);
+    }
+
+    fn refuse_tool_surface_override(&mut self, message: String) {
+        self.request_session_setup_snapshot_refresh();
+        self.set_session_setup_notice(message.clone());
+        if let Overlay::Tools(pane) = &mut self.overlay {
+            pane.refuse_session_override(message);
         }
     }
 
@@ -1089,18 +1117,16 @@ impl App {
             // ExitGuardStatus has a dedicated response payload that controls
             // the exit path in `apply_control_request_outcome`.
             ControlApplied::ExitGuardStatus => {}
-            ControlApplied::CacheBreakWarning => {
-                if let Some(warning) = self.cache_break_warning() {
-                    self.push_plain(warning);
-                }
-            }
             ControlApplied::PrimaryAgentSwitch { name } => {
                 self.record_primary_switch_confirmation(&name);
                 self.request_session_setup_snapshot_refresh();
             }
-            ControlApplied::SessionSetupToolSurface { cache_break } => {
+            ControlApplied::ToolSurfaceOverride { cache_break } => {
                 if cache_break && let Some(warning) = self.cache_break_warning() {
                     self.push_plain(warning);
+                }
+                if let Overlay::Tools(pane) = &mut self.overlay {
+                    pane.confirm_session_override();
                 }
                 self.request_session_setup_snapshot_refresh();
             }

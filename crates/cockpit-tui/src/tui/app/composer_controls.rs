@@ -136,15 +136,20 @@ impl ComposerPicker {
 }
 
 impl App {
-    /// Generation-invalidate composer picker/pending ownership.
+    /// Fence composer picker/pending UI ownership.
     ///
-    /// A pending composer mutation is one claim over both the picker UI and
-    /// its bound `pending_control_requests` entry. Every close, reconnect,
-    /// session-generation, reset, terminal, and timeout path must call this
-    /// so a later receipt cannot apply confirmation side-effects and the
-    /// picker cannot remain on `Applying…`. When `refresh_if_fenced` is set
-    /// and an in-flight request was dropped, displayed pills reconverge from
-    /// daemon state instead of the discarded completion.
+    /// A pending composer mutation is the picker's claim to show Applying /
+    /// Confirmed. The bound `pending_control_requests` entry uniquely owns
+    /// correlated in-flight slots (`pending_model_selection`, tokenizer
+    /// confirm) and must stay until the outcome is observed: dropping it
+    /// would orphan those slots on Rejected/NotDelivered. Every close,
+    /// reconnect, session-generation, reset, terminal, and timeout path
+    /// must call this so a later receipt cannot confirm the picker. The
+    /// correlation is marked `fenced` rather than removed. When
+    /// `refresh_if_fenced` is set and an in-flight request was fenced,
+    /// displayed pills reconverge from daemon state instead of the
+    /// discarded completion. Applied model selections are released
+    /// independently by `ModelSelectionResult`.
     pub(super) fn invalidate_composer_control_ownership(
         &mut self,
         clear_selection: bool,
@@ -163,7 +168,7 @@ impl App {
             self.composer_controls.selection = None;
         }
         if let Some(request_id) = request_id {
-            self.pending_control_requests.remove(&request_id);
+            self.fence_pending_control_request(request_id);
             if refresh_if_fenced {
                 self.request_session_setup_snapshot_refresh();
             }

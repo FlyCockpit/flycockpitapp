@@ -265,6 +265,34 @@ fn install_agent_inventory(app: &mut App) {
     });
 }
 
+fn arm_model_mutation(app: &mut App) -> ControlRequestId {
+    app.activate_composer_pill(ComposerControlKind::Model);
+    if app
+        .composer_controls
+        .picker
+        .as_ref()
+        .is_some_and(|picker| picker.level == 0)
+    {
+        app.handle_key(press(KeyCode::Enter));
+    }
+    if let Some(picker) = app.composer_controls.picker.as_mut()
+        && let Some(idx) = picker.categories.get(picker.category).and_then(|category| {
+            category
+                .items
+                .iter()
+                .position(|item| item.id == "gpt-other")
+        })
+    {
+        picker.cursor = idx;
+    }
+    app.handle_key(press(KeyCode::Enter));
+    app.composer_controls
+        .pending
+        .as_ref()
+        .and_then(|pending| pending.request_id)
+        .expect("model mutation bound to a control request")
+}
+
 fn commit_plan_agent(app: &mut App) -> ControlRequestId {
     app.activate_composer_pill(ComposerControlKind::Agent);
     if let Some(picker) = app.composer_controls.picker.as_mut()
@@ -295,13 +323,28 @@ fn history_plain_lines(app: &App) -> Vec<&str> {
         .collect()
 }
 
-fn apply_control_applied(app: &mut App, request_id: ControlRequestId) {
+fn apply_control_outcome(
+    app: &mut App,
+    request_id: ControlRequestId,
+    outcome: ControlRequestOutcome,
+) {
     app.apply_event(
         cockpit_client::presentation::TurnEvent::ControlRequestFinished {
             request_id,
-            outcome: ControlRequestOutcome::Applied,
+            outcome,
         },
     );
+}
+
+fn apply_control_applied(app: &mut App, request_id: ControlRequestId) {
+    apply_control_outcome(app, request_id, ControlRequestOutcome::Applied);
+}
+
+fn snapshot_refresh_pending(app: &App) -> bool {
+    app.async_actions
+        .has_pending_key(&crate::tui::async_action::AsyncActionKey::new(
+            "session_setup.snapshot",
+        ))
 }
 
 #[test]
@@ -350,8 +393,10 @@ fn closing_composer_picker_fences_in_flight_control_request() {
     assert!(app.composer_controls.pending.is_none());
     assert!(app.composer_controls.picker.is_none());
     assert!(
-        !app.pending_control_requests.contains_key(&request_id),
-        "close must fence the in-flight request so a late receipt cannot confirm"
+        app.pending_control_requests
+            .get(&request_id)
+            .is_some_and(|pending| pending.fenced),
+        "close fences picker confirmation but keeps correlation for outcome cleanup"
     );
     assert!(
         app.async_actions
@@ -364,6 +409,10 @@ fn closing_composer_picker_fences_in_flight_control_request() {
     apply_control_applied(&mut app, request_id);
     assert!(app.composer_controls.pending.is_none());
     assert!(app.composer_controls.picker.is_none());
+    assert!(
+        !app.pending_control_requests.contains_key(&request_id),
+        "the fenced outcome is consumed without re-confirming the picker"
+    );
 
     let (mut app, _control_rx) = app_with_runner(&tmp);
     let request_id = arm_approval_mutation(&mut app);
@@ -371,7 +420,9 @@ fn closing_composer_picker_fences_in_flight_control_request() {
     assert!(app.composer_controls.pending.is_none());
     assert!(app.composer_controls.picker.is_none());
     assert!(
-        !app.pending_control_requests.contains_key(&request_id),
+        app.pending_control_requests
+            .get(&request_id)
+            .is_some_and(|pending| pending.fenced),
         "generation bump must fence the in-flight request"
     );
     apply_control_applied(&mut app, request_id);
@@ -381,7 +432,9 @@ fn closing_composer_picker_fences_in_flight_control_request() {
     let request_id = arm_approval_mutation(&mut app);
     app.activate_composer_pill(ComposerControlKind::Model);
     assert!(
-        !app.pending_control_requests.contains_key(&request_id),
+        app.pending_control_requests
+            .get(&request_id)
+            .is_some_and(|pending| pending.fenced),
         "opening another pill must fence the previous in-flight request"
     );
     apply_control_applied(&mut app, request_id);
@@ -390,6 +443,64 @@ fn closing_composer_picker_fences_in_flight_control_request() {
             .pending
             .as_ref()
             .is_none_or(|pending| pending.request_id != Some(request_id))
+    );
+}
+
+#[test]
+fn fenced_model_selection_failed_delivery_releases_ownership() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _control_rx) = app_with_runner(&tmp);
+    let request_id = arm_model_mutation(&mut app);
+    assert!(app.pending_model_selection.is_some());
+    app.close_composer_picker();
+    assert!(
+        app.pending_control_requests
+            .get(&request_id)
+            .is_some_and(|pending| pending.fenced),
+        "close must keep model-selection correlation"
+    );
+    assert!(
+        app.pending_model_selection.is_some(),
+        "applied ModelSelectionResult still owns a live selection"
+    );
+
+    apply_control_outcome(
+        &mut app,
+        request_id,
+        ControlRequestOutcome::Rejected("model refused".to_string()),
+    );
+    assert!(
+        app.pending_model_selection.is_none(),
+        "rejected fenced model selection must release ownership"
+    );
+    assert!(app.composer_controls.picker.is_none());
+    assert!(
+        !matches!(app.overlay, Overlay::ModelPicker(_)),
+        "fenced model rejection must not reopen the model picker"
+    );
+
+    let retry_id = arm_model_mutation(&mut app);
+    assert!(
+        app.pending_model_selection.is_some(),
+        "a later model selection must not be blocked by the fenced rejection"
+    );
+
+    app.close_composer_picker();
+    apply_control_outcome(
+        &mut app,
+        retry_id,
+        ControlRequestOutcome::NotDelivered(
+            cockpit_client::presentation::ControlRequestNotDelivered::ChannelClosed,
+        ),
+    );
+    assert!(
+        app.pending_model_selection.is_none(),
+        "undelivered fenced model selection must release ownership"
+    );
+    let _ = arm_model_mutation(&mut app);
+    assert!(
+        app.pending_model_selection.is_some(),
+        "a later model selection must not be blocked by the fenced undelivered request"
     );
 }
 
@@ -421,7 +532,12 @@ fn session_reset_and_terminal_link_terminate_composer_pending() {
         "terminal disconnect must not leave Applying…"
     );
     assert!(app.composer_controls.picker.is_none());
-    assert!(!app.pending_control_requests.contains_key(&request_id));
+    assert!(
+        app.pending_control_requests
+            .get(&request_id)
+            .is_some_and(|pending| pending.fenced),
+        "terminal disconnect fences composer confirmation and keeps correlation"
+    );
     apply_control_applied(&mut app, request_id);
     assert!(app.composer_controls.pending.is_none());
     assert!(app.composer_controls.picker.is_none());
@@ -739,7 +855,6 @@ fn header_tools_pill_reconciles_tool_surface_override() {
     let _ = render(&mut app, 100, 30);
     app.activate_header_pill(HeaderPillKind::Tool);
     assert!(matches!(app.overlay, Overlay::Tools(_)));
-    app.overlay = Overlay::None;
 
     let legal = legal_tool_tiers("code");
     assert!(
@@ -762,13 +877,51 @@ fn header_tools_pill_reconciles_tool_surface_override() {
     match control_rx.try_recv().unwrap().request {
         Request::SetToolSurfaceOverride {
             cache_break_acknowledged,
+            persist_session,
             ..
-        } => assert!(
-            !cache_break_acknowledged,
-            "legal non-cache-breaking transition does not claim a cache break"
-        ),
+        } => {
+            assert!(
+                !cache_break_acknowledged,
+                "legal non-cache-breaking transition does not claim a cache break"
+            );
+            assert!(persist_session);
+        }
         other => panic!("expected SetToolSurfaceOverride, got {other:?}"),
     }
+    assert!(
+        matches!(app.overlay, Overlay::Tools(_)),
+        "header tools surface stays open until daemon confirmation"
+    );
+    let Overlay::Tools(pane) = &app.overlay else {
+        panic!("tools overlay");
+    };
+    assert!(
+        pane.session_override_pending(),
+        "session override waits for the daemon receipt"
+    );
+    let original = pane.original_selection().clone();
+    assert_eq!(
+        app.pending_control_requests
+            .get(&ControlRequestId(1))
+            .map(|pending| pending.applied.clone()),
+        Some(super::ControlApplied::ToolSurfaceOverride { cache_break: false })
+    );
+
+    apply_control_applied(&mut app, ControlRequestId(1));
+    assert!(
+        snapshot_refresh_pending(&app),
+        "applied header-tools mutation must refresh daemon tool-surface state"
+    );
+    assert!(matches!(app.overlay, Overlay::Tools(_)));
+    let Overlay::Tools(pane) = &app.overlay else {
+        panic!("tools overlay");
+    };
+    assert!(
+        !pane.session_override_pending(),
+        "applied receipt confirms the header tools surface"
+    );
+    assert_eq!(pane.original_selection(), pane.draft_selection());
+    assert_eq!(pane.original_selection(), &original);
 
     app.handle_tools_outcome(ToolsOutcome::Apply {
         override_json: "{}".to_string(),
@@ -786,21 +939,36 @@ fn header_tools_pill_reconciles_tool_surface_override() {
         ),
         other => panic!("expected SetToolSurfaceOverride, got {other:?}"),
     }
-
-    app.handle_tools_outcome(ToolsOutcome::Apply {
-        override_json: "{}".to_string(),
-        persist_session: true,
-        cache_break: true,
-        monty_nudge: None,
-    });
-    let _ = control_rx.try_recv();
-    app.apply_event(
-        cockpit_client::presentation::TurnEvent::ControlRequestFinished {
-            request_id: ControlRequestId(3),
-            outcome: ControlRequestOutcome::Rejected("illegal tier".to_string()),
-        },
+    assert_eq!(
+        app.pending_control_requests
+            .get(&ControlRequestId(2))
+            .map(|pending| pending.applied.clone()),
+        Some(super::ControlApplied::ToolSurfaceOverride { cache_break: true })
     );
-    // Refusal is a daemon event: confirmed display state is not locally rewritten.
+
+    apply_control_outcome(
+        &mut app,
+        ControlRequestId(2),
+        ControlRequestOutcome::Rejected("illegal tier".to_string()),
+    );
+    assert!(
+        snapshot_refresh_pending(&app),
+        "refused header-tools mutation must refresh from daemon state"
+    );
+    assert!(matches!(app.overlay, Overlay::Tools(_)));
+    let Overlay::Tools(pane) = &app.overlay else {
+        panic!("tools overlay");
+    };
+    assert!(
+        !pane.session_override_pending(),
+        "refusal must release session-override pending ownership"
+    );
+    assert_eq!(
+        pane.draft_selection(),
+        pane.original_selection(),
+        "refusal leaves confirmed tool-surface state intact"
+    );
+    assert_eq!(pane.original_selection(), &original);
     assert_eq!(
         app.launch.active_model,
         Some(("openai".to_string(), "gpt-test".to_string()))

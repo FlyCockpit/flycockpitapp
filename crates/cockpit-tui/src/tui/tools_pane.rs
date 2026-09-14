@@ -46,6 +46,9 @@ pub(crate) struct ToolsPane {
     nudge_monty: bool,
     pending_effect: Option<ToolsEffect>,
     in_flight: Option<ToolsPending>,
+    /// Session `SetToolSurfaceOverride` is in flight; the pane stays open
+    /// until the daemon receipt reconciles displayed/selectable state.
+    session_override_pending: bool,
 }
 
 #[derive(Debug)]
@@ -105,6 +108,49 @@ impl ToolsPane {
     /// The initial snapshot load is deliberately excluded: it is read-only.
     pub(crate) fn has_unsettled_local_authority(&self) -> bool {
         matches!(self.in_flight, Some(ToolsPending::SaveAgent { .. }))
+            || self.session_override_pending
+    }
+
+    pub(crate) fn mark_session_override_pending(&mut self) {
+        self.session_override_pending = true;
+        self.status = Some("Applying session tool surface…".to_string());
+        self.confirm = None;
+    }
+
+    pub(crate) fn confirm_session_override(&mut self) {
+        if !self.session_override_pending {
+            return;
+        }
+        self.session_override_pending = false;
+        self.original = self.draft.selection().clone();
+        self.status = Some("session tool surface confirmed".to_string());
+        self.row_errors.clear();
+        self.confirm = None;
+    }
+
+    pub(crate) fn refuse_session_override(&mut self, message: String) {
+        if !self.session_override_pending {
+            return;
+        }
+        self.session_override_pending = false;
+        self.draft = ToolSurfaceDraft::from_selection(self.original.clone());
+        self.status = Some(message);
+        self.confirm = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_override_pending(&self) -> bool {
+        self.session_override_pending
+    }
+
+    #[cfg(test)]
+    pub(crate) fn original_selection(&self) -> &ToolSurfaceSelection {
+        &self.original
+    }
+
+    #[cfg(test)]
+    pub(crate) fn draft_selection(&self) -> &ToolSurfaceSelection {
+        self.draft.selection()
     }
 
     pub(crate) fn open(cwd: &Path, agent_name: &str, root_foreground: bool) -> Result<Self> {
@@ -147,6 +193,7 @@ impl ToolsPane {
                 agent_name: agent_name.to_string(),
                 project_root,
             }),
+            session_override_pending: false,
         })
     }
 
@@ -503,8 +550,11 @@ impl ToolsPane {
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Option<ToolsOutcome> {
-        if self.in_flight.is_some() {
-            if key.code == KeyCode::Enter && self.pending_effect.is_none() {
+        if self.in_flight.is_some() || self.session_override_pending {
+            if key.code == KeyCode::Enter
+                && self.pending_effect.is_none()
+                && self.in_flight.is_some()
+            {
                 self.retry_settlement();
             } else {
                 self.status = Some(
@@ -870,6 +920,7 @@ mod tests {
             nudge_monty: true,
             pending_effect: None,
             in_flight: None,
+            session_override_pending: false,
         }
     }
 
@@ -989,6 +1040,30 @@ mod tests {
                 .exists(),
             "session save must not eject built-in agent to disk"
         );
+    }
+
+    #[test]
+    fn tools_session_override_holds_authority_until_daemon_receipt() {
+        let mut pane = pane_with_tools(&["read"], &[]);
+        pane.draft.set_granted("skill", true);
+        let original = pane.original.clone();
+        pane.mark_session_override_pending();
+        assert!(pane.has_unsettled_local_authority());
+        assert_eq!(pane.handle_key(KeyEvent::from(KeyCode::Esc)), None);
+        pane.refuse_session_override("illegal tier".to_string());
+        assert!(!pane.has_unsettled_local_authority());
+        assert_eq!(pane.draft.selection(), &original);
+        assert_eq!(
+            pane.handle_key(KeyEvent::from(KeyCode::Esc)),
+            Some(ToolsOutcome::Close)
+        );
+
+        pane.mark_session_override_pending();
+        let confirmed = pane.draft.selection().clone();
+        pane.confirm_session_override();
+        assert!(!pane.has_unsettled_local_authority());
+        assert_eq!(pane.original, confirmed);
+        assert_eq!(pane.draft.selection(), &confirmed);
     }
 
     #[test]

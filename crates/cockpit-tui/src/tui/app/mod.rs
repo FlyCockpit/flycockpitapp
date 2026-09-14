@@ -246,6 +246,20 @@ pub(super) struct PendingAgentSwitchLog {
 pub(crate) struct PendingControlRequest {
     label: String,
     applied: ControlApplied,
+    /// Fenced requests keep correlation so Rejected/NotDelivered can still
+    /// release uniquely-owned slots (`pending_model_selection`, tokenizer
+    /// confirm) without driving picker confirmation side-effects.
+    fenced: bool,
+}
+
+impl PendingControlRequest {
+    pub(crate) fn new(label: impl Into<String>, applied: ControlApplied) -> Self {
+        Self {
+            label: label.into(),
+            applied,
+            fenced: false,
+        }
+    }
 }
 
 pub(crate) struct PendingModelSelection {
@@ -398,11 +412,12 @@ pub(crate) enum ControlApplied {
     ModelSelection {
         selection_id: uuid::Uuid,
     },
-    CacheBreakWarning,
     PrimaryAgentSwitch {
         name: String,
     },
-    SessionSetupToolSurface {
+    /// Any `SetToolSurfaceOverride` receipt: cache-break warning (when set)
+    /// plus daemon snapshot reconciliation of every open tool-surface UI.
+    ToolSurfaceOverride {
         cache_break: bool,
     },
     Multireview {

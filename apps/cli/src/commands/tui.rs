@@ -70,6 +70,7 @@ pub async fn run(
         false,
         false,
         None,
+        None,
     )
     .await
 }
@@ -87,6 +88,7 @@ pub async fn run_mode(
     force_setup: bool,
     debug_last_message: bool,
     setup_wizard: Option<String>,
+    provider_add_template: Option<String>,
 ) -> Result<()> {
     if !stdin().is_terminal() || !stdout().is_terminal() {
         welcome::print(project, !no_sandbox);
@@ -103,7 +105,12 @@ pub async fn run_mode(
         lifecycle,
     );
     app.set_startup_debug_last_message(debug_last_message);
-    app.configure_onboarding_launch_with_setup_wizard(skip_setup, force_setup, setup_wizard);
+    app.configure_onboarding_launch_with_setup_wizard(
+        skip_setup,
+        force_setup,
+        setup_wizard,
+        provider_add_template,
+    );
     let result = app.run().await;
     drop(app);
     let lifecycle_result = finish_lifecycle(lifecycle_task).await;

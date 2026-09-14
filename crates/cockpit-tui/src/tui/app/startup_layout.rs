@@ -119,7 +119,7 @@ impl App {
     }
 
     pub fn configure_onboarding_launch(&mut self, skip: bool, force: bool) {
-        self.configure_onboarding_launch_with_setup_wizard(skip, force, None);
+        self.configure_onboarding_launch_with_setup_wizard(skip, force, None, None);
     }
 
     pub fn configure_onboarding_launch_with_setup_wizard(
@@ -127,10 +127,12 @@ impl App {
         skip: bool,
         force: bool,
         setup_wizard: Option<String>,
+        provider_add_template: Option<String>,
     ) {
         self.onboarding_skip = skip;
         self.onboarding_force = force;
         self.pending_setup_wizard = setup_wizard;
+        self.pending_provider_add_template = provider_add_template;
         if skip {
             self.onboarding_snapshot = None;
             self.onboarding_shell = None;
@@ -154,8 +156,36 @@ impl App {
             return;
         }
         if let Some(wizard) = self.pending_setup_wizard.take() {
+            let template = self.pending_provider_add_template.take();
             self.open_onboarding_setup(Some(&wizard));
+            if wizard == cockpit_core::wizard::PROVIDER_WIZARD_ID {
+                self.maybe_seed_pending_provider_template(template);
+            }
         }
+    }
+
+    fn maybe_seed_pending_provider_template(&mut self, template: Option<String>) {
+        let Some(template_id) = template else {
+            return;
+        };
+        let template = cockpit_core::providers::template_by_id(&template_id).or_else(|| {
+            self.push_plain(format!(
+                "Unknown provider template `{template_id}`; pick one from the catalog."
+            ));
+            None
+        });
+        if template.is_none() {
+            return;
+        }
+        let template = template.unwrap();
+        if !self.dialog.is_provider_add() {
+            self.dialog =
+                crate::tui::settings::Dialog::onboarding_provider_engine(&self.launch.cwd, None);
+            if let Some(shell) = self.onboarding_shell.as_mut() {
+                shell.present_engine(crate::tui::onboarding::EngineStage::Provider);
+            }
+        }
+        self.dialog.seed_provider_template(template);
     }
 
     /// Route `/setup` and equivalent interactive onboarding entrypoints through

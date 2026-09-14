@@ -363,16 +363,7 @@ pub fn descriptor_for_cwd_with_caps(
         return Some(crate::wizard::onboarding_profile_descriptor());
     }
     if id == crate::wizard::ONBOARDING_AGENT_WIZARD_ID {
-        let current = ConfigDoc::load(&global_config)
-            .ok()
-            .map(|doc| doc.providers())
-            .unwrap_or_default();
-        let catalog = crate::daemon::agent_catalog::preferred_catalog_for_discovery().ok()?;
-        return Some(crate::wizard::onboarding_agent_descriptor(
-            &current,
-            &catalog.index,
-            catalog.revision,
-        ));
+        return None;
     }
     if id == crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID {
         return Some(crate::wizard::onboarding_lifetime_descriptor());

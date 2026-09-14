@@ -9328,6 +9328,8 @@ pub use run_invocation::{
     wall_ms_now as run_invocation_wall_ms_now,
 };
 #[cfg(test)]
+mod agent_authoring_daemon_tests;
+#[cfg(test)]
 mod host_capabilities_tests;
 pub(crate) mod inventory;
 #[cfg(test)]

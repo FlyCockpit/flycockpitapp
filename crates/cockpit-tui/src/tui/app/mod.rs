@@ -2847,6 +2847,9 @@ pub struct App {
     /// When set by `cockpit setup <wizard>`, open that wizard in the shell
     /// after the bootstrap projection lands.
     pending_setup_wizard: Option<String>,
+    /// When set by `cockpit provider add <template>`, seed the provider engine
+    /// after the provider stage mounts.
+    pending_provider_add_template: Option<String>,
     /// Occupancy fence: the user explicitly closed the shell (Cancel /
     /// completion exit). Late authority results and concurrent-client
     /// broadcasts still update [`Self::onboarding_snapshot`] but must not
@@ -4194,6 +4197,7 @@ impl App {
             onboarding_skip: false,
             onboarding_force: false,
             pending_setup_wizard: None,
+            pending_provider_add_template: None,
             onboarding_dismissed: false,
             side_conversation: None,
             daemon_draining: false,

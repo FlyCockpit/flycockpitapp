@@ -155,6 +155,24 @@ fn reopen_onboarding_from_deferred_snapshot_uses_provider_search() {
 }
 
 #[test]
+fn provider_add_cli_dispatch_routes_through_shell_adapter() {
+    let lib = include_str!("../../../../../apps/cli/src/lib.rs");
+    assert!(
+        lib.contains("Command::Provider(crate::cli::ProvidersCommand::Add(args))"),
+        "provider add must have an interactive shell adapter"
+    );
+    assert!(
+        lib.contains("cockpit_core::wizard::PROVIDER_WIZARD_ID"),
+        "provider add must mount the full-screen provider stage"
+    );
+    let providers = include_str!("../../../../../apps/cli/src/commands/providers.rs");
+    assert!(
+        providers.contains("cockpit provider add requires an interactive stdin"),
+        "non-interactive provider add must fail before any mutation"
+    );
+}
+
+#[test]
 fn force_setup_flag_is_stored_for_bootstrap_reentry() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());

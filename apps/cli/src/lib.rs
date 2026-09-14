@@ -967,6 +967,7 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
             false,
             cli.debug_last_message,
             None,
+            None,
         )
         .await;
     }
@@ -982,6 +983,31 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
                 args.wizard.is_none(),
                 cli.debug_last_message,
                 args.wizard.clone(),
+                None,
+            )
+            .await;
+        }
+    }
+
+    if let Some(Command::Provider(crate::cli::ProvidersCommand::Add(args))) = cli.command.as_ref() {
+        if interactive_shell {
+            if let Some(template) = args.template.as_deref()
+                && crate::providers::template_by_id(template).is_none()
+            {
+                return Err(anyhow::anyhow!(
+                    "unknown provider template `{template}`; run `cockpit provider list`"
+                ));
+            }
+            return commands::tui::run_mode(
+                cli.project.as_deref(),
+                cli.no_sandbox,
+                commands::tui::SessionMode::Code,
+                Some(launch_start),
+                cli.skip_setup,
+                false,
+                cli.debug_last_message,
+                Some(cockpit_core::wizard::PROVIDER_WIZARD_ID.to_string()),
+                args.template.clone(),
             )
             .await;
         }
@@ -1775,6 +1801,10 @@ mod tests {
         assert!(
             lib.contains("Some(Command::Setup(args)) => commands::setup::run(args).await"),
             "non-interactive setup must keep the typed InteractiveOnboardingRequired path"
+        );
+        assert!(
+            lib.contains("Command::Provider(crate::cli::ProvidersCommand::Add(args))"),
+            "interactive provider add must route through the TUI shell"
         );
         assert!(
             lib.contains("Some(Command::Provider(sub)) => commands::providers::run(sub).await")

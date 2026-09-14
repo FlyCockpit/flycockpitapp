@@ -2129,6 +2129,40 @@ pub(crate) fn load_workspace_package_from_files(
     )
 }
 
+fn assemble_nested_private_subagents(
+    parsed: BTreeMap<String, AgentDef>,
+) -> BTreeMap<String, AgentDef> {
+    let mut assembled = parsed
+        .iter()
+        .map(|(path, def)| (path.clone(), def.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for def in assembled.values_mut() {
+        def.private_subagents = BTreeMap::new();
+    }
+    let mut nested_paths = assembled
+        .keys()
+        .filter(|path| path.contains('/'))
+        .cloned()
+        .collect::<Vec<_>>();
+    nested_paths.sort_by_key(|path| path.chars().filter(|ch| *ch == '/').count());
+    nested_paths.reverse();
+    for path in nested_paths {
+        let Some((parent_path, child_name)) = path.rsplit_once('/') else {
+            continue;
+        };
+        let child = assembled
+            .remove(&path)
+            .expect("nested private subagent path must exist");
+        assembled
+            .entry(parent_path.to_string())
+            .expect("nested private subagent parent must exist")
+            .private_subagents
+            .insert(child_name.to_string(), child);
+    }
+    assembled.retain(|path, _| !path.contains('/'));
+    assembled
+}
+
 fn load_package_from_files(
     agent_dir: &Path,
     name: &str,
@@ -2255,7 +2289,7 @@ fn load_package_from_files(
     base.source = agent_dir.to_path_buf();
     base.prompt_overrides = overrides;
     base.package_files = Some(files);
-    base.private_subagents = private_subagents;
+    base.private_subagents = assemble_nested_private_subagents(private_subagents);
     if let Some(bytes) = base
         .package_files
         .as_ref()

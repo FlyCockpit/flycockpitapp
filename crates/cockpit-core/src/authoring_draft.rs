@@ -238,7 +238,7 @@ pub fn build_package_draft(
             bail!("remote sidecar egress confirmation is required");
         }
     }
-    validate_child_tree(&draft.children)?;
+    validate_child_tree(&draft.children, 1)?;
 
     let (source, name, body) = resolve_source(projection, draft)?;
     validate_authored_agent_name(&name)?;
@@ -482,13 +482,19 @@ fn validate_authored_agent_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_child_tree(children: &[ChildAuthoringDraft]) -> Result<()> {
+const AUTHORED_MAX_DESCENDANT_DEPTH: u16 = 2;
+
+fn validate_child_tree(children: &[ChildAuthoringDraft], depth: u16) -> Result<()> {
+    ensure!(
+        depth <= AUTHORED_MAX_DESCENDANT_DEPTH,
+        "subagent tree exceeds the canonical max descendant depth of {AUTHORED_MAX_DESCENDANT_DEPTH}"
+    );
     let mut seen = std::collections::BTreeSet::new();
     for child in children {
         let slug = child_slug(child);
         ensure!(seen.insert(slug.clone()), "duplicate child name `{slug}`");
         validate_authored_agent_name(&slug)?;
-        validate_child_tree(&child.children)?;
+        validate_child_tree(&child.children, depth.saturating_add(1))?;
     }
     Ok(())
 }
@@ -586,15 +592,7 @@ fn build_child_markdown(
             let allowed_children = child
                 .children
                 .iter()
-                .map(|nested| {
-                    let slug = child_slug(nested);
-                    let portable_ref = if parent_prefix.is_empty() {
-                        slug
-                    } else {
-                        format!("{parent_prefix}/{slug}")
-                    };
-                    AllowedChild::portable_ref(&portable_ref)
-                })
+                .map(|nested| AllowedChild::portable_ref(&child_slug(nested)))
                 .collect();
             Some(DelegationPolicy {
                 allowed_children,

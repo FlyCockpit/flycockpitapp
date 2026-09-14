@@ -230,7 +230,9 @@ pub async fn receipt(
             )?));
         }
         if journal.settlement_phase == AUTHORED_PACKAGE_SETTLEMENT_PENDING {
-            return Ok(Some(pending_receipt_from_journal(&journal)));
+            return Ok(Some(pending_receipt_from_journal(&journal).unwrap_or_else(
+                |_| unknown_receipt(&query.client_operation_id, None),
+            )));
         }
     }
     let Some(settlement) = ctx
@@ -253,7 +255,9 @@ pub async fn receipt(
                 .authored_agent_package_journal(owner.to_owned(), query.client_operation_id.clone())
                 .await?
             {
-                return Ok(Some(pending_receipt_from_journal(&journal)));
+                return Ok(Some(pending_receipt_from_journal(&journal).unwrap_or_else(
+                    |_| unknown_receipt(&query.client_operation_id, None),
+                )));
             }
             Ok(Some(unknown_receipt(&query.client_operation_id, None)))
         }
@@ -281,17 +285,17 @@ fn receipt_from_terminal_json(
             reason,
             message,
             ..
-        }) => Ok(rejected_receipt(client_operation_id, reason, message)),
+        }) => Ok(rejected_receipt(client_operation_id, reason, message, None)),
         other => anyhow::bail!("authored package terminal payload is not a receipt: {other:?}"),
     }
 }
 
 fn pending_receipt_from_journal(
     journal: &AuthoredAgentPackageJournalRow,
-) -> ApplyAuthoredAgentPackageReceipt {
+) -> Result<ApplyAuthoredAgentPackageReceipt> {
     let review = serde_json::from_str::<AuthoredAgentReview>(&journal.review_json)
-        .unwrap_or_else(|_| empty_review(&journal.agent_name));
-    ApplyAuthoredAgentPackageReceipt {
+        .context("decoding pending authored package review")?;
+    Ok(ApplyAuthoredAgentPackageReceipt {
         client_operation_id: journal.client_operation_id.clone(),
         receipt_id: uuid::Uuid::nil(),
         status: AuthoredAgentReceiptStatus::Pending,
@@ -301,14 +305,30 @@ fn pending_receipt_from_journal(
         default_selected: journal.default_selected,
         result_config_generation: 0,
         review,
-    }
+    })
 }
 
 fn rejected_receipt(
     client_operation_id: &str,
     _reason: AuthoredAgentRejectReason,
     _message: String,
+    journal: Option<&AuthoredAgentPackageJournalRow>,
 ) -> ApplyAuthoredAgentPackageReceipt {
+    if let Some(journal) = journal {
+        let review = serde_json::from_str::<AuthoredAgentReview>(&journal.review_json)
+            .unwrap_or_else(|_| empty_review(&journal.agent_name));
+        return ApplyAuthoredAgentPackageReceipt {
+            client_operation_id: client_operation_id.to_string(),
+            receipt_id: uuid::Uuid::nil(),
+            status: AuthoredAgentReceiptStatus::Rejected,
+            package_digest: journal.package_digest.clone(),
+            policy_revision: journal.policy_revision.clone(),
+            installation_id: journal.installation_id.clone(),
+            default_selected: journal.default_selected,
+            result_config_generation: 0,
+            review,
+        };
+    }
     ApplyAuthoredAgentPackageReceipt {
         client_operation_id: client_operation_id.to_string(),
         receipt_id: uuid::Uuid::nil(),
@@ -479,15 +499,22 @@ async fn complete_pending_authored_journal(
         .await
         .context("committing authored draft revision")?;
     if !cas_ok {
+        let rejected = ApplyAuthoredAgentPackageReceipt {
+            client_operation_id: journal.client_operation_id.clone(),
+            receipt_id: uuid::Uuid::nil(),
+            status: AuthoredAgentReceiptStatus::Rejected,
+            package_digest: journal.package_digest.clone(),
+            policy_revision: journal.policy_revision.clone(),
+            installation_id: installation_id.clone(),
+            default_selected: journal.make_default,
+            result_config_generation: 0,
+            review,
+        };
         return settle_authored_outcome(
             ctx,
             &journal,
             installation_id,
-            ApplyAuthoredAgentPackageOutcome::Rejected {
-                reason: AuthoredAgentRejectReason::StaleDraft,
-                message: "authored draft revision does not match the last authoritative draft; edit/retry the current revision".into(),
-                projection: None,
-            },
+            ApplyAuthoredAgentPackageOutcome::Receipt(rejected),
         )
         .await;
     }

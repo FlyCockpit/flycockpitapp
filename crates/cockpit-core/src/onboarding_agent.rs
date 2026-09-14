@@ -1041,13 +1041,20 @@ fn review_children_from_package_files(
     draft
         .children
         .iter()
+        .filter(|child| {
+            child
+                .relative_path
+                .strip_prefix("subagents/")
+                .and_then(|rest| rest.strip_suffix(".md"))
+                .is_some_and(|rest| !rest.contains('/'))
+        })
         .filter_map(|child| {
-            review_child_from_markdown(&child.relative_path, &child.markdown, snapshot, files)
+            review_child_at_path(&child.relative_path, &child.markdown, snapshot, files)
         })
         .collect()
 }
 
-fn review_child_from_markdown(
+fn review_child_at_path(
     path: &str,
     markdown: &str,
     snapshot: &AgentPolicySnapshot,
@@ -1116,40 +1123,23 @@ fn review_child_from_markdown(
         .and_then(|vnext| vnext.verification.as_ref())
         .map(|policy| policy.goal_skeptics)
         .unwrap_or(GoalSkepticsPolicy::Off);
-    let nested = child_def
-        .vnext
-        .as_ref()
-        .map(|vnext| {
-            vnext
-                .delegation
-                .allowed_children
-                .iter()
-                .filter_map(|allowed| {
-                    let portable_ref = match allowed {
-                        crate::agents::AllowedChild::PortableRef { portable_agent_ref } => {
-                            portable_agent_ref.as_str()
-                        }
-                        _ => return None,
-                    };
-                    files
-                        .iter()
-                        .find(|(rel, _)| {
-                            rel.strip_prefix("subagents/")
-                                .and_then(|rest| rest.strip_suffix(".md"))
-                                .is_some_and(|rest| {
-                                    rest == portable_agent_ref
-                                        || rest.ends_with(&format!("/{portable_agent_ref}"))
-                                })
-                        })
-                        .and_then(|(rel, bytes)| {
-                            std::str::from_utf8(bytes).ok().and_then(|markdown| {
-                                review_child_from_markdown(rel, markdown, snapshot, files)
-                            })
-                        })
+    let nested_prefix = format!("{child_name}/");
+    let nested = files
+        .iter()
+        .filter(|(rel, _)| {
+            rel.strip_prefix("subagents/")
+                .and_then(|rest| rest.strip_suffix(".md"))
+                .is_some_and(|rest| {
+                    rest.strip_prefix(&nested_prefix)
+                        .is_some_and(|tail| !tail.is_empty() && !tail.contains('/'))
                 })
-                .collect()
         })
-        .unwrap_or_default();
+        .filter_map(|(rel, bytes)| {
+            std::str::from_utf8(bytes)
+                .ok()
+                .and_then(|markdown| review_child_at_path(rel, markdown, snapshot, files))
+        })
+        .collect();
     Some(AuthoredAgentReviewChild {
         path: path.to_string(),
         grants,
@@ -1571,7 +1561,8 @@ mod tests {
         assert!(canonical.files.contains_key("mcp.json"));
         assert!(canonical.files.contains_key("subagents/reviewer.md"));
         assert!(!canonical.files.contains_key("sidecar.json"));
-        assert_eq!(canonical.review.children, vec!["subagents/reviewer.md"]);
+        assert_eq!(canonical.review.children.len(), 1);
+        assert_eq!(canonical.review.children[0].path, "subagents/reviewer.md");
         assert!(canonical.review.trust_disclosure.contains("shared global"));
         assert!(
             !canonical

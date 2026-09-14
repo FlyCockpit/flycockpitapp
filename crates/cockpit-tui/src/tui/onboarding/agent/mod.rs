@@ -866,10 +866,9 @@ impl AgentAuthoringScreen {
         };
         let child = default_child_draft(&self.projection);
         if let Some(parent) = Self::child_slot_at_path(&mut self.draft, &parent_path) {
-            parent.children.push(child);
             let child_path = parent_path
                 .iter()
-                .chain([&parent.children.len() - 1])
+                .chain([&parent.children.len()])
                 .copied()
                 .collect();
             self.subagent_stack.push(SubagentStackFrame {
@@ -877,6 +876,9 @@ impl AgentAuthoringScreen {
                 child_path,
                 phase: SubagentPhase::Identity,
             });
+            if let Some(parent) = Self::child_slot_at_path(&mut self.draft, &parent_path) {
+                parent.children.push(child);
+            }
             self.editing_child = Self::child_at_path(&self.draft, &child_path).cloned();
             self.subagents_focus = SubagentsFocus::Add;
             self.phase = Phase::SubagentEdit(SubagentPhase::Identity);
@@ -1291,6 +1293,18 @@ impl AgentAuthoringScreen {
                     "Review agent package",
                 ));
             }
+            Phase::SubagentEdit(SubagentPhase::SubagentsList) => {
+                lines.push(opt_line(0, self.cursor, "Add nested subagent"));
+                if let Some(child) = &self.editing_child {
+                    for (index, nested) in child.children.iter().enumerate() {
+                        lines.push(opt_line(
+                            index + 1,
+                            self.cursor,
+                            &format!("Edit {}", nested.name),
+                        ));
+                    }
+                }
+            }
             Phase::SubagentEdit(SubagentPhase::Identity) => {
                 lines.push(Line::from(format!("Name: {}", self.name_field.text())));
             }
@@ -1370,14 +1384,36 @@ fn cycle_tool_tier(tiers: &mut std::collections::BTreeMap<String, ToolTier>, cur
 
 fn review_child_lines(child: &AuthoredAgentReviewChild, indent: usize) -> Vec<Line<'static>> {
     let prefix = "  ".repeat(indent);
-    let mut lines = vec![Line::from(format!(
-        "{prefix}{} · grants={} · tools={}",
-        child.path,
-        child.grants.len(),
-        child.tool_tier_preferences.len()
-    ))];
-    for nested in &child.children {
-        lines.extend(review_child_lines(nested, indent + 1));
+    let mut lines = vec![Line::from(format!("{prefix}{}", child.path))];
+    for grant in &child.grants {
+        let mark = if grant.is_default { "*" } else { " " };
+        lines.push(Line::from(format!(
+            "{prefix}  {mark} {}/{} · {}",
+            grant.provider_id,
+            grant.model_id,
+            trust_label(grant.trust)
+        )));
+    }
+    for (tool, tier) in &child.tool_tier_preferences {
+        lines.push(Line::from(format!("{prefix}  {tool}: {tier}")));
+    }
+    lines.push(Line::from(format!(
+        "{prefix}  interactive subagents: {}",
+        if child.interactive_subagents {
+            "on"
+        } else {
+            "off"
+        }
+    )));
+    lines.push(Line::from(format!(
+        "{prefix}  goal skeptics: {}",
+        child.goal_skeptics_label
+    )));
+    if !child.children.is_empty() {
+        lines.push(Line::from(format!("{prefix}  delegation children:")));
+        for nested in &child.children {
+            lines.extend(review_child_lines(nested, indent + 1));
+        }
     }
     lines
 }

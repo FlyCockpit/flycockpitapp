@@ -402,3 +402,97 @@ async fn authored_agent_pending_journal_surfaces_exact_pending_receipt() {
     assert_eq!(pending.status, AuthoredAgentReceiptStatus::Pending);
     assert_eq!(pending.package_digest, canonical.digest);
 }
+
+#[tokio::test]
+async fn authored_agent_unknown_settlement_without_durable_journal() {
+    let ctx = authored_test_ctx();
+    let mut state = MutableClientState::detached_for_test();
+    let projection = fetch_projection(&ctx, &mut state).await;
+    let package = package_from_projection(&projection);
+    let operation_id = "authored-unknown-settlement";
+    let request = ApplyAuthoredAgentPackageRequest {
+        client_operation_id: operation_id.into(),
+        expected_policy_revision: projection.policy.policy_revision.clone(),
+        package,
+        onboarding: None,
+        validate_only: false,
+    };
+    let fence = crate::daemon::agent_authoring::publication_fence_for_request(&request)
+        .expect("publication fence");
+    ctx.db
+        .begin_local_operation(
+            fence.owner_digest.clone(),
+            operation_id.into(),
+            "apply_authored_agent_package".into(),
+            fence.request_hash,
+        )
+        .await
+        .expect("pending local operation");
+    let receipt = receipt_for(&ctx, &mut state, operation_id)
+        .await
+        .expect("unknown receipt");
+    assert_eq!(receipt.status, AuthoredAgentReceiptStatus::Unknown);
+}
+
+#[tokio::test]
+async fn authored_agent_rejected_create_allows_adjusted_retry_with_stable_operation_id() {
+    let ctx = authored_test_ctx();
+    let mut state = MutableClientState::detached_for_test();
+    let projection = fetch_projection(&ctx, &mut state).await;
+    let stale_package = package_from_projection(&projection);
+    let operation_id = "authored-rejected-retry";
+    let now = crate::workspace_lease::now_unix_ms();
+    ctx.db
+        .cas_authored_agent_package_draft(
+            stale_package.name.clone(),
+            None,
+            "other-client-draft".into(),
+            "a".repeat(64),
+            now,
+        )
+        .await
+        .expect("second client draft CAS");
+
+    let rejected = apply_authored(
+        &ctx,
+        &mut state,
+        ApplyAuthoredAgentPackageRequest {
+            client_operation_id: operation_id.into(),
+            expected_policy_revision: projection.policy.policy_revision.clone(),
+            package: stale_package,
+            onboarding: None,
+            validate_only: false,
+        },
+    )
+    .await;
+    assert!(matches!(
+        rejected,
+        ApplyAuthoredAgentPackageOutcome::Rejected {
+            reason: AuthoredAgentRejectReason::StaleDraft,
+            ..
+        }
+    ));
+
+    let mut adjusted = package_from_projection(&projection);
+    adjusted.draft_revision = Some("other-client-draft".into());
+    let retried = apply_authored(
+        &ctx,
+        &mut state,
+        ApplyAuthoredAgentPackageRequest {
+            client_operation_id: operation_id.into(),
+            expected_policy_revision: projection.policy.policy_revision.clone(),
+            package: adjusted,
+            onboarding: None,
+            validate_only: false,
+        },
+    )
+    .await;
+    match retried {
+        ApplyAuthoredAgentPackageOutcome::Receipt(receipt)
+            if receipt.status == AuthoredAgentReceiptStatus::Committed =>
+        {
+            assert!(receipt.installation_id.is_some());
+        }
+        other => panic!("adjusted retry must commit with the stable operation id: {other:?}"),
+    }
+}

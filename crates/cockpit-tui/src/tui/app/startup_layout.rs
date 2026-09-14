@@ -274,27 +274,44 @@ impl App {
                 );
             }
             Some(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID) => {
-                self.mount_onboarding_wizard(
+                if !self.require_onboarding_snapshot_for_named_route(
                     cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID,
-                    None,
+                ) {
+                    return;
+                }
+                self.mount_named_setup_wizard_in_onboarding_shell(
+                    cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID,
                     None,
                 );
             }
             Some(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID) => {
-                self.mount_onboarding_wizard(
+                if !self.require_onboarding_snapshot_for_named_route(
                     cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
-                    None,
+                ) {
+                    return;
+                }
+                self.mount_named_setup_wizard_in_onboarding_shell(
+                    cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
                     None,
                 );
             }
             Some(cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID) => {
-                self.mount_onboarding_wizard(
+                if !self.require_onboarding_snapshot_for_named_route(
+                    cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
+                ) {
+                    return;
+                }
+                self.mount_named_setup_wizard_in_onboarding_shell(
                     cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
                     None,
-                    Some("Choose what happens when the last Cockpit window closes.".to_string()),
                 );
             }
             Some(cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID) => {
+                if !self.require_onboarding_snapshot_for_named_route(
+                    cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID,
+                ) {
+                    return;
+                }
                 self.mount_onboarding_agent_authoring();
             }
             Some(other) => {
@@ -325,11 +342,16 @@ impl App {
                 self.dialog = dialog;
                 if let Some(shell) = self.onboarding_shell.as_mut() {
                     shell.present_engine(match wizard_id {
-                        cockpit_core::wizard::SECURITY_WIZARD_ID => {
+                        cockpit_core::wizard::SECURITY_WIZARD_ID
+                        | cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID => {
                             crate::tui::onboarding::EngineStage::Profile
                         }
-                        cockpit_core::wizard::MODEL_WIZARD_ID => {
+                        cockpit_core::wizard::MODEL_WIZARD_ID
+                        | cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID => {
                             crate::tui::onboarding::EngineStage::Model
+                        }
+                        cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID => {
+                            crate::tui::onboarding::EngineStage::Lifetime
                         }
                         _ => crate::tui::onboarding::EngineStage::Model,
                     });
@@ -1232,6 +1254,12 @@ impl App {
         let Some(snapshot) = self.onboarding_snapshot.clone() else {
             return;
         };
+        if self.onboarding_shell.is_none() {
+            self.onboarding_shell = Some(Box::new(crate::tui::onboarding::OnboardingShell::new(
+                &snapshot,
+                crate::tui::onboarding::reduced_motion_enabled(),
+            )));
+        }
         let operation_id = self
             .onboarding_agent_operation_id
             .get_or_insert_with(|| {
@@ -1376,15 +1404,7 @@ impl App {
             AgentAuthoringAction::ApplyPackage {
                 client_operation_id,
                 package,
-            } => {
-                let _ = client_operation_id;
-                (
-                    false,
-                    package,
-                    "agent_authoring.apply",
-                    operation_id.clone(),
-                )
-            }
+            } => (false, package, "agent_authoring.apply", client_operation_id),
             AgentAuthoringAction::RefreshProjection => {
                 self.request_agent_authoring_projection(operation_id);
                 return;

@@ -1444,8 +1444,14 @@ pub const PENDING_ATTACHMENT_TTL_SECS: u64 = 10 * 60;
 pub const IMAGE_ATTACHMENT_MIME_PNG: &str = "image/png";
 pub const IMAGE_PART_SENTINEL: &str = "\u{0}<cockpit-image-part>\u{0}";
 
-pub fn is_protocol_compatible(_v: u32) -> bool {
-    true
+pub fn is_protocol_compatible(v: u32) -> bool {
+    v == PROTOCOL_VERSION
+}
+
+pub fn version_mismatch_message(v: u32) -> String {
+    format!(
+        "wire protocol version mismatch: peer sent v{v}, this binary speaks v{PROTOCOL_VERSION} only"
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1471,6 +1477,12 @@ impl NegotiatedProtocol {
     }
 
     pub fn from_hello(hello: &DaemonHello) -> std::result::Result<Self, ErrorPayload> {
+        if hello.protocol_version != PROTOCOL_VERSION {
+            return Err(ErrorPayload {
+                code: ErrorCode::ProtocolVersion,
+                message: incompatible_daemon_protocol_message(hello.protocol_version),
+            });
+        }
         Ok(Self {
             version: PROTOCOL_VERSION,
             daemon_version: hello.daemon_version.clone(),
@@ -4141,6 +4153,18 @@ where
                 .and_then(serde_json::Value::as_u64)
                 .and_then(|n| u32::try_from(n).ok())
                 .context("deserializing envelope: missing or invalid v")?;
+            if v != PROTOCOL_VERSION {
+                let kind = value
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let id = value
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|raw| Uuid::parse_str(raw).ok());
+                return Ok(Some(RecvFrame::VersionMismatch { v, kind, id }));
+            }
             let kind = value
                 .get("kind")
                 .and_then(serde_json::Value::as_str)
@@ -7468,10 +7492,10 @@ mod tests {
     }
 
     #[test]
-    fn is_protocol_compatible_accepts_every_prerelease_version() {
+    fn is_protocol_compatible_requires_exact_live_version() {
         assert!(is_protocol_compatible(PROTOCOL_VERSION));
-        assert!(is_protocol_compatible(PROTOCOL_VERSION + 1));
-        assert!(is_protocol_compatible(PROTOCOL_VERSION - 1));
+        assert!(!is_protocol_compatible(PROTOCOL_VERSION + 1));
+        assert!(!is_protocol_compatible(PROTOCOL_VERSION - 1));
     }
 
     #[test]

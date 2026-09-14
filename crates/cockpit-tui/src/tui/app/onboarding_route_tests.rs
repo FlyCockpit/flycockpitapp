@@ -18,56 +18,36 @@ fn snapshot(stage: cockpit_proto::OnboardingStage) -> cockpit_proto::OnboardingB
 }
 
 #[test]
-fn named_setup_wizard_inventory_covers_registry_rows() {
-    let mut expected = cockpit_core::wizard::named_setup_wizard_ids()
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    expected.sort();
-    let startup = include_str!("startup_layout.rs");
-    let open_onboarding = startup
-        .split("pub(super) fn open_onboarding_setup")
-        .nth(1)
-        .and_then(|tail| {
-            tail.split("fn mount_named_setup_wizard_in_onboarding_shell")
-                .next()
-        })
-        .expect("open_onboarding_setup");
-    let wizard_match_arm = |id: &str| match id {
-        cockpit_core::wizard::PROVIDER_WIZARD_ID => {
-            "Some(cockpit_core::wizard::PROVIDER_WIZARD_ID)"
+fn named_setup_wizards_mount_inside_onboarding_shell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    for wizard_id in cockpit_core::wizard::named_setup_wizard_ids() {
+        let mut app = App::new(Some(tmp.path()), false);
+        app.apply_onboarding_bootstrap_snapshot(Some(snapshot(
+            cockpit_proto::OnboardingStage::Complete,
+        )));
+        app.open_onboarding_setup(Some(wizard_id));
+        assert!(
+            app.onboarding_shell.is_some(),
+            "wizard `{wizard_id}` must mount the full-screen onboarding shell"
+        );
+        if wizard_id == cockpit_core::wizard::PROVIDER_WIZARD_ID {
+            assert_eq!(
+                app.onboarding_shell
+                    .as_ref()
+                    .map(|shell| shell.screen_kind()),
+                Some(crate::tui::onboarding::OnboardingScreenKind::ProviderSearch)
+            );
+        } else if wizard_id != cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID {
+            assert_eq!(
+                app.onboarding_shell
+                    .as_ref()
+                    .map(|shell| shell.screen_kind()),
+                Some(crate::tui::onboarding::OnboardingScreenKind::Engine),
+                "wizard `{wizard_id}` must present through the shell engine"
+            );
         }
-        cockpit_core::wizard::SECURITY_WIZARD_ID => {
-            "Some(cockpit_core::wizard::SECURITY_WIZARD_ID)"
-        }
-        cockpit_core::wizard::MODEL_WIZARD_ID => "Some(cockpit_core::wizard::MODEL_WIZARD_ID)",
-        cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID => {
-            "Some(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID)"
-        }
-        cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID => {
-            "Some(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID)"
-        }
-        cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID => {
-            "Some(cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID)"
-        }
-        cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID => {
-            "Some(cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID)"
-        }
-        other => panic!("unknown setup wizard id `{other}`"),
-    };
-    let mut routed = cockpit_core::wizard::named_setup_wizard_ids()
-        .into_iter()
-        .filter(|wizard_id| {
-            let arm = wizard_match_arm(wizard_id);
-            open_onboarding.contains(arm) && !open_onboarding.contains(&format!("// {arm}"))
-        })
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    routed.sort();
-    assert_eq!(
-        expected, routed,
-        "every named setup wizard must route through open_onboarding_setup"
-    );
+    }
 }
 
 #[test]

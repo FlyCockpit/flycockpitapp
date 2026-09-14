@@ -11051,6 +11051,13 @@ async fn handle_serialized_request_impl(
             }
             let settlement_owner = settings_capability_owner(state);
             let request_hash = local_operation_request_hash(&request)?;
+            prepare_authored_apply_local_operation_retry(
+                ctx,
+                &settlement_owner,
+                &request.client_operation_id,
+                request_hash,
+            )
+            .await?;
             let fencing_generation = match begin_local_operation(
                 ctx,
                 &settlement_owner,
@@ -22180,6 +22187,53 @@ pub(super) async fn recover_assistant_mutation_journals(
         recovered = recovered.saturating_add(1);
     }
     Ok(recovered)
+}
+
+async fn prepare_authored_apply_local_operation_retry(
+    ctx: &DaemonContext,
+    owner: &str,
+    client_operation_id: &str,
+    request_hash: [u8; 32],
+) -> std::result::Result<(), ErrorPayload> {
+    let settlement = ctx
+        .db
+        .local_operation_settlement(owner.to_owned(), client_operation_id.to_owned())
+        .await
+        .map_err(internal)?;
+    let Some(crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(
+        identity,
+        json,
+    )) = settlement
+    else {
+        return Ok(());
+    };
+    if identity.request_hash.as_slice() == request_hash.as_slice() {
+        return Ok(());
+    }
+    let Ok(cockpit_proto::Response::AuthoredAgentPackage(
+        cockpit_proto::ApplyAuthoredAgentPackageOutcome::Rejected { .. },
+    )) = serde_json::from_str(&json)
+    else {
+        return Err(conflict(
+            "client operation id was reused for a different request",
+        ));
+    };
+    let reset = ctx
+        .db
+        .reset_terminal_local_operation_for_retry(
+            owner.to_owned(),
+            client_operation_id.to_owned(),
+            "apply_authored_agent_package".to_owned(),
+            request_hash,
+        )
+        .await
+        .map_err(internal)?;
+    if !reset {
+        return Err(conflict(
+            "client operation id was reused for a different request",
+        ));
+    }
+    Ok(())
 }
 
 async fn begin_local_operation(

@@ -3625,31 +3625,25 @@ impl Driver {
             .await
         {
             Ok(admission) => {
-                let table = match admission
-                    .consume_at_async_sink(|new_table| {
-                        let new_table = new_table.clone();
-                        let interrupts = self.interrupts.clone();
-                        let session = self.session.clone();
-                        let redact = self.redact.clone();
-                        async move {
-                            match interrupts
-                                .refresh_union_redaction(&session, &new_table)
-                                .await
-                            {
-                                Ok(Some(table)) => Ok(table),
-                                Ok(None) => {
-                                    let table = redact.union(&new_table)?;
-                                    let table = Arc::new(table);
-                                    session.persist_redaction_table(&table)?;
-                                    Ok(table)
-                                }
-                                Err(error) => Err(error),
-                            }
-                        }
-                    })
+                let new_table = match admission
+                    .consume_at_async_sink(|new_table| async move { Ok(new_table) })
                     .await
                 {
                     Ok(table) => table,
+                    Err(error) => return Self::refuse_unredacted_send(tx, error).await,
+                };
+                let table = match self
+                    .interrupts
+                    .refresh_union_redaction(&self.session, &new_table)
+                    .await
+                {
+                    Ok(Some(table)) => table,
+                    Ok(None) => {
+                        let table = self.redact.union(&new_table)?;
+                        let table = Arc::new(table);
+                        self.session.persist_redaction_table(&table)?;
+                        table
+                    }
                     Err(error) => return Self::refuse_unredacted_send(tx, error).await,
                 };
                 for path in table.unsupported_files() {

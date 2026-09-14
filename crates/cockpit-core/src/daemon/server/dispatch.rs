@@ -6502,7 +6502,8 @@ async fn handle_serialized_request_impl(
                             proto::RedactionCoverageStatusProjection {
                                 state: proto::RedactionCoverageState::Ready,
                                 owner_diagnostic: None,
-                                rendered_context: owner.then(|| render_debug_context(&root, table)),
+                                rendered_context: owner
+                                    .then(|| render_debug_context(&root, &table)),
                             },
                         ))
                     })
@@ -6563,7 +6564,7 @@ async fn handle_serialized_request_impl(
             };
             let text = admission
                 .consume_at_async_sink(|table| {
-                    let table = std::sync::Arc::new(table.clone());
+                    let table = std::sync::Arc::new(table);
                     let turns = turns.clone();
                     let snapshot = snapshot.clone();
                     async move {
@@ -31596,7 +31597,7 @@ async fn run_docs_ask_pipeline(
     let env_live_for_model = env_live.clone();
     let (model, redact) = admission
         .consume_at_sink(|redact| {
-            let redact = std::sync::Arc::new(redact.clone());
+            let redact = std::sync::Arc::new(redact);
             let model = Arc::new(crate::engine::model::Model::from_config_with_store(
                 &providers,
                 redact.clone(),
@@ -32600,7 +32601,7 @@ pub(super) async fn export_session_data(
             proto::ExportSessionKind::TranscriptJson => {
                 let bytes = admission
                     .consume_at_async_sink(|export_redactor| {
-                        let export_redactor = std::sync::Arc::new(export_redactor.clone());
+                        let export_redactor = std::sync::Arc::new(export_redactor);
                         let db = db.clone();
                         let target = target.clone();
                         let secret_vault = ctx.secret_vault.clone();
@@ -32641,7 +32642,7 @@ pub(super) async fn export_session_data(
             proto::ExportSessionKind::DebugBundle => {
                 let bundle = admission
                     .consume_at_async_sink(|export_redactor| {
-                        let export_redactor = std::sync::Arc::new(export_redactor.clone());
+                        let export_redactor = std::sync::Arc::new(export_redactor);
                         let db = db.clone();
                         let target = target.clone();
                         let secret_vault = ctx.secret_vault.clone();
@@ -32947,7 +32948,7 @@ pub(super) async fn auto_title_request(
                 &session,
                 extended,
                 providers,
-                std::sync::Arc::new(table.clone()),
+                std::sync::Arc::new(table),
                 String::new(),
                 crate::session::TitleAction::Explicit,
             )

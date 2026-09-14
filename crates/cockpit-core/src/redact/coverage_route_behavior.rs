@@ -233,4 +233,107 @@ pub(crate) mod tests {
             .expect("right sink");
         assert!(left.union(&right).is_err());
     }
+
+    pub(crate) async fn assert_union_adopts_newer_binding_not_right_operand() {
+        let authority = RedactionCoverageAuthority::default();
+        let captures = Arc::new(AtomicUsize::new(0));
+        let parts = [3, 3, 3, 3, 3, 3, 3, 3, 3, 3];
+        let key = key(parts);
+        let older = authority
+            .acquire(
+                key.clone(),
+                CoverageScope::SessionSubmission,
+                capture(captures.clone(), parts),
+            )
+            .await
+            .expect("older capture")
+            .install_table()
+            .expect("older sink");
+        authority.invalidate_key(&key);
+        let newer = authority
+            .acquire(
+                key,
+                CoverageScope::DriverTurn,
+                capture(captures.clone(), parts),
+            )
+            .await
+            .expect("newer capture")
+            .install_table()
+            .expect("newer sink");
+        let older_binding = older.coverage_binding().expect("older binding");
+        let newer_binding = newer.coverage_binding().expect("newer binding");
+        assert!(
+            newer_binding.binding_ordering(&older_binding) == Some(std::cmp::Ordering::Greater)
+        );
+
+        let forward = older.union(&newer).expect("older union newer");
+        assert_eq!(
+            forward
+                .coverage_binding()
+                .expect("forward binding")
+                .binding_ordering(&newer_binding),
+            Some(std::cmp::Ordering::Equal)
+        );
+
+        let reverse = newer.union(&older).expect("newer union older");
+        assert_eq!(
+            reverse
+                .coverage_binding()
+                .expect("reverse binding")
+                .binding_ordering(&newer_binding),
+            Some(std::cmp::Ordering::Equal)
+        );
+    }
+
+    pub(crate) async fn assert_async_sink_revalidates_before_result_escapes() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        use tokio::sync::Notify;
+
+        let authority = RedactionCoverageAuthority::default();
+        let captures = Arc::new(AtomicUsize::new(0));
+        let parts = [4, 4, 4, 4, 4, 4, 4, 4, 4, 4];
+        let admission = authority
+            .acquire(
+                key(parts),
+                CoverageScope::SessionSubmission,
+                capture(captures.clone(), parts),
+            )
+            .await
+            .expect("async sink admission");
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let persisted = Arc::new(AtomicBool::new(false));
+        let persisted_for_sink = persisted.clone();
+        let entered_for_sink = entered.clone();
+        let release_for_sink = release.clone();
+        let sink_task = tokio::spawn(async move {
+            let result = admission
+                .consume_at_async_sink(|table| {
+                    let entered = entered_for_sink.clone();
+                    let release = release_for_sink.clone();
+                    async move {
+                        entered.notify_one();
+                        release.notified().await;
+                        Ok(table)
+                    }
+                })
+                .await;
+            if result.is_ok() {
+                persisted_for_sink.store(true, Ordering::SeqCst);
+            }
+            result
+        });
+        entered.notified().await;
+        authority.invalidate();
+        release.notify_one();
+        assert!(matches!(
+            sink_task.await.expect("sink task"),
+            Err(CoverageError::Invalidated)
+        ));
+        assert!(!persisted.load(Ordering::SeqCst));
+    }
 }

@@ -13613,38 +13613,56 @@ pub(super) async fn run_worker(
                                                             )
                                                             .await
                                                         {
-                                                            Ok(admission) => admission
-                                                                .consume_at_async_sink(|new_table| {
-                                                                    let new_table = new_table.clone();
-                                                                    let session = session.clone();
-                                                                    let redaction = redaction.clone();
-                                                                    let interrupts =
-                                                                        interrupts.clone();
-                                                                    async move {
+                                                            Ok(admission) => {
+                                                                match admission
+                                                                    .consume_at_async_sink(
+                                                                        |new_table| async move {
+                                                                            Ok(new_table)
+                                                                        },
+                                                                    )
+                                                                    .await
+                                                                {
+                                                                    Ok(new_table) => {
                                                                         let _redaction_guard =
                                                                             interrupts
                                                                                 .lock_redaction_table_write()
                                                                                 .await;
-                                                                        let base =
-                                                                            current_redaction(&redaction);
-                                                                        let unioned =
-                                                                            base.union(&new_table)?;
-                                                                        let unioned =
-                                                                            Arc::new(unioned);
-                                                                        session.persist_redaction_table(
-                                                                            &unioned,
-                                                                        )?;
-                                                                        set_current_redaction(
+                                                                        let base = current_redaction(
                                                                             &redaction,
-                                                                            unioned.clone(),
                                                                         );
-                                                                        Ok(unioned)
+                                                                        match base.union(&new_table) {
+                                                                            Ok(unioned) => {
+                                                                                let unioned =
+                                                                                    Arc::new(unioned);
+                                                                                match session
+                                                                                    .persist_redaction_table(
+                                                                                        &unioned,
+                                                                                    )
+                                                                                {
+                                                                                    Ok(()) => {
+                                                                                        set_current_redaction(
+                                                                                            &redaction,
+                                                                                            unioned.clone(),
+                                                                                        );
+                                                                                        Ok(unioned)
+                                                                                    }
+                                                                                    Err(error) => {
+                                                                                        Err(error)
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                            Err(error) => {
+                                                                                Err(error)
+                                                                            }
+                                                                        }
                                                                     }
-                                                                })
-                                                                .await
-                                                                .map_err(|error| {
-                                                                    anyhow::anyhow!(error.to_string())
-                                                                }),
+                                                                    Err(error) => Err(
+                                                                        anyhow::anyhow!(
+                                                                            error.to_string()
+                                                                        ),
+                                                                    ),
+                                                                }
+                                                            }
                                                             Err(error) => Err(anyhow::anyhow!(
                                                                 error.to_string()
                                                             )),

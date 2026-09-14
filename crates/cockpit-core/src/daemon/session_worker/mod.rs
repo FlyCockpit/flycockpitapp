@@ -535,7 +535,6 @@ async fn refresh_redaction_for_turn(
         publish_command_cache,
     )
     .publish_fence();
-    let session_for_sink = session.clone();
     let refresh_result = match authority
         .acquire(
             coverage_key,
@@ -567,37 +566,29 @@ async fn refresh_redaction_for_turn(
         )
         .await
     {
-        Ok(admission) => admission
-            .consume_at_async_sink(|new_table| {
-                let new_table = new_table.clone();
-                let session = session_for_sink.clone();
-                let accumulated_redact = accumulated_redact.clone();
-                let interrupts = interrupts.clone();
-                async move {
-                    // H1: read the LATEST table, union, persist, and swap all under the
-                    // per-session redaction-table write lock so this refresh serializes
-                    // with sealed adoption / approved-secret-file registration and can
-                    // neither read a stale table nor swap over a concurrently-committed
-                    // adoption. The guard is released before the driver `.await` below.
-                    let _redaction_guard = interrupts.lock_redaction_table_write().await;
-                    let base = current_redaction(&accumulated_redact);
-                    match base.union(&new_table) {
-                        Ok(unioned) => {
-                            let unioned = std::sync::Arc::new(unioned);
-                            match session.persist_redaction_table(&unioned) {
-                                Ok(()) => {
-                                    set_current_redaction(&accumulated_redact, unioned.clone());
-                                    Ok(unioned)
-                                }
-                                Err(error) => Err(error),
-                            }
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-            })
+        Ok(admission) => match admission
+            .consume_at_async_sink(|new_table| async move { Ok(new_table) })
             .await
-            .map_err(|error| anyhow::anyhow!(error.to_string())),
+        {
+            Ok(new_table) => {
+                let _redaction_guard = interrupts.lock_redaction_table_write().await;
+                let base = current_redaction(&accumulated_redact);
+                match base.union(&new_table) {
+                    Ok(unioned) => {
+                        let unioned = std::sync::Arc::new(unioned);
+                        match session.persist_redaction_table(&unioned) {
+                            Ok(()) => {
+                                set_current_redaction(&accumulated_redact, unioned.clone());
+                                Ok(unioned)
+                            }
+                            Err(error) => Err(anyhow::anyhow!(error)),
+                        }
+                    }
+                    Err(error) => Err(anyhow::anyhow!(error)),
+                }
+            }
+            Err(error) => Err(anyhow::anyhow!(error.to_string())),
+        },
         Err(error) => Err(anyhow::anyhow!(error.to_string())),
     };
     match refresh_result {

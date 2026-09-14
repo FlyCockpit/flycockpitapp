@@ -324,19 +324,7 @@ impl EntryClass {
     fn retained_origin_allocation_bytes(&self) -> usize {
         match self {
             EntryClass::Ordinary { origin, .. } => origin.capacity(),
-            EntryClass::Sealed(identity) => identity
-                .name
-                .as_str()
-                .len()
-                .saturating_add(
-                    identity
-                        .record_id
-                        .map(|record_id| record_id.to_string().len())
-                        .unwrap_or(0),
-                )
-                .saturating_add(std::mem::size_of::<
-                    crate::sealed::identity::SealedRedactionIdentity,
-                >()),
+            EntryClass::Sealed(identity) => identity.retained_heap_bytes(),
         }
     }
 
@@ -1536,8 +1524,12 @@ impl RedactionTable {
             protected,
         )?;
         merged.coverage_binding = match (&self.coverage_binding, &other.coverage_binding) {
-            (Some(left), Some(right)) if left.same_generation(right) => Some(left.clone()),
-            (Some(_left), Some(right)) => Some(right.clone()),
+            (Some(left), Some(right)) => match left.binding_ordering(right) {
+                Some(std::cmp::Ordering::Equal) => Some(left.clone()),
+                Some(std::cmp::Ordering::Greater) => Some(left.clone()),
+                Some(std::cmp::Ordering::Less) => Some(right.clone()),
+                None => anyhow::bail!("coverage binding mismatch across union operands"),
+            },
             (Some(binding), None) if other.is_union_identity_operand() => Some(binding.clone()),
             (None, Some(binding)) if self.is_union_identity_operand() => Some(binding.clone()),
             (None, None)
@@ -2028,6 +2020,10 @@ impl RedactionTable {
             coverage_binding: Some(binding),
             ..self
         }
+    }
+
+    pub(crate) fn coverage_binding(&self) -> Option<&coverage_authority::CoverageTableBinding> {
+        self.coverage_binding.as_ref()
     }
 
     pub(crate) fn ensure_binding_current(

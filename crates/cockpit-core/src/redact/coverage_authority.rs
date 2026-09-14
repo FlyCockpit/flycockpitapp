@@ -292,6 +292,30 @@ impl CoverageTableBinding {
             && self.key_revision == other.key_revision
     }
 
+    pub(crate) fn same_coverage_key(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+
+    pub(crate) fn binding_ordering(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        if !self.same_coverage_key(other) {
+            return None;
+        }
+        match self.epoch.cmp(&other.epoch) {
+            std::cmp::Ordering::Equal => {}
+            order => return Some(order),
+        }
+        match self.key_revision.cmp(&other.key_revision) {
+            std::cmp::Ordering::Equal => {
+                if self.same_generation(other) {
+                    Some(std::cmp::Ordering::Equal)
+                } else {
+                    None
+                }
+            }
+            order => Some(order),
+        }
+    }
+
     pub(crate) fn validate(&self) -> Result<(), CoverageError> {
         let inner = self.authority.upgrade().ok_or(CoverageError::Unavailable)?;
         let state = lock(&inner.state);
@@ -1089,45 +1113,45 @@ impl CoverageAdmission {
     /// The raw generation [`Arc`] cannot escape; only this bound table may be
     /// persisted or installed for later historical folds.
     pub(crate) fn install_table(self) -> std::result::Result<RedactionTable, CoverageError> {
-        let table = self.bound_table_for_sink()?;
-        self.validate_current()?;
-        Ok(table)
+        self.bound_table_for_sink()
     }
 
     /// Run one immediate sink against the admitted generation table. The lease
-    /// is consumed before the sink returns; only a bound sink view is exposed.
+    /// is consumed before the sink returns; the sink receives one owned bound
+    /// table and must not perform irreversible side effects before returning.
     pub(crate) fn consume_at_sink<T>(
         self,
-        sink: impl FnOnce(&RedactionTable) -> Result<T>,
+        sink: impl FnOnce(RedactionTable) -> Result<T>,
     ) -> std::result::Result<T, CoverageError> {
         let table = self.bound_table_for_sink()?;
-        let result = sink(&table).map_err(|_| CoverageError::Unavailable)?;
+        let result = sink(table).map_err(|_| CoverageError::Unavailable)?;
         self.validate_current()?;
         Ok(result)
     }
 
     /// Async variant of [`Self::consume_at_sink`]. The lease stays active until
-    /// the future completes so the sink can await owned egress work.
+    /// the future completes. Callers must defer persistence, swap, and other
+    /// irreversible side effects until after this method returns `Ok`.
     pub(crate) async fn consume_at_async_sink<T, F, Fut>(
         self,
         sink: F,
     ) -> std::result::Result<T, CoverageError>
     where
-        F: FnOnce(&RedactionTable) -> Fut,
+        F: FnOnce(RedactionTable) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
         let table = self.bound_table_for_sink()?;
-        let result = sink(&table).await.map_err(|_| CoverageError::Unavailable)?;
+        let result = sink(table).await.map_err(|_| CoverageError::Unavailable)?;
         self.validate_current()?;
         Ok(result)
     }
 
     pub(crate) fn use_at_sink<T>(
         self,
-        sink: impl FnOnce(&RedactionTable) -> Result<T>,
+        sink: impl FnOnce(RedactionTable) -> Result<T>,
     ) -> std::result::Result<T, CoverageError> {
         let table = self.bound_table_for_sink()?;
-        let result = sink(&table).map_err(|_| CoverageError::Unavailable)?;
+        let result = sink(table).map_err(|_| CoverageError::Unavailable)?;
         self.validate_current()?;
         Ok(result)
     }

@@ -720,6 +720,18 @@ async fn union_refuses_mismatched_generation_bindings() {
 }
 
 #[tokio::test]
+async fn union_adopts_newer_binding_not_right_operand() {
+    crate::redact::coverage_route_behavior::tests::assert_union_adopts_newer_binding_not_right_operand()
+        .await;
+}
+
+#[tokio::test]
+async fn async_sink_revalidates_before_result_escapes() {
+    crate::redact::coverage_route_behavior::tests::assert_async_sink_revalidates_before_result_escapes()
+        .await;
+}
+
+#[tokio::test]
 async fn publish_fence_rejects_stale_owned_revisions() {
     crate::redact::coverage_route_behavior::tests::assert_publish_fence_rejects_stale_owned_revisions()
         .await;

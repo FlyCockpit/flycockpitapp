@@ -51,6 +51,10 @@ impl SealedName {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub(crate) fn retained_capacity(&self) -> usize {
+        self.0.capacity()
+    }
 }
 
 impl fmt::Debug for SealedName {
@@ -251,6 +255,12 @@ pub struct SealedRedactionIdentity {
 }
 
 impl SealedRedactionIdentity {
+    /// Heap tails retained by this identity inside one [`RedactionEntry`]. The
+    /// struct itself is counted by the entry vector's inline slot accounting.
+    pub(crate) fn retained_heap_bytes(&self) -> usize {
+        self.name.retained_capacity()
+    }
+
     /// The canonical diagnostic origin *string* for `cockpit debug redact`
     /// display, derived FROM this typed identity. A scoped entry renders the
     /// full grammar; a legacy session entry (no record id) renders the

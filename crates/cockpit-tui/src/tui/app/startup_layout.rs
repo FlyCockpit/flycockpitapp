@@ -1,5 +1,40 @@
 use super::*;
 
+#[cfg(test)]
+mod tests {
+    #[tokio::test(flavor = "current_thread")]
+    async fn coverage_postpaint_integration_uses_existing_upstream_firstpaint_seam() {
+        let namespace = tempfile::tempdir().expect("isolated startup trace root");
+        let workspace = namespace.path().join("workspace");
+        let runtime = namespace.path().join("runtime");
+        std::fs::create_dir_all(&workspace).expect("workspace fixture");
+        std::fs::create_dir_all(&runtime).expect("runtime fixture");
+        let trace = crate::tui::app::startup_first_paint_tests::run_startup_trace_case(
+            &workspace, &runtime, false, true,
+        )
+        .await;
+
+        let mut cursor = 0usize;
+        for event in [
+            "first-paint",
+            "coverage-phase-start",
+            "coverage-phase-complete",
+            "daemon-ready",
+            "first-model-request",
+        ] {
+            let relative = trace[cursor..]
+                .find(event)
+                .unwrap_or_else(|| panic!("missing `{event}` in startup trace: {trace}"));
+            cursor += relative + event.len();
+        }
+        assert!(trace.contains("scope_class=\"daemon_global\""));
+        assert!(trace.contains("correlation=\"opaque-test-correlation\""));
+        for forbidden in ["candidate", "matcher", "fingerprint", "source_inventory"] {
+            assert!(!trace.contains(forbidden), "trace exposed {forbidden}");
+        }
+    }
+}
+
 fn onboarding_ready_construction_retry_required(error: &cockpit_proto::ErrorPayload) -> bool {
     error.code == cockpit_proto::ErrorCode::Internal
         && error.message.contains("retry ready construction")

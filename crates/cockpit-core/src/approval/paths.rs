@@ -653,15 +653,15 @@ impl Approver {
         // Session redaction snapshot for the write-preview diff truncation:
         // the preview must elide boundary-straddling secret partials just
         // like the model-facing truncators do.
-        let redact = self
-            .redact
-            .as_ref()
-            .map(|slot| {
-                slot.read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone()
-            })
-            .unwrap_or_else(|| std::sync::Arc::new(crate::redact::RedactionTable::empty()));
+        let Some(redact) = self.redact.as_ref().map(|slot| {
+            slot.read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }) else {
+            // A write can still be denied safely; do not construct a preview
+            // prompt when no bound coverage snapshot exists.
+            return Ok(Decision::Deny);
+        };
         let question = InterruptQuestion::Single {
             prompt: format!("Replace existing file `{target}`?"),
             options: vec![
@@ -934,10 +934,14 @@ mod file_write_grant_tests {
             cwd.to_path_buf(),
             crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
         );
-        Arc::new(Approver::new(
+        let session = Arc::new(session);
+        Arc::new(Approver::new_for_session(
             store,
             db,
-            session.id,
+            session,
+            Arc::new(std::sync::RwLock::new(Arc::new(
+                crate::redact::RedactionTable::empty(),
+            ))),
             "builder",
             Arc::new(InterruptHub::detached()),
         ))
@@ -959,6 +963,42 @@ mod file_write_grant_tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_preview_refuses_without_bound_coverage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = crate::session::Session::create_for_test(
+            db.clone(),
+            tmp.path().to_path_buf(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        session.clear_redaction_coverage_for_test();
+        let approver = Arc::new(Approver::new(
+            GrantStore::new(
+                db.clone(),
+                session.id,
+                tmp.path().to_path_buf(),
+                crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
+            ),
+            db,
+            session.id,
+            "builder",
+            Arc::new(InterruptHub::detached()),
+        ));
+        let decision = approver
+            .approve_file_write(
+                &tmp.path().join("existing.txt"),
+                b"secret-old",
+                b"secret-new",
+            )
+            .await
+            .expect("missing coverage has a safe denial");
+        assert_eq!(decision, Decision::Deny);
+        assert!(approver.interrupts.subscribe_raised().try_recv().is_err());
     }
 
     #[tokio::test]

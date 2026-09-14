@@ -799,7 +799,7 @@ pub async fn mutate(
     if matches!(
         &mutation,
         AgentMutation::AddMcpServer { secret_values, .. } if !secret_values.is_empty()
-    ) && let Err(error) = ctx.publish_owner_redaction_table()
+    ) && let Err(error) = ctx.publish_owner_redaction_table().await
     {
         ctx.poison_redaction_publication(&error);
         return Err(ErrorPayload {
@@ -1507,7 +1507,7 @@ async fn compensate_agent_mcp_credentials(
         })
         .await
         .map_err(internal)?;
-    ctx.publish_owner_redaction_table().map_err(|error| {
+    ctx.publish_owner_redaction_table().await.map_err(|error| {
         ctx.poison_redaction_publication(&error);
         ErrorPayload {
             code: ErrorCode::Shutdown,

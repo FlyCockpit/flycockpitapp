@@ -372,7 +372,7 @@ fn code_root_transition_source_key(event: &proto::Event) -> Option<String> {
 /// and resolves are tiny.
 const WORK_QUEUE_CAPACITY: usize = 64;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct RedactionSourceOverrides {
     scan_environment: Option<bool>,
     scan_dotenv: Option<bool>,
@@ -403,91 +403,219 @@ enum RedactionRefreshOutcome {
     Refused(String),
 }
 
+pub(super) fn worker_coverage_publish_owners(
+    session: &std::sync::Arc<Session>,
+    env_overlay: &std::sync::Arc<std::sync::RwLock<HashMap<String, String>>>,
+    config_snapshot: &std::sync::Arc<std::sync::RwLock<handle::SessionConfigSnapshot>>,
+    overrides: &RedactionSourceOverrides,
+    vault: std::sync::Arc<crate::secure_key::SecretVault>,
+    db: cockpit_db::Db,
+    command_cache: std::sync::Arc<crate::secret_command::CommandSecretCache>,
+) -> crate::redact::coverage_bindings::SessionCoveragePublishOwners {
+    use crate::redact::coverage_bindings::{SessionCoveragePublishLive, session_publish_owners};
+    let session = session.clone();
+    let env_overlay = env_overlay.clone();
+    let config_snapshot = config_snapshot.clone();
+    let overrides = overrides.clone();
+    let project_root = session.project_root.clone();
+    session_publish_owners(
+        vault,
+        db,
+        command_cache,
+        SessionCoveragePublishLive {
+            environment: std::sync::Arc::new(move || {
+                Ok(crate::env_snapshot::EnvSnapshot::new(
+                    cockpit_proto::EnvSnapshotSource::SessionWorker,
+                    env_overlay
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone(),
+                ))
+            }),
+            policy_digest: std::sync::Arc::new({
+                let config_snapshot = config_snapshot.clone();
+                let overrides = overrides.clone();
+                move || {
+                    let mut cfg = config_snapshot
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .extended
+                        .redact
+                        .clone();
+                    overrides.apply_to(&mut cfg);
+                    crate::redact::coverage_bindings::redact_config_digest(&cfg)
+                }
+            }),
+            override_revision: std::sync::Arc::new(|| 0),
+            redact_config: std::sync::Arc::new({
+                let config_snapshot = config_snapshot.clone();
+                let overrides = overrides.clone();
+                move || {
+                    let mut cfg = config_snapshot
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .extended
+                        .redact
+                        .clone();
+                    overrides.apply_to(&mut cfg);
+                    cfg
+                }
+            }),
+            workspace_root: std::sync::Arc::new(move || project_root.clone()),
+        },
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn refresh_redaction_for_turn(
-    session: &Session,
+    session: &std::sync::Arc<Session>,
     session_id: Uuid,
     project_root: &Path,
     base_redact: crate::config::extended::RedactConfig,
     overrides: &RedactionSourceOverrides,
     unsupported_notified: &mut HashSet<PathBuf>,
     accumulated_redact: &SharedRedactionTable,
-    interrupts: &crate::engine::interrupt::InterruptHub,
+    interrupts: &std::sync::Arc<crate::engine::interrupt::InterruptHub>,
     event_tx: &EventSender,
     driver_control_tx: &mpsc::Sender<crate::engine::driver::DriverControl>,
-    env: &HashMap<String, String>,
+    env_overlay: std::sync::Arc<std::sync::RwLock<HashMap<String, String>>>,
+    config_snapshot: std::sync::Arc<std::sync::RwLock<handle::SessionConfigSnapshot>>,
 ) -> RedactionRefreshOutcome {
     let mut cfg = base_redact;
     overrides.apply_to(&mut cfg);
-    let new_table = session.credential_store().and_then(|store| {
-        crate::redact::RedactionTable::build_with_env_and_credential_store(
-            &cfg,
-            project_root,
-            env,
-            &store,
-        )
-    });
-    let new_table = match new_table {
-        Ok(table) => session.with_machine_scoped_sealed_redactions(&table).await,
-        Err(error) => Err(error),
+    let Some((authority, installed_key, _installed_policy_digest)) = session.redaction_coverage()
+    else {
+        return RedactionRefreshOutcome::Refused("coverage_unavailable".to_string());
     };
-    match new_table {
-        Ok(new_table) => {
-            // H1: read the LATEST table, union, persist, and swap all under the
-            // per-session redaction-table write lock so this refresh serializes
-            // with sealed adoption / approved-secret-file registration and can
-            // neither read a stale table nor swap over a concurrently-committed
-            // adoption. The guard is released before the driver `.await` below.
-            let table = {
+    let store = match session.credential_store() {
+        Ok(store) => store,
+        Err(error) => return RedactionRefreshOutcome::Refused(error.to_string()),
+    };
+    let sealed = match session.machine_scoped_sealed_redactions().await {
+        Ok(table) => table,
+        Err(error) => return RedactionRefreshOutcome::Refused(error.to_string()),
+    };
+    let root = project_root.to_path_buf();
+    let env = env_overlay
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let environment = crate::env_snapshot::EnvSnapshot::new(
+        cockpit_proto::EnvSnapshotSource::SessionWorker,
+        env.clone(),
+    );
+    let sealed_records = match session.db.machine_scoped_sealed_redaction_records().await {
+        Ok(records) => records,
+        Err(error) => return RedactionRefreshOutcome::Refused(error.to_string()),
+    };
+    let sealed_binding = crate::redact::coverage_bindings::sealed_records_binding(&sealed_records);
+    let policy_digest = crate::redact::coverage_bindings::redact_config_digest(&cfg);
+    let principal = crate::daemon::principal::ClientPrincipal::owner();
+    let command_cache = match session.command_secret_cache() {
+        Some(cache) => cache,
+        None => return RedactionRefreshOutcome::Refused("coverage_unavailable".to_string()),
+    };
+    let vault_revision = match session.secret_vault().current_inventory_generation() {
+        Ok(revision) => revision,
+        Err(error) => {
+            return RedactionRefreshOutcome::Refused(format!(
+                "reading redaction vault revision: {error}"
+            ));
+        }
+    };
+    let current_key = crate::redact::coverage_bindings::SessionCoverageInputs {
+        principal: &principal,
+        owner_authorization_revision: 0,
+        session_id,
+        workspace_root: project_root,
+        environment: &environment,
+        vault_revision,
+        command_cache: &command_cache,
+        policy_digest: &policy_digest,
+        sealed: sealed_binding,
+        override_revision: 0,
+        redact_config: &cfg,
+    }
+    .coverage_key();
+    let coverage_key = installed_key.with_current_owned_revisions(&current_key);
+    let capture_policy_digest = policy_digest.clone();
+    let env_snapshot_for_capture = environment.clone();
+    let publish_vault = session.secret_vault().clone();
+    let publish_db = session.db.clone();
+    let publish_command_cache = command_cache.clone();
+    let publish_fence = worker_coverage_publish_owners(
+        session,
+        &env_overlay,
+        &config_snapshot,
+        overrides,
+        publish_vault,
+        publish_db,
+        publish_command_cache,
+    )
+    .publish_fence();
+    let refresh_result = match authority
+        .acquire(
+            coverage_key.clone(),
+            crate::redact::coverage_authority::CoverageScope::SessionSubmission,
+            move || {
+                let capture_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+                    principal: &principal,
+                    owner_authorization_revision: 0,
+                    session_id,
+                    workspace_root: &root,
+                    environment: &env_snapshot_for_capture,
+                    vault_revision,
+                    command_cache: &command_cache,
+                    policy_digest: &capture_policy_digest,
+                    sealed: sealed_binding,
+                    override_revision: 0,
+                    redact_config: &cfg,
+                };
+                let build = crate::redact::coverage_authority::CoverageBuild::capture(
+                    &cfg,
+                    &root,
+                    &env,
+                    &store,
+                    &sealed,
+                    &capture_inputs,
+                )?;
+                Ok(build.with_publish_fence(publish_fence))
+            },
+        )
+        .await
+    {
+        Ok(admission) => match admission
+            .consume_at_async_sink(|new_table| async move { Ok(new_table) })
+            .await
+        {
+            Ok(new_table) => {
                 let _redaction_guard = interrupts.lock_redaction_table_write().await;
-                let base = current_redaction(accumulated_redact);
+                let base = current_redaction(&accumulated_redact);
                 match base.union(&new_table) {
                     Ok(unioned) => {
-                        let unioned = Arc::new(unioned);
-                        // J3: persist BEFORE swapping the live table so a persist
-                        // failure never leaves the live table advanced ahead of the
-                        // durable one (a restart would then lose the accumulated
-                        // entry). On failure keep the previously-committed table live
-                        // and refuse this send: the turn-boundary scan did not
-                        // commit, so newly introduced or rotated secrets would be
-                        // omitted.
+                        let unioned = std::sync::Arc::new(unioned);
                         match session.persist_redaction_table(&unioned) {
                             Ok(()) => {
-                                set_current_redaction(accumulated_redact, unioned.clone());
+                                set_current_redaction(&accumulated_redact, unioned.clone());
+                                session.set_redaction_coverage(
+                                    authority.clone(),
+                                    coverage_key,
+                                    policy_digest,
+                                );
                                 Ok(unioned)
                             }
-                            Err(error) => Err(error),
+                            Err(error) => Err(anyhow::anyhow!(error)),
                         }
                     }
-                    Err(error) => {
-                        // K6: never overwrite the committed table (which may hold a
-                        // sealed literal adopted this turn) with a bare disk scan on
-                        // a union error. Keep the committed `base` live and durable
-                        // and refuse this send rather than proceeding without the
-                        // turn-boundary scan.
-                        Err(error)
-                    }
+                    Err(error) => Err(anyhow::anyhow!(error)),
                 }
-            };
-            let table = match table {
-                Ok(table) => table,
-                Err(error) => {
-                    tracing::warn!(error = %error, %session_id, "refreshing redaction table failed; refusing to send unredacted");
-                    send_current_session_event(
-                        session,
-                        event_tx,
-                        accumulated_redact,
-                        proto::Event::Notice {
-                            session_id,
-                            text: format!(
-                                "Redaction refresh failed; refusing to send unredacted: {error:#}"
-                            ),
-                        },
-                        NoticeSource::DaemonDirect,
-                    );
-                    return RedactionRefreshOutcome::Refused(error.to_string());
-                }
-            };
+            }
+            Err(error) => Err(anyhow::anyhow!(error.to_string())),
+        },
+        Err(error) => Err(anyhow::anyhow!(error.to_string())),
+    };
+    match refresh_result {
+        Ok(table) => {
             for path in table.unsupported_files() {
                 if unsupported_notified.insert(path.clone()) {
                     send_session_event(
@@ -496,10 +624,8 @@ async fn refresh_redaction_for_turn(
                         &table,
                         proto::Event::Notice {
                             session_id,
-                            text: format!(
-                                "`{}` is an unsupported format; redaction for this file will not work",
-                                path.display()
-                            ),
+                        text: "A configured source has an unsupported format; coverage is unavailable for that source"
+                            .to_string(),
                         },
                         NoticeSource::DaemonDirect,
                     );

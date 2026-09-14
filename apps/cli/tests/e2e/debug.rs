@@ -1,4 +1,4 @@
-use crate::support::{IsolatedHome, output_text};
+use crate::support::{IsolatedHome, SpawnedDaemon, output_text};
 
 #[test]
 fn paths_reports_locations() {
@@ -106,8 +106,8 @@ fn config_redacts_secrets() {
     assert!(!text.contains("debug-custom-header-secret-67890"), "{text}");
 }
 
-#[test]
-fn context_is_redacted_and_bounded() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn context_is_redacted_and_bounded() {
     let mut home = IsolatedHome::new();
     home.set_env("COCKPIT_DEBUG_SECRET", "debug-context-secret-12345");
     std::fs::write(
@@ -120,7 +120,12 @@ Use debug-context-secret-12345 only for this test.
         ),
     )
     .unwrap();
-    let output = home.cockpit().args(["debug", "context"]).output().unwrap();
+    let daemon = SpawnedDaemon::start_with_home(home).await;
+    let output = daemon
+        .command()
+        .args(["debug", "context"])
+        .output()
+        .unwrap();
     assert!(output.status.success(), "{}", output_text(&output));
     let text = output_text(&output);
     assert!(text.contains("assembled context (fresh-session baseline)"));

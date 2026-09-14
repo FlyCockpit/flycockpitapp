@@ -483,19 +483,20 @@ pub fn quote_tracked_tags(buffer: &str, accepted: &[String]) -> String {
 /// expansions for the chat (GOALS §1e).
 #[cfg(test)]
 fn expand_tags(buffer: &str, cwd: &Path) -> ExpandResult {
-    expand_tags_inner(buffer, cwd, None)
+    let policy = TagPolicy::new(cwd, vec!["*".to_string()]);
+    expand_tags_inner(buffer, &policy)
 }
 
 pub fn expand_tags_with_policy(buffer: &str, policy: &TagPolicy) -> ExpandResult {
-    expand_tags_inner(buffer, &policy.cwd, Some(policy))
+    expand_tags_inner(buffer, policy)
 }
 
 pub fn expand_assembly_tags_with_policy(buffer: &str, policy: &TagPolicy) -> ExpandResult {
-    expand_tags_inner_with_mode(buffer, &policy.cwd, Some(policy), ExpansionMode::Assembly)
+    expand_tags_inner_with_mode(buffer, policy, ExpansionMode::Assembly)
 }
 
-fn expand_tags_inner(buffer: &str, cwd: &Path, policy: Option<&TagPolicy>) -> ExpandResult {
-    expand_tags_inner_with_mode(buffer, cwd, policy, ExpansionMode::Composer)
+fn expand_tags_inner(buffer: &str, policy: &TagPolicy) -> ExpandResult {
+    expand_tags_inner_with_mode(buffer, policy, ExpansionMode::Composer)
 }
 
 #[derive(Clone, Copy)]
@@ -506,10 +507,10 @@ enum ExpansionMode {
 
 fn expand_tags_inner_with_mode(
     buffer: &str,
-    cwd: &Path,
-    policy: Option<&TagPolicy>,
+    policy: &TagPolicy,
     mode: ExpansionMode,
 ) -> ExpandResult {
+    let cwd = &policy.cwd;
     let mut wire = String::with_capacity(buffer.len());
     let mut expansions: Vec<TagExpansion> = Vec::new();
     // Dedup state, per call (one message): a repeated `@`-tag of the same
@@ -645,23 +646,15 @@ fn try_inline(
     path_part: &str,
     range: Option<(usize, usize)>,
     raw: &str,
-    policy: Option<&TagPolicy>,
+    policy: &TagPolicy,
     mode: ExpansionMode,
 ) -> Expanded {
     let resolved = resolve_path(cwd, path_part);
-    if let Some(policy) = policy
-        && let Some(blocked) = check_policy(path_part, raw, &resolved, policy)
-    {
+    if let Some(blocked) = check_policy(path_part, raw, &resolved, policy) {
         return blocked;
     }
-    let caps = policy
-        .map(TagPolicy::caps)
-        .unwrap_or(TagInlineCaps::STANDARD);
-    // No policy (bare `expand_tags`) has no session table; the driver and
-    // TUI paths always construct one.
-    let redact = policy
-        .map(|p| p.redact.clone())
-        .unwrap_or_else(|| std::sync::Arc::new(crate::redact::RedactionTable::empty()));
+    let caps = policy.caps();
+    let redact = policy.redact.clone();
     let meta = match std::fs::metadata(&resolved) {
         Ok(m) => m,
         Err(e) => {
@@ -907,7 +900,7 @@ fn render_file(
 fn render_directory(
     path: &Path,
     display_path: &str,
-    policy: Option<&TagPolicy>,
+    policy: &TagPolicy,
     caps: TagInlineCaps,
 ) -> (String, usize) {
     let display = if display_path.ends_with('/') {
@@ -916,30 +909,18 @@ fn render_directory(
         format!("{display_path}/")
     };
     let mut entries: Vec<(String, bool, u64)> = Vec::new();
-    if let Some(policy) = policy {
-        for (entry_path, is_dir, _gitignored) in
-            level_entries(path, &policy.allow_root, policy.allow())
-        {
-            let name = entry_path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let size = if is_dir {
-                0
-            } else {
-                std::fs::metadata(&entry_path).map(|m| m.len()).unwrap_or(0)
-            };
-            entries.push((name, is_dir, size));
-        }
-    } else if let Ok(rd) = std::fs::read_dir(path) {
-        for ent in rd.flatten() {
-            let name = ent.file_name().to_string_lossy().into_owned();
-            let (is_dir, size) = match ent.metadata() {
-                Ok(m) => (m.is_dir(), m.len()),
-                Err(_) => (false, 0),
-            };
-            entries.push((name, is_dir, size));
-        }
+    for (entry_path, is_dir, _gitignored) in level_entries(path, &policy.allow_root, policy.allow())
+    {
+        let name = entry_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let size = if is_dir {
+            0
+        } else {
+            std::fs::metadata(&entry_path).map(|m| m.len()).unwrap_or(0)
+        };
+        entries.push((name, is_dir, size));
     }
     entries.sort_by(|a, b| match (a.1, b.1) {
         (true, false) => std::cmp::Ordering::Less,
@@ -973,6 +954,26 @@ mod tests {
 
     fn tmp_root() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
+    }
+
+    #[test]
+    fn no_policy_tag_expansion_is_test_only_and_cannot_reach_submission() {
+        let source = include_str!("tags.rs");
+        let helper = source
+            .split("#[cfg(test)]\nfn expand_tags(")
+            .nth(1)
+            .and_then(|body| body.split("pub fn expand_tags_with_policy").next())
+            .expect("test-only bare tag helper");
+        assert!(helper.contains("TagPolicy::new"));
+        let inline = source
+            .split("fn try_inline(")
+            .nth(1)
+            .and_then(|body| body.split("fn resolve_path(").next())
+            .expect("tag inline funnel");
+        assert!(inline.contains("policy: &TagPolicy"));
+        assert!(inline.contains("policy.redact.clone()"));
+        assert!(!inline.contains("Option<&TagPolicy>"));
+        assert!(!inline.contains("RedactionTable::empty"));
     }
 
     /// Suggestions with an empty frequency map — these tests exercise

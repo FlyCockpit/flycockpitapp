@@ -929,7 +929,36 @@ export type QueueDeliveryClass = z.infer<typeof queueDeliveryClassSchema>;
 export const localClientRoleSchema = z.enum(["tui", "cli", "acp", "agent_child"]);
 export type LocalClientRole = z.infer<typeof localClientRoleSchema>;
 
+export const inputPredictionTurnSchema = z.object({ user: z.string(), agent: z.string() }).strict();
+export const inputPredictionModeSchema = z.enum(["short", "long"]);
+export const inputPredictionProjectionSchema = z.object({ text: z.string().optional() }).strict();
+export const tagPreviewProjectionSchema = z
+  .object({ wire: z.string(), expansions: z.array(messageTagExpansionSchema) })
+  .strict();
+export const ownerUnsupportedSourceDiagnosticSchema = z
+  .object({
+    display_path: z.string(),
+    detail: z.enum(["unsupported_format", "unreadable", "changed_during_capture"]),
+  })
+  .strict();
+export const redactionCoverageStatusProjectionSchema = z
+  .object({
+    state: z.enum(["ready", "unsupported_coverage", "coverage_unavailable"]),
+    owner_diagnostic: ownerUnsupportedSourceDiagnosticSchema.optional(),
+    rendered_context: z.string().optional(),
+  })
+  .strict();
+
 const requestParamSchemas = {
+  get_redaction_coverage_status: z.object({ session_id: uuidSchema.optional() }).strict(),
+  render_input_prediction: z
+    .object({
+      session_id: uuidSchema,
+      turns: z.array(inputPredictionTurnSchema),
+      mode: inputPredictionModeSchema,
+    })
+    .strict(),
+  resolve_tag_preview: z.object({ session_id: uuidSchema, input: z.string() }).strict(),
   get_onboarding_bootstrap_snapshot: z.undefined(),
   begin_or_reopen_onboarding: beginOrReopenOnboardingSchema,
   apply_onboarding_transition: applyOnboardingTransitionSchema,
@@ -1450,6 +1479,12 @@ function requestVariantNoParams<Name extends RequestName>(request: Name) {
 // array directly so it stays in sync with `clientRequestSchema` by
 // construction.
 const clientRequestVariants = [
+  requestVariant(
+    "get_redaction_coverage_status",
+    requestParamSchemas.get_redaction_coverage_status,
+  ),
+  requestVariant("render_input_prediction", requestParamSchemas.render_input_prediction),
+  requestVariant("resolve_tag_preview", requestParamSchemas.resolve_tag_preview),
   requestVariantNoParams("get_onboarding_bootstrap_snapshot"),
   requestVariant("begin_or_reopen_onboarding", requestParamSchemas.begin_or_reopen_onboarding),
   requestVariant("apply_onboarding_transition", requestParamSchemas.apply_onboarding_transition),
@@ -1666,6 +1701,9 @@ export type RunInvocationCancelResultV1 = z.infer<typeof runInvocationCancelResu
 
 export const responseNameSchema = z.enum([
   "ack",
+  "redaction_coverage_status",
+  "input_prediction",
+  "tag_preview",
   "onboarding_bootstrap_snapshot",
   "locked_bootstrap_hello",
   "onboarding_transition",
@@ -1976,7 +2014,13 @@ export const activeSubagentSchema = z
 export type ActiveSubagent = z.infer<typeof activeSubagentSchema>;
 export const envSnapshotMetaSchema = z
   .object({
-    source: z.enum(["daemon_start", "tui_shell", "tui_process_fallback", "explicit_cli"]),
+    source: z.enum([
+      "daemon_start",
+      "tui_shell",
+      "tui_process_fallback",
+      "explicit_cli",
+      "session_worker",
+    ]),
     digest: z.string(),
     key_count: z.number().int().nonnegative(),
     path_entry_count: z.number().int().nonnegative(),
@@ -2196,6 +2240,9 @@ const responseVariant = <Name extends ResponseName, Schema extends z.ZodTypeAny>
 
 export const responseEnvelopeSchema = z.discriminatedUnion("response", [
   z.object({ ...responseBaseSchema, response: z.literal("ack") }).passthrough(),
+  responseVariant("redaction_coverage_status", redactionCoverageStatusProjectionSchema),
+  responseVariant("input_prediction", inputPredictionProjectionSchema),
+  responseVariant("tag_preview", tagPreviewProjectionSchema),
   responseVariant("onboarding_bootstrap_snapshot", onboardingBootstrapSnapshotSchema.nullable()),
   responseVariant("locked_bootstrap_hello", lockedBootstrapHelloSchema),
   responseVariant("onboarding_transition", onboardingTransitionResultSchema),

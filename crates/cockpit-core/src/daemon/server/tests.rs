@@ -10149,7 +10149,7 @@ async fn owner_secret_write_does_not_ack_when_redaction_publication_fails() {
             .named_secret("publication-failure-name"),
         None
     );
-    ctx.refresh_redaction_table().unwrap();
+    ctx.refresh_redaction_table().await.unwrap();
     assert!(
         crate::daemon::current_redaction(&ctx.global_redaction)
             .scrub("publication-failure-value")
@@ -12324,7 +12324,7 @@ async fn owner_secret_redaction_failure_rolls_back_every_vault_namespace() {
         crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
     store.set_named_secret("rollback-named", "old-named-value");
     store.save().unwrap();
-    ctx.refresh_redaction_table().unwrap();
+    ctx.refresh_redaction_table().await.unwrap();
     ctx.set_force_daemon_redaction_refresh_failure(true);
     expect_failed(
         handle_request(
@@ -12356,7 +12356,7 @@ async fn owner_secret_redaction_failure_rolls_back_every_vault_namespace() {
         serde_json::json!({"api_key": "old-provider"}),
     );
     store.save().unwrap();
-    ctx.refresh_redaction_table().unwrap();
+    ctx.refresh_redaction_table().await.unwrap();
     ctx.set_force_daemon_redaction_refresh_failure(true);
     expect_failed(
         handle_request(
@@ -12382,7 +12382,7 @@ async fn owner_secret_redaction_failure_rolls_back_every_vault_namespace() {
             .contains("old-provider"),
         "failed provider replacement must preserve the prior redaction table"
     );
-    ctx.refresh_redaction_table().unwrap();
+    ctx.refresh_redaction_table().await.unwrap();
     ctx.set_force_daemon_redaction_refresh_failure(true);
     expect_failed(
         handle_request(
@@ -12432,7 +12432,7 @@ async fn owner_secret_redaction_failure_rolls_back_every_vault_namespace() {
         "failed account write must not publish its token to redaction"
     );
     crate::auth::flycockpit::store_credential_in_vault(ctx.secret_vault.clone(), &account).unwrap();
-    ctx.refresh_redaction_table().unwrap();
+    ctx.refresh_redaction_table().await.unwrap();
     ctx.set_force_daemon_redaction_refresh_failure(true);
     expect_failed(handle_request(Request::ClearFlycockpitCredential, &mut state, &ctx).await);
     assert_eq!(ctx.load_flycockpit_credential().unwrap(), Some(account));
@@ -17581,6 +17581,51 @@ async fn attached_state(
     (state, session_id)
 }
 
+async fn seed_test_handle_redaction_coverage(
+    ctx: &Arc<DaemonContext>,
+    handle: &SessionWorkerHandle,
+) {
+    let session = handle.session();
+    let config = handle.config_snapshot().extended.redact;
+    let policy_digest = crate::redact::coverage_bindings::redact_config_digest(&config);
+    let environment = crate::env_snapshot::EnvSnapshot::new(
+        proto::EnvSnapshotSource::SessionWorker,
+        HashMap::new(),
+    );
+    let command_cache = ctx.registry.command_secret_cache();
+    session.set_command_secret_cache(Some(command_cache.clone()));
+    let sealed_records = ctx
+        .db
+        .machine_scoped_sealed_redaction_records()
+        .await
+        .expect("test handle sealed-record inventory");
+    let sealed = crate::redact::coverage_bindings::sealed_records_binding(&sealed_records);
+    let principal = ClientPrincipal::owner();
+    let vault_revision = session
+        .secret_vault()
+        .current_inventory_generation()
+        .expect("test handle vault inventory");
+    let key = crate::redact::coverage_bindings::SessionCoverageInputs {
+        principal: &principal,
+        owner_authorization_revision: handle.current_trust_revision(),
+        session_id: session.id,
+        workspace_root: &handle.project_root,
+        environment: &environment,
+        vault_revision,
+        command_cache: &command_cache,
+        policy_digest: &policy_digest,
+        sealed,
+        override_revision: 0,
+        redact_config: &config,
+    }
+    .coverage_key();
+    session.set_redaction_coverage(
+        ctx.registry.coverage_authority().clone(),
+        key,
+        policy_digest,
+    );
+}
+
 async fn attached_state_with_worker_receiver(
     ctx: &Arc<DaemonContext>,
     project_root: &std::path::Path,
@@ -17653,6 +17698,11 @@ async fn attached_state_with_worker_receiver(
     let publication = handle.begin_trust_transition(&resolved_trust).await;
     assert!(handle.complete_trust_transition_for_test(resolved_trust.revision));
     drop(publication);
+    seed_test_handle_redaction_coverage(ctx, &handle).await;
+    let join = tokio::spawn(async move {
+        std::future::pending::<()>().await;
+    });
+    ctx.registry.insert_test_worker(handle.clone(), join);
     (
         MutableClientState {
             principal: ClientPrincipal::owner(),
@@ -18871,6 +18921,8 @@ fn dispatch_matrix_class_for_command(
         ("exchange_local_peer_credential", "public_read", false) => {
             DispatchMatrixClass::NonDispatchable
         }
+        ("render_input_prediction", "owner_only", false)
+        | ("resolve_tag_preview", "owner_only", false) => DispatchMatrixClass::Readonly,
         (_, "owner_only", _) => DispatchMatrixClass::AccessControlled,
         ("fs_list", "project_files", false)
         | ("fs_stat", "project_files", false)
@@ -18890,6 +18942,7 @@ fn dispatch_matrix_class_for_command(
         | ("get_guidance_enablement_trace", "session_reader", false)
         | ("daemon_status", "public_read", false)
         | ("get_host_capabilities", "public_read", false)
+        | ("get_redaction_coverage_status", "public_read", false)
         | ("guidance_estimate", "project_read", false)
         | ("get_media_attachment_status", "public_read", false)
         | ("get_media_attachment_preview", "public_read", false)
@@ -18951,6 +19004,9 @@ enum ReadonlyDispatchCaseKind {
     GetGuidanceEnablementTrace,
     DaemonStatus,
     GetHostCapabilities,
+    GetRedactionCoverageStatus,
+    RenderInputPrediction,
+    ResolveTagPreview,
     GuidanceEstimate,
     GetMediaAttachmentStatus,
     GetMediaAttachmentPreview,
@@ -19043,6 +19099,18 @@ fn readonly_dispatch_case_list() -> Vec<ReadonlyDispatchCase> {
         ReadonlyDispatchCase {
             kind: "get_host_capabilities",
             case: ReadonlyDispatchCaseKind::GetHostCapabilities,
+        },
+        ReadonlyDispatchCase {
+            kind: "get_redaction_coverage_status",
+            case: ReadonlyDispatchCaseKind::GetRedactionCoverageStatus,
+        },
+        ReadonlyDispatchCase {
+            kind: "render_input_prediction",
+            case: ReadonlyDispatchCaseKind::RenderInputPrediction,
+        },
+        ReadonlyDispatchCase {
+            kind: "resolve_tag_preview",
+            case: ReadonlyDispatchCaseKind::ResolveTagPreview,
         },
         ReadonlyDispatchCase {
             kind: "guidance_estimate",
@@ -20016,6 +20084,8 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "get_inventory_bundle"
         | "get_session_setup_snapshot"
         | "get_guidance_enablement_trace"
+        | "render_input_prediction"
+        | "resolve_tag_preview"
         | "read_agent_tree"
         | "read_agent_attention"
         | "git_review_sources"
@@ -20164,17 +20234,20 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // caller-supplied payload after the owner gate; the matrix request's
         // bogus inputs (or the fresh, untrusted workspace) surface `BadRequest`
         // just like the sibling secret/provider owner mutations above. The
-        // ephemeral-daemon owner mutations (`setup_copilot_auth`,
-        // `save_mcp_config`, the flycockpit ones) reject via the ephemeral
-        // guard; `save_extended_config` rejects the non-`config.json` target;
+        // ephemeral-daemon owner mutations (`setup_copilot_auth` and the
+        // flycockpit ones) reject via the ephemeral guard;
+        // `save_extended_config` rejects the non-`config.json` target;
         // `save_image_spend_policy` rejects the malformed settings JSON.
         "setup_copilot_auth"
-        | "save_mcp_config"
         | "save_extended_config"
         | "save_image_spend_policy"
         | "set_flycockpit_connector_enabled"
         | "sync_flycockpit_org_policy"
         | "enroll_flycockpit_org_sync" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        // The matrix deliberately has no minted edit capability. A coherent
+        // intent therefore reaches the post-owner-gate capability CAS and
+        // returns the precise stale/missing-authority conflict.
+        "save_mcp_config" => AuthzAllowedOutcome::Error(ErrorCode::Conflict),
         // The legacy catalog constructor remains on the wire for an explicit,
         // typed retirement error. Authorization succeeds for the owner before
         // dispatch directs callers to the owner-declared sink replacement.
@@ -20378,6 +20451,8 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("create_assistant_session"),
         authz_session_writer("auto_title"),
         authz_owner_only("export_session_data"),
+        authz_owner_only("render_input_prediction"),
+        authz_owner_only("resolve_tag_preview"),
         authz_owner_only("import_session_archive"),
         authz_bulk_transfer_chunk(),
         authz_owner_only("read_bulk_transfer_chunk"),
@@ -21591,6 +21666,8 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             "get_inventory_bundle"
                 | "get_session_setup_snapshot"
                 | "get_guidance_enablement_trace"
+                | "render_input_prediction"
+                | "resolve_tag_preview"
                 | "list_guidance_proposals"
                 | "review_guidance_proposal"
         ) && level.can_attach())
@@ -21723,6 +21800,15 @@ fn sealed_action_matrix_executable() -> String {
 fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Request {
     let root = project_root.to_string_lossy().into_owned();
     match kind {
+        "render_input_prediction" => Request::RenderInputPrediction {
+            session_id,
+            turns: Vec::new(),
+            mode: proto::InputPredictionMode::Short,
+        },
+        "resolve_tag_preview" => Request::ResolveTagPreview {
+            session_id,
+            input: "plain text".into(),
+        },
         "create_code_root_v1" => proto::create_code_root_v1_request(
             root,
             None,
@@ -22757,26 +22843,28 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             provider_id: "matrix-provider".into(),
             project_root: None,
         },
-        "save_mcp_config" => Request::SaveMcpConfig {
-            client_operation_id: "matrix-operation".into(),
-            project_root: root.clone(),
-            snapshot_capability: "snapshot".into(),
-            owner_root: root.clone(),
-            config_path: format!("{root}/.cockpit/mcp.json"),
-            expected_revision: "00".repeat(32),
-            mutation_intent_hash: "11".repeat(32),
-            patch: serde_json::to_string(&cockpit_proto::McpConfigPatch {
+        "save_mcp_config" => {
+            let patch = cockpit_proto::McpConfigPatch {
                 operations: vec![
                     cockpit_proto::McpConfigPatchOperation::DeleteAuthoredServer {
                         name: "fixture".into(),
                     },
                 ],
-            })
-            .unwrap()
-            .into(),
-            secret_values_json: "{}".into(),
-            target_scope: None,
-        },
+            };
+            let patch = serde_json::to_string(&patch).unwrap();
+            Request::SaveMcpConfig {
+                client_operation_id: "matrix-operation".into(),
+                project_root: root.clone(),
+                snapshot_capability: "snapshot".into(),
+                owner_root: root.clone(),
+                config_path: format!("{root}/.cockpit/mcp.json"),
+                expected_revision: "00".repeat(32),
+                mutation_intent_hash: cockpit_proto::mcp_mutation_intent_hash(&root, &patch),
+                patch: patch.into(),
+                secret_values_json: "{}".into(),
+                target_scope: None,
+            }
+        }
         "export_policy" => Request::ExportPolicy {
             project_root: root.clone(),
         },
@@ -23623,6 +23711,52 @@ impl ReadonlyDispatchCaseKind {
                     "folded snapshot must not emit {leftover}: {encoded}"
                 );
             }
+            Self::GetRedactionCoverageStatus => {
+                let ctx = test_ctx();
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::GetRedactionCoverageStatus { session_id: None },
+                )
+                .await
+                .expect("get_redaction_coverage_status happy");
+                let Response::RedactionCoverageStatus(status) = response else {
+                    panic!("expected RedactionCoverageStatus");
+                };
+                assert_eq!(status.state, proto::RedactionCoverageState::Ready);
+            }
+            Self::RenderInputPrediction => {
+                let ctx = test_ctx();
+                let tmp = tempfile::tempdir().unwrap();
+                let (mut state, session_id) = attached_state(&ctx, tmp.path()).await;
+                let response = handle_request(
+                    Request::RenderInputPrediction {
+                        session_id,
+                        turns: Vec::new(),
+                        mode: proto::InputPredictionMode::Short,
+                    },
+                    &mut state,
+                    &ctx,
+                )
+                .await
+                .expect("render_input_prediction happy");
+                assert!(matches!(response, Response::InputPrediction(_)));
+            }
+            Self::ResolveTagPreview => {
+                let ctx = test_ctx();
+                let tmp = tempfile::tempdir().unwrap();
+                let (mut state, session_id) = attached_state(&ctx, tmp.path()).await;
+                let response = handle_request(
+                    Request::ResolveTagPreview {
+                        session_id,
+                        input: "plain text".into(),
+                    },
+                    &mut state,
+                    &ctx,
+                )
+                .await
+                .expect("resolve_tag_preview happy");
+                assert!(matches!(response, Response::TagPreview(_)));
+            }
             Self::GetRunInvocationStatus => {
                 let ctx = test_ctx();
                 let id = Uuid::new_v4();
@@ -24078,6 +24212,48 @@ impl ReadonlyDispatchCaseKind {
                 )
                 .await
                 .expect_err("get_host_capabilities malformed protocol version");
+                assert_eq!(err.code, ErrorCode::ProtocolVersion);
+            }
+            Self::GetRedactionCoverageStatus => {
+                let ctx = test_ctx();
+                let request_id = Uuid::new_v4();
+                let err = dispatch_matrix_raw_line(
+                    &ctx,
+                    request_id,
+                    serde_json::json!({
+                        "v": proto::PROTOCOL_VERSION + 1,
+                        "kind": "req",
+                        "id": request_id,
+                        "request": "get_redaction_coverage_status",
+                        "session_id": null,
+                    })
+                    .to_string(),
+                )
+                .await
+                .expect_err("get_redaction_coverage_status malformed protocol version");
+                assert_eq!(err.code, ErrorCode::ProtocolVersion);
+            }
+            Self::RenderInputPrediction | Self::ResolveTagPreview => {
+                let ctx = test_ctx();
+                let request_id = Uuid::new_v4();
+                let request = match self {
+                    Self::RenderInputPrediction => "render_input_prediction",
+                    Self::ResolveTagPreview => "resolve_tag_preview",
+                    _ => unreachable!(),
+                };
+                let err = dispatch_matrix_raw_line(
+                    &ctx,
+                    request_id,
+                    serde_json::json!({
+                        "v": proto::PROTOCOL_VERSION + 1,
+                        "kind": "req",
+                        "id": request_id,
+                        "request": request,
+                    })
+                    .to_string(),
+                )
+                .await
+                .expect_err("projection request rejects malformed protocol version");
                 assert_eq!(err.code, ErrorCode::ProtocolVersion);
             }
             Self::GetRunInvocationStatus => {
@@ -24808,6 +24984,7 @@ async fn live_worker_with_receiver(
     let publication = handle.begin_trust_transition(&resolved_trust).await;
     assert!(handle.complete_trust_transition_for_test(resolved_trust.revision));
     drop(publication);
+    seed_test_handle_redaction_coverage(ctx, &handle).await;
     let join = tokio::spawn(async move {
         std::future::pending::<()>().await;
     });
@@ -28832,6 +29009,10 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_r
         #[cfg(feature = "extended")]
         "image_workflow_get",
         "get_provider_catalog_snapshot",
+        // #390 explicitly adds this projection to the readonly concurrent
+        // protocol surface; keeping it in the exact set preserves the
+        // exhaustiveness check rather than exempting the new route.
+        "get_redaction_coverage_status",
         "get_run_invocation_status",
         "get_usage_counts",
         "git_diff",
@@ -37194,7 +37375,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         caffeinate: base.caffeinate.clone(),
         global_events,
         global_redaction: base.global_redaction.clone(),
-        redaction_generation: std::sync::atomic::AtomicU64::new(0),
+        redaction_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         redaction_refresh_failure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         persistent_endpoint_publication_failure: std::sync::atomic::AtomicBool::new(false),
         redaction_publication_poisoned: std::sync::atomic::AtomicBool::new(false),
@@ -37420,7 +37601,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         caffeinate: base.caffeinate.clone(),
         global_events,
         global_redaction: base.global_redaction.clone(),
-        redaction_generation: std::sync::atomic::AtomicU64::new(0),
+        redaction_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         redaction_refresh_failure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         persistent_endpoint_publication_failure: std::sync::atomic::AtomicBool::new(false),
         redaction_publication_poisoned: std::sync::atomic::AtomicBool::new(false),
@@ -43088,4 +43269,111 @@ async fn resolve_interrupt_dispatch_threads_only_the_rendering_live_attachment_p
     .expect_err("a replacement attachment cannot reuse the old render identity");
     assert_eq!(recycled_error.code, ErrorCode::Authorization);
     assert!(work_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn locked_services_never_admit_ordinary_payload_before_coverage() {
+    let (_tmp, locked, _) = super::onboarding_bootstrap_tests::ready_construction().await;
+
+    let denied = handle_locked_in_process_request(&locked, Request::GetStorageReport)
+        .await
+        .expect_err("locked bootstrap must deny ordinary payloads");
+    assert_eq!(denied.code, ErrorCode::BootstrapLocked);
+
+    let constructed = locked
+        .finish_ready_transition()
+        .await
+        .expect("coverage-gated ready construction");
+    assert!(
+        constructed
+            .ready
+            .as_ref()
+            .expect("constructed ready services")
+            .context
+            .redaction_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0,
+        "ReadyServices publication requires an admitted authority generation"
+    );
+    let _ready = constructed.publish_returned();
+    assert!(locked.ready.load(std::sync::atomic::Ordering::Acquire));
+    assert!(
+        locked.finish_ready_transition().await.is_err(),
+        "the LockedServices owner must not open ReadyServices twice"
+    );
+}
+
+#[test]
+fn global_coverage_helper_has_no_legacy_builder() {
+    let source = include_str!("mod.rs");
+    let helper = source
+        .split("async fn acquire_daemon_redaction_table(")
+        .nth(1)
+        .and_then(|body| body.split("fn scrub_json_strings").next())
+        .expect("daemon coverage helper");
+    // #390 centralizes key construction in the complete bound-input owner;
+    // asserting both pieces keeps this a structural route test without
+    // requiring the superseded direct key constructor spelling.
+    assert!(helper.contains("DaemonGlobalCoverageInputs"));
+    assert!(helper.contains("coverage_key()"));
+    assert!(helper.contains("CoverageBuild::capture_without_sealed"));
+    // #390's authority helper returns only a table installed from the bound
+    // admission; callers then hold their own route-specific sink lease.
+    assert!(helper.contains("install_table"));
+    assert!(!helper.contains("build_daemon_redaction_table"));
+    assert!(!helper.contains("refresh_global_redaction_table"));
+    assert!(!helper.contains("RedactionTable::empty"));
+}
+
+#[tokio::test]
+async fn global_vault_mutation_revokes_coverage() {
+    use crate::redact::coverage_authority::{
+        CoverageBinding, CoverageBuild, CoverageError, CoverageScope, RedactionCoverageAuthority,
+        RedactionCoverageKey,
+    };
+    let authority = RedactionCoverageAuthority::default();
+    let binding = |value| CoverageBinding::from_daemon_bytes([value; 16]);
+    let key = RedactionCoverageKey::daemon_global(
+        binding(1),
+        binding(2),
+        binding(3),
+        binding(4),
+        binding(5),
+        binding(6),
+        binding(7),
+        binding(8),
+    );
+    let revisions = crate::redact::coverage_bindings::OwnedSourceRevisions {
+        environment: binding(3),
+        credential_vault: binding(4),
+        policy: binding(5),
+        sealed: binding(6),
+        override_revision: binding(7),
+        machine_sources: binding(8),
+    };
+    let admission = authority
+        .acquire(key, CoverageScope::DaemonGlobalRefresh, move || {
+            Ok(CoverageBuild::from_complete_table(
+                RedactionTable::empty().with_forced_literal(
+                    "global-vault-coverage-canary".into(),
+                    "$test:global-vault".into(),
+                )?,
+                revisions,
+            ))
+        })
+        .await
+        .expect("global coverage admission");
+    authority.invalidate();
+    assert_eq!(
+        admission.use_at_sink(|_| Ok(())),
+        Err(CoverageError::Invalidated)
+    );
+
+    let source = include_str!("mod.rs");
+    let publisher = source
+        .split("install_owner_redaction_publisher")
+        .nth(1)
+        .and_then(|body| body.split("#[cfg(debug_assertions)]").next())
+        .expect("vault mutation publisher");
+    assert!(publisher.contains("publisher_authority.invalidate()"));
 }

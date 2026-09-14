@@ -36,28 +36,48 @@ impl App {
             return;
         }
         let turn_id = self.prediction_state.turn();
-        let cwd = self.launch.cwd.clone();
+        let Some(endpoint) = self.attached_daemon_endpoint() else {
+            return;
+        };
+        let Some(session_id) = self.launch.session_id else {
+            return;
+        };
         let slot = Arc::clone(&self.prediction_result);
         tokio::spawn(async move {
-            let (extended, providers) = cockpit_core::auto_title::load_configs_for(&cwd);
-            // Scrub env/dotenv/ssh material before the local utility call
-            // (GOALS §7). Named secrets live in the daemon-owned vault and
-            // cannot be opened from this process while the daemon holds the
-            // database; daemon-emitted history is already scrubbed. A table
-            // build failure refuses the prediction send rather than
-            // proceeding unredacted.
-            let redactor = match cockpit_core::redact::RedactionTable::build(&extended.redact, &cwd)
-            {
-                Ok(r) => Arc::new(r),
-                Err(e) => {
-                    tracing::warn!(error = %e, "predict: redaction table build failed; no ghost");
-                    return;
+            let wire_turns = turns
+                .into_iter()
+                .map(|turn| cockpit_proto::InputPredictionTurn {
+                    user: turn.user,
+                    agent: turn.agent,
+                })
+                .collect();
+            let mode = match mode {
+                cockpit_config::extended::PredictNextMessage::Long => {
+                    cockpit_proto::InputPredictionMode::Long
                 }
+                cockpit_config::extended::PredictNextMessage::Short => {
+                    cockpit_proto::InputPredictionMode::Short
+                }
+                cockpit_config::extended::PredictNextMessage::Off => return,
             };
-            let text = cockpit_core::engine::predict::predict(
-                &turns, mode, &extended, &providers, redactor,
-            )
+            let response = async {
+                let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                client
+                    .request_ok(cockpit_proto::Request::RenderInputPrediction {
+                        session_id,
+                        turns: wire_turns,
+                        mode,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+            }
             .await;
+            let text = match response {
+                Ok(cockpit_proto::Response::InputPrediction(projection)) => projection.text,
+                Ok(_) | Err(_) => None,
+            };
             if let Ok(mut guard) = slot.lock() {
                 *guard = Some((turn_id, text));
             }
@@ -90,5 +110,17 @@ impl App {
     /// reused). Never overwrites typed content.
     pub(super) fn sync_prediction_ghost(&mut self) {
         self.prediction_state.reconcile(self.composer.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn prediction_refuses_without_bound_coverage() {
+        let source = include_str!("prediction.rs");
+        assert!(source.contains("Request::RenderInputPrediction"));
+        assert!(source.contains("Response::InputPrediction"));
+        assert!(!source.contains(&["RedactionTable", "build"].join("::")));
+        assert!(!source.contains(&["engine", "predict", "predict"].join("::")));
     }
 }

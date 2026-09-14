@@ -142,7 +142,7 @@ impl Session {
         let records = self.db.machine_scoped_sealed_redaction_records().await?;
         let compartment =
             crate::sealed::compartment::SealedCompartment::from_vault(self.secret_vault.clone());
-        let mut unioned = table.union(&crate::redact::RedactionTable::empty())?;
+        let mut unioned = table.clone();
 
         for record in records {
             let locator = record
@@ -167,6 +167,16 @@ impl Session {
         }
 
         Ok(unioned)
+    }
+
+    /// Capture the sealed portion of a fresh authority scan. This local empty
+    /// identity never leaves the sealed-source collector and cannot create a
+    /// generation or an admission lease.
+    pub(crate) async fn machine_scoped_sealed_redactions(
+        &self,
+    ) -> Result<crate::redact::RedactionTable> {
+        self.with_machine_scoped_sealed_redactions(&crate::redact::RedactionTable::empty())
+            .await
     }
 
     /// Create a session-scoped value in the agent-acquired namespace. This is
@@ -542,6 +552,9 @@ impl Session {
         // transaction commits, so a rollback never leaves a cache ahead of the
         // durable table.
         *self.redaction_table_json.lock().unwrap() = Some(json);
+        if let Some((authority, key, _policy_digest)) = self.redaction_coverage() {
+            authority.invalidate_key(&key);
+        }
         Ok(metadata)
     }
 
@@ -566,13 +579,18 @@ impl Session {
         _owner: crate::sealed::OwnerAuthority,
         value_id: &str,
     ) -> Result<bool> {
-        self.db
+        let deleted = self
+            .db
             .delete_sealed_value_for_session(
                 self.live_id().to_string(),
                 value_id.to_owned(),
                 chrono::Utc::now().timestamp_millis(),
             )
-            .await
+            .await?;
+        if deleted && let Some((authority, key, _policy_digest)) = self.redaction_coverage() {
+            authority.invalidate_key(&key);
+        }
+        Ok(deleted)
     }
 
     /// Owner-only existence check. Sealed literals are never returned for
@@ -592,6 +610,32 @@ impl Session {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn empty_union_identity_cannot_create_coverage_admission() {
+        let source = include_str!("sealed_values.rs");
+        let collector = source
+            .split("pub(crate) async fn machine_scoped_sealed_redactions(")
+            .nth(1)
+            .and_then(|body| body.split("/// Create a session-scoped value").next())
+            .expect("sealed source collector");
+        assert!(collector.contains("with_machine_scoped_sealed_redactions"));
+        assert!(collector.contains("RedactionTable::empty"));
+        for forbidden in [
+            "CoverageAdmission",
+            "RedactionCoverageGeneration",
+            "use_at_sink",
+        ] {
+            assert!(!collector.contains(forbidden));
+        }
+        let recall = source
+            .split("pub(crate) fn recall_redaction_table_from_base(")
+            .nth(1)
+            .and_then(|body| body.split("#[cfg(test)]").next())
+            .expect("recalled sealed-value fold");
+        assert!(recall.contains("RedactionTable::empty"));
+        assert!(!recall.contains("CoverageAdmission"));
+    }
 
     #[test]
     fn poisoning_guard_distinguishes_empty_and_unsafe_literals() {

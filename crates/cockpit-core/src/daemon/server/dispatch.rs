@@ -1863,7 +1863,7 @@ async fn commit_oauth_begin(
         })
         .await
         .map_err(internal)?;
-    if let Err(error) = ctx.publish_owner_redaction_table() {
+    if let Err(error) = ctx.publish_owner_redaction_table().await {
         ctx.poison_redaction_publication(&error);
         tracing::error!(%error, "OAuth begin committed but redaction publication failed; daemon poisoned");
     }
@@ -2003,7 +2003,7 @@ async fn commit_oauth_cancel(
         })
         .await
         .map_err(internal)?;
-    if delete_ready_flow && let Err(error) = ctx.publish_owner_redaction_table() {
+    if delete_ready_flow && let Err(error) = ctx.publish_owner_redaction_table().await {
         ctx.poison_redaction_publication(&error);
         tracing::error!(%error, "OAuth cancellation committed but redaction publication failed; daemon poisoned");
     }
@@ -3020,6 +3020,65 @@ mod oauth_store_tests {
     }
 
     #[test]
+    fn coverage_authority_migrates_global_docsask_and_both_auto_title_routes() {
+        let source = include_str!("dispatch.rs");
+        let docs = source
+            .rsplit("async fn run_docs_ask_pipeline(")
+            .next()
+            .and_then(|body| body.split("async fn ").next())
+            .expect("DocsAsk implementation");
+        assert!(docs.contains("CoverageScope::DocsAsk"));
+        assert!(docs.contains("coverage_authority"));
+        assert!(docs.contains(".acquire("));
+        assert!(!docs.contains("RedactionTable::build"));
+
+        let title = source
+            .rsplit("async fn auto_title_request(")
+            .next()
+            .and_then(|body| body.split("async fn ").next())
+            .expect("AutoTitle redaction implementation");
+        assert!(title.contains("if session.redaction_coverage().is_none()"));
+        assert!(title.contains("session.redaction_coverage()"));
+        assert!(title.contains("CoverageScope::AutoTitle"));
+        assert!(title.contains(".acquire("));
+        assert!(title.contains("key,"));
+        assert!(!title.contains("RedactionTable::build"));
+        assert!(!title.contains("RedactionTable::empty"));
+    }
+
+    #[test]
+    fn docsask_requires_bound_coverage() {
+        let source = include_str!("dispatch.rs");
+        let docs = source
+            .rsplit("async fn run_docs_ask_pipeline(")
+            .next()
+            .and_then(|body| body.split("async fn ").next())
+            .expect("DocsAsk implementation");
+        assert!(docs.contains("CoverageScope::DocsAsk"));
+        // #390 requires the lease to span the awaited model sink. The async
+        // consuming API is the stronger boundary; a synchronous `use_at_sink`
+        // check before the await would leave a stale-generation window.
+        assert!(docs.contains("consume_at_async_sink"));
+        assert!(!docs.contains("RedactionTable::build"));
+    }
+
+    #[test]
+    fn auto_title_live_and_non_live_require_bound_coverage() {
+        let source = include_str!("dispatch.rs");
+        let title = source
+            .rsplit("async fn auto_title_request(")
+            .next()
+            .and_then(|body| body.split("async fn ").next())
+            .expect("AutoTitle implementation");
+        assert!(title.contains("let live = ctx.registry.live_handle(session_id)"));
+        assert!(title.contains("if session.redaction_coverage().is_none()"));
+        assert!(title.contains("CoverageScope::AutoTitle"));
+        assert!(title.contains("consume_at_async_sink"));
+        assert!(title.contains("coverage_publish_owners"));
+        assert!(!title.contains("RedactionTable::build"));
+    }
+
+    #[test]
     fn durable_oauth_contract_is_expiring_fenced_and_secret_safe() {
         let source = include_str!("dispatch.rs");
         for required in [
@@ -3625,7 +3684,39 @@ async fn handle_send_user_message_v2(
     // cannot commit a receipt against a missing parent row.
     attached.handle.persist_if_needed().map_err(internal)?;
     let authoritative_model = attached.handle.authoritative_active_model_state();
-    let request = validated.command;
+    let mut request = validated.command;
+    if request.tag_expansions.is_empty() && request.text.contains('@') {
+        let admission = attached
+            .handle
+            .acquire_redaction_coverage(crate::redact::coverage_authority::CoverageScope::TagInline)
+            .await
+            .map_err(internal)?;
+        let root = attached.handle.project_root.clone();
+        let mut allow = crate::config::extended::resolve_gitignore_allow(&root);
+        allow.extend(attached.handle.session().gitignore_session_allow());
+        let input = request.text.clone();
+        let expanded = tokio::task::spawn_blocking(move || {
+            admission.use_at_sink(|table| {
+                let policy = crate::tags::TagPolicy::new_for_caps(
+                    &root,
+                    allow,
+                    crate::tags::TagInlineCaps::STANDARD,
+                    Arc::new(table.enforced()),
+                );
+                Ok(crate::tags::expand_tags_with_policy(&input, &policy))
+            })
+        })
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
+        request.text = expanded.wire;
+        request.tag_expansions = expanded
+            .expansions
+            .into_iter()
+            .map(crate::daemon::proto::TagExpansionMeta::from)
+            .map(Into::into)
+            .collect();
+    }
     if request.text.len() > INLINE_USER_TEXT_BYTES {
         return Err(ErrorPayload {
             code: ErrorCode::BadRequest,
@@ -5296,7 +5387,7 @@ async fn mutate_owner_vault_item_with_remote_ledger(
     // here would make the caller retry while replay returns that response, so
     // publication failure instead poisons and force-shuts the daemon before
     // it can serve another request with a stale redaction table.
-    if let Err(error) = ctx.publish_owner_redaction_table() {
+    if let Err(error) = ctx.publish_owner_redaction_table().await {
         ctx.poison_redaction_publication(&error);
     }
     Ok(response)
@@ -6237,6 +6328,106 @@ async fn handle_serialized_request_impl(
     // oracle that distinguishes requests the principal could never invoke.
     require_compiled_product_domain(&request)?;
     match request {
+        Request::RenderInputPrediction {
+            session_id,
+            turns,
+            mode,
+        } => {
+            let handle = ctx
+                .registry
+                .live_handle(session_id)
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::UnknownSession,
+                    message: "input prediction is unavailable for that session".into(),
+                })?;
+            let admission = handle
+                .acquire_redaction_coverage(
+                    crate::redact::coverage_authority::CoverageScope::InputPrediction,
+                )
+                .await
+                .map_err(internal)?;
+            let snapshot = handle.config_snapshot();
+            let turns = turns
+                .into_iter()
+                .map(|turn| crate::engine::predict::PredictionTurn {
+                    user: turn.user,
+                    agent: turn.agent,
+                })
+                .collect::<Vec<_>>();
+            let mode = match mode {
+                proto::InputPredictionMode::Short => {
+                    crate::config::extended::PredictNextMessage::Short
+                }
+                proto::InputPredictionMode::Long => {
+                    crate::config::extended::PredictNextMessage::Long
+                }
+            };
+            let text = admission
+                .consume_at_async_sink(|table| {
+                    let table = std::sync::Arc::new(table);
+                    let turns = turns.clone();
+                    let snapshot = snapshot.clone();
+                    async move {
+                        Ok(crate::engine::predict::predict(
+                            &turns,
+                            mode,
+                            &snapshot.extended,
+                            &snapshot.providers,
+                            table,
+                        )
+                        .await)
+                    }
+                })
+                .await
+                .map_err(internal)?;
+            Ok(Response::InputPrediction(
+                proto::InputPredictionProjection { text },
+            ))
+        }
+        Request::ResolveTagPreview { session_id, input } => {
+            let handle = ctx
+                .registry
+                .live_handle(session_id)
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::UnknownSession,
+                    message: "tag preview is unavailable for that session".into(),
+                })?;
+            let admission = handle
+                .acquire_redaction_coverage(
+                    crate::redact::coverage_authority::CoverageScope::TagInline,
+                )
+                .await
+                .map_err(internal)?;
+            let root = handle.project_root.clone();
+            let allow = crate::config::extended::resolve_gitignore_allow(&root);
+            tokio::task::spawn_blocking(move || {
+                admission.use_at_sink(|table| {
+                    let policy = crate::tags::TagPolicy::new_for_caps(
+                        &root,
+                        allow,
+                        crate::tags::TagInlineCaps::STANDARD,
+                        Arc::new(table.enforced()),
+                    );
+                    let expanded = crate::tags::expand_tags_with_policy(&input, &policy);
+                    Ok(Response::TagPreview(proto::TagPreviewProjection {
+                        wire: table.scrub(&expanded.wire),
+                        expansions: expanded
+                            .expansions
+                            .into_iter()
+                            .map(proto::TagExpansionMeta::from)
+                            .map(|mut item| {
+                                item.path = table.scrub(&item.path);
+                                item.detail = table.scrub(&item.detail);
+                                item
+                            })
+                            .collect(),
+                    }))
+                })
+            })
+            .await
+            .map_err(internal)?
+            .map_err(internal)
+        }
         Request::GetOnboardingBootstrapSnapshot => {
             let capabilities = ctx
                 .host_capabilities
@@ -8101,9 +8292,42 @@ async fn handle_serialized_request_impl(
         Request::SetQueuedUserMessageClass {
             queue_item_id,
             delivery_class,
-            replacement,
+            mut replacement,
         } => {
             let att = require_attached(state)?;
+            if let Some(replacement) = replacement.as_mut()
+                && replacement.action == proto::QueueEditAction::Commit
+                && replacement.tag_expansions.is_empty()
+                && replacement.text.contains('@')
+            {
+                let admission = att
+                    .handle
+                    .acquire_redaction_coverage(
+                        crate::redact::coverage_authority::CoverageScope::TagInline,
+                    )
+                    .await
+                    .map_err(internal)?;
+                let root = att.handle.project_root.clone();
+                let mut allow = crate::config::extended::resolve_gitignore_allow(&root);
+                allow.extend(att.handle.session().gitignore_session_allow());
+                let expanded = admission
+                    .use_at_sink(|table| {
+                        let policy = crate::tags::TagPolicy::new_for_caps(
+                            &root,
+                            allow,
+                            crate::tags::TagInlineCaps::STANDARD,
+                            Arc::new(table.enforced()),
+                        );
+                        Ok(crate::tags::expand_tags_with_policy(
+                            &replacement.text,
+                            &policy,
+                        ))
+                    })
+                    .map_err(internal)?;
+                replacement.text = expanded.wire;
+                replacement.tag_expansions =
+                    expanded.expansions.into_iter().map(Into::into).collect();
+            }
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             att.handle
                 .send_work(SessionWork::SetQueuedUserMessageClass {
@@ -9622,6 +9846,12 @@ async fn handle_serialized_request_impl(
                 .set_workspace_trust(&trust_root.root, requested_mode)
                 .await
                 .map_err(internal)?;
+            ctx.registry.coverage_authority().invalidate_workspace(
+                crate::redact::coverage_authority::CoverageBinding::derive(
+                    b"workspace",
+                    trust_root.root.as_os_str().as_encoded_bytes(),
+                ),
+            );
             transition_owned_revision.store(
                 committed.revision,
                 std::sync::atomic::Ordering::Release,
@@ -10177,6 +10407,12 @@ async fn handle_serialized_request_impl(
         Request::ListAssistants => Err(ErrorPayload {
             code: ErrorCode::Internal,
             message: "concurrent request `list_assistants` reached serialized dispatch".to_string(),
+        }),
+        Request::GetRedactionCoverageStatus { .. } => Err(ErrorPayload {
+            code: ErrorCode::Internal,
+            message:
+                "concurrent request `get_redaction_coverage_status` reached serialized dispatch"
+                    .to_string(),
         }),
         Request::SetPrimaryAssistantSoulEditMode { soul_edit_mode } => {
             if ctx.is_ephemeral_lifetime() {
@@ -11842,7 +12078,7 @@ async fn handle_serialized_request_impl(
                 // reintroduce the per-event fork/scan storm. A rebuild failure
                 // must not be swallowed: retaining the stale table could
                 // disclose the secret, so poison the daemon.
-                if let Err(error) = ctx.refresh_redaction_table() {
+                if let Err(error) = ctx.refresh_redaction_table().await {
                     ctx.poison_redaction_publication(&error);
                     return Err(internal(error));
                 }
@@ -14917,6 +15153,7 @@ async fn handle_serialized_request_impl(
                         crate::auth::flycockpit::CREDENTIAL_KEY,
                         Some(&credential_bytes),
                     )
+                    .await
                     .map(|()| response)
                     .map_err(internal),
             };
@@ -15237,6 +15474,7 @@ async fn handle_serialized_request_impl(
                             &name,
                             Some(value.as_bytes()),
                         )
+                        .await
                         .map_err(internal)?;
                         Ok(Response::Ack)
                     }
@@ -15249,6 +15487,7 @@ async fn handle_serialized_request_impl(
                     &name,
                     Some(value.as_bytes()),
                 )
+                .await
                 .map_err(internal)?;
                 Ok(Response::Ack)
             }
@@ -15348,7 +15587,7 @@ async fn handle_serialized_request_impl(
                     })
                     .await
                     .map_err(internal)?;
-                if let Err(error) = ctx.publish_owner_redaction_table() {
+                if let Err(error) = ctx.publish_owner_redaction_table().await {
                     ctx.poison_redaction_publication(&error);
                     tracing::error!(%error, "subscription acknowledgement committed but redaction publication failed; daemon poisoned");
                 }
@@ -15409,6 +15648,7 @@ async fn handle_serialized_request_impl(
                             &name,
                             None,
                         )
+                        .await
                         .map_err(internal)?;
                         Ok(Response::Ack)
                     }
@@ -15421,6 +15661,7 @@ async fn handle_serialized_request_impl(
                     &name,
                     None,
                 )
+                .await
                 .map_err(internal)?;
                 Ok(Response::Ack)
             }
@@ -16440,7 +16681,7 @@ async fn handle_serialized_request_impl(
                     })
                     .await
                     .map_err(internal)?;
-                if let Err(error) = ctx.publish_owner_redaction_table() {
+                if let Err(error) = ctx.publish_owner_redaction_table().await {
                     ctx.poison_redaction_publication(&error);
                     tracing::error!(%error, "provider OAuth committed but redaction publication failed; daemon poisoned");
                 }
@@ -17518,7 +17759,7 @@ async fn handle_serialized_request_impl(
                     })
                     .await
                     .map_err(map_named_secret_tx_error)?;
-                if let Err(error) = ctx.publish_owner_redaction_table() {
+                if let Err(error) = ctx.publish_owner_redaction_table().await {
                     // Vault + ownership are committed. The exchange is one-shot,
                     // so rollback could orphan the already-authorized token;
                     // poison and fail closed until the daemon is restarted.
@@ -19621,6 +19862,31 @@ async fn handle_serialized_request_impl(
     }
 }
 
+fn render_debug_context(root: &Path, table: &crate::redact::RedactionTable) -> String {
+    const OUTPUT_LIMIT: usize = 16 * 1024;
+    let mut rendered = format!(
+        "System prompt:\n{}",
+        crate::engine::builtin::default_chat_system_prompt(root, "")
+    );
+    if let Some((path, guidance)) = crate::engine::builtin::load_agent_guidance(root) {
+        rendered.push_str("\n\nProject guidance (user-role prelude): ");
+        rendered.push_str(&table.scrub(&path.display().to_string()));
+        rendered.push('\n');
+        rendered.push_str(&guidance);
+    }
+    let scrubbed = table.scrub(&rendered);
+    if scrubbed.len() <= OUTPUT_LIMIT {
+        return scrubbed;
+    }
+    let cut = scrubbed
+        .char_indices()
+        .take_while(|(index, _)| *index < OUTPUT_LIMIT)
+        .map(|(index, ch)| index + ch.len_utf8())
+        .last()
+        .unwrap_or(0);
+    format!("{}\n[truncated at {OUTPUT_LIMIT} bytes]", &scrubbed[..cut])
+}
+
 fn agent_editor_lease_owner(state: &MutableClientState) -> String {
     // Editor leases intentionally survive a transport reconnect.  The opaque
     // lease remains additionally bound to its canonical workspace, agent and
@@ -19968,6 +20234,55 @@ async fn handle_concurrent_request_impl(
     #[cfg(test)]
     apply_concurrent_request_test_hook(&request).await;
     match request {
+        Request::GetRedactionCoverageStatus { session_id } => {
+            let owner = shared.principal.has_owner_level_authority();
+            if let Some(session_id) = session_id {
+                let handle = ctx
+                    .registry
+                    .live_handle(session_id)
+                    .ok_or_else(|| ErrorPayload {
+                        code: ErrorCode::UnknownSession,
+                        message: "redaction coverage is unavailable for that session".into(),
+                    })?;
+                let admission = handle
+                    .acquire_redaction_coverage(
+                        crate::redact::coverage_authority::CoverageScope::DebugContext,
+                    )
+                    .await
+                    .map_err(internal)?;
+                let root = handle.project_root.clone();
+                admission
+                    .use_at_sink(|table| {
+                        Ok(Response::RedactionCoverageStatus(
+                            proto::RedactionCoverageStatusProjection {
+                                state: proto::RedactionCoverageState::Ready,
+                                owner_diagnostic: None,
+                                rendered_context: owner
+                                    .then(|| render_debug_context(&root, &table)),
+                            },
+                        ))
+                    })
+                    .map_err(internal)
+            } else {
+                acquire_daemon_redaction_table(
+                    ctx.registry.coverage_authority().clone(),
+                    ctx.config_source(),
+                    &ctx.secret_vault,
+                    &ctx.registry.command_secret_cache(),
+                    crate::redact::coverage_authority::CoverageScope::DebugContext,
+                )
+                .await
+                .map(|table| {
+                    Response::RedactionCoverageStatus(proto::RedactionCoverageStatusProjection {
+                        state: proto::RedactionCoverageState::Ready,
+                        owner_diagnostic: None,
+                        rendered_context: owner
+                            .then(|| render_debug_context(&ctx.canonical_cwd, &table)),
+                    })
+                })
+                .map_err(internal)
+            }
+        }
         Request::CleanManagedWorkspaceLease {
             session_id,
             owner_agent_instance_id,
@@ -22646,7 +22961,7 @@ async fn commit_local_provider_credential(
     if matches!(
         &response,
         Response::ProviderCredentialCommitted { changed: true, .. }
-    ) && let Err(error) = ctx.publish_owner_redaction_table()
+    ) && let Err(error) = ctx.publish_owner_redaction_table().await
     {
         ctx.poison_redaction_publication(&error);
         return Err(internal(error));
@@ -23081,7 +23396,7 @@ async fn stage_and_recover_provider_batch(
         })
         .await
         .map_err(map_named_secret_tx_error)?;
-    if let Err(error) = ctx.publish_owner_redaction_table() {
+    if let Err(error) = ctx.publish_owner_redaction_table().await {
         let compensation = compensate_provider_batch_staging(ctx, &journal_id).await;
         ctx.poison_redaction_publication(&error);
         return match compensation {
@@ -24997,6 +25312,7 @@ async fn recover_provider_config_journals_inner(
                     &reference,
                     None,
                 )
+                .await
                 .map_err(internal)?;
             }
         }
@@ -25033,6 +25349,7 @@ async fn recover_provider_config_journals_inner(
                             &reference,
                             None,
                         )
+                        .await
                         .map_err(internal)?;
                     }
                 }
@@ -25913,7 +26230,7 @@ async fn provider_config_save_under_lock(
     // includes those newly-created values. A publication failure is a
     // fail-closed operation: compensate the staged rows and retire the
     // journal, then poison the daemon if compensation itself cannot complete.
-    if let Err(publication_error) = ctx.publish_owner_redaction_table() {
+    if let Err(publication_error) = ctx.publish_owner_redaction_table().await {
         let staged_names = staged
             .iter()
             .map(|(name, _)| name.clone())
@@ -26606,7 +26923,7 @@ async fn save_mcp_config(
         })
         .await
         .map_err(map_named_secret_tx_error)?;
-    if let Err(error) = ctx.publish_owner_redaction_table() {
+    if let Err(error) = ctx.publish_owner_redaction_table().await {
         compensate_mcp_staged_and_retire(ctx, &journal_id, &staged_mutations).await?;
         ctx.poison_redaction_publication(&error);
         return Err(internal(error));
@@ -27407,7 +27724,7 @@ async fn delete_owned_named_secret(
         })
         .await
         .map_err(internal)?;
-    if let Err(error) = ctx.publish_owner_redaction_table() {
+    if let Err(error) = ctx.publish_owner_redaction_table().await {
         ctx.poison_redaction_publication(&error);
         return Err(internal(error));
     }
@@ -30838,12 +31155,14 @@ async fn docs_ask_response(
     package: Option<String>,
     project_root: Option<String>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    let cwd = project_root
+    let requested_root = project_root
         .map(PathBuf::from)
         .unwrap_or_else(|| ctx.canonical_cwd.clone());
-    let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
-        .await
-        .map_err(internal)?;
+    let trust_policy =
+        crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &requested_root)
+            .await
+            .map_err(internal)?;
+    let cwd = trust_policy.root.root.clone();
     let (providers, extended) = ctx
         .config_source()
         .load_effective_for_daemon(&cwd, &trust_policy)
@@ -30858,6 +31177,7 @@ async fn docs_ask_response(
     let vault = ctx.secret_vault.clone();
     let db = ctx.db.clone();
     let guidance_proposals = ctx.guidance_proposals.clone();
+    let coverage_authority = ctx.registry.coverage_authority().clone();
 
     // Async, owner-scoped pre-resolution BEFORE spawn_blocking: command
     // resolution is async subprocess work and cannot run on the sync docs build
@@ -30885,6 +31205,7 @@ async fn docs_ask_response(
             vault,
             guidance_proposals,
             command_secret_cache,
+            coverage_authority,
             package,
             question,
         ))
@@ -30912,6 +31233,7 @@ async fn run_docs_ask_pipeline(
         tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>,
     >,
     command_secret_cache: Arc<crate::secret_command::CommandSecretCache>,
+    coverage_authority: crate::redact::coverage_authority::RedactionCoverageAuthority,
     package: Option<String>,
     question: String,
 ) -> std::result::Result<String, String> {
@@ -30921,11 +31243,12 @@ async fn run_docs_ask_pipeline(
         "docs",
         &extended,
         resolver,
-        vault,
+        vault.clone(),
     )
     .map_err(|error| format!("creating docs ask session: {error:#}"))?;
     // Install the daemon command-secret cache so this session's sync redaction
     // and model builds inject the (already pre-resolved) command outputs.
+    let command_cache = command_secret_cache.clone();
     session.set_command_secret_cache(Some(command_secret_cache));
     // The docs session is created outside the session worker, so it has no
     // attached daemon recovery journal; take the audited opt-out from the
@@ -30945,24 +31268,152 @@ async fn run_docs_ask_pipeline(
     let store = session
         .provider_credential_store(&providers)
         .map_err(|error| format!("opening owner-scoped credential store: {error:#}"))?;
-    let redact = Arc::new(
-        crate::redact::RedactionTable::build_with_env_and_credential_store(
-            &extended.redact,
-            &cwd,
-            env_snapshot.vars(),
-            &store,
+    let vault_revision = vault
+        .current_inventory_generation()
+        .map_err(|_| "coverage_unavailable".to_string())?;
+    let policy_digest = crate::redact::coverage_bindings::redact_config_digest(&extended.redact);
+    let principal = crate::daemon::principal::ClientPrincipal::owner();
+    let coverage_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+        principal: &principal,
+        owner_authorization_revision: 0,
+        session_id: session.id,
+        workspace_root: &cwd,
+        environment: &env_snapshot,
+        vault_revision,
+        command_cache: &command_cache,
+        policy_digest: &policy_digest,
+        sealed: crate::redact::coverage_authority::CoverageBinding::derive(b"sealed", &[]),
+        override_revision: 0,
+        redact_config: &extended.redact,
+    };
+    let coverage_key = coverage_inputs.coverage_key();
+    let capture_policy_digest = policy_digest.clone();
+    let docs_session_id = session.id;
+    let capture_config = extended.redact.clone();
+    let capture_root = cwd.clone();
+    let capture_env = env_snapshot.vars().clone();
+    let capture_store = store.clone();
+    let env_snapshot_for_capture = env_snapshot.clone();
+    let publish_vault = session.secret_vault().clone();
+    let publish_db = session.db.clone();
+    let publish_command_cache = command_cache.clone();
+    let env_live = std::sync::Arc::new(std::sync::RwLock::new(env_snapshot.clone()));
+    let extended_live = extended.clone();
+    let capture_root_for_publish = cwd.clone();
+    let publish_fence = crate::redact::coverage_bindings::session_publish_owners(
+        publish_vault.clone(),
+        publish_db.clone(),
+        publish_command_cache.clone(),
+        crate::redact::coverage_bindings::SessionCoveragePublishLive {
+            environment: std::sync::Arc::new({
+                let env_live = env_live.clone();
+                move || {
+                    Ok(env_live
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone())
+                }
+            }),
+            policy_digest: std::sync::Arc::new({
+                let extended_live = extended_live.clone();
+                move || {
+                    crate::redact::coverage_bindings::redact_config_digest(&extended_live.redact)
+                }
+            }),
+            override_revision: std::sync::Arc::new(|| 0),
+            redact_config: std::sync::Arc::new({
+                let extended_live = extended_live.clone();
+                move || extended_live.redact.clone()
+            }),
+            workspace_root: std::sync::Arc::new(move || capture_root_for_publish.clone()),
+        },
+    )
+    .publish_fence();
+    let admission = coverage_authority
+        .acquire(
+            coverage_key.clone(),
+            crate::redact::coverage_authority::CoverageScope::DocsAsk,
+            move || {
+                let capture_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+                    principal: &principal,
+                    owner_authorization_revision: 0,
+                    session_id: docs_session_id,
+                    workspace_root: &capture_root,
+                    environment: &env_snapshot_for_capture,
+                    vault_revision,
+                    command_cache: &command_cache,
+                    policy_digest: &capture_policy_digest,
+                    sealed: crate::redact::coverage_authority::CoverageBinding::derive(
+                        b"sealed",
+                        &[],
+                    ),
+                    override_revision: 0,
+                    redact_config: &capture_config,
+                };
+                let build =
+                    crate::redact::coverage_authority::CoverageBuild::capture_session_without_sealed(
+                        &capture_config,
+                        &capture_root,
+                        &capture_env,
+                        &capture_store,
+                        &capture_inputs,
+                    )?;
+                Ok(build.with_publish_fence(publish_fence))
+            },
         )
-        .map_err(|error| format!("building redaction table: {error:#}"))?,
-    );
-    let model = Arc::new(
-        crate::engine::model::Model::from_config_with_store(
-            &providers,
-            redact.clone(),
-            |name| env_snapshot.vars().get(name).cloned(),
-            store.clone(),
-        )
-        .map_err(|error| format!("resolving active model: {error:#}"))?,
-    );
+        .await
+        .map_err(|error| error.to_string())?;
+    session.set_redaction_coverage(coverage_authority, coverage_key, policy_digest);
+    admission
+        .consume_at_async_sink_preserving_error(|redact| {
+            run_docs_ask_model_pipeline(
+                db,
+                cwd,
+                providers,
+                extended,
+                env_live,
+                session,
+                guidance_proposals,
+                store,
+                package,
+                question,
+                Arc::new(redact),
+            )
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("{error:#}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_docs_ask_model_pipeline(
+    db: crate::db::Db,
+    cwd: PathBuf,
+    providers: crate::config::providers::ProvidersConfig,
+    extended: crate::config::extended::ExtendedConfig,
+    env_live: Arc<std::sync::RwLock<EnvSnapshot>>,
+    session: crate::session::Session,
+    guidance_proposals: Arc<
+        tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>,
+    >,
+    store: crate::credentials::CredentialStore,
+    package: Option<String>,
+    question: String,
+    redact: Arc<crate::redact::RedactionTable>,
+) -> anyhow::Result<String> {
+    let model = Arc::new(crate::engine::model::Model::from_config_with_store(
+        &providers,
+        redact.clone(),
+        |name| {
+            env_live
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .vars()
+                .get(name)
+                .cloned()
+        },
+        store.clone(),
+    )?);
     let reasoning_params = model.resolve_reasoning_params(&providers);
     let endpoint_recovery_reasoning_params = model.endpoint_recovery_reasoning_params(&providers);
     let config = crate::daemon::session_worker::SessionConfigHandle::detached(
@@ -31029,7 +31480,7 @@ async fn run_docs_ask_pipeline(
     let locks = Arc::new(
         crate::locks::LockManager::from_db(db)
             .await
-            .map_err(|error| format!("loading lock state: {error:#}"))?,
+            .context("loading lock state")?,
     );
     let brief = build_docs_ask_brief(package.as_deref(), &question);
     let outcome = crate::engine::docs_pipeline::run(
@@ -31046,8 +31497,7 @@ async fn run_docs_ask_pipeline(
         None,
         None,
     )
-    .await
-    .map_err(|error| format!("{error:#}"))?;
+    .await?;
     Ok(outcome.report)
 }
 
@@ -31773,6 +32223,19 @@ pub(super) async fn export_session_data(
                 .to_string(),
         });
     }
+    let mut raw_disposition = if include_sensitive {
+        Some(
+            crate::redact::coverage_authority::RawExportDisposition::after_owner_local_check(
+                local_owner_action,
+            )
+            .ok_or_else(|| ErrorPayload {
+                code: ErrorCode::Authorization,
+                message: "raw export authorization is unavailable".to_string(),
+            })?,
+        )
+    } else {
+        None
+    };
     let db = ctx.db.clone();
     let target = db
         .get_session(session_id)
@@ -31782,17 +32245,249 @@ pub(super) async fn export_session_data(
             code: ErrorCode::UnknownSession,
             message: format!("unknown session {session_id}"),
         })?;
+    let export_admission = if include_sensitive {
+        None
+    } else if let Some(handle) = ctx.registry.live_handle(session_id) {
+        Some(
+            handle
+                .acquire_redaction_coverage(
+                    crate::redact::coverage_authority::CoverageScope::RedactedExport,
+                )
+                .await
+                .map_err(internal)?,
+        )
+    } else {
+        let session = std::sync::Arc::new(
+            crate::session::Session::resume(
+                ctx.db.clone(),
+                session_id,
+                ctx.redaction_key_resolver().map_err(internal)?,
+                ctx.secret_vault.clone(),
+            )
+            .map_err(internal)?
+            .ok_or_else(|| ErrorPayload {
+                code: ErrorCode::UnknownSession,
+                message: "redacted export session is unavailable".into(),
+            })?,
+        );
+        let env_snapshot = ctx
+            .env_baseline
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let trust = crate::config::trust::resolve_historical_workspace_trust_policy_from_db(
+            &ctx.db,
+            &session.project_root,
+        )
+        .await
+        .map_err(workspace_trust_error)?;
+        let (_, extended) = ctx
+            .config_source()
+            .load_with_trust(&session.project_root, &trust)
+            .map_err(workspace_trust_error)?;
+        let vault_revision = ctx
+            .secret_vault
+            .current_inventory_generation()
+            .map_err(internal)?;
+        let policy_digest =
+            crate::redact::coverage_bindings::redact_config_digest(&extended.redact);
+        let principal = crate::daemon::principal::ClientPrincipal::owner();
+        let command_cache = ctx.registry.command_secret_cache();
+        let sealed_records = session
+            .db
+            .machine_scoped_sealed_redaction_records()
+            .await
+            .map_err(internal)?;
+        let sealed_binding =
+            crate::redact::coverage_bindings::sealed_records_binding(&sealed_records);
+        let coverage_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+            principal: &principal,
+            owner_authorization_revision: 0,
+            session_id: session.id,
+            workspace_root: &session.project_root,
+            environment: &env_snapshot,
+            vault_revision,
+            command_cache: &command_cache,
+            policy_digest: &policy_digest,
+            sealed: sealed_binding,
+            override_revision: 0,
+            redact_config: &extended.redact,
+        };
+        let key = coverage_inputs.coverage_key();
+        let sealed = session
+            .machine_scoped_sealed_redactions()
+            .await
+            .map_err(internal)?;
+        let store = session.credential_store().map_err(internal)?;
+        let config = extended.redact;
+        let root = session.project_root.clone();
+        let environment = env_snapshot.vars().clone();
+        let env_snapshot_for_capture = env_snapshot.clone();
+        let export_session_id = session.id;
+        let publish_vault = session.secret_vault().clone();
+        let publish_db = session.db.clone();
+        let publish_command_cache = command_cache.clone();
+        let env_baseline = ctx.env_baseline.clone();
+        let config_source = ctx.config_source().clone();
+        let project_root = session.project_root.clone();
+        let publish_fence = crate::redact::coverage_bindings::session_publish_owners_for_session(
+            session.clone(),
+            publish_vault.clone(),
+            publish_db.clone(),
+            publish_command_cache.clone(),
+            std::sync::Arc::new(move || {
+                Ok(env_baseline
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone())
+            }),
+            std::sync::Arc::new({
+                let config_source = config_source.clone();
+                let project_root = project_root.clone();
+                move || {
+                    config_source
+                        .load(&project_root)
+                        .expect("loading detached export redact config at publication")
+                        .1
+                        .redact
+                        .clone()
+                }
+            }),
+            std::sync::Arc::new(|| 0),
+        )
+        .publish_fence();
+        let admission = ctx
+            .registry
+            .coverage_authority()
+            .acquire(
+                key,
+                crate::redact::coverage_authority::CoverageScope::RedactedExport,
+                move || {
+                    let capture_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+                        principal: &principal,
+                        owner_authorization_revision: 0,
+                        session_id: export_session_id,
+                        workspace_root: &root,
+                        environment: &env_snapshot_for_capture,
+                        vault_revision,
+                        command_cache: &command_cache,
+                        policy_digest: &policy_digest,
+                        sealed: sealed_binding,
+                        override_revision: 0,
+                        redact_config: &config,
+                    };
+                    let build = crate::redact::coverage_authority::CoverageBuild::capture(
+                        &config,
+                        &root,
+                        &environment,
+                        &store,
+                        &sealed,
+                        &capture_inputs,
+                    )?;
+                    Ok(build.with_publish_fence(publish_fence))
+                },
+            )
+            .await
+            .map_err(internal)?;
+        Some(admission)
+    };
     // A redacted export rides the type-bound RedactedExport class (owner-remoted
     // reader); the raw archive rides the plain Export class (owner-local generic
     // reader only).
-    let mime_class = if include_sensitive {
-        RemoteBulkMimeClass::Export
+    let data = if let Some(admission) = export_admission {
+        let mime_class = RemoteBulkMimeClass::RedactedExport;
+        match kind {
+            proto::ExportSessionKind::TranscriptJson => {
+                let bytes = admission
+                    .consume_at_async_sink(|export_redactor| {
+                        let export_redactor = std::sync::Arc::new(export_redactor);
+                        let db = db.clone();
+                        let target = target.clone();
+                        let secret_vault = ctx.secret_vault.clone();
+                        let resolver = ctx.redaction_key_resolver();
+                        let env = ctx
+                            .env_baseline
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .vars()
+                            .clone();
+                        async move {
+                            let resolver = resolver.map_err(|error| anyhow::anyhow!("{error}"))?;
+                            crate::session::export::build_redacted_transcript_json_bytes(
+                                &db,
+                                &target,
+                                &secret_vault,
+                                resolver,
+                                env,
+                                export_redactor,
+                            )
+                            .await
+                            .map_err(|error| anyhow::anyhow!("{error}"))
+                        }
+                    })
+                    .await
+                    .map_err(internal)?;
+                let transfer = stage_export_bytes(&bytes, mime_class, quota)?;
+                proto::ExportSessionData {
+                    session_id,
+                    kind,
+                    filename_extension: "json".to_string(),
+                    mime: "application/json".to_string(),
+                    transfer,
+                    session_count: Some(1),
+                    redacted: true,
+                }
+            }
+            proto::ExportSessionKind::DebugBundle => {
+                let bundle = admission
+                    .consume_at_async_sink(|export_redactor| {
+                        let export_redactor = std::sync::Arc::new(export_redactor);
+                        let db = db.clone();
+                        let target = target.clone();
+                        let secret_vault = ctx.secret_vault.clone();
+                        let resolver = ctx.redaction_key_resolver();
+                        let env = ctx
+                            .env_baseline
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .vars()
+                            .clone();
+                        async move {
+                            let resolver = resolver.map_err(|error| anyhow::anyhow!("{error}"))?;
+                            crate::session::export::build_bundle_zip_bytes(
+                                &db,
+                                &target,
+                                include_generated_artifacts,
+                                &secret_vault,
+                                resolver,
+                                env,
+                                export_redactor,
+                            )
+                            .await
+                            .map_err(|error| anyhow::anyhow!("{error}"))
+                        }
+                    })
+                    .await
+                    .map_err(internal)?;
+                let transfer = stage_export_bytes(&bundle.bytes, mime_class, quota)?;
+                proto::ExportSessionData {
+                    session_id,
+                    kind,
+                    filename_extension: "zip".to_string(),
+                    mime: "application/zip".to_string(),
+                    transfer,
+                    session_count: Some(bundle.summary.session_count),
+                    redacted: true,
+                }
+            }
+        }
     } else {
-        RemoteBulkMimeClass::RedactedExport
-    };
-    let data = match kind {
-        proto::ExportSessionKind::TranscriptJson => {
-            let bytes = if include_sensitive {
+        let mime_class = RemoteBulkMimeClass::Export;
+        match kind {
+            proto::ExportSessionKind::TranscriptJson => {
+                let _disposition = raw_disposition
+                    .take()
+                    .ok_or_else(|| internal("raw export authorization is unavailable"))?;
                 // Raw local transcript: the unredacted message bodies verbatim.
                 // No redaction and no history fold, so the multi-read is benign
                 // (the raw archive shows everything regardless).
@@ -31813,94 +32508,39 @@ pub(super) async fn export_session_data(
                     }
                 }
                 messages.sort_by_key(|message| message.seq);
-                serde_json::to_vec_pretty(&messages).map_err(internal)?
-            } else {
-                // Redacted transcript: the message reads, the protected-history
-                // fold, and the scrub all run inside ONE read snapshot, so the
-                // transcribed message set and the folded-literal set come from
-                // the SAME snapshot — no discover-then-assemble TOCTOU. Fails
-                // closed on any resolver/integrity error (no partial artifact).
-                let resolver = ctx.redaction_key_resolver().map_err(internal)?;
-                // Feed the live daemon environment baseline into the export
-                // redaction table so an env-derived secret that surfaces in a
-                // transcript member is scrubbed even when it was never
-                // independently persisted or journaled (defense-in-depth: the
-                // same env source the live session redaction path uses).
-                let env = ctx
-                    .env_baseline
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .vars()
-                    .clone();
-                crate::session::export::build_redacted_transcript_json_bytes(
-                    &db,
-                    &target,
-                    &ctx.secret_vault,
-                    resolver,
-                    env,
-                )
-                .await
-                .map_err(internal)?
-            };
-            let transfer = stage_export_bytes(&bytes, mime_class, quota)?;
-            proto::ExportSessionData {
-                session_id,
-                kind,
-                filename_extension: "json".to_string(),
-                mime: "application/json".to_string(),
-                transfer,
-                session_count: Some(1),
-                redacted: !include_sensitive,
+                let bytes = serde_json::to_vec_pretty(&messages).map_err(internal)?;
+                let transfer = stage_export_bytes(&bytes, mime_class, quota)?;
+                proto::ExportSessionData {
+                    session_id,
+                    kind,
+                    filename_extension: "json".to_string(),
+                    mime: "application/json".to_string(),
+                    transfer,
+                    session_count: Some(1),
+                    redacted: false,
+                }
             }
-        }
-        proto::ExportSessionKind::DebugBundle => {
-            let bundle = if include_sensitive {
-                crate::session::export::build_bundle_zip_bytes_raw_local(
+            proto::ExportSessionKind::DebugBundle => {
+                let bundle = crate::session::export::build_bundle_zip_bytes_raw_local(
                     &db,
                     &target,
                     include_generated_artifacts,
+                    raw_disposition
+                        .take()
+                        .ok_or_else(|| internal("raw export authorization is unavailable"))?,
                 )
                 .await
-                .map_err(internal)?
-            } else {
-                // The debug bundle folds protected-history literals IN the same
-                // read snapshot that discovers and assembles the bundle (the
-                // resolver is warmed then threaded into the assembly), so a fork
-                // or `/compact` successor committed concurrently can never be
-                // assembled without its journal literals folded — closing the
-                // discover-then-assemble TOCTOU. Fails closed on any
-                // resolver/integrity error.
-                let resolver = ctx.redaction_key_resolver().map_err(internal)?;
-                // Feed the live daemon environment baseline into the export
-                // redaction table (see the transcript branch): an env-derived
-                // secret embedded in a config/approval/artifact member is
-                // scrubbed even when it was never persisted or journaled.
-                let env = ctx
-                    .env_baseline
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .vars()
-                    .clone();
-                crate::session::export::build_bundle_zip_bytes(
-                    &db,
-                    &target,
-                    include_generated_artifacts,
-                    &ctx.secret_vault,
-                    resolver,
-                    env,
-                )
-                .await
-                .map_err(internal)?
-            };
-            let transfer = stage_export_bytes(&bundle.bytes, mime_class, quota)?;
-            proto::ExportSessionData {
-                session_id,
-                kind,
-                filename_extension: "zip".to_string(),
-                mime: "application/zip".to_string(),
-                transfer,
-                session_count: Some(bundle.summary.session_count),
-                redacted: !include_sensitive,
+                .map_err(internal)?;
+                let transfer = stage_export_bytes(&bundle.bytes, mime_class, quota)?;
+                proto::ExportSessionData {
+                    session_id,
+                    kind,
+                    filename_extension: "zip".to_string(),
+                    mime: "application/zip".to_string(),
+                    transfer,
+                    session_count: Some(bundle.summary.session_count),
+                    redacted: false,
+                }
             }
         }
     };
@@ -31952,49 +32592,182 @@ pub(super) async fn auto_title_request(
         .config_source()
         .load_with_trust(&session.project_root, &trust_policy)
         .map_err(workspace_trust_error)?;
-    let redact = if let Some(handle) = live {
-        handle.redaction_table()
+    let env = live.as_ref().map_or_else(
+        || {
+            ctx.env_baseline
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .vars()
+                .clone()
+        },
+        |handle| handle.env_overlay_snapshot(),
+    );
+    let env_identity = crate::env_snapshot::EnvSnapshot::new(
+        cockpit_proto::EnvSnapshotSource::DaemonStart,
+        env.clone(),
+    );
+    if session.redaction_coverage().is_none() {
+        let vault_revision = ctx
+            .secret_vault
+            .current_inventory_generation()
+            .map_err(internal)?;
+        let policy_digest =
+            crate::redact::coverage_bindings::redact_config_digest(&extended.redact);
+        let principal = crate::daemon::principal::ClientPrincipal::owner();
+        let command_cache = ctx.registry.command_secret_cache();
+        let sealed_records = session
+            .db
+            .machine_scoped_sealed_redaction_records()
+            .await
+            .map_err(internal)?;
+        let sealed_binding =
+            crate::redact::coverage_bindings::sealed_records_binding(&sealed_records);
+        let coverage_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+            principal: &principal,
+            owner_authorization_revision: 0,
+            session_id: session.id,
+            workspace_root: &session.project_root,
+            environment: &env_identity,
+            vault_revision,
+            command_cache: &command_cache,
+            policy_digest: &policy_digest,
+            sealed: sealed_binding,
+            override_revision: 0,
+            redact_config: &extended.redact,
+        };
+        let key = coverage_inputs.coverage_key();
+        session.set_redaction_coverage(
+            ctx.registry.coverage_authority().clone(),
+            key,
+            policy_digest,
+        );
+    }
+    let (authority, key, policy_digest) = session
+        .redaction_coverage()
+        .ok_or_else(|| internal("coverage_unavailable"))?;
+    let store = session.credential_store().map_err(internal)?;
+    let sealed = session
+        .machine_scoped_sealed_redactions()
+        .await
+        .map_err(internal)?;
+    let capture_config = extended.redact.clone();
+    let capture_root = session.project_root.clone();
+    let sealed_records = session
+        .db
+        .machine_scoped_sealed_redaction_records()
+        .await
+        .map_err(internal)?;
+    let sealed_binding = crate::redact::coverage_bindings::sealed_records_binding(&sealed_records);
+    let principal = crate::daemon::principal::ClientPrincipal::owner();
+    let command_cache = ctx.registry.command_secret_cache();
+    let vault_revision = ctx
+        .secret_vault
+        .current_inventory_generation()
+        .map_err(internal)?;
+    let session_id = session.id;
+    let env_snapshot_for_capture = env_identity.clone();
+    let publish_vault = session.secret_vault().clone();
+    let publish_db = session.db.clone();
+    let publish_command_cache = command_cache.clone();
+    let publish_fence = if let Some(handle) = live.as_ref() {
+        handle
+            .coverage_publish_owners(
+                publish_vault.clone(),
+                publish_db.clone(),
+                publish_command_cache.clone(),
+            )
+            .publish_fence()
     } else {
-        let table = match session.persisted_redaction_table().map_err(internal)? {
-            Some(table) => table,
-            None => {
-                let store = session.credential_store().map_err(internal)?;
-                let env: std::collections::HashMap<String, String> = std::env::vars().collect();
-                crate::redact::RedactionTable::build_with_env_and_credential_store(
-                    &extended.redact,
-                    &session.project_root,
+        let config_source = ctx.config_source().clone();
+        let env_baseline = ctx.env_baseline.clone();
+        let session_for_publish = session.clone();
+        crate::redact::coverage_bindings::session_publish_owners_for_session(
+            session_for_publish,
+            publish_vault.clone(),
+            publish_db.clone(),
+            publish_command_cache.clone(),
+            std::sync::Arc::new(move || {
+                Ok(env_baseline
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone())
+            }),
+            std::sync::Arc::new({
+                let config_source = config_source.clone();
+                let project_root = session.project_root.clone();
+                let trust_policy = trust_policy.clone();
+                move || {
+                    config_source
+                        .load_with_trust(&project_root, &trust_policy)
+                        .expect("loading auto-title redact config at publication")
+                        .1
+                        .redact
+                        .clone()
+                }
+            }),
+            std::sync::Arc::new(|| 0),
+        )
+        .publish_fence()
+    };
+    let admission = authority
+        .acquire(
+            key,
+            crate::redact::coverage_authority::CoverageScope::AutoTitle,
+            move || {
+                let capture_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+                    principal: &principal,
+                    owner_authorization_revision: 0,
+                    session_id,
+                    workspace_root: &capture_root,
+                    environment: &env_snapshot_for_capture,
+                    vault_revision,
+                    command_cache: &command_cache,
+                    policy_digest: &policy_digest,
+                    sealed: sealed_binding,
+                    override_revision: 0,
+                    redact_config: &capture_config,
+                };
+                let build = crate::redact::coverage_authority::CoverageBuild::capture(
+                    &capture_config,
+                    &capture_root,
                     &env,
                     &store,
-                )
-                .map_err(internal)?
-            }
-        };
-        std::sync::Arc::new(table)
-    };
+                    &sealed,
+                    &capture_inputs,
+                )?;
+                Ok(build.with_publish_fence(publish_fence))
+            },
+        )
+        .await
+        .map_err(internal)?;
 
-    let title = crate::auto_title::generate_session_title_slug_once(
-        &session,
-        extended,
-        providers,
-        redact,
-        String::new(),
-        crate::session::TitleAction::Explicit,
-    )
-    .await
-    .map_err(|error| {
-        crate::engine::model::log_utility_model_failure("auto_title", &error);
-        ErrorPayload {
+    let title = admission
+        .consume_at_async_sink_preserving_error(|table| {
+            crate::auto_title::generate_session_title_slug_once(
+                &session,
+                extended,
+                providers,
+                std::sync::Arc::new(table),
+                String::new(),
+                crate::session::TitleAction::Explicit,
+            )
+        })
+        .await
+        .map_err(internal)?
+        .map_err(|error| {
+            crate::engine::model::log_utility_model_failure("auto_title", &error);
+            ErrorPayload {
+                code: ErrorCode::BadRequest,
+                // Rig's provider-response display includes provider-owned body and
+                // request-id details. Keep those out of this RPC error channel.
+                message: crate::engine::model::safe_inference_error_detail(&error)
+                    .map_or_else(|| error.to_string(), |safe| safe.marker_string()),
+            }
+        })?
+        .ok_or_else(|| ErrorPayload {
             code: ErrorCode::BadRequest,
-            // Rig's provider-response display includes provider-owned body and
-            // request-id details. Keep those out of this RPC error channel.
-            message: crate::engine::model::safe_inference_error_detail(&error)
-                .map_or_else(|| error.to_string(), |safe| safe.marker_string()),
-        }
-    })?
-    .ok_or_else(|| ErrorPayload {
-        code: ErrorCode::BadRequest,
-        message: "utility model returned no usable title".to_string(),
-    })?;
+            message: "utility model returned no usable title".to_string(),
+        })?;
 
     if !session
         .set_explicit_auto_title_if_untitled(&title)

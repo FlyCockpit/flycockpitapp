@@ -308,6 +308,9 @@ struct Inner {
     /// tests inject fixed configs so no attach/resume/worker path consults
     /// the machine's live layered config.
     config_source: crate::daemon::config_source::ConfigSource,
+    /// Single daemon-owned redaction coverage scheduler/cache. It exists in
+    /// every composition, independently of the optional resource scheduler.
+    coverage_authority: crate::redact::coverage_authority::RedactionCoverageAuthority,
     /// Test-only seam for proving that the start boundary cannot replace the
     /// authority/configuration preflight selected. Production has no callback
     /// between those two phases.
@@ -332,6 +335,12 @@ struct Inner {
     image_generation_dispatch_registry: crate::daemon::image_runtime::DaemonImageDispatchRegistry,
     /// Daemon-owned installed-agent tree (`<pid-file-parent>/agents`).
     daemon_agents_dir: Mutex<Option<PathBuf>>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.coverage_authority.shutdown();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -791,6 +800,42 @@ impl SessionRegistry {
         resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
         config_source: crate::daemon::config_source::ConfigSource,
     ) -> Self {
+        Self::new_with_coverage_mode(
+            db,
+            locks,
+            shutdown,
+            resource_scheduler,
+            config_source,
+            crate::redact::coverage_authority::CoverageOwnerMode::InProcess,
+        )
+    }
+
+    pub(crate) fn new_with_coverage_mode(
+        db: Db,
+        locks: Arc<LockManager>,
+        shutdown: ShutdownSignal,
+        resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+        config_source: crate::daemon::config_source::ConfigSource,
+        coverage_mode: crate::redact::coverage_authority::CoverageOwnerMode,
+    ) -> Self {
+        Self::new_with_coverage_authority(
+            db,
+            locks,
+            shutdown,
+            resource_scheduler,
+            config_source,
+            crate::redact::coverage_authority::RedactionCoverageAuthority::new(coverage_mode),
+        )
+    }
+
+    pub(crate) fn new_with_coverage_authority(
+        db: Db,
+        locks: Arc<LockManager>,
+        shutdown: ShutdownSignal,
+        resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
+        config_source: crate::daemon::config_source::ConfigSource,
+        coverage_authority: crate::redact::coverage_authority::RedactionCoverageAuthority,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 guidance_proposals: Arc::new(tokio::sync::Mutex::new(
@@ -826,6 +871,7 @@ impl SessionRegistry {
                 shutdown,
                 global_bus: Mutex::new(None),
                 config_source,
+                coverage_authority,
                 #[cfg(test)]
                 pre_start_worker_hook: Mutex::new(None),
                 host_capabilities: Mutex::new(None),
@@ -845,6 +891,12 @@ impl SessionRegistry {
                 daemon_agents_dir: Mutex::new(None),
             }),
         }
+    }
+
+    pub(crate) fn coverage_authority(
+        &self,
+    ) -> &crate::redact::coverage_authority::RedactionCoverageAuthority {
+        &self.inner.coverage_authority
     }
 
     pub fn set_daemon_agents_dir(&self, dir: PathBuf) {
@@ -1085,6 +1137,10 @@ impl SessionRegistry {
         crate::sync::lock_or_recover(&self.inner.command_secret_cache).clone()
     }
 
+    pub(crate) fn config_source(&self) -> &crate::daemon::config_source::ConfigSource {
+        &self.inner.config_source
+    }
+
     /// Pre-resolve (execute-once) every command-backed secret referenced by
     /// `providers_cfg`'s headers into the daemon cache, reading argv specs
     /// through the session's OWNER-SCOPED provider store — so only command names
@@ -1222,6 +1278,9 @@ impl SessionRegistry {
             // resolved value stays in daemon memory; only a sanitized status is
             // observable outside the cache.
             cache.ensure_resolved(name, &argv).await;
+        }
+        if !referenced.is_empty() {
+            self.coverage_authority().invalidate();
         }
     }
 
@@ -1701,6 +1760,10 @@ impl SessionRegistry {
                 &trust_policy,
             )?,
         );
+        let project_root = workspace_root_authority
+            .attached_root
+            .canonical_path()
+            .to_path_buf();
         // Use the complete attach-time source chain. In addition to avoiding
         // a later ambient `COCKPIT_CONFIG` redirect, this preserves exact
         // provenance for global provider/model choices so an attached
@@ -2401,22 +2464,140 @@ impl SessionRegistry {
         // lookup). Pre-resolution has already run on the async caller path.
         session.set_command_secret_cache(Some(self.command_secret_cache()));
 
-        // Build per-session redaction table from the immutable session env.
+        // Build per-session redaction coverage from the immutable session env
+        // through the daemon's sole bounded authority. Machine-scoped sealed
+        // values are captured before matcher publication and folded into the
+        // same generation.
         // `credential_store` injects any resolved command-backed output into the
         // store, so the planted token joins the redaction table while the argv
         // spec never does (`command_secret_output_joins_redaction_table`).
-        let redact = RedactionTable::build_with_env_and_credential_store(
-            &extended_cfg.redact,
-            &project_root,
-            env_snapshot.vars(),
-            &session.credential_store()?,
-        )
-        .context("building redaction table")?;
-        let redact = session
-            .with_machine_scoped_sealed_redactions(&redact)
+        let sealed = session
+            .machine_scoped_sealed_redactions()
             .await
-            .context("adding machine-scoped sealed values to redaction table")?;
-        let redact = Arc::new(redact);
+            .context("capturing machine-scoped sealed redaction values")?;
+        let store = session.credential_store()?;
+        let config = extended_cfg.redact.clone();
+        let root = project_root.clone();
+        let env = env_snapshot.vars().clone();
+        let vault_revision = self
+            .secret_vault()?
+            .current_inventory_generation()
+            .map_err(|error| anyhow::anyhow!("reading redaction vault revision: {error}"))?;
+        let sealed_records = session
+            .db
+            .machine_scoped_sealed_redaction_records()
+            .await
+            .context("listing machine-scoped sealed redaction records")?;
+        let sealed_binding =
+            crate::redact::coverage_bindings::sealed_records_binding(&sealed_records);
+        // Coverage provenance describes the redaction policy itself.  The
+        // retained workspace-layer digest has a wider domain (providers and
+        // unrelated settings), so using it here can never match the publish
+        // fence's live redaction-policy digest and makes a fresh worker's
+        // first publication spuriously unavailable.
+        let policy_digest =
+            crate::redact::coverage_bindings::redact_config_digest(&extended_cfg.redact);
+        let command_cache = self.command_secret_cache();
+        let principal = crate::daemon::principal::ClientPrincipal::owner();
+        let coverage_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+            principal: &principal,
+            owner_authorization_revision: trust_revision,
+            session_id,
+            workspace_root: &project_root,
+            environment: &env_snapshot,
+            vault_revision,
+            command_cache: &command_cache,
+            policy_digest: &policy_digest,
+            sealed: sealed_binding,
+            override_revision: 0,
+            redact_config: &extended_cfg.redact,
+        };
+        let coverage_key = coverage_inputs.coverage_key();
+        let capture_policy_digest = policy_digest.clone();
+        let env_snapshot_for_capture = env_snapshot.clone();
+        let publish_vault = session.secret_vault().clone();
+        let publish_db = session.db.clone();
+        let publish_command_cache = command_cache.clone();
+        let env_live = std::sync::Arc::new(std::sync::RwLock::new(env_snapshot.clone()));
+        let publish_project_root = project_root.clone();
+        // Session start publishes the exact retained config snapshot selected
+        // above. A concurrently malformed disk layer must not replace that
+        // last-good snapshot or panic the coverage worker at its publish fence;
+        // the config watcher owns later valid adoption and invalidation.
+        let publish_redact_config = extended_cfg.redact.clone();
+        let publish_fence = crate::redact::coverage_bindings::session_publish_owners(
+            publish_vault.clone(),
+            publish_db.clone(),
+            publish_command_cache.clone(),
+            crate::redact::coverage_bindings::SessionCoveragePublishLive {
+                environment: std::sync::Arc::new({
+                    let env_live = env_live.clone();
+                    move || {
+                        Ok(env_live
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone())
+                    }
+                }),
+                policy_digest: std::sync::Arc::new({
+                    let publish_redact_config = publish_redact_config.clone();
+                    move || {
+                        crate::redact::coverage_bindings::redact_config_digest(
+                            &publish_redact_config,
+                        )
+                    }
+                }),
+                override_revision: std::sync::Arc::new(|| 0),
+                redact_config: std::sync::Arc::new({
+                    let publish_redact_config = publish_redact_config.clone();
+                    move || publish_redact_config.clone()
+                }),
+                workspace_root: std::sync::Arc::new(move || publish_project_root.clone()),
+            },
+        )
+        .publish_fence();
+        let admission = self
+            .coverage_authority()
+            .acquire(
+                coverage_key.clone(),
+                crate::redact::coverage_authority::CoverageScope::SessionStart,
+                move || {
+                    let capture_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+                        principal: &principal,
+                        owner_authorization_revision: trust_revision,
+                        session_id,
+                        workspace_root: &root,
+                        environment: &env_snapshot_for_capture,
+                        vault_revision,
+                        command_cache: &command_cache,
+                        policy_digest: &capture_policy_digest,
+                        sealed: sealed_binding,
+                        override_revision: 0,
+                        redact_config: &config,
+                    };
+                    let build = crate::redact::coverage_authority::CoverageBuild::capture(
+                        &config,
+                        &root,
+                        &env,
+                        &store,
+                        &sealed,
+                        &capture_inputs,
+                    )?;
+                    Ok(build.with_publish_fence(publish_fence))
+                },
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let redact = std::sync::Arc::new(
+            admission
+                .install_table()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+        );
+        session.set_redaction_coverage(
+            self.coverage_authority().clone(),
+            coverage_key,
+            policy_digest,
+        );
 
         // Build the model from providers config. Errors out loud if
         // no provider is configured for the session's active model. Install
@@ -2647,6 +2828,7 @@ impl SessionRegistry {
             self.inner.config_source.clone(),
             handle.clone(),
             config_watch_paths,
+            self.coverage_authority().clone(),
         );
         crate::sync::lock_or_recover(&self.inner.worker_joins).insert(
             session_id,
@@ -2739,6 +2921,10 @@ impl SessionRegistry {
         grace: Duration,
         park_commit_deadline: Duration,
     ) -> DrainOutcome {
+        // Close redaction acquisition before asking session workers to stop.
+        // Existing admissions are revoked immediately; already-running source
+        // captures are joined only by this daemon teardown coordinator below.
+        self.inner.coverage_authority.shutdown();
         // Snapshot + take the join handles. Taking them out of the map means
         // a worker that exits on its own mid-drain (and calls `forget`)
         // can't race us for its handle.
@@ -2914,6 +3100,7 @@ impl SessionRegistry {
         // finding 1) is a forced shutdown, not a clean drain.
         let running_work_clean = phase2_clean && !any_wedged;
         self.forget_generations(drained_generations);
+        self.inner.coverage_authority.shutdown_and_wait().await;
         DrainOutcome {
             running_work_clean,
             park_commit,
@@ -3478,6 +3665,16 @@ mod tests {
             ProvidersConfig::default(),
             ExtendedConfig::default(),
         ))
+    }
+
+    #[tokio::test]
+    async fn session_start_acquires_bound_coverage() {
+        crate::redact::coverage_route_behavior::tests::assert_unbound_tables_support_derived_transforms()
+            .await;
+        crate::redact::coverage_route_behavior::tests::assert_resident_generation_survives_lru_while_admitted()
+            .await;
+        crate::redact::coverage_route_behavior::tests::assert_publish_fence_rejects_stale_owned_revisions()
+            .await;
     }
 
     fn test_registry_with_config_source(

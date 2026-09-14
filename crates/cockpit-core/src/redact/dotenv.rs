@@ -20,15 +20,15 @@ use super::*;
 /// `WalkBuilder::max_depth` (via `walkdir`) counts the root as depth 0, its
 /// direct children as depth 1, and so on — so `Some(8)` yields entries up
 /// to eight levels below `cwd` and stops descending past that.
-pub(super) fn dotenv_max_depth(in_git_repo: bool) -> Option<usize> {
+pub(crate) fn dotenv_max_depth(in_git_repo: bool) -> Option<usize> {
     if in_git_repo { None } else { Some(8) }
 }
 
-pub(super) fn matched_dotenv_paths(
+pub(crate) fn matched_dotenv_paths(
     cwd: &Path,
     patterns: &[String],
     extra: &[PathBuf],
-) -> Vec<PathBuf> {
+) -> Result<Vec<PathBuf>> {
     use ignore::WalkBuilder;
     use ignore::overrides::OverrideBuilder;
 
@@ -40,14 +40,10 @@ pub(super) fn matched_dotenv_paths(
             cwd = %cwd.display(),
             "redaction `.env` walk skipped from unbounded filesystem start; explicit extra dotenv paths are still honored"
         );
-        for p in extra {
-            if p.is_file() {
-                out.push(p.clone());
-            }
-        }
+        collect_explicit_dotenv_paths(extra, &mut out)?;
         out.sort();
         out.dedup();
-        return out;
+        return Ok(out);
     }
 
     // Bound the walk only outside a git repo: inside one we keep the
@@ -84,25 +80,79 @@ pub(super) fn matched_dotenv_paths(
                 // Never descend into the git object store.
                 !(entry.file_type().is_some_and(|t| t.is_dir()) && entry.file_name() == ".git")
             });
-        for entry in builder.build().flatten() {
+        for entry in builder.build() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error)
+                    if error
+                        .io_error()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    // Dotenv sources are optional. A workspace or candidate
+                    // disappearing before discovery means there is no dotenv
+                    // input for this capture; permission and traversal errors
+                    // remain hard failures below.
+                    continue;
+                }
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "dotenv discovery failed during capture: {error}"
+                    ));
+                }
+            };
             if entry.file_type().is_some_and(|t| t.is_file()) {
                 out.push(entry.into_path());
             }
         }
     }
 
-    for p in extra {
-        if p.is_file() {
-            out.push(p.clone());
-        }
-    }
+    collect_explicit_dotenv_paths(extra, &mut out)?;
 
     out.sort();
     out.dedup();
-    out
+    Ok(out)
 }
 
-pub(super) fn dotenv_scan_start_is_unbounded(cwd: &Path) -> bool {
+fn collect_explicit_dotenv_paths(extra: &[PathBuf], out: &mut Vec<PathBuf>) -> Result<()> {
+    for path in extra {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "configured dotenv source is unavailable during capture: {error}"
+                ));
+            }
+            Ok(metadata) if metadata.file_type().is_symlink() => match std::fs::metadata(path) {
+                Ok(target) if target.is_file() => {
+                    std::fs::File::open(path).map_err(|error| {
+                        anyhow::anyhow!(
+                            "configured dotenv source is unavailable during capture: {error}"
+                        )
+                    })?;
+                    out.push(path.clone());
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "configured dotenv source is unavailable during capture: {error}"
+                    ));
+                }
+            },
+            Ok(metadata) if metadata.is_file() => {
+                std::fs::File::open(path).map_err(|error| {
+                    anyhow::anyhow!(
+                        "configured dotenv source is unavailable during capture: {error}"
+                    )
+                })?;
+                out.push(path.clone());
+            }
+            Ok(_) => {}
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn dotenv_scan_start_is_unbounded(cwd: &Path) -> bool {
     if cwd.parent().is_none() {
         return true;
     }
@@ -139,12 +189,29 @@ fn same_path_lexical_or_canonical(a: &Path, b: &Path) -> bool {
 ///
 /// A file that parses as none of these is [`EnvFileScan::Unsupported`].
 pub(super) fn collect_env_file_candidates(path: &Path, user_allowlist: &[String]) -> EnvFileScan {
-    let bytes = match crate::resource_limits::read_for_tool(path) {
+    collect_env_file_candidates_with_fence(path, user_allowlist, || {})
+}
+
+pub(super) fn collect_env_file_candidates_with_fence(
+    path: &Path,
+    user_allowlist: &[String],
+    before_confirm: impl FnOnce(),
+) -> EnvFileScan {
+    let first = match crate::resource_limits::read_for_tool(path) {
         Ok(bytes) => bytes,
         Err(crate::resource_limits::ResourceLimitError::ByteLimit { .. }) => {
             return EnvFileScan::OverLimit;
         }
         Err(_) => return EnvFileScan::Unreadable,
+    };
+    before_confirm();
+    let bytes = match crate::resource_limits::read_for_tool(path) {
+        Ok(bytes) if bytes == first => bytes,
+        Ok(_) => return EnvFileScan::Changed,
+        Err(crate::resource_limits::ResourceLimitError::ByteLimit { .. }) => {
+            return EnvFileScan::OverLimit;
+        }
+        Err(_) => return EnvFileScan::Changed,
     };
     let text = String::from_utf8_lossy(&bytes);
     let display = path.display().to_string();
@@ -437,6 +504,47 @@ mod case_variant_tests {
         assert_eq!(table.scrub("CASETOKENVALUE123"), cfg.placeholder);
         // Capitalized (Title-case first letter of the lowercased form) echo.
         assert_eq!(table.scrub("Casetokenvalue123"), cfg.placeholder);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unreadable_extra_dotenv_path_fails_discovery() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let secret = dir.path().join("blocked.env");
+        std::fs::write(&secret, "X=blocked-secret-value\n").unwrap();
+        let mut perms = std::fs::metadata(&secret).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&secret, perms).unwrap();
+        let result = super::matched_dotenv_paths(dir.path(), &[], std::slice::from_ref(&secret));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn absent_workspace_and_extra_dotenv_are_benign() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let absent_root = dir.path().join("virtual-workspace");
+        let absent_extra = dir.path().join("optional.env");
+        let paths = super::matched_dotenv_paths(
+            &absent_root,
+            &default_dotenv_patterns(),
+            std::slice::from_ref(&absent_extra),
+        )
+        .expect("absent optional dotenv sources are not capture failures");
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn broken_extra_dotenv_symlink_fails_discovery() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let broken = dir.path().join("broken.env");
+        symlink(dir.path().join("missing-target.env"), &broken).unwrap();
+        let result = super::matched_dotenv_paths(dir.path(), &[], std::slice::from_ref(&broken));
+        assert!(result.is_err());
     }
 
     // The narrow `length_exempt` floor is untouched: a short value under a

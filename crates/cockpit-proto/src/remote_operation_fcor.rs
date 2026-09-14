@@ -343,6 +343,7 @@ canonical_unit_enum16!(crate::EnvSnapshotSource, {
     TuiShell = 2,
     TuiProcessFallback = 3,
     ExplicitCli = 4,
+    SessionWorker = 5,
 });
 canonical_unit_enum16!(cockpit_config::config::extended::ApprovalMode, {
     Manual = 1,
@@ -1645,6 +1646,10 @@ mod tests {
         check!(
             "env_snapshot_source.explicit_cli",
             crate::EnvSnapshotSource::ExplicitCli
+        );
+        check!(
+            "env_snapshot_source.session_worker",
+            crate::EnvSnapshotSource::SessionWorker
         );
         check!(
             "approval_mode.manual",

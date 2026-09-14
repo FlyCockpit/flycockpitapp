@@ -294,6 +294,34 @@ pub async fn resolve_workspace_trust_policy_from_db(
     )
 }
 
+/// Resolve trust for a persisted artifact whose workspace may no longer
+/// exist. A missing workspace cannot contribute a project config layer, so an
+/// `IgnoreConfig` policy over its already-persisted lexical root is the
+/// fail-closed historical projection. Other filesystem errors, including a
+/// broken symlink, remain hard failures. Live attach/open paths must continue
+/// to use [`resolve_workspace_trust_policy_from_db`].
+pub async fn resolve_historical_workspace_trust_policy_from_db(
+    db: &crate::db::Db,
+    path: &Path,
+) -> Result<WorkspaceTrustPolicy> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => resolve_workspace_trust_policy_from_db(db, path).await,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let root = lexical_absolute(path);
+            Ok(WorkspaceTrustPolicy {
+                root: TrustRoot {
+                    opened_path: root.clone(),
+                    root,
+                    kind: TrustRootKind::Directory,
+                },
+                mode: WorkspaceTrustMode::IgnoreConfig,
+            })
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("inspecting historical workspace {}", path.display())),
+    }
+}
+
 /// Resolve the policy and its durable generation in one database observation.
 /// Callers that perform asynchronous preflight before publishing a worker or a
 /// replacement snapshot must retain `revision` and re-read it at the final

@@ -41,6 +41,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Cursor, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use rusqlite::Connection;
@@ -422,12 +423,11 @@ pub async fn build_bundle_zip_bytes(
     vault: &crate::secure_key::SecretVault,
     resolver: std::sync::Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
     env: HashMap<String, String>,
+    base_redactor: Arc<RedactionTable>,
 ) -> Result<BundleBytes> {
     let db_for_files = db.clone();
     let target_id = target.session_id;
     let vault = vault.clone();
-    let store =
-        crate::credentials::CredentialStore::from_vault(std::sync::Arc::new(vault.clone()))?;
     // Warm EVERY historical key version before entering the read snapshot, so the
     // in-snapshot protected-history fold can decrypt any bundled session's rows
     // synchronously (the resolver `resolve` is warm-cache-only). Fails closed if
@@ -445,8 +445,8 @@ pub async fn build_bundle_zip_bytes(
             },
             &env,
             Some(&vault),
-            Some(&store),
             Some(resolver.as_ref()),
+            Some(base_redactor.as_ref()),
         )
     })
     .await
@@ -471,11 +471,10 @@ pub async fn build_redacted_transcript_json_bytes(
     vault: &crate::secure_key::SecretVault,
     resolver: std::sync::Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
     env: HashMap<String, String>,
+    base_redactor: Arc<RedactionTable>,
 ) -> Result<Vec<u8>> {
     let target_id = target.session_id;
     let vault = vault.clone();
-    let store =
-        crate::credentials::CredentialStore::from_vault(std::sync::Arc::new(vault.clone()))?;
     crate::redact::protected_redaction_history::warm_all_redaction_key_versions(resolver.as_ref())
         .await?;
     db.read(move |conn| {
@@ -508,12 +507,11 @@ pub async fn build_redacted_transcript_json_bytes(
         // protected-history literals from the same `tx`.
         let export_redactor = export_redaction_table_for_sessions(
             Some(&vault),
-            Some(&store),
             Some(conn),
             &target,
             std::slice::from_ref(&target),
-            &env,
             Some(resolver.as_ref()),
+            base_redactor.as_ref(),
         )?;
         let mut messages_value = serde_json::to_value(&messages)?;
         scrub_export_json_value(&mut messages_value, &export_redactor);
@@ -538,10 +536,11 @@ pub async fn build_redacted_transcript_json_bytes(
 /// by omission: only the local `cockpit export --include-sensitive` command
 /// surface calls this. The daemon RPC (`Request::ExportSessionData`) and the
 /// TUI have no raw option and stay invariantly redacted.
-pub async fn build_bundle_zip_bytes_raw_local(
+pub(crate) async fn build_bundle_zip_bytes_raw_local(
     db: &Db,
     target: &SessionRow,
     include_generated_artifacts: bool,
+    _disposition: crate::redact::coverage_authority::RawExportDisposition,
 ) -> Result<BundleBytes> {
     let db_for_files = db.clone();
     let target_id = target.session_id;
@@ -603,6 +602,7 @@ pub async fn write_bundle_zip(
         vault,
         crate::session::test_redaction_key_resolver(),
         HashMap::new(),
+        Arc::new(RedactionTable::empty()),
     )
     .await?;
 
@@ -625,12 +625,13 @@ pub async fn write_bundle_zip(
 /// as the redacted path. It starts no secure-key actor and rehydrates nothing.
 /// The stderr "raw secrets" warning is emitted by the CLI command surface, not
 /// here.
-pub async fn write_bundle_zip_raw_local(
+pub(crate) async fn write_bundle_zip_raw_local(
     db: &Db,
     target: &SessionRow,
     out_path: &std::path::Path,
     overwrite: bool,
     include_generated_artifacts: bool,
+    disposition: crate::redact::coverage_authority::RawExportDisposition,
 ) -> Result<BundleSummary> {
     if out_path.exists() && !overwrite {
         anyhow::bail!(
@@ -639,7 +640,9 @@ pub async fn write_bundle_zip_raw_local(
         );
     }
 
-    let bundle = build_bundle_zip_bytes_raw_local(db, target, include_generated_artifacts).await?;
+    let bundle =
+        build_bundle_zip_bytes_raw_local(db, target, include_generated_artifacts, disposition)
+            .await?;
 
     if let Some(parent) = out_path.parent()
         && !parent.as_os_str().is_empty()
@@ -667,8 +670,8 @@ fn assemble_bundle_snapshot_conn(
     options: ExportBundleOptions,
     env: &HashMap<String, String>,
     vault: Option<&crate::secure_key::SecretVault>,
-    store: Option<&crate::credentials::CredentialStore>,
     resolver: Option<&dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
+    base_redactor: Option<&RedactionTable>,
 ) -> Result<BundleBytes> {
     assemble_bundle_snapshot_conn_with_after_collect(
         db,
@@ -677,8 +680,8 @@ fn assemble_bundle_snapshot_conn(
         options,
         env,
         vault,
-        store,
         resolver,
+        base_redactor,
         || Ok(()),
     )
 }
@@ -691,8 +694,8 @@ fn assemble_bundle_snapshot_conn_with_after_collect<F>(
     options: ExportBundleOptions,
     env: &HashMap<String, String>,
     vault: Option<&crate::secure_key::SecretVault>,
-    store: Option<&crate::credentials::CredentialStore>,
     resolver: Option<&dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
+    base_redactor: Option<&RedactionTable>,
     after_collect: F,
 ) -> Result<BundleBytes>
 where
@@ -714,7 +717,15 @@ where
     after_collect()?;
 
     let bytes = build_zip_with_options_and_env_conn(
-        db, &tx, &target, &bundle, options, env, vault, store, resolver,
+        db,
+        &tx,
+        &target,
+        &bundle,
+        options,
+        env,
+        vault,
+        resolver,
+        base_redactor,
     )?;
     let summary = BundleSummary {
         session_count: bundle.len(),
@@ -892,6 +903,23 @@ async fn build_zip_with_options_and_env(
     } else {
         None
     };
+    let base_redactor = if options.redacted {
+        let store = store
+            .as_ref()
+            .context("redacted test export requires credential store")?;
+        let root = PathBuf::from(&target.project_root);
+        let extended = crate::config::extended::load_for_cwd(&root);
+        Some(Arc::new(
+            RedactionTable::build_with_env_and_credential_store(
+                &extended.redact,
+                &root,
+                &env,
+                store,
+            )?,
+        ))
+    } else {
+        None
+    };
     let trust_policy = crate::config::trust::current_workspace_trust_policy();
     db.read(move |conn| {
         let build = || {
@@ -903,8 +931,8 @@ async fn build_zip_with_options_and_env(
                 options,
                 &env,
                 vault.as_deref(),
-                store.as_ref(),
                 resolver.as_deref(),
+                base_redactor.as_deref(),
             )
         };
         match trust_policy {
@@ -924,8 +952,8 @@ fn build_zip_with_options_and_env_conn(
     options: ExportBundleOptions,
     env: &HashMap<String, String>,
     vault: Option<&crate::secure_key::SecretVault>,
-    store: Option<&crate::credentials::CredentialStore>,
     resolver: Option<&dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
+    base_redactor: Option<&RedactionTable>,
 ) -> Result<Vec<u8>> {
     let export_redactor = if options.redacted {
         // Non-bypassable default: the enforced table unioned across every
@@ -937,7 +965,15 @@ fn build_zip_with_options_and_env_conn(
         // rehydrated.
         let resolver =
             resolver.context("a redacted export requires a warm redaction key resolver")?;
-        export_redaction_table_for_bundle(vault, store, Some(conn), target, bundle, env, resolver)?
+        let base_redactor = base_redactor.context("redacted export requires bound coverage")?;
+        export_redaction_table_for_bundle(
+            vault,
+            Some(conn),
+            target,
+            bundle,
+            resolver,
+            base_redactor,
+        )?
     } else {
         // Explicit local raw export: a no-op table so every member body and
         // member path is emitted exactly as stored. No journal rehydration and
@@ -2007,45 +2043,33 @@ fn session_required_vault_redaction_json(
 #[allow(clippy::too_many_arguments)]
 fn export_redaction_table_for_bundle(
     vault: Option<&crate::secure_key::SecretVault>,
-    store: Option<&crate::credentials::CredentialStore>,
     conn: Option<&Connection>,
     target: &SessionRow,
     bundle: &[SessionRow],
-    env: &HashMap<String, String>,
     resolver: &dyn crate::redact::protected_redaction_history::RedactionKeyResolver,
+    base_redactor: &RedactionTable,
 ) -> Result<RedactionTable> {
     // The debug bundle folds history IN-SNAPSHOT via the resolver so the folded
     // set equals the assembled set (`bundle` was discovered on the same `conn`).
-    export_redaction_table_for_sessions(vault, store, conn, target, bundle, env, Some(resolver))
+    export_redaction_table_for_sessions(vault, conn, target, bundle, Some(resolver), base_redactor)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn export_redaction_table_for_sessions(
     vault: Option<&crate::secure_key::SecretVault>,
-    store: Option<&crate::credentials::CredentialStore>,
     conn: Option<&Connection>,
     target: &SessionRow,
     sessions: &[SessionRow],
-    env: &HashMap<String, String>,
     resolver: Option<&dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
+    base_redactor: &RedactionTable,
 ) -> Result<RedactionTable> {
-    let cwd = PathBuf::from(&target.project_root);
-    let extended = crate::config::extended::load_for_cwd(&cwd);
     let vault = vault.ok_or_else(|| {
         crate::redact::RedactionTableUnavailable::new(
             "building export redaction table",
             "redacted export requires a session vault",
         )
     })?;
-    let store = store.ok_or_else(|| {
-        crate::redact::RedactionTableUnavailable::new(
-            "building export redaction table",
-            "redacted export requires an opened credential store",
-        )
-    })?;
-    let mut table =
-        RedactionTable::build_with_env_and_credential_store(&extended.redact, &cwd, env, store)
-            .context("building export redaction table")?;
+    let mut table = base_redactor.enforced();
     for session in sessions {
         let json = session_required_vault_redaction_json(vault, conn, session)?;
         // Fail closed: a persisted or vault table that cannot be parsed aborts

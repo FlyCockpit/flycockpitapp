@@ -40,6 +40,7 @@
     "env_snapshot_source.tui_shell": 2,
     "env_snapshot_source.tui_process_fallback": 3,
     "env_snapshot_source.explicit_cli": 4,
+    "env_snapshot_source.session_worker": 5,
     "approval_mode.manual": 1,
     "approval_mode.auto": 2,
     "approval_mode.yolo": 3,

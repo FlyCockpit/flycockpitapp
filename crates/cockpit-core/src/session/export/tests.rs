@@ -7,6 +7,11 @@ use crate::engine::tool::Tool;
 use crate::session::{Session, ToolCallProviderIdentity, ToolCallRow};
 use std::io::Read;
 
+fn raw_export_disposition() -> crate::redact::coverage_authority::RawExportDisposition {
+    crate::redact::coverage_authority::RawExportDisposition::after_owner_local_check(true)
+        .expect("test owner-local authorization")
+}
+
 /// Test seam: seed one inference attempt (ordinal 0) with its immutable body and
 /// advance it to `status`, mirroring the live dispatch→settle split against the
 /// per-attempt `(call_id, ordinal)` schema. Returns `Result` so existing call
@@ -45,6 +50,49 @@ fn trusted_test_policy(root: &Path) -> crate::config::trust::WorkspaceTrustPolic
         },
         mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
     }
+}
+
+async fn build_bundle_zip_bytes(
+    db: &Db,
+    target: &SessionRow,
+    include_generated_artifacts: bool,
+    vault: &crate::secure_key::SecretVault,
+    resolver: std::sync::Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
+    env: HashMap<String, String>,
+) -> Result<BundleBytes> {
+    let store =
+        crate::credentials::CredentialStore::from_vault(std::sync::Arc::new(vault.clone()))?;
+    let root = PathBuf::from(&target.project_root);
+    let extended = crate::config::extended::load_for_cwd(&root);
+    let base =
+        RedactionTable::build_with_env_and_credential_store(&extended.redact, &root, &env, &store)?;
+    super::build_bundle_zip_bytes(
+        db,
+        target,
+        include_generated_artifacts,
+        vault,
+        resolver,
+        env,
+        Arc::new(base),
+    )
+    .await
+}
+
+async fn build_redacted_transcript_json_bytes(
+    db: &Db,
+    target: &SessionRow,
+    vault: &crate::secure_key::SecretVault,
+    resolver: std::sync::Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
+    env: HashMap<String, String>,
+) -> Result<Vec<u8>> {
+    let store =
+        crate::credentials::CredentialStore::from_vault(std::sync::Arc::new(vault.clone()))?;
+    let root = PathBuf::from(&target.project_root);
+    let extended = crate::config::extended::load_for_cwd(&root);
+    let base =
+        RedactionTable::build_with_env_and_credential_store(&extended.redact, &root, &env, &store)?;
+    super::build_redacted_transcript_json_bytes(db, target, vault, resolver, env, Arc::new(base))
+        .await
 }
 
 async fn trusted_build_zip_with_options(
@@ -3562,6 +3610,13 @@ async fn bundle_export_is_one_wal_snapshot_across_all_query_phases() {
     let db_for_files = db.clone();
     let vault = crate::secure_key::vault_for_db(&db).unwrap();
     let store = crate::credentials::CredentialStore::from_vault(vault.clone()).unwrap();
+    let base_redactor = RedactionTable::build_with_env_and_credential_store(
+        &crate::config::extended::RedactConfig::default(),
+        tmp.path(),
+        &test_export_env(),
+        &store,
+    )
+    .unwrap();
     let resolver = crate::session::test_redaction_key_resolver();
     crate::redact::protected_redaction_history::warm_all_redaction_key_versions(resolver.as_ref())
         .await
@@ -3578,8 +3633,8 @@ async fn bundle_export_is_one_wal_snapshot_across_all_query_phases() {
                 },
                 &test_export_env(),
                 Some(vault.as_ref()),
-                Some(&store),
                 Some(resolver.as_ref()),
+                Some(&base_redactor),
                 move || {
                     start_writer_tx
                         .send(())
@@ -5068,7 +5123,7 @@ async fn export_redaction_ignores_config_opt_out() {
     // Explicit raw export of the SAME fixture: the sentinel is present. This is
     // both the precondition proof (the sentinel really reached the artifact) and
     // the distinguishing input (the enforced path had something to scrub).
-    let raw = build_bundle_zip_bytes_raw_local(&db, &target, false)
+    let raw = build_bundle_zip_bytes_raw_local(&db, &target, false, raw_export_disposition())
         .await
         .unwrap();
     let events_raw = read_zip_entry(&raw.bytes, "events.json").unwrap();
@@ -5299,7 +5354,7 @@ async fn redacted_export_scrubs_secret_from_every_member_including_manifest_and_
 
     // RAW export: the secret is present in each member (precondition — proves
     // the members really carry it, so the redacted scan below is non-vacuous).
-    let raw = build_bundle_zip_bytes_raw_local(&db, &target, false)
+    let raw = build_bundle_zip_bytes_raw_local(&db, &target, false, raw_export_disposition())
         .await
         .unwrap();
     assert!(
@@ -5389,7 +5444,7 @@ async fn redacted_export_scrubs_live_env_secret_absent_from_vault_and_journal() 
 
     // RAW export ships everything, so the secret is present (precondition — the
     // event member really carries it, so the redacted scan is non-vacuous).
-    let raw = build_bundle_zip_bytes_raw_local(&db, &target, false)
+    let raw = build_bundle_zip_bytes_raw_local(&db, &target, false, raw_export_disposition())
         .await
         .unwrap();
     assert!(
@@ -5642,8 +5697,24 @@ async fn export_json_key_collision_is_terminal_and_uniform() {
 /// destination through `private_fs::write_private_export_file`
 /// (`write_bundle_zip*`), and the raw path constructs no key resolver / actor.
 #[tokio::test]
-async fn include_sensitive_export_is_explicit_raw_local_and_marked() {
+async fn redacted_export_requires_bound_coverage_and_raw_export_is_typed_owner_only() {
     const SECRET: &str = "RAWLOCAL_EXPORT_SENTINEL_7654321FEDCBA";
+
+    assert!(
+        crate::redact::coverage_authority::RawExportDisposition::after_owner_local_check(false)
+            .is_none(),
+        "a non-owner-local caller cannot construct the raw disposition"
+    );
+    let dispatch = include_str!("../../daemon/server/dispatch.rs");
+    let route = dispatch
+        .split("pub(super) async fn export_session_data(")
+        .nth(1)
+        .and_then(|body| body.split("pub(super) async fn auto_title_request(").next())
+        .expect("export dispatch route");
+    assert!(route.contains("CoverageScope::RedactedExport"));
+    assert!(route.contains("raw export authorization is unavailable"));
+    assert!(route.contains("RawExportDisposition::after_owner_local_check"));
+    assert!(!route.contains("RedactionTable::empty"));
 
     let tmp = tempfile::TempDir::new().unwrap();
     let root = tmp.path().to_string_lossy().to_string();
@@ -5673,9 +5744,16 @@ async fn include_sensitive_export_is_explicit_raw_local_and_marked() {
 
     // Raw path: writes an UNREDACTED archive to the destination.
     let raw_out = tmp.path().join("raw-export.zip");
-    write_bundle_zip_raw_local(&db, &target, &raw_out, false, false)
-        .await
-        .unwrap();
+    write_bundle_zip_raw_local(
+        &db,
+        &target,
+        &raw_out,
+        false,
+        false,
+        raw_export_disposition(),
+    )
+    .await
+    .unwrap();
     assert!(
         raw_out.exists(),
         "raw export file must land at the destination"
@@ -5691,16 +5769,24 @@ async fn include_sensitive_export_is_explicit_raw_local_and_marked() {
 
     // Default path on the same fixture: redacted archive, marked true.
     let red_out = tmp.path().join("redacted-export.zip");
-    write_bundle_zip(
+    let redaction = RedactionTable::empty()
+        .with_forced_literal(
+            SECRET.to_string(),
+            "$test:typed-redacted-export".to_string(),
+        )
+        .unwrap();
+    let redacted_bundle = super::build_bundle_zip_bytes(
         &db,
         &target,
-        &red_out,
-        false,
         false,
         &crate::secure_key::vault_for_db(&db).unwrap(),
+        crate::session::test_redaction_key_resolver(),
+        HashMap::new(),
+        Arc::new(redaction),
     )
     .await
     .unwrap();
+    cockpit_host::private_fs::write_private_export_file(&red_out, &redacted_bundle.bytes).unwrap();
     let red_bytes = std::fs::read(&red_out).unwrap();
     let red_manifest = read_zip_entry(&red_bytes, "manifest.json").unwrap();
     assert!(red_manifest.contains("\"redacted\": true"));
@@ -5715,9 +5801,16 @@ async fn include_sensitive_export_is_explicit_raw_local_and_marked() {
 
     // No-clobber without force is preserved on the raw path.
     assert!(
-        write_bundle_zip_raw_local(&db, &target, &raw_out, false, false)
-            .await
-            .is_err(),
+        write_bundle_zip_raw_local(
+            &db,
+            &target,
+            &raw_out,
+            false,
+            false,
+            raw_export_disposition(),
+        )
+        .await
+        .is_err(),
         "raw export must refuse to overwrite without force",
     );
 }

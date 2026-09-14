@@ -6,7 +6,7 @@ This inventory classifies every production `RedactionTable::scrub` boundary and 
 
 <!-- scrub-inventory:start -->
 - Dispatch: `crates/cockpit-core/src/engine/model/dispatch.rs`, `crates/cockpit-core/src/engine/model/mod.rs`, `crates/cockpit-core/src/engine/model/redact.rs`, `crates/cockpit-core/src/engine/model/outbound_guard.rs`, `crates/cockpit-core/src/engine/model_roles.rs`, `crates/cockpit-core/src/embeddings.rs`, `crates/cockpit-core/src/harness/run.rs`, `crates/cockpit-core/src/knowledge.rs`, `crates/cockpit-core/src/knowledge/dream.rs`, `crates/cockpit-core/src/mcp/builtin.rs`, `crates/cockpit-core/src/skills/auto_select/mod.rs`, `crates/cockpit-core/src/tools/edit.rs`, `crates/cockpit-core/src/tools/skill.rs`, `crates/cockpit-core/src/tools/read.rs`, `crates/cockpit-core/src/tools/recall.rs`, `crates/cockpit-core/src/tools/session_search.rs`, `crates/cockpit-core/src/tools/write.rs`, `crates/cockpit-core/src/tools/mcp_tool.rs`, `crates/cockpit-core/src/engine/agent/tool_dispatch.rs`, `crates/cockpit-core/src/engine/verification/intercept.rs`
-- Client boundary: `apps/cli/src/commands/debug.rs`, `crates/cockpit-core/src/daemon/server/mod.rs`, `crates/cockpit-core/src/daemon/fs_api.rs`
+- Client boundary: `crates/cockpit-core/src/daemon/server/dispatch.rs`, `crates/cockpit-core/src/daemon/server/mod.rs`, `crates/cockpit-core/src/daemon/fs_api.rs`, `crates/cockpit-core/src/redact/coverage_authority.rs`
 - Approval, rules, skills, and sandbox boundary: `crates/cockpit-core/src/approval/policy.rs`, `crates/cockpit-core/src/conversation_rules.rs`, `crates/cockpit-core/src/skills/mod.rs`, `crates/cockpit-core/src/mcp/network.rs`, `crates/cockpit-core/src/mcp/sandbox.rs`
 - Off machine: `crates/cockpit-core/src/session/export/mod.rs`, `crates/cockpit-core/src/daemon/org_sync.rs`, `crates/cockpit-core/src/daemon/remote_audit_upload.rs`
 - Session-worker persist path: `crates/cockpit-core/src/daemon/session_worker/mod.rs`, `crates/cockpit-core/src/daemon/session_worker/run.rs`, `crates/cockpit-core/src/engine/driver/mod.rs`, `crates/cockpit-core/src/engine/rehydrate.rs`, `crates/cockpit-core/src/session/recording.rs`
@@ -34,9 +34,10 @@ This inventory classifies every production `RedactionTable::scrub` boundary and 
 
 ## Client Boundary
 
-- `apps/cli/src/commands/debug.rs`: assembled-context diagnostics are scrubbed and bounded before they are printed to the local client.
+- `crates/cockpit-core/src/daemon/server/dispatch.rs`: daemon-rendered debug context, prediction, and tag projections consume bound coverage before their redacted DTO crosses to a CLI or TUI client; clients never receive matcher material.
 - `crates/cockpit-core/src/daemon/server/mod.rs`: recursively scrubs event JSON strings for non-owner principals at socket forwarding and attach-history egress, including the attach/list history helpers dispatch invokes.
 - `crates/cockpit-core/src/daemon/fs_api.rs`: owner settings projections scrub secret literals to opaque per-occurrence placeholders before typed config leaves the daemon.
+- `crates/cockpit-core/src/redact/coverage_authority.rs`: constructs owner-only unsupported-source diagnostics through a generation-bound table, scrubbing the narrow display path before it can enter the status projection.
 
 ## Approval, rules, skills, and sandbox boundary
 

@@ -128,6 +128,7 @@ pub async fn select_from_explore_fork(
         cwd,
         config,
         slot.clone(),
+        model.redact_table(),
     );
     let mut history = history.to_vec();
     let mut prompt = Message::user(

@@ -98,7 +98,7 @@ fn limits() -> ResourceLimits {
 /// script's final value rendered as JSON text (the only thing that enters
 /// model context), except that printed stdout is returned as a bounded
 /// fallback when the final value is `None`.
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn run(script: &str, cfg: &McpConfig) -> Result<String> {
     let host = HostContext::empty_for_tests();
     run_with_host(script, cfg, &host).await
@@ -198,16 +198,16 @@ async fn run_envelope_with_host_inner(
         inputs.push(host_module_namespace("requests"));
     }
     let tracker = LimitedTracker::new(limits());
-    // Session redaction table for the stdout-fallback truncation: a secret
-    // straddling the truncation boundary must not leave a PARTIAL in the
-    // model lane. Forks without a native-tool context (metadata/seed forks,
-    // tests) carry no registered literals, so the empty-table fallback keeps
-    // their truncation identical to the previous plain behavior.
-    let redact = host
+    // Projection can reach the model lane, so absence of the daemon-bound
+    // native context is a coverage refusal, never an empty matcher fallback.
+    let Some(redact) = host
         .native_tool_ctx
         .as_ref()
         .map(|ctx| ctx.redact.clone())
-        .unwrap_or_else(|| std::sync::Arc::new(crate::redact::RedactionTable::empty()));
+        .or_else(|| host.projection_redact.clone())
+    else {
+        return Err(anyhow::anyhow!("coverage_unavailable"));
+    };
     let mut stdout = String::new();
     let mut envelope = ProjectionEnvelope::default();
     let mut progress = runner
@@ -1894,6 +1894,18 @@ mod tests {
     use super::*;
     use crate::engine::agent::TurnEvent;
     use crate::mcp::config::{DisclosureMode, ServerConfig, Transport};
+
+    #[tokio::test]
+    async fn projection_refuses_without_bound_coverage() {
+        let error = run_envelope_with_host(
+            "emit({'secret': 'coverage-refusal-canary'})",
+            &McpConfig::default(),
+            &HostContext::empty_for_tests().without_projection_coverage(),
+        )
+        .await
+        .expect_err("model projection without bound coverage must refuse");
+        assert_eq!(error.to_string(), "coverage_unavailable");
+    }
 
     async fn network_test_identity(
         ctx: &mut crate::engine::tool::ToolCtx,

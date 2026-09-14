@@ -807,6 +807,26 @@ impl CommandSecretCache {
         }
     }
 
+    /// Opaque daemon-private fingerprint of every cached command-backed secret
+    /// generation. Included in coverage credential bindings so a mint or
+    /// invalidation cannot reuse a stale generation.
+    pub fn coverage_fingerprint(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut names = entries.keys().collect::<Vec<_>>();
+        names.sort();
+        let mut hasher = Sha256::new();
+        hasher.update(b"flycockpit-command-secret-cache-v1\0");
+        for name in names {
+            hasher.update(name.as_bytes());
+            hasher.update(entries[name].generation.to_le_bytes());
+        }
+        hasher.finalize().into()
+    }
+
     /// Run `argv` once, out of band from the cache, returning only a sanitized
     /// status. Used by the owner test-resolve RPC: it proves resolvability
     /// without ever caching or returning the token.

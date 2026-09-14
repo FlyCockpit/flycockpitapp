@@ -845,6 +845,35 @@ describe("cockpit-proto daemon wire schemas", () => {
     ).toBe(false);
   });
 
+  it("redaction projection requests and responses mirror the exact current protocol", () => {
+    expect(clientEnvelopeSchema.parse(requestsFixture.get_redaction_coverage_status)).toEqual(
+      requestsFixture.get_redaction_coverage_status,
+    );
+    expect(clientEnvelopeSchema.parse(requestsFixture.render_input_prediction)).toEqual(
+      requestsFixture.render_input_prediction,
+    );
+    expect(clientEnvelopeSchema.parse(requestsFixture.resolve_tag_preview)).toEqual(
+      requestsFixture.resolve_tag_preview,
+    );
+    expect(responseEnvelopeSchema.parse(responsesFixture.redaction_coverage_status)).toEqual(
+      responsesFixture.redaction_coverage_status,
+    );
+    expect(responseEnvelopeSchema.parse(responsesFixture.input_prediction)).toEqual(
+      responsesFixture.input_prediction,
+    );
+    expect(responseEnvelopeSchema.parse(responsesFixture.tag_preview)).toEqual(
+      responsesFixture.tag_preview,
+    );
+    for (const neighbor of [PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1]) {
+      expect(
+        clientEnvelopeSchema.safeParse({
+          ...requestsFixture.get_redaction_coverage_status,
+          v: neighbor,
+        }).success,
+      ).toBe(false);
+    }
+  });
+
   it("mirrors non-optional session favorite on list and applied receipts", () => {
     expect(PROTOCOL_VERSION).toBe(1);
     const request = {

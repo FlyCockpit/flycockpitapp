@@ -74,6 +74,45 @@ impl TestSessionRowOptions {
 }
 
 impl Session {
+    fn with_test_redaction_coverage(self) -> Result<Self> {
+        let command_cache = crate::secret_command::CommandSecretCache::with_subprocess_executor();
+        self.set_command_secret_cache(Some(command_cache.clone()));
+        let config = crate::config::extended::RedactConfig::default();
+        let policy_digest = crate::redact::coverage_bindings::redact_config_digest(&config);
+        let environment = crate::env_snapshot::EnvSnapshot::new(
+            cockpit_proto::EnvSnapshotSource::SessionWorker,
+            Default::default(),
+        );
+        let vault_revision = self
+            .secret_vault()
+            .current_inventory_generation()
+            .map_err(|error| anyhow::anyhow!("reading test redaction vault revision: {error}"))?;
+        let principal = crate::daemon::principal::ClientPrincipal::owner();
+        let inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+            principal: &principal,
+            owner_authorization_revision: 0,
+            session_id: self.id,
+            workspace_root: &self.project_root,
+            environment: &environment,
+            vault_revision,
+            command_cache: &command_cache,
+            policy_digest: &policy_digest,
+            sealed: crate::redact::coverage_bindings::sealed_records_binding(&[]),
+            override_revision: 0,
+            redact_config: &config,
+        };
+        self.set_redaction_coverage(
+            crate::redact::coverage_authority::RedactionCoverageAuthority::default(),
+            inputs.coverage_key(),
+            policy_digest,
+        );
+        Ok(self)
+    }
+
+    pub(crate) fn clear_redaction_coverage_for_test(&self) {
+        *self.redaction_coverage.lock().unwrap() = None;
+    }
+
     /// Build and insert a durable row that can be consumed by
     /// [`Session::resume_for_test`]. Raw-row fixtures use this boundary so the
     /// writer and resume validation share one synthetic project identity.
@@ -145,7 +184,8 @@ impl Session {
     ) -> Result<Self> {
         let vault = crate::secure_key::vault_for_db(&db)
             .map_err(|e| anyhow::anyhow!("opening test session vault: {e}"))?;
-        Self::create_with_test_workspace_root(db, project_root, active_agent, resolver, vault)
+        Self::create_with_test_workspace_root(db, project_root, active_agent, resolver, vault)?
+            .with_test_redaction_coverage()
     }
 
     pub fn create_deferred_for_test(
@@ -162,7 +202,8 @@ impl Session {
             active_agent,
             resolver,
             vault,
-        )
+        )?
+        .with_test_redaction_coverage()
     }
 
     pub fn create_assistant_deferred_for_test(
@@ -181,7 +222,8 @@ impl Session {
             assistant_name,
             resolver,
             vault,
-        )
+        )?
+        .with_test_redaction_coverage()
     }
 
     pub fn create_fork_for_test(
@@ -198,7 +240,8 @@ impl Session {
             fork_point_turn_id,
             resolver,
             vault,
-        )
+        )?
+        .with_test_redaction_coverage()
     }
 
     pub fn resume_for_test(
@@ -208,7 +251,9 @@ impl Session {
     ) -> Result<Option<Self>> {
         let vault = crate::secure_key::vault_for_db(&db)
             .map_err(|e| anyhow::anyhow!("opening test session vault: {e}"))?;
-        Self::resume_with_test_workspace_root(db, session_id, resolver, vault)
+        Self::resume_with_test_workspace_root(db, session_id, resolver, vault)?
+            .map(Self::with_test_redaction_coverage)
+            .transpose()
     }
 
     pub fn resume_strict_for_test(
@@ -218,6 +263,8 @@ impl Session {
     ) -> Result<Option<Self>> {
         let vault = crate::secure_key::vault_for_db(&db)
             .map_err(|e| anyhow::anyhow!("opening test session vault: {e}"))?;
-        Self::resume_with_strict_test_workspace_root(db, session_id, resolver, vault)
+        Self::resume_with_strict_test_workspace_root(db, session_id, resolver, vault)?
+            .map(Self::with_test_redaction_coverage)
+            .transpose()
     }
 }

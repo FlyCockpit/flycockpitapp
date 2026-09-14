@@ -75,6 +75,48 @@ async fn admit_image_ingress_via_daemon(
     })
 }
 
+#[cfg(test)]
+mod daemon_tag_coverage_tests {
+    #[test]
+    fn tag_inline_requires_bound_coverage() {
+        let tui = include_str!("input.rs");
+        let daemon = include_str!("../../../../cockpit-core/src/daemon/server/dispatch.rs");
+        assert!(!tui.contains(&["RedactionTable", "build"].join("::")));
+        assert!(!tui.contains(&["RedactionTable", "empty"].join("::")));
+        let submission = daemon
+            .split("async fn handle_send_user_message_v2(")
+            .nth(1)
+            .and_then(|body| body.split("async fn ").next())
+            .expect("V2 submission route");
+        assert!(submission.contains("CoverageScope::TagInline"));
+        assert!(submission.contains("admission.use_at_sink"));
+        assert!(submission.contains("expand_tags_with_policy"));
+    }
+
+    #[test]
+    fn no_tag_policy_cannot_admit_submission_without_coverage() {
+        let daemon = include_str!("../../../../cockpit-core/src/daemon/server/dispatch.rs");
+        let submission = daemon
+            .split("async fn handle_send_user_message_v2(")
+            .nth(1)
+            .and_then(|body| body.split("async fn ").next())
+            .expect("V2 submission route");
+        assert!(
+            submission.contains("request.tag_expansions.is_empty() && request.text.contains('@')")
+        );
+        assert!(!submission.contains(&["RedactionTable", "empty"].join("::")));
+        assert!(submission.contains("accept_message_with_attachments"));
+        assert!(
+            submission
+                .find("CoverageScope::TagInline")
+                .expect("coverage acquisition")
+                < submission
+                    .find("accept_message_with_attachments")
+                    .expect("durable acceptance")
+        );
+    }
+}
+
 impl App {
     /// Replay a rapid-paste candidate through the composer route that owned
     /// it at intake, without allowing a subsequently opened pane/modal to
@@ -2688,38 +2730,10 @@ impl App {
             self.show_toast(message, super::ToastKind::Error);
             return false;
         }
-        // The `@`-tag inline expansion truncates inlined file/dir content at
-        // the daemon-owned line/byte caps, and those cuts must elide a
-        // boundary-straddling secret under the real session table (issue
-        // #294) — the downstream §7 whole-value scrub cannot recover a
-        // truncation partial. Build the table BEFORE the fence owns durable
-        // submit state and fail CLOSED when a tag could be present and the
-        // build errors: an empty-table fallback would silently disable the
-        // boundary elision while the submission continued (the daemon
-        // likewise refuses to run a session whose table cannot be built).
-        // A submission with no `@` candidate cannot inline (or truncate)
-        // anything, so it neither needs nor builds the table; the compact
-        // handoff path never expands tags either.
+        // Quote tracked tags, but leave expansion to the daemon. The daemon
+        // owns both source authority and truncation-safe redaction; this
+        // client never constructs or receives a matcher.
         let quoted = cockpit_core::tags::quote_tracked_tags(&paste_wire, &self.accepted_tags);
-        let tag_redact = if self.pending_compact.is_none() && quoted.contains('@') {
-            let (extended, _) = cockpit_core::auto_title::load_configs_for(&self.launch.cwd);
-            match cockpit_core::redact::RedactionTable::build(&extended.redact, &self.launch.cwd) {
-                Ok(table) => Some(std::sync::Arc::new(table)),
-                Err(error) => {
-                    let _ = self.submission_order.complete(fence_sequence);
-                    self.show_toast(
-                        format!(
-                            "not sent: redaction table for @-tag expansion failed to build \
-                             ({error}); remove the @-tags or fix the redaction config"
-                        ),
-                        super::ToastKind::Error,
-                    );
-                    return false;
-                }
-            }
-        } else {
-            None
-        };
         // Only handles embedded in the wire submission cross the reference
         // boundary. On a no-vision model the registry renders text notes, so
         // those admitted drafts remain disposal-owned by the frontend.
@@ -2826,32 +2840,12 @@ impl App {
         // history — jump back to the live tail so they see the reply.
         self.pin_chat_to_tail();
 
-        // Expand any `@path[:range]` tags into fenced file/dir blocks
-        // before dispatch (GOALS §1e). The displayed user message keeps
-        // the original `@`-form; only the wire payload gets inlined.
-        // Autocompleted spaced paths are quoted on this submit copy (the
-        // `quoted` computed before the fence) so the scanner reads them as
-        // one token (the composer stays clean). Tag expansion runs over
-        // the paste-expanded wire so a tag and a pasted block can coexist
-        // in one message.
-        let mut allow = cockpit_config::extended::resolve_gitignore_allow(&self.launch.cwd);
-        allow.extend(self.gitignore_session_allow.clone());
-        // Tag caps are daemon-owned agent policy. The TUI expands with the
-        // Standard profile and never resolves agent definitions from disk.
-        // `tag_redact` was built before the fence took durable submit
-        // state, failing closed when a tag could be present; when no `@`
-        // candidate is present the expansion cannot inline (or truncate)
-        // anything, so an empty table is never a fail-open truncation
-        // surface here.
-        let tag_policy = cockpit_core::tags::TagPolicy::new_for_caps(
-            &self.launch.cwd,
-            allow,
-            cockpit_core::tags::TagInlineCaps::STANDARD,
-            tag_redact.unwrap_or_else(|| {
-                std::sync::Arc::new(cockpit_core::redact::RedactionTable::empty())
-            }),
-        );
-        let expanded = cockpit_core::tags::expand_tags_with_policy(&quoted, &tag_policy);
+        // The accepted V2 submission expands this text inside daemon dispatch
+        // under a bound one-operation coverage lease.
+        let expanded = cockpit_core::tags::ExpandResult {
+            wire: quoted,
+            expansions: Vec::new(),
+        };
         // Attach any buffered `/git` blocks to this message's wire text
         // (GOALS §1l). The displayed user message keeps the original
         // text (wire/user split); only the agent-bound wire carries the

@@ -1275,8 +1275,14 @@ impl Session {
         allow_unbound_test_fixture_project_id: bool,
     ) -> Result<Self> {
         let project_root = if initialize_workspace_scratch {
-            canonical_workspace_root(&project_root)
-                .context("canonicalizing persisted session workspace root")?
+            match std::fs::symlink_metadata(&project_root) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => project_root,
+                Err(error) => {
+                    return Err(error).context("inspecting persisted session workspace root");
+                }
+                Ok(_) => canonical_workspace_root(&project_root)
+                    .context("canonicalizing persisted session workspace root")?,
+            }
         } else {
             // Test-support project ids are derived from a stable path spelling
             // rather than a host directory identity, and are never published
@@ -1445,6 +1451,7 @@ impl Session {
             tool_media_authority: Mutex::new(None),
             profile_utility_model_resolver: Mutex::new(None),
             command_secret_cache: Mutex::new(None),
+            redaction_coverage: Mutex::new(None),
             process_containment: Mutex::new(None),
             redaction_key_resolver: resolver,
             allow_unjournaled_inference: std::sync::atomic::AtomicBool::new(false),
@@ -1826,6 +1833,43 @@ pub(crate) fn host_shim_bin_dir_for_data_dir(data_dir: &Path, session_id: Uuid) 
 #[cfg(test)]
 mod vault_unification_tests {
     use super::*;
+
+    #[test]
+    fn empty_custody_initialization_cannot_admit_egress() {
+        let lifecycle = include_str!("lifecycle.rs");
+        let custody = lifecycle
+            .split("pub(crate) fn persist_empty_redaction_table_on_conn(")
+            .nth(1)
+            .and_then(|body| body.split("/// Create empty vault custody").next())
+            .expect("empty custody initializer");
+        assert!(custody.contains(") -> Result<()>"));
+        assert!(custody.contains("persist_redaction_table_to_vault_on_conn"));
+        for forbidden in [
+            "CoverageAdmission",
+            "RedactionCoverageGeneration",
+            "use_at_sink",
+        ] {
+            assert!(!custody.contains(forbidden));
+        }
+        let production_lifecycle = lifecycle
+            .split("mod vault_unification_tests")
+            .next()
+            .expect("production lifecycle source");
+        assert_eq!(
+            production_lifecycle
+                .matches("persist_empty_redaction_table_on_conn(")
+                .count(),
+            2,
+            "empty custody may only be declared and called by lifecycle initialization"
+        );
+        let import = include_str!("import.rs");
+        assert_eq!(
+            import
+                .matches("persist_empty_redaction_table_on_conn(")
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn redaction_table_not_plaintext_in_sessions_column() {

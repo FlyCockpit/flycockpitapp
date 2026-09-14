@@ -1375,7 +1375,12 @@ impl SessionWorkerHandle {
             .env_overlay
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *overlay = vars;
+        if *overlay != vars {
+            *overlay = vars;
+            if let Some((authority, key, _policy_digest)) = self.session.redaction_coverage() {
+                authority.invalidate_key(&key);
+            }
+        }
     }
 
     /// Snapshot the authenticated session environment for daemon-owned
@@ -1911,6 +1916,160 @@ impl SessionWorkerHandle {
 
     pub fn redaction_table(&self) -> Arc<RedactionTable> {
         current_redaction(&self.redaction)
+    }
+
+    pub(crate) fn coverage_publish_owners(
+        &self,
+        vault: std::sync::Arc<crate::secure_key::SecretVault>,
+        db: cockpit_db::Db,
+        command_cache: std::sync::Arc<crate::secret_command::CommandSecretCache>,
+    ) -> crate::redact::coverage_bindings::SessionCoveragePublishOwners {
+        use crate::redact::coverage_bindings::{
+            SessionCoveragePublishLive, session_publish_owners,
+        };
+        let config_snapshot = self.config_snapshot.clone();
+        let env_overlay = self.env_overlay.clone();
+        let project_root = self.project_root.clone();
+        session_publish_owners(
+            vault,
+            db,
+            command_cache,
+            SessionCoveragePublishLive {
+                environment: std::sync::Arc::new(move || {
+                    Ok(crate::env_snapshot::EnvSnapshot::new(
+                        cockpit_proto::EnvSnapshotSource::SessionWorker,
+                        env_overlay
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone(),
+                    ))
+                }),
+                policy_digest: std::sync::Arc::new({
+                    let config_snapshot = config_snapshot.clone();
+                    move || {
+                        crate::redact::coverage_bindings::redact_config_digest(
+                            &config_snapshot
+                                .read()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .extended
+                                .redact,
+                        )
+                    }
+                }),
+                override_revision: std::sync::Arc::new(|| 0),
+                redact_config: std::sync::Arc::new({
+                    let config_snapshot = config_snapshot.clone();
+                    move || {
+                        config_snapshot
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .extended
+                            .redact
+                            .clone()
+                    }
+                }),
+                workspace_root: std::sync::Arc::new(move || project_root.clone()),
+            },
+        )
+    }
+
+    /// Acquire the session's daemon-bound coverage for one immediate sink.
+    /// This is the common route for utility inference, tag rendering, debug
+    /// projection, and other attached operations that do not run through the
+    /// main worker submission refresh.
+    pub(crate) async fn acquire_redaction_coverage(
+        &self,
+        purpose: crate::redact::coverage_authority::CoverageScope,
+    ) -> anyhow::Result<crate::redact::coverage_authority::CoverageAdmission> {
+        let (authority, installed_key, _installed_policy_digest) = self
+            .session
+            .redaction_coverage()
+            .ok_or_else(|| anyhow::anyhow!("coverage_unavailable"))?;
+        let config = self.config_snapshot().extended.redact.clone();
+        let policy_digest = crate::redact::coverage_bindings::redact_config_digest(&config);
+        let root = self.project_root.clone();
+        let environment = crate::env_snapshot::EnvSnapshot::new(
+            cockpit_proto::EnvSnapshotSource::SessionWorker,
+            self.env_overlay_snapshot(),
+        );
+        let sealed_records = self
+            .session
+            .db
+            .machine_scoped_sealed_redaction_records()
+            .await?;
+        let sealed_binding =
+            crate::redact::coverage_bindings::sealed_records_binding(&sealed_records);
+        let principal = crate::daemon::principal::ClientPrincipal::owner();
+        let trust_revision = self.current_trust_revision();
+        let session_id = self.session.id;
+        let command_cache = self
+            .session
+            .command_secret_cache()
+            .ok_or_else(|| anyhow::anyhow!("coverage_unavailable"))?;
+        let vault_revision = self
+            .session
+            .secret_vault()
+            .current_inventory_generation()
+            .map_err(|error| anyhow::anyhow!("reading redaction vault revision: {error}"))?;
+        let current_key = crate::redact::coverage_bindings::SessionCoverageInputs {
+            principal: &principal,
+            owner_authorization_revision: trust_revision,
+            session_id,
+            workspace_root: &root,
+            environment: &environment,
+            vault_revision,
+            command_cache: &command_cache,
+            policy_digest: &policy_digest,
+            sealed: sealed_binding,
+            override_revision: 0,
+            redact_config: &config,
+        }
+        .coverage_key();
+        let key = installed_key.with_current_owned_revisions(&current_key);
+        let store = self.session.credential_store()?;
+        let sealed = self.session.machine_scoped_sealed_redactions().await?;
+        let env = environment.vars().clone();
+        let env_snapshot_for_capture = environment.clone();
+        let publish_vault = self.session.secret_vault().clone();
+        let publish_db = self.session.db.clone();
+        let publish_command_cache = command_cache.clone();
+        let publish_fence = self
+            .coverage_publish_owners(publish_vault, publish_db, publish_command_cache)
+            .publish_fence();
+        let capture_policy_digest = policy_digest.clone();
+        let admission = authority
+            .acquire(key.clone(), purpose, move || {
+                let capture_inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+                    principal: &principal,
+                    owner_authorization_revision: trust_revision,
+                    session_id,
+                    workspace_root: &root,
+                    environment: &env_snapshot_for_capture,
+                    vault_revision,
+                    command_cache: &command_cache,
+                    policy_digest: &capture_policy_digest,
+                    sealed: sealed_binding,
+                    override_revision: 0,
+                    redact_config: &config,
+                };
+                let build = crate::redact::coverage_authority::CoverageBuild::capture(
+                    &config,
+                    &root,
+                    &env,
+                    &store,
+                    &sealed,
+                    &capture_inputs,
+                )?;
+                Ok(build.with_publish_fence(publish_fence))
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        // The operation boundary has awaited a complete, fenced publication;
+        // advertise that generation before serving the sink so later
+        // mutations revoke the current key rather than a stale startup key.
+        self.session
+            .set_redaction_coverage(authority, key, policy_digest);
+        Ok(admission)
     }
 
     /// Delete a sealed value. Reached only from the daemon's `owner_only`

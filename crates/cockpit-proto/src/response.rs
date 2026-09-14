@@ -95,6 +95,9 @@ pub enum Response {
     /// whose effects flow back as events (`SendUserMessage`,
     /// `CancelTurn`, `ResolveInterrupt`, …).
     Ack,
+    RedactionCoverageStatus(crate::RedactionCoverageStatusProjection),
+    InputPrediction(crate::InputPredictionProjection),
+    TagPreview(crate::TagPreviewProjection),
     OnboardingBootstrapSnapshot(Option<crate::OnboardingBootstrapSnapshot>),
     LockedBootstrapHello(crate::LockedBootstrapHello),
     OnboardingTransition(crate::OnboardingTransitionResult),
@@ -1669,6 +1672,9 @@ macro_rules! response_variants {
     ($with_variants:ident $(, $context:ident)*) => {
         $with_variants! { ($($context),*) [
             (Response::Ack, "ack");
+            (Response::RedactionCoverageStatus(..), "redaction_coverage_status");
+            (Response::InputPrediction(..), "input_prediction");
+            (Response::TagPreview(..), "tag_preview");
             (Response::OnboardingBootstrapSnapshot(..), "onboarding_bootstrap_snapshot");
             (Response::LockedBootstrapHello(..), "locked_bootstrap_hello");
             (Response::OnboardingTransition(..), "onboarding_transition");

@@ -85,7 +85,12 @@ impl std::fmt::Display for RedactionTableUnavailable {
 impl std::error::Error for RedactionTableUnavailable {}
 
 mod command_output;
+pub(crate) mod coverage_authority;
+pub(crate) mod coverage_bindings;
 mod dotenv;
+pub(super) use dotenv::matched_dotenv_paths;
+#[cfg(test)]
+pub(crate) use dotenv::{dotenv_max_depth, dotenv_scan_start_is_unbounded};
 mod protected;
 pub(crate) mod protected_redaction_history;
 // The production key resolver is wired into the daemon / registry / Session
@@ -216,6 +221,13 @@ pub enum Replacement {
 }
 
 impl Replacement {
+    fn retained_allocation_bytes(&self) -> usize {
+        match self {
+            Self::Generic => 0,
+            Self::Sealed { value_id } => value_id.capacity(),
+        }
+    }
+
     /// Resolve this descriptor to its replacement text against a placeholder.
     fn render(&self, placeholder: &str) -> String {
         match self {
@@ -306,6 +318,13 @@ impl EntryClass {
         match self {
             EntryClass::Ordinary { origin, .. } => origin.clone(),
             EntryClass::Sealed(identity) => sealed_identity_origin(identity),
+        }
+    }
+
+    fn retained_origin_allocation_bytes(&self) -> usize {
+        match self {
+            EntryClass::Ordinary { origin, .. } => origin.capacity(),
+            EntryClass::Sealed(identity) => identity.retained_heap_bytes(),
         }
     }
 
@@ -413,7 +432,7 @@ impl RedactionEntry {
 
 #[cfg(test)]
 use self::dotenv::*;
-use self::dotenv::{collect_env_file_candidates, consume_marked_value, matched_dotenv_paths};
+use self::dotenv::{collect_env_file_candidates, consume_marked_value};
 use self::protected::{ProtectedPaths, is_existing_absolute_path};
 use self::ssh::collect_ssh_key_candidates;
 #[cfg(test)]
@@ -1061,6 +1080,8 @@ pub struct RedactionTable {
     protected: ProtectedPaths,
     /// Forced-secret origins that intentionally override protected paths.
     protected_path_conflicts: Vec<String>,
+    /// When set, every scrub revalidates the admitting generation before egress.
+    coverage_binding: Option<coverage_authority::CoverageTableBinding>,
     /// Test-only fault injection: when set, [`Self::enforced_checked`] returns
     /// an error, so a caller's fail-closed-before-side-effect path (e.g. the
     /// external-harness runner constructing its scrub view before spawning a
@@ -1232,26 +1253,42 @@ impl RedactionTable {
         }
 
         if cfg.scan_dotenv {
-            for path in matched_dotenv_paths(cwd, &cfg.dotenv_patterns, &cfg.extra_dotenv_paths) {
-                match collect_env_file_candidates(&path, &cfg.allowlist) {
+            let discovered =
+                matched_dotenv_paths(cwd, &cfg.dotenv_patterns, &cfg.extra_dotenv_paths)?;
+            for path in &discovered {
+                match collect_env_file_candidates(path, &cfg.allowlist) {
                     EnvFileScan::Candidates(file_entries) => {
                         for entry in file_entries {
                             candidates.push(entry);
                         }
                     }
-                    EnvFileScan::Unsupported => unsupported_files.push(path),
-                    EnvFileScan::Unreadable => {}
+                    EnvFileScan::Unsupported => unsupported_files.push(path.clone()),
+                    EnvFileScan::Unreadable => {
+                        return Err(RedactionSourceUnreadableError { path: path.clone() }.into());
+                    }
                     EnvFileScan::OverLimit => {
-                        return Err(EnvFileOverLimitError { path }.into());
+                        return Err(EnvFileOverLimitError { path: path.clone() }.into());
+                    }
+                    EnvFileScan::Changed => {
+                        return Err(RedactionSourceChangedError.into());
                     }
                 }
+            }
+            // Re-enumerate after every discovered source has been read and
+            // confirmed. A matching source created, removed, or renamed during
+            // capture must refuse this generation rather than publish coverage
+            // for only one side of the mutable directory view.
+            if discovered
+                != matched_dotenv_paths(cwd, &cfg.dotenv_patterns, &cfg.extra_dotenv_paths)?
+            {
+                return Err(RedactionSourceChangedError.into());
             }
         }
 
         // Private SSH keys: each is registered as a forced (non-prunable)
         // secret — key material must never be dropped by the prune step.
         if cfg.scan_ssh_keys {
-            for (value, origin) in collect_ssh_key_candidates(cfg.ssh_key_dir.as_deref()) {
+            for (value, origin) in collect_ssh_key_candidates(cfg.ssh_key_dir.as_deref())? {
                 candidates.push(Candidate::forced(value, origin, true));
             }
         }
@@ -1431,6 +1468,7 @@ impl RedactionTable {
                 unsupported_files,
                 protected,
                 protected_path_conflicts,
+                coverage_binding: None,
                 #[cfg(test)]
                 fail_enforced_view: false,
             });
@@ -1468,6 +1506,7 @@ impl RedactionTable {
             unsupported_files,
             protected,
             protected_path_conflicts,
+            coverage_binding: None,
             #[cfg(test)]
             fail_enforced_view: false,
         })
@@ -1481,13 +1520,29 @@ impl RedactionTable {
         unsupported_files.sort();
         unsupported_files.dedup();
         let protected = self.protected.union(&other.protected);
-        Self::from_redaction_entries(
+        let mut merged = Self::from_redaction_entries(
             entries,
             self.placeholder.clone(),
             self.disabled && other.disabled,
             unsupported_files,
             protected,
-        )
+        )?;
+        merged.coverage_binding = match (&self.coverage_binding, &other.coverage_binding) {
+            (Some(left), Some(right)) => match left.binding_ordering(right) {
+                Some(std::cmp::Ordering::Equal) => Some(left.clone()),
+                Some(std::cmp::Ordering::Greater) => Some(left.clone()),
+                Some(std::cmp::Ordering::Less) => Some(right.clone()),
+                None => anyhow::bail!("coverage binding mismatch across union operands"),
+            },
+            // Unbound operands are monotonic additions: persisted historical
+            // tables, protected-history literals, and freshly parsed approved
+            // files can only add scrub candidates. They therefore adopt the
+            // bound operand's generation without weakening its coverage. Two
+            // bound operands are handled above and remain lineage-checked.
+            (Some(binding), None) | (None, Some(binding)) => Some(binding.clone()),
+            (None, None) => None,
+        };
+        Ok(merged)
     }
 
     /// Add one caller-supplied ordinary literal to this table.  Sealed-value
@@ -1502,13 +1557,15 @@ impl RedactionTable {
             origin,
             OrdinarySource::ContainedLeak,
         ));
-        Self::from_redaction_entries(
+        let mut table = Self::from_redaction_entries(
             entries,
             self.placeholder.clone(),
             self.disabled,
             self.unsupported_files.clone(),
             self.protected.clone(),
-        )
+        )?;
+        table.coverage_binding = self.coverage_binding.clone();
+        Ok(table)
     }
 
     /// Add one caller-supplied **sealed** literal, carrying its canonical typed
@@ -1522,13 +1579,15 @@ impl RedactionTable {
     ) -> Result<Self> {
         let mut entries = self.entries.clone();
         entries.push(RedactionEntry::sealed(value, identity));
-        Self::from_redaction_entries(
+        let mut table = Self::from_redaction_entries(
             entries,
             self.placeholder.clone(),
             self.disabled,
             self.unsupported_files.clone(),
             self.protected.clone(),
-        )
+        )?;
+        table.coverage_binding = self.coverage_binding.clone();
+        Ok(table)
     }
 
     /// Produce an egress-time derived table where sealed entries whose typed
@@ -1602,6 +1661,7 @@ impl RedactionTable {
             unsupported_files: self.unsupported_files.clone(),
             protected: self.protected.clone(),
             protected_path_conflicts: self.protected_path_conflicts.clone(),
+            coverage_binding: self.coverage_binding.clone(),
             #[cfg(test)]
             fail_enforced_view: self.fail_enforced_view,
         }
@@ -1627,6 +1687,9 @@ impl RedactionTable {
                     Vec::new(),
                     self.protected.clone(),
                 )?);
+            }
+            EnvFileScan::Changed => {
+                return Err(RedactionSourceChangedError.into());
             }
         };
         let mut entries: Vec<(String, String, OrdinarySource)> = Vec::new();
@@ -1746,6 +1809,14 @@ impl RedactionTable {
     /// no-table-or-disabled path returns a borrowed input, and a configured
     /// table with no match also avoids allocating.
     pub fn scrub_cow<'a>(&self, body: &'a str) -> Cow<'a, str> {
+        if self.coverage_binding_stale() {
+            if body.is_empty() {
+                return Cow::Borrowed(body);
+            }
+            // A stale generation-bound table must not silently substitute the
+            // whole payload; callers holding an admission lease must refuse.
+            return Cow::Owned(self.placeholder.clone());
+        }
         // The config-level opt-out (`redact.enabled = false`) suppresses
         // substitution even though the entries are present. Only routes
         // entitled to honor the opt-out ever hold a table in this state;
@@ -1853,6 +1924,61 @@ impl RedactionTable {
         self.disabled || self.matcher.is_none()
     }
 
+    /// Measured private heap accounting for one immutable authority artifact.
+    /// Uses the entry heap plus each automaton's library-reported
+    /// [`aho_corasick::AhoCorasick::memory_usage`]. This value never leaves the
+    /// daemon and is not a source or candidate fingerprint.
+    pub(super) fn measured_immutable_artifact_bytes(&self) -> usize {
+        let entry_bytes = self
+            .entries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<RedactionEntry>())
+            .saturating_add(self.entries.iter().fold(0usize, |total, entry| {
+                total
+                    .saturating_add(entry.value.capacity())
+                    .saturating_add(entry.class.retained_origin_allocation_bytes())
+                    .saturating_add(entry.replacement.retained_allocation_bytes())
+            }));
+        let automaton_bytes = self
+            .matcher
+            .as_ref()
+            .map(|matcher| matcher.memory_usage())
+            .unwrap_or(0)
+            .saturating_add(
+                self.overlap_matcher
+                    .as_ref()
+                    .map(|matcher| matcher.memory_usage())
+                    .unwrap_or(0),
+            );
+        let unsupported_path_bytes = self
+            .unsupported_files
+            .capacity()
+            .saturating_mul(std::mem::size_of::<PathBuf>())
+            .saturating_add(
+                self.unsupported_files
+                    .iter()
+                    .map(|path| path.as_os_str().len())
+                    .sum::<usize>(),
+            );
+        let conflict_string_bytes = self
+            .protected_path_conflicts
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_add(
+                self.protected_path_conflicts
+                    .iter()
+                    .map(|value| value.capacity())
+                    .sum::<usize>(),
+            );
+        let protected_path_bytes = self.protected.measured_retained_bytes();
+        entry_bytes
+            .saturating_add(automaton_bytes)
+            .saturating_add(self.placeholder.capacity())
+            .saturating_add(unsupported_path_bytes)
+            .saturating_add(conflict_string_bytes)
+            .saturating_add(protected_path_bytes)
+    }
+
     /// This table with the config-level opt-out (`redact.enabled = false`)
     /// ignored, so the collected entries actually substitute.
     ///
@@ -1876,9 +2002,39 @@ impl RedactionTable {
             unsupported_files: self.unsupported_files.clone(),
             protected: self.protected.clone(),
             protected_path_conflicts: self.protected_path_conflicts.clone(),
+            coverage_binding: self.coverage_binding.clone(),
             #[cfg(test)]
             fail_enforced_view: self.fail_enforced_view,
         }
+    }
+
+    pub(crate) fn with_coverage_binding(
+        self,
+        binding: coverage_authority::CoverageTableBinding,
+    ) -> Self {
+        Self {
+            coverage_binding: Some(binding),
+            ..self
+        }
+    }
+
+    pub(crate) fn coverage_binding(&self) -> Option<&coverage_authority::CoverageTableBinding> {
+        self.coverage_binding.as_ref()
+    }
+
+    pub(crate) fn ensure_binding_current(
+        &self,
+    ) -> std::result::Result<(), coverage_authority::CoverageError> {
+        if let Some(binding) = &self.coverage_binding {
+            binding.validate()?;
+        }
+        Ok(())
+    }
+
+    fn coverage_binding_stale(&self) -> bool {
+        self.coverage_binding
+            .as_ref()
+            .is_some_and(|binding| binding.validate().is_err())
     }
 
     /// [`Self::enforced`] wrapped in a `Result`.
@@ -2113,6 +2269,7 @@ impl RedactionTable {
             unsupported_files: Vec::new(),
             protected: ProtectedPaths::default(),
             protected_path_conflicts: Vec::new(),
+            coverage_binding: None,
             #[cfg(test)]
             fail_enforced_view: false,
         }
@@ -2304,12 +2461,27 @@ pub(crate) struct EnvFileOverLimitError {
     path: PathBuf,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("redaction source changed during complete capture")]
+struct RedactionSourceChangedError;
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "configured redaction source `{path}` is unreadable; refusing to publish incomplete coverage"
+)]
+pub(crate) struct RedactionSourceUnreadableError {
+    path: PathBuf,
+}
+
 /// True when [`RedactionTable::build`] (and siblings) refused so a later
 /// consumer cannot proceed with a table that would miss secrets.
 pub(crate) fn build_would_miss_secrets(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.downcast_ref::<EnvFileOverLimitError>().is_some())
+    error.chain().any(|cause| {
+        cause.downcast_ref::<EnvFileOverLimitError>().is_some()
+            || cause
+                .downcast_ref::<RedactionSourceUnreadableError>()
+                .is_some()
+    })
 }
 
 /// Outcome of scanning one matched env file (§4).
@@ -2324,6 +2496,9 @@ enum EnvFileScan {
     /// File exceeded the daemon project-file cap. Must fail the table build:
     /// skipping it would miss secrets (fail open).
     OverLimit,
+    /// The source was replaced or changed while it was being captured.
+    /// Refuse this generation; a later acquisition performs a fresh scan.
+    Changed,
 }
 
 #[cfg(test)]
@@ -2762,12 +2937,12 @@ mod scrub_inventory_tests {
     const INVENTORY_START: &str = "<!-- scrub-inventory:start -->";
     const INVENTORY_END: &str = "<!-- scrub-inventory:end -->";
     const EXPECTED_SCRUB_FILES: &[&str] = &[
-        "apps/cli/src/commands/debug.rs",
         "crates/cockpit-core/src/approval/policy.rs",
         "crates/cockpit-core/src/conversation_rules.rs",
         "crates/cockpit-core/src/daemon/fs_api.rs",
         "crates/cockpit-core/src/daemon/org_sync.rs",
         "crates/cockpit-core/src/daemon/remote_audit_upload.rs",
+        "crates/cockpit-core/src/daemon/server/dispatch.rs",
         "crates/cockpit-core/src/daemon/server/mod.rs",
         "crates/cockpit-core/src/daemon/session_worker/mod.rs",
         "crates/cockpit-core/src/daemon/session_worker/run.rs",
@@ -2787,6 +2962,7 @@ mod scrub_inventory_tests {
         "crates/cockpit-core/src/mcp/builtin.rs",
         "crates/cockpit-core/src/mcp/network.rs",
         "crates/cockpit-core/src/mcp/sandbox.rs",
+        "crates/cockpit-core/src/redact/coverage_authority.rs",
         "crates/cockpit-core/src/redact/mod.rs",
         "crates/cockpit-core/src/session/export/mod.rs",
         "crates/cockpit-core/src/session/recording.rs",
@@ -2943,11 +3119,32 @@ mod scrub_inventory_tests {
     }
 
     fn brace_delta(line: &str) -> i32 {
-        line.chars().fold(0, |delta, ch| match ch {
-            '{' => delta + 1,
-            '}' => delta - 1,
-            _ => delta,
-        })
+        let mut delta = 0;
+        let mut chars = line.chars().peekable();
+        let mut quoted = None;
+        let mut escaped = false;
+        while let Some(ch) = chars.next() {
+            if let Some(quote) = quoted {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == quote {
+                    quoted = None;
+                }
+                continue;
+            }
+            if ch == '/' && chars.peek() == Some(&'/') {
+                break;
+            }
+            match ch {
+                '"' => quoted = Some(ch),
+                '{' => delta += 1,
+                '}' => delta -= 1,
+                _ => {}
+            }
+        }
+        delta
     }
 
     fn doc_inventory_paths(path: &Path) -> BTreeSet<String> {
@@ -3079,6 +3276,9 @@ mod sec_f3_case_and_hex_tests {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod coverage_route_behavior;
 
 #[cfg(test)]
 mod tests;

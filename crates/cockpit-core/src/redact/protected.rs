@@ -39,6 +39,17 @@ impl ProtectedPaths {
         self.paths.clone()
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    pub(crate) fn measured_retained_bytes(&self) -> usize {
+        self.paths
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_add(self.paths.iter().map(|path| path.capacity()).sum::<usize>())
+    }
+
     pub(crate) fn contains_value(&self, value: &str) -> bool {
         !value.is_empty() && self.paths.iter().any(|path| path.contains(value))
     }

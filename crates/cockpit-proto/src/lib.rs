@@ -304,6 +304,7 @@ pub enum EnvSnapshotSource {
     TuiShell,
     TuiProcessFallback,
     ExplicitCli,
+    SessionWorker,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1347,17 +1348,20 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// `SetupWizardApplied.config_generation` a required field carrying the
 /// apply's post-commit published generation (wizard onboarding settlements
 /// prove stage advancement against the receipt itself, with no compatibility
-/// window for daemons predating the field), and adds the onboarding-facing
-/// agent authoring projection with the atomic authored-package
-/// apply/receipt family. On top of v23's
-/// durable logical-conversation favorites and daemon-authoritative
-/// onboarding bootstrap transitions, first-class assistant-thread creation,
-/// durable lineage projections, the V2 tagged ingress envelope,
-/// queued-message delivery classes, local queue controls, MCP credential
-/// profiles, agent-dimensioned MCP scopes on the attached-session and
-/// daemon-owned setup inventory, bounded base64 media previews, the
-/// rolling-precompaction resume choice, and knowledge-dream completion
-/// receipts including ordered all-KB runs.
+/// window for daemons predating the field), adds daemon-rendered redaction
+/// coverage, input-prediction, and tag-preview projections, and adds the
+/// onboarding-facing agent authoring projection with the atomic
+/// authored-package apply/receipt family. On top of v23's durable
+/// logical-conversation favorites (`SetSessionFavorite` /
+/// `SessionFavoriteApplied` and the resolved-root `SessionSummary.favorite`
+/// bit), daemon-authoritative onboarding (`BeginOrReopenOnboarding` /
+/// `ApplyOnboardingTransition` and bootstrap snapshots), first-class
+/// assistant-thread creation and durable lineage projections, the V2 tagged
+/// ingress envelope, queued-message delivery classes, local queue controls,
+/// MCP credential profiles, agent-dimensioned MCP scopes on the
+/// attached-session and daemon-owned setup inventory, bounded base64 media
+/// previews, the rolling-precompaction resume choice, and knowledge-dream
+/// completion receipts including ordered all-KB runs.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Version string the daemon advertises to clients on attach/status.
@@ -3828,6 +3832,73 @@ pub struct TagExpansionMeta {
     pub ok: bool,
 }
 
+/// Boundary-safe user/assistant turn supplied to the daemon prediction
+/// renderer. Tool payloads and reasoning are structurally absent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InputPredictionTurn {
+    pub user: String,
+    pub agent: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InputPredictionMode {
+    Short,
+    Long,
+}
+
+/// Redacted output produced while the daemon holds a one-operation coverage
+/// admission. No matcher, candidate, source identity, or cache identifier is
+/// representable in this DTO.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InputPredictionProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// Daemon-rendered `@` expansion. The wire body has already crossed the
+/// coverage sink; clients receive only boundary-safe content and display
+/// metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TagPreviewProjection {
+    pub wire: String,
+    #[serde(default)]
+    pub expansions: Vec<TagExpansionMeta>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RedactionCoverageState {
+    Ready,
+    UnsupportedCoverage,
+    CoverageUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UnsupportedSourceDetailClass {
+    UnsupportedFormat,
+    Unreadable,
+    ChangedDuringCapture,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OwnerUnsupportedSourceDiagnostic {
+    pub display_path: String,
+    pub detail: UnsupportedSourceDetailClass,
+}
+
+/// Safe status projection for CLI/debug consumers. Non-owners receive only
+/// `state`; the owner-only diagnostic is constructed by the daemon authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RedactionCoverageStatusProjection {
+    pub state: RedactionCoverageState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_diagnostic: Option<OwnerUnsupportedSourceDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rendered_context: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QueueTarget {
     pub id: String,
@@ -4610,6 +4681,9 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
 ";
 
     const REQUEST_ALLOWLIST: &[&str] = &[
+        "get_redaction_coverage_status",
+        "render_input_prediction",
+        "resolve_tag_preview",
         "archive_session",
         // Migrated to a typed bulk transfer reference by
         // `remote-transport-logical-lanes`; mirrored so the TypeScript schemas
@@ -4672,6 +4746,9 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
 
     const RESPONSE_ALLOWLIST: &[&str] = &[
         "ack",
+        "redaction_coverage_status",
+        "input_prediction",
+        "tag_preview",
         "config_refreshed",
         "bulk_transfer_chunk",
         "bulk_transfer_chunk_accepted",

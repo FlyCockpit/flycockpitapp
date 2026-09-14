@@ -10977,7 +10977,8 @@ pub(super) async fn run_worker(
                         &interrupts,
                         &event_tx,
                         &driver_control_tx,
-                        &session_env,
+                        env_overlay.clone(),
+                        config_snapshot.clone(),
                     )
                     .await
                     {
@@ -13522,63 +13523,196 @@ pub(super) async fn run_worker(
                         .read()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone();
-                    let new_table = session.credential_store().and_then(|store| {
-                        crate::redact::RedactionTable::build_with_env_and_credential_store(
-                            &effective_redact,
-                            &project_root,
-                            &session_env,
-                            &store,
-                        )
-                    });
-                    let new_table = match new_table {
-                        Ok(table) => session.with_machine_scoped_sealed_redactions(&table).await,
-                        Err(error) => Err(error),
-                    };
-                    match new_table {
-                        Ok(new_table) => {
-                            // H1: read the LATEST table, union, persist, and swap
-                            // under the per-session redaction-table write lock so
-                            // this `/toggle-redaction` refresh serializes with
-                            // sealed adoption / approved-secret-file registration
-                            // and cannot clobber a concurrently-committed adoption.
-                            // The guard is released before the driver `.await`.
-                            let table = {
-                                let _redaction_guard =
-                                    interrupts.lock_redaction_table_write().await;
-                                let base = current_redaction(&redaction);
-                                match base.union(&new_table) {
-                                    Ok(unioned) => {
-                                        let unioned = Arc::new(unioned);
-                                        // J3: persist BEFORE swapping the live table
-                                        // so a persist failure never leaves the live
-                                        // table advanced ahead of the durable one (a
-                                        // restart would lose the accumulated entry).
-                                        // On failure keep the previously-committed
-                                        // table live and surface the error.
-                                        match session.persist_redaction_table(&unioned) {
-                                            Ok(()) => {
-                                                set_current_redaction(&redaction, unioned.clone());
-                                                unioned
-                                            }
-                                            Err(error) => {
-                                                tracing::warn!(error = %error, %session_id, "persisting redaction table failed; keeping previously committed redaction table live");
-                                                base
+                    let new_table = if let Some((
+                        authority,
+                        installed_key,
+                        _installed_policy_digest,
+                    )) = session.redaction_coverage()
+                    {
+                        match session.credential_store() {
+                            Ok(store) => match session.machine_scoped_sealed_redactions().await {
+                                Ok(sealed) => match session
+                                    .db
+                                    .machine_scoped_sealed_redaction_records()
+                                    .await
+                                {
+                                    Err(error) => Err(anyhow::anyhow!(error.to_string())),
+                                    Ok(sealed_records) => {
+                                        let root = project_root.clone();
+                                        let capture_redact = effective_redact.clone();
+                                        let environment = crate::env_snapshot::EnvSnapshot::new(
+                                            cockpit_proto::EnvSnapshotSource::SessionWorker,
+                                            session_env.clone(),
+                                        );
+                                        let sealed_binding =
+                                            crate::redact::coverage_bindings::sealed_records_binding(
+                                                &sealed_records,
+                                            );
+                                        let principal =
+                                            crate::daemon::principal::ClientPrincipal::owner();
+                                        match session.command_secret_cache() {
+                                            None => Err(anyhow::anyhow!("coverage_unavailable")),
+                                            Some(command_cache) => {
+                                                match session
+                                                    .secret_vault()
+                                                    .current_inventory_generation()
+                                                {
+                                                    Err(error) => Err(anyhow::anyhow!(
+                                                        "reading redaction vault revision: {error}"
+                                                    )),
+                                                    Ok(vault_revision) => {
+                                                        let policy_digest = crate::redact::coverage_bindings::redact_config_digest(
+                                                            &effective_redact,
+                                                        );
+                                                        let current_key = crate::redact::coverage_bindings::SessionCoverageInputs {
+                                                            principal: &principal,
+                                                            owner_authorization_revision: 0,
+                                                            session_id,
+                                                            workspace_root: &root,
+                                                            environment: &environment,
+                                                            vault_revision,
+                                                            command_cache: &command_cache,
+                                                            policy_digest: &policy_digest,
+                                                            sealed: sealed_binding,
+                                                            override_revision: 0,
+                                                            redact_config: &effective_redact,
+                                                        }
+                                                        .coverage_key();
+                                                        let coverage_key = installed_key
+                                                            .with_current_owned_revisions(
+                                                                &current_key,
+                                                            );
+                                                        authority.invalidate_key(&installed_key);
+                                                        let capture_policy_digest =
+                                                            policy_digest.clone();
+                                                        let env = session_env.clone();
+                                                        let env_snapshot_for_capture =
+                                                            environment.clone();
+                                                        let publish_vault =
+                                                            session.secret_vault().clone();
+                                                        let publish_db = session.db.clone();
+                                                        let publish_command_cache =
+                                                            command_cache.clone();
+                                                        let publish_fence =
+                                                            crate::daemon::session_worker::worker_coverage_publish_owners(
+                                                                &session,
+                                                                &env_overlay,
+                                                                &config_snapshot,
+                                                                &redaction_overrides,
+                                                                publish_vault.clone(),
+                                                                publish_db.clone(),
+                                                                publish_command_cache.clone(),
+                                                            )
+                                                            .publish_fence();
+                                                        match authority
+                                                            .acquire(
+                                                                coverage_key.clone(),
+                                                                crate::redact::coverage_authority::CoverageScope::RedactionOverride,
+                                                                move || {
+                                                                    let capture_inputs =
+                                                                        crate::redact::coverage_bindings::SessionCoverageInputs {
+                                                                            principal: &principal,
+                                                                            owner_authorization_revision: 0,
+                                                                            session_id,
+                                                                            workspace_root: &root,
+                                                                            environment: &env_snapshot_for_capture,
+                                                                            vault_revision,
+                                                                            command_cache: &command_cache,
+                                                                            policy_digest: &capture_policy_digest,
+                                                                            sealed: sealed_binding,
+                                                                            override_revision: 0,
+                                                                            redact_config: &capture_redact,
+                                                                        };
+                                                                    let build =
+                                                                        crate::redact::coverage_authority::CoverageBuild::capture(
+                                                                            &capture_redact,
+                                                                            &root,
+                                                                            &env,
+                                                                            &store,
+                                                                            &sealed,
+                                                                            &capture_inputs,
+                                                                        )?;
+                                                                    Ok(build.with_publish_fence(
+                                                                        publish_fence,
+                                                                    ))
+                                                                },
+                                                            )
+                                                            .await
+                                                        {
+                                                            Ok(admission) => {
+                                                                match admission
+                                                                    .consume_at_async_sink(
+                                                                        |new_table| async move {
+                                                                            Ok(new_table)
+                                                                        },
+                                                                    )
+                                                                    .await
+                                                                {
+                                                                    Ok(new_table) => {
+                                                                        let _redaction_guard =
+                                                                            interrupts
+                                                                                .lock_redaction_table_write()
+                                                                                .await;
+                                                                        let base = current_redaction(
+                                                                            &redaction,
+                                                                        );
+                                                                        match base.union(&new_table) {
+                                                                            Ok(unioned) => {
+                                                                                let unioned =
+                                                                                    Arc::new(unioned);
+                                                                                match session
+                                                                                    .persist_redaction_table(
+                                                                                        &unioned,
+                                                                                    )
+                                                                                {
+                                                                                    Ok(()) => {
+                                                                                        set_current_redaction(
+                                                                                            &redaction,
+                                                                                            unioned.clone(),
+                                                                                        );
+                                                                                        session.set_redaction_coverage(
+                                                                                            authority.clone(),
+                                                                                            coverage_key,
+                                                                                            policy_digest,
+                                                                                        );
+                                                                                        Ok(unioned)
+                                                                                    }
+                                                                                    Err(error) => {
+                                                                                        Err(error)
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                            Err(error) => {
+                                                                                Err(error)
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    Err(error) => Err(
+                                                                        anyhow::anyhow!(
+                                                                            error.to_string()
+                                                                        ),
+                                                                    ),
+                                                                }
+                                                            }
+                                                            Err(error) => Err(anyhow::anyhow!(
+                                                                error.to_string()
+                                                            )),
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
-                                    Err(error) => {
-                                        // K6: never overwrite the committed table
-                                        // (which may hold a sealed literal adopted this
-                                        // turn) with a bare disk scan on a union error.
-                                        // Keep the committed `base` live and durable and
-                                        // defer the disk delta to the next refresh,
-                                        // mirroring
-                                        // `InterruptHub::refresh_union_redaction`.
-                                        tracing::warn!(error = %error, %session_id, "unioning redaction table failed; keeping committed redaction table live");
-                                        base
-                                    }
-                                }
-                            };
+                                },
+                                Err(error) => Err(error),
+                            },
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        Err(anyhow::anyhow!("coverage_unavailable"))
+                    };
+                    match new_table {
+                        Ok(table) => {
                             for path in table.unsupported_files() {
                                 if unsupported_redaction_notified.insert(path.clone()) {
                                     send_current_session_event(
@@ -13587,10 +13721,8 @@ pub(super) async fn run_worker(
                                         &redaction,
                                         proto::Event::Notice {
                                             session_id,
-                                            text: format!(
-                                                "`{}` is an unsupported format; redaction for this file will not work",
-                                                path.display()
-                                            ),
+                                            text: "A configured source has an unsupported format; coverage is unavailable for that source"
+                                                .to_string(),
                                         },
                                         NoticeSource::DaemonDirect,
                                     );

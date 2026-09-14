@@ -6100,10 +6100,6 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup typed-settings journal recovery failed")?;
-    dispatch::recover_onboarding_agent_publication_journals(ctx)
-        .await
-        .map_err(|error| anyhow::anyhow!(error.message))
-        .context("startup onboarding-agent publication recovery failed")?;
     #[cfg(feature = "extended")]
     {
         let recovered_image_config =
@@ -9327,6 +9323,8 @@ pub use run_invocation::{
     remaining_after_restart_for_row as run_invocation_remaining_after_restart,
     wall_ms_now as run_invocation_wall_ms_now,
 };
+#[cfg(test)]
+mod agent_authoring_daemon_tests;
 #[cfg(test)]
 mod host_capabilities_tests;
 pub(crate) mod inventory;

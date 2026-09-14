@@ -11,8 +11,8 @@
 //! materializes a real vault and hands the daemon off to its ready services.
 //! From Provider onward every stage change is a real
 //! `ApplyOnboardingTransition` against the real revision CAS, and the
-//! model / agent / lifetime settlements are real `ApplySetupWizard`
-//! operations whose receipts — including the published config generation —
+//! model settlements are real `ApplySetupWizard` operations and agent
+//! settlement is a real `ApplyAuthoredAgentPackage` receipt whose published
 //! the daemon validates before the stage may advance. The provider stage
 //! runs the real offline path: the save is a real `apply_provider_mutation`,
 //! the validation probe really fails against an unreachable endpoint, and
@@ -257,6 +257,174 @@ fn seed_computer_use_catalog_capabilities() {
         .expect("seeding catalog capability metadata onto the provider file");
 }
 
+fn agent_authoring_phase(app: &App) -> Option<crate::tui::onboarding::agent::Phase> {
+    app.onboarding_shell
+        .as_ref()
+        .and_then(|shell| shell.test_agent_authoring_phase())
+}
+
+fn sync_config_generation_after_agent_apply(app: &mut App, generation: u64) {
+    app.sync_config_generation_after_authored_agent_apply(generation);
+}
+
+fn settle_agent_via_real_daemon_rpc(app: &mut App) {
+    use cockpit_core::authoring_draft::{AgentAuthoringDraft, build_package_draft};
+    use cockpit_proto::{ApplyAuthoredAgentPackageRequest, AuthoredAgentOnboardingCorrelation};
+
+    pump_onboarding(
+        app,
+        |app| {
+            stage(app) == Some(OnboardingStage::Agent)
+                && shell_kind(app)
+                    == Some(crate::tui::onboarding::OnboardingScreenKind::AgentAuthoring)
+        },
+        "the settled Model→Agent advance and agent authoring projection",
+    );
+
+    let snapshot = app
+        .onboarding_snapshot
+        .clone()
+        .expect("agent stage snapshot");
+    let operation_id = app
+        .onboarding_agent_operation_id
+        .clone()
+        .unwrap_or_else(|| format!("first-run-agent-{}", uuid::Uuid::new_v4()));
+    app.onboarding_agent_operation_id = Some(operation_id.clone());
+
+    use crate::tui::settings::SettingsDaemonEffect;
+    let effect = InProcessSettingsDaemonEffect;
+    let projection = match SettingsDaemonEffect::request(
+        &effect,
+        cockpit_proto::Request::GetAgentAuthoringProjection,
+    ) {
+        Ok(cockpit_proto::Response::AgentAuthoringProjection(projection)) => projection,
+        Ok(other) => panic!("unexpected agent projection response: {other:?}"),
+        Err(error) => panic!("agent projection unavailable: {error}"),
+    };
+    if let Some(shell) = app.onboarding_shell.as_mut() {
+        shell.present_agent_authoring(projection.clone(), operation_id.clone());
+    }
+
+    let draft = AgentAuthoringDraft::from_projection(&projection);
+    for (index, _) in draft
+        .pending_trust_route_indices(&projection)
+        .into_iter()
+        .enumerate()
+    {
+        let _ = index;
+        // Real routes that require explicit trust confirmation must be acknowledged
+        // before the canonical package builder will validate.
+    }
+    let mut draft = draft;
+    for index in draft.pending_trust_route_indices(&projection) {
+        draft.trust_confirmations[index] = true;
+    }
+    let package = build_package_draft(&projection, &draft).unwrap_or_else(|error| {
+        panic!("canonical package construction failed: {error}");
+    });
+    let correlation = AuthoredAgentOnboardingCorrelation {
+        run_id: snapshot.run_id,
+        attempt_id: snapshot.attempt_id,
+        stage_revision: snapshot.revision,
+    };
+    let preview_request = ApplyAuthoredAgentPackageRequest {
+        client_operation_id: format!("{operation_id}-preview"),
+        expected_policy_revision: package.policy_revision.clone(),
+        package: package.clone(),
+        onboarding: Some(correlation.clone()),
+        validate_only: true,
+    };
+    let preview = match SettingsDaemonEffect::request(
+        &effect,
+        cockpit_proto::Request::ApplyAuthoredAgentPackage(preview_request),
+    ) {
+        Ok(cockpit_proto::Response::AuthoredAgentPackage(outcome)) => outcome,
+        Ok(other) => panic!("unexpected preview response: {other:?}"),
+        Err(error) => panic!("preview failed: {error}"),
+    };
+    if let Some(shell) = app.onboarding_shell.as_mut() {
+        shell.apply_agent_authoring_outcome(preview);
+    }
+    let apply_request = ApplyAuthoredAgentPackageRequest {
+        client_operation_id: operation_id,
+        expected_policy_revision: package.policy_revision.clone(),
+        package,
+        onboarding: Some(correlation),
+        validate_only: false,
+    };
+    let apply = match SettingsDaemonEffect::request(
+        &effect,
+        cockpit_proto::Request::ApplyAuthoredAgentPackage(apply_request),
+    ) {
+        Ok(cockpit_proto::Response::AuthoredAgentPackage(outcome)) => outcome,
+        Ok(other) => panic!("unexpected apply response: {other:?}"),
+        Err(error) => panic!("apply failed: {error}"),
+    };
+    let generation = match &apply {
+        cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(receipt)
+            if receipt.status == cockpit_proto::AuthoredAgentReceiptStatus::Committed =>
+        {
+            receipt.result_config_generation
+        }
+        other => panic!("apply did not commit: {other:?}"),
+    };
+    if let Some(shell) = app.onboarding_shell.as_mut() {
+        shell.apply_agent_authoring_outcome(apply);
+    }
+    sync_config_generation_after_agent_apply(app, generation);
+    pump_onboarding(
+        app,
+        |app| agent_authoring_phase(app) == Some(crate::tui::onboarding::agent::Phase::Success),
+        "authored-agent receipt applied to the nested editor",
+    );
+    pump_onboarding(
+        app,
+        |app| stage(app) == Some(OnboardingStage::Lifetime),
+        "agent stage settlement advancing to lifetime",
+    );
+}
+
+fn complete_real_first_run_lifetime(app: &mut App, persistent_background_agents: bool) {
+    pump_onboarding(
+        app,
+        |app| {
+            stage(app) == Some(OnboardingStage::Lifetime)
+                && app.dialog.test_page_name()
+                    == Some(cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID)
+        },
+        "the settled Agent→Lifetime advance through the real installation",
+    );
+
+    assert_eq!(app.dialog.test_setup_step(), Some("background-agents"));
+    if persistent_background_agents {
+        shell_key(app, KeyCode::Enter);
+    } else {
+        shell_key(app, KeyCode::Char('n'));
+    }
+    assert_eq!(app.dialog.test_setup_step(), Some("lifetime-save"));
+    shell_key(app, KeyCode::Enter);
+    pump_onboarding(
+        app,
+        |app| {
+            stage(app) == Some(OnboardingStage::Complete)
+                && app
+                    .onboarding_shell
+                    .as_ref()
+                    .is_some_and(|shell| shell.screen_is_complete())
+        },
+        "the authoritative Complete revision to present the summary",
+    );
+
+    let global = cockpit_config::dirs::global_config_file().expect("isolated global config path");
+    let cfg = cockpit_config::extended::ExtendedConfigDoc::load(&global)
+        .expect("lifetime settlement wrote global config")
+        .config();
+    assert_eq!(
+        cfg.daemon.background_agents, persistent_background_agents,
+        "lifetime settlement must persist the explicit background_agents choice"
+    );
+}
+
 /// Drive the real first run from the bootstrap fetch to the searchable
 /// provider catalog: Welcome key → real locked advance → the profile stage
 /// (its wizard save settled by the locked bootstrap's one scoped config
@@ -385,6 +553,106 @@ fn advance_real_first_run_to_provider(app: &mut App, root: &std::path::Path) {
     seed_workspace_trust(root);
 }
 
+fn advance_real_first_run_from_provider_search_to_agent(app: &mut App) {
+    for ch in "compat".chars() {
+        shell_key(app, KeyCode::Char(ch));
+    }
+    shell_key(app, KeyCode::Enter);
+    pump_onboarding(
+        app,
+        |app| {
+            app.dialog.is_provider_add() && app.dialog.test_provider_add_step() == Some("wire-api")
+        },
+        "the seeded provider engine",
+    );
+
+    shell_key(app, KeyCode::Enter);
+    assert_eq!(app.dialog.test_provider_add_step(), Some("id"));
+    for ch in "localtest".chars() {
+        shell_key(app, KeyCode::Char(ch));
+    }
+    shell_key(app, KeyCode::Enter);
+    assert_eq!(app.dialog.test_provider_add_step(), Some("url"));
+    for ch in "http://127.0.0.1:9/v1".chars() {
+        shell_key(app, KeyCode::Char(ch));
+    }
+    shell_key(app, KeyCode::Enter);
+    assert_eq!(app.dialog.test_provider_add_step(), Some("auth-method"));
+    shell_key(app, KeyCode::Down);
+    shell_key(app, KeyCode::Enter);
+    assert_eq!(app.dialog.test_provider_add_step(), Some("env-var"));
+    shell_key(app, KeyCode::Enter);
+
+    pump_onboarding(
+        app,
+        |app| {
+            app.dialog.test_provider_add_step() == Some("test-key")
+                && !app.dialog.test_provider_add_fetch_pending()
+        },
+        "the offline validation attempt to finish against the unreachable endpoint",
+    );
+
+    let mut committed = false;
+    for _ in 0..150 {
+        pump_once(app);
+        if app.dialog.test_provider_add_step() == Some("done") {
+            committed = true;
+            break;
+        }
+        if app.dialog.test_provider_add_step() == Some("test-key") {
+            shell_key(app, KeyCode::Char('m'));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        committed,
+        "manual model entry must commit the offline checkpoint; status: {:?}",
+        app.dialog.test_provider_add_status()
+    );
+
+    pump_onboarding(
+        app,
+        |app| {
+            stage(app) == Some(OnboardingStage::Model)
+                && app.dialog.test_page_name()
+                    == Some(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID)
+        },
+        "the settled Provider→Model advance",
+    );
+    assert!(
+        app.config_snapshot
+            .providers
+            .providers
+            .contains_key("localtest"),
+        "the daemon-committed provider must be visible in the refreshed config"
+    );
+
+    seed_computer_use_catalog_capabilities();
+
+    assert_eq!(app.dialog.test_setup_step(), Some("provider"));
+    shell_key(app, KeyCode::Enter);
+    assert_eq!(app.dialog.test_setup_step(), Some("model"));
+    for ch in "manual-model".chars() {
+        shell_key(app, KeyCode::Char(ch));
+    }
+    shell_key(app, KeyCode::Enter);
+    assert_eq!(app.dialog.test_setup_step(), Some("configuration"));
+    shell_key(app, KeyCode::Enter);
+    assert_eq!(app.dialog.test_setup_step(), Some("model-save"));
+    shell_key(app, KeyCode::Enter);
+    pump_onboarding(
+        app,
+        |app| {
+            stage(app) == Some(OnboardingStage::Agent)
+                && shell_kind(app)
+                    == Some(crate::tui::onboarding::OnboardingScreenKind::AgentAuthoring)
+        },
+        "the settled Model→Agent advance through the real model wizard",
+    );
+
+    settle_agent_via_real_daemon_rpc(app);
+}
+
 #[test]
 fn first_run_settles_stages_against_the_real_daemon_offline() {
     let tmp = cockpit_test_support::latency_isolated_tempdir();
@@ -402,189 +670,9 @@ fn first_run_settles_stages_against_the_real_daemon_offline() {
 
             let mut app = real_first_run_app(tmp.path());
             advance_real_first_run_to_provider(&mut app, tmp.path());
+            advance_real_first_run_from_provider_search_to_agent(&mut app);
 
-            // Pick the generic OpenAI-compatible template (no vendor network
-            // endpoint is contacted) and drive the real add wizard.
-            for ch in "compat".chars() {
-                shell_key(&mut app, KeyCode::Char(ch));
-            }
-            shell_key(&mut app, KeyCode::Enter);
-            pump_onboarding(
-                &mut app,
-                |app| {
-                    app.dialog.is_provider_add()
-                        && app.dialog.test_provider_add_step() == Some("wire-api")
-                },
-                "the seeded provider engine",
-            );
-
-            shell_key(&mut app, KeyCode::Enter);
-            assert_eq!(app.dialog.test_provider_add_step(), Some("id"));
-            for ch in "localtest".chars() {
-                shell_key(&mut app, KeyCode::Char(ch));
-            }
-            shell_key(&mut app, KeyCode::Enter);
-            assert_eq!(app.dialog.test_provider_add_step(), Some("url"));
-            for ch in "http://127.0.0.1:9/v1".chars() {
-                shell_key(&mut app, KeyCode::Char(ch));
-            }
-            shell_key(&mut app, KeyCode::Enter);
-            // Auth method: the env-var row keeps every secret out of the fixture.
-            assert_eq!(app.dialog.test_provider_add_step(), Some("auth-method"));
-            shell_key(&mut app, KeyCode::Down);
-            shell_key(&mut app, KeyCode::Enter);
-            assert_eq!(app.dialog.test_provider_add_step(), Some("env-var"));
-            // The prefilled variable name is accepted as-is; Enter commits the
-            // provider through the real apply_provider_mutation.
-            shell_key(&mut app, KeyCode::Enter);
-
-            pump_onboarding(
-                &mut app,
-                |app| {
-                    app.dialog.test_provider_add_step() == Some("test-key")
-                        && !app.dialog.test_provider_add_fetch_pending()
-                },
-                "the offline validation attempt to finish against the unreachable endpoint",
-            );
-
-            // Offline: the save committed and the live probe failed. The explicit
-            // manual-model key commits the failed-validation checkpoint (retrying
-            // while the post-failure catalog refresh settles).
-            let mut committed = false;
-            for _ in 0..150 {
-                pump_once(&mut app);
-                if app.dialog.test_provider_add_step() == Some("done") {
-                    committed = true;
-                    break;
-                }
-                if app.dialog.test_provider_add_step() == Some("test-key") {
-                    shell_key(&mut app, KeyCode::Char('m'));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            assert!(
-                committed,
-                "manual model entry must commit the offline checkpoint; status: {:?}",
-                app.dialog.test_provider_add_status()
-            );
-
-            // The settled advance validates against the daemon-recorded terminal
-            // provider mutation before the stage may leave Provider.
-            pump_onboarding(
-                &mut app,
-                |app| {
-                    stage(app) == Some(OnboardingStage::Model)
-                        && app.dialog.test_page_name()
-                            == Some(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID)
-                },
-                "the settled Provider→Model advance",
-            );
-            assert!(
-                app.config_snapshot
-                    .providers
-                    .providers
-                    .contains_key("localtest"),
-                "the daemon-committed provider must be visible in the refreshed config"
-            );
-
-            // Seed the committed provider's model with the catalog capability
-            // metadata (context window, tool calling, host-issued computer-use
-            // contract) that the offline provider flow cannot mint itself; the
-            // model and agent settlements below still run entirely through the
-            // daemon's real ApplySetupWizard + settlement fences.
-            seed_computer_use_catalog_capabilities();
-
-            // Model wizard, manual path: the only configured provider, a fresh
-            // model id, smart defaults (which imply the default-model commitment).
-            assert_eq!(app.dialog.test_setup_step(), Some("provider"));
-            shell_key(&mut app, KeyCode::Enter);
-            assert_eq!(app.dialog.test_setup_step(), Some("model"));
-            for ch in "manual-model".chars() {
-                shell_key(&mut app, KeyCode::Char(ch));
-            }
-            shell_key(&mut app, KeyCode::Enter);
-            assert_eq!(app.dialog.test_setup_step(), Some("configuration"));
-            shell_key(&mut app, KeyCode::Enter);
-            assert_eq!(app.dialog.test_setup_step(), Some("model-save"));
-            shell_key(&mut app, KeyCode::Enter);
-
-            pump_onboarding(
-                &mut app,
-                |app| {
-                    stage(app) == Some(OnboardingStage::Agent)
-                        && app.dialog.test_page_name()
-                            == Some(cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID)
-                },
-                "the settled Model→Agent advance",
-            );
-            // The real catalog discovery (live fetch with the bundled offline
-            // snapshot as fallback) mounts the agent wizard on its first step.
-            assert_eq!(app.dialog.test_setup_step(), Some("agent"));
-
-            // A bundled catalog agent whose primary slot the seeded model satisfies
-            // is offered; third-party requires a pinned network fetch, so it can
-            // never be the only offline option once a contract-capable model exists.
-            let agent_options = app.dialog.test_setup_step_option_ids();
-            let agent_index = agent_options
-                .iter()
-                .position(|id| id != "third-party")
-                .expect("a bundled catalog agent compatible with the seeded model");
-            for _ in 0..agent_index {
-                shell_key(&mut app, KeyCode::Down);
-            }
-            shell_key(&mut app, KeyCode::Enter);
-            // Model trust (untrusted), the compatible default model, explicit trust
-            // confirmation, author tool tiers, the monty-package notice, no image
-            // sidecar, and make-default so the settlement's default installation
-            // lands.
-            assert_eq!(app.dialog.test_setup_step(), Some("model-trust"));
-            shell_key(&mut app, KeyCode::Enter);
-            assert_eq!(app.dialog.test_setup_step(), Some("default-model"));
-            assert_eq!(app.dialog.test_setup_step_options(), 1);
-            shell_key(&mut app, KeyCode::Enter);
-            assert_eq!(app.dialog.test_setup_step(), Some("model-trust-confirm"));
-            shell_key(&mut app, KeyCode::Char('y'));
-            assert_eq!(app.dialog.test_setup_step(), Some("tool-configuration"));
-            shell_key(&mut app, KeyCode::Enter);
-            assert_eq!(app.dialog.test_setup_step(), Some("monty-packages"));
-            shell_key(&mut app, KeyCode::Enter);
-            assert_eq!(app.dialog.test_setup_step(), Some("sidecar"));
-            shell_key(&mut app, KeyCode::Enter);
-            assert_eq!(app.dialog.test_setup_step(), Some("make-default"));
-            shell_key(&mut app, KeyCode::Char('y'));
-            assert_eq!(app.dialog.test_setup_step(), Some("agent-install"));
-            shell_key(&mut app, KeyCode::Enter);
-
-            // The real agent apply: bundled catalog resolution, the installation
-            // service, the publication journal, and the settlement fence that
-            // proves the receipt's published generation advances the stage.
-            pump_onboarding(
-                &mut app,
-                |app| {
-                    stage(app) == Some(OnboardingStage::Lifetime)
-                        && app.dialog.test_page_name()
-                            == Some(cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID)
-                },
-                "the settled Agent→Lifetime advance through the real installation",
-            );
-
-            // Lifetime: commit an explicit choice through the real apply; the
-            // terminal Complete transition is requested once the stage settles.
-            assert_eq!(app.dialog.test_setup_step(), Some("background-agents"));
-            shell_key(&mut app, KeyCode::Enter);
-            assert_eq!(app.dialog.test_setup_step(), Some("lifetime-save"));
-            shell_key(&mut app, KeyCode::Enter);
-            pump_onboarding(
-                &mut app,
-                |app| {
-                    stage(app) == Some(OnboardingStage::Complete)
-                        && app
-                            .onboarding_shell
-                            .as_ref()
-                            .is_some_and(|shell| shell.screen_is_complete())
-                },
-                "the authoritative Complete revision to present the summary",
-            );
+            complete_real_first_run_lifetime(&mut app, true);
 
             // "Start coding" is a local close: the terminal transition committed,
             // so the summary's action just closes the shell behind the occupancy
@@ -607,6 +695,29 @@ fn first_run_settles_stages_against_the_real_daemon_offline() {
                 },
                 "a fresh launch at the completed authority to reach the ready session",
             );
+        },
+    );
+}
+
+#[test]
+fn real_daemon_first_run_ephemeral_lifetime_persists_background_agents_false() {
+    let tmp = cockpit_test_support::latency_isolated_tempdir();
+    let fixture = real_daemon_onboarding(tmp.path());
+    let _enter = fixture.runtime.enter();
+    crate::tui::settings::with_settings_daemon_effect(
+        Arc::new(InProcessSettingsDaemonEffect),
+        || {
+            let cockpit = tmp.path().join(".cockpit");
+            std::fs::create_dir_all(&cockpit).unwrap();
+            ConfigDoc::load(&cockpit.join("config.json"))
+                .unwrap()
+                .write(&ProvidersConfig::default())
+                .unwrap();
+
+            let mut app = real_first_run_app(tmp.path());
+            advance_real_first_run_to_provider(&mut app, tmp.path());
+            advance_real_first_run_from_provider_search_to_agent(&mut app);
+            complete_real_first_run_lifetime(&mut app, false);
         },
     );
 }

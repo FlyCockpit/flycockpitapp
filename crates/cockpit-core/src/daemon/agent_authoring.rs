@@ -37,6 +37,23 @@ pub struct AuthoredApplyFence {
     pub fencing_generation: i64,
 }
 
+/// Validate every rejection gate that precedes durable publication.
+///
+/// The caller holds the daemon-wide config-publication lock across this
+/// preflight, local-operation reservation, and [`apply_package_under_publication_lock`].
+/// Canonical rejections therefore never become terminal local-operation
+/// receipts: the same logical client operation may be corrected and submitted
+/// again, while any operation that reaches a recoverable effect remains bound
+/// to one immutable request hash.
+pub async fn preflight_package_under_publication_lock(
+    ctx: &DaemonContext,
+    request: &ApplyAuthoredAgentPackageRequest,
+) -> Result<Option<ApplyAuthoredAgentPackageOutcome>> {
+    prepare_package(ctx, request)
+        .await
+        .map(|result| result.err())
+}
+
 pub async fn apply_package(
     ctx: &DaemonContext,
     request: ApplyAuthoredAgentPackageRequest,
@@ -57,79 +74,20 @@ pub async fn apply_package_under_publication_lock(
     if let Some(outcome) = replay_existing_journal(ctx, &request, &fence).await? {
         return Ok(outcome);
     }
-    let providers = ctx
-        .config_source()
-        .load(&ctx.canonical_cwd)
-        .context("loading daemon provider configuration")?
-        .0;
-    let catalog = crate::daemon::agent_catalog::preferred_catalog().await?;
-    let snapshot =
-        crate::onboarding_agent::policy_snapshot(&providers, catalog.origin, &catalog.revision);
-    if request.expected_policy_revision != snapshot.policy_revision
-        || request.package.policy_revision != snapshot.policy_revision
-    {
-        let projection = crate::onboarding_agent::authoring_projection(
-            &providers,
-            &catalog.index,
-            catalog.origin,
-            &catalog.revision,
-        )?;
-        return Ok(ApplyAuthoredAgentPackageOutcome::PolicyRevisionConflict { projection });
-    }
-    if let Some(correlation) = &request.onboarding {
-        let current = ctx.db.onboarding_snapshot().await?;
-        let live = current.as_ref().is_some_and(|row| {
-            row.run_id == correlation.run_id
-                && row.attempt_id == correlation.attempt_id
-                && row.revision == correlation.stage_revision
-                && row.stage == crate::db::onboarding::OnboardingStage::Agent
-        });
-        if !live {
-            return Ok(ApplyAuthoredAgentPackageOutcome::Rejected {
-                reason: AuthoredAgentRejectReason::StaleDraft,
-                message: "onboarding correlation does not match the active agent-stage run; query the exact operation instead of retrying create".into(),
-                projection: None,
-            });
-        }
-    }
-    let package = match crate::onboarding_agent::canonicalize_authored_package(
-        &request.package,
-        &snapshot,
-        &providers,
-        &catalog.index,
-    ) {
-        Ok(package) => package,
-        Err(error) => {
-            return Ok(ApplyAuthoredAgentPackageOutcome::Rejected {
-                reason: error.reason,
-                message: error.message,
-                projection: None,
-            });
-        }
+    let prepared = match prepare_package(ctx, &request).await? {
+        Ok(prepared) => prepared,
+        Err(outcome) => return Ok(outcome),
     };
-    let now = crate::workspace_lease::now_unix_ms();
-    let current_draft = ctx
-        .db
-        .authored_agent_package_draft(request.package.name.clone())
-        .await
-        .context("loading authored draft revision")?;
-    let draft_matches = match (
-        request.package.draft_revision.as_deref(),
-        current_draft
-            .as_ref()
-            .map(|row| row.draft_revision.as_str()),
-    ) {
-        (None, None) => true,
-        (Some(expected), Some(actual)) => expected == actual,
-        _ => false,
-    };
-    if !draft_matches {
-        return Ok(ApplyAuthoredAgentPackageOutcome::Rejected {
-            reason: AuthoredAgentRejectReason::StaleDraft,
-            message: "authored draft revision does not match the last authoritative draft; edit/retry the current revision".into(),
-            projection: None,
-        });
+    if request.validate_only {
+        return Ok(ApplyAuthoredAgentPackageOutcome::Review(
+            prepared.package.review,
+        ));
     }
+    let PreparedAuthoredPackage {
+        providers,
+        snapshot,
+        package,
+    } = prepared;
     let require_third_party = matches!(
         request.package.source.kind,
         cockpit_proto::AgentAuthoringSourceKind::ThirdParty
@@ -144,6 +102,7 @@ pub async fn apply_package_under_publication_lock(
     let package_files_json = encode_package_files(&package.files)?;
     let review_json =
         serde_json::to_string(&package.review).context("encoding authored package review")?;
+    let now = crate::workspace_lease::now_unix_ms();
     let intent = AuthoredAgentPackageJournalRow {
         owner_digest: fence.owner_digest.clone(),
         client_operation_id: request.client_operation_id.clone(),
@@ -188,6 +147,97 @@ pub async fn apply_package_under_publication_lock(
     complete_pending_authored_journal(ctx, journal).await
 }
 
+struct PreparedAuthoredPackage {
+    providers: crate::config::providers::ProvidersConfig,
+    snapshot: cockpit_proto::AgentPolicySnapshot,
+    package: crate::onboarding_agent::CanonicalAuthoredPackage,
+}
+
+async fn prepare_package(
+    ctx: &DaemonContext,
+    request: &ApplyAuthoredAgentPackageRequest,
+) -> Result<std::result::Result<PreparedAuthoredPackage, ApplyAuthoredAgentPackageOutcome>> {
+    let providers = ctx
+        .config_source()
+        .load(&ctx.canonical_cwd)
+        .context("loading daemon provider configuration")?
+        .0;
+    let catalog = crate::daemon::agent_catalog::preferred_catalog().await?;
+    let snapshot =
+        crate::onboarding_agent::policy_snapshot(&providers, catalog.origin, &catalog.revision);
+    if request.expected_policy_revision != snapshot.policy_revision
+        || request.package.policy_revision != snapshot.policy_revision
+    {
+        let projection = crate::onboarding_agent::authoring_projection(
+            &providers,
+            &catalog.index,
+            catalog.origin,
+            &catalog.revision,
+        )?;
+        return Ok(Err(
+            ApplyAuthoredAgentPackageOutcome::PolicyRevisionConflict { projection },
+        ));
+    }
+    if let Some(correlation) = &request.onboarding {
+        let current = ctx.db.onboarding_snapshot().await?;
+        let live = current.as_ref().is_some_and(|row| {
+            row.run_id == correlation.run_id
+                && row.attempt_id == correlation.attempt_id
+                && row.revision == correlation.stage_revision
+                && row.stage == crate::db::onboarding::OnboardingStage::Agent
+        });
+        if !live {
+            return Ok(Err(ApplyAuthoredAgentPackageOutcome::Rejected {
+                reason: AuthoredAgentRejectReason::StaleDraft,
+                message: "onboarding correlation does not match the active agent-stage run; query the exact operation instead of retrying create".into(),
+                projection: None,
+            }));
+        }
+    }
+    let package = match crate::onboarding_agent::canonicalize_authored_package(
+        &request.package,
+        &snapshot,
+        &providers,
+        &catalog.index,
+    ) {
+        Ok(package) => package,
+        Err(error) => {
+            return Ok(Err(ApplyAuthoredAgentPackageOutcome::Rejected {
+                reason: error.reason,
+                message: error.message,
+                projection: None,
+            }));
+        }
+    };
+    let current_draft = ctx
+        .db
+        .authored_agent_package_draft(request.package.name.clone())
+        .await
+        .context("loading authored draft revision")?;
+    let draft_matches = match (
+        request.package.draft_revision.as_deref(),
+        current_draft
+            .as_ref()
+            .map(|row| row.draft_revision.as_str()),
+    ) {
+        (None, None) => true,
+        (Some(expected), Some(actual)) => expected == actual,
+        _ => false,
+    };
+    if !draft_matches {
+        return Ok(Err(ApplyAuthoredAgentPackageOutcome::Rejected {
+            reason: AuthoredAgentRejectReason::StaleDraft,
+            message: "authored draft revision does not match the last authoritative draft; edit/retry the current revision".into(),
+            projection: None,
+        }));
+    }
+    Ok(Ok(PreparedAuthoredPackage {
+        providers,
+        snapshot,
+        package,
+    }))
+}
+
 pub async fn recover_authored_agent_package_journals(ctx: &DaemonContext) -> Result<u64> {
     let rows = ctx.db.list_authored_agent_package_journals().await?;
     let mut recovered = 0_u64;
@@ -214,55 +264,147 @@ pub async fn receipt(
     ctx: &DaemonContext,
     owner: &str,
     query: AuthoredAgentPackageReceiptQuery,
-) -> Result<ApplyAuthoredAgentPackageReceipt> {
+) -> Result<Option<ApplyAuthoredAgentPackageReceipt>> {
     if let Some(journal) = ctx
         .db
         .authored_agent_package_journal(owner.to_owned(), query.client_operation_id.clone())
         .await?
-        && let Some(json) = journal.terminal_response_json.as_deref()
-        && let Ok(Response::AuthoredAgentPackage(ApplyAuthoredAgentPackageOutcome::Receipt(
-            receipt,
-        ))) = serde_json::from_str(json)
     {
-        return Ok(receipt);
+        if let Some(json) = journal.terminal_response_json.as_deref() {
+            return Ok(Some(receipt_from_terminal_json(
+                &query.client_operation_id,
+                json,
+            )?));
+        }
+        if journal.settlement_phase == AUTHORED_PACKAGE_SETTLEMENT_PENDING {
+            return Ok(Some(pending_receipt_from_journal(&journal).unwrap_or_else(
+                |_| unknown_receipt(&query.client_operation_id, None),
+            )));
+        }
     }
     let Some(settlement) = ctx
         .db
         .local_operation_settlement(owner.to_owned(), query.client_operation_id.clone())
         .await?
     else {
-        return Ok(unknown_receipt(&query.client_operation_id, None));
+        return Ok(None);
     };
     match settlement {
         crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(
             identity,
             json,
-        ) if identity.operation_kind == "apply_authored_agent_package" => {
-            match serde_json::from_str::<Response>(&json) {
-                Ok(Response::AuthoredAgentPackage(ApplyAuthoredAgentPackageOutcome::Receipt(
-                    receipt,
-                ))) => Ok(receipt),
-                Ok(Response::AuthoredAgentPackage(
-                    ApplyAuthoredAgentPackageOutcome::Rejected { .. },
-                )) => Ok(unknown_receipt(&query.client_operation_id, None)),
-                _ => Ok(unknown_receipt(&query.client_operation_id, None)),
-            }
-        }
+        ) if identity.operation_kind == "apply_authored_agent_package" => Ok(Some(
+            receipt_from_terminal_json(&query.client_operation_id, &json)?,
+        )),
         crate::db::local_operation_receipts::LocalOperationSettlement::Pending(_) => {
             if let Some(journal) = ctx
                 .db
                 .authored_agent_package_journal(owner.to_owned(), query.client_operation_id.clone())
                 .await?
-                && let Some(json) = journal.terminal_response_json.as_deref()
-                && let Ok(Response::AuthoredAgentPackage(
-                    ApplyAuthoredAgentPackageOutcome::Receipt(receipt),
-                )) = serde_json::from_str(json)
             {
-                return Ok(receipt);
+                return Ok(Some(pending_receipt_from_journal(&journal).unwrap_or_else(
+                    |_| unknown_receipt(&query.client_operation_id, None),
+                )));
             }
-            Ok(unknown_receipt(&query.client_operation_id, None))
+            Ok(Some(unknown_receipt(&query.client_operation_id, None)))
         }
-        _ => Ok(unknown_receipt(&query.client_operation_id, None)),
+        crate::db::local_operation_receipts::LocalOperationSettlement::TerminalError(_, json)
+        | crate::db::local_operation_receipts::LocalOperationSettlement::TerminalCancelled(
+            _,
+            json,
+        ) => Ok(Some(receipt_from_terminal_json(
+            &query.client_operation_id,
+            &json,
+        )?)),
+        _ => Ok(Some(unknown_receipt(&query.client_operation_id, None))),
+    }
+}
+
+fn receipt_from_terminal_json(
+    client_operation_id: &str,
+    json: &str,
+) -> Result<ApplyAuthoredAgentPackageReceipt> {
+    match serde_json::from_str::<Response>(json)? {
+        Response::AuthoredAgentPackage(ApplyAuthoredAgentPackageOutcome::Receipt(receipt)) => {
+            Ok(receipt)
+        }
+        Response::AuthoredAgentPackage(ApplyAuthoredAgentPackageOutcome::Rejected {
+            reason,
+            message,
+            ..
+        }) => Ok(rejected_receipt(client_operation_id, reason, message, None)),
+        other => anyhow::bail!("authored package terminal payload is not a receipt: {other:?}"),
+    }
+}
+
+fn pending_receipt_from_journal(
+    journal: &AuthoredAgentPackageJournalRow,
+) -> Result<ApplyAuthoredAgentPackageReceipt> {
+    let review = serde_json::from_str::<AuthoredAgentReview>(&journal.review_json)
+        .context("decoding pending authored package review")?;
+    Ok(ApplyAuthoredAgentPackageReceipt {
+        client_operation_id: journal.client_operation_id.clone(),
+        receipt_id: uuid::Uuid::nil(),
+        status: AuthoredAgentReceiptStatus::Pending,
+        package_digest: journal.package_digest.clone(),
+        policy_revision: journal.policy_revision.clone(),
+        installation_id: journal.installation_id.clone(),
+        default_selected: journal.default_selected,
+        result_config_generation: 0,
+        review,
+    })
+}
+
+fn rejected_receipt(
+    client_operation_id: &str,
+    _reason: AuthoredAgentRejectReason,
+    _message: String,
+    journal: Option<&AuthoredAgentPackageJournalRow>,
+) -> ApplyAuthoredAgentPackageReceipt {
+    if let Some(journal) = journal {
+        let review = serde_json::from_str::<AuthoredAgentReview>(&journal.review_json)
+            .unwrap_or_else(|_| empty_review(&journal.agent_name));
+        return ApplyAuthoredAgentPackageReceipt {
+            client_operation_id: client_operation_id.to_string(),
+            receipt_id: uuid::Uuid::nil(),
+            status: AuthoredAgentReceiptStatus::Rejected,
+            package_digest: journal.package_digest.clone(),
+            policy_revision: journal.policy_revision.clone(),
+            installation_id: journal.installation_id.clone(),
+            default_selected: journal.default_selected,
+            result_config_generation: 0,
+            review,
+        };
+    }
+    ApplyAuthoredAgentPackageReceipt {
+        client_operation_id: client_operation_id.to_string(),
+        receipt_id: uuid::Uuid::nil(),
+        status: AuthoredAgentReceiptStatus::Rejected,
+        package_digest: String::new(),
+        policy_revision: String::new(),
+        installation_id: None,
+        default_selected: false,
+        result_config_generation: 0,
+        review: empty_review(""),
+    }
+}
+
+fn empty_review(agent_name: &str) -> AuthoredAgentReview {
+    AuthoredAgentReview {
+        agent_name: agent_name.to_string(),
+        grants: Vec::new(),
+        tool_tier_preferences: Vec::new(),
+        verification_label: None,
+        interactive_subagents: false,
+        goal_skeptics_label: crate::agents::GoalSkepticsPolicy::Off
+            .review_label()
+            .to_string(),
+        children: Vec::new(),
+        sidecars: Vec::new(),
+        source: String::new(),
+        make_default: false,
+        trust_is_shared: true,
+        trust_disclosure: crate::onboarding_agent::REVIEW_TRUST_DISCLOSURE.to_string(),
     }
 }
 
@@ -278,7 +420,7 @@ fn publication_fence(
     let owner_digest = request
         .onboarding
         .as_ref()
-        .map(|row| format!("onboarding:{}", row.run_id))
+        .map(|row| format!("onboarding:{}", row.attempt_id))
         .unwrap_or_else(|| "authored-unfenced".to_string());
     Ok(AuthoredApplyFence {
         owner_digest,
@@ -398,18 +540,26 @@ async fn complete_pending_authored_journal(
         .await
         .context("committing authored draft revision")?;
     if !cas_ok {
+        let rejected = ApplyAuthoredAgentPackageReceipt {
+            client_operation_id: journal.client_operation_id.clone(),
+            receipt_id: uuid::Uuid::nil(),
+            status: AuthoredAgentReceiptStatus::Rejected,
+            package_digest: journal.package_digest.clone(),
+            policy_revision: journal.policy_revision.clone(),
+            installation_id: installation_id.clone(),
+            default_selected: journal.make_default,
+            result_config_generation: 0,
+            review,
+        };
         return settle_authored_outcome(
             ctx,
             &journal,
             installation_id,
-            ApplyAuthoredAgentPackageOutcome::Rejected {
-                reason: AuthoredAgentRejectReason::StaleDraft,
-                message: "authored draft revision does not match the last authoritative draft; edit/retry the current revision".into(),
-                projection: None,
-            },
+            ApplyAuthoredAgentPackageOutcome::Receipt(rejected),
         )
         .await;
     }
+    let result_config_generation = crate::daemon::server::inventory::current_config_generation();
     let mut receipt = ApplyAuthoredAgentPackageReceipt {
         client_operation_id: journal.client_operation_id.clone(),
         receipt_id: uuid::Uuid::now_v7(),
@@ -418,6 +568,7 @@ async fn complete_pending_authored_journal(
         policy_revision: journal.policy_revision.clone(),
         installation_id: installation_id.clone(),
         default_selected: journal.make_default,
+        result_config_generation,
         review,
     };
     if let Ok(id) = uuid::Uuid::parse_str(&operation_id) {
@@ -559,6 +710,7 @@ fn unknown_receipt(
         policy_revision: String::new(),
         installation_id: None,
         default_selected: false,
+        result_config_generation: 0,
         review: AuthoredAgentReview {
             agent_name: String::new(),
             grants: Vec::new(),
@@ -571,6 +723,7 @@ fn unknown_receipt(
             children: Vec::new(),
             sidecars: Vec::new(),
             source: String::new(),
+            make_default: false,
             trust_is_shared: true,
             trust_disclosure: crate::onboarding_agent::REVIEW_TRUST_DISCLOSURE.to_string(),
         },
@@ -613,96 +766,34 @@ mod tests {
     #[test]
     fn onboarding_and_rpc_apply_both_record_a_publication_fence() {
         let dispatch = include_str!("server/dispatch.rs");
-        let onboarding = dispatch
-            .split("apply_package_under_publication_lock")
+        let authored_apply = dispatch
+            .split("Request::ApplyAuthoredAgentPackage(request) =>")
             .nth(1)
-            .expect("onboarding authored apply");
+            .and_then(|tail| tail.split("Request::GetAuthoredAgentPackageReceipt").next())
+            .expect("shared authored apply RPC");
         assert!(
-            onboarding.contains("AuthoredApplyFence"),
-            "onboarding must journal authored publication under the owner fence"
+            authored_apply.contains("AuthoredApplyFence"),
+            "the shared onboarding/settings RPC must journal authored publication under the owner fence"
         );
         assert!(
-            !onboarding
-                .lines()
-                .take(20)
-                .any(|line| line.trim() == "None,"),
-            "onboarding must not skip the authored publication journal"
+            include_str!("agent_authoring.rs")
+                .contains("if let Some(correlation) = &request.onboarding"),
+            "the fenced shared RPC must retain onboarding correlation validation"
         );
     }
 
     #[test]
-    fn onboarding_compensation_inverts_draft_cas_under_composite_journal_identity() {
+    fn onboarding_agent_setup_wizard_bridge_is_removed_from_dispatch() {
         let dispatch = include_str!("server/dispatch.rs");
-        let compensate = dispatch
-            .split("async fn compensate_onboarding_agent_publication")
-            .nth(1)
-            .and_then(|tail| {
-                tail.split("pub(super) async fn recover_onboarding_agent_publication_journals")
-                    .next()
-            })
-            .expect("onboarding compensation");
         assert!(
-            compensate.contains("compensate_authored_agent_package_journal"),
-            "onboarding compensation must invoke the composite authored-journal inverse"
+            dispatch.contains(
+                "the onboarding agent stage uses ApplyAuthoredAgentPackage, not ApplySetupWizard"
+            ),
+            "the legacy onboarding-agent ApplySetupWizard bridge must fail closed"
         );
         assert!(
-            compensate.contains("authored_owner_digest"),
-            "onboarding compensation must pass the persisted authored owner, not a suffix-only operation id"
-        );
-        assert!(
-            !compensate.contains("delete_authored_agent_package_journals_by_client_operation"),
-            "compensation must not delete every journal sharing a client operation id"
-        );
-        let authored_idx = compensate
-            .find("compensate_authored_agent_package_journal")
-            .expect("authored inverse");
-        let install_idx = compensate
-            .find("cleanup_owned_onboarding_installation")
-            .expect("installation inverse");
-        assert!(
-            authored_idx < install_idx,
-            "authored inverse must run before other effects so recovery cannot complete-forward a compensating apply"
-        );
-
-        let recover = dispatch
-            .split("pub(super) async fn recover_onboarding_agent_publication_journals")
-            .nth(1)
-            .and_then(|tail| tail.split("/// Recover the catalog").next())
-            .expect("onboarding recovery");
-        assert!(recover.contains("authored_owner_digest"));
-        assert!(recover.contains("compensate_onboarding_agent_publication"));
-
-        let apply = dispatch
-            .split("if wizard_id == crate::wizard::ONBOARDING_AGENT_WIZARD_ID")
-            .nth(1)
-            .and_then(|tail| {
-                tail.split("crate::wizard::apply_setup_wizard_answers_authoritative")
-                    .next()
-            })
-            .expect("onboarding apply");
-        assert!(
-            apply.contains("authored_owner_digest"),
-            "onboarding must persist the nested authored journal owner before effects"
-        );
-        assert!(
-            apply.contains("journal_authored_owner = settlement_owner.clone()"),
-            "the persisted owner must be the capability owner used as the authored fence"
-        );
-        assert!(
-            !apply.contains("owned_installation_id = installation_id"),
-            "compensation and settlement must keep the minted operation identity"
-        );
-        assert_eq!(
-            apply
-                .matches("compensate_onboarding_agent_publication")
-                .count(),
-            3,
-            "every onboarding failure path compensates"
-        );
-        assert_eq!(
-            apply.matches("settlement_owner.clone(),").count(),
-            4,
-            "the authored fence and every compensation call must pass the persisted capability owner"
+            !dispatch.contains("prepare_onboarding_agent_answers_for_catalog"),
+            "onboarding agent installation must not route through ApplySetupWizard"
         );
     }
 
@@ -769,6 +860,56 @@ mod tests {
             "local-operation settlement must take the durable terminal payload as an argument"
         );
         assert!(finish.contains("terminal_response_json.to_owned()"));
+    }
+
+    #[test]
+    fn apply_reuses_terminal_journal_for_duplicate_client_operation_id() {
+        let source = include_str!("agent_authoring.rs");
+        let apply = source
+            .split("pub async fn apply_package_under_publication_lock")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("pub async fn recover_authored_agent_package_journals")
+                    .next()
+            })
+            .expect("apply under publication lock");
+        assert!(
+            apply.contains("replay_existing_journal"),
+            "duplicate create submits must query the durable receipt instead of minting a replacement operation"
+        );
+        assert!(
+            apply.contains("AUTHORED_PACKAGE_SETTLEMENT_PENDING"),
+            "pending journals must remain visible until the terminal receipt lands"
+        );
+    }
+
+    #[test]
+    fn receipt_query_never_mints_a_replacement_operation() {
+        let source = include_str!("agent_authoring.rs");
+        let receipt = source
+            .split("pub async fn receipt")
+            .nth(1)
+            .and_then(|tail| tail.split("fn encode_package_files").next())
+            .expect("receipt lookup");
+        assert!(receipt.contains("authored_agent_package_journal"));
+        assert!(!receipt.contains("begin_authored_agent_package_journal"));
+    }
+
+    #[test]
+    fn editor_lease_and_onboarding_create_share_exact_operation_settlement() {
+        let agent_management = include_str!("agent_management.rs");
+        assert!(
+            agent_management.contains("completion_operation_id"),
+            "editor lease settlement must bind to one stable client operation id"
+        );
+        assert!(
+            agent_management.contains("terminal_result_json"),
+            "editor lease settlement must replay the durable terminal receipt"
+        );
+        let apply = include_str!("agent_authoring.rs");
+        assert!(apply.contains("replay_existing_journal"));
+        assert!(apply.contains("set_default_agent_installation"));
+        assert!(apply.contains("finish_matching_local_operation"));
     }
 
     #[test]

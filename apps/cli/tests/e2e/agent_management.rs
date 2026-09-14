@@ -1087,6 +1087,7 @@ fn authored_agent_package_protocol_is_daemon_owned_and_secret_free() {
             draft_revision: None,
         },
         onboarding: None,
+        validate_only: false,
     };
     let encoded = serde_json::to_string(&request).expect("encode authored package request");
     assert!(!encoded.contains("api_key"));

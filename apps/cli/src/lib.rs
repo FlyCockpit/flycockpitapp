@@ -805,6 +805,8 @@ fn error_exit_code(err: &anyhow::Error) -> u8 {
         commands::REMOVED_COMMAND_EXIT_CODE
     } else if err.is::<commands::CommandUsageError>() {
         commands::USAGE_EXIT_CODE
+    } else if err.is::<commands::InteractiveOnboardingRequired>() {
+        commands::USAGE_EXIT_CODE
     } else if let Some(error) = err.downcast_ref::<commands::agent::AgentCommandError>() {
         error.exit_code()
     } else {
@@ -925,6 +927,8 @@ fn error_stderr_line(err: &anyhow::Error) -> String {
         format!("error: {}", removed.message())
     } else if let Some(usage) = err.downcast_ref::<commands::CommandUsageError>() {
         format!("error: {}", usage.message())
+    } else if let Some(required) = err.downcast_ref::<commands::InteractiveOnboardingRequired>() {
+        format!("error: {}", required.message())
     } else {
         format!("Error: {err:?}")
     }
@@ -941,7 +945,7 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         && (tui_mode_for_command(cli.command.as_ref()).is_some()
             || matches!(
                 cli.command.as_ref(),
-                Some(Command::Setup(crate::cli::SetupArgs { wizard: None }))
+                Some(Command::Setup(_))
                     | Some(Command::Assistants(
                         crate::cli::AssistantCommand::Chat { .. }
                     ))
@@ -966,30 +970,68 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
             cli.skip_setup,
             false,
             cli.debug_last_message,
+            None,
+            None,
         )
         .await;
     }
 
-    if matches!(
-        cli.command.as_ref(),
-        Some(Command::Setup(crate::cli::SetupArgs { wizard: None }))
-    ) {
-        return commands::tui::run_mode(
-            cli.project.as_deref(),
-            cli.no_sandbox,
-            commands::tui::SessionMode::Code,
-            Some(launch_start),
-            false,
-            true,
-            cli.debug_last_message,
-        )
-        .await;
+    if let Some(Command::Setup(args)) = cli.command.as_ref() {
+        if interactive_shell {
+            return commands::tui::run_mode(
+                cli.project.as_deref(),
+                cli.no_sandbox,
+                commands::tui::SessionMode::Code,
+                Some(launch_start),
+                cli.skip_setup,
+                args.wizard.is_none(),
+                cli.debug_last_message,
+                args.wizard.clone(),
+                None,
+            )
+            .await;
+        }
+    }
+
+    if let Some(Command::Provider(crate::cli::ProvidersCommand::Add(args))) = cli.command.as_ref() {
+        if interactive_shell {
+            if let Some(template) = args.template.as_deref()
+                && crate::providers::template_by_id(template).is_none()
+            {
+                return Err(anyhow::anyhow!(
+                    "unknown provider template `{template}`; run `cockpit provider list`"
+                ));
+            }
+            return commands::tui::run_mode(
+                cli.project.as_deref(),
+                cli.no_sandbox,
+                commands::tui::SessionMode::Code,
+                Some(launch_start),
+                cli.skip_setup,
+                false,
+                cli.debug_last_message,
+                Some(cockpit_core::wizard::PROVIDER_WIZARD_ID.to_string()),
+                args.template.clone(),
+            )
+            .await;
+        }
     }
 
     if cli.debug_last_message && !interactive_shell {
         match std::env::current_dir() {
             Ok(cwd) => engine::model::enable_debug_last_message(cwd.join(".lastmessage")),
             Err(e) => tracing::warn!(error = %e, "--debug-last-message: cwd unavailable"),
+        }
+    }
+
+    if let Some(Command::Setup(_)) = cli.command.as_ref() {
+        if !interactive_shell {
+            return Err(commands::InteractiveOnboardingRequired::setup().into());
+        }
+    }
+    if let Some(Command::Provider(crate::cli::ProvidersCommand::Add(_))) = cli.command.as_ref() {
+        if !interactive_shell {
+            return Err(commands::InteractiveOnboardingRequired::provider_add().into());
         }
     }
 
@@ -1758,7 +1800,7 @@ mod tests {
             "None | Some(Command::Code)",
             "Some(Command::Assistant)",
             "Some(Command::Computer)",
-            "Some(Command::Setup(crate::cli::SetupArgs { wizard: None }))",
+            "Some(Command::Setup(_))",
             "AssistantCommand::Chat { name }",
             "run_with_session",
         ] {
@@ -1767,7 +1809,22 @@ mod tests {
                 "interactive route `{route}` is missing from the dispatch inventory"
             );
         }
-        assert!(lib.contains("Some(Command::Setup(args)) => commands::setup::run(args).await"));
+        assert!(
+            lib.contains("Some(Command::Setup(args))") && lib.contains("interactive_shell"),
+            "named setup wizards must route through the TUI shell when stdin is a TTY"
+        );
+        assert!(
+            lib.contains("InteractiveOnboardingRequired::setup()"),
+            "non-interactive setup must keep the typed InteractiveOnboardingRequired path"
+        );
+        assert!(
+            lib.contains("InteractiveOnboardingRequired::provider_add()"),
+            "non-interactive provider add must keep the typed InteractiveOnboardingRequired path"
+        );
+        assert!(
+            lib.contains("Command::Provider(crate::cli::ProvidersCommand::Add(args))"),
+            "interactive provider add must route through the TUI shell"
+        );
         assert!(
             lib.contains("Some(Command::Provider(sub)) => commands::providers::run(sub).await")
         );

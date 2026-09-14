@@ -23,6 +23,8 @@ use crate::wizard::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::commands::InteractiveOnboardingRequired;
+
 pub async fn run(args: SetupArgs) -> Result<()> {
     let stdin_tty = io::stdin().is_terminal();
     let cwd = std::env::current_dir().context("getting cwd")?;
@@ -72,7 +74,7 @@ async fn choose_wizard(
     caps: &cockpit_proto::HostCapabilitySnapshot,
 ) -> Result<WizardDescriptor> {
     if !tty {
-        bail!("cockpit setup requires an interactive stdin; run `cockpit` and use /setup instead");
+        return Err(InteractiveOnboardingRequired::setup().into());
     }
     io.write_line("Available setup wizards:")?;
     for (index, wizard) in crate::wizard::registry().iter().enumerate() {
@@ -176,7 +178,7 @@ pub(crate) async fn run_terminal_wizard(
     actions: &mut dyn TerminalActionHandler,
 ) -> Result<WizardRun> {
     if !tty.is_tty() {
-        bail!("cockpit setup requires an interactive stdin; run `cockpit` and use /setup instead");
+        return Err(InteractiveOnboardingRequired::setup().into());
     }
 
     let mut run = WizardRun::new(descriptor)?;

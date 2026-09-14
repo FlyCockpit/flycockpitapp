@@ -591,6 +591,22 @@ pub enum AsyncActionPayload {
         generation: u64,
         error: String,
     },
+    StartupAgentAuthoringProjection {
+        client_operation_id: String,
+        request_id: String,
+        projection: cockpit_proto::AgentAuthoringProjection,
+    },
+    StartupAgentAuthoringReceipt {
+        request_id: String,
+        receipt: cockpit_proto::ApplyAuthoredAgentPackageReceipt,
+    },
+    StartupAgentAuthoringReceiptMiss {
+        request_id: String,
+    },
+    StartupAgentAuthoringOutcome {
+        request_id: String,
+        outcome: Result<cockpit_proto::ApplyAuthoredAgentPackageOutcome, String>,
+    },
     StartupWorkspace(crate::tui::app::StartupWorkspaceCompletion),
     StartupWorkspaceFailed {
         generation: u64,

@@ -4661,6 +4661,7 @@ impl AgentInstallationService {
             !name.is_empty()
                 && !name.contains('/')
                 && !name.contains('\\')
+                && !name.contains('.')
                 && name
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),

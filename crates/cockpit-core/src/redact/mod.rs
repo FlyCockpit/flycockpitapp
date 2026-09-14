@@ -2937,12 +2937,12 @@ mod scrub_inventory_tests {
     const INVENTORY_START: &str = "<!-- scrub-inventory:start -->";
     const INVENTORY_END: &str = "<!-- scrub-inventory:end -->";
     const EXPECTED_SCRUB_FILES: &[&str] = &[
-        "apps/cli/src/commands/debug.rs",
         "crates/cockpit-core/src/approval/policy.rs",
         "crates/cockpit-core/src/conversation_rules.rs",
         "crates/cockpit-core/src/daemon/fs_api.rs",
         "crates/cockpit-core/src/daemon/org_sync.rs",
         "crates/cockpit-core/src/daemon/remote_audit_upload.rs",
+        "crates/cockpit-core/src/daemon/server/dispatch.rs",
         "crates/cockpit-core/src/daemon/server/mod.rs",
         "crates/cockpit-core/src/daemon/session_worker/mod.rs",
         "crates/cockpit-core/src/daemon/session_worker/run.rs",
@@ -2962,6 +2962,7 @@ mod scrub_inventory_tests {
         "crates/cockpit-core/src/mcp/builtin.rs",
         "crates/cockpit-core/src/mcp/network.rs",
         "crates/cockpit-core/src/mcp/sandbox.rs",
+        "crates/cockpit-core/src/redact/coverage_authority.rs",
         "crates/cockpit-core/src/redact/mod.rs",
         "crates/cockpit-core/src/session/export/mod.rs",
         "crates/cockpit-core/src/session/recording.rs",
@@ -3118,11 +3119,32 @@ mod scrub_inventory_tests {
     }
 
     fn brace_delta(line: &str) -> i32 {
-        line.chars().fold(0, |delta, ch| match ch {
-            '{' => delta + 1,
-            '}' => delta - 1,
-            _ => delta,
-        })
+        let mut delta = 0;
+        let mut chars = line.chars().peekable();
+        let mut quoted = None;
+        let mut escaped = false;
+        while let Some(ch) = chars.next() {
+            if let Some(quote) = quoted {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == quote {
+                    quoted = None;
+                }
+                continue;
+            }
+            if ch == '/' && chars.peek() == Some(&'/') {
+                break;
+            }
+            match ch {
+                '"' => quoted = Some(ch),
+                '{' => delta += 1,
+                '}' => delta -= 1,
+                _ => {}
+            }
+        }
+        delta
     }
 
     fn doc_inventory_paths(path: &Path) -> BTreeSet<String> {

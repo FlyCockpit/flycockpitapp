@@ -681,7 +681,7 @@ fn try_inline(
         if matches!(mode, ExpansionMode::Assembly) {
             return lazy_reference("list", path_part, raw, "directory reference");
         }
-        let (block, count) = render_directory(&resolved, path_part, Some(policy), caps);
+        let (block, count) = render_directory(&resolved, path_part, policy, caps);
         return Expanded {
             wire_piece: block,
             expansion: TagExpansion {
@@ -900,7 +900,7 @@ fn render_file(
 fn render_directory(
     path: &Path,
     display_path: &str,
-    policy: Option<&TagPolicy>,
+    policy: &TagPolicy,
     caps: TagInlineCaps,
 ) -> (String, usize) {
     let display = if display_path.ends_with('/') {
@@ -909,30 +909,18 @@ fn render_directory(
         format!("{display_path}/")
     };
     let mut entries: Vec<(String, bool, u64)> = Vec::new();
-    if let Some(policy) = policy {
-        for (entry_path, is_dir, _gitignored) in
-            level_entries(path, &policy.allow_root, policy.allow())
-        {
-            let name = entry_path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let size = if is_dir {
-                0
-            } else {
-                std::fs::metadata(&entry_path).map(|m| m.len()).unwrap_or(0)
-            };
-            entries.push((name, is_dir, size));
-        }
-    } else if let Ok(rd) = std::fs::read_dir(path) {
-        for ent in rd.flatten() {
-            let name = ent.file_name().to_string_lossy().into_owned();
-            let (is_dir, size) = match ent.metadata() {
-                Ok(m) => (m.is_dir(), m.len()),
-                Err(_) => (false, 0),
-            };
-            entries.push((name, is_dir, size));
-        }
+    for (entry_path, is_dir, _gitignored) in level_entries(path, &policy.allow_root, policy.allow())
+    {
+        let name = entry_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let size = if is_dir {
+            0
+        } else {
+            std::fs::metadata(&entry_path).map(|m| m.len()).unwrap_or(0)
+        };
+        entries.push((name, is_dir, size));
     }
     entries.sort_by(|a, b| match (a.1, b.1) {
         (true, false) => std::cmp::Ordering::Less,

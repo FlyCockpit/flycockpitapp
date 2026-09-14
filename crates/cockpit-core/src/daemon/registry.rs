@@ -2519,9 +2519,12 @@ impl SessionRegistry {
         let publish_db = session.db.clone();
         let publish_command_cache = command_cache.clone();
         let env_live = std::sync::Arc::new(std::sync::RwLock::new(env_snapshot.clone()));
-        let config_source = self.config_source().clone();
         let publish_project_root = project_root.clone();
-        let publish_trust_policy = trust_policy.clone();
+        // Session start publishes the exact retained config snapshot selected
+        // above. A concurrently malformed disk layer must not replace that
+        // last-good snapshot or panic the coverage worker at its publish fence;
+        // the config watcher owns later valid adoption and invalidation.
+        let publish_redact_config = extended_cfg.redact.clone();
         let publish_fence = crate::redact::coverage_bindings::session_publish_owners(
             publish_vault.clone(),
             publish_db.clone(),
@@ -2537,29 +2540,17 @@ impl SessionRegistry {
                     }
                 }),
                 policy_digest: std::sync::Arc::new({
-                    let config_source = config_source.clone();
-                    let publish_project_root = publish_project_root.clone();
-                    let publish_trust_policy = publish_trust_policy.clone();
+                    let publish_redact_config = publish_redact_config.clone();
                     move || {
-                        let (_, extended) = config_source
-                            .load_with_trust(&publish_project_root, &publish_trust_policy)
-                            .expect("loading worker redact policy at publication");
-                        crate::redact::coverage_bindings::redact_config_digest(&extended.redact)
+                        crate::redact::coverage_bindings::redact_config_digest(
+                            &publish_redact_config,
+                        )
                     }
                 }),
                 override_revision: std::sync::Arc::new(|| 0),
                 redact_config: std::sync::Arc::new({
-                    let config_source = config_source.clone();
-                    let publish_project_root = publish_project_root.clone();
-                    let publish_trust_policy = publish_trust_policy.clone();
-                    move || {
-                        config_source
-                            .load_with_trust(&publish_project_root, &publish_trust_policy)
-                            .expect("loading worker redact config at publication")
-                            .1
-                            .redact
-                            .clone()
-                    }
+                    let publish_redact_config = publish_redact_config.clone();
+                    move || publish_redact_config.clone()
                 }),
                 workspace_root: std::sync::Arc::new(move || publish_project_root.clone()),
             },

@@ -1232,7 +1232,7 @@ mod tests {
         ctx.interrupts = Arc::new(
             crate::engine::interrupt::InterruptHub::new(
                 events,
-                redaction,
+                redaction.clone(),
                 Arc::new(std::sync::atomic::AtomicUsize::new(1)),
                 ctx.session.db.clone(),
                 ctx.session.id,
@@ -1245,10 +1245,11 @@ mod tests {
             ctx.cwd.clone(),
             ctx.config.clone(),
         );
-        ctx.approver = Some(Arc::new(crate::approval::Approver::new(
+        ctx.approver = Some(Arc::new(crate::approval::Approver::new_for_session(
             store,
             ctx.session.db.clone(),
-            ctx.session.id,
+            ctx.session.clone(),
+            redaction,
             "helper",
             ctx.interrupts.clone(),
         )));

@@ -934,10 +934,14 @@ mod file_write_grant_tests {
             cwd.to_path_buf(),
             crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
         );
-        Arc::new(Approver::new(
+        let session = Arc::new(session);
+        Arc::new(Approver::new_for_session(
             store,
             db,
-            session.id,
+            session,
+            Arc::new(std::sync::RwLock::new(Arc::new(
+                crate::redact::RedactionTable::empty(),
+            ))),
             "builder",
             Arc::new(InterruptHub::detached()),
         ))
@@ -964,7 +968,27 @@ mod file_write_grant_tests {
     #[tokio::test]
     async fn write_preview_refuses_without_bound_coverage() {
         let tmp = tempfile::tempdir().unwrap();
-        let approver = approver(tmp.path()).await;
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = crate::session::Session::create_for_test(
+            db.clone(),
+            tmp.path().to_path_buf(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        session.clear_redaction_coverage_for_test();
+        let approver = Arc::new(Approver::new(
+            GrantStore::new(
+                db.clone(),
+                session.id,
+                tmp.path().to_path_buf(),
+                crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
+            ),
+            db,
+            session.id,
+            "builder",
+            Arc::new(InterruptHub::detached()),
+        ));
         let decision = approver
             .approve_file_write(
                 &tmp.path().join("existing.txt"),

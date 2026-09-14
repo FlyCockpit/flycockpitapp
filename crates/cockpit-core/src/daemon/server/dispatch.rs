@@ -31364,26 +31364,56 @@ async fn run_docs_ask_pipeline(
         .await
         .map_err(|error| error.to_string())?;
     session.set_redaction_coverage(coverage_authority, coverage_key, policy_digest);
-    let env_live_for_model = env_live.clone();
-    let (model, redact) = admission
-        .consume_at_sink(|redact| {
-            let redact = std::sync::Arc::new(redact);
-            let model = Arc::new(crate::engine::model::Model::from_config_with_store(
-                &providers,
-                redact.clone(),
-                |name| {
-                    env_live_for_model
-                        .read()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .vars()
-                        .get(name)
-                        .cloned()
-                },
-                store.clone(),
-            )?);
-            Ok((model, redact))
+    admission
+        .consume_at_async_sink_preserving_error(|redact| {
+            run_docs_ask_model_pipeline(
+                db,
+                cwd,
+                providers,
+                extended,
+                env_live,
+                session,
+                guidance_proposals,
+                store,
+                package,
+                question,
+                Arc::new(redact),
+            )
         })
-        .map_err(|error| error.to_string())?;
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("{error:#}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_docs_ask_model_pipeline(
+    db: crate::db::Db,
+    cwd: PathBuf,
+    providers: crate::config::providers::ProvidersConfig,
+    extended: crate::config::extended::ExtendedConfig,
+    env_live: Arc<std::sync::RwLock<EnvSnapshot>>,
+    session: crate::session::Session,
+    guidance_proposals: Arc<
+        tokio::sync::Mutex<crate::computer::guidance::service::GuidanceProposalService>,
+    >,
+    store: crate::credentials::CredentialStore,
+    package: Option<String>,
+    question: String,
+    redact: Arc<crate::redact::RedactionTable>,
+) -> anyhow::Result<String> {
+    let model = Arc::new(crate::engine::model::Model::from_config_with_store(
+        &providers,
+        redact.clone(),
+        |name| {
+            env_live
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .vars()
+                .get(name)
+                .cloned()
+        },
+        store.clone(),
+    )?);
     let reasoning_params = model.resolve_reasoning_params(&providers);
     let endpoint_recovery_reasoning_params = model.endpoint_recovery_reasoning_params(&providers);
     let config = crate::daemon::session_worker::SessionConfigHandle::detached(
@@ -31450,7 +31480,7 @@ async fn run_docs_ask_pipeline(
     let locks = Arc::new(
         crate::locks::LockManager::from_db(db)
             .await
-            .map_err(|error| format!("loading lock state: {error:#}"))?,
+            .context("loading lock state")?,
     );
     let brief = build_docs_ask_brief(package.as_deref(), &question);
     let outcome = crate::engine::docs_pipeline::run(
@@ -31467,8 +31497,7 @@ async fn run_docs_ask_pipeline(
         None,
         None,
     )
-    .await
-    .map_err(|error| format!("{error:#}"))?;
+    .await?;
     Ok(outcome.report)
 }
 
@@ -32713,7 +32742,7 @@ pub(super) async fn auto_title_request(
         .map_err(internal)?;
 
     let title = admission
-        .consume_at_async_sink(|table| {
+        .consume_at_async_sink_preserving_error(|table| {
             crate::auto_title::generate_session_title_slug_once(
                 &session,
                 extended,
@@ -32724,15 +32753,15 @@ pub(super) async fn auto_title_request(
             )
         })
         .await
+        .map_err(internal)?
         .map_err(|error| {
-            let wrapped = anyhow::anyhow!(error.to_string());
-            crate::engine::model::log_utility_model_failure("auto_title", &wrapped);
+            crate::engine::model::log_utility_model_failure("auto_title", &error);
             ErrorPayload {
                 code: ErrorCode::BadRequest,
                 // Rig's provider-response display includes provider-owned body and
                 // request-id details. Keep those out of this RPC error channel.
-                message: crate::engine::model::safe_inference_error_detail(&wrapped)
-                    .map_or_else(|| wrapped.to_string(), |safe| safe.marker_string()),
+                message: crate::engine::model::safe_inference_error_detail(&error)
+                    .map_or_else(|| error.to_string(), |safe| safe.marker_string()),
             }
         })?
         .ok_or_else(|| ErrorPayload {

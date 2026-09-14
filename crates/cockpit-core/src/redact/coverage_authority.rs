@@ -248,6 +248,10 @@ pub(crate) enum CoverageError {
     Unavailable,
     Saturated,
     Invalidated,
+    /// Complete capture found an env source that cannot be read within the
+    /// daemon's fixed file cap. The category is safe to surface; the source
+    /// path and all other capture details remain confined to the worker.
+    SourceFileOverLimit,
 }
 
 impl fmt::Display for CoverageError {
@@ -256,6 +260,7 @@ impl fmt::Display for CoverageError {
             Self::Unavailable => "coverage_unavailable",
             Self::Saturated => "coverage_saturated",
             Self::Invalidated => "coverage_unavailable",
+            Self::SourceFileOverLimit => "redaction source exceeds the daemon file size limit",
         })
     }
 }
@@ -765,7 +770,17 @@ impl RedactionCoverageAuthority {
                     }
                 }
                 Ok(Ok(_)) => Err(CoverageError::Unavailable),
-                Ok(Err(_)) | Err(_) => Err(CoverageError::Unavailable),
+                Ok(Err(error)) => Err(
+                    if error
+                        .chain()
+                        .any(|cause| cause.is::<super::EnvFileOverLimitError>())
+                    {
+                        CoverageError::SourceFileOverLimit
+                    } else {
+                        CoverageError::Unavailable
+                    },
+                ),
+                Err(_) => Err(CoverageError::Unavailable),
             },
             Some(_) | None => Err(CoverageError::Unavailable),
         };
@@ -1190,6 +1205,23 @@ impl CoverageAdmission {
     {
         let table = self.bound_table_for_sink()?;
         let result = sink(table).await.map_err(|_| CoverageError::Unavailable)?;
+        self.validate_current()?;
+        Ok(result)
+    }
+
+    /// Async sink variant that keeps the sink's domain error distinct from a
+    /// coverage invalidation. The lease still spans the entire future and is
+    /// revalidated before the caller may act on either domain result.
+    pub(crate) async fn consume_at_async_sink_preserving_error<T, E, F, Fut>(
+        self,
+        sink: F,
+    ) -> std::result::Result<std::result::Result<T, E>, CoverageError>
+    where
+        F: FnOnce(RedactionTable) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<T, E>>,
+    {
+        let table = self.bound_table_for_sink()?;
+        let result = sink(table).await;
         self.validate_current()?;
         Ok(result)
     }

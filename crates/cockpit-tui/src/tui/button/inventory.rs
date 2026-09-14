@@ -1,4 +1,4 @@
-use crate::tui::chrome::FooterControl;
+use crate::tui::composer_controls::ComposerControlKind;
 use crate::tui::settings::pointer_actions::SettingsPointerAction;
 use crate::tui::settings::shell::SettingsHeaderAction;
 
@@ -53,8 +53,15 @@ pub(crate) fn button_inventory() -> Vec<InventoryAssignment> {
         "settings",
         ButtonId::SettingsHeader(SettingsHeaderAction::BackToConfigPicker),
     );
-    push_button(&mut out, "footer", ButtonId::Footer(FooterControl::Agent));
-    push_button(&mut out, "footer", ButtonId::Footer(FooterControl::Model));
+    for kind in ComposerControlKind::ALL {
+        push_button(&mut out, "composer", ButtonId::ComposerPill(kind));
+    }
+    push_button(&mut out, "composer", ButtonId::ComposerSend);
+    push_button(
+        &mut out,
+        "composer",
+        ButtonId::ComposerPickerRow { index: 0 },
+    );
     for kind in crate::tui::chat_header::HeaderPillKind::ALL {
         push_button(&mut out, "header", ButtonId::HeaderPill(kind));
     }
@@ -67,6 +74,22 @@ pub(crate) fn button_inventory() -> Vec<InventoryAssignment> {
         &mut out,
         "queue",
         ButtonId::QueueToggleClass { item_id: None },
+    );
+    push_button(
+        &mut out,
+        "queue",
+        ButtonId::QueueSetClass {
+            item_id: None,
+            class: cockpit_proto::QueueDeliveryClass::Held,
+        },
+    );
+    push_button(
+        &mut out,
+        "queue",
+        ButtonId::QueueSetClass {
+            item_id: None,
+            class: cockpit_proto::QueueDeliveryClass::Steering,
+        },
     );
     push_button(&mut out, "queue", ButtonId::QueueEdit { item_id: None });
     push_button(&mut out, "queue", ButtonId::QueueCancel { item_id: None });
@@ -82,6 +105,22 @@ pub(crate) fn button_inventory() -> Vec<InventoryAssignment> {
         "queue",
         ButtonId::QueueToggleClass {
             item_id: Some(uuid::Uuid::nil()),
+        },
+    );
+    push_button(
+        &mut out,
+        "queue",
+        ButtonId::QueueSetClass {
+            item_id: Some(uuid::Uuid::nil()),
+            class: cockpit_proto::QueueDeliveryClass::Held,
+        },
+    );
+    push_button(
+        &mut out,
+        "queue",
+        ButtonId::QueueSetClass {
+            item_id: Some(uuid::Uuid::nil()),
+            class: cockpit_proto::QueueDeliveryClass::Steering,
         },
     );
     push_button(
@@ -291,13 +330,16 @@ pub(crate) fn button_id_family(id: &ButtonId) -> &'static str {
     match id {
         ButtonId::SettingsHeader(_) => "settings_header",
         ButtonId::Settings(_) => "settings",
-        ButtonId::Footer(_) => "footer",
+        ButtonId::ComposerPill(_) | ButtonId::ComposerSend | ButtonId::ComposerPickerRow { .. } => {
+            "composer"
+        }
         ButtonId::HeaderPill(_) | ButtonId::HeaderMore => "header",
         ButtonId::TranscriptPin { .. }
         | ButtonId::TranscriptUnpin { .. }
         | ButtonId::TranscriptFork { .. } => "transcript",
         ButtonId::QueueSendNow { .. }
         | ButtonId::QueueToggleClass { .. }
+        | ButtonId::QueueSetClass { .. }
         | ButtonId::QueueEdit { .. }
         | ButtonId::QueueCancel { .. } => "queue",
         ButtonId::PersistentNoticeCopy

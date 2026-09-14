@@ -173,7 +173,13 @@ impl App {
                     })
                     .await
                     .map_err(|error| error.to_string())?;
-                Ok(crate::tui::async_action::AsyncActionPayload::SessionSetupSnapshot(response))
+                Ok(
+                    crate::tui::async_action::AsyncActionPayload::SessionSetupSnapshot {
+                        response,
+                        correlation:
+                            crate::tui::app::SessionSetupSnapshotCorrelation::unrelated_mutation(),
+                    },
+                )
             },
         );
     }

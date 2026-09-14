@@ -712,7 +712,7 @@ impl App {
             return false;
         }
 
-        if self.handle_footer_control_key(key) {
+        if self.handle_composer_control_key(key) {
             return false;
         }
 
@@ -972,10 +972,22 @@ impl App {
             }
             Overlay::Tools(mut pane) => {
                 if let Some(outcome) = pane.handle_key(key) {
-                    if matches!(outcome, crate::tui::tools_pane::ToolsOutcome::Pending) {
-                        self.overlay = Overlay::Tools(pane);
-                    } else {
-                        self.handle_tools_outcome(outcome);
+                    match &outcome {
+                        crate::tui::tools_pane::ToolsOutcome::Pending
+                        | crate::tui::tools_pane::ToolsOutcome::RefreshSnapshot
+                        | crate::tui::tools_pane::ToolsOutcome::Apply { .. } => {
+                            self.overlay = Overlay::Tools(pane);
+                            if matches!(
+                                outcome,
+                                crate::tui::tools_pane::ToolsOutcome::Apply { .. }
+                                    | crate::tui::tools_pane::ToolsOutcome::RefreshSnapshot
+                            ) {
+                                self.handle_tools_outcome(outcome);
+                            }
+                        }
+                        crate::tui::tools_pane::ToolsOutcome::Close => {
+                            self.handle_tools_outcome(outcome);
+                        }
                     }
                 } else {
                     self.overlay = Overlay::Tools(pane);
@@ -1333,79 +1345,6 @@ impl App {
             }
         }
         self.handle_key_insert(key)
-    }
-
-    fn handle_footer_control_key(&mut self, key: KeyEvent) -> bool {
-        if let Some(mut picker) = self.footer_agent_picker.take() {
-            match key.code {
-                KeyCode::Esc => {
-                    self.footer_selection = None;
-                    return true;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    picker.prev();
-                    self.footer_agent_picker = Some(picker);
-                    return true;
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    picker.next();
-                    self.footer_agent_picker = Some(picker);
-                    return true;
-                }
-                KeyCode::Enter => {
-                    self.commit_footer_agent_picker(&picker);
-                    return true;
-                }
-                _ if !is_modifier_only(&key) => {
-                    self.footer_agent_picker = None;
-                    self.footer_selection = None;
-                    return false;
-                }
-                _ => {
-                    self.footer_agent_picker = Some(picker);
-                    return true;
-                }
-            }
-        }
-
-        let Some(selected) = self.footer_selection else {
-            return false;
-        };
-        match key.code {
-            KeyCode::Esc => {
-                self.footer_selection = None;
-                true
-            }
-            KeyCode::Left | KeyCode::Char('h') => {
-                match selected {
-                    crate::tui::chrome::FooterControl::Agent => self.footer_cycle_agent(),
-                    crate::tui::chrome::FooterControl::Model => self.cycle_footer_model(false),
-                }
-                true
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                match selected {
-                    crate::tui::chrome::FooterControl::Agent => self.footer_cycle_agent(),
-                    crate::tui::chrome::FooterControl::Model => self.cycle_footer_model(true),
-                }
-                true
-            }
-            KeyCode::Enter => {
-                match selected {
-                    crate::tui::chrome::FooterControl::Agent => self.open_footer_agent_picker(),
-                    crate::tui::chrome::FooterControl::Model => {
-                        self.footer_selection = None;
-                        self.open_model_picker();
-                    }
-                }
-                true
-            }
-            _ if !is_modifier_only(&key) => {
-                self.footer_selection = None;
-                false
-            }
-            _ => true,
-        }
     }
 
     fn handle_chat_scrollback_key(&mut self, key: KeyEvent) -> bool {
@@ -2626,10 +2565,7 @@ impl App {
                 .unwrap_or_default()
         });
         if submitted.is_empty() && self.composer.paste_is_empty() && pending_probe_ids.is_empty() {
-            if !self.config_snapshot.extended.queued_messages_as_steering && !self.queue.is_empty()
-            {
-                self.queue_promote_all(proto::QueueDeliveryClass::Steering);
-            }
+            self.handle_empty_composer_enter();
             return false;
         }
         if (self.first_paint_completed || self.startup_background.started)

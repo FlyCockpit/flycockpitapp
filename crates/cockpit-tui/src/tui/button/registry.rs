@@ -202,7 +202,8 @@ impl ButtonRegistry {
 fn dispatch_is_idempotent(dispatch: &ButtonDispatch) -> bool {
     matches!(
         dispatch,
-        ButtonDispatch::Footer(_)
+        ButtonDispatch::ComposerPill(_)
+            | ButtonDispatch::ComposerSend
             | ButtonDispatch::TranscriptPin { .. }
             | ButtonDispatch::TranscriptUnpin { .. }
             | ButtonDispatch::TranscriptFork { .. }

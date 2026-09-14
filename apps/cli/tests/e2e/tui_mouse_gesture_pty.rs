@@ -14,7 +14,6 @@ const HEAD_PREFIX: &str = "PTY GESTURE RESPONSE";
 const TAIL_MARKER: &str = "PTY GESTURE RESPONSE omega";
 const WORD_MARKER: &str = "alpha";
 const MAX_WHEEL_EVENTS: usize = 80;
-const MUTED_COLOR_INDEX: u8 = 250;
 
 fn gesture_completion() -> String {
     let mut lines = Vec::with_capacity(80);
@@ -479,19 +478,27 @@ fn assert_inverse_only_span(screen: &ScreenSnapshot, start: CellPos, end: CellPo
 
 fn find_muted_footer_separator(screen: &ScreenSnapshot) -> CellPos {
     let (rows, _) = screen.size();
-    let status_row = rows.saturating_sub(1);
-    if let Some(cell) = screen.cells().iter().find(|cell| {
-        cell.row == status_row
-            && cell.fg_index == Some(MUTED_COLOR_INDEX)
-            && (cell.text == "·" || cell.text == "─")
-    }) {
-        return CellPos {
-            row: cell.row,
-            col: cell.col,
-        };
+    // The five-pill control deck occupies the composer input's bottom
+    // border, which is not the screen's last row once a sandbox or
+    // status notice paints below. Chrome drags must hit that border.
+    for row in (0..rows).rev() {
+        let text = screen.row_text(row);
+        if !(text.contains("[Send]") || text.contains("[Queue]")) {
+            continue;
+        }
+        if let Some(cell) = screen
+            .cells()
+            .iter()
+            .find(|cell| cell.row == row && (cell.text == "─" || cell.text == "·"))
+        {
+            return CellPos {
+                row: cell.row,
+                col: cell.col,
+            };
+        }
     }
     panic!(
-        "muted footer separator not observed; status_row={status_row} chat={:?}",
+        "composer chrome separator not observed; chat={:?}",
         observed_chat_coord(screen)
     );
 }

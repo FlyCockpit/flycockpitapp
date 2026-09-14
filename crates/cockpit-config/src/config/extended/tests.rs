@@ -1696,6 +1696,28 @@ fn approval_mode_cycles_manual_auto_yolo() {
 }
 
 #[test]
+fn session_set_approval_mode_requires_trusted_workspace_for_auto_and_yolo() {
+    use crate::WorkspaceTrustMode;
+    assert!(ApprovalMode::Manual.session_set_allowed(None));
+    assert!(ApprovalMode::Manual.session_set_allowed(Some(WorkspaceTrustMode::IgnoreConfig)));
+    assert!(ApprovalMode::Manual.session_set_allowed(Some(WorkspaceTrustMode::Untrusted)));
+    assert!(ApprovalMode::Manual.session_set_allowed(Some(WorkspaceTrustMode::Trust)));
+    for mode in [ApprovalMode::Auto, ApprovalMode::Yolo] {
+        assert!(
+            !mode.session_set_allowed(None),
+            "{mode:?} must not be selectable without a trust decision"
+        );
+        assert!(!mode.session_set_allowed(Some(WorkspaceTrustMode::IgnoreConfig)));
+        assert!(!mode.session_set_allowed(Some(WorkspaceTrustMode::Untrusted)));
+        assert!(mode.session_set_allowed(Some(WorkspaceTrustMode::Trust)));
+        assert!(
+            mode.session_set_block_reason(Some(WorkspaceTrustMode::IgnoreConfig))
+                .is_some_and(|reason| reason.contains("trusted workspace"))
+        );
+    }
+}
+
+#[test]
 fn approval_policy_config_parses_risk_program_and_key_caps() {
     let cfg: ExtendedConfig = serde_json::from_str(
         r#"{

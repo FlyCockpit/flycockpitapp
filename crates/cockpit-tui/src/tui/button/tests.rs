@@ -9,7 +9,7 @@ use crate::tui::button::{
     InventoryMember, bracketed_label, button_inventory, clip_to_display_width, display_width,
     settings_pointer_control_kind,
 };
-use crate::tui::chrome::FooterControl;
+use crate::tui::composer_controls::ComposerControlKind;
 use crate::tui::settings::pointer_actions::SettingsPointerAction;
 use crate::tui::settings::shell::SettingsHeaderAction;
 use crate::tui::theme::{
@@ -82,9 +82,9 @@ fn button_primitive_exact_bounds() {
 
     registry.begin_frame(true, 1);
     let combining = ButtonSpec::new(
-        ButtonId::Footer(FooterControl::Model),
+        ButtonId::ComposerPill(ComposerControlKind::Model),
         "e\u{301}",
-        ButtonDispatch::Footer(FooterControl::Model),
+        ButtonDispatch::ComposerPill(ComposerControlKind::Model),
     );
     let (rect, _) = paint_sample(&mut registry, combining, 0, 40);
     assert_eq!(rect.width, display_width("[e\u{301}]"));
@@ -302,7 +302,7 @@ fn tui_button_inventory_is_complete() {
         )),
         "settings header buttons must be inventoried"
     );
-    assert!(inventory.iter().any(|item| item.surface == "footer"));
+    assert!(inventory.iter().any(|item| item.surface == "composer"));
     assert!(inventory.iter().any(|item| item.surface == "transcript"));
     assert!(inventory.iter().any(|item| item.surface == "queue"));
     assert!(inventory.iter().any(|item| item.surface == "notice"));
@@ -360,7 +360,7 @@ fn tui_button_inventory_is_complete() {
         .collect();
     for family in [
         "settings_header",
-        "footer",
+        "composer",
         "transcript",
         "notice",
         "sessions",

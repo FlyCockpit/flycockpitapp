@@ -14,21 +14,26 @@ queued and shown above the composer.
   arrives immediately and its result attaches when the process exits; other
   tools finish normally and deliver at the resulting safe point.
 
-Visual order is delivery order: the **steering · next turn** group on top,
-**after completion** below. Toggling a class moves the message between groups
-without reordering siblings. Send-now and steering items share that top group
-and retain their original queue order relative to one another.
+Visual order is delivery order: the **Steer** group on top, **Held** below.
+Selecting a class moves the message between groups without reordering
+siblings. Send-now and Steer items share that top group and retain their
+original queue order relative to one another.
 
 ## Setting
 
 `queuedMessagesAsSteering` (extended config, `/settings` → Behavior, default
-**on**):
+**off** / Held):
 
-- On: Enter during a run classes the message `steering`.
-- Off: Enter during a run classes it `held`. Enter on an **empty** composer
-  promotes the whole queue to `steering`.
+- Off (default): Enter during a run classes the message `held`.
+- On: Enter during a run classes it `steering` (explicit opt-in).
 
-Per-message and box-level toggles override the setting.
+Empty-composer Enter never submits text. An empty queue is a no-op; a
+Held-only or mixed queue promotes every Held item to Steering; a
+steering-only queue then requests Send now. A mixed queue therefore
+promotes first and requests send-now only on the next empty Enter.
+
+Per-message and box-level Held / Steer / Send now controls override the
+setting.
 
 ## Routing
 
@@ -39,10 +44,10 @@ which the agent stack will reach their boundaries.
 
 ## Controls
 
-Box: `[send now] [steer all|hold all] [edit] [cancel]`. These are atomic
+Box: `[Send now] [Steer] [Held] [edit] [cancel]`. These are atomic
 whole-queue operations, including when queued items span a focus transition.
 
-Per message (hover or keyboard focus): `[send now] [steer|hold] [edit] [cancel]`.
+Per message (hover or keyboard focus): `[Send now] [Steer] [Held] [edit] [cancel]`.
 
 Opening a per-message edit reserves that exact queue slot. Queue mutations are
 serialized until the edit is committed or cancelled; reconnects retry the same

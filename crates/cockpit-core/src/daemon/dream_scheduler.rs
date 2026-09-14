@@ -358,7 +358,7 @@ pub(crate) async fn run_knowledge_dream(
                 queue_target: None,
                 pending_terminal_disposition: None,
                 run_invocation_id: None,
-                delivery_class: QueueDeliveryClass::default(),
+                delivery_class: QueueDeliveryClass::Held,
                 delivery_class_override: None,
             }),
             #[cfg(feature = "remote")]

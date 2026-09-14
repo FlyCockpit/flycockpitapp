@@ -1,41 +1,22 @@
 //! TUI status line / chrome.
 //!
 //! The fixed path/git chrome and the async-schedule strip moved to the
-//! three-row chat header (`crate::tui::chat_header`); this module keeps the
-//! footer's remaining controls (agent/model picker slots, sandbox label)
-//! and the additive transient indicators.
+//! three-row chat header (`crate::tui::chat_header`); agent/model/sandbox
+//! pickers live on the composer bottom-border deck. This module keeps the
+//! additive transient indicators (longcache, caffeination, lock wait, …).
 
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
 #[cfg(feature = "remote")]
 use crate::tui::theme::PLAN_YELLOW;
-use crate::tui::theme::{
-    FAVORITE_MODEL, MUTED_COLOR_INDEX, WARNING_TEXT, button_focus_style, button_hover_style,
-    button_idle_style,
-};
-use cockpit_config::sandbox_mode::SandboxMode;
-use cockpit_proto::LaunchInfo;
+use crate::tui::theme::{MUTED_COLOR_INDEX, WARNING_TEXT};
 #[cfg(feature = "remote")]
 use cockpit_proto::{ConnectorDisclosure, OrgSyncDisclosure};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FooterControl {
-    Agent,
-    Model,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FooterHit {
-    pub control: FooterControl,
-    pub start: u16,
-    pub end: u16,
-}
 
 #[derive(Debug, Clone)]
 pub struct LeftStatus {
     pub spans: Vec<Span<'static>>,
-    pub hits: Vec<FooterHit>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,87 +31,19 @@ impl LongcacheStatus {
     }
 }
 
-/// Bottom-left status: `agent path · provider/model`.
-///
-///   - The model glyph is green when trusted, dark yellow when marked
-///     favorite, light grey otherwise.
-///   - Agent segments use the same styling as delegated child-agent names in
-///     the history view.
-pub fn left_status(
-    info: &LaunchInfo,
-    agent_path: &[String],
-    selected: Option<FooterControl>,
-    sandbox_mode: SandboxMode,
-    sandbox_escalation_enabled: bool,
-    longcache: LongcacheStatus,
-) -> LeftStatus {
+/// Bottom-left status: additive indicators that are not composer pills
+/// (currently longcache). Agent, model, effort, approval, and sandbox live
+/// on the composer bottom-border deck.
+pub fn left_status(longcache: LongcacheStatus) -> LeftStatus {
     let LongcacheStatus {
         enabled: longcache_enabled,
         supported: longcache_supported,
     } = longcache;
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut hits = Vec::new();
     let mut col: u16 = 0;
 
-    let path = if agent_path.is_empty() {
-        vec![info.agent_name.clone()]
-    } else {
-        agent_path.to_vec()
-    };
-    let agent_label = path
-        .iter()
-        .map(|name| crate::tui::history::agent_display_label(name).to_string())
-        .collect::<Vec<_>>()
-        .join(" › ");
-    let agent_start = col;
-    push_span(
-        &mut spans,
-        &mut col,
-        Span::styled(
-            format!("[{agent_label}]"),
-            footer_button_style(
-                crate::tui::history::subagent_child_name_style(path.last().unwrap_or(&path[0])),
-                selected == Some(FooterControl::Agent),
-            ),
-        ),
-    );
-    hits.push(FooterHit {
-        control: FooterControl::Agent,
-        start: agent_start,
-        end: col,
-    });
-
-    if let Some((provider, model)) = &info.active_model {
-        push_span(&mut spans, &mut col, Span::styled(" · ".to_string(), muted));
-        let model_style = if info.active_model_is_trusted {
-            Style::default().fg(Color::Green)
-        } else if info.active_model_is_favorite {
-            // Dark yellow / amber (xterm 220 is the bright shade we use
-            // for the branch badge — 178 reads as "dark yellow" alongside
-            // the light grey).
-            Style::default().fg(FAVORITE_MODEL)
-        } else {
-            muted
-        };
-        let start = col;
-        push_span(
-            &mut spans,
-            &mut col,
-            Span::styled(
-                format!("[{provider}/{model}]"),
-                footer_button_style(model_style, selected == Some(FooterControl::Model)),
-            ),
-        );
-        hits.push(FooterHit {
-            control: FooterControl::Model,
-            start,
-            end: col,
-        });
-    }
-
     if longcache_enabled {
-        push_span(&mut spans, &mut col, Span::styled(" · ".to_string(), muted));
         let (label, style) = if longcache_supported {
             ("longcache".to_string(), muted)
         } else {
@@ -142,46 +55,12 @@ pub fn left_status(
         push_span(&mut spans, &mut col, Span::styled(label, style));
     }
 
-    let (sandbox_label, sandbox_style) = match sandbox_mode {
-        SandboxMode::Off => ("sandbox off", Style::default().fg(WARNING_TEXT)),
-        SandboxMode::Sandbox => ("sandbox", muted),
-        SandboxMode::Container => ("container", muted),
-        SandboxMode::ContainerReadonly => ("container readonly", muted),
-        SandboxMode::Refuse => ("sandbox refused", Style::default().fg(WARNING_TEXT)),
-    };
-    push_span(&mut spans, &mut col, Span::styled(" · ".to_string(), muted));
-    push_span(
-        &mut spans,
-        &mut col,
-        Span::styled(sandbox_label.to_string(), sandbox_style),
-    );
-    if sandbox_mode.enabled() && !sandbox_escalation_enabled {
-        push_span(&mut spans, &mut col, Span::styled(" · ".to_string(), muted));
-        push_span(
-            &mut spans,
-            &mut col,
-            Span::styled("esc off".to_string(), Style::default().fg(WARNING_TEXT)),
-        );
-    }
-
-    LeftStatus { spans, hits }
+    LeftStatus { spans }
 }
 
 fn push_span(spans: &mut Vec<Span<'static>>, col: &mut u16, span: Span<'static>) {
     *col = col.saturating_add(span.width() as u16);
     spans.push(span);
-}
-
-fn footer_button_style(idle: Style, selected: bool) -> Style {
-    if selected {
-        button_focus_style()
-    } else {
-        idle.patch(button_idle_style())
-    }
-}
-
-pub fn footer_hover_style() -> Style {
-    button_hover_style()
 }
 
 /// Persistent enterprise session-log sync disclosure. Rendered only while an
@@ -279,27 +158,6 @@ pub fn side_glyph_spans(active: bool) -> Vec<Span<'static>> {
 mod tests {
     use super::*;
 
-    fn launch_info(agent: &str) -> LaunchInfo {
-        LaunchInfo {
-            version: "test".to_string(),
-            session_id: None,
-            session_short_id: None,
-            provider_line: String::new(),
-            active_model: Some(("openai".into(), "gpt-test".into())),
-            active_model_diverged: false,
-            active_model_is_favorite: true,
-            active_model_is_trusted: false,
-            active_model_max_context: None,
-            active_model_supports_images: false,
-            cwd: std::path::PathBuf::from("/repo"),
-            cwd_display: "/repo".into(),
-            repo_status: None,
-            agent_name: agent.into(),
-            user_name: None,
-            banner_enabled: false,
-        }
-    }
-
     /// The waiting-for-lock indicator surfaces the contended path (basename)
     /// and the holder while waiting, and is absent (empty) when not waiting —
     /// the same additive-chrome contract as the ☕ glyph.
@@ -344,228 +202,45 @@ mod tests {
     }
 
     #[test]
-    fn left_status_agent_uses_history_subagent_child_name_foreground() {
-        let mut info = launch_info("explore");
-        info.active_model_is_favorite = false;
-
-        let spans = left_status(
-            &info,
-            std::slice::from_ref(&info.agent_name),
-            None,
-            SandboxMode::Sandbox,
-            true,
-            LongcacheStatus::new(false, true),
-        )
-        .spans;
-        let agent = spans
-            .iter()
-            .find(|span| span.content.contains("explore"))
-            .expect("active-agent span present");
-        assert_eq!(
-            agent.style.fg,
-            crate::tui::history::subagent_child_name_style("explore").fg
-        );
-    }
-
-    #[test]
-    fn left_status_trusted_model_renders_green() {
-        let mut info = launch_info("Build");
-        info.active_model_is_favorite = false;
-        info.active_model_is_trusted = true;
-        let spans = left_status(
-            &info,
-            std::slice::from_ref(&info.agent_name),
-            None,
-            SandboxMode::Sandbox,
-            true,
-            LongcacheStatus::new(false, true),
-        )
-        .spans;
-        let model = spans
-            .iter()
-            .find(|span| span.content == "[openai/gpt-test]")
-            .expect("active model span present");
-        assert_eq!(model.style.fg, Some(Color::Green));
-    }
-
-    #[test]
-    fn left_status_never_renders_model_config_drift_badge() {
-        let mut info = launch_info("Build");
-        info.active_model_diverged = true;
-        let text = left_status(
-            &info,
-            std::slice::from_ref(&info.agent_name),
-            None,
-            SandboxMode::Sandbox,
-            true,
-            LongcacheStatus::new(false, true),
-        )
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>();
-        assert!(!text.contains("model ≠ config"), "{text}");
-        assert!(!text.contains("!= config"), "{text}");
-    }
-
-    #[test]
-    fn left_status_renders_agent_path_and_model_with_hits() {
-        let info = launch_info("Build");
-        let path = vec!["Build".to_string(), "explore".to_string()];
-        let status = left_status(
-            &info,
-            &path,
-            None,
-            SandboxMode::Sandbox,
-            true,
-            LongcacheStatus::new(false, true),
-        );
-        let text = status
+    fn left_status_omits_agent_model_and_sandbox() {
+        let text: String = left_status(LongcacheStatus::new(false, true))
             .spans
             .iter()
             .map(|span| span.content.as_ref())
-            .collect::<String>();
-
-        assert_eq!(text, "[Build › explore] · [openai/gpt-test] · sandbox");
-        assert_eq!(
-            status
-                .hits
-                .iter()
-                .map(|hit| hit.control)
-                .collect::<Vec<_>>(),
-            vec![FooterControl::Agent, FooterControl::Model]
-        );
-        for hit in &status.hits {
-            let fragment: String = status
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-                .chars()
-                .skip(hit.start as usize)
-                .take((hit.end - hit.start) as usize)
-                .collect();
-            assert!(
-                fragment.starts_with('[') && fragment.ends_with(']'),
-                "hit {hit:?} must span its bracket pair, got {fragment:?}"
-            );
-        }
-        assert!(text.contains(" · sandbox"));
-        assert!(!text.contains("[sandbox]"));
-    }
-
-    #[test]
-    fn footer_control_selected_style() {
-        left_status_renders_agent_path_and_model_with_hits();
+            .collect();
+        assert!(!text.contains("Build"), "{text}");
+        assert!(!text.contains("gpt-test"), "{text}");
+        assert!(!text.contains("sandbox"), "{text}");
+        assert!(!text.contains("compact"), "{text}");
+        assert!(!text.contains("export"), "{text}");
+        assert!(!text.contains("tools"), "{text}");
     }
 
     #[test]
     fn longcache_status_indicator_renders_supported_and_unsupported() {
-        let info = launch_info("Build");
-        let path = vec!["Build".to_string()];
-
-        let off = left_status(
-            &info,
-            &path,
-            None,
-            SandboxMode::Sandbox,
-            true,
-            LongcacheStatus::new(false, true),
-        );
-        let off_text = off
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
+        let off = left_status(LongcacheStatus::new(false, true));
+        let off_text: String = off.spans.iter().map(|span| span.content.as_ref()).collect();
         assert!(!off_text.contains("longcache"), "{off_text}");
 
-        let supported = left_status(
-            &info,
-            &path,
-            None,
-            SandboxMode::Sandbox,
-            true,
-            LongcacheStatus::new(true, true),
-        );
-        let supported_text = supported
+        let supported = left_status(LongcacheStatus::new(true, true));
+        let supported_text: String = supported
             .spans
             .iter()
             .map(|span| span.content.as_ref())
-            .collect::<String>();
+            .collect();
         assert!(supported_text.contains("longcache"), "{supported_text}");
         assert!(!supported_text.contains("unsupported"), "{supported_text}");
 
-        let unsupported = left_status(
-            &info,
-            &path,
-            None,
-            SandboxMode::Sandbox,
-            true,
-            LongcacheStatus::new(true, false),
-        );
-        let unsupported_text = unsupported
+        let unsupported = left_status(LongcacheStatus::new(true, false));
+        let unsupported_text: String = unsupported
             .spans
             .iter()
             .map(|span| span.content.as_ref())
-            .collect::<String>();
+            .collect();
         assert!(
             unsupported_text.contains("longcache unsupported"),
             "{unsupported_text}"
         );
-    }
-
-    fn sandbox_status_text(mode: SandboxMode, escalation_enabled: bool) -> String {
-        let info = launch_info("Build");
-        left_status(
-            &info,
-            std::slice::from_ref(&info.agent_name),
-            None,
-            mode,
-            escalation_enabled,
-            LongcacheStatus::new(false, true),
-        )
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect()
-    }
-
-    #[test]
-    fn left_status_sandbox_off_shows_sandbox_off() {
-        let text = sandbox_status_text(SandboxMode::Off, true);
-        assert!(text.contains("sandbox off"), "{text}");
-        assert!(!text.contains("esc "), "{text}");
-    }
-
-    #[test]
-    fn left_status_sandbox_on_omits_esc_on() {
-        let text = sandbox_status_text(SandboxMode::Sandbox, true);
-        assert!(text.contains("sandbox"), "{text}");
-        assert!(!text.contains("esc "), "{text}");
-    }
-
-    #[test]
-    fn left_status_sandbox_on_esc_off() {
-        assert!(sandbox_status_text(SandboxMode::Sandbox, false).contains("sandbox · esc off"));
-    }
-
-    #[test]
-    fn left_status_container_mode_label() {
-        let text = sandbox_status_text(SandboxMode::Container, false);
-        assert!(text.contains("container · esc off"), "{text}");
-    }
-
-    #[test]
-    fn left_status_container_readonly_mode_label() {
-        let text = sandbox_status_text(SandboxMode::ContainerReadonly, true);
-        assert!(text.contains("container readonly"), "{text}");
-        assert!(!text.contains("esc "), "{text}");
-    }
-
-    #[test]
-    fn left_status_sandbox_refuse_is_visible_warning() {
-        let text = sandbox_status_text(SandboxMode::Refuse, true);
-        assert!(text.contains("sandbox refused"), "{text}");
     }
 }
 

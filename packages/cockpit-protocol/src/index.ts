@@ -1924,7 +1924,7 @@ export const queueItemSchema = z
     text: z.string(),
     display_text: z.string().optional(),
     target: queueTargetSchema,
-    delivery_class: queueDeliveryClassSchema.default("steering"),
+    delivery_class: queueDeliveryClassSchema.default("held"),
     send_now: z.boolean().default(false),
   })
   .passthrough();

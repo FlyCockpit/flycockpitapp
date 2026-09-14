@@ -776,13 +776,14 @@ pub struct ExtendedConfig {
     #[serde(rename = "intelCentralityRanking", default = "default_true")]
     pub intel_centrality_ranking: bool,
 
-    /// When true (the default), a message submitted while a run is in
-    /// flight is classed `steering` and injects at the focused agent's
-    /// next turn boundary. When false, it is classed `held` until the
-    /// run completes; Enter on an empty composer then promotes the
-    /// whole queue to steering. Per-message and box-level toggles
-    /// override this default. Behavioral, not a TUI chrome setting.
-    #[serde(rename = "queuedMessagesAsSteering", default = "default_true")]
+    /// When true, a message submitted while a run is in flight is classed
+    /// `steering` and injects at the focused agent's next turn boundary.
+    /// When false (the default), it is classed `held` until the run
+    /// completes. An omitted field and [`ExtendedConfig::default`] are
+    /// Held. Explicit `true` is the Steering opt-in. Per-message and
+    /// box-level toggles override this default. Behavioral, not a TUI
+    /// chrome setting.
+    #[serde(rename = "queuedMessagesAsSteering", default)]
     pub queued_messages_as_steering: bool,
 
     /// Directory names pruned from intel index walks at every depth. When
@@ -1387,6 +1388,40 @@ impl ApprovalMode {
             ApprovalMode::Yolo => ApprovalMode::Manual,
         }
     }
+
+    /// Auto and Yolo relax the live session permission gate. Selecting them
+    /// through `SetApprovalMode` requires a trusted workspace so the least
+    /// restrictive postures cannot be armed without proving authorization.
+    pub fn session_set_requires_trusted_workspace(self) -> bool {
+        matches!(self, Self::Auto | Self::Yolo)
+    }
+
+    /// Whether a live session may adopt this mode under `trust`.
+    pub fn session_set_allowed(self, trust: Option<crate::WorkspaceTrustMode>) -> bool {
+        !self.session_set_requires_trusted_workspace()
+            || matches!(trust, Some(crate::WorkspaceTrustMode::Trust))
+    }
+
+    /// Human-readable refusal when [`Self::session_set_allowed`] is false.
+    pub fn session_set_block_reason(
+        self,
+        trust: Option<crate::WorkspaceTrustMode>,
+    ) -> Option<String> {
+        if self.session_set_allowed(trust) {
+            return None;
+        }
+        Some(match trust {
+            Some(mode) => format!(
+                "approval mode `{}` requires a trusted workspace (current: {})",
+                self.as_str(),
+                mode.as_str()
+            ),
+            None => format!(
+                "approval mode `{}` requires a trusted workspace",
+                self.as_str()
+            ),
+        })
+    }
 }
 
 pub const SEEDED_SCAN_DIRS: [&str; 2] = ["~/.agents/skills", "./.agents/skills"];
@@ -1964,7 +1999,7 @@ impl Default for ExtendedConfig {
             hint_tool_call_corrections: false,
             text_embedded_recovery: TextEmbeddedRecovery::default(),
             intel_centrality_ranking: default_true(),
-            queued_messages_as_steering: default_true(),
+            queued_messages_as_steering: false,
             intel: IntelConfig::default(),
         }
     }

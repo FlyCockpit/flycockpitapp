@@ -74,33 +74,6 @@ impl App {
         self.swap_primary_agent(&next);
     }
 
-    pub(super) fn open_footer_agent_picker(&mut self) {
-        let order = self.inventory_agent_names();
-        let current = self
-            .agent_path
-            .first()
-            .map(String::as_str)
-            .unwrap_or(self.launch.agent_name.as_str());
-        self.footer_agent_picker = Some(FooterAgentPicker::new(current, order));
-    }
-
-    pub(super) fn commit_footer_agent_picker(&mut self, picker: &FooterAgentPicker) {
-        if self.agent_path.len() > 1 {
-            self.push_plain(
-                "Agent switch is disabled while an interactive subagent is active.".to_string(),
-            );
-            self.footer_agent_picker = Some(picker.clone());
-            return;
-        }
-        if let Some(name) = picker.selected_agent() {
-            self.footer_agent_picker = None;
-            self.footer_selection = None;
-            self.swap_primary_agent(name);
-        } else {
-            self.footer_agent_picker = Some(picker.clone());
-        }
-    }
-
     pub(super) fn open_model_picker(&mut self) {
         self.default_model_picker_mode = false;
         self.open_model_picker_highlighting(None);
@@ -136,8 +109,6 @@ impl App {
             self.current_model_selection_retry()
                 .map(|retry| retry.requested.clone())
         });
-        self.footer_selection = None;
-        self.footer_agent_picker = None;
         match crate::tui::model_picker::ModelPickerDialog::open_with_failures(
             self.config_snapshot.providers.clone(),
             self.launch.active_model.clone(),
@@ -178,10 +149,31 @@ impl App {
             .as_ref()
             .expect("expired pending selection exists")
             .selection_id;
+        let composer_owns_expired =
+            self.composer_controls
+                .pending
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.request_id.is_some_and(|request_id| {
+                        self.pending_control_requests
+                            .get(&request_id)
+                            .is_some_and(|request| {
+                                matches!(
+                                    request.applied,
+                                    ControlApplied::ModelSelection {
+                                        selection_id: pending_id
+                                    } if pending_id == selection_id
+                                )
+                            })
+                    })
+                });
         let pending = self
             .clear_pending_model_selection(Some(selection_id))
             .expect("expired pending selection exists");
         let pending = self.preserve_failed_model_selection(pending);
+        if composer_owns_expired {
+            self.invalidate_composer_control_ownership(true, true);
+        }
         self.push_plain(
             "The previous model selection timed out. Choose a model to retry; your queued message is retained."
                 .to_string(),
@@ -190,8 +182,6 @@ impl App {
     }
 
     pub(super) fn open_model_picker_for_provider(&mut self, provider: &str) {
-        self.footer_selection = None;
-        self.footer_agent_picker = None;
         match crate::tui::model_picker::ModelPickerDialog::open_for_provider_with_failures(
             self.config_snapshot.providers.clone(),
             provider,
@@ -227,17 +217,20 @@ impl App {
         match outcome {
             crate::tui::tools_pane::ToolsOutcome::Close => {}
             crate::tui::tools_pane::ToolsOutcome::Pending => {}
+            crate::tui::tools_pane::ToolsOutcome::RefreshSnapshot => {
+                if let Some(correlation) = self.request_session_setup_snapshot_refresh() {
+                    self.bind_tool_surface_snapshot_wait(correlation);
+                }
+            }
             crate::tui::tools_pane::ToolsOutcome::Apply {
                 override_json,
                 persist_session,
                 cache_break,
                 monty_nudge,
             } => {
-                let applied = if cache_break {
-                    ControlApplied::CacheBreakWarning
-                } else {
-                    ControlApplied::None
-                };
+                if persist_session && let Overlay::Tools(pane) = &mut self.overlay {
+                    pane.mark_session_override_pending();
+                }
                 self.send_daemon_request(
                     "/tools",
                     cockpit_proto::Request::SetToolSurfaceOverride {
@@ -246,7 +239,7 @@ impl App {
                         cache_break_acknowledged: cache_break,
                         monty_nudge,
                     },
-                    applied,
+                    ControlApplied::ToolSurfaceOverride { cache_break },
                 );
             }
         }
@@ -625,36 +618,6 @@ impl App {
         self.push_plain(message);
     }
 
-    pub(super) fn cycle_footer_model(&mut self, forward: bool) {
-        match crate::tui::model_picker::cycle_active_favorite(
-            &self.config_snapshot.providers,
-            self.active_model_selection.as_ref(),
-            &self.usage_models,
-            forward,
-        ) {
-            Ok(Some(active)) => {
-                let provider = active.provider.clone();
-                let model = active.model.clone();
-                if self.notify_active_model_selected(
-                    active,
-                    false,
-                    cockpit_proto::ActiveModelSwitchTrigger::Cycle,
-                ) {
-                    self.push_plain(format!("/model: selecting {provider}/{model} ★"));
-                }
-            }
-            Ok(None) => {
-                self.push_plain(
-                    "No other favorite model to cycle to; open `/model` for the full list."
-                        .to_string(),
-                );
-            }
-            Err(e) => {
-                self.push_plain(format!("/model: {e}"));
-            }
-        }
-    }
-
     pub(super) fn open_quick_dialog(&mut self) {
         let models = crate::tui::model_picker::ordered_model_choices_from_inventory(
             &self.inventory_models(),
@@ -694,8 +657,6 @@ impl App {
                 })
                 .unwrap_or_default(),
         };
-        self.footer_selection = None;
-        self.footer_agent_picker = None;
         self.overlay = Overlay::Quick(crate::tui::quick_dialog::QuickDialog::open(current, models));
     }
 
@@ -773,22 +734,13 @@ impl App {
         }
     }
 
-    pub(super) fn footer_cycle_agent(&mut self) {
-        if self.agent_path.len() > 1 {
-            self.push_plain(
-                "Agent cycle is disabled while an interactive subagent is active.".to_string(),
-            );
-            return;
-        }
-        self.cycle_primary_agent();
-    }
-
     pub(super) fn send_daemon_request(
         &mut self,
         label: &str,
         req: cockpit_proto::Request,
         applied: ControlApplied,
     ) {
+        let tool_surface_override = matches!(applied, ControlApplied::ToolSurfaceOverride { .. });
         let Some(Ok(runner)) = self.agent_runner.as_ref() else {
             let message =
                 Self::control_not_delivered_message(label, ControlRequestNotDelivered::NoRunner);
@@ -796,44 +748,223 @@ impl App {
                 ControlApplied::ModelSelection { selection_id } => Some(selection_id),
                 _ => None,
             };
+            if tool_surface_override {
+                self.refuse_tool_surface_override(message.clone());
+            }
             if let Some(pending) = self.clear_pending_model_selection(selection_id) {
-                self.show_failed_model_selection(pending, message);
-            } else {
-                self.push_plain(message);
+                self.show_failed_model_selection(pending, message.clone());
+            } else if !tool_surface_override {
+                self.push_plain(message.clone());
+            }
+            if self.composer_controls.dispatch_armed {
+                self.refuse_unbound_composer_control(
+                    &message,
+                    super::composer_controls::ComposerPickerStatus::Unavailable,
+                );
             }
             return;
         };
+        // Clone the send handles before mutating `self`. Binding the composer
+        // request takes `&mut self`, which cannot overlap the `runner` borrow.
+        let control_tx = runner.control_tx.clone();
+        let events = runner.events.clone();
+        let event_notify = runner.event_notify.clone();
+        let session_id = runner.session_id();
+        let attachment_epoch = runner.attachment_epoch();
         self.next_control_request_seq = self.next_control_request_seq.saturating_add(1);
         let request_id = ControlRequestId(self.next_control_request_seq);
         self.pending_control_requests.insert(
             request_id,
-            PendingControlRequest {
-                label: label.to_string(),
-                applied,
-            },
+            PendingControlRequest::new(label.to_string(), applied),
         );
+        self.bind_composer_control_request(request_id);
         let result = agent_runner::send_control_request(
-            &runner.control_tx,
-            &runner.events,
-            &runner.event_notify,
+            &control_tx,
+            &events,
+            &event_notify,
             request_id,
-            runner.session_id(),
-            runner.attachment_epoch(),
+            session_id,
+            attachment_epoch,
             req,
         );
         if let Err(reason) = result {
-            let selection_id =
-                self.pending_control_requests
-                    .remove(&request_id)
-                    .and_then(|pending| match pending.applied {
-                        ControlApplied::ModelSelection { selection_id } => Some(selection_id),
-                        _ => None,
-                    });
+            let removed = self.pending_control_requests.remove(&request_id);
+            let tool_surface_override = removed.as_ref().is_some_and(|pending| {
+                matches!(pending.applied, ControlApplied::ToolSurfaceOverride { .. })
+            });
+            let selection_id = removed.and_then(|pending| match pending.applied {
+                ControlApplied::ModelSelection { selection_id } => Some(selection_id),
+                _ => None,
+            });
             let message = Self::control_not_delivered_message(label, reason);
+            if tool_surface_override {
+                self.refuse_tool_surface_override(message.clone());
+            }
             if let Some(pending) = self.clear_pending_model_selection(selection_id) {
-                self.show_failed_model_selection(pending, message);
+                self.show_failed_model_selection(pending, message.clone());
+            } else if !tool_surface_override {
+                self.push_plain(message.clone());
+            }
+            self.refuse_composer_control_for_request(
+                request_id,
+                &message,
+                super::composer_controls::ComposerPickerStatus::Unavailable,
+            );
+        }
+    }
+
+    pub(super) fn fence_pending_control_request(&mut self, request_id: ControlRequestId) {
+        if let Some(pending) = self.pending_control_requests.get_mut(&request_id) {
+            pending.fenced = true;
+        }
+    }
+
+    /// Completions for `send_control_request` are stamped with the sending
+    /// attachment epoch and dropped once visibility advances. Drain those
+    /// owners here so reconnect, resync, or session-switch cannot leave them
+    /// pending with no remaining settlement path. Every `ControlApplied`
+    /// variant is classified by `epoch_abandon_action`; adding a variant
+    /// without an arm is a compile error.
+    pub(super) fn abandon_epoch_bound_control_receipts(
+        &mut self,
+        reason: super::ControlEpochAbandonment,
+    ) {
+        let pending = std::mem::take(&mut self.pending_control_requests);
+        let mut refresh_snapshot = false;
+        let interruption = match reason {
+            super::ControlEpochAbandonment::SameSession => "reconnect",
+            super::ControlEpochAbandonment::SessionTransition => "session change",
+            super::ControlEpochAbandonment::TerminalDisconnect => "the daemon connection ending",
+        };
+        for (id, request) in pending {
+            // Fenced correlations still swallow late receipts without
+            // confirming; dropping them would lose that settlement path.
+            if request.fenced {
+                self.pending_control_requests.insert(id, request);
+                continue;
+            }
+            match request.applied.epoch_abandon_action(reason) {
+                super::ControlEpochAbandonAction::Silent
+                | super::ControlEpochAbandonAction::ModelSelection => {}
+                super::ControlEpochAbandonAction::RefreshSnapshot => {
+                    refresh_snapshot = true;
+                }
+                super::ControlEpochAbandonAction::FailTokenizer => {
+                    if let ControlApplied::ResponseMetricsTokenizer { confirm_id } = request.applied
+                        && let Some(tok) = self.pending_tokenizer_confirm.take()
+                    {
+                        let outcome = tok.on_response(confirm_id, 0, false, Some("refresh_failed"));
+                        self.apply_tokenizer_confirm_outcome(outcome);
+                    }
+                }
+                super::ControlEpochAbandonAction::DaemonOwnedNotice => {
+                    self.push_plain(format!(
+                        "{}: confirmation was interrupted by {interruption}; daemon state is authoritative",
+                        request.label
+                    ));
+                }
+                super::ControlEpochAbandonAction::DropFollowOn => {
+                    self.push_plain(format!(
+                        "{}: was not confirmed; retry after {interruption}",
+                        request.label
+                    ));
+                }
+                super::ControlEpochAbandonAction::ParkRepairResume => {
+                    self.parked_control_follow_ons.repair_resume = true;
+                }
+                super::ControlEpochAbandonAction::ParkExitGuard => {
+                    self.parked_control_follow_ons.exit_guard = true;
+                }
+                super::ControlEpochAbandonAction::ParkExitAfterStop => {
+                    self.parked_control_follow_ons.exit_after_stop = true;
+                }
+                super::ControlEpochAbandonAction::ParkExitAfterBackground => {
+                    self.parked_control_follow_ons.exit_after_background = true;
+                }
+                super::ControlEpochAbandonAction::CompleteExitLocally => {
+                    self.exit_requested = true;
+                }
+                super::ControlEpochAbandonAction::CompleteExitAfterBackground => {
+                    self.exit_notice = Some(format!(
+                        "This session is still running in the background; reattach with {}",
+                        self.exit_reattach_command()
+                    ));
+                    self.exit_requested = true;
+                }
+            }
+        }
+        if let Overlay::Tools(pane) = &mut self.overlay
+            && pane.mark_session_override_refreshing()
+        {
+            refresh_snapshot = true;
+        }
+        if refresh_snapshot && let Some(correlation) = self.request_session_setup_snapshot_refresh()
+        {
+            self.begin_tool_surface_snapshot_wait(correlation);
+        }
+    }
+
+    pub(super) fn retry_parked_control_follow_ons(&mut self) {
+        let parked = std::mem::take(&mut self.parked_control_follow_ons);
+        let has_runner = self
+            .agent_runner
+            .as_ref()
+            .is_some_and(|runner| runner.is_ok());
+        if parked.repair_resume {
+            let session_id = self
+                .agent_runner
+                .as_ref()
+                .and_then(|runner| runner.as_ref().ok())
+                .map(|runner| runner.session_id())
+                .or(self.launch.session_id);
+            if let Some(session_id) = session_id {
+                self.send_daemon_request(
+                    "/resume",
+                    cockpit_proto::Request::RepairResume { session_id },
+                    ControlApplied::RepairResume,
+                );
             } else {
-                self.push_plain(message);
+                self.push_plain(
+                    "/resume: repair confirmation was interrupted; retry /resume repair"
+                        .to_string(),
+                );
+            }
+        }
+        if parked.exit_guard {
+            if has_runner {
+                self.send_daemon_request(
+                    "exit check",
+                    cockpit_proto::Request::ExitGuardStatus,
+                    ControlApplied::ExitGuardStatus,
+                );
+            } else {
+                self.exit_requested = true;
+            }
+        }
+        if parked.exit_after_stop {
+            if has_runner {
+                self.send_daemon_request(
+                    "stop all",
+                    cockpit_proto::Request::CancelAllSessionWork,
+                    ControlApplied::ExitAfterStoppingWork,
+                );
+            } else {
+                self.exit_requested = true;
+            }
+        }
+        if parked.exit_after_background {
+            if has_runner {
+                self.send_daemon_request(
+                    "run in background",
+                    cockpit_proto::Request::PromoteToPersistent,
+                    ControlApplied::ExitAfterBackgroundPromotion,
+                );
+            } else {
+                self.exit_notice = Some(format!(
+                    "This session is still running in the background; reattach with {}",
+                    self.exit_reattach_command()
+                ));
+                self.exit_requested = true;
             }
         }
     }
@@ -846,6 +977,8 @@ impl App {
         let Some(pending) = self.pending_control_requests.remove(&request_id) else {
             return;
         };
+        let skip_confirmation =
+            pending.fenced || self.discard_stale_composer_control_receipt(request_id);
         let selection_id = match pending.applied {
             ControlApplied::ModelSelection { selection_id } => Some(selection_id),
             _ => None,
@@ -854,10 +987,8 @@ impl App {
             ControlApplied::ResponseMetricsTokenizer { confirm_id } => Some(confirm_id),
             _ => None,
         };
-        let refresh_session_setup_on_failure = matches!(
-            pending.applied,
-            ControlApplied::SessionSetupToolSurface { .. }
-        );
+        let refresh_tool_surface_on_failure =
+            matches!(pending.applied, ControlApplied::ToolSurfaceOverride { .. });
         match outcome {
             ControlRequestOutcome::ConfigRefreshed {
                 applied_generation,
@@ -868,19 +999,31 @@ impl App {
                 {
                     let outcome = tok.on_response(confirm_id, applied_generation, changed, None);
                     self.apply_tokenizer_confirm_outcome(outcome);
-                } else {
+                } else if !skip_confirmation {
                     self.apply_control_success(pending.applied);
+                    self.apply_composer_control_outcome(request_id, None, false);
                 }
             }
-            ControlRequestOutcome::Applied => self.apply_control_success(pending.applied),
+            ControlRequestOutcome::Applied => {
+                if !skip_confirmation {
+                    self.apply_control_success(pending.applied);
+                    self.apply_composer_control_outcome(request_id, None, false);
+                }
+            }
             ControlRequestOutcome::HostCapabilities { snapshot } => {
                 self.apply_host_capabilities(*snapshot);
-                self.apply_control_success(pending.applied);
+                if !skip_confirmation {
+                    self.apply_control_success(pending.applied);
+                    self.apply_composer_control_outcome(request_id, None, false);
+                }
             }
             ControlRequestOutcome::ExitGuardStatus {
                 ephemeral_owner,
                 has_live_work,
             } => {
+                if skip_confirmation {
+                    return;
+                }
                 if matches!(pending.applied, ControlApplied::ExitGuardStatus) {
                     self.apply_exit_guard_status(ephemeral_owner, has_live_work);
                 } else {
@@ -891,9 +1034,8 @@ impl App {
                 }
             }
             ControlRequestOutcome::Rejected(error) => {
-                if refresh_session_setup_on_failure {
-                    self.request_session_setup_snapshot_refresh();
-                    self.set_session_setup_notice(format!(
+                if refresh_tool_surface_on_failure {
+                    self.refuse_tool_surface_override(format!(
                         "Tool surface update was refused: {error}"
                     ));
                 }
@@ -913,17 +1055,19 @@ impl App {
                     self.apply_tokenizer_confirm_outcome(outcome);
                 } else {
                     let message = format!("{}: daemon rejected request: {error}", pending.label);
-                    if let Some(selection) = self.clear_pending_model_selection(selection_id) {
-                        self.show_failed_model_selection(selection, message);
-                    } else {
-                        self.push_plain(message);
-                    }
+                    self.finish_control_failure(
+                        skip_confirmation,
+                        selection_id,
+                        request_id,
+                        message,
+                        &error,
+                        false,
+                    );
                 }
             }
             ControlRequestOutcome::NotDelivered(reason) => {
-                if refresh_session_setup_on_failure {
-                    self.request_session_setup_snapshot_refresh();
-                    self.set_session_setup_notice(
+                if refresh_tool_surface_on_failure {
+                    self.refuse_tool_surface_override(
                         "Tool surface update was not delivered; restored daemon state.".to_string(),
                     );
                 }
@@ -934,13 +1078,47 @@ impl App {
                     self.apply_tokenizer_confirm_outcome(outcome);
                 } else {
                     let message = Self::control_not_delivered_message(&pending.label, reason);
-                    if let Some(selection) = self.clear_pending_model_selection(selection_id) {
-                        self.show_failed_model_selection(selection, message);
-                    } else {
-                        self.push_plain(message);
-                    }
+                    self.finish_control_failure(
+                        skip_confirmation,
+                        selection_id,
+                        request_id,
+                        message.clone(),
+                        &message,
+                        true,
+                    );
                 }
             }
+        }
+    }
+
+    fn finish_control_failure(
+        &mut self,
+        skip_confirmation: bool,
+        selection_id: Option<uuid::Uuid>,
+        request_id: ControlRequestId,
+        message: String,
+        composer_error: &str,
+        unavailable: bool,
+    ) {
+        if skip_confirmation {
+            if let Some(selection) = self.clear_pending_model_selection(selection_id) {
+                let _ = self.preserve_failed_model_selection(selection);
+            }
+            return;
+        }
+        if let Some(selection) = self.clear_pending_model_selection(selection_id) {
+            self.show_failed_model_selection(selection, message);
+        } else {
+            self.push_plain(message);
+        }
+        self.apply_composer_control_outcome(request_id, Some(composer_error), unavailable);
+    }
+
+    fn refuse_tool_surface_override(&mut self, message: String) {
+        self.request_session_setup_snapshot_refresh();
+        self.set_session_setup_notice(message.clone());
+        if let Overlay::Tools(pane) = &mut self.overlay {
+            pane.refuse_session_override(message);
         }
     }
 
@@ -1063,6 +1241,10 @@ impl App {
     }
 
     pub(super) fn cancel_model_controls_for_terminal_link(&mut self) {
+        self.invalidate_composer_control_ownership(true, false);
+        self.abandon_epoch_bound_control_receipts(
+            super::ControlEpochAbandonment::TerminalDisconnect,
+        );
         if let Some(pending) = self.cancel_model_controls_for_runner_epoch() {
             tracing::warn!(
                 session_id = ?pending.session_id,
@@ -1108,20 +1290,20 @@ impl App {
             // ExitGuardStatus has a dedicated response payload that controls
             // the exit path in `apply_control_request_outcome`.
             ControlApplied::ExitGuardStatus => {}
-            ControlApplied::CacheBreakWarning => {
-                if let Some(warning) = self.cache_break_warning() {
-                    self.push_plain(warning);
-                }
-            }
             ControlApplied::PrimaryAgentSwitch { name } => {
                 self.record_primary_switch_confirmation(&name);
                 self.request_session_setup_snapshot_refresh();
             }
-            ControlApplied::SessionSetupToolSurface { cache_break } => {
+            ControlApplied::ToolSurfaceOverride { cache_break } => {
                 if cache_break && let Some(warning) = self.cache_break_warning() {
                     self.push_plain(warning);
                 }
-                self.request_session_setup_snapshot_refresh();
+                if let Overlay::Tools(pane) = &mut self.overlay {
+                    pane.mark_session_override_awaiting_snapshot();
+                }
+                if let Some(correlation) = self.request_session_setup_snapshot_refresh() {
+                    self.begin_tool_surface_snapshot_wait(correlation);
+                }
             }
             ControlApplied::Multireview { kickoff } => {
                 self.push_plain(MULTIREVIEW_TOKEN_BURN_WARNING.to_string());

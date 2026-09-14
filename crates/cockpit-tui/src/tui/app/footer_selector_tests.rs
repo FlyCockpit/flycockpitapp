@@ -1,36 +1,9 @@
-use super::{
-    App, FooterAgentPicker, FooterHitArea, FooterPickerKind, FooterPickerRowHit, HistoryEntry,
-    Overlay,
-};
+use super::{App, HistoryEntry};
 use crate::tui::agent_runner::{AgentRunner, ControlRequest};
 use crate::tui::settings::Dialog;
 use cockpit_client::presentation::{ControlRequestId, ControlRequestOutcome, TurnEvent};
 use cockpit_proto::Request;
-use crossterm::event::{
-    KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind,
-};
-use ratatui::layout::Rect;
-use std::fs;
 use tokio::sync::mpsc;
-
-fn press(code: KeyCode) -> KeyEvent {
-    KeyEvent {
-        code,
-        modifiers: KeyModifiers::empty(),
-        kind: KeyEventKind::Press,
-        state: KeyEventState::empty(),
-    }
-}
-
-fn click(column: u16, row: u16) -> MouseEvent {
-    MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column,
-        row,
-        modifiers: KeyModifiers::empty(),
-    }
-}
 
 fn app(tmp: &tempfile::TempDir) -> App {
     let mut app = App::new(Some(tmp.path()), false);
@@ -45,21 +18,6 @@ fn app_with_runner(tmp: &tempfile::TempDir) -> (App, mpsc::Receiver<ControlReque
     (app, control_rx)
 }
 
-fn write_model_config(root: &std::path::Path) {
-    let cockpit = root.join(".cockpit");
-    fs::create_dir_all(&cockpit).unwrap();
-    let config_path = cockpit.join("config.json");
-    fs::write(&config_path, "{}").unwrap();
-    let provider_path =
-        cockpit_config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
-    fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
-    fs::write(
-        provider_path,
-        r#"{"url":"https://example.test","models":[{"id":"a"}]}"#,
-    )
-    .unwrap();
-}
-
 fn plain_lines(app: &App) -> Vec<&str> {
     app.history
         .iter()
@@ -68,70 +26,6 @@ fn plain_lines(app: &App) -> Vec<&str> {
             _ => None,
         })
         .collect()
-}
-
-#[test]
-fn footer_enter_opens_selector_for_each_axis() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-    write_model_config(tmp.path());
-    let mut app = app(&tmp);
-
-    app.footer_selection = Some(crate::tui::chrome::FooterControl::Agent);
-    app.handle_key(press(KeyCode::Enter));
-    assert!(app.footer_agent_picker.is_some());
-    assert!(!matches!(app.overlay, Overlay::ModelPicker(_)));
-
-    app.footer_agent_picker = None;
-    app.footer_selection = Some(crate::tui::chrome::FooterControl::Model);
-    app.handle_key(press(KeyCode::Enter));
-    assert!(matches!(app.overlay, Overlay::ModelPicker(_)));
-}
-
-#[test]
-fn footer_mouse_capture_gates_footer_hits_and_second_click_opens() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut app = app(&tmp);
-    app.footer_hit_areas = vec![FooterHitArea {
-        control: crate::tui::chrome::FooterControl::Agent,
-        rect: Rect::new(2, 9, 6, 1),
-    }];
-
-    app.mouse_capture = false;
-    app.handle_mouse(click(3, 9));
-    assert!(app.footer_selection.is_none());
-
-    app.mouse_capture = true;
-    app.handle_mouse(click(3, 9));
-    assert_eq!(
-        app.footer_selection,
-        Some(crate::tui::chrome::FooterControl::Agent)
-    );
-    assert!(app.footer_agent_picker.is_none());
-
-    app.handle_mouse(click(3, 9));
-    assert!(app.footer_agent_picker.is_some());
-}
-
-#[test]
-fn agent_picker_mouse_row_commits_through_set_agent() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (mut app, mut control_rx) = app_with_runner(&tmp);
-    app.mouse_capture = true;
-    app.footer_agent_picker = Some(FooterAgentPicker::new("Build", vec!["Build".to_string()]));
-    app.footer_picker_row_hits = vec![FooterPickerRowHit {
-        kind: FooterPickerKind::Agent,
-        index: 0,
-        rect: Rect::new(0, 4, 20, 1),
-    }];
-
-    app.handle_mouse(click(1, 4));
-
-    assert!(app.footer_agent_picker.is_none());
-    assert!(matches!(
-        control_rx.try_recv().unwrap().request,
-        Request::SetAgent { name } if name == "Build"
-    ));
 }
 
 #[test]

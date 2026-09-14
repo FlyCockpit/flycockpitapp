@@ -407,10 +407,7 @@ fn durable_control_receipt_fences_every_guarded_exit() {
     let request_id = cockpit_client::presentation::ControlRequestId(41);
     app.pending_control_requests.insert(
         request_id,
-        PendingControlRequest {
-            label: "durable mutation".to_string(),
-            applied: ControlApplied::None,
-        },
+        PendingControlRequest::new("durable mutation", ControlApplied::None),
     );
 
     assert!(app.has_unsettled_local_authority());

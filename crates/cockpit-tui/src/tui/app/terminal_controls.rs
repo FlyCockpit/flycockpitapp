@@ -19,6 +19,7 @@ impl App {
             || self.pending_model_selection.is_some()
             || self.pending_default_model_update_id.is_some()
             || !self.pending_control_requests.is_empty()
+            || self.parked_control_follow_ons.is_pending()
             || !self.pending_usage.is_empty()
             || !self.settings_blocking_actions.is_empty()
             || self.async_actions.has_unsettled_local_authority()

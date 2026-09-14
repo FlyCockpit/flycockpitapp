@@ -10618,7 +10618,8 @@ mod prediction_ghost_context_indicator_tests {
         let mut send_now = queued_item("urgent held", QueueTarget::root("Build"));
         send_now.delivery_class = QueueDeliveryClass::Held;
         send_now.send_now = true;
-        let steering = queued_item("steering", QueueTarget::root("Build"));
+        let mut steering = queued_item("steering", QueueTarget::root("Build"));
+        steering.delivery_class = QueueDeliveryClass::Steering;
         let held_id = held.id;
         let send_now_id = send_now.id;
         let steering_id = steering.id;
@@ -10638,12 +10639,14 @@ mod prediction_ghost_context_indicator_tests {
         let child = QueueTarget::child("builder", 1, "call-1", "default");
         app.foreground_input_target = Some(child.clone());
 
-        let root_steering = queued_item("root steering", root.clone());
+        let mut root_steering = queued_item("root steering", root.clone());
+        root_steering.delivery_class = QueueDeliveryClass::Steering;
         let mut child_held = queued_item("child held", child.clone());
         child_held.delivery_class = QueueDeliveryClass::Held;
         let mut root_held = queued_item("root held", root);
         root_held.delivery_class = QueueDeliveryClass::Held;
-        let child_steering = queued_item("child steering", child);
+        let mut child_steering = queued_item("child steering", child);
+        child_steering.delivery_class = QueueDeliveryClass::Steering;
         let expected = vec![
             child_steering.id,
             child_held.id,
@@ -10803,11 +10806,11 @@ mod prediction_ghost_context_indicator_tests {
         let buf = render_queue_buffer(&mut app, 48, height);
         let rows: Vec<String> = (0..height).map(|y| row_text(&buf, y, 48)).collect();
         let joined = rows.join("\n");
-        assert!(joined.contains("steering · next turn"), "{joined}");
-        assert!(joined.contains("after completion"), "{joined}");
+        assert!(joined.contains("Steer · next safe boundary"), "{joined}");
+        assert!(joined.contains("Held · after completion"), "{joined}");
         let steer_header = rows
             .iter()
-            .position(|row| row.contains("steering · next turn"))
+            .position(|row| row.contains("Steer · next safe boundary"))
             .expect("steering header");
         let first_idx = rows
             .iter()
@@ -10845,8 +10848,8 @@ mod prediction_ghost_context_indicator_tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        assert!(before.contains("steering · next turn"));
-        assert!(!before.contains("after completion"));
+        assert!(before.contains("Steer · next safe boundary"));
+        assert!(!before.contains("Held · after completion"));
 
         app.queue[0].delivery_class = QueueDeliveryClass::Held;
         let after = {
@@ -10857,8 +10860,8 @@ mod prediction_ghost_context_indicator_tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        assert!(after.contains("after completion"));
-        assert!(!after.contains("steering · next turn"));
+        assert!(after.contains("Held · after completion"));
+        assert!(!after.contains("Steer · next safe boundary"));
         assert!(after.contains("toggle me"));
     }
 

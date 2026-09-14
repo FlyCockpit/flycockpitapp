@@ -3674,12 +3674,9 @@ mod tests {
         let mut held = UserSubmission::text("held first in fifo");
         held.delivery_class = QueueDeliveryClass::Held;
         queue.push(held, target.clone()).await;
-        queue
-            .push(
-                UserSubmission::text("steering second in fifo"),
-                target.clone(),
-            )
-            .await;
+        let mut steering = UserSubmission::text("steering second in fifo");
+        steering.delivery_class = QueueDeliveryClass::Steering;
+        queue.push(steering, target.clone()).await;
 
         let first = queue.recv_group_order_for(Some(&target.id)).await.unwrap();
         let mut batch = vec![first];
@@ -3701,12 +3698,10 @@ mod tests {
         let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = UserSubmissionQueue::new(updates_tx);
         let target = QueueTarget::root("Build");
+        let mut delayed = UserSubmission::text("delayed steering");
+        delayed.delivery_class = QueueDeliveryClass::Steering;
         queue
-            .requeue_front_after(
-                UserSubmission::text("delayed steering"),
-                target.clone(),
-                std::time::Duration::from_secs(60),
-            )
+            .requeue_front_after(delayed, target.clone(), std::time::Duration::from_secs(60))
             .await;
         let mut held = UserSubmission::text("ready held");
         held.delivery_class = QueueDeliveryClass::Held;
@@ -3737,9 +3732,11 @@ mod tests {
         let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = UserSubmissionQueue::new(updates_tx);
         let target = QueueTarget::root("Build");
+        let mut delayed = UserSubmission::text("delayed steering");
+        delayed.delivery_class = QueueDeliveryClass::Steering;
         queue
             .requeue_front_after(
-                UserSubmission::text("delayed steering"),
+                delayed,
                 target.clone(),
                 std::time::Duration::from_millis(250),
             )
@@ -3903,9 +3900,9 @@ mod tests {
         let mut held = UserSubmission::text("held");
         held.delivery_class = QueueDeliveryClass::Held;
         queue.push(held, target.clone()).await;
-        queue
-            .push(UserSubmission::text("steer"), target.clone())
-            .await;
+        let mut steering = UserSubmission::text("steer");
+        steering.delivery_class = QueueDeliveryClass::Steering;
+        queue.push(steering, target.clone()).await;
 
         assert!(
             tokio::time::timeout(

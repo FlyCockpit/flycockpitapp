@@ -1080,6 +1080,7 @@ fn header_tools_reconnect_discards_stale_receipt_and_reconciles_snapshot() {
 
     let tmp = tempfile::tempdir().unwrap();
     let (mut app, mut control_rx) = app_with_runner(&tmp);
+    let _ = render(&mut app, 100, 30);
     app.activate_header_pill(HeaderPillKind::Tool);
     app.handle_tools_outcome(ToolsOutcome::Apply {
         override_json: "{}".to_string(),
@@ -1155,6 +1156,7 @@ fn header_tools_reconnect_discards_stale_receipt_and_reconciles_snapshot() {
 fn header_tools_uncorrelated_snapshots_do_not_confirm_pending_override() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut app, mut control_rx) = app_with_runner(&tmp);
+    let _ = render(&mut app, 100, 30);
     app.activate_header_pill(HeaderPillKind::Tool);
     app.handle_tools_outcome(ToolsOutcome::Apply {
         override_json: "{}".to_string(),

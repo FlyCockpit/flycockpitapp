@@ -836,7 +836,13 @@ impl App {
             super::ControlEpochAbandonment::SessionTransition => "session change",
             super::ControlEpochAbandonment::TerminalDisconnect => "the daemon connection ending",
         };
-        for (_, request) in pending {
+        for (id, request) in pending {
+            // Fenced correlations still swallow late receipts without
+            // confirming; dropping them would lose that settlement path.
+            if request.fenced {
+                self.pending_control_requests.insert(id, request);
+                continue;
+            }
             match request.applied.epoch_abandon_action(reason) {
                 super::ControlEpochAbandonAction::Silent
                 | super::ControlEpochAbandonAction::ModelSelection => {}

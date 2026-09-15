@@ -3,8 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::{
-    AuthorizationCapability, FallbackReceiveWindow, FallbackSendWindow, NoiseChild,
-    ReceiveDisposition, RecordKind, TranscriptAuthorizationGate, TranscriptAuthorizationRequest,
+    AuthorizationCapability, CumulativeAckV1, FallbackReceiveWindow, FallbackSendWindow,
+    NoiseChild, ReceiveDisposition, RecordKind, TranscriptAuthorizationGate,
+    TranscriptAuthorizationRequest,
 };
 
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
@@ -14,6 +15,15 @@ static FALLBACK_HANDLES: OnceLock<Mutex<HashMap<u64, FallbackBindingState>>> = O
 struct FallbackBindingState {
     receive: FallbackReceiveWindow,
     send: FallbackSendWindow,
+}
+
+enum FallbackObservation {
+    Buffered(CumulativeAckV1),
+    Duplicate(CumulativeAckV1),
+    Contiguous {
+        records: Vec<Vec<u8>>,
+        acknowledge: CumulativeAckV1,
+    },
 }
 
 fn handles() -> &'static Mutex<HashMap<u64, NoiseChild>> {
@@ -329,11 +339,26 @@ pub fn fallback_create(now_millis: u64) -> Result<u64, NoiseBindingError> {
     Ok(handle)
 }
 
-fn encode_byte_list(values: &[&[u8]]) -> Result<Vec<u8>, NoiseBindingError> {
+fn byte_list_wire_len<T: AsRef<[u8]>>(values: &[T]) -> Result<usize, NoiseBindingError> {
+    u16::try_from(values.len()).map_err(|_| NoiseBindingError::Internal)?;
+    values.iter().try_fold(2_usize, |wire_len, value| {
+        let value_len = value.as_ref().len();
+        u32::try_from(value_len).map_err(|_| NoiseBindingError::Internal)?;
+        wire_len
+            .checked_add(4)
+            .and_then(|wire_len| wire_len.checked_add(value_len))
+            .ok_or(NoiseBindingError::Internal)
+    })
+}
+
+fn append_byte_list<T: AsRef<[u8]>>(
+    out: &mut Vec<u8>,
+    values: &[T],
+) -> Result<(), NoiseBindingError> {
     let count = u16::try_from(values.len()).map_err(|_| NoiseBindingError::Internal)?;
-    let mut out = Vec::new();
     out.extend_from_slice(&count.to_be_bytes());
     for value in values {
+        let value = value.as_ref();
         out.extend_from_slice(
             &u32::try_from(value.len())
                 .map_err(|_| NoiseBindingError::Internal)?
@@ -341,41 +366,77 @@ fn encode_byte_list(values: &[&[u8]]) -> Result<Vec<u8>, NoiseBindingError> {
         );
         out.extend_from_slice(value);
     }
+    Ok(())
+}
+
+fn encode_byte_list<T: AsRef<[u8]>>(values: &[T]) -> Result<Vec<u8>, NoiseBindingError> {
+    let wire_len = byte_list_wire_len(values)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(wire_len)
+        .map_err(|_| NoiseBindingError::Internal)?;
+    append_byte_list(&mut out, values)?;
+    Ok(out)
+}
+
+fn encode_contiguous_observation(
+    records: Vec<Vec<u8>>,
+    acknowledge: CumulativeAckV1,
+) -> Result<Vec<u8>, NoiseBindingError> {
+    let gap_filled = records.len() > 1;
+    let byte_list_len = byte_list_wire_len(&records)?;
+    let ack_len = if gap_filled {
+        acknowledge.encode().len()
+    } else {
+        0
+    };
+    let response_len = 2_usize
+        .checked_add(ack_len)
+        .and_then(|response_len| response_len.checked_add(byte_list_len))
+        .ok_or(NoiseBindingError::Internal)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(response_len)
+        .map_err(|_| NoiseBindingError::Internal)?;
+    out.push(2);
+    out.push(u8::from(gap_filled));
+    if gap_filled {
+        out.extend_from_slice(&acknowledge.encode());
+    }
+    append_byte_list(&mut out, &records)?;
     Ok(out)
 }
 
 pub fn fallback_observe(handle: u64, outer_record: Vec<u8>) -> Result<Vec<u8>, NoiseBindingError> {
-    let mut guard = fallback_handles()
-        .lock()
-        .map_err(|_| NoiseBindingError::Internal)?;
-    let state = guard.get_mut(&handle).ok_or(NoiseBindingError::Closed)?;
-    match state.receive.observe(outer_record)? {
-        ReceiveDisposition::Buffered => {
+    let observation = {
+        let mut guard = fallback_handles()
+            .lock()
+            .map_err(|_| NoiseBindingError::Internal)?;
+        let state = guard.get_mut(&handle).ok_or(NoiseBindingError::Closed)?;
+        match state.receive.observe(outer_record)? {
+            ReceiveDisposition::Buffered => FallbackObservation::Buffered(state.receive.ack()),
+            ReceiveDisposition::Duplicate { acknowledge } => {
+                FallbackObservation::Duplicate(acknowledge)
+            }
+            ReceiveDisposition::Contiguous(records) => FallbackObservation::Contiguous {
+                records,
+                acknowledge: state.receive.ack(),
+            },
+        }
+    };
+    match observation {
+        FallbackObservation::Buffered(acknowledge) => {
             let mut out = vec![0];
-            out.extend_from_slice(&state.receive.ack().encode());
+            out.extend_from_slice(&acknowledge.encode());
             Ok(out)
         }
-        ReceiveDisposition::Duplicate { acknowledge } => {
+        FallbackObservation::Duplicate(acknowledge) => {
             let mut out = vec![1];
             out.extend_from_slice(&acknowledge.encode());
             Ok(out)
         }
-        ReceiveDisposition::Contiguous(records) => {
-            let gap_filled = records.len() > 1;
-            let encoded: Result<Vec<Vec<u8>>, _> = records
-                .iter()
-                .map(crate::FallbackOuterRecordV1::encode)
-                .collect();
-            let encoded = encoded?;
-            let borrowed: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
-            let mut out = vec![2];
-            out.push(u8::from(gap_filled));
-            if gap_filled {
-                out.extend_from_slice(&state.receive.ack().encode());
-            }
-            out.extend_from_slice(&encode_byte_list(&borrowed)?);
-            Ok(out)
-        }
+        FallbackObservation::Contiguous {
+            records,
+            acknowledge,
+        } => encode_contiguous_observation(records, acknowledge),
     }
 }
 

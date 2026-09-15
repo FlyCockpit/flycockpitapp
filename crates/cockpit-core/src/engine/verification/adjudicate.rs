@@ -191,11 +191,15 @@ pub async fn adjudicate(
     candidates: &[CollectedCandidate],
     deadline_unix_ms: i64,
 ) -> Result<AdjudicatorVerdict> {
-    if let Some(mut verdict) = take_override() {
+    if let Some(verdict) = take_override() {
         #[cfg(test)]
-        if verdict.selected == Some(Uuid::nil()) {
-            verdict.selected = candidates.first().map(|candidate| candidate.candidate_id);
-        }
+        let verdict = {
+            let mut verdict = verdict;
+            if verdict.selected == Some(Uuid::nil()) {
+                verdict.selected = candidates.first().map(|candidate| candidate.candidate_id);
+            }
+            verdict
+        };
         return Ok(verdict);
     }
     anyhow::ensure!(

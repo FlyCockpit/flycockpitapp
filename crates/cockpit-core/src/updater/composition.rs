@@ -1,7 +1,6 @@
 //! Installed updater composition. Production callers must use this funnel.
 
 use super::disabled::DisabledUpdater;
-use super::traits::Updater;
 
 /// Installed updater composition for the shipped binary.
 #[derive(Debug, Clone)]

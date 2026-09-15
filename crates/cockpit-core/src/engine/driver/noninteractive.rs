@@ -5123,12 +5123,11 @@ impl Driver {
                     // redaction-table rendering; trusted (self-hosted / no-log)
                     // children get it unchanged.
                     let dispatch_brief = {
-                        let (extended, providers) =
+                        let (_extended, providers) =
                             crate::engine::model_roles::load_model_role_config(&self.config);
                         crate::engine::model_roles::render_brief_for_model(
                             &providers,
                             &child.model,
-                            &extended,
                             &composed_brief,
                         )
                     };
@@ -7956,12 +7955,11 @@ impl Driver {
                     // (cloud) child gets the session redaction-table rendering,
                     // a trusted (self-hosted / no-log) child gets it unchanged.
                     let brief = {
-                        let (extended, providers) =
+                        let (_extended, providers) =
                             crate::engine::model_roles::load_model_role_config(&pinned);
                         crate::engine::model_roles::render_brief_for_model(
                             &providers,
                             &child.model,
-                            &extended,
                             &brief,
                         )
                     };

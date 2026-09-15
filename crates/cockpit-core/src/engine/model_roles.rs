@@ -288,34 +288,15 @@ pub fn resolve_host_config_spawn_selector_with_store(
         "host_config_spawn_model",
         true,
         agent_name,
-        extended,
         providers,
         session_model,
         store,
     )
 }
 
-pub fn resolve_policy_selector(
-    selector: &DelegationModelSelector,
-    agent_name: &str,
-    extended: &ExtendedConfig,
-    providers: &ProvidersConfig,
-    session_model: &Arc<Model>,
-) -> Result<(Arc<Model>, DelegationCustody), SelectorResolution> {
-    resolve_policy_selector_with_store(
-        selector,
-        agent_name,
-        extended,
-        providers,
-        session_model,
-        None,
-    )
-}
-
 pub fn resolve_policy_selector_with_store(
     selector: &DelegationModelSelector,
     agent_name: &str,
-    extended: &ExtendedConfig,
     providers: &ProvidersConfig,
     session_model: &Arc<Model>,
     store: Option<crate::credentials::CredentialStore>,
@@ -460,7 +441,6 @@ pub fn resolve_delegated_model_with_custody(
             "frontmatter_model",
             false,
             agent_name,
-            extended,
             providers,
             session_model,
             store.clone(),
@@ -479,7 +459,6 @@ pub fn resolve_delegated_model_with_custody(
         match resolve_policy_selector_with_store(
             selector,
             agent_name,
-            extended,
             providers,
             session_model,
             store.clone(),
@@ -502,7 +481,6 @@ pub fn resolve_delegated_model_with_custody(
             "configured_role_default",
             false,
             agent_name,
-            extended,
             providers,
             session_model,
             store.clone(),
@@ -563,7 +541,7 @@ pub fn resolve_delegated_model_with_custody(
             session_model.model_id_ref()
         ),
     ));
-    let custody = host_selected_custody_for_model(providers, session_model, extended, diagnostics);
+    let custody = host_selected_custody_for_model(providers, session_model, diagnostics);
     Ok((session_model.clone(), custody))
 }
 
@@ -581,7 +559,6 @@ pub fn resolve_delegated_model_with_custody(
 pub fn resolve_trusted_child_model(
     category: &str,
     agent_name: &str,
-    extended: &ExtendedConfig,
     providers: &ProvidersConfig,
     session_model: &Arc<Model>,
     store: Option<crate::credentials::CredentialStore>,
@@ -876,7 +853,6 @@ fn build_host_selected_policy_model(
     stage: &'static str,
     require_subagent_invokable: bool,
     agent_name: &str,
-    extended: &ExtendedConfig,
     providers: &ProvidersConfig,
     session_model: &Arc<Model>,
     store: Option<crate::credentials::CredentialStore>,
@@ -943,7 +919,6 @@ fn build_host_selected_policy_model(
 fn host_selected_custody_for_model(
     providers: &ProvidersConfig,
     model: &Arc<Model>,
-    extended: &ExtendedConfig,
     mut diagnostics: Vec<CustodyDiagnostic>,
 ) -> DelegationCustody {
     let provider = model.provider_id().to_string();
@@ -1011,10 +986,9 @@ fn host_selected_custody_for_model(
 pub fn render_brief_for_model(
     providers: &ProvidersConfig,
     model: &Arc<Model>,
-    extended: &ExtendedConfig,
     brief: &str,
 ) -> String {
-    inherited_custody_for_model(providers, model, extended).render_brief(brief)
+    inherited_custody_for_model(providers, model).render_brief(brief)
 }
 
 /// The custody record for a child that inherits an already-built, host-chosen
@@ -1023,9 +997,8 @@ pub fn render_brief_for_model(
 pub fn inherited_custody_for_model(
     providers: &ProvidersConfig,
     model: &Arc<Model>,
-    extended: &ExtendedConfig,
 ) -> DelegationCustody {
-    host_selected_custody_for_model(providers, model, extended, Vec::new())
+    host_selected_custody_for_model(providers, model, Vec::new())
 }
 
 fn selector_reason(error: &SelectorResolution) -> String {
@@ -2014,7 +1987,6 @@ mod tests {
         let (trusted, grant) = resolve_trusted_child_model(
             "reasoning",
             "deepthink",
-            &extended,
             &providers,
             &session,
             None,
@@ -2413,7 +2385,6 @@ mod tests {
     fn render_brief_for_model_renders_for_the_childs_custody_class() {
         let providers = trust_mode_providers();
         let session = session_model_with_secret(&providers);
-        let extended = ExtendedConfig::default();
         let brief = format!("ship it with {REDACTION_TEST_SECRET}");
 
         let untrusted_child = Arc::new(
@@ -2425,7 +2396,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let rendered = render_brief_for_model(&providers, &untrusted_child, &extended, &brief);
+        let rendered = render_brief_for_model(&providers, &untrusted_child, &brief);
         assert!(!rendered.contains(REDACTION_TEST_SECRET), "{rendered}");
         assert_eq!(rendered, session.session_redact_table().scrub(&brief));
 
@@ -2439,15 +2410,15 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(
-            render_brief_for_model(&providers, &trusted_child, &extended, &brief),
+            render_brief_for_model(&providers, &trusted_child, &brief),
             session.session_redact_table().scrub(&brief),
             "a trusted child remains reference-only"
         );
 
         // Rendering is idempotent, so a path that renders twice (batch entry
         // already rendered, then re-rendered at dispatch) cannot corrupt it.
-        let once = render_brief_for_model(&providers, &untrusted_child, &extended, &brief);
-        let twice = render_brief_for_model(&providers, &untrusted_child, &extended, &once);
+        let once = render_brief_for_model(&providers, &untrusted_child, &brief);
+        let twice = render_brief_for_model(&providers, &untrusted_child, &once);
         assert_eq!(once, twice);
     }
 
@@ -2629,7 +2600,7 @@ mod tests {
         assert_eq!(model.model_id_ref(), "trusted-code");
 
         // The session-model fallback also carries a decided custody class.
-        let custody = inherited_custody_for_model(&providers, &session, &ExtendedConfig::default());
+        let custody = inherited_custody_for_model(&providers, &session);
         assert_eq!(custody.route().provider, session.provider_id());
         assert_eq!(custody.route().model, session.model_id_ref());
         assert!(
@@ -2694,7 +2665,6 @@ mod tests {
         match resolve_trusted_child_model(
             "reasoning",
             "deepthink",
-            &extended_mode(),
             &providers,
             &session,
             None,
@@ -2726,7 +2696,6 @@ mod tests {
         let (model, grant) = resolve_trusted_child_model(
             "reasoning",
             "deepthink",
-            &extended_mode(),
             &providers,
             &session,
             None,
@@ -2750,7 +2719,6 @@ mod tests {
                 resolve_trusted_child_model(
                     "reasoning",
                     "deepthink",
-                    &extended_mode(),
                     &providers,
                     &session,
                     None,
@@ -2794,7 +2762,6 @@ mod tests {
             resolve_trusted_child_model(
                 "reasoning",
                 "deepthink",
-                &extended_mode(),
                 &providers,
                 &session,
                 None,
@@ -2813,7 +2780,6 @@ mod tests {
         let (model, grant) = resolve_trusted_child_model(
             "reasoning",
             "deepthink",
-            &extended_mode(),
             &providers,
             &session,
             None,
@@ -2828,7 +2794,6 @@ mod tests {
             resolve_trusted_child_model(
                 "reasoning",
                 "deepthink",
-                &extended_mode(),
                 &providers,
                 &session,
                 None,

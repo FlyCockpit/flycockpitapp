@@ -689,7 +689,7 @@ fn digest(parts: &[&[u8]]) -> String {
 mod imp {
     use std::ffi::{CString, OsStr};
     use std::io::Read as _;
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
 
@@ -1007,7 +1007,7 @@ mod imp {
                 );
             }
             let leaf = CString::new(*leaf).context("workspace executable leaf has NUL")?;
-            let mut file = held_fd::openat(
+            let file = held_fd::openat(
                 parent.as_raw_fd(),
                 &leaf,
                 libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,

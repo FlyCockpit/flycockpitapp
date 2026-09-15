@@ -93,7 +93,7 @@ mod wire;
 pub(crate) mod wire_schema;
 
 pub(crate) use display_dispatch::{
-    DisplayAttemptSlot, DisplayClockFactory, assistant_display_complete_turn_event,
+    DisplayAttemptSlot, assistant_display_complete_turn_event,
     finish_open_display_classifier,
 };
 

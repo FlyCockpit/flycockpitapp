@@ -1956,7 +1956,7 @@ fn read_macos_window_generation(
 fn cgs_main_connection_id() -> Option<i32> {
     type Fn = unsafe extern "C" fn() -> i32;
     static CACHED: std::sync::OnceLock<Option<Fn>> = std::sync::OnceLock::new();
-    let f = CACHED.get_or_init(|| dlsym_fn(c"CGSMainConnectionID"))?;
+    let f = (*CACHED.get_or_init(|| dlsym_fn(c"CGSMainConnectionID")))?;
     // SAFETY: CGSMainConnectionID takes no arguments and returns the process
     // WindowServer connection id.
     Some(unsafe { f() })

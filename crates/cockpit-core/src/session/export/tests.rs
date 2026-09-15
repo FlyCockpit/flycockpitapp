@@ -91,7 +91,7 @@ async fn build_redacted_transcript_json_bytes(
     let extended = crate::config::extended::load_for_cwd(&root);
     let base =
         RedactionTable::build_with_env_and_credential_store(&extended.redact, &root, &env, &store)?;
-    super::build_redacted_transcript_json_bytes(db, target, vault, resolver, env, Arc::new(base))
+    super::build_redacted_transcript_json_bytes(db, target, vault, resolver, Arc::new(base))
         .await
 }
 

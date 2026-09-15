@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use quick_xml::Reader;
+use quick_xml::XmlVersion;
 use quick_xml::events::{BytesStart, Event};
 
 use super::{
@@ -244,7 +245,7 @@ fn verify_start(
         let attribute = attribute.map_err(|_| error("attribute"))?;
         let name = std::str::from_utf8(attribute.key.as_ref()).map_err(|_| error("attribute"))?;
         let value = attribute
-            .decode_and_unescape_value(reader.decoder())
+            .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
             .map_err(|_| error("attribute"))?;
         object_bbox |= match (kind, name) {
             (Kind::ClipPath, "clipPathUnits") => value == "objectBoundingBox",
@@ -275,7 +276,7 @@ fn verify_start(
             return fail(SvgSanitizeCode::StructuralVerify, "attribute-bytes");
         }
         let value = attribute
-            .decode_and_unescape_value(reader.decoder())
+            .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
             .map_err(|_| error("attribute"))?;
         if key == b"xmlns" {
             if kind != Kind::Svg || saw_xmlns || value.as_ref() != SVG_NS {

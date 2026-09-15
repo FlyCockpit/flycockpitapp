@@ -431,6 +431,7 @@ where
     deserialize_bounded_string::<MAX_OWNER_PROVIDER_METADATA_JSON_BYTES, D>(deserializer)
 }
 
+#[cfg(feature = "extended")]
 fn deserialize_owner_sensitive_metadata_json<'de, D>(
     deserializer: D,
 ) -> std::result::Result<SensitiveWirePayload, D::Error>

@@ -3046,7 +3046,7 @@ fn one_config_file_has_one_journal_key_across_path_spellings() {
     assert!(journal_path_for_config(&direct).exists());
 
     // …and it must be in context — hence maskable — under the others.
-    let masked_round_about = masked_layer_bytes(std::slice::from_ref(&round_about));
+    let masked_round_about = masked_layers(std::slice::from_ref(&round_about)).0;
     assert_eq!(
         masked_round_about.len(),
         1,

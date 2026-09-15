@@ -850,7 +850,6 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
             let custody = crate::engine::model_roles::inherited_custody_for_model(
                 &providers,
                 &ctx.agent.model,
-                &extended,
             );
             (ctx.agent.model.clone(), custody)
         }
@@ -1112,7 +1111,6 @@ mod tests {
                 .with_forced_literal(SECRET.to_string(), "TEST".to_string())
                 .expect("forced literal"),
         );
-        let extended = crate::config::extended::ExtendedConfig::default();
 
         let mut spec = spec(1, 3);
         spec.prompt = format!("use {SECRET} against the staging box");
@@ -1127,7 +1125,6 @@ mod tests {
         let trusted_custody = crate::engine::model_roles::inherited_custody_for_model(
             &cfg,
             &trusted_parent,
-            &extended,
         );
         assert_eq!(
             trusted_custody.custody(),
@@ -1145,7 +1142,6 @@ mod tests {
         let untrusted_custody = crate::engine::model_roles::inherited_custody_for_model(
             &cfg,
             &untrusted_child,
-            &extended,
         );
         assert_eq!(
             untrusted_custody.custody(),

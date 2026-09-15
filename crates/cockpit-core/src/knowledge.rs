@@ -183,11 +183,12 @@ pub use dream::build_dream_prompt;
 /// floor beneath the utility-model guard, and a missing utility model
 /// degrades to that floor rather than to near-nothing — is documented there.
 pub(crate) mod injection_scan;
+#[cfg(test)]
+pub(crate) use injection_scan::{fence_knowledge_tool_output_if_needed, knowledge_content_has_injection};
 pub(crate) use injection_scan::{
     DREAM_INJECTION_NEUTRALIZED_MARKER, KbUtilityGuard, fence_knowledge_content,
     fence_knowledge_content_if_needed, fence_knowledge_model_text_layered,
-    fence_knowledge_tool_output_if_needed, fence_knowledge_tool_output_layered,
-    fence_knowledge_with_utility_model, knowledge_content_has_injection,
+    fence_knowledge_tool_output_layered, fence_knowledge_with_utility_model,
     knowledge_injection_findings, neutralize_dream_injection,
     utility_quarantine_finding_for_dream_write,
 };
@@ -6442,7 +6443,7 @@ fn read_human_knowledge_concept_nofollow(
 ) -> Result<Option<Vec<u8>>> {
     use std::os::fd::AsRawFd as _;
 
-    let mut file = match cockpit_host::private_fs::held_fd::openat(
+    let file = match cockpit_host::private_fs::held_fd::openat(
         parent.as_raw_fd(),
         leaf,
         libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,

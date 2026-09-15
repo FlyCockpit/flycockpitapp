@@ -10971,30 +10971,6 @@ fn validate_safe_identifier(value: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_safe_display(value: &str, field: &str) -> Result<()> {
-    let lower = value.to_ascii_lowercase();
-    ensure!(
-        !value.is_empty()
-            && value.len() <= 160
-            && !value
-                .chars()
-                .any(|character| matches!(character, '\n' | '\r' | '`' | '[' | ']' | '<' | '>'))
-            && !lower.contains("credential")
-            && !lower.contains("password")
-            && !lower.contains("secret")
-            && !lower.contains("token")
-            && !lower.contains("api_key")
-            && !lower.contains("api key")
-            && !lower.contains("private key")
-            && !lower.contains("bearer")
-            && !lower.contains("github_pat")
-            && !lower.contains("sk-")
-            && !lower.contains("handle"),
-        "{field} contains unsafe or markdown-like content"
-    );
-    Ok(())
-}
-
 fn validate_bounded_display(
     value: &str,
     field: &str,

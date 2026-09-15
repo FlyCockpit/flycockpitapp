@@ -41,7 +41,7 @@ use crate::daemon::proto::{
 use crate::daemon::registry::SessionRegistry;
 #[cfg(feature = "extended")]
 use crate::daemon::scheduler::DaemonSchedulerHandle;
-use crate::daemon::session_worker::{SessionWork, SessionWorkerHandle, UserMessageProbeResult};
+use crate::daemon::session_worker::{SessionWork, SessionWorkerHandle};
 use crate::daemon::shutdown::ShutdownPhase;
 use crate::daemon::{
     EventEnvelope, EventReceiver, EventSender, SharedRedactionTable, current_redaction, send_event,
@@ -1048,7 +1048,6 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         } => {
             scrub_session_summary(session, redact);
         }
-        proto::Response::PrimaryAssistantSoulEditMode { .. } => {}
         proto::Response::AssistantUpserted { assistant } => {
             scrub_assistant_summary(assistant, redact)
         }
@@ -5362,7 +5361,7 @@ impl LockedServices {
 
     async fn mark_ready_construction_recovered(&self) -> Result<()> {
         self.onboarding
-            .mark_ready_construction_recovered(self.host_capabilities.clone())
+            .mark_ready_construction_recovered()
             .await
             .context("recording ready-construction recovery")
     }

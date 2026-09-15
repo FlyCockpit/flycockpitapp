@@ -120,7 +120,6 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
     let mut last_result = String::new();
     let mut iteration: u64 = 0;
     let mut errored = false;
-    let mut cancelled = false;
     let mut failed_idle_notes = Vec::new();
     let mut failed_idle_requests = Vec::new();
     let mut failed_idle_actions = Vec::new();
@@ -163,13 +162,11 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
             }
             WakeWait::Cancelled => {
                 last_result = format!("{} cancelled", args.kind().as_str());
-                cancelled = true;
                 break;
             }
         }
 
-        if cancelled || cancel.is_cancelled() {
-            cancelled = true;
+        if cancel.is_cancelled() {
             break;
         }
 
@@ -279,7 +276,6 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
             Ok(text) => last_result = text,
             Err(e) if crate::engine::model::is_cancelled(&e) || cancel.is_cancelled() => {
                 last_result = format!("{} cancelled", args.kind().as_str());
-                cancelled = true;
                 break;
             }
             Err(e) => {
@@ -371,7 +367,6 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
 
         // The fork may have asked to cancel its own loop mid-iteration.
         if state.is_cancelled() {
-            cancelled = true;
             break;
         }
 

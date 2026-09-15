@@ -88,7 +88,6 @@ pub(crate) use outcome::{collapse_continue_without_injection, task_budget_spec};
 pub(crate) use recheck::{ResultRecheckCtx, result_recheck};
 pub(crate) use tool_timeout::dispatch_arc_with_default_timeout;
 
-use backup::*;
 use gate::*;
 use loop_guard::*;
 pub use outcome::*;

@@ -462,15 +462,16 @@ pub async fn build_bundle_zip_bytes(
 /// two-snapshot path had. Warms the resolver before the sync snapshot (its
 /// `resolve` is warm-cache-only). Fails closed on any resolver/integrity error.
 ///
-/// `env` is the live daemon environment (the RPC threads `ctx.env_baseline`) so
-/// an env-derived secret surfacing in a transcript member is scrubbed by the
-/// table's `scan_environment` pass even when it was never persisted or journaled.
+/// Env-derived secrets are already covered by the caller-provided
+/// `base_redactor`: the coverage authority builds that table with the live
+/// daemon environment, so its env pass is folded in before this function runs.
+/// This path emits no config files or manifest, so it needs no separate env
+/// argument of its own.
 pub async fn build_redacted_transcript_json_bytes(
     db: &Db,
     target: &SessionRow,
     vault: &crate::secure_key::SecretVault,
     resolver: std::sync::Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
-    env: HashMap<String, String>,
     base_redactor: Arc<RedactionTable>,
 ) -> Result<Vec<u8>> {
     let target_id = target.session_id;

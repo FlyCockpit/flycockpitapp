@@ -2741,7 +2741,7 @@ async fn run_foreground_inner_with_boot_db(
     // gone idle past the 5-minute threshold, so a hung/abandoned holder
     // can't block a waiting `read` forever.
     let mut lock_sweeper = ForegroundTask::new(server::spawn_lock_sweeper(ctx.clone()));
-    let mut update_check_task =
+    let update_check_task =
         crate::updater::maybe_spawn_background(ctx.clone()).map(ForegroundTask::new);
     #[cfg(feature = "remote")]
     let mut org_sync_task = ForegroundTask::new(org_sync::spawn_background(ctx.clone()));

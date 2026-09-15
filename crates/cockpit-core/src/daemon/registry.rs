@@ -2090,7 +2090,7 @@ impl SessionRegistry {
         worker_publication: &WorkerPublicationPermit<'_>,
     ) -> Result<SessionWorkerHandle> {
         let _config_publication_guard = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
-        let mut session = Session::resume(
+        let session = Session::resume(
             self.inner.db.clone(),
             id,
             self.redaction_key_resolver()?,

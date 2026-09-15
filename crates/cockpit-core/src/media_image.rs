@@ -10,8 +10,10 @@ use anyhow::{Result, anyhow, bail, ensure};
 use image::codecs::png::{CompressionType, FilterType};
 use image::imageops::FilterType as ResizeFilter;
 use image::metadata::Orientation;
+#[cfg(test)]
+use image::ImageFormat;
 use image::{
-    ColorType, DynamicImage, ExtendedColorType, ImageDecoder as _, ImageEncoder, ImageFormat,
+    ColorType, DynamicImage, ExtendedColorType, ImageDecoder as _, ImageEncoder,
     ImageReader, Limits,
 };
 

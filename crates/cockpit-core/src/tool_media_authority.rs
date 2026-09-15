@@ -84,9 +84,8 @@ pub use recovery::{
 pub use revalidator::{RevalidatorError, ToolMediaSubjectRevalidator};
 pub use seal::SealError;
 pub(crate) use session_authority::{
-    AdmissionDenial, AdmissionIoCounters, AdmittedAttachment, AdmittedHandle, AdmittedReadImage,
-    ImageDerivativeReservation, ImmutableAttachmentIdentity, NestedMediaSource, ReadImageSource,
-    SessionMediaAuthority, SourceAdmission, ToolSource,
+    AdmissionDenial, AdmittedAttachment, AdmittedHandle, NestedMediaSource, ReadImageSource,
+    SessionMediaAuthority,
 };
 
 /// The secure-key namespace used by tool-media-subject-binding sealed locators.

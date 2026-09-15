@@ -306,7 +306,6 @@ pub async fn run_trusted_child_acquisition(
     let (child_model, _trusted_custody) = match resolve_trusted_child_model(
         request.category,
         request.delegating_agent_name,
-        request.extended,
         request.providers,
         request.session_model,
         request.store,

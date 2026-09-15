@@ -18,7 +18,6 @@ use cockpit_proto::{
 };
 use reqwest::header::{HeaderName, HeaderValue};
 use tokio_util::sync::CancellationToken;
-use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use super::protocol::ToolDescriptor;

@@ -3759,7 +3759,6 @@ fn resolve_unprepared_vnext_delegation_selector(
         return crate::engine::model_roles::resolve_policy_selector_with_store(
             selector,
             &def.name,
-            extended,
             &args.config.providers(),
             &args.model,
             args.credential_store.clone(),

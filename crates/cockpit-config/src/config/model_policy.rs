@@ -1175,7 +1175,7 @@ impl ProvidersConfig {
         // default and no `Option`, and the payload must agree with it.
         let request = SensitiveModelPolicyRequest::new(criteria, custody, payload)?;
         let policy =
-            self.resolved_policy(provider, model, request.criteria(), Some(request.custody()));
+            self.resolved_policy(provider, model, Some(request.custody()));
         Ok(seal_custody_selection(policy, request.custody()))
     }
 
@@ -1243,7 +1243,7 @@ impl ProvidersConfig {
             });
         };
         self.check_policy_candidate(provider, model_entry, criteria, custody)?;
-        Ok(self.resolved_policy(provider, model, criteria, custody))
+        Ok(self.resolved_policy(provider, model, custody))
     }
 
     #[allow(dead_code)]
@@ -1281,7 +1281,7 @@ impl ProvidersConfig {
                     .check_policy_candidate(provider, model, criteria, custody)
                     .is_ok()
                 {
-                    let resolved = self.resolved_policy(provider, &model.id, criteria, custody);
+                    let resolved = self.resolved_policy(provider, &model.id, custody);
                     let is_explicit = category
                         .is_some_and(|c| model.availability.categories.iter().any(|cat| cat == c));
                     if is_explicit {
@@ -1389,7 +1389,6 @@ impl ProvidersConfig {
         &self,
         provider: &str,
         model: &str,
-        criteria: &ModelPolicyCriteria<'_>,
         custody: Option<ModelCustody>,
     ) -> ResolvedModelPolicy {
         ResolvedModelPolicy {

@@ -243,6 +243,13 @@ fn verify_start(
     let mut object_bbox = inherited_object_bbox;
     for attribute in event.attributes().with_checks(true) {
         let attribute = attribute.map_err(|_| error("attribute"))?;
+        // The canonical serializer never writes literal XML whitespace to
+        // attributes: list-like values are joined with spaces and every other
+        // allowed attribute value is a canonical token. Reject it before
+        // quick-xml's XML attribute normalization could turn it into a space.
+        if attribute.value.as_ref().contains(&b'\t') || attribute.value.as_ref().contains(&b'\n') {
+            return fail(SvgSanitizeCode::StructuralVerify, "attribute-whitespace");
+        }
         let name = std::str::from_utf8(attribute.key.as_ref()).map_err(|_| error("attribute"))?;
         let value = attribute
             .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())

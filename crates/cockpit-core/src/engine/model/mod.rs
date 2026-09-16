@@ -92,9 +92,10 @@ pub(crate) mod rig_boundary;
 mod wire;
 pub(crate) mod wire_schema;
 
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use display_dispatch::DisplayClockFactory;
 pub(crate) use display_dispatch::{
-    DisplayAttemptSlot, assistant_display_complete_turn_event,
-    finish_open_display_classifier,
+    DisplayAttemptSlot, assistant_display_complete_turn_event, finish_open_display_classifier,
 };
 
 #[allow(unused_imports)]

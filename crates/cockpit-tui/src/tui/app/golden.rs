@@ -1,0 +1,137 @@
+//! App- and onboarding-screen helpers for the golden harness.
+
+use std::path::Path;
+
+use ratatui::buffer::Buffer;
+
+use super::{App, Overlay};
+use crate::tui::golden::{
+    GoldenPins, assert_golden_sizes, buffer_text, hover_allowed, pinned_frame, render_frame,
+};
+use crate::tui::onboarding::OnboardingShell;
+use crate::tui::settings::Dialog;
+use cockpit_config::extended::VimModeSetting;
+use cockpit_proto::{OnboardingBootstrapSnapshot, OnboardingStage};
+
+/// Clear mouse-hover unless the test opted in via [`GoldenPins::allow_hover`].
+pub fn pin_app(app: &mut App) {
+    if hover_allowed() {
+        return;
+    }
+    app.hovered_affordance = None;
+    app.hovered_suggestion = None;
+    app.hovered_control_chip = None;
+    app.queue_hover = None;
+    app.button_registry.clear_hover_and_pressed();
+    app.link_registry.clear_hover();
+}
+
+/// Render the whole `App` frame through [`ratatui::backend::TestBackend`].
+pub fn render_app(app: &mut App, width: u16, height: u16) -> Buffer {
+    pin_app(app);
+    if app.launch.banner_enabled {
+        crate::tui::banner_box::with_test_banner_visible(|| {
+            render_frame(width, height, |frame| app.render(frame))
+        })
+    } else {
+        render_frame(width, height, |frame| app.render(frame))
+    }
+}
+
+/// Empty chat with the in-TUI launch banner — seed dump (a).
+pub fn empty_chat_banner_app() -> App {
+    let mut app = App::new(Some(Path::new("/tmp/project")), false);
+    app.dialog = Dialog::None;
+    app.overlay = Overlay::None;
+    app.launch.banner_enabled = true;
+    app.launch.cwd = Path::new("/tmp/project").to_path_buf();
+    app.launch.cwd_display = "~/project".to_string();
+    app.launch.repo_status = None;
+    app.launch.user_name = None;
+    app.launch.session_id = None;
+    app.launch.session_short_id = None;
+    app.vim_setting = VimModeSetting::Disabled;
+    app.composer.set_vim_enabled(false);
+    app
+}
+
+/// Settled onboarding Welcome shell — seed dump (b).
+pub fn onboarding_welcome_shell() -> OnboardingShell {
+    let snapshot = OnboardingBootstrapSnapshot {
+        run_id: uuid::Uuid::from_u128(1),
+        attempt_id: uuid::Uuid::from_u128(2),
+        revision: 3,
+        stage: OnboardingStage::Welcome,
+        bootstrap_state: cockpit_proto::OnboardingBootstrapState::AwaitingChoice,
+        limited_mode: false,
+        lifetime_selection: None,
+        host_capabilities: cockpit_proto::HostCapabilitySnapshot::unpublished(),
+        last_receipt: None,
+    };
+    let mut shell = OnboardingShell::new(&snapshot, false);
+    shell.set_frame_for_golden(pinned_frame());
+    shell
+}
+
+/// Render the settled Welcome screen.
+pub fn render_onboarding_welcome(width: u16, height: u16) -> Buffer {
+    let mut shell = onboarding_welcome_shell();
+    let engine = Dialog::None;
+    let mut links = crate::tui::links::LinkRegistry::default();
+    render_frame(width, height, |frame| {
+        shell.render(frame, frame.area(), &engine, &mut links);
+    })
+}
+
+/// Compare empty-chat-with-banner dumps at both review sizes.
+pub fn assert_empty_chat_banner() {
+    let _pins = GoldenPins::install();
+    let mut app = empty_chat_banner_app();
+    assert_golden_sizes("chat", "empty-banner", |width, height| {
+        render_app(&mut app, width, height)
+    });
+    let preview = buffer_text(&render_app(&mut app, 80, 24));
+    assert!(
+        preview.contains("FlyCockpit"),
+        "empty chat dump must include the launch banner"
+    );
+}
+
+/// Compare onboarding Welcome dumps at both review sizes.
+pub fn assert_onboarding_welcome() {
+    let _pins = GoldenPins::install();
+    assert_golden_sizes("onboarding", "welcome", render_onboarding_welcome);
+    let preview = buffer_text(&render_onboarding_welcome(80, 24));
+    assert!(
+        preview.contains("Press any key"),
+        "welcome dump must be the settled screen"
+    );
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+    use cockpit_test_support::TestEnvGuard;
+
+    fn isolate_render_env() -> TestEnvGuard {
+        let env = TestEnvGuard::isolated_cockpit_home();
+        env.remove_var("NO_COLOR");
+        env.remove_var("COCKPIT_ROOSTER");
+        env.remove_var("COCKPIT_REDUCE_MOTION");
+        env.remove_var("REDUCE_MOTION");
+        env.set_var("TERM", "xterm-256color");
+        env
+    }
+
+    #[test]
+    fn golden_empty_chat_with_banner() {
+        let _env = isolate_render_env();
+        assert_empty_chat_banner();
+    }
+
+    #[test]
+    fn golden_onboarding_welcome() {
+        let _env = isolate_render_env();
+        assert_onboarding_welcome();
+    }
+}

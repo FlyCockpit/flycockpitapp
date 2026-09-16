@@ -29,7 +29,7 @@ const INNER_PAD: usize = 1;
 /// skip rather than clip a half-drawn box).
 pub fn build(info: &LaunchInfo, pane_w: u16, pane_h: u16) -> Option<Vec<Line<'static>>> {
     let suppressed = banner::suppressed_for_tui(info.banner_enabled);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let suppressed = suppressed && !TEST_FORCE_VISIBLE.with(std::cell::Cell::get);
     if suppressed {
         return None;
@@ -37,12 +37,12 @@ pub fn build(info: &LaunchInfo, pane_w: u16, pane_h: u16) -> Option<Vec<Line<'st
     build_box(info, pane_w, pane_h)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 std::thread_local! {
     static TEST_FORCE_VISIBLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn with_test_banner_visible<T>(f: impl FnOnce() -> T) -> T {
     struct ResetVisibility<'a> {
         force: &'a std::cell::Cell<bool>,

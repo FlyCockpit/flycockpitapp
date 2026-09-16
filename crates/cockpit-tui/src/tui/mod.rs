@@ -36,6 +36,8 @@ pub mod dir_suggest;
 pub(crate) mod file_icons;
 pub mod geometry;
 pub mod goal_settings_pane;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod golden;
 pub mod guidance_review;
 pub mod guidance_trace;
 pub mod history;

@@ -217,6 +217,8 @@ mod control_request_tests;
 mod first_run_daemon_tests;
 #[cfg(test)]
 mod first_run_tests;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod golden;
 #[cfg(test)]
 mod onboarding_route_tests;
 
@@ -3639,7 +3641,7 @@ fn safe_shell_launch_info(project: Option<&Path>) -> LaunchInfo {
 }
 
 impl App {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(project: Option<&Path>, no_sandbox: bool) -> Self {
         let mut app = Self::new_inner(
             project,

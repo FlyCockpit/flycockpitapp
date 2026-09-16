@@ -1,0 +1,26 @@
+# style runs: count:fg/bg/mod  (mod is - or BOLD+DIM+…)
+80x24
+0	80:Reset/Reset/-
+1	1:Reset/Reset/- 9:Yellow/Reset/BOLD 2:Reset/Reset/- 14:Indexed(250)/Reset/- 2:Reset/Reset/- 10:Indexed(250)/Reset/- 2:Reset/Reset/- 7:Indexed(250)/Reset/- 2:Reset/Reset/- 7:Indexed(250)/Reset/- 2:Reset/Reset/- 10:Indexed(250)/Reset/- 2:Reset/Reset/- 7:Indexed(250)/Reset/- 3:Reset/Reset/-
+2	34:Reset/Reset/- 13:Yellow/Reset/BOLD 33:Reset/Reset/-
+3	80:Reset/Reset/-
+4	80:Reset/Reset/-
+5	80:Reset/Reset/-
+6	80:Reset/Reset/-
+7	80:Reset/Reset/-
+8	80:Reset/Reset/-
+9	1:Reset/Reset/- 29:Indexed(250)/Reset/- 50:Reset/Reset/-
+10	80:Reset/Reset/-
+11	80:Reset/Reset/-
+12	80:Reset/Reset/-
+13	80:Reset/Reset/-
+14	80:Reset/Reset/-
+15	80:Reset/Reset/-
+16	80:Reset/Reset/-
+17	80:Reset/Reset/-
+18	80:Reset/Reset/-
+19	80:Reset/Reset/-
+20	80:Reset/Reset/-
+21	80:Reset/Reset/-
+22	1:Reset/Reset/- 34:Indexed(250)/Reset/- 45:Reset/Reset/-
+23	80:Reset/Reset/-

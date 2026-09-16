@@ -670,6 +670,10 @@ pub fn card_lines(
 }
 
 fn fmt_time(epoch_unix_ms: i64) -> String {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(pinned) = crate::tui::golden::pinned_datetime() {
+        return pinned.to_string();
+    }
     use chrono::{Local, TimeZone};
     match Local.timestamp_millis_opt(epoch_unix_ms).single() {
         Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
@@ -678,6 +682,10 @@ fn fmt_time(epoch_unix_ms: i64) -> String {
 }
 
 fn fmt_time_with_relative(epoch_unix_ms: i64) -> String {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(pinned) = crate::tui::golden::pinned_datetime() {
+        return pinned.to_string();
+    }
     let elapsed_ms = chrono::Utc::now()
         .timestamp_millis()
         .saturating_sub(epoch_unix_ms);

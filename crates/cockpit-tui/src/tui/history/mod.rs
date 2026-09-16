@@ -4168,6 +4168,10 @@ fn render_first_line_with_pin_and_timestamp_inner(
 }
 
 fn format_timestamp(t: DateTime<Local>) -> String {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(hms) = crate::tui::golden::pinned_hhmm() {
+        return hms.to_string();
+    }
     t.format("%H:%M").to_string()
 }
 

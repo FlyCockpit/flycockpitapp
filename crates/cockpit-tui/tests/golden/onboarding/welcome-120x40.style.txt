@@ -1,0 +1,42 @@
+# style runs: count:fg/bg/mod  (mod is - or BOLD+DIM+…)
+120x40
+0	120:Reset/Reset/-
+1	1:Reset/Reset/- 9:Yellow/Reset/BOLD 2:Reset/Reset/- 14:Indexed(250)/Reset/- 2:Reset/Reset/- 10:Indexed(250)/Reset/- 2:Reset/Reset/- 7:Indexed(250)/Reset/- 2:Reset/Reset/- 7:Indexed(250)/Reset/- 2:Reset/Reset/- 10:Indexed(250)/Reset/- 2:Reset/Reset/- 7:Indexed(250)/Reset/- 43:Reset/Reset/-
+2	54:Reset/Reset/- 13:Yellow/Reset/BOLD 53:Reset/Reset/-
+3	120:Reset/Reset/-
+4	120:Reset/Reset/-
+5	120:Reset/Reset/-
+6	120:Reset/Reset/-
+7	120:Reset/Reset/-
+8	120:Reset/Reset/-
+9	1:Reset/Reset/- 29:Indexed(250)/Reset/- 90:Reset/Reset/-
+10	120:Reset/Reset/-
+11	120:Reset/Reset/-
+12	120:Reset/Reset/-
+13	120:Reset/Reset/-
+14	120:Reset/Reset/-
+15	120:Reset/Reset/-
+16	120:Reset/Reset/-
+17	120:Reset/Reset/-
+18	120:Reset/Reset/-
+19	120:Reset/Reset/-
+20	120:Reset/Reset/-
+21	120:Reset/Reset/-
+22	120:Reset/Reset/-
+23	120:Reset/Reset/-
+24	120:Reset/Reset/-
+25	120:Reset/Reset/-
+26	120:Reset/Reset/-
+27	120:Reset/Reset/-
+28	120:Reset/Reset/-
+29	120:Reset/Reset/-
+30	120:Reset/Reset/-
+31	120:Reset/Reset/-
+32	120:Reset/Reset/-
+33	120:Reset/Reset/-
+34	120:Reset/Reset/-
+35	120:Reset/Reset/-
+36	120:Reset/Reset/-
+37	120:Reset/Reset/-
+38	1:Reset/Reset/- 34:Indexed(250)/Reset/- 85:Reset/Reset/-
+39	120:Reset/Reset/-

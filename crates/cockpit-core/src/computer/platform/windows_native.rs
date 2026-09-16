@@ -2153,7 +2153,7 @@ mod tests {
         let store = RealDesktopGrantStore::for_cockpit_data_dir().unwrap();
         let mut backend =
             WindowsDesktopBackend::construct(DisplayTarget::RealDesktop, Some(&store)).unwrap();
-        let frame = futures::executor::block_on(super::super::execute_backend_action(
+        let frame = futures::executor::block_on(crate::computer::execute_backend_action(
             &mut backend,
             &ComputerAction::CaptureFull,
         ))

@@ -1689,8 +1689,7 @@ mod tests {
             1,
             credential.clone(),
         )
-        .await
-        .unwrap();
+        .await;
         db.save_image_spend_policy(
             ctx.session.project_id.clone(),
             ImageSpendSettings {

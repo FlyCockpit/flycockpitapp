@@ -2974,9 +2974,10 @@ mod tests {
             std::fs::rename(parent_for_hook, parked_for_hook).unwrap();
         });
 
-        let error = create_new_file(&prep, &path, b"must not be disclosed")
-            .unwrap_err()
-            .to_string();
+        let Err(error) = create_new_file(&prep, &path, b"must not be disclosed") else {
+            panic!("parent replacement must fail the write");
+        };
+        let error = error.to_string();
 
         assert!(error.contains("changed"), "{error}");
         assert!(!path.exists());

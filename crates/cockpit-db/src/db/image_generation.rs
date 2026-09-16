@@ -5888,7 +5888,8 @@ mod tests {
             deadline_boot_id: Uuid::from_u128(0xaaaaaaaa_aaaa_4aaa_8aaa_aaaaaaaaaaaa),
             enqueue_started_monotonic_ms: enqueue_ms,
             operation_deadline_monotonic_ms: deadline_ms,
-            sealed_prompt: SealedImageGenerationPromptV1::bind("fixture prompt".into())?,
+            sealed_prompt: SealedImageGenerationPromptV1::bind("fixture prompt".into())
+                .expect("fixture prompt must seal"),
             required_grants: vec![GrantRequirementV1 {
                 grant_kind: "image.generate".into(),
                 authority_digest: "3".repeat(64),

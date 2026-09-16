@@ -387,7 +387,7 @@ impl HeldWorkspaceDirectoryAuthority {
 }
 
 impl HeldDirectoryAuthority {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn force_next_directory_sync_failure(&self) {
         FORCE_DIRECTORY_SYNC_FAILURE.set(true);
     }
@@ -603,7 +603,7 @@ fn unknown_recovery(
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! { static FORCE_DIRECTORY_SYNC_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(test)]
 thread_local! { static BEFORE_PUBLISH_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
@@ -615,11 +615,11 @@ thread_local! { static FORCE_PUBLISH_NONCOLLISION_FAILURE: std::cell::Cell<bool>
 thread_local! { static FORCE_SOURCE_CLEANUP_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(test)]
 thread_local! { static FORCE_POST_CLEANUP_METADATA_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn sync_failure_forced() -> bool {
     FORCE_DIRECTORY_SYNC_FAILURE.replace(false)
 }
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 fn sync_failure_forced() -> bool {
     false
 }

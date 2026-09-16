@@ -2598,7 +2598,10 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
     match recv_writer_body(&mut writer_rx, "local mutation result").await {
         Body::Error { id, error } => {
             assert_eq!(id, Some(local_id));
-            assert_ne!(error.message, remote_operation_denied().message);
+            assert_ne!(
+                error.message,
+                "remote operations require a valid server-authenticated actor binding and operation identity"
+            );
         }
         Body::Response { id, .. } => assert_eq!(id, local_id),
         other => panic!("unexpected local mutation result: {other:?}"),
@@ -4505,6 +4508,7 @@ async fn remote_outbox_replay_is_actor_bound_ordered_and_token_correlated() {
         &mut first,
         &mut first_shared,
         &ctx,
+        test_principal_tx!(),
         &event_tx,
         &writer_tx,
         &mut concurrent,
@@ -4533,6 +4537,7 @@ async fn remote_outbox_replay_is_actor_bound_ordered_and_token_correlated() {
         &mut second,
         &mut second_shared,
         &ctx,
+        test_principal_tx!(),
         &event_tx,
         &writer_tx,
         &mut concurrent,
@@ -4562,6 +4567,7 @@ async fn remote_outbox_replay_is_actor_bound_ordered_and_token_correlated() {
         &mut second,
         &mut second_shared,
         &ctx,
+        test_principal_tx!(),
         &event_tx,
         &writer_tx,
         &mut concurrent,
@@ -4585,6 +4591,7 @@ async fn remote_outbox_replay_is_actor_bound_ordered_and_token_correlated() {
         &mut first,
         &mut first_shared,
         &ctx,
+        test_principal_tx!(),
         &event_tx,
         &writer_tx,
         &mut concurrent,
@@ -4605,6 +4612,7 @@ async fn remote_outbox_replay_is_actor_bound_ordered_and_token_correlated() {
         &mut first,
         &mut first_shared,
         &ctx,
+        test_principal_tx!(),
         &event_tx,
         &writer_tx,
         &mut concurrent,
@@ -13382,17 +13390,32 @@ async fn send_user_message_ledger_hash_binds_client_submission_id() {
         shared: &Arc<SharedClientState>,
         work_rx: &mut tokio::sync::mpsc::Receiver<SessionWork>,
         client_submission_id: Uuid,
-        operation: RemoteOperationContext,
+        operation: &RemoteOperationContext,
     ) -> (MutableClientState, [u8; 32]) {
         let session_id = state
             .attached
             .as_ref()
             .expect("worker request hash requires an attached state")
             .handle
-            .session_id;
+            .session_id();
         let ctx = ctx.clone();
         let shared = shared.clone();
+        let operation_identity = (
+            operation.request_id,
+            operation.logical_attachment_id,
+            operation.operation_id,
+            operation.authenticated_device_id,
+            operation.authenticated_device_generation,
+        );
         let task = tokio::spawn(async move {
+            let operation = RemoteOperationContext::for_test(
+                operation_identity.0,
+                operation_identity.1,
+                operation_identity.2,
+                operation_identity.3,
+                operation_identity.4,
+            )
+            .await;
             let mut state = state;
             let mut effects = ClientRequestEffects::default();
             let request = Request::SendUserMessageV2 {
@@ -13475,7 +13498,7 @@ async fn send_user_message_ledger_hash_binds_client_submission_id() {
         &shared,
         &mut work_rx,
         Uuid::new_v4(),
-        operation,
+        &operation,
     )
     .await;
     let shared_submission_id = Uuid::new_v4();
@@ -13485,7 +13508,7 @@ async fn send_user_message_ledger_hash_binds_client_submission_id() {
         &shared,
         &mut work_rx,
         shared_submission_id,
-        operation,
+        &operation,
     )
     .await;
     assert_ne!(
@@ -13506,7 +13529,7 @@ async fn send_user_message_ledger_hash_binds_client_submission_id() {
         &shared_two,
         &mut work_rx_two,
         shared_submission_id,
-        operation,
+        &operation,
     )
     .await;
     assert_ne!(
@@ -16579,6 +16602,7 @@ async fn remote_fs_rename_fails_closed_before_reservation_until_held_recovery_is
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_tx,
         &writer_tx,
         &mut concurrent,
@@ -16642,6 +16666,7 @@ async fn remote_fs_rename_present_but_blocked_journal_rejects_before_observation
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_tx,
         &writer_tx,
         &mut concurrent,
@@ -16719,6 +16744,7 @@ async fn remote_fs_rename_real_ingress_applies_replays_and_conflicts_without_sec
             &mut state,
             &mut shared,
             &ctx,
+            test_principal_tx!(),
             &event_tx,
             &writer_tx,
             &mut concurrent,
@@ -16746,6 +16772,7 @@ async fn remote_fs_rename_real_ingress_applies_replays_and_conflicts_without_sec
         &mut state,
         &mut shared,
         &ctx,
+        test_principal_tx!(),
         &event_tx,
         &writer_tx,
         &mut concurrent,
@@ -17132,6 +17159,7 @@ async fn staged_rename_executor_recovers_every_durability_barrier_cut() {
                     &mut remote_state,
                     &mut remote_shared,
                     &ctx,
+                    test_principal_tx!(),
                     &event_tx,
                     &writer_tx,
                     &mut concurrent,
@@ -31225,6 +31253,27 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                         Request::GetAgentAuthoringProjection => "GetAgentAuthoringProjection",
                         Request::ApplyAuthoredAgentPackage(..) => "ApplyAuthoredAgentPackage",
                         Request::GetAuthoredAgentPackageReceipt(..) => "GetAuthoredAgentPackageReceipt",
+                        Request::CreateCodeRootV1(..) => "CreateCodeRootV1",
+                        Request::AttachExistingCodeRootV1(..) => "AttachExistingCodeRootV1",
+                        Request::CloseCodeRootAttachmentV1(..) => "CloseCodeRootAttachmentV1",
+                        Request::CreateCodeRootWithAcpIngressV1(..) => "CreateCodeRootWithAcpIngressV1",
+                        Request::AttachExistingCodeRootWithAcpIngressV1(..) => "AttachExistingCodeRootWithAcpIngressV1",
+                        Request::CloseAcpCodeRootAttachmentV1(..) => "CloseAcpCodeRootAttachmentV1",
+                        Request::DiscoverCodeRootsV1(..) => "DiscoverCodeRootsV1",
+                        Request::ReadCodeRootV1(..) => "ReadCodeRootV1",
+                        Request::ReadCodeRootDeliveriesV1(..) => "ReadCodeRootDeliveriesV1",
+                        Request::AckCodeRootDeliveriesV1(..) => "AckCodeRootDeliveriesV1",
+                        Request::ResolveCodeRootInterruptV1(..) => "ResolveCodeRootInterruptV1",
+                        Request::RetryOnboardingReadyConstruction => "RetryOnboardingReadyConstruction",
+                        Request::GetStorageReport => "GetStorageReport",
+                        Request::CancelAllSessionWork => "CancelAllSessionWork",
+                        Request::PromoteToPersistent => "PromoteToPersistent",
+                        Request::ExitGuardStatus => "ExitGuardStatus",
+                        Request::ReleaseExitGuard => "ReleaseExitGuard",
+                        Request::ResumeFromCompaction => "ResumeFromCompaction",
+                        Request::ExchangeLocalPeerCredential => "ExchangeLocalPeerCredential",
+                        Request::ListGuidanceProposals => "ListGuidanceProposals",
+                        Request::GetGuidanceEnablementTrace => "GetGuidanceEnablementTrace",
                         #[cfg(feature = "remote")]
                         Request::OperationStatus { .. } => "OperationStatus",
                         $($(#[$variant_attr])* Request::$variant { .. } => stringify!($variant),)*
@@ -31240,6 +31289,15 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                     "AgentInstallationList", "AgentInstallationInspect",
                     "GetAgentAuthoringProjection", "ApplyAuthoredAgentPackage",
                     "GetAuthoredAgentPackageReceipt",
+                    "CreateCodeRootV1", "AttachExistingCodeRootV1", "CloseCodeRootAttachmentV1",
+                    "CreateCodeRootWithAcpIngressV1", "AttachExistingCodeRootWithAcpIngressV1",
+                    "CloseAcpCodeRootAttachmentV1", "DiscoverCodeRootsV1", "ReadCodeRootV1",
+                    "ReadCodeRootDeliveriesV1", "AckCodeRootDeliveriesV1",
+                    "ResolveCodeRootInterruptV1",
+                    "RetryOnboardingReadyConstruction", "GetStorageReport",
+                    "CancelAllSessionWork", "PromoteToPersistent", "ExitGuardStatus",
+                    "ReleaseExitGuard", "ResumeFromCompaction", "ExchangeLocalPeerCredential",
+                    "ListGuidanceProposals", "GetGuidanceEnablementTrace",
                     #[cfg(feature = "remote")]
                     "OperationStatus",
                     $($(#[$variant_attr])* stringify!($variant)),*, "Unknown"
@@ -31247,6 +31305,34 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             };
         }
     request_variants!(
+        GetRedactionCoverageStatus,
+        RenderInputPrediction,
+        ResolveTagPreview,
+        AttachKnowledgeBaseSession,
+        DetachKnowledgeBaseSession,
+        KnowledgeDreamStatus,
+        RunKnowledgeDream,
+        SetQueuedUserMessageClass,
+        PromoteQueuedUserMessages,
+        SendNowQueuedUserMessage,
+        SetConversationRule,
+        RemoveConversationRule,
+        ListConversationRules,
+        PromoteConversationRule,
+        CreateDeclaredSealedAction,
+        SetWorkspaceHistoryScope,
+        GetWorkspaceHistoryScope,
+        PreviewStorageCleanup,
+        ExecuteStorageCleanup,
+        ReadAssistantInbox,
+        AcknowledgeAssistantInboxHumanRead,
+        ReadAgentTree,
+        ReadAgentAttention,
+        ResolveAgentDecision,
+        GetAgentEffectiveSettings,
+        ApplyAgentSessionOverride,
+        CleanManagedWorkspaceLease,
+        ReviewGuidanceProposal,
         WriteBulkTransferChunk,
         ReadBulkTransferChunk,
         ReadRedactedExportChunk,
@@ -37391,7 +37477,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         #[cfg(feature = "remote")]
         connector_wake: base.connector_wake.clone(),
         #[cfg(feature = "remote")]
-        remote_operation_locks: base.remote_operation_locks.clone(),
+        remote_operation_locks: tokio::sync::Mutex::new(HashMap::new()),
         #[cfg(feature = "extended")]
         scheduler: base.scheduler.clone(),
         promoted_persistent_services: StdMutex::new(PromotedPersistentServices::empty()),
@@ -37617,7 +37703,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         #[cfg(feature = "remote")]
         connector_wake: base.connector_wake.clone(),
         #[cfg(feature = "remote")]
-        remote_operation_locks: base.remote_operation_locks.clone(),
+        remote_operation_locks: tokio::sync::Mutex::new(HashMap::new()),
         #[cfg(feature = "extended")]
         scheduler: base.scheduler.clone(),
         promoted_persistent_services: StdMutex::new(PromotedPersistentServices::empty()),

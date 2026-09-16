@@ -1874,7 +1874,7 @@ mod tests {
                         id,
                         owner_capability,
                         request: Request::ExchangeLocalPeerCredential,
-                        operation: _,
+                        ..
                     } => {
                         assert_eq!(
                             owner_capability

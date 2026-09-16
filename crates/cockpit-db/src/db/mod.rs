@@ -21,9 +21,12 @@
 //!   the prior committed snapshot. Dropping a write/transaction future after
 //!   enqueue does not dequeue the job: the writer thread still runs it, and
 //!   the cancelled caller must not report success.
-//! - File-backed enqueue never blocks the Tokio runtime. A saturated writer
-//!   queue returns [`WriterQueueSaturated`] and does not drop the caller's
-//!   durability obligation — the write never started and remains retryable.
+//! - Async file-backed enqueue (`Db::write` / `Db::transaction`) never blocks
+//!   the Tokio runtime. A saturated writer queue returns
+//!   [`WriterQueueSaturated`] and does not drop the caller's durability
+//!   obligation — the write never started and remains retryable. Dropping the
+//!   wait does not dequeue the job. Blocking wrappers park on enqueue until
+//!   the writer has room or shuts down, then park on the reply.
 //! - Composing two async accessors is not atomic. Any multi-statement
 //!   invariant that must not interleave with another writer belongs in a
 //!   single [`Db::transaction`] closure.
@@ -165,15 +168,35 @@ pub fn open_default_call_count() -> usize {
 type DbJob = Box<dyn FnOnce(&Connection) -> Result<Box<dyn Any + Send>> + Send + 'static>;
 type WriteReply = Result<Box<dyn Any + Send>>;
 
+enum WriteReplySink {
+    Async(tokio::sync::oneshot::Sender<WriteReply>),
+    Blocking(mpsc::SyncSender<WriteReply>),
+}
+
+impl WriteReplySink {
+    fn send(self, result: WriteReply) {
+        match self {
+            Self::Async(reply) => {
+                let _ = reply.send(result);
+            }
+            Self::Blocking(reply) => {
+                let _ = reply.send(result);
+            }
+        }
+    }
+}
+
 struct WriteRequest {
     job: DbJob,
-    reply: tokio::sync::oneshot::Sender<WriteReply>,
+    reply: WriteReplySink,
 }
 
 /// Returned when the file-backed writer queue cannot accept another job.
 ///
-/// The write was not enqueued and did not run. Callers must treat this as a
-/// fail-closed retryable durability error, never as success.
+/// Async [`Db::write`] / [`Db::transaction`] fail closed here so a saturated
+/// queue never blocks the Tokio runtime; the write was not enqueued and did
+/// not run. Callers must treat this as a retryable durability error, never as
+/// success. Blocking wrappers wait for capacity instead of returning this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("db writer queue is saturated")]
 pub struct WriterQueueSaturated;
@@ -291,7 +314,7 @@ impl Writer {
                         .and_then(|result| result)
                         .map_err(annotate_database_storage_failure);
                     let poison = result.as_ref().err().is_some_and(writer_error_poisoned);
-                    let _ = request.reply.send(result);
+                    request.reply.send(result);
                     if poison {
                         // The connection may still own an unknown transaction
                         // or an unrestored append-only delete fence. Drop it
@@ -320,25 +343,28 @@ impl Writer {
         })
     }
 
+    /// Clone the queue sender under the mutex, then release it. Never hold
+    /// `WriterInner::tx` across `send`/`try_send` or a reply wait.
+    fn queue_sender(&self) -> Result<mpsc::SyncSender<WriteRequest>> {
+        self.inner
+            .tx
+            .lock()
+            .map_err(|_| anyhow::anyhow!("db writer mutex poisoned"))?
+            .as_ref()
+            .cloned()
+            .context("db writer is shut down")
+    }
+
     fn submit<F, T>(&self, f: F) -> Result<tokio::sync::oneshot::Receiver<WriteReply>>
     where
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        let job: DbJob = Box::new(move |conn| {
-            let value = f(conn)?;
-            Ok(Box::new(value) as Box<dyn Any + Send>)
-        });
-        match self
-            .inner
-            .tx
-            .lock()
-            .map_err(|_| anyhow::anyhow!("db writer mutex poisoned"))?
-            .as_ref()
-            .context("db writer is shut down")?
-            .try_send(WriteRequest { job, reply })
-        {
+        match self.queue_sender()?.try_send(WriteRequest {
+            job: box_write_job(f),
+            reply: WriteReplySink::Async(reply),
+        }) {
             Ok(()) => Ok(rx),
             Err(TrySendError::Full(_request)) => Err(WriterQueueSaturated.into()),
             Err(TrySendError::Disconnected(_request)) => {
@@ -346,6 +372,35 @@ impl Writer {
             }
         }
     }
+
+    fn submit_blocking<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.queue_sender()?
+            .send(WriteRequest {
+                job: box_write_job(f),
+                reply: WriteReplySink::Blocking(reply),
+            })
+            .map_err(|_| anyhow::anyhow!("db writer is shut down"))?;
+        let boxed = rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("db writer reply dropped"))??;
+        downcast_write_result(boxed)
+    }
+}
+
+fn box_write_job<F, T>(f: F) -> DbJob
+where
+    F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    Box::new(move |conn| {
+        let value = f(conn)?;
+        Ok(Box::new(value) as Box<dyn Any + Send>)
+    })
 }
 
 fn downcast_write_result<T: 'static>(boxed: Box<dyn Any + Send>) -> Result<T> {
@@ -353,38 +408,6 @@ fn downcast_write_result<T: 'static>(boxed: Box<dyn Any + Send>) -> Result<T> {
         .downcast::<T>()
         .map(|value| *value)
         .map_err(|_| anyhow::anyhow!("db writer returned unexpected result type"))
-}
-
-fn recv_write_reply_blocking<T: 'static>(
-    rx: tokio::sync::oneshot::Receiver<WriteReply>,
-) -> Result<T> {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        // Temporary sync wrappers still run from some async tests on
-        // file-backed databases. `oneshot::Receiver::blocking_recv` panics
-        // on a runtime worker; poll the same reply without taking the
-        // runtime's park.
-        return recv_write_reply_blocking_from_runtime(rx);
-    }
-    let boxed = rx
-        .blocking_recv()
-        .map_err(|_| anyhow::anyhow!("db writer reply dropped"))??;
-    downcast_write_result(boxed)
-}
-
-fn recv_write_reply_blocking_from_runtime<T: 'static>(
-    mut rx: tokio::sync::oneshot::Receiver<WriteReply>,
-) -> Result<T> {
-    loop {
-        match rx.try_recv() {
-            Ok(result) => return downcast_write_result(result?),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                std::thread::yield_now();
-            }
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                return Err(anyhow::anyhow!("db writer reply dropped"));
-            }
-        }
-    }
 }
 
 async fn recv_write_reply<T: 'static>(rx: tokio::sync::oneshot::Receiver<WriteReply>) -> Result<T> {
@@ -1222,8 +1245,7 @@ impl Db {
             anyhow::bail!("read-only diagnostic database does not permit writes");
         }
         if let Some(writer) = &self.writer {
-            let rx = writer.submit(f)?;
-            return recv_write_reply_blocking(rx);
+            return writer.submit_blocking(f);
         }
         let inner = self
             .memory
@@ -2918,6 +2940,90 @@ mod tests {
             .expect_err("aborted task");
         assert!(started.elapsed() < Duration::from_millis(200));
         drop(stall);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocking_write_from_tokio_runtime_does_not_busy_spin_or_panic() {
+        let source =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db/mod.rs"))
+                .unwrap();
+        let spin_helper = concat!("fn recv_write_reply_blocking", "_from_runtime");
+        assert!(
+            !source.contains(spin_helper),
+            "busy-spin write-reply helper must not exist"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let db = Db::open(&tmp.path().join("blocking-runtime.db")).unwrap();
+        db.blocking_write_for_sync_event(|conn| {
+            conn.execute_batch("CREATE TABLE blocking_runtime (value INTEGER NOT NULL);")?;
+            conn.execute("INSERT INTO blocking_runtime (value) VALUES (9)", [])?;
+            Ok(())
+        })
+        .unwrap();
+        let value: i64 = db
+            .read(|conn| {
+                Ok(conn.query_row("SELECT value FROM blocking_runtime", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(value, 9);
+    }
+
+    #[test]
+    fn blocking_write_on_full_queue_waits_rather_than_returning_saturation() {
+        let tmp = TempDir::new().unwrap();
+        let db = Db::open_with_writer_capacity_for_test(&tmp.path().join("blocking-full.db"), 1)
+            .unwrap();
+        db.blocking_write_for_sync_event(|conn| {
+            conn.execute_batch("CREATE TABLE blocking_full (value INTEGER NOT NULL);")?;
+            Ok(())
+        })
+        .unwrap();
+
+        let stall = db.stall_writer_for_test().expect("stall writer");
+        let queued = db
+            .writer
+            .as_ref()
+            .expect("file-backed writer")
+            .submit(|_| Ok(()))
+            .expect("one waiting job fills capacity 1");
+
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let writer_db = db.clone();
+        let join = std::thread::spawn(move || {
+            let result = writer_db.blocking_write_for_sync_event(|conn| {
+                conn.execute("INSERT INTO blocking_full (value) VALUES (42)", [])?;
+                Ok(())
+            });
+            let _ = done_tx.send(result);
+        });
+
+        match done_rx.recv_timeout(Duration::from_millis(150)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(Err(err)) if err.downcast_ref::<WriterQueueSaturated>().is_some() => {
+                panic!("blocking write returned WriterQueueSaturated instead of waiting");
+            }
+            Ok(other) => panic!("blocking write finished while the writer was stalled: {other:?}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("blocking write thread dropped its reply")
+            }
+        }
+
+        drop(queued);
+        drop(stall);
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocking write must complete after the stall is released");
+        result.expect("blocking write should persist after waiting for capacity");
+        join.join().expect("blocking write thread panicked");
+
+        let value: i64 = db
+            .blocking_read_for_sync_ui(|conn| {
+                Ok(conn.query_row("SELECT value FROM blocking_full", [], |row| row.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(value, 42);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

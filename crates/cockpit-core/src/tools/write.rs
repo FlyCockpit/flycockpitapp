@@ -472,6 +472,7 @@ const CREATED_DIR_MODE: libc::mode_t = 0o755;
 /// depend on the process umask: a restrictive umask (e.g. `0o700`) would
 /// otherwise strip the owner's read bit from the `0o666` creation mode and
 /// block reading a file this tool just created.
+#[cfg(unix)]
 const CREATED_FILE_MODE: libc::mode_t = 0o644;
 #[cfg(unix)]
 const CREATED_DIR_INITIAL_MODE: libc::mode_t = 0o700;

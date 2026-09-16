@@ -47,7 +47,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetPropW, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
     WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
 };
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::{AgileReference, PCWSTR, PWSTR};
 
 #[cfg(test)]
 use crate::computer::ComputerAction;
@@ -94,7 +94,7 @@ pub(crate) struct WindowsDesktopBackend {
 struct EvidencedWindowsWindow {
     opaque: OpaqueWindowId,
     hwnd_bits: isize,
-    element: Option<IUIAutomationElement>,
+    element: Option<AgileReference<IUIAutomationElement>>,
 }
 
 impl std::fmt::Debug for EvidencedWindowsWindow {
@@ -232,6 +232,7 @@ impl WindowsDesktopBackend {
         let (geometry, origin_x, origin_y) = query_geometry()?;
         let held_input_journal = WindowsHeldInputJournal::for_current_input_session()?;
         let held = held_input_journal.load()?;
+        let cleanup_window = evidenced_windows_window_from_journal(&held);
         Ok(Self {
             geometry,
             origin_x,
@@ -242,7 +243,7 @@ impl WindowsDesktopBackend {
             held_buttons: held.buttons,
             physical_capability: None,
             evidenced_window: None,
-            cleanup_window: evidenced_windows_window_from_journal(&held),
+            cleanup_window,
         })
     }
 
@@ -289,6 +290,7 @@ impl WindowsDesktopBackend {
 
     fn reload_held_keyboard_inputs(&mut self) -> Result<(), ComputerError> {
         let state = self.held_input_journal.load()?;
+        let cleanup_window = evidenced_windows_window_from_journal(&state);
         self.held_keyboard_inputs = state.keyboard;
         if self.held_buttons.is_empty() {
             self.held_buttons = state.buttons;
@@ -300,7 +302,7 @@ impl WindowsDesktopBackend {
             }
         }
         if self.cleanup_window.is_none() {
-            self.cleanup_window = evidenced_windows_window_from_journal(&state);
+            self.cleanup_window = cleanup_window;
         }
         Ok(())
     }
@@ -369,11 +371,11 @@ impl WindowsDesktopBackend {
         Ok(())
     }
 
-    fn rollback_known_pre_send_refusal(
+    fn rollback_known_pre_send_refusal<T>(
         &mut self,
         previous: WindowsHeldInputState,
         refusal: ComputerError,
-    ) -> Result<(), ComputerError> {
+    ) -> Result<T, ComputerError> {
         self.rollback_delivery(previous).map_err(|rollback| {
             ComputerError::Refused(format!(
                 "{refusal}; exact pre-send authority rollback failed: {rollback}"
@@ -795,8 +797,10 @@ fn ambiguous_send_timeout() -> ComputerError {
 fn hwnd_from_retained_window_object(
     bound: &EvidencedWindowsWindow,
 ) -> Result<(HWND, IUIAutomationElement), ComputerError> {
-    let element = if let Some(element) = bound.element.clone() {
+    let element = if let Some(element) = &bound.element {
         element
+            .resolve()
+            .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?
     } else {
         let hwnd = hwnd_from_bits(bound.hwnd_bits);
         if hwnd.is_invalid() || !unsafe { IsWindow(Some(hwnd)).as_bool() } {
@@ -1224,7 +1228,8 @@ impl ComputerBackend for WindowsDesktopBackend {
         }
         plant_hwnd_identity(hwnd, window)
             .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
-        let element = uia_window_element(hwnd)?;
+        let element = AgileReference::new(&uia_window_element(hwnd)?)
+            .map_err(|_| ComputerError::Refused(EVIDENCED_WINDOW_MISMATCH.to_string()))?;
         self.evidenced_window = Some(EvidencedWindowsWindow {
             opaque: window,
             hwnd_bits: hwnd_bits(hwnd),
@@ -1348,9 +1353,9 @@ fn mouse_message_keys(held: &[MouseButton], button: MouseButton, up: bool) -> us
 
 fn mouse_mk_bit(button: MouseButton) -> usize {
     match button {
-        MouseButton::Left => MK_LBUTTON.0 as usize,
-        MouseButton::Right => MK_RBUTTON.0 as usize,
-        MouseButton::Middle => MK_MBUTTON.0 as usize,
+        MouseButton::Left => 0x0001,
+        MouseButton::Right => 0x0002,
+        MouseButton::Middle => 0x0010,
     }
 }
 
@@ -1380,10 +1385,10 @@ fn plant_hwnd_identity(hwnd: HWND, opaque: OpaqueWindowId) -> Result<(), TargetU
         SetPropW(
             hwnd,
             PCWSTR(name.as_ptr()),
-            HANDLE(core::ptr::without_provenance_mut(1)),
+            Some(HANDLE(core::ptr::without_provenance_mut(1))),
         )
     };
-    if !planted.as_bool() || !hwnd_identity_prop_is_live(hwnd, opaque) {
+    if planted.is_err() || !hwnd_identity_prop_is_live(hwnd, opaque) {
         return Err(TargetUnavailableReason::QueryMismatch);
     }
     Ok(())
@@ -1428,10 +1433,7 @@ fn click_count(count: ClickCount) -> usize {
     }
 }
 fn win32_error(operation: &str) -> ComputerError {
-    win_input_error(format!(
-        "{operation}: {}",
-        windows::core::Error::from_win32()
-    ))
+    win_input_error(format!("{operation}: {:?}", unsafe { GetLastError() }))
 }
 fn win_input_error(error: impl std::fmt::Display) -> ComputerError {
     ComputerError::CommandFailed {
@@ -1845,9 +1847,11 @@ fn ensure_com_mta() -> Result<(), ComputerError> {
     }
     INITIALIZED.with(|initialized| {
         if !initialized.get() {
-            unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.map_err(|_| {
-                ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string())
-            })?;
+            unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+                .ok()
+                .map_err(|_| {
+                    ComputerError::Refused(SYNTHETIC_INPUT_REQUIRES_EVIDENCED_WINDOW.to_string())
+                })?;
             initialized.set(true);
         }
         Ok(())

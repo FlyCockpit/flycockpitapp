@@ -25835,7 +25835,6 @@ fn retain_only_stale_provider_credentials(
     cleanup.retain(|_, references| !references.is_empty());
 }
 
-#[cfg(any(unix, test))]
 pub(super) async fn recover_all_provider_config_journals(
     ctx: &DaemonContext,
     publication: crate::daemon::config_publication_recovery::PreSocketConfigPublication,
@@ -27896,7 +27895,6 @@ fn reconcile_mcp_journal_file(
     Ok(())
 }
 
-#[cfg(any(unix, test))]
 pub(super) async fn recover_all_mcp_config_journals(
     ctx: &DaemonContext,
     publication: crate::daemon::config_publication_recovery::PreSocketConfigPublication,

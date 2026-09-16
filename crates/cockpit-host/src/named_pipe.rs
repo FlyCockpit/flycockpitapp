@@ -200,6 +200,12 @@ pub struct OwnerOnlyPipeSecurity {
     attrs: windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
 }
 
+// SAFETY: the descriptor is an owned LocalAlloc allocation, and `attrs`
+// merely points to that allocation. Neither has thread affinity; moving the
+// owner does not invalidate the allocation or its pointer.
+#[cfg(windows)]
+unsafe impl Send for OwnerOnlyPipeSecurity {}
+
 #[cfg(windows)]
 impl OwnerOnlyPipeSecurity {
     pub fn for_current_user() -> Result<Self> {
@@ -561,13 +567,15 @@ pub async fn connect_client_pipe(
     use std::os::windows::io::AsRawHandle;
     use tokio::net::windows::named_pipe::NamedPipeClient;
 
-    let handle = retry_busy_open_async(pipe, CLIENT_PIPE_CONNECT_TIMEOUT, || {
+    let handle_bits = retry_busy_open_async(pipe, CLIENT_PIPE_CONNECT_TIMEOUT, || {
         open_pipe_client_handle(
             pipe,
             windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED,
         )
+        .map(|handle| handle as usize)
     })
     .await?;
+    let handle = handle_bits as windows_sys::Win32::Foundation::HANDLE;
     // SAFETY: `open_pipe_client_handle` returns a unique, owned overlapped
     // pipe handle. Tokio takes ownership on success and closes it on error.
     let client = unsafe { NamedPipeClient::from_raw_handle(handle.cast()) }?;

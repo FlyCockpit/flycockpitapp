@@ -1365,8 +1365,8 @@ fn component_buf_os(name: &std::ffi::OsStr) -> Result<SkillComponentBuf> {
             && name != "."
             && name != ".."
             && !units.contains(&0)
-            && !units.contains(&b'/' as u16)
-            && !units.contains(&b'\\' as u16),
+            && !units.contains(&(b'/' as u16))
+            && !units.contains(&(b'\\' as u16)),
         "skill filesystem component is unsafe"
     );
     Ok(name.to_os_string())

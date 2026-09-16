@@ -578,8 +578,15 @@ pub fn attest_local_client_role(
     if !cockpit_host::daemon_lifecycle::exact_executable_identity(&exe, approved_executable) {
         return attest_agent_child_role(peer, approved_executable);
     }
-    let cmdline = cockpit_host::daemon_lifecycle::read_process_cmdline(peer.pid).ok()?;
-    classify_cockpit_cmdline(&cmdline)
+    #[cfg(unix)]
+    {
+        let cmdline = cockpit_host::daemon_lifecycle::read_process_cmdline(peer.pid).ok()?;
+        classify_cockpit_cmdline(&cmdline)
+    }
+    #[cfg(windows)]
+    {
+        None
+    }
 }
 
 fn attest_agent_child_role(

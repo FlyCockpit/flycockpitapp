@@ -649,7 +649,7 @@ impl SidecarProcessLock {
             .collect();
         let name = format!(
             "Global\\FlycockpitKnowledgeSidecar-{}",
-            hex::encode(Sha256::digest(identity))
+            crate::intel::hex_lower(&Sha256::digest(identity))
         );
         let name: Vec<u16> = OsStr::new(&name).encode_wide().chain(Some(0)).collect();
         // SAFETY: the name is NUL-terminated and the returned handle is owned

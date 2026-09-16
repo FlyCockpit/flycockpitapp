@@ -266,7 +266,7 @@ rustls-native-certs = { version = "=0.8.4", default-features = false, optional =
 # Process-global rustls provider install (`aws_lc_rs`) shared by TURN TLS and
 # media HTTPS. Default features keep the `aws_lc_rs` provider available; `ring`
 # is never installed as the process default. Already resolved in Cargo.lock at
-# 0.23.43 (previously a dev-dependency), so promoting it to a normal dependency
+# 0.23.45 (previously a dev-dependency), so promoting it to a normal dependency
 # adds no new lock entry.
 rustls = "=0.23.45"
 

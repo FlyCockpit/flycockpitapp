@@ -1067,8 +1067,8 @@ pub(crate) fn read_file_nofollow_with_identity(
         }
         match open_windows_relative_nofollow(&parent, &file_name, false, access, FILE_OPEN) {
             Ok(file) => file,
-            Err(error) if root_cause_is_not_found(&error) => return Ok(None),
-            Err(error) => return Err(error),
+            Err(error) if root_cause_is_not_found(&error.into()) => return Ok(None),
+            Err(error) => return Err(error.into()),
         }
     };
     #[cfg(all(not(unix), not(windows)))]

@@ -13,8 +13,10 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::agents::{
-    AgentDef, AgentMode, ExecutionKind, ModelCapability, ModelLocality, ModelSlot, VnextAgentDef,
+    AgentDef, AgentMode, ModelCapability, ModelLocality, ModelSlot, VnextAgentDef,
 };
+#[cfg(test)]
+use crate::agents::ExecutionKind;
 use crate::db::Db;
 use crate::db::assistants::AssistantRow;
 use crate::wizard::{

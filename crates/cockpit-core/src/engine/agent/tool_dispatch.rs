@@ -8,8 +8,6 @@
 
 use std::sync::Arc;
 
-use anyhow::Context as _;
-
 use super::*;
 
 /// Dispatch-time capability boundary for a cache-reusing fork or fenced
@@ -1700,21 +1698,14 @@ async fn execute_ordinary_call_unscoped(
         match verification {
             DispatchVerificationOutcome::Block {
                 message,
-                operation_id,
+                operation_id: _,
             } => {
+                // A verification Block is a deterministic refusal, not an
+                // approval boundary: it raises no interrupt and parks no
+                // payload, so there is no durable continuation to memoize.
+                // The model receives the rejected tool result and must
+                // revise and re-emit under a fresh call id.
                 verification_blocked = true;
-                if let Some(operation_id) = operation_id {
-                    payload.verification =
-                        Some(crate::db::needs_attention::InterruptVerificationMemo {
-                            operation_id,
-                            dispatch_attempt_revision: -1,
-                            outcome:
-                                crate::db::needs_attention::InterruptVerificationOutcome::Block {
-                                    message: message.clone(),
-                                },
-                            goal_skeptics: 0,
-                        });
-                }
                 (Err(invalid_input(message)), 0)
             }
             DispatchVerificationOutcome::Revise {
@@ -1850,15 +1841,11 @@ async fn execute_ordinary_call_unscoped(
                             verification_blocked = true;
                             let message = "verification produced a revision, but this provider-signed assistant turn cannot be rewritten safely; revise and re-emit"
                                 .to_string();
-                            payload.verification =
-                                Some(crate::db::needs_attention::InterruptVerificationMemo {
-                                    operation_id,
-                                    dispatch_attempt_revision: -1,
-                                    outcome: crate::db::needs_attention::InterruptVerificationOutcome::Block {
-                                        message: message.clone(),
-                                    },
-                                    goal_skeptics: 0,
-                                });
+                            // Refusing the rewrite is a deterministic block,
+                            // not a parked approval: no interrupt is raised
+                            // and `payload` is never moved into a park scope
+                            // here, so recording a Block memo would be dead
+                            // state the replay path could never consume.
                             (Err(invalid_input(message)), 0)
                         } else {
                             args = authorized_args;
@@ -2097,10 +2084,6 @@ async fn execute_ordinary_call_unscoped(
     // event omits the `sandbox` key. Never model-facing (token economy).
     let sandbox_meta = match &result {
         Ok(out) => out.sandbox.clone(),
-        Err(_) => None,
-    };
-    let resource_meta = match &result {
-        Ok(out) => out.resource.clone(),
         Err(_) => None,
     };
     // Part (c): `bash`'s authoritative exit code for the tool_call event.

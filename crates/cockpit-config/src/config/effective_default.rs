@@ -21,7 +21,7 @@
 //! driver's own Ctrl+Enter transaction). A reader without session authority
 //! must neither compensate nor delete such a journal — it *masks* the layer
 //! instead, serving the recorded prior bytes so a fresh client never observes
-//! a half-committed default. See [`masked_layer_bytes`].
+//! a half-committed default. See [`masked_layers`].
 //!
 //! # Durability ordering
 //!
@@ -2252,7 +2252,7 @@ pub(crate) fn project_retained_effective_default_bytes(
 /// read. A journal with a session participant is only *processed* when
 /// `sessions` supplies durable session authority; without it the journal is
 /// left completely untouched (no compensation, no deletion) and the layer is
-/// masked by [`masked_layer_bytes`] instead.
+/// masked by [`masked_layers`] instead.
 pub fn recover_effective_default_journal(
     config_path: &Path,
     recovery: JournalRecovery<'_, '_>,
@@ -2585,23 +2585,12 @@ fn sweep_captured_orphans_locked(target: &CapturedEffectiveDefaultTarget) {
     }
 }
 
-/// Layers whose pending journal must be masked on read.
-///
 /// A session-bearing journal cannot be finished without daemon session
 /// authority, so a plain config read must not observe whichever half is
-/// already published. This returns the recorded **prior** bytes for those
-/// layers — the only value both authorities are known to have agreed on.
+/// already published. [`masked_layers`] returns the recorded **prior** bytes
+/// for those layers — the only value both authorities are known to have agreed
+/// on — plus the layers that could not be masked and must fail closed.
 /// Config-only journals are never masked: ordinary recovery finishes them.
-pub(crate) fn masked_layer_bytes(paths: &[PathBuf]) -> HashMap<PathBuf, Vec<u8>> {
-    masked_layers(paths).0
-}
-
-/// Masks plus the layers that have a pending journal which could **not** be
-/// masked (unreadable record, missing or mismatched snapshot).
-///
-/// An unmaskable pending layer must never be merged live: after a crash at or
-/// after the replacement its bytes may already hold the target, and serving
-/// them would expose a half-committed default. Callers fail closed instead.
 pub(crate) fn masked_layers(paths: &[PathBuf]) -> (HashMap<PathBuf, Vec<u8>>, Vec<PathBuf>) {
     let mut masks = HashMap::new();
     let mut unmaskable = Vec::new();

@@ -1976,8 +1976,6 @@ enum PrivateWritePublish {
 
 #[cfg(unix)]
 fn write_private_file_unix(path: &Path, bytes: &[u8], publish: PrivateWritePublish) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-
     let dir = atomic_write_dir(path);
     let final_name = path.file_name().ok_or_else(|| {
         anyhow::anyhow!(

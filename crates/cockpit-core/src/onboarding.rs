@@ -338,10 +338,7 @@ impl OnboardingAuthority {
         project(row, host_capabilities, None)
     }
 
-    pub async fn mark_ready_construction_recovered(
-        &self,
-        host_capabilities: HostCapabilitySnapshot,
-    ) -> Result<()> {
+    pub async fn mark_ready_construction_recovered(&self) -> Result<()> {
         let current = self
             .db
             .onboarding_snapshot()

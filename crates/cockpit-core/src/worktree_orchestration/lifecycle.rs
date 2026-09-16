@@ -149,7 +149,6 @@ pub async fn cleanup_managed_worktree(
             {
                 LeaseCasOutcome::Transitioned(updated) => {
                     revision = updated.revision;
-                    row = updated;
                 }
                 LeaseCasOutcome::AlreadyTerminal(updated) => {
                     return Ok(CleanupOutcome::Cleaned(updated));

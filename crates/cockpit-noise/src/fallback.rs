@@ -44,6 +44,58 @@ pub struct FallbackOuterRecordV1 {
     pub ciphertext: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ValidatedFallbackOuterHeader {
+    route_generation: u64,
+    direction: FallbackDirection,
+    record_sequence: u64,
+    peer_seen_through: u64,
+    ciphertext_len: usize,
+}
+
+fn validate_outer_header(bytes: &[u8]) -> Result<ValidatedFallbackOuterHeader> {
+    if bytes.len() < FALLBACK_OUTER_HEADER_LEN
+        || bytes.len() > FALLBACK_MAX_MESSAGE
+        || bytes[0] != 1
+    {
+        return Err(NoiseError::InvalidFallback);
+    }
+    let ciphertext_len = usize::from(u16::from_be_bytes(
+        bytes[26..28]
+            .try_into()
+            .map_err(|_| NoiseError::InvalidFallback)?,
+    ));
+    if !(FALLBACK_MIN_CIPHERTEXT..=FALLBACK_MAX_CIPHERTEXT).contains(&ciphertext_len)
+        || bytes.len() != FALLBACK_OUTER_HEADER_LEN + ciphertext_len
+    {
+        return Err(NoiseError::InvalidFallback);
+    }
+    let route_generation = u64::from_be_bytes(
+        bytes[1..9]
+            .try_into()
+            .map_err(|_| NoiseError::InvalidFallback)?,
+    );
+    let record_sequence = u64::from_be_bytes(
+        bytes[10..18]
+            .try_into()
+            .map_err(|_| NoiseError::InvalidFallback)?,
+    );
+    if route_generation == 0 || record_sequence >= FALLBACK_SEQUENCE_LIMIT {
+        return Err(NoiseError::InvalidFallback);
+    }
+    Ok(ValidatedFallbackOuterHeader {
+        route_generation,
+        direction: bytes[9].try_into()?,
+        record_sequence,
+        peer_seen_through: u64::from_be_bytes(
+            bytes[18..26]
+                .try_into()
+                .map_err(|_| NoiseError::InvalidFallback)?,
+        ),
+        ciphertext_len,
+    })
+}
+
 impl FallbackOuterRecordV1 {
     pub fn encode(&self) -> Result<Vec<u8>> {
         if self.route_generation == 0
@@ -67,44 +119,12 @@ impl FallbackOuterRecordV1 {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < FALLBACK_OUTER_HEADER_LEN
-            || bytes.len() > FALLBACK_MAX_MESSAGE
-            || bytes[0] != 1
-        {
-            return Err(NoiseError::InvalidFallback);
-        }
-        let length = usize::from(u16::from_be_bytes(
-            bytes[26..28]
-                .try_into()
-                .map_err(|_| NoiseError::InvalidFallback)?,
-        ));
-        if !(FALLBACK_MIN_CIPHERTEXT..=FALLBACK_MAX_CIPHERTEXT).contains(&length)
-            || bytes.len() != FALLBACK_OUTER_HEADER_LEN + length
-        {
-            return Err(NoiseError::InvalidFallback);
-        }
-        let route_generation = u64::from_be_bytes(
-            bytes[1..9]
-                .try_into()
-                .map_err(|_| NoiseError::InvalidFallback)?,
-        );
-        let record_sequence = u64::from_be_bytes(
-            bytes[10..18]
-                .try_into()
-                .map_err(|_| NoiseError::InvalidFallback)?,
-        );
-        if route_generation == 0 || record_sequence >= FALLBACK_SEQUENCE_LIMIT {
-            return Err(NoiseError::InvalidFallback);
-        }
+        let header = validate_outer_header(bytes)?;
         Ok(Self {
-            route_generation,
-            direction: bytes[9].try_into()?,
-            record_sequence,
-            peer_seen_through: u64::from_be_bytes(
-                bytes[18..26]
-                    .try_into()
-                    .map_err(|_| NoiseError::InvalidFallback)?,
-            ),
+            route_generation: header.route_generation,
+            direction: header.direction,
+            record_sequence: header.record_sequence,
+            peer_seen_through: header.peer_seen_through,
             ciphertext: bytes[28..].to_vec(),
         })
     }
@@ -166,8 +186,11 @@ struct CachedRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReceiveDisposition {
     Buffered,
-    Duplicate { acknowledge: CumulativeAckV1 },
-    Contiguous(Vec<FallbackOuterRecordV1>),
+    Duplicate {
+        acknowledge: CumulativeAckV1,
+    },
+    /// Original, admission-validated outer-record wire bytes, in sequence order.
+    Contiguous(Vec<Vec<u8>>),
 }
 
 #[derive(Debug)]
@@ -194,9 +217,9 @@ impl FallbackReceiveWindow {
     }
 
     pub fn observe(&mut self, bytes: Vec<u8>) -> Result<ReceiveDisposition> {
-        let outer = FallbackOuterRecordV1::decode(&bytes)?;
-        let byte_cost = outer.ciphertext.len();
-        let sequence = outer.record_sequence;
+        let header = validate_outer_header(&bytes)?;
+        let byte_cost = header.ciphertext_len;
+        let sequence = header.record_sequence;
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
         if sequence < self.next_sequence {
             return match self.accepted.get(&sequence) {
@@ -240,7 +263,6 @@ impl FallbackReceiveWindow {
         let mut contiguous = Vec::new();
         while let Some(cached) = self.pending.remove(&self.next_sequence) {
             self.bytes -= cached.byte_cost;
-            let decoded = FallbackOuterRecordV1::decode(&cached.bytes)?;
             self.accepted.insert(self.next_sequence, cached.digest);
             while self.accepted.len() > FALLBACK_WINDOW_RECORDS {
                 let first = *self
@@ -255,7 +277,7 @@ impl FallbackReceiveWindow {
                 .checked_add(1)
                 .ok_or(NoiseError::SequenceExhausted)?;
             self.newly_admitted = self.newly_admitted.saturating_add(1);
-            contiguous.push(decoded);
+            contiguous.push(cached.bytes);
         }
         Ok(ReceiveDisposition::Contiguous(contiguous))
     }
@@ -494,14 +516,16 @@ mod tests {
         );
 
         let mut receive = FallbackReceiveWindow::new(0);
-        receive.observe(outer(1, 2)).unwrap();
-        let admitted = receive.observe(outer(0, 1)).unwrap();
-        assert!(
-            matches!(admitted, ReceiveDisposition::Contiguous(records) if records.iter().map(|record| record.record_sequence).collect::<Vec<_>>() == vec![0, 1])
+        let delayed = outer(1, 2);
+        let leading = outer(0, 1);
+        receive.observe(delayed.clone()).unwrap();
+        assert_eq!(
+            receive.observe(leading.clone()).unwrap(),
+            ReceiveDisposition::Contiguous(vec![leading.clone(), delayed])
         );
         assert_eq!(receive.ack().largest_contiguous, 1);
         assert!(matches!(
-            receive.observe(outer(0, 1)).unwrap(),
+            receive.observe(leading).unwrap(),
             ReceiveDisposition::Duplicate { .. }
         ));
         assert_eq!(

@@ -265,7 +265,7 @@ async fn finish_after_send(
     // its accepted/terminal facts are committed. Record it first when
     // possible; a failed write is deliberately retried below, after the
     // provider outcome is known.
-    let mut cancellation_observed = cancel.is_cancelled();
+    let cancellation_observed = cancel.is_cancelled();
     if cancellation_observed {
         let _ = record_cancellation_after_dispatch(journal, ticket, now_wall_ms).await;
     }
@@ -275,7 +275,6 @@ async fn finish_after_send(
                 .record_outcome(ticket, ExternalJournalState::Accepted, now_wall_ms)
                 .await;
             if cancel.is_cancelled() {
-                cancellation_observed = true;
                 let _ = record_cancellation_after_dispatch(journal, ticket, now_wall_ms).await;
             }
             // Do not return after a failed accepted write: an already-known

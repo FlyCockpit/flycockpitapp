@@ -8766,10 +8766,10 @@ pub(super) async fn run_worker(
                     let mut recoveries = Vec::with_capacity(descriptors.len());
                     let mut failed = false;
                     for item in descriptors {
-                        let Some(row) = state_by_label.remove(&item.label) else {
+                        if state_by_label.remove(&item.label).is_none() {
                             failed = true;
                             break;
-                        };
+                        }
                         let payload = match session
                             .db
                             .load_task_delegation_payload(&item.task_call_id, &item.label)
@@ -10956,10 +10956,6 @@ pub(super) async fn run_worker(
                     if let Err(e) = session.touch() {
                         tracing::warn!(error = %e, "session touch failed");
                     }
-                    let session_env = env_overlay
-                        .read()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone();
                     let base_redact = {
                         let snapshot = config_snapshot
                             .read()

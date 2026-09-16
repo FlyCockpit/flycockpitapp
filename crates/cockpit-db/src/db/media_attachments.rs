@@ -2750,6 +2750,7 @@ fn positive_u64(value: i64, field: &'static str) -> Result<u64> {
     u64::try_from(value).with_context(|| format!("{field} exceeds u64"))
 }
 
+#[cfg(test)]
 fn parse_decimal(value: String, field: &'static str) -> Result<u64> {
     ensure!(
         !value.is_empty()

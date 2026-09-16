@@ -2017,7 +2017,7 @@ fn profile_definition_from_loaded(
         observation.installation_id == installation.installation_id,
         "profile observation belongs to a different installation"
     );
-    let launch_target = installation
+    installation
         .source_agent_id
         .rsplit('/')
         .next()

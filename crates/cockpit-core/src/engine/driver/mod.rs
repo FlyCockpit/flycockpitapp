@@ -15423,7 +15423,7 @@ impl Driver {
                     // rendering, a trusted (self-hosted / no-log) child gets it
                     // unchanged.
                     let brief = {
-                        let (extended, providers) =
+                        let (_extended, providers) =
                             crate::engine::model_roles::load_model_role_config(&self.config);
                         let child_model = self
                             .stack
@@ -15435,7 +15435,6 @@ impl Driver {
                         crate::engine::model_roles::render_brief_for_model(
                             &providers,
                             &child_model,
-                            &extended,
                             &brief,
                         )
                     };

@@ -6,7 +6,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::sessions::*;
 use super::*;
 use crate::daemon::session_worker::{CancelOrigin, SessionWork};
 use crate::db::run_invocations::{

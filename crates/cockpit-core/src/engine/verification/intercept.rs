@@ -48,7 +48,7 @@ use super::{
         input_cost_microusd,
     },
     generate::{CollectedCandidate, CollectionInput, collect_candidates, generator_budget_text},
-    recipe::{RecipeAssemblyInput, assemble_recipe, select_guidance_for_target},
+    recipe::{RecipeAssemblyInput, assemble_recipe},
 };
 
 #[path = "generator_context.rs"]
@@ -330,16 +330,6 @@ async fn run_verification(
                 input.ctx.cwd.join(path)
             }
         });
-    let instructions = select_guidance_for_target(
-        input.session,
-        input.session.project_root.as_path(),
-        input.ctx.cwd.as_path(),
-        target.as_deref(),
-        &guidance_names,
-    )
-    .await
-    .map(|(_, body)| body)
-    .unwrap_or_default();
     let author_slot = author_slot_for_agent(input.agent);
     let generators = rule
         .generators

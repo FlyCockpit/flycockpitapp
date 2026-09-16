@@ -322,7 +322,7 @@ impl<'de> Deserialize<'de> for DaemonRelayFrame {
             .transpose()
             .map_err(serde::de::Error::custom)?;
         if let Some(kind) = unknown_kind {
-            let v = serde_json::from_value::<RelayEnvelopeVersionProbe>(value)
+            let v = serde_json::from_value::<SupportedRelayEnvelopeVersionProbe>(value)
                 .map_err(serde::de::Error::custom)?
                 .v;
             return Ok(Self::Unknown { v, kind });
@@ -487,15 +487,15 @@ pub fn parse_incoming(value: &str) -> serde_json::Result<IncomingRelayFrame> {
         .as_object()
         .is_some_and(|object| object.contains_key("type"))
     {
-        let kind = serde_json::from_value::<RelayFrameKindProbe>(parsed.clone())?.kind;
+        let kind = serde_json::from_str::<RelayFrameKindProbe>(value)?.kind;
         if kind == "system" {
             return serde_json::from_value::<SystemRelayFrame>(parsed)
                 .map(IncomingRelayFrame::System);
         }
-        let v = serde_json::from_value::<RelayEnvelopeVersionProbe>(parsed)?.v;
+        let v = serde_json::from_str::<SupportedRelayEnvelopeVersionProbe>(value)?.v;
         return Ok(IncomingRelayFrame::Unknown { v, kind });
     }
-    let v = serde_json::from_value::<RelayEnvelopeVersionProbe>(parsed.clone())?.v;
+    let v = serde_json::from_str::<RelayEnvelopeVersionProbe>(value)?.v;
     if !is_relay_envelope_version_supported(v) {
         return Ok(IncomingRelayFrame::Unknown {
             v,
@@ -549,8 +549,12 @@ where
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct RelayEnvelopeVersionProbe {
+    v: u32,
+}
+
+#[derive(Deserialize)]
+struct SupportedRelayEnvelopeVersionProbe {
     #[serde(deserialize_with = "relay_envelope_version")]
     v: u32,
 }
@@ -620,6 +624,77 @@ mod tests {
             }
             IncomingRelayFrame::System(_) => panic!("expected client frame"),
             IncomingRelayFrame::Unknown { .. } => panic!("expected client frame"),
+        }
+    }
+
+    #[test]
+    fn parse_incoming_routes_supported_client_version() {
+        let raw = json!({
+            "v": RELAY_ENVELOPE_VERSION,
+            "channelId": "ch-2",
+            "from": "client",
+            "principal": {
+                "userId": "user-2",
+                "grants": []
+            },
+            "payload": { "kind": "req" }
+        })
+        .to_string();
+
+        let frame = parse_incoming(&raw).unwrap();
+
+        assert!(matches!(
+            frame,
+            IncomingRelayFrame::Client(StampedClientRelayFrame {
+                v: RELAY_ENVELOPE_VERSION,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_incoming_routes_unsupported_client_version_to_unknown() {
+        let unsupported_version = RELAY_ENVELOPE_VERSION + 1;
+        let raw = json!({
+            "v": unsupported_version,
+            "channelId": "ch-future",
+            "from": "client",
+            "principal": {
+                "userId": "user-future",
+                "grants": []
+            },
+            "payload": { "kind": "req" }
+        })
+        .to_string();
+
+        assert_eq!(
+            parse_incoming(&raw).unwrap(),
+            IncomingRelayFrame::Unknown {
+                v: unsupported_version,
+                kind: "client".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_incoming_rejects_malformed_client_versions() {
+        for raw in [
+            r#"{
+                "channelId": "ch-missing-version",
+                "payload": {}
+            }"#,
+            r#"{
+                "v": "3",
+                "channelId": "ch-string-version",
+                "payload": {}
+            }"#,
+            r#"{
+                "v": null,
+                "channelId": "ch-null-version",
+                "payload": {}
+            }"#,
+        ] {
+            assert!(parse_incoming(raw).is_err(), "{raw}");
         }
     }
 

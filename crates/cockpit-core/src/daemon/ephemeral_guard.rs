@@ -9,13 +9,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(any(windows, test))]
+use crate::daemon::proto::Envelope;
 use anyhow::Context as _;
 use cockpit_host::daemon_lifecycle::{
     DaemonPidReceipt, DaemonPidRecord, PidIdentity, read_daemon_pid_record,
     verify_cockpit_daemon_receipt_identity,
 };
 
-use crate::daemon::proto::{Envelope, Request};
+use crate::daemon::proto::Request;
 
 #[derive(Clone)]
 struct ProcessCleanup {

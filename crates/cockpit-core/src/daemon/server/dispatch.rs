@@ -19151,7 +19151,7 @@ async fn handle_serialized_request_impl(
             Ok(Response::Ack)
         }
         Request::GetHostCapabilities => get_host_capabilities(ctx),
-        Request::RefreshHostCapabilities => refresh_host_capabilities_request(state, ctx).await,
+        Request::RefreshHostCapabilities => refresh_host_capabilities_request(state).await,
         Request::MigrateKekPlacement { dest } => migrate_kek_placement_request(ctx, dest).await,
         Request::RestartIfIdle => {
             tracing::info!("RestartIfIdle requested via client");
@@ -20901,7 +20901,7 @@ async fn handle_concurrent_request_impl(
         }),
         Request::GetHostCapabilities => get_host_capabilities(&ctx),
         Request::RefreshHostCapabilities => {
-            refresh_host_capabilities_request_shared(&shared, &ctx).await
+            refresh_host_capabilities_request_shared(&shared).await
         }
         Request::ListLeakReports {
             cursor,
@@ -21352,10 +21352,8 @@ async fn migrate_kek_placement_request(
 
 async fn refresh_host_capabilities_request(
     state: &MutableClientState,
-    ctx: &Arc<DaemonContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    refresh_host_capabilities_request_with_handle(require_attached(state)?.handle.clone(), ctx)
-        .await
+    refresh_host_capabilities_request_with_handle(require_attached(state)?.handle.clone()).await
 }
 
 /// Concurrent-dispatch counterpart for the durable host-capability refresh
@@ -21367,15 +21365,13 @@ async fn refresh_host_capabilities_request(
 /// connection's serialized loop free to receive `ResolveInterrupt`.
 async fn refresh_host_capabilities_request_shared(
     shared: &SharedClientState,
-    ctx: &Arc<DaemonContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
     let handle = require_shared_attached(shared)?.handle.clone();
-    refresh_host_capabilities_request_with_handle(handle, ctx).await
+    refresh_host_capabilities_request_with_handle(handle).await
 }
 
 async fn refresh_host_capabilities_request_with_handle(
     handle: crate::daemon::session_worker::SessionWorkerHandle,
-    ctx: &Arc<DaemonContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
     // A host-capability refresh is intentionally the only low-risk host
     // effect. The server cannot invoke it straight from this RPC: route it to
@@ -31815,7 +31811,7 @@ fn compile_owner_declared_sealed_action(
         HttpsCredentialPlacement, HttpsOriginAllowlist, SealedActionKind, SealedProjectionId,
         local_executor::{
             CommandInjection, ExecutableIdentity, FileDestination, FilePersistence,
-            FileSystemIdentity, PersistentFileApproval, SEALED_FILE_PATH_PLACEHOLDER,
+            FileSystemIdentity, PersistentFileApproval,
             SEALED_VALUE_ARG_PLACEHOLDER,
         },
     };
@@ -32405,12 +32401,6 @@ pub(super) async fn export_session_data(
                         let target = target.clone();
                         let secret_vault = ctx.secret_vault.clone();
                         let resolver = ctx.redaction_key_resolver();
-                        let env = ctx
-                            .env_baseline
-                            .read()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .vars()
-                            .clone();
                         async move {
                             let resolver = resolver.map_err(|error| anyhow::anyhow!("{error}"))?;
                             crate::session::export::build_redacted_transcript_json_bytes(
@@ -32418,7 +32408,6 @@ pub(super) async fn export_session_data(
                                 &target,
                                 &secret_vault,
                                 resolver,
-                                env,
                                 export_redactor,
                             )
                             .await

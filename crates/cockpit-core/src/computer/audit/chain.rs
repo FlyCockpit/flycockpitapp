@@ -575,7 +575,6 @@ impl ComputerAuditChain {
                 sequence,
                 head.confirmed_mac,
                 inner.current_key_version,
-                monotonic,
                 wall_unix_millis,
             );
             let entry_bytes = entry.encode();
@@ -1476,7 +1475,6 @@ fn build_prune_checkpoint_entry(
     sequence: u64,
     previous_mac: [u8; 32],
     key_version: u32,
-    monotonic_nanos: u64,
     wall_unix_millis: i64,
 ) -> ComputerAuditEntryV1 {
     let present_bits_mask = present_bits::OPERATION_ID

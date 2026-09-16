@@ -26,7 +26,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
-use super::config::{Auth, DEFAULT_PROFILE, OauthAuth, ServerConfig};
+use super::config::{Auth, OauthAuth, ServerConfig};
+#[cfg(test)]
+use super::config::DEFAULT_PROFILE;
 
 const OAUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OAUTH_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);

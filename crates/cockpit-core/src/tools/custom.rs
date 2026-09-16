@@ -20,9 +20,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 
+#[cfg(test)]
+use crate::redact::RedactionTable;
 use crate::config::extended::ToolCommandTemplate;
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, ToolOutputSidecar};
-use crate::redact::RedactionTable;
 use crate::tools::common::{
     OUTPUT_BYTE_CAP, boundary_safe_capture, boundary_safe_join, truncate_head_tail_redacted,
 };

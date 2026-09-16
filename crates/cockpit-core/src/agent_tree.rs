@@ -4692,7 +4692,7 @@ impl RedactedInterruptQuestion {
             (
                 Self::Single {
                     option_ids,
-                    allow_freetext,
+                    allow_freetext: _,
                 },
                 ResolveResponse::Single { selected_id },
             ) => {

@@ -11,10 +11,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
+#[cfg(test)]
+use super::MAX_PROCESS_STDERR_BYTES;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use super::{MAX_PROCESS_STDERR_BYTES, MAX_PROCESS_STDOUT_BYTES, ProcessSpec};
+use super::{MAX_PROCESS_STDOUT_BYTES, ProcessSpec};
 
 const PROCESS_TREE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 

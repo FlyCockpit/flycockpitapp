@@ -9,7 +9,7 @@ use std::io::{self};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use cockpit_client::DaemonClient;
@@ -37,6 +37,11 @@ use super::envelope::{invalid_params, invalid_request, success_response};
 use super::registry::{ApprovalAck, CancelTurnError, ResolveCodeRootInterrupt};
 
 const DISCOVERY_PAGE_SIZE: u16 = 100;
+/// Durable delivery writes normally precede their associated daemon event,
+/// which lets ACP render them promptly without repeatedly reading every
+/// attachment. This remains only a recovery interval: delivery writers that
+/// do not have an event counterpart must still be observed.
+const DELIVERY_WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Wait for `initialize` before acquiring the shared socket owner. This is
 /// important: a malformed or abandoned editor launch must not create a daemon.
@@ -187,6 +192,7 @@ struct Attachment {
     capability: CodeRootAttachmentCapabilityV1,
     cursor: cockpit_proto::CodeRootReplayCursorV1,
     rendered_initial: bool,
+    delivery_poll_pending: bool,
 }
 
 struct PendingPrompt {
@@ -215,6 +221,7 @@ struct State {
 struct Peer {
     state: Arc<Mutex<State>>,
     handle: Handle,
+    next_delivery_watchdog: Instant,
     adapter: AcpAdapter<AcpLineWriter<io::Stdout>, DaemonResolve, DaemonAck, DaemonIngress>,
 }
 
@@ -237,6 +244,7 @@ impl Peer {
             ),
             state,
             handle,
+            next_delivery_watchdog: Instant::now(),
         }
     }
 
@@ -262,14 +270,8 @@ impl Peer {
     }
 
     fn drain_deliveries(&mut self) -> Result<()> {
-        let attachments: Vec<_> = self
-            .state
-            .lock()
-            .expect("ACP state")
-            .attachments
-            .iter()
-            .map(|(session_id, attachment)| (session_id.clone(), attachment.clone()))
-            .collect();
+        let watchdog_due = self.delivery_watchdog_due();
+        let attachments = self.take_delivery_poll_attachments(watchdog_due);
         for (session_id, attachment) in attachments {
             if !attachment.rendered_initial {
                 let response = self.read_attachment(
@@ -362,6 +364,49 @@ impl Peer {
             }
         }
         Ok(())
+    }
+
+    fn delivery_watchdog_due(&mut self) -> bool {
+        let now = Instant::now();
+        if now < self.next_delivery_watchdog {
+            return false;
+        }
+        self.next_delivery_watchdog = now + DELIVERY_WATCHDOG_INTERVAL;
+        true
+    }
+
+    /// Select delivery reads after an attachment's initial projection, an
+    /// event-driven wake-up, or the bounded missed-event watchdog. Clearing
+    /// the wake before I/O is safe because this single ACP loop is the only
+    /// consumer: a later daemon event is queued independently and will set it
+    /// again before its next read.
+    fn take_delivery_poll_attachments(&mut self, watchdog_due: bool) -> Vec<(String, Attachment)> {
+        self.state
+            .lock()
+            .expect("ACP state")
+            .attachments
+            .iter_mut()
+            .filter_map(|(session_id, attachment)| {
+                if attachment.rendered_initial && !attachment.delivery_poll_pending && !watchdog_due
+                {
+                    return None;
+                }
+                attachment.delivery_poll_pending = false;
+                Some((session_id.clone(), attachment.clone()))
+            })
+            .collect()
+    }
+
+    fn request_delivery_poll(&mut self, session_id: &str) {
+        if let Some(attachment) = self
+            .state
+            .lock()
+            .expect("ACP state")
+            .attachments
+            .get_mut(session_id)
+        {
+            attachment.delivery_poll_pending = true;
+        }
     }
 
     /// A failed attachment read means this peer can no longer prove the
@@ -461,6 +506,12 @@ impl Peer {
                     }
                     _ => {}
                 }
+                // `send_session_event` persists a Code-root
+                // `RootStateChanged` delivery before forwarding the associated
+                // session event. Treat the event as a prompt read hint, not a
+                // delivery-completeness guarantee: the watchdog below remains
+                // responsible for delivery writers without an event.
+                self.request_delivery_poll(&session_id);
             }
         }
         Ok(())
@@ -671,6 +722,9 @@ impl DaemonIngress {
                 capability: attachment.attachment_capability,
                 cursor: attachment.replay_cursor,
                 rendered_initial: false,
+                // Initial history and any post-attach durable delivery must
+                // be rendered without waiting for a future daemon event.
+                delivery_poll_pending: true,
             },
         );
     }
@@ -1085,12 +1139,26 @@ mod tests {
         DaemonClient::from_in_process(InProcessConnection { requests, events })
     }
 
+    fn event_client() -> (
+        DaemonClient,
+        tokio::sync::mpsc::Sender<cockpit_proto::Event>,
+    ) {
+        let (requests, request_receiver) = tokio::sync::mpsc::channel(1);
+        drop(request_receiver);
+        let (event_sender, events) = tokio::sync::mpsc::channel(1);
+        (
+            DaemonClient::from_in_process(InProcessConnection { requests, events }),
+            event_sender,
+        )
+    }
+
     fn attachment() -> Attachment {
         Attachment {
             client: closed_client(),
             capability: CodeRootAttachmentCapabilityV1::from_daemon_random(Uuid::new_v4()),
             cursor: cockpit_proto::CodeRootReplayCursorV1::from_daemon_random(Uuid::new_v4()),
             rendered_initial: false,
+            delivery_poll_pending: false,
         }
     }
 
@@ -1147,6 +1215,99 @@ mod tests {
                 .expect("ACP state")
                 .attachments
                 .contains_key("root")
+        );
+    }
+
+    #[test]
+    fn daemon_event_wakes_delivery_read_for_its_attachment() {
+        let (_runtime, mut peer) = peer();
+        let (client, event_sender) = event_client();
+        let root_id = Uuid::new_v4();
+        let root = root_id.to_string();
+        let mut root_attachment = attachment();
+        root_attachment.client = client;
+        root_attachment.rendered_initial = true;
+        peer.state
+            .lock()
+            .expect("ACP state")
+            .attachments
+            .insert(root.clone(), root_attachment);
+        let (unrelated_client, _unrelated_event_sender) = event_client();
+        let mut unrelated_attachment = attachment();
+        unrelated_attachment.client = unrelated_client;
+        unrelated_attachment.rendered_initial = true;
+        peer.state
+            .lock()
+            .expect("ACP state")
+            .attachments
+            .insert("unrelated-root".to_string(), unrelated_attachment);
+        event_sender
+            .try_send(cockpit_proto::Event::Notice {
+                session_id: root_id,
+                text: "delivery wake".to_string(),
+            })
+            .expect("queue daemon event");
+
+        peer.drain_turn_events().expect("drain daemon event");
+
+        let attachments = peer.take_delivery_poll_attachments(false);
+        assert_eq!(
+            attachments
+                .iter()
+                .map(|(session_id, _)| session_id.as_str())
+                .collect::<Vec<_>>(),
+            [root.as_str()]
+        );
+        assert!(
+            !peer
+                .state
+                .lock()
+                .expect("ACP state")
+                .attachments
+                .get(&root)
+                .expect("live attachment")
+                .delivery_poll_pending
+        );
+    }
+
+    #[test]
+    fn delivery_watchdog_polls_without_a_daemon_event() {
+        let (_runtime, mut peer) = peer();
+        let mut attachment = attachment();
+        attachment.rendered_initial = true;
+        peer.state
+            .lock()
+            .expect("ACP state")
+            .attachments
+            .insert("root".to_string(), attachment);
+
+        assert!(peer.take_delivery_poll_attachments(false).is_empty());
+        peer.next_delivery_watchdog = Instant::now();
+        assert!(peer.delivery_watchdog_due());
+        assert_eq!(
+            peer.take_delivery_poll_attachments(true)
+                .iter()
+                .map(|(session_id, _)| session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["root"]
+        );
+    }
+
+    #[test]
+    fn initial_history_rendering_does_not_wait_for_an_event_or_watchdog() {
+        let (_runtime, mut peer) = peer();
+        peer.state
+            .lock()
+            .expect("ACP state")
+            .attachments
+            .insert("root".to_string(), attachment());
+
+        assert_eq!(
+            peer.take_delivery_poll_attachments(false)
+                .iter()
+                .map(|(session_id, _)| session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["root"]
         );
     }
 }

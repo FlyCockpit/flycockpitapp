@@ -2133,18 +2133,6 @@ fn validate_provenance(
         .ok_or_else(|| anyhow!("text artifact provenance must be an object"))
 }
 
-fn only_provenance_keys(
-    provenance: &serde_json::Map<String, serde_json::Value>,
-    expected: &[&str],
-) -> Result<()> {
-    ensure!(
-        provenance.len() == expected.len()
-            && expected.iter().all(|key| provenance.contains_key(*key)),
-        "text artifact provenance has an invalid shape"
-    );
-    Ok(())
-}
-
 fn bounded_provenance_text(
     provenance: &serde_json::Map<String, serde_json::Value>,
     key: &str,

@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use quick_xml::Reader;
+use quick_xml::XmlVersion;
 use quick_xml::events::{BytesStart, Event};
 
 use super::{
@@ -242,9 +243,16 @@ fn verify_start(
     let mut object_bbox = inherited_object_bbox;
     for attribute in event.attributes().with_checks(true) {
         let attribute = attribute.map_err(|_| error("attribute"))?;
+        // The canonical serializer never writes literal XML whitespace to
+        // attributes: list-like values are joined with spaces and every other
+        // allowed attribute value is a canonical token. Reject it before
+        // quick-xml's XML attribute normalization could turn it into a space.
+        if attribute.value.as_ref().contains(&b'\t') || attribute.value.as_ref().contains(&b'\n') {
+            return fail(SvgSanitizeCode::StructuralVerify, "attribute-whitespace");
+        }
         let name = std::str::from_utf8(attribute.key.as_ref()).map_err(|_| error("attribute"))?;
         let value = attribute
-            .decode_and_unescape_value(reader.decoder())
+            .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
             .map_err(|_| error("attribute"))?;
         object_bbox |= match (kind, name) {
             (Kind::ClipPath, "clipPathUnits") => value == "objectBoundingBox",
@@ -275,7 +283,7 @@ fn verify_start(
             return fail(SvgSanitizeCode::StructuralVerify, "attribute-bytes");
         }
         let value = attribute
-            .decode_and_unescape_value(reader.decoder())
+            .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
             .map_err(|_| error("attribute"))?;
         if key == b"xmlns" {
             if kind != Kind::Svg || saw_xmlns || value.as_ref() != SVG_NS {

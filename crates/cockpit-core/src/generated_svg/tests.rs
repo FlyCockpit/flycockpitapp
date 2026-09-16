@@ -414,6 +414,30 @@ fn generated_svg_independent_verifier_rejects_adversarial_canonical_mutations() 
 }
 
 #[test]
+fn generated_svg_independent_verifier_rejects_literal_attribute_whitespace() {
+    let canonical = format!(r#"<svg xmlns="{SVG_NS}" viewBox="0 0 10 10"/>"#);
+    assert!(super::verify::verify_canonical_svg(canonical.as_bytes()).is_ok());
+    let entity_encoded =
+        format!(r#"<svg xmlns="{SVG_NS}" viewBox="&#48; &#48; &#49;&#48; &#49;&#48;"/>"#);
+    assert!(super::verify::verify_canonical_svg(entity_encoded.as_bytes()).is_ok());
+
+    for whitespace in ['\t', '\n'] {
+        let mutation = format!(r#"<svg xmlns="{SVG_NS}" viewBox="0{whitespace}0 10 10"/>"#);
+        assert_eq!(
+            sanitize_generated_svg(mutation.as_bytes())
+                .unwrap()
+                .as_bytes(),
+            canonical.as_bytes(),
+            "{mutation:?}"
+        );
+        assert!(
+            super::verify::verify_canonical_svg(mutation.as_bytes()).is_err(),
+            "{mutation:?}"
+        );
+    }
+}
+
+#[test]
 fn generated_svg_defense_disagreement_is_never_projected_away() {
     let raw = format!(r##"<svg xmlns="{SVG_NS}"><title xml:space="preserve">x</title></svg>"##);
     assert_eq!(

@@ -515,6 +515,24 @@ impl HermeticCockpit {
     ) -> Self {
         let home = IsolatedHome::new();
         home.write_local_provider_config(DUMMY_PROVIDER_URL);
+        Self::from_parts(home, profile, inherited)
+    }
+
+    /// Cold-launch variant of [`Self::prepare`]: a genuinely new
+    /// installation ([`IsolatedHome::new_fresh`]) with no database, no
+    /// onboarding authority, and no provider config. Scenarios built on
+    /// this state must let the PTY child's TUI spawn its own daemon and
+    /// present first-run onboarding instead of a ready composer.
+    pub fn prepare_fresh(profile: HermeticProfile) -> Self {
+        let home = IsolatedHome::new_fresh();
+        Self::from_parts(home, profile, InheritedEnvironmentModel::poison_sentinels())
+    }
+
+    fn from_parts(
+        home: IsolatedHome,
+        profile: HermeticProfile,
+        inherited: InheritedEnvironmentModel,
+    ) -> Self {
         let executable = absolute_cargo_bin();
         let spec = HermeticLaunchSpec::from_home(&home, executable, profile);
         Self {
@@ -685,6 +703,28 @@ impl HermeticCockpit {
             self.daemon_pid = self.pid_from_file();
         }
         output
+    }
+
+    /// Stop a daemon the PTY child spawned itself (cold first-run). `reap()`
+    /// only owns daemons the fixture started, and the locked bootstrap
+    /// admission matrix has no stop verb while first-run onboarding is
+    /// still open (#426 owns that fallout), so the product stop command
+    /// cannot be used here. Instead use the same receipt-verified process
+    /// stop the CLI falls back to when the socket is unreachable — never a
+    /// raw numeric signal. Idempotent: no PID metadata means nothing to do.
+    pub fn stop_child_spawned_daemon(&mut self) {
+        let paths = cockpit_core::daemon::DaemonPaths {
+            socket: self.home.socket_path(),
+            pid_file: self.home.pid_file(),
+            ephemeral: false,
+        };
+        cockpit_core::daemon::stop_with_timeout(&paths, Duration::from_secs(15))
+            .expect("receipt-verified stop of the child-spawned daemon");
+        assert!(
+            !self.socket_path().exists(),
+            "child-spawned daemon socket still exists after stop: {}",
+            self.socket_path().display()
+        );
     }
 
     fn command(&self, args: &[&str]) -> Output {

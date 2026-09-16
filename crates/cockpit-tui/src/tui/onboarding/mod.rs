@@ -49,10 +49,13 @@ pub use secure_store::SecureStoreSubmission;
 /// Frames the welcome fly-in runs for before settling on the static layout.
 pub(crate) const WELCOME_ANIMATION_FRAMES: usize = 18;
 
-/// Ordered progress chrome. Maps the daemon stage enum onto the seven
-/// user-visible checkpoints (welcome/profile share the first slot).
-const PROGRESS_STEPS: [&str; 7] = [
+/// Ordered progress chrome. Maps the daemon stage enum onto the eight
+/// user-visible checkpoints; `Profile` owns its own slot so a failed
+/// profile-engine mount can never strand the user on the Welcome "press
+/// any key" screen at a later stage (#425).
+const PROGRESS_STEPS: [&str; 8] = [
     "Welcome",
+    "Profile",
     "Secure store",
     "Provider",
     "Model",
@@ -63,13 +66,14 @@ const PROGRESS_STEPS: [&str; 7] = [
 
 fn progress_index(stage: OnboardingStage) -> usize {
     match stage {
-        OnboardingStage::Welcome | OnboardingStage::Profile => 0,
-        OnboardingStage::SecureStore => 1,
-        OnboardingStage::Provider => 2,
-        OnboardingStage::Model => 3,
-        OnboardingStage::Agent => 4,
-        OnboardingStage::Lifetime => 5,
-        OnboardingStage::Complete => 6,
+        OnboardingStage::Welcome => 0,
+        OnboardingStage::Profile => 1,
+        OnboardingStage::SecureStore => 2,
+        OnboardingStage::Provider => 3,
+        OnboardingStage::Model => 4,
+        OnboardingStage::Agent => 5,
+        OnboardingStage::Lifetime => 6,
+        OnboardingStage::Complete => 7,
     }
 }
 
@@ -396,7 +400,12 @@ impl OnboardingShell {
 
     fn native_screen_for(snapshot: &OnboardingBootstrapSnapshot) -> OnboardingScreen {
         match snapshot.stage {
-            OnboardingStage::Welcome | OnboardingStage::Profile => OnboardingScreen::Welcome,
+            // Only the authoritative Welcome stage presents the Welcome
+            // screen. `Profile` deliberately falls through to its engine
+            // screen: if the profile wizard fails to mount, the shell must
+            // still show the profile step (esc: options, back) instead of a
+            // "press any key" screen whose key handler is a no-op (#425).
+            OnboardingStage::Welcome => OnboardingScreen::Welcome,
             OnboardingStage::SecureStore => OnboardingScreen::SecureStore(Box::new(
                 SecureStoreScreen::new(snapshot.host_capabilities.clone()),
             )),
@@ -746,9 +755,9 @@ impl OnboardingShell {
                     self.open_escape_menu(engine);
                     return None;
                 }
-                // Any other key begins setup. A Welcome screen paired with a
-                // later stage (a failed profile-engine mount) must not skip
-                // that stage; only the authoritative Welcome stage advances.
+                // Any other key begins setup. Only the authoritative Welcome
+                // stage advances; a defensively mis-paired screen must never
+                // skip the stage it does not own.
                 if self.stage == OnboardingStage::Welcome {
                     return Some(OnboardingShellAction::Transition(
                         OnboardingTransitionKind::Advance,
@@ -1054,9 +1063,13 @@ impl OnboardingShell {
             if index == current {
                 style = style.add_modifier(Modifier::BOLD);
             }
-            spans.push(Span::styled(format!("{mark} {step}"), style));
+            spans.push(Span::styled(format!("{mark}{step}"), style));
             if index + 1 < PROGRESS_STEPS.len() {
-                spans.push(Span::raw("  "));
+                // The eight-step row (Profile got its own slot in #425) must
+                // stay on one line on an 80-column terminal: the marker is
+                // glued to its label and steps are single-space separated,
+                // which leaves the final "Ready" label legible.
+                spans.push(Span::raw(" "));
             }
         }
         frame.render_widget(

@@ -172,6 +172,53 @@ async fn locked_dispatch_denies_ordinary_reads_with_the_typed_error() {
     assert_eq!(denied.message, "daemon bootstrap is locked");
 }
 
+/// A locked-path handler failure must not be flattened into an opaque
+/// refusal (#425): the code stays `BootstrapLocked`, but the underlying
+/// cause rides in the message so the visible error names the real reason.
+#[tokio::test]
+async fn locked_dispatch_carries_the_handler_cause_in_the_message() {
+    let (_tmp, locked) = fresh_locked_services().await;
+    let (welcome, _) = locked
+        .onboarding
+        .begin_or_reopen(
+            BeginOrReopenOnboarding {
+                expected_revision: None,
+                client_operation_id: "begin-cause".into(),
+                reentry: false,
+            },
+            locked.host_capabilities.clone(),
+        )
+        .await
+        .expect("begin onboarding");
+
+    // An admitted verb (the stage is Welcome) whose authority check fails:
+    // the revision CAS rejects the stale client revision.
+    let denied = handle_locked_in_process_request(
+        &locked,
+        Request::ApplyOnboardingTransition(ApplyOnboardingTransition {
+            run_id: welcome.run_id,
+            attempt_id: welcome.attempt_id,
+            expected_revision: welcome.revision + 7,
+            client_operation_id: "stale-revision".into(),
+            transition: OnboardingTransitionKind::Advance,
+            settlement: None,
+        }),
+    )
+    .await
+    .expect_err("the stale revision must be rejected");
+    assert_eq!(denied.code, ErrorCode::BootstrapLocked);
+    assert!(
+        denied.message.starts_with("daemon bootstrap is locked: "),
+        "the cause must ride in the message: {}",
+        denied.message
+    );
+    assert!(
+        denied.message.contains("revision"),
+        "the cause must name the revision conflict: {}",
+        denied.message
+    );
+}
+
 /// The profile stage precedes the secure-store choice (#391), so its wizard
 /// settlement is the one ordinary config mutation that must complete while
 /// locked. The admission is scoped to exactly that: the onboarding profile

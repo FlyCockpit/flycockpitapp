@@ -3981,7 +3981,14 @@ impl App {
     }
 
     pub(super) fn structured_paste_composer_eligible(&self) -> bool {
-        !(self.btw_pane.as_ref().is_some_and(|pane| pane.focused)
+        // The full-screen onboarding shell owns every key while it is open:
+        // its Enter/Space/arrows drive stage transitions, not the composer.
+        // If those keys are intake-buffered as rapid-paste candidates they
+        // are replayed through the frozen-composer route and never reach the
+        // shell, wedging a real-terminal first run at Welcome (#425). Paste
+        // events still route through `handle_paste`'s onboarding branch.
+        !(self.onboarding_shell.is_some()
+            || self.btw_pane.as_ref().is_some_and(|pane| pane.focused)
             || (self.pane_focused && self.pane.is_some()))
             && !matches!(
                 self.overlay,

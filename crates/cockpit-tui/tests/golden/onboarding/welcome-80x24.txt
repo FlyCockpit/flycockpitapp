@@ -1,5 +1,5 @@
-┌ Cockpit setup · step 1/7 ────────────────────────────────────────────────────┐
-│◐ Welcome  ○ Secure store  ○ Provider  ○ Model  ○ Agent  ○ Lifetime  ○ Ready  │
+┌ Cockpit setup · step 1/8 ────────────────────────────────────────────────────┐
+│◐Welcome ○Profile ○Secure store ○Provider ○Model ○Agent ○Lifetime ○Ready      │
 │                                 ✈  FlyCockpit                                │
 │                                                                              │
 │A focused cockpit for coding with the models you choose.                      │

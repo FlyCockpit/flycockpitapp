@@ -28,6 +28,8 @@ mod run_noninteractive;
 #[cfg(unix)]
 mod tui_mouse_gesture_pty;
 #[cfg(unix)]
+mod tui_pty_cold_first_run;
+#[cfg(unix)]
 mod tui_pty_fixture;
 #[cfg(unix)]
 mod tui_pty_mouse;

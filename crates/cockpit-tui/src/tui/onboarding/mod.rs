@@ -47,7 +47,7 @@ use secure_store::SecureStoreScreen;
 pub use secure_store::SecureStoreSubmission;
 
 /// Frames the welcome fly-in runs for before settling on the static layout.
-const WELCOME_ANIMATION_FRAMES: usize = 18;
+pub(crate) const WELCOME_ANIMATION_FRAMES: usize = 18;
 
 /// Ordered progress chrome. Maps the daemon stage enum onto the seven
 /// user-visible checkpoints (welcome/profile share the first slot).
@@ -700,6 +700,12 @@ impl OnboardingShell {
                 screen.capabilities = capabilities.clone();
             }
         }
+    }
+
+    /// Pin the welcome fly-in frame for golden dumps.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_frame_for_golden(&mut self, frame: usize) {
+        self.frame = frame;
     }
 
     /// Advance the welcome fly-in exactly one frame. Returns whether the

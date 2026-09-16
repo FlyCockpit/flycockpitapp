@@ -65,6 +65,49 @@ Also read [AGENTS.md](AGENTS.md) — its safety and code-standard rules apply
 to human contributors as much as to coding agents. Never include secrets,
 credentials, or `.env` files in a contribution.
 
+## TUI golden screen dumps
+
+`cockpit-tui` checks full-screen renders at 80×24 and 120×40 against
+checked-in dumps under `crates/cockpit-tui/tests/golden/<area>/`. The
+harness lives in `crates/cockpit-tui/src/tui/golden.rs` (plus App
+helpers in `src/tui/app/golden.rs`); Cargo cannot host both
+`tests/golden.rs` and `tests/golden/`, so the dump directory is the
+corpus and `cargo test -p cockpit-tui golden` runs the tests. The
+harness renders through `ratatui::backend::TestBackend`, compares
+byte-for-byte, and writes a `.style.txt` sidecar (fg/bg/modifier per
+cell run) so palette changes show up in review. The visual reference
+for future UI work is [`reference/example-tui/`](reference/example-tui/README.md).
+
+### Add a dump
+
+1. Render a `ratatui` widget or the whole `App` frame with
+   `cockpit_tui::test_support::golden` (`render_widget`, `render_app`,
+   or `render_frame`).
+2. Call `assert_golden("area", "screen", width, height, &buf)` or
+   `assert_golden_sizes("area", "screen", |w, h| …)` so both review
+   sizes are captured.
+3. Run with `COCKPIT_UPDATE_GOLDEN=1` (below) to write
+   `<screen>-<WxH>.txt` and `<screen>-<WxH>.style.txt`.
+4. Commit both files. A golden change needs a screenshot-style review
+   note in the PR — the unified diff of the text dump is the evidence.
+
+The helper pins the clock (`HH:MM` stamps become `12:00`), the welcome
+frame counter, and the cloud RNG seed for `clouds::seed_with(w, h,
+entropy)` (#428). Mouse-hover is cleared unless the test calls
+`GoldenPins::allow_hover()`.
+
+### Regenerate
+
+From the repository root:
+
+```sh
+COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-tui golden
+```
+
+Only the dumps whose tests ran are rewritten. The same
+`COCKPIT_UPDATE_GOLDEN=1` convention is used by
+`crates/cockpit-proto/tests/remote_transport_fixtures.rs`.
+
 ## Security issues
 
 Do not open public issues or pull requests for security vulnerabilities. See

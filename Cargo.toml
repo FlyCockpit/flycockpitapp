@@ -16,6 +16,9 @@ members = [
     "crates/relay-protocol",
     "tools/tuf-release",
 ]
+exclude = [
+    "reference/example-tui",
+]
 resolver = "3"
 
 # Shared dependency specs: every dependency used by two or more workspace

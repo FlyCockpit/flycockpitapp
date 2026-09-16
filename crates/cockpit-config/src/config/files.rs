@@ -1188,8 +1188,8 @@ pub(crate) fn directory_handle_matches_path(
         };
         let named = match open_windows_directory_nofollow(path, false) {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error.into()),
+            Err(error) if root_cause_is_not_found(&error) => return Ok(false),
+            Err(error) => return Err(error),
         };
         let mut held_info = BY_HANDLE_FILE_INFORMATION::default();
         let mut named_info = BY_HANDLE_FILE_INFORMATION::default();
@@ -3533,6 +3533,9 @@ pub(crate) fn probe_directory_writable_from_retained_directory(
 /// Directory writability is not enough: an atomic rename can still replace a
 /// `0400` config file when its parent is writable. A missing leaf is allowed
 /// so first-time creation can proceed after the directory probe.
+// The retained directory is probed through the descriptor only on Unix; the
+// Windows fallback probes by pathname, so the parameter is unused there.
+#[cfg_attr(not(unix), allow(unused_variables))]
 pub(crate) fn probe_existing_leaf_writable_from_retained_directory(
     directory: &std::fs::File,
     leaf: &std::ffi::OsStr,

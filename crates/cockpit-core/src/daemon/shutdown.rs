@@ -13,10 +13,17 @@
 //! immediate force-exit. Both transitions are monotonic and idempotent, so
 //! a second signal never starts a second drain, resets the deadline, or
 //! deadlocks.
+//!
+//! Phase transitions and guidance-maintenance admission share one mutex so a
+//! pass cannot start after drain has begun. That boundary is the lock, not a
+//! racy `is_draining()` check beside the worker.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::watch;
+
+use crate::sync::lock_or_recover;
 
 /// Grace period the daemon waits for in-flight inference + tool calls to
 /// drain before it force-exits and aborts whatever is still running. Held
@@ -48,11 +55,17 @@ impl ShutdownPhase {
     }
 }
 
+struct GuidanceAdmission {
+    phase: ShutdownPhase,
+    admitted_guidance_passes: usize,
+}
+
 /// Cloneable handle to the daemon-wide shutdown state. Cheap to clone —
 /// it's a `watch` sender/receiver pair behind shared ownership.
 #[derive(Clone)]
 pub struct ShutdownSignal {
     tx: watch::Sender<ShutdownPhase>,
+    admission: Arc<Mutex<GuidanceAdmission>>,
 }
 
 impl Default for ShutdownSignal {
@@ -61,16 +74,36 @@ impl Default for ShutdownSignal {
     }
 }
 
+/// Guard for one admitted guidance-maintenance pass. Dropping it releases the
+/// admission slot. The worker holds this for the whole flush+expire pass.
+#[must_use]
+pub(crate) struct GuidanceMaintenancePass {
+    admission: Arc<Mutex<GuidanceAdmission>>,
+}
+
+impl Drop for GuidanceMaintenancePass {
+    fn drop(&mut self) {
+        let mut inner = lock_or_recover(&self.admission);
+        inner.admitted_guidance_passes = inner.admitted_guidance_passes.saturating_sub(1);
+    }
+}
+
 impl ShutdownSignal {
     /// A fresh signal in the `Running` phase.
     pub fn new() -> Self {
         let (tx, _rx) = watch::channel(ShutdownPhase::Running);
-        Self { tx }
+        Self {
+            tx,
+            admission: Arc::new(Mutex::new(GuidanceAdmission {
+                phase: ShutdownPhase::Running,
+                admitted_guidance_passes: 0,
+            })),
+        }
     }
 
     /// Current phase.
     pub fn phase(&self) -> ShutdownPhase {
-        *self.tx.borrow()
+        lock_or_recover(&self.admission).phase
     }
 
     /// Whether a drain has begun (phase is `Draining` or `Forced`). Used by
@@ -89,18 +122,17 @@ impl ShutdownSignal {
     /// never start a second drain or reset the deadline. Returns `true`
     /// only on the transition that actually started the drain — the caller
     /// uses that to run the one-and-only teardown.
+    ///
+    /// Shares the admission mutex with [`Self::admit_guidance_maintenance`],
+    /// so a pass cannot be admitted once this returns.
     pub fn begin_drain(&self) -> bool {
-        let mut started = false;
-        self.tx.send_if_modified(|phase| {
-            if *phase == ShutdownPhase::Running {
-                *phase = ShutdownPhase::Draining;
-                started = true;
-                true
-            } else {
-                false
-            }
-        });
-        started
+        let mut inner = lock_or_recover(&self.admission);
+        if inner.phase != ShutdownPhase::Running {
+            return false;
+        }
+        inner.phase = ShutdownPhase::Draining;
+        self.tx.send_replace(ShutdownPhase::Draining);
+        true
     }
 
     /// Force-exit now. Monotonic: promotes `Running`/`Draining` to `Forced`
@@ -108,14 +140,26 @@ impl ShutdownSignal {
     /// timer and by a second stop request arriving mid-drain (which
     /// shortens the wait to an immediate force-exit).
     pub fn force(&self) {
-        self.tx.send_if_modified(|phase| {
-            if *phase == ShutdownPhase::Forced {
-                false
-            } else {
-                *phase = ShutdownPhase::Forced;
-                true
-            }
-        });
+        let mut inner = lock_or_recover(&self.admission);
+        if inner.phase == ShutdownPhase::Forced {
+            return;
+        }
+        inner.phase = ShutdownPhase::Forced;
+        self.tx.send_replace(ShutdownPhase::Forced);
+    }
+
+    /// Admit one guidance-maintenance pass. Succeeds only while phase is
+    /// `Running`, under the same mutex [`Self::begin_drain`] takes. After
+    /// drain starts this returns `None` and the caller must not start a pass.
+    pub(crate) fn admit_guidance_maintenance(&self) -> Option<GuidanceMaintenancePass> {
+        let mut inner = lock_or_recover(&self.admission);
+        if inner.phase != ShutdownPhase::Running {
+            return None;
+        }
+        inner.admitted_guidance_passes = inner.admitted_guidance_passes.saturating_add(1);
+        Some(GuidanceMaintenancePass {
+            admission: Arc::clone(&self.admission),
+        })
     }
 
     /// Subscribe for phase transitions. The inference-dispatch chokepoint
@@ -123,11 +167,29 @@ impl ShutdownSignal {
     pub fn subscribe(&self) -> watch::Receiver<ShutdownPhase> {
         self.tx.subscribe()
     }
+
+    /// Resolves when the signal becomes `Forced` (or the publisher is dropped).
+    /// Drain alone does not resolve this — an already-admitted pass may finish
+    /// during normal grace.
+    pub(crate) async fn wait_until_forced(&self) {
+        let mut rx = self.subscribe();
+        loop {
+            if self.is_forced() {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Instant;
 
     #[test]
     fn begin_drain_is_monotonic_and_idempotent() {
@@ -168,5 +230,86 @@ mod tests {
         let sig = ShutdownSignal::new();
         sig.force();
         assert_eq!(sig.phase(), ShutdownPhase::Forced);
+    }
+
+    #[test]
+    fn admit_succeeds_only_while_running() {
+        let sig = ShutdownSignal::new();
+        let pass = sig
+            .admit_guidance_maintenance()
+            .expect("running daemon admits one pass");
+        drop(pass);
+
+        assert!(sig.begin_drain());
+        assert!(
+            sig.admit_guidance_maintenance().is_none(),
+            "drain must refuse new guidance-maintenance admission"
+        );
+
+        sig.force();
+        assert!(sig.admit_guidance_maintenance().is_none());
+    }
+
+    #[test]
+    fn subscribe_notifies_after_mutex_phase_change() {
+        let sig = ShutdownSignal::new();
+        let rx = sig.subscribe();
+        assert!(sig.begin_drain());
+        assert_eq!(*rx.borrow(), ShutdownPhase::Draining);
+        sig.force();
+        assert_eq!(*rx.borrow(), ShutdownPhase::Forced);
+    }
+
+    #[test]
+    fn concurrent_admits_cannot_succeed_after_drain() {
+        let sig = ShutdownSignal::new();
+        let stop = AtomicBool::new(false);
+        let post_drain_success = AtomicUsize::new(0);
+
+        thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Acquire) {
+                        let _pass = sig.admit_guidance_maintenance();
+                        thread::yield_now();
+                    }
+                    for _ in 0..200 {
+                        if sig.admit_guidance_maintenance().is_some() {
+                            post_drain_success.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                });
+            }
+            thread::yield_now();
+            assert!(sig.begin_drain());
+            stop.store(true, Ordering::Release);
+        });
+
+        assert_eq!(
+            post_drain_success.load(Ordering::SeqCst),
+            0,
+            "an admit that ran after begin_drain returned observed Running"
+        );
+        assert!(sig.admit_guidance_maintenance().is_none());
+    }
+
+    #[tokio::test]
+    async fn wait_until_forced_ignores_drain_and_returns_on_force() {
+        let sig = ShutdownSignal::new();
+        let waiting = sig.clone();
+        let wait = tokio::spawn(async move { waiting.wait_until_forced().await });
+        sig.begin_drain();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !wait.is_finished(),
+            "drain must not cancel an admitted wait"
+        );
+        sig.force();
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_millis(200), wait)
+            .await
+            .expect("forced wait should resolve promptly")
+            .expect("wait task");
+        assert!(started.elapsed() < Duration::from_millis(200));
     }
 }

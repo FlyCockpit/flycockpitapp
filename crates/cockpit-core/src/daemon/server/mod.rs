@@ -6543,9 +6543,6 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, mut listener: DaemonListen
     let mut editor_maintenance_interval = tokio::time::interval(std::time::Duration::from_secs(60));
     editor_maintenance_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     editor_maintenance_interval.tick().await;
-    let mut guidance_expiry_interval = tokio::time::interval(std::time::Duration::from_secs(1));
-    guidance_expiry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    guidance_expiry_interval.tick().await;
     // A drain may already have begun before we subscribed (begin_drain on a
     // very fast StopDaemon); break immediately if so.
     if ctx.shutdown.is_draining() {
@@ -6577,19 +6574,6 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, mut listener: DaemonListen
                 }
                 if let Err(error) = dispatch::maintain_durable_oauth_flows(&ctx).await {
                     tracing::warn!(message = %error.message, "OAuth flow maintenance failed");
-                }
-            }
-            _ = guidance_expiry_interval.tick() => {
-                let now_ms = chrono::Utc::now().timestamp_millis();
-                let mut service = ctx.guidance_proposals.lock().await;
-                if let Err(error) = service.flush_audit_outbox(now_ms).await {
-                    tracing::warn!(%error, "guidance proposal audit outbox delivery deferred");
-                }
-                let candidates = service.expired_candidates(now_ms);
-                for candidate in candidates {
-                    if let Err(error) = service.expire_candidate(&candidate, now_ms).await {
-                        tracing::warn!(%error, "guidance proposal expiry delivery deferred");
-                    }
                 }
             }
             accepted = accept_daemon_stream(&mut listener) => {
@@ -9621,6 +9605,8 @@ mod sessions_remote;
 pub(crate) mod storage;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::{disk_test_ctx, test_ctx};
 
 pub use attachments::validate_png_attachment_blocking;
 pub(crate) use dispatch::CONFIG_PUBLICATION_RPC_LOCK;

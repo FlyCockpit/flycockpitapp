@@ -7925,7 +7925,7 @@ pub(crate) fn test_ctx() -> Arc<DaemonContext> {
     test_ctx_with_config_source(stub_config_source())
 }
 
-fn disk_test_ctx(db_path: &Path, spool_path: &Path) -> Arc<DaemonContext> {
+pub(crate) fn disk_test_ctx(db_path: &Path, spool_path: &Path) -> Arc<DaemonContext> {
     let db = Db::open(db_path).expect("file-backed test db");
     let locks = Arc::new(LockManager::in_memory(db.clone()));
     let mut context = DaemonContext::new(

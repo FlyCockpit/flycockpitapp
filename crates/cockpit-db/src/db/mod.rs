@@ -18,7 +18,12 @@
 //!
 //! - `Db::write(...).await` completing means the write is committed, so a
 //!   later awaited read observes it. A read racing an unawaited write may see
-//!   the prior committed snapshot.
+//!   the prior committed snapshot. Dropping a write/transaction future after
+//!   enqueue does not dequeue the job: the writer thread still runs it, and
+//!   the cancelled caller must not report success.
+//! - File-backed enqueue never blocks the Tokio runtime. A saturated writer
+//!   queue returns [`WriterQueueSaturated`] and does not drop the caller's
+//!   durability obligation — the write never started and remains retryable.
 //! - Composing two async accessors is not atomic. Any multi-statement
 //!   invariant that must not interleave with another writer belongs in a
 //!   single [`Db::transaction`] closure.
@@ -135,6 +140,7 @@ use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::TrySendError;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::time::Duration;
 
@@ -157,11 +163,37 @@ pub fn open_default_call_count() -> usize {
 }
 
 type DbJob = Box<dyn FnOnce(&Connection) -> Result<Box<dyn Any + Send>> + Send + 'static>;
+type WriteReply = Result<Box<dyn Any + Send>>;
 
 struct WriteRequest {
     job: DbJob,
-    reply: mpsc::SyncSender<Result<Box<dyn Any + Send>>>,
+    reply: tokio::sync::oneshot::Sender<WriteReply>,
 }
+
+/// Returned when the file-backed writer queue cannot accept another job.
+///
+/// The write was not enqueued and did not run. Callers must treat this as a
+/// fail-closed retryable durability error, never as success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("db writer queue is saturated")]
+pub struct WriterQueueSaturated;
+
+/// Releases a parked writer-thread job started by [`Db::stall_writer_for_test`].
+#[cfg(any(test, feature = "test-support"))]
+pub struct WriterStallGuard {
+    release: Option<mpsc::SyncSender<()>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for WriterStallGuard {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+const WRITER_QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Debug, thiserror::Error)]
 #[error("database transaction rollback failed after {primary:#}: {rollback}")]
@@ -247,8 +279,9 @@ impl Drop for WriterInner {
 }
 
 impl Writer {
-    fn start(conn: Connection) -> Result<Self> {
-        let (tx, rx) = mpsc::sync_channel::<WriteRequest>(1024);
+    fn start_with_capacity(conn: Connection, capacity: usize) -> Result<Self> {
+        anyhow::ensure!(capacity > 0, "db writer queue capacity must be nonzero");
+        let (tx, rx) = mpsc::sync_channel::<WriteRequest>(capacity);
         let join = std::thread::Builder::new()
             .name("cockpit-db-writer".into())
             .spawn(move || -> Result<()> {
@@ -287,26 +320,78 @@ impl Writer {
         })
     }
 
-    fn submit<F, T>(&self, f: F) -> Result<mpsc::Receiver<Result<Box<dyn Any + Send>>>>
+    fn submit<F, T>(&self, f: F) -> Result<tokio::sync::oneshot::Receiver<WriteReply>>
     where
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        let (reply, rx) = mpsc::sync_channel(1);
+        let (reply, rx) = tokio::sync::oneshot::channel();
         let job: DbJob = Box::new(move |conn| {
             let value = f(conn)?;
             Ok(Box::new(value) as Box<dyn Any + Send>)
         });
-        self.inner
+        match self
+            .inner
             .tx
             .lock()
             .map_err(|_| anyhow::anyhow!("db writer mutex poisoned"))?
             .as_ref()
             .context("db writer is shut down")?
-            .send(WriteRequest { job, reply })
-            .map_err(|_| anyhow::anyhow!("db writer is shut down"))?;
-        Ok(rx)
+            .try_send(WriteRequest { job, reply })
+        {
+            Ok(()) => Ok(rx),
+            Err(TrySendError::Full(_request)) => Err(WriterQueueSaturated.into()),
+            Err(TrySendError::Disconnected(_request)) => {
+                Err(anyhow::anyhow!("db writer is shut down"))
+            }
+        }
     }
+}
+
+fn downcast_write_result<T: 'static>(boxed: Box<dyn Any + Send>) -> Result<T> {
+    boxed
+        .downcast::<T>()
+        .map(|value| *value)
+        .map_err(|_| anyhow::anyhow!("db writer returned unexpected result type"))
+}
+
+fn recv_write_reply_blocking<T: 'static>(
+    rx: tokio::sync::oneshot::Receiver<WriteReply>,
+) -> Result<T> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        // Temporary sync wrappers still run from some async tests on
+        // file-backed databases. `oneshot::Receiver::blocking_recv` panics
+        // on a runtime worker; poll the same reply without taking the
+        // runtime's park.
+        return recv_write_reply_blocking_from_runtime(rx);
+    }
+    let boxed = rx
+        .blocking_recv()
+        .map_err(|_| anyhow::anyhow!("db writer reply dropped"))??;
+    downcast_write_result(boxed)
+}
+
+fn recv_write_reply_blocking_from_runtime<T: 'static>(
+    mut rx: tokio::sync::oneshot::Receiver<WriteReply>,
+) -> Result<T> {
+    loop {
+        match rx.try_recv() {
+            Ok(result) => return downcast_write_result(result?),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                std::thread::yield_now();
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                return Err(anyhow::anyhow!("db writer reply dropped"));
+            }
+        }
+    }
+}
+
+async fn recv_write_reply<T: 'static>(rx: tokio::sync::oneshot::Receiver<WriteReply>) -> Result<T> {
+    let boxed = rx
+        .await
+        .map_err(|_| anyhow::anyhow!("db writer reply dropped"))??;
+    downcast_write_result(boxed)
 }
 
 struct ReadPool {
@@ -627,6 +712,14 @@ impl Db {
     }
 
     fn open_impl(path: &Path, daemon_owned: bool) -> Result<Self> {
+        Self::open_impl_with_writer_capacity(path, daemon_owned, WRITER_QUEUE_CAPACITY)
+    }
+
+    fn open_impl_with_writer_capacity(
+        path: &Path,
+        daemon_owned: bool,
+        writer_capacity: usize,
+    ) -> Result<Self> {
         let mut timer = files::PhaseTimer::start("Db::open");
         files::ensure_parent_dir_private(path)
             .with_context(|| format!("securing parent of {}", path.display()))?;
@@ -662,7 +755,7 @@ impl Db {
         // connection. Reopening and reapplying pragmas in a newly scheduled
         // thread adds no readiness guarantee and can indefinitely delay boot
         // under CPU contention before the daemon publishes its endpoint.
-        let writer = Writer::start(conn)?;
+        let writer = Writer::start_with_capacity(conn, writer_capacity)?;
         let db = Self {
             memory: None,
             writer: Some(writer),
@@ -677,6 +770,37 @@ impl Db {
         };
         timer.done();
         Ok(db)
+    }
+
+    /// Open a file-backed database whose writer queue holds at most
+    /// `writer_capacity` waiting jobs. Test-only: production always uses the
+    /// default capacity.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn open_with_writer_capacity_for_test(path: &Path, writer_capacity: usize) -> Result<Self> {
+        Self::open_impl_with_writer_capacity(path, false, writer_capacity)
+    }
+
+    /// Park the writer thread until the returned guard is released. Subsequent
+    /// writes enqueue (or saturate) behind this job instead of running.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn stall_writer_for_test(&self) -> Result<WriterStallGuard> {
+        let writer = self
+            .writer
+            .as_ref()
+            .context("in-memory database has no writer thread")?;
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let _reply = writer.submit(move |_conn| {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+            Ok(())
+        })?;
+        entered_rx
+            .recv()
+            .context("writer stall job did not start")?;
+        Ok(WriterStallGuard {
+            release: Some(release_tx),
+        })
     }
 
     /// In-memory database for tests and ephemeral callers; durable state
@@ -945,16 +1069,7 @@ impl Db {
         }
         if let Some(writer) = &self.writer {
             let rx = writer.submit(f)?;
-            let boxed = tokio::task::spawn_blocking(move || {
-                rx.recv()
-                    .map_err(|_| anyhow::anyhow!("db writer reply dropped"))?
-            })
-            .await
-            .context("db writer reply worker joined")??;
-            boxed
-                .downcast::<T>()
-                .map(|value| *value)
-                .map_err(|_| anyhow::anyhow!("db writer returned unexpected result type"))
+            recv_write_reply(rx).await
         } else {
             let inner = self
                 .memory
@@ -986,16 +1101,7 @@ impl Db {
         }
         if let Some(writer) = &self.writer {
             let rx = writer.submit(move |conn| run_transaction(conn, f))?;
-            let boxed = tokio::task::spawn_blocking(move || {
-                rx.recv()
-                    .map_err(|_| anyhow::anyhow!("db writer reply dropped"))?
-            })
-            .await
-            .context("db transaction reply worker joined")??;
-            boxed
-                .downcast::<T>()
-                .map(|value| *value)
-                .map_err(|_| anyhow::anyhow!("db writer returned unexpected result type"))
+            recv_write_reply(rx).await
         } else {
             let inner = self
                 .memory
@@ -1117,13 +1223,7 @@ impl Db {
         }
         if let Some(writer) = &self.writer {
             let rx = writer.submit(f)?;
-            let boxed = rx
-                .recv()
-                .map_err(|_| anyhow::anyhow!("db writer reply dropped"))??;
-            return boxed
-                .downcast::<T>()
-                .map(|value| *value)
-                .map_err(|_| anyhow::anyhow!("db writer returned unexpected result type"));
+            return recv_write_reply_blocking(rx);
         }
         let inner = self
             .memory
@@ -2714,6 +2814,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value, 7);
+    }
+
+    #[tokio::test]
+    async fn writer_submit_on_full_queue_returns_saturation_error_without_blocking() {
+        let tmp = TempDir::new().unwrap();
+        let db =
+            Db::open_with_writer_capacity_for_test(&tmp.path().join("saturated.db"), 1).unwrap();
+        let stall = db.stall_writer_for_test().expect("stall writer");
+        let queued = db
+            .writer
+            .as_ref()
+            .expect("file-backed writer")
+            .submit(|_| Ok(()))
+            .expect("one waiting job fills capacity 1");
+
+        let started = Instant::now();
+        let err = db
+            .writer
+            .as_ref()
+            .expect("file-backed writer")
+            .submit(|_| Ok(()))
+            .expect_err("full queue must fail closed");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "try_send on a full writer queue blocked: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            err.downcast_ref::<WriterQueueSaturated>().is_some(),
+            "expected WriterQueueSaturated, got {err:#}"
+        );
+
+        drop(queued);
+        drop(stall);
+    }
+
+    #[tokio::test]
+    async fn dropping_write_wait_does_not_drop_enqueued_job_or_report_success() {
+        let tmp = TempDir::new().unwrap();
+        let db = Db::open(&tmp.path().join("cancel-wait.db")).unwrap();
+        let stall = db.stall_writer_for_test().expect("stall writer");
+
+        let rx = db
+            .writer
+            .as_ref()
+            .expect("file-backed writer")
+            .submit(|conn| {
+                conn.execute_batch("CREATE TABLE dropped_wait (value INTEGER NOT NULL);")?;
+                conn.execute("INSERT INTO dropped_wait (value) VALUES (1)", [])?;
+                Ok(())
+            })
+            .expect("enqueue behind the stalled writer");
+        drop(rx);
+
+        drop(stall);
+        let value = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let found = db
+                    .read(|conn| {
+                        let exists: i64 = conn.query_row(
+                            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'dropped_wait'",
+                            [],
+                            |row| row.get(0),
+                        )?;
+                        if exists == 0 {
+                            return Ok(None);
+                        }
+                        Ok(Some(conn.query_row(
+                            "SELECT value FROM dropped_wait",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )?))
+                    })
+                    .await
+                    .unwrap();
+                if let Some(value) = found {
+                    return value;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("enqueued write must still commit after the waiter is dropped");
+        assert_eq!(value, 1);
+    }
+
+    #[tokio::test]
+    async fn stalled_writer_does_not_block_force_cancellation_of_write_wait() {
+        let tmp = TempDir::new().unwrap();
+        let db = Db::open(&tmp.path().join("stalled-cancel.db")).unwrap();
+        let stall = db.stall_writer_for_test().expect("stall writer");
+        let write = {
+            let db = db.clone();
+            tokio::spawn(async move { db.write(|_| Ok(())).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        write.abort();
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_millis(200), write)
+            .await
+            .expect("oneshot write wait must cancel while the writer is stalled")
+            .expect_err("aborted task");
+        assert!(started.elapsed() < Duration::from_millis(200));
+        drop(stall);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

@@ -52,6 +52,7 @@ pub mod effective_default_recovery;
 pub mod egress;
 pub(crate) mod ephemeral_guard;
 pub mod fs_api;
+pub(crate) mod guidance_maintenance;
 #[cfg(feature = "extended")]
 pub(crate) mod image_generation_adapters;
 #[cfg(feature = "extended")]
@@ -1920,6 +1921,9 @@ fn spawn_owned_in_process_daemon(
                         let tasks = {
                             let mut tasks = Vec::new();
                             tasks.push(server::spawn_lock_sweeper(ctx.clone()));
+                            tasks.push(
+                                guidance_maintenance::spawn_guidance_maintenance(ctx.clone()),
+                            );
                             if let Some(handle) =
                                 crate::updater::maybe_spawn_background(ctx.clone())
                             {
@@ -2741,6 +2745,11 @@ async fn run_foreground_inner_with_boot_db(
     // gone idle past the 5-minute threshold, so a hung/abandoned holder
     // can't block a waiting `read` forever.
     let mut lock_sweeper = ForegroundTask::new(server::spawn_lock_sweeper(ctx.clone()));
+    // Serialized guidance outbox/expiry worker. Admission shares the drain
+    // mutex so a pass cannot start after drain; Forced cancels an in-flight wait.
+    let mut guidance_maintenance_task = ForegroundTask::new(
+        guidance_maintenance::spawn_guidance_maintenance(ctx.clone()),
+    );
     let update_check_task =
         crate::updater::maybe_spawn_background(ctx.clone()).map(ForegroundTask::new);
     #[cfg(feature = "remote")]
@@ -2831,6 +2840,7 @@ async fn run_foreground_inner_with_boot_db(
 
     signal_task.abort_and_join().await;
     lock_sweeper.abort_and_join().await;
+    guidance_maintenance_task.abort_and_join().await;
     if let Some(mut task) = update_check_task {
         task.abort_and_join().await;
     }

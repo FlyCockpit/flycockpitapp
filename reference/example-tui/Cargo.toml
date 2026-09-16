@@ -1,0 +1,29 @@
+[package]
+name = "excoc"
+version = "0.1.0"
+edition = "2024"
+description = "Reference CLI for FlyCockpit's attach-or-spawn ephemeral daemon lifecycle"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "excoc"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.29"
+libc = "0.2"
+ratatui = "0.30"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "2"
+tokio = { version = "1", features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "signal",
+    "sync",
+    "time",
+] }

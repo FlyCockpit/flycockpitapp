@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-#[cfg(test)]
+#[cfg(any(windows, test))]
 use crate::daemon::proto::Envelope;
 use anyhow::Context as _;
 use cockpit_host::daemon_lifecycle::{

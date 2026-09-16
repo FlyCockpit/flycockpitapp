@@ -769,7 +769,7 @@ pub(crate) use helpers::daemon_no_sandbox;
 pub(crate) use helpers::{removed_primary_notice, resolve_root_agent, resolve_root_agent_conn};
 pub(crate) use lifecycle::initial_active_agent;
 #[cfg(feature = "remote")]
-pub use remote::{
+pub(crate) use remote::{
     RemoteQueueMutationReceiptV1, RemoteQueueOperation, RemoteSendDecision,
     reserve_remote_send_operation,
 };

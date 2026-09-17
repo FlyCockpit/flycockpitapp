@@ -169,7 +169,33 @@ async fn locked_dispatch_denies_ordinary_reads_with_the_typed_error() {
         .await
         .expect_err("ordinary read must stay unavailable before vault intent");
     assert_eq!(denied.code, ErrorCode::BootstrapLocked);
-    assert_eq!(denied.message, "daemon bootstrap is locked");
+    assert!(denied.message.contains("bootstrap is locked"));
+}
+
+#[tokio::test]
+async fn locked_in_process_dispatch_admits_workspace_trust_and_stop() {
+    let (tmp, locked) = fresh_locked_services().await;
+
+    let trust = handle_locked_in_process_request(
+        &locked,
+        Request::GetWorkspaceTrust {
+            project_root: tmp.path().display().to_string(),
+        },
+    )
+    .await
+    .expect("workspace trust remains readable during bootstrap");
+    assert!(matches!(trust, Response::WorkspaceTrust { mode: None, .. }));
+
+    let stopped =
+        handle_locked_in_process_request(&locked, Request::StopDaemon { grace_secs: None })
+            .await
+            .expect("locked daemon accepts stop");
+    assert!(matches!(stopped, Response::Ack));
+
+    let denied = handle_locked_in_process_request(&locked, Request::GetStorageReport)
+        .await
+        .expect_err("stop closes further locked admission");
+    assert_eq!(denied.code, ErrorCode::BootstrapLocked);
 }
 
 /// A locked-path handler failure must not be flattened into an opaque
@@ -217,6 +243,75 @@ async fn locked_dispatch_carries_the_handler_cause_in_the_message() {
         "the cause must name the revision conflict: {}",
         denied.message
     );
+}
+
+/// An acknowledged locked-mode `StopDaemon` must stop the daemon without
+/// waiting for other attached clients (the onboarding wizard) to disconnect:
+/// their handlers stay blocked in `recv`, so the locked run loop has to tear
+/// them down with the ready handoff's abort semantics. Otherwise
+/// `cockpit daemon stop`/`restart` stall waiting for the pid release until
+/// their command deadline.
+#[cfg(unix)]
+#[tokio::test]
+async fn acknowledged_locked_stop_tears_down_attached_wizard_clients() {
+    let (tmp, locked) = fresh_locked_services().await;
+    let locked = std::sync::Arc::new(locked);
+    let socket = locked.paths.socket.clone();
+
+    // Owner-class wire authentication: install launch provenance bound to
+    // this test process and persist the matching follower ticket the wire
+    // client resolves next to the socket.
+    let ticket = crate::daemon::peer_authority::mint_launch_ticket();
+    let pid = std::process::id();
+    let (uid, gid) = cockpit_host::daemon_lifecycle::read_process_credentials(pid)
+        .expect("test process uid/gid");
+    let launcher = cockpit_host::peer_cred::PeerIdentity {
+        pid,
+        uid,
+        gid,
+        process_start: cockpit_host::daemon_lifecycle::process_start_identity(pid)
+            .expect("test process start identity"),
+    };
+    locked
+        .peer_credential_registry
+        .install_launch_provenance_for_test(&ticket, launcher);
+    crate::daemon::peer_authority::persist_launch_ticket(&socket, &ticket)
+        .expect("persist locked launch ticket");
+
+    let listener = crate::daemon::bind_private_socket(&socket).expect("bind control listener");
+    let reveal = crate::daemon::leak_reveal_socket::bind_reveal_socket(&locked.paths)
+        .expect("bind leak-reveal socket");
+    let loop_locked = locked.clone();
+    let run = tokio::spawn(async move {
+        super::run_locked_until_ready(loop_locked, listener, reveal)
+            .await
+            .expect("locked run loop")
+    });
+
+    // The attached wizard: a live owner connection that never disconnects
+    // and whose server-side handler stays blocked in recv.
+    let wizard = cockpit_client::DaemonClient::connect(&socket)
+        .await
+        .expect("wizard attaches to the locked daemon");
+    let stopper = cockpit_client::DaemonClient::connect(&socket)
+        .await
+        .expect("stopper attaches to the locked daemon");
+    let response = stopper
+        .request(Request::StopDaemon { grace_secs: None })
+        .await
+        .expect("deliver locked stop over the wire")
+        .expect("locked stop is acknowledged, not refused");
+    assert!(matches!(response, Response::Ack));
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .expect("acknowledged locked stop must not wait for the wizard to disconnect")
+        .expect("locked run loop task joined");
+    assert!(matches!(outcome, super::LockedRunOutcome::Shutdown));
+    drop(wizard);
+    drop(stopper);
+    drop(locked);
+    drop(tmp);
 }
 
 /// The profile stage precedes the secure-store choice (#391), so its wizard

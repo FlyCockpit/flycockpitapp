@@ -63,33 +63,49 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             validate_grace(grace)?;
             let deadline = lifecycle_deadline.expect("stop command deadline");
             let old_pid = daemon::daemon_pid(&paths);
-            let release = daemon::capture_restart_release(&paths, old_pid);
+            let mut release = daemon::capture_restart_release(&paths, old_pid);
+            let mut stop_acknowledged = false;
             if let Ok(Ok(client)) = tokio::time::timeout(
                 remaining_command_budget(deadline),
                 DaemonClient::connect(&paths.socket),
             )
             .await
             {
-                tokio::time::timeout(
+                let stop_response = tokio::time::timeout(
                     remaining_command_budget(deadline),
-                    client.request_ok(Request::StopDaemon { grace_secs: grace }),
+                    client.request(Request::StopDaemon { grace_secs: grace }),
                 )
-                .await
-                .context("timed out delivering daemon stop within the command deadline")??;
+                .await;
+                match stop_response {
+                    Ok(Ok(Ok(_))) => stop_acknowledged = true,
+                    Ok(Ok(Err(error))) if error.code == proto::ErrorCode::BootstrapLocked => {
+                        // Locked and older locked-bootstrap daemons reject the
+                        // connected stop; the receipt-bound platform signal
+                        // below still stops them.
+                    }
+                    Ok(Ok(Err(error))) => bail!("daemon error: {error}"),
+                    // A delivery timeout or transport failure leaves the stop
+                    // unconfirmed: fall through to the platform signal instead
+                    // of failing the stop.
+                    Ok(Err(_)) | Err(_) => {}
+                }
                 drop(client);
-                if !daemon::wait_for_restart_release(
+            }
+            if stop_acknowledged {
+                if daemon::wait_for_restart_release(
                     &paths,
                     release,
                     remaining_command_budget(deadline),
                 )
                 .await
                 {
-                    bail!(
-                        "timed out waiting for the previous daemon process to exit and release its pid and socket"
-                    );
+                    println!("daemon: stopped");
+                    return Ok(());
                 }
-                println!("daemon: stopped");
-                return Ok(());
+                // The acknowledged owner never released its pid and socket:
+                // recapture the witness the release wait consumed and signal
+                // it down.
+                release = daemon::capture_restart_release(&paths, old_pid);
             }
             let stop_paths = paths.clone();
             let stop_budget = remaining_command_budget(deadline);
@@ -145,22 +161,51 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             let resume = !no_resume;
 
             if should_stop {
+                let mut stop_acknowledged = false;
                 if let Ok(Ok(client)) = tokio::time::timeout(
                     remaining_command_budget(deadline),
                     DaemonClient::connect(&paths.socket),
                 )
                 .await
                 {
-                    tokio::time::timeout(
+                    let stop_response = tokio::time::timeout(
                         remaining_command_budget(deadline),
-                        client.request_ok(Request::StopDaemon { grace_secs: grace }),
+                        client.request(Request::StopDaemon { grace_secs: grace }),
                     )
-                    .await
-                    .context(
-                        "timed out delivering daemon restart stop within the command deadline",
-                    )??;
+                    .await;
+                    match stop_response {
+                        Ok(Ok(Ok(_))) => stop_acknowledged = true,
+                        Ok(Ok(Err(error))) if error.code == proto::ErrorCode::BootstrapLocked => {
+                            // Locked and older locked-bootstrap daemons reject
+                            // the connected stop; the receipt-bound platform
+                            // signal below still stops them.
+                        }
+                        Ok(Ok(Err(error))) => bail!("daemon error: {error}"),
+                        // A delivery timeout or transport failure leaves the
+                        // stop unconfirmed: fall through to the platform
+                        // signal instead of failing the restart.
+                        Ok(Err(_)) | Err(_) => {}
+                    }
                     drop(client);
-                } else {
+                }
+                let mut released = false;
+                // The command-start witness proves the captured predecessor
+                // released. The acknowledged wait consumes it, so only that
+                // path recaptures a fresh witness for the signal fallback.
+                let mut release = Some(release);
+                if stop_acknowledged {
+                    released = daemon::wait_for_restart_release(
+                        &paths,
+                        release
+                            .take()
+                            .expect("restart release witness is consumed once"),
+                        remaining_command_budget(deadline),
+                    )
+                    .await;
+                }
+                if !released {
+                    let release = release
+                        .unwrap_or_else(|| daemon::capture_restart_release(&paths, old_pid));
                     let stop_paths = paths.clone();
                     let stop_budget = remaining_command_budget(deadline);
                     let _ = tokio::task::spawn_blocking(move || {
@@ -168,17 +213,17 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                     })
                     .await
                     .context("joining platform daemon restart stop")??;
-                }
-                let released = daemon::wait_for_restart_release(
-                    &paths,
-                    release,
-                    remaining_command_budget(deadline),
-                )
-                .await;
-                if !released {
-                    bail!(
-                        "timed out waiting for the previous daemon process to exit and release its pid and socket"
-                    );
+                    if !daemon::wait_for_restart_release(
+                        &paths,
+                        release,
+                        remaining_command_budget(deadline),
+                    )
+                    .await
+                    {
+                        bail!(
+                            "timed out waiting for the previous daemon process to exit and release its pid and socket"
+                        );
+                    }
                 }
             }
 
@@ -213,6 +258,11 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                                 Some(&versions),
                                 None,
                             )
+                        );
+                    }
+                    RunningStatusVersionRead::BootstrapLocked { protocol_version } => {
+                        println!(
+                            "daemon: running; onboarding bootstrap is in progress (protocol v{protocol_version})"
                         );
                     }
                     RunningStatusVersionRead::ProtocolMismatch => {
@@ -422,6 +472,7 @@ struct DaemonVersions {
 
 enum RunningStatusVersionRead {
     Versions(DaemonVersions),
+    BootstrapLocked { protocol_version: u32 },
     ProtocolMismatch,
     ReadFailed(String),
 }
@@ -466,6 +517,9 @@ async fn read_daemon_versions(socket: &Path) -> RunningStatusVersionRead {
             daemon_version,
             protocol_version,
         }),
+        Response::LockedBootstrapHello(hello) => RunningStatusVersionRead::BootstrapLocked {
+            protocol_version: hello.protocol_version,
+        },
         other => RunningStatusVersionRead::ReadFailed(format!(
             "unexpected daemon status response: {other:?}"
         )),

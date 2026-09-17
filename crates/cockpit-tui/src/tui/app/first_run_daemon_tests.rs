@@ -669,6 +669,11 @@ fn first_run_settles_stages_against_the_real_daemon_offline() {
                 .unwrap();
 
             let mut app = real_first_run_app(tmp.path());
+            pump_onboarding(
+                &mut app,
+                |app| app.startup_background.workspace_ready,
+                "the locked daemon workspace-trust RPC",
+            );
             advance_real_first_run_to_provider(&mut app, tmp.path());
             advance_real_first_run_from_provider_search_to_agent(&mut app);
 

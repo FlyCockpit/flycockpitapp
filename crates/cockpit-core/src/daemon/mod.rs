@@ -2726,7 +2726,7 @@ async fn run_foreground_inner_with_boot_db(
     // one client has established a transport connection, then begins the
     // normal drain immediately when the final client disconnects. This
     // deliberately has no idle timeout.
-    let lifecycle_task = if paths.ephemeral {
+    let lifecycle_task = {
         let ctx = ctx.clone();
         let reaper_ctx = ctx.clone();
         let client_presence = ctx.client_presence();
@@ -2736,8 +2736,6 @@ async fn run_foreground_inner_with_boot_db(
             })
             .await;
         })))
-    } else {
-        None
     };
 
     // Idle-lock sweeper (`read-wait-and-lock-expiry.md`): the single
@@ -2979,7 +2977,12 @@ async fn ephemeral_last_client_reaper(
                     tracing::info!("ephemeral daemon lost its final client; beginning teardown");
                     return;
                 }
-                server::EphemeralReapDecision::Persistent => return,
+                server::EphemeralReapDecision::Persistent => {
+                    if presence.changed().await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 // A detach-time snapshot may race a worker becoming live after
                 // the client receives its response. Never tear that work down;
                 // wait for it to settle before completing ephemeral teardown.

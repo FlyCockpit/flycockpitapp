@@ -4863,8 +4863,7 @@ async fn handle_locked_in_process_request(
                 })
             }
             Request::StopDaemon { .. } => {
-                locked.closing.store(true, Ordering::Release);
-                locked.client_presence.send_modify(|_| {});
+                locked.request_locked_stop();
                 Ok(Response::Ack)
             }
             Request::ApplyOnboardingTransition(request) => {
@@ -5073,6 +5072,11 @@ pub(crate) struct LockedServices {
     approved_client_executable: PathBuf,
     ready: AtomicBool,
     closing: AtomicBool,
+    /// An acknowledged locked-mode `StopDaemon`. Distinct from `closing`,
+    /// which a ready transition also sets while clients remain attached:
+    /// this flag tells the locked run loop to tear every attached client
+    /// down instead of waiting for the presence count to drain.
+    stop_requested: AtomicBool,
     inflight_mutations: AtomicUsize,
     ready_transition_inflight: AtomicBool,
     ready_handoff: StdMutex<ReadyHandoffState>,
@@ -5356,6 +5360,7 @@ impl LockedServices {
                 .context("resolving approved local client executable")?,
             ready: AtomicBool::new(false),
             closing: AtomicBool::new(false),
+            stop_requested: AtomicBool::new(false),
             inflight_mutations: AtomicUsize::new(0),
             ready_transition_inflight: AtomicBool::new(false),
             ready_handoff: StdMutex::new(ReadyHandoffState::default()),
@@ -5368,6 +5373,17 @@ impl LockedServices {
 
     fn locked_admission_denied(&self) -> bool {
         self.closing.load(Ordering::Acquire) || self.ready.load(Ordering::Acquire)
+    }
+
+    /// Record an acknowledged locked-mode `StopDaemon`. The locked run loop
+    /// must stop with the ready dispatch's teardown semantics: an attached
+    /// onboarding wizard stays blocked in `recv` and never drains the
+    /// presence count, so waiting for `count == 0` would stall the stop
+    /// until the client's command deadline.
+    fn request_locked_stop(&self) {
+        self.stop_requested.store(true, Ordering::Release);
+        self.closing.store(true, Ordering::Release);
+        self.client_presence.send_modify(|_| {});
     }
 
     fn track_client(self: &Arc<Self>) -> LockedClientGuard {
@@ -6960,8 +6976,7 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
         };
         proto_stream.send(&response).await?;
         if stop_after_response {
-            locked.closing.store(true, Ordering::Release);
-            locked.client_presence.send_modify(|_| {});
+            locked.request_locked_stop();
             break;
         }
     }
@@ -6991,8 +7006,14 @@ pub(crate) async fn run_locked_until_ready(
     let mut client_presence = locked.client_presence();
     loop {
         let observed = *client_presence.borrow_and_update();
-        if (observed.has_lifetime_client || locked.closing.load(Ordering::Acquire))
-            && observed.count == 0
+        // An acknowledged StopDaemon tears down every attached locked client
+        // — an onboarding wizard stays blocked in recv and never drains the
+        // presence count — with the same abort semantics the ready handoff
+        // uses. `closing` alone still waits for the count: a ready
+        // transition also sets it while clients remain attached.
+        if (locked.stop_requested.load(Ordering::Acquire)
+            || ((observed.has_lifetime_client || locked.closing.load(Ordering::Acquire))
+                && observed.count == 0))
             && !locked.ready_transition_inflight.load(Ordering::Acquire)
         {
             locked.closing.store(true, Ordering::Release);

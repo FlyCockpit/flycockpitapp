@@ -1723,12 +1723,14 @@ mod tests {
         };
         pin_file_destination(&mut destination).expect("pin destination");
 
-        let error = resolve_destination(&destination).expect_err("must fail closed on macOS");
-        assert!(
-            error
-                .to_string()
-                .contains("pinned sealed-file destinations are unsupported on macOS")
-        );
+        match resolve_destination(&destination) {
+            Ok(_) => panic!("must fail closed on macOS"),
+            Err(error) => assert!(
+                error
+                    .to_string()
+                    .contains("pinned sealed-file destinations are unsupported on macOS")
+            ),
+        }
     }
 
     #[test]

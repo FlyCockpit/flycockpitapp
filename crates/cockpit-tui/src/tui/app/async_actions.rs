@@ -1,5 +1,80 @@
 use super::*;
 
+/// Correlation verdict for a completed onboarding transition RPC (#425).
+///
+/// The guards run in the same order the completion dispatcher always
+/// applied them; each arm names the exact check that failed so the warn log
+/// identifies the rejecting guard with its receipt/revision context.
+pub(super) enum OnboardingTransitionCorrelation {
+    /// Every guard passed; the projection is authoritative and applies.
+    Apply,
+    /// The completion belongs to a replaced startup generation or an app
+    /// that is exiting: presentation-inert by design, logged and dropped.
+    Inert(&'static str),
+    /// A live mismatch against the current authority. The pending
+    /// transition latch must be cleared and the cause surfaced so the
+    /// stage can retry from the real checkpoint.
+    Rejected(&'static str),
+}
+
+pub(super) fn evaluate_onboarding_transition_correlation(
+    completion: &StartupOnboardingCompletion,
+    label: &str,
+    pending_request_id: Option<&str>,
+    current: Option<&cockpit_proto::OnboardingBootstrapSnapshot>,
+    startup_generation: u64,
+    exit_requested: bool,
+) -> OnboardingTransitionCorrelation {
+    use OnboardingTransitionCorrelation::{Apply, Inert, Rejected};
+    if exit_requested {
+        return Inert("app exit requested");
+    }
+    if completion.generation != startup_generation {
+        return Inert("startup generation mismatch");
+    }
+    let Some(current) = current else {
+        return Rejected("onboarding checkpoint is unavailable");
+    };
+    if current.run_id != completion.run_id {
+        return Rejected("onboarding run changed");
+    }
+    if current.attempt_id != completion.attempt_id {
+        return Rejected("onboarding attempt changed");
+    }
+    if current.revision != completion.expected_revision {
+        return Rejected("authority revision moved");
+    }
+    if pending_request_id != Some(completion.request_id.as_str()) {
+        return Rejected("pending request correlation lost");
+    }
+    if label != "onboarding.ready_retry" && completion.receipt.is_none() {
+        return Rejected("commit receipt missing");
+    }
+    if let Some(receipt) = completion.receipt.as_ref() {
+        if receipt.status != cockpit_proto::OnboardingReceiptStatus::Committed {
+            return Rejected("commit receipt is not committed");
+        }
+        if receipt.run_id != completion.run_id {
+            return Rejected("receipt run id mismatch");
+        }
+        if receipt.attempt_id != completion.attempt_id {
+            return Rejected("receipt attempt id mismatch");
+        }
+        if receipt.consumed_revision != completion.expected_revision {
+            return Rejected("receipt revision mismatch");
+        }
+        if label != "onboarding.secure_intent"
+            && completion
+                .snapshot
+                .as_ref()
+                .is_none_or(|snapshot| snapshot.last_receipt.as_ref() != Some(receipt))
+        {
+            return Rejected("snapshot receipt mismatch");
+        }
+    }
+    Apply
+}
+
 const OAUTH_BEGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 // Descriptor device-code grants can remain pending for fifteen minutes. Leave
 // a small bounded margin for the last token response and durable commit.
@@ -1230,31 +1305,76 @@ impl App {
                     .pending_startup_onboarding_operations
                     .remove(&result.id);
                 match result.payload {
-                    Ok(AsyncActionPayload::StartupOnboardingTransition(completion))
-                        if completion.generation == self.startup_background.generation
-                            && !self.exit_requested
-                            && self.onboarding_snapshot.as_ref().is_some_and(|current| {
-                                current.run_id == completion.run_id
-                                    && current.attempt_id == completion.attempt_id
-                                    && current.revision == completion.expected_revision
-                            })
-                            && pending_request_id.as_deref() == Some(&completion.request_id)
-                            && (label == "onboarding.ready_retry"
-                                || completion.receipt.is_some())
-                            && completion.receipt.as_ref().is_none_or(|receipt| {
-                                receipt.status == cockpit_proto::OnboardingReceiptStatus::Committed
-                                    && receipt.run_id == completion.run_id
-                                    && receipt.attempt_id == completion.attempt_id
-                                    && receipt.consumed_revision == completion.expected_revision
-                                    && (label == "onboarding.secure_intent"
-                                        || completion.snapshot.as_ref().is_some_and(|snapshot| {
-                                            snapshot.last_receipt.as_ref() == Some(receipt)
-                                        }))
-                            }) =>
-                    {
-                        self.apply_onboarding_bootstrap_snapshot(completion.snapshot);
+                    Ok(AsyncActionPayload::StartupOnboardingTransition(completion)) => {
+                        let verdict = evaluate_onboarding_transition_correlation(
+                            &completion,
+                            label,
+                            pending_request_id.as_deref(),
+                            self.onboarding_snapshot.as_ref(),
+                            self.startup_background.generation,
+                            self.exit_requested,
+                        );
+                        match verdict {
+                            OnboardingTransitionCorrelation::Apply => {
+                                self.apply_onboarding_bootstrap_snapshot(completion.snapshot);
+                            }
+                            OnboardingTransitionCorrelation::Inert(reason) => {
+                                tracing::warn!(
+                                    label,
+                                    reason,
+                                    completion_generation = completion.generation,
+                                    startup_generation = self.startup_background.generation,
+                                    "onboarding transition completion is presentation-inert"
+                                );
+                            }
+                            OnboardingTransitionCorrelation::Rejected(reason) => {
+                                let current = self.onboarding_snapshot.as_ref();
+                                tracing::warn!(
+                                    label,
+                                    reason,
+                                    completion_run_id = %completion.run_id,
+                                    completion_attempt_id = %completion.attempt_id,
+                                    expected_revision = completion.expected_revision,
+                                    completion_request_id = %completion.request_id,
+                                    current_run_id = ?current.map(|snapshot| snapshot.run_id),
+                                    current_attempt_id =
+                                        ?current.map(|snapshot| snapshot.attempt_id),
+                                    current_revision =
+                                        ?current.map(|snapshot| snapshot.revision),
+                                    pending_request_id = ?pending_request_id,
+                                    receipt_id = ?completion
+                                        .receipt
+                                        .as_ref()
+                                        .map(|receipt| receipt.receipt_id),
+                                    receipt_status = ?completion
+                                        .receipt
+                                        .as_ref()
+                                        .map(|receipt| receipt.status),
+                                    consumed_revision = ?completion
+                                        .receipt
+                                        .as_ref()
+                                        .map(|receipt| receipt.consumed_revision),
+                                    "onboarding transition correlation rejected"
+                                );
+                                if self.mark_startup_trace_milestone("onboarding-error") {
+                                    tracing::warn!(target: cockpit_core::startup::TARGET, event = "onboarding-error", "startup");
+                                }
+                                // A transition result that fails a live
+                                // correlation guard must not leave the shell
+                                // latched: clear the pending transition and
+                                // surface the cause so the stage can retry
+                                // from the authoritative checkpoint (#425).
+                                self.show_toast(
+                                    format!("Onboarding transition could not be applied: {reason}"),
+                                    crate::tui::app::ToastKind::Error,
+                                );
+                                if let Some(shell) = self.onboarding_shell.as_mut() {
+                                    shell.clear_pending_transition();
+                                }
+                                self.refresh_onboarding_bootstrap_snapshot();
+                            }
+                        }
                     }
-                    Ok(AsyncActionPayload::StartupOnboardingTransition(_)) => {}
                     Err(error) if !self.exit_requested && pending_request_id.is_some() => {
                         self.startup_background.retry = Some(StartupRetry::Onboarding);
                         if self.mark_startup_trace_milestone("onboarding-error") {

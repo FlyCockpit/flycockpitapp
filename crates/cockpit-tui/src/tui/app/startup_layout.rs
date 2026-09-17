@@ -603,7 +603,18 @@ impl App {
         // session-attach reducer and every project-touching path stay fenced
         // behind `workspace_ready` until that lands, so an eager attach can
         // never read a project config under the safe shell's `.` placeholder.
-        if !self.startup_background.workspace_ready {
+        //
+        // The ride-along is deferred while an onboarding run is still open:
+        // a bootstrap-locked daemon denies `GetWorkspaceTrust`, so resolving
+        // during the wizard can only produce the red "could not be resolved"
+        // toast of #426 on every cold launch. The deferral re-arms itself
+        // here the moment the authoritative snapshot reaches `Complete`
+        // (the vault exists by then, the daemon is ready, and the trust
+        // modal can actually be answered), so no path stays unfenced.
+        let onboarding_resolvable = snapshot
+            .as_ref()
+            .is_none_or(|current| current.stage == cockpit_proto::OnboardingStage::Complete);
+        if !self.startup_background.workspace_ready && onboarding_resolvable {
             self.start_workspace_resolution(snapshot.clone());
         }
         if let Some(incoming) = snapshot.as_ref()
@@ -879,9 +890,12 @@ impl App {
                 }
             }
             Err(error) => {
-                // Fail visibly: the stage has no native screen, so surface
-                // the construction failure and drop the engine.
+                // Fail visibly: surface the construction failure and drop
+                // the engine. The shell stays on the stage's own engine
+                // screen (never a collapsed Welcome screen), so Escape —
+                // Back still works and the stage remains retryable (#425).
                 self.dialog = crate::tui::settings::Dialog::None;
+                tracing::warn!(wizard_id, %error, "onboarding wizard engine mount failed");
                 self.show_toast(error, super::ToastKind::Error);
             }
         }
@@ -1246,11 +1260,11 @@ impl App {
                     transition,
                     settlement,
                 };
-                match client
+                let response = client
                     .request(cockpit_proto::Request::ApplyOnboardingTransition(request))
                     .await
-                    .map_err(|error| error.to_string())?
-                {
+                    .map_err(|error| error.to_string())?;
+                match response {
                     Ok(cockpit_proto::Response::OnboardingTransition(result)) => Ok(
                         crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
                             StartupOnboardingCompletion {
@@ -1295,6 +1309,13 @@ impl App {
                     .as_ref()
                     .is_some_and(|shell| shell.pending_transition_kind() == Some(kind));
                 if already_in_flight {
+                    tracing::warn!(
+                        ?kind,
+                        "onboarding transition intent rejected: matching transition is already pending"
+                    );
+                    // Visible, not silent: the user's key was received while
+                    // the previous transition is still settling (#425).
+                    self.show_toast("Still applying the previous step…", super::ToastKind::Info);
                     return;
                 }
                 self.request_onboarding_transition(kind, settlement);
@@ -1632,6 +1653,7 @@ impl App {
         // path shares one abandon detector.
         shell.reconcile_provider_engine(&self.dialog);
         if shell.transition_pending() {
+            tracing::warn!(stage = ?shell.stage(), pending_kind = ?shell.pending_transition_kind(), revision = snapshot.revision, "onboarding shell service rejected: transition is pending");
             return false;
         }
         match shell.stage() {

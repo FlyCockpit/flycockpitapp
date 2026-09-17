@@ -111,12 +111,23 @@ fn welcome_any_key_requests_advance_only_on_welcome_stage() {
 }
 
 #[test]
-fn welcome_screen_never_advances_a_later_stage() {
-    // A Welcome screen paired with a later stage can only happen when the
-    // profile engine failed to mount; a key there must not skip Profile.
+fn profile_stage_presents_its_own_engine_screen_and_step() {
+    // Profile is un-collapsed from Welcome (#425): the stage owns the second
+    // progress step and its engine screen, so a failed profile-engine mount
+    // can no longer strand the user on a "press any key" screen whose key
+    // handler ignores the stage.
     let mut shell = shell_at(OnboardingStage::Profile);
     let mut engine = Dialog::None;
+    assert_eq!(shell.screen_kind(), OnboardingScreenKind::Engine);
+    let rendered = render_string(&mut shell, 110, 32, &engine);
+    assert!(rendered.contains("step 2/8"), "{rendered}");
+    assert!(rendered.contains("Profile"), "{rendered}");
+    // A bare key neither advances the stage nor strands it: keys route to
+    // the (unmounted) engine and only Escape offers the escape hatch.
     assert!(shell.handle_key(key(KeyCode::Enter), &mut engine).is_none());
+    assert!(shell.handle_key(key(KeyCode::Esc), &mut engine).is_none());
+    let rendered = render_string(&mut shell, 110, 32, &engine);
+    assert!(rendered.contains("Leave setup?"), "{rendered}");
 }
 
 #[test]
@@ -858,8 +869,11 @@ fn provider_auth_engine_renders_inside_full_screen_chrome_at_narrow_and_wide_siz
         let rendered = render_string(&mut shell, width, height, &engine);
         assert!(rendered.contains("Cockpit setup"), "{rendered}");
         assert!(rendered.contains("Template: OpenAI"), "{rendered}");
-        assert!(rendered.contains("Provider"), "{rendered}");
         assert!(rendered.contains("esc: options"), "{rendered}");
+        // The progress row now carries eight steps (#425 gives Profile its
+        // own stage) with markers glued to labels, so the current step stays
+        // legible even on a 48-column terminal.
+        assert!(rendered.contains("◐Provider"), "{rendered}");
     }
 }
 

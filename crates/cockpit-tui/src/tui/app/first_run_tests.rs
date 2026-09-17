@@ -943,3 +943,188 @@ async fn onboarding_never_auto_trusts() {
     assert_eq!(app.dialog.test_page_name(), Some("workspace_trust"));
     cockpit_config::trust::clear_runtime_policy_for_tests();
 }
+
+// ── #425: silent drop sites ──────────────────────────────────────────────
+
+#[test]
+fn onboarding_shell_disables_structured_paste_intake() {
+    // Root cause of the cold-run Welcome wedge: while the full-screen shell
+    // owns every key, ordinary keystrokes must not be intake-buffered as
+    // rapid-paste candidates — the classifier replays those through the
+    // frozen-composer route and the shell never sees them.
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = App::new(Some(tmp.path()), false);
+    assert!(
+        app.structured_paste_composer_eligible(),
+        "composer owns paste intake when no shell is open"
+    );
+    set_onboarding_stage(&mut app, OnboardingStage::Welcome);
+    assert!(
+        !app.structured_paste_composer_eligible(),
+        "the onboarding shell must own its own keys"
+    );
+}
+
+#[test]
+fn duplicate_transition_intent_while_pending_is_visible_not_silent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = App::new(Some(tmp.path()), false);
+    set_onboarding_stage(&mut app, OnboardingStage::Welcome);
+
+    shell_key(&mut app, KeyCode::Char(' '));
+    assert!(
+        app.onboarding_shell
+            .as_ref()
+            .is_some_and(|shell| shell.transition_pending()),
+        "the first intent latches the in-flight transition"
+    );
+    assert_eq!(app.pending_startup_onboarding_operations.len(), 1);
+
+    shell_key(&mut app, KeyCode::Char(' '));
+    assert_eq!(
+        app.toast.as_ref().map(|toast| toast.text.as_str()),
+        Some("Still applying the previous step…"),
+        "a duplicate intent while the transition is pending must be visible"
+    );
+    assert_eq!(
+        app.pending_startup_onboarding_operations.len(),
+        1,
+        "the duplicate intent must not abort and resend the RPC"
+    );
+}
+
+#[test]
+fn transition_correlation_failure_clears_latch_and_surfaces_retryable_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = App::new(Some(tmp.path()), false);
+    set_onboarding_stage(&mut app, OnboardingStage::Welcome);
+    let snapshot = app.onboarding_snapshot.clone().expect("welcome snapshot");
+
+    shell_key(&mut app, KeyCode::Char(' '));
+    let (action_id, request_id) = app
+        .pending_startup_onboarding_operations
+        .iter()
+        .next()
+        .map(|(id, request)| (*id, request.clone()))
+        .expect("the transition RPC is pending");
+    // A corrupt receipt: every identity field correlates, but the consumed
+    // revision does not match the transition the client believes it sent.
+    let receipt = cockpit_proto::OnboardingTransitionReceipt {
+        run_id: snapshot.run_id,
+        attempt_id: snapshot.attempt_id,
+        consumed_revision: snapshot.revision + 1,
+        receipt_id: uuid::Uuid::from_u128(77),
+        status: cockpit_proto::OnboardingReceiptStatus::Committed,
+    };
+    app.apply_async_action_result(crate::tui::async_action::AsyncActionResult {
+        id: action_id,
+        kind: crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.transition"),
+        presentation_stale: false,
+        payload: Ok(
+            crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
+                super::StartupOnboardingCompletion {
+                    generation: app.startup_background.generation,
+                    run_id: snapshot.run_id,
+                    attempt_id: snapshot.attempt_id,
+                    expected_revision: snapshot.revision,
+                    request_id,
+                    receipt: Some(receipt),
+                    snapshot: None,
+                },
+            ),
+        ),
+    });
+
+    assert!(
+        !app.onboarding_shell
+            .as_ref()
+            .is_some_and(|shell| shell.transition_pending()),
+        "a rejected correlation must clear the pending-transition latch"
+    );
+    let toast = app.toast.as_ref().expect("the rejection is visible");
+    assert!(
+        toast.text.contains("receipt revision mismatch"),
+        "{}",
+        toast.text
+    );
+    assert!(
+        app.async_actions
+            .has_pending_kind(&crate::tui::async_action::AsyncActionKind::DaemonRpc(
+                "onboarding.bootstrap_refresh"
+            )),
+        "the rejection re-reads the authority so the stage can retry"
+    );
+}
+
+#[test]
+fn stale_generation_transition_completion_is_inert_not_erroring() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = App::new(Some(tmp.path()), false);
+    set_onboarding_stage(&mut app, OnboardingStage::Welcome);
+
+    shell_key(&mut app, KeyCode::Char(' '));
+    let (action_id, request_id) = app
+        .pending_startup_onboarding_operations
+        .iter()
+        .next()
+        .map(|(id, request)| (*id, request.clone()))
+        .expect("the transition RPC is pending");
+    app.apply_async_action_result(crate::tui::async_action::AsyncActionResult {
+        id: action_id,
+        kind: crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.transition"),
+        presentation_stale: false,
+        payload: Ok(
+            crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
+                super::StartupOnboardingCompletion {
+                    generation: app.startup_background.generation + 1,
+                    run_id: uuid::Uuid::from_u128(1),
+                    attempt_id: uuid::Uuid::from_u128(2),
+                    expected_revision: 0,
+                    request_id,
+                    receipt: None,
+                    snapshot: None,
+                },
+            ),
+        ),
+    });
+
+    assert!(
+        app.toast.is_none(),
+        "a replaced-generation completion is presentation-inert, not an error"
+    );
+    assert!(
+        !app.async_actions
+            .has_pending_kind(&crate::tui::async_action::AsyncActionKind::DaemonRpc(
+                "onboarding.bootstrap_refresh"
+            )),
+        "an inert completion must not trigger an authority refresh"
+    );
+}
+
+#[test]
+fn workspace_resolution_waits_for_the_onboarding_run_to_complete() {
+    // The bootstrap-locked daemon denies `GetWorkspaceTrust`; resolving it
+    // while the wizard is open can only produce the cold-run red toast.
+    // The ride-along must defer until the authoritative run completes.
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = App::new(Some(tmp.path()), false);
+    assert!(!app.startup_background.workspace_ready);
+
+    app.apply_onboarding_bootstrap_snapshot(Some(onboarding_snapshot(OnboardingStage::Welcome)));
+    let workspace_kind = crate::tui::async_action::AsyncActionKind::DaemonRpc("startup.workspace");
+    assert!(
+        !app.async_actions.has_pending_kind(&workspace_kind),
+        "no workspace RPC while the onboarding run is open"
+    );
+
+    app.apply_onboarding_bootstrap_snapshot(Some(onboarding_snapshot(OnboardingStage::Complete)));
+    assert!(
+        app.async_actions.has_pending_kind(&workspace_kind),
+        "the deferred workspace resolution starts once the run completes"
+    );
+}

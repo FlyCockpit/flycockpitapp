@@ -4764,6 +4764,26 @@ async fn apply_locked_onboarding_profile_wizard(
     })
 }
 
+/// Flatten a locked-bootstrap failure into its wire error. The code stays
+/// `BootstrapLocked`, but a handler failure with a real cause carries that
+/// cause in `message` (#425: the locked path must not erase *why* it
+/// refused). Bare admission denials — whose handlers use the fixed
+/// "bootstrap is locked" bail text — keep the plain message instead of
+/// restating themselves.
+fn locked_error_payload(error: &anyhow::Error) -> ErrorPayload {
+    const PLAIN: &str = "daemon bootstrap is locked";
+    const ADMISSION: &str = "bootstrap is locked";
+    let message = if error.to_string() == ADMISSION {
+        PLAIN.to_string()
+    } else {
+        format!("{PLAIN}: {error:#}")
+    };
+    ErrorPayload {
+        code: ErrorCode::BootstrapLocked,
+        message,
+    }
+}
+
 async fn handle_locked_in_process_request(
     locked: &LockedServices,
     request: Request,
@@ -4857,9 +4877,9 @@ async fn handle_locked_in_process_request(
         }
     }
     .await;
-    result.map_err(|_| ErrorPayload {
-        code: ErrorCode::BootstrapLocked,
-        message: "daemon bootstrap is locked".into(),
+    result.map_err(|error| {
+        tracing::warn!(%error, "locked in-process request rejected");
+        locked_error_payload(&error)
     })
 }
 
@@ -6861,13 +6881,10 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
         };
         let response = match result {
             Ok(response) => Envelope::response(id, response),
-            Err(_) => Envelope::error(
-                Some(id),
-                ErrorPayload {
-                    code: ErrorCode::BootstrapLocked,
-                    message: "daemon bootstrap is locked".into(),
-                },
-            ),
+            Err(error) => {
+                tracing::warn!(request_id = %id, %error, "locked socket request rejected");
+                Envelope::error(Some(id), locked_error_payload(&error))
+            }
         };
         proto_stream.send(&response).await?;
     }

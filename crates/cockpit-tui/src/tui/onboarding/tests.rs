@@ -1022,19 +1022,17 @@ fn action_bar_continue_advances_welcome() {
     let mut shell = shell_at(OnboardingStage::Welcome);
     shell.set_frame_for_golden(WELCOME_ANIMATION_FRAMES);
     render_string(&mut shell, 80, 24, &engine);
-    let outcome = shell.handle_mouse(click(70, 20), &mut engine);
-    // The Continue button is right-aligned on the help row; if the click
-    // misses, fall back to asserting the button is painted.
-    if outcome.action.is_none() {
-        let rendered = render_string(&mut shell, 80, 24, &engine);
-        assert!(rendered.contains("[ Continue ]"), "{rendered}");
-    } else {
-        assert!(matches!(
-            outcome.action,
-            Some(OnboardingShellAction::Transition(
-                cockpit_proto::OnboardingTransitionKind::Advance,
-                None
-            ))
-        ));
-    }
+    let continue_btn = shell.actions.rects()[0];
+    assert!(
+        continue_btn.width > 0 && continue_btn.height > 0,
+        "Continue must occupy a clickable rect after render"
+    );
+    let outcome = shell.handle_mouse(click(continue_btn.x, continue_btn.y), &mut engine);
+    assert!(matches!(
+        outcome.action,
+        Some(OnboardingShellAction::Transition(
+            cockpit_proto::OnboardingTransitionKind::Advance,
+            None
+        ))
+    ));
 }

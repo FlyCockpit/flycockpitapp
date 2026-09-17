@@ -203,6 +203,13 @@ impl ActionBar {
     pub(super) fn clicked(&self, pos: Position) -> Option<usize> {
         button_at(&self.rects, pos)
     }
+
+    /// Hit rects recorded at the last render, in button order. Empty rects
+    /// belong to disabled buttons and never match a click.
+    #[cfg(test)]
+    pub(super) fn rects(&self) -> &[Rect] {
+        &self.rects
+    }
 }
 
 #[cfg(test)]

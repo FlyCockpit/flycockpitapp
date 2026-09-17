@@ -6472,6 +6472,7 @@ async fn handle_serialized_request_impl(
             // concurrent clients follow it through the read-only refresh; a
             // fresh attempt supersedes their cached run/attempt/revision.
             broadcast_onboarding_bootstrap(ctx, &snapshot);
+            ctx.mark_onboarding_stage(snapshot.stage);
             Ok(Response::OnboardingTransition(
                 cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
             ))
@@ -6527,6 +6528,7 @@ async fn handle_serialized_request_impl(
             // authority every attached client projects; announce it so they
             // re-read instead of waiting for their own next RPC.
             broadcast_onboarding_bootstrap(ctx, &snapshot);
+            ctx.mark_onboarding_stage(snapshot.stage);
             Ok(Response::OnboardingTransition(
                 cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
             ))
@@ -20916,9 +20918,7 @@ async fn handle_concurrent_request_impl(
             schema_version: ctx.db.schema_version().await.map_err(internal)?,
         }),
         Request::GetHostCapabilities => get_host_capabilities(&ctx),
-        Request::RefreshHostCapabilities => {
-            refresh_host_capabilities_request_shared(&shared).await
-        }
+        Request::RefreshHostCapabilities => refresh_host_capabilities_request_shared(&shared).await,
         Request::ListLeakReports {
             cursor,
             limit,
@@ -31832,8 +31832,7 @@ fn compile_owner_declared_sealed_action(
         HttpsCredentialPlacement, HttpsOriginAllowlist, SealedActionKind, SealedProjectionId,
         local_executor::{
             CommandInjection, ExecutableIdentity, FileDestination, FilePersistence,
-            FileSystemIdentity, PersistentFileApproval,
-            SEALED_VALUE_ARG_PLACEHOLDER,
+            FileSystemIdentity, PersistentFileApproval, SEALED_VALUE_ARG_PLACEHOLDER,
         },
     };
 

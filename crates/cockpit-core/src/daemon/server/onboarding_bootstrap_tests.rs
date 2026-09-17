@@ -169,7 +169,33 @@ async fn locked_dispatch_denies_ordinary_reads_with_the_typed_error() {
         .await
         .expect_err("ordinary read must stay unavailable before vault intent");
     assert_eq!(denied.code, ErrorCode::BootstrapLocked);
-    assert_eq!(denied.message, "daemon bootstrap is locked");
+    assert!(denied.message.contains("bootstrap is locked"));
+}
+
+#[tokio::test]
+async fn locked_in_process_dispatch_admits_workspace_trust_and_stop() {
+    let (tmp, locked) = fresh_locked_services().await;
+
+    let trust = handle_locked_in_process_request(
+        &locked,
+        Request::GetWorkspaceTrust {
+            project_root: tmp.path().display().to_string(),
+        },
+    )
+    .await
+    .expect("workspace trust remains readable during bootstrap");
+    assert!(matches!(trust, Response::WorkspaceTrust { mode: None, .. }));
+
+    let stopped =
+        handle_locked_in_process_request(&locked, Request::StopDaemon { grace_secs: None })
+            .await
+            .expect("locked daemon accepts stop");
+    assert!(matches!(stopped, Response::Ack));
+
+    let denied = handle_locked_in_process_request(&locked, Request::GetStorageReport)
+        .await
+        .expect_err("stop closes further locked admission");
+    assert_eq!(denied.code, ErrorCode::BootstrapLocked);
 }
 
 /// A locked-path handler failure must not be flattened into an opaque

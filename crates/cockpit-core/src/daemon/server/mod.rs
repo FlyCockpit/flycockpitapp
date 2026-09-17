@@ -2781,6 +2781,10 @@ pub struct DaemonContext {
     /// while work is live; the last-client reaper consults this instead of the
     /// boot-time path marker.
     ephemeral_lifetime: AtomicBool,
+    /// First-run owners retain last-client teardown until the durable
+    /// onboarding authority reaches Complete, independent of configured
+    /// persistent lifetime.
+    onboarding_incomplete: AtomicBool,
     shutdown_grace_override: StdMutex<Option<Duration>>,
     env_baseline: Arc<std::sync::RwLock<EnvSnapshot>>,
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
@@ -2928,6 +2932,15 @@ impl DaemonContext {
     /// Whether this owner still follows last-client ephemeral teardown.
     pub(crate) fn is_ephemeral_lifetime(&self) -> bool {
         self.ephemeral_lifetime.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn needs_last_client_reaper(&self) -> bool {
+        self.is_ephemeral_lifetime() || self.onboarding_incomplete.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_onboarding_stage(&self, stage: proto::OnboardingStage) {
+        self.onboarding_incomplete
+            .store(stage != proto::OnboardingStage::Complete, Ordering::Release);
     }
 
     /// Promote this exact live owner without draining its workers. The endpoint
@@ -3238,7 +3251,7 @@ impl DaemonContext {
     /// it to a stale zero-client observation.
     pub(crate) fn reap_ephemeral_last_client(self: &Arc<Self>) -> EphemeralReapDecision {
         let _decision = crate::sync::lock_or_recover(&self.restart_decision);
-        if !self.is_ephemeral_lifetime() {
+        if !self.needs_last_client_reaper() {
             return EphemeralReapDecision::Persistent;
         }
         if self.registry.any_agent_running() {
@@ -3292,6 +3305,7 @@ impl DaemonContext {
             None,
             None,
             None,
+            false,
         )
     }
 
@@ -3305,6 +3319,7 @@ impl DaemonContext {
         boot_secret_vault: Arc<crate::secure_key::SecretVault>,
         boot_container: Arc<crate::container::ContainerManager>,
         coverage_authority: crate::redact::coverage_authority::RedactionCoverageAuthority,
+        onboarding_incomplete: bool,
     ) -> Self {
         Self::assemble(
             db,
@@ -3316,6 +3331,7 @@ impl DaemonContext {
             Some(boot_secret_vault),
             Some(boot_container),
             Some(coverage_authority),
+            onboarding_incomplete,
         )
     }
 
@@ -3331,6 +3347,7 @@ impl DaemonContext {
         boot_coverage_authority: Option<
             crate::redact::coverage_authority::RedactionCoverageAuthority,
         >,
+        onboarding_incomplete: bool,
     ) -> Self {
         let daemon_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let canonical_cwd = daemon_cwd.canonicalize().unwrap_or(daemon_cwd);
@@ -3588,6 +3605,7 @@ impl DaemonContext {
             restart_decision: StdMutex::new(()),
             exit_guard_reservation: StdMutex::new(Weak::new()),
             ephemeral_lifetime: AtomicBool::new(ephemeral_lifetime),
+            onboarding_incomplete: AtomicBool::new(onboarding_incomplete),
             shutdown_grace_override: StdMutex::new(None),
             env_baseline: Arc::new(std::sync::RwLock::new(EnvSnapshot::from_process(
                 EnvSnapshotSource::DaemonStart,
@@ -4791,7 +4809,8 @@ async fn handle_locked_in_process_request(
     if locked.locked_admission_denied() {
         return Err(ErrorPayload {
             code: ErrorCode::BootstrapLocked,
-            message: "daemon bootstrap is locked".into(),
+            message: "daemon bootstrap is locked: transition or shutdown is already in progress"
+                .into(),
         });
     }
     let result: Result<Response> = async {
@@ -4823,6 +4842,31 @@ async fn handle_locked_in_process_request(
             Request::GetOnboardingTransitionReceipt(query) => Ok(
                 Response::OnboardingTransitionReceipt(locked.onboarding.receipt(query).await?),
             ),
+            Request::GetWorkspaceTrust { project_root } => {
+                let decision = locked
+                    .db
+                    .workspace_trust_by_root(PathBuf::from(&project_root).as_path())
+                    .await?;
+                Ok(Response::WorkspaceTrust {
+                    mode: decision.map(|decision| match decision.mode {
+                        crate::db::workspace_trust::WorkspaceTrustMode::Trust => {
+                            cockpit_proto::WorkspaceTrustMode::Trust
+                        }
+                        crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig => {
+                            cockpit_proto::WorkspaceTrustMode::IgnoreConfig
+                        }
+                        crate::db::workspace_trust::WorkspaceTrustMode::Untrusted => {
+                            cockpit_proto::WorkspaceTrustMode::Untrusted
+                        }
+                    }),
+                    config_generation: inventory::current_config_generation(),
+                })
+            }
+            Request::StopDaemon { .. } => {
+                locked.closing.store(true, Ordering::Release);
+                locked.client_presence.send_modify(|_| {});
+                Ok(Response::Ack)
+            }
             Request::ApplyOnboardingTransition(request) => {
                 if !locked.begin_locked_mutation() {
                     anyhow::bail!("bootstrap is locked");
@@ -5883,6 +5927,11 @@ pub(crate) async fn boot_ready_with_db(
         .map(|table| Arc::new(table))
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     timer.phase("redaction_table");
+    let onboarding_incomplete = db
+        .onboarding_snapshot()
+        .await
+        .context("loading onboarding lifetime state")?
+        .is_some_and(|snapshot| snapshot.stage != crate::db::onboarding::OnboardingStage::Complete);
     let mut ctx = DaemonContext::new_with_boot_authority(
         db.clone(),
         locks,
@@ -5893,6 +5942,7 @@ pub(crate) async fn boot_ready_with_db(
         boot_secret_store.vault.clone(),
         boot_container,
         coverage_authority,
+        onboarding_incomplete,
     );
     ctx.secret_store_path = Some(boot_secret_store_path);
     // A capability refresh receipt is daemon-global state, not a per-session
@@ -6724,13 +6774,13 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
                         constructed.publish_stored();
                     }
                 }
-                Err(_) => {
+                Err(error) => {
                     proto_stream
                         .send(&Envelope::error(
                             Some(id),
                             ErrorPayload {
                                 code: ErrorCode::BootstrapLocked,
-                                message: "daemon bootstrap is locked".into(),
+                                message: format!("daemon bootstrap is locked: {error}"),
                             },
                         ))
                         .await?;
@@ -6738,6 +6788,7 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
             }
             continue;
         }
+        let stop_after_response = matches!(&request, Request::StopDaemon { .. });
         let result = match request {
             Request::DaemonStatus if authenticated_owner => locked_bootstrap_hello(&locked).await,
             Request::DaemonStatus => Ok(locked_bootstrap_hello_minimal()),
@@ -6828,6 +6879,27 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
             Request::GetOnboardingTransitionReceipt(query) => Ok(
                 Response::OnboardingTransitionReceipt(locked.onboarding.receipt(query).await?),
             ),
+            Request::GetWorkspaceTrust { project_root } => {
+                let decision = locked
+                    .db
+                    .workspace_trust_by_root(PathBuf::from(&project_root).as_path())
+                    .await?;
+                Ok(Response::WorkspaceTrust {
+                    mode: decision.map(|decision| match decision.mode {
+                        crate::db::workspace_trust::WorkspaceTrustMode::Trust => {
+                            cockpit_proto::WorkspaceTrustMode::Trust
+                        }
+                        crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig => {
+                            cockpit_proto::WorkspaceTrustMode::IgnoreConfig
+                        }
+                        crate::db::workspace_trust::WorkspaceTrustMode::Untrusted => {
+                            cockpit_proto::WorkspaceTrustMode::Untrusted
+                        }
+                    }),
+                    config_generation: inventory::current_config_generation(),
+                })
+            }
+            Request::StopDaemon { .. } => Ok(Response::Ack),
             Request::ApplyOnboardingTransition(request) => {
                 if !locked.begin_locked_mutation() {
                     anyhow::bail!("bootstrap is locked");
@@ -6887,6 +6959,11 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
             }
         };
         proto_stream.send(&response).await?;
+        if stop_after_response {
+            locked.closing.store(true, Ordering::Release);
+            locked.client_presence.send_modify(|_| {});
+            break;
+        }
     }
     locked
         .peer_credential_registry
@@ -6914,8 +6991,7 @@ pub(crate) async fn run_locked_until_ready(
     let mut client_presence = locked.client_presence();
     loop {
         let observed = *client_presence.borrow_and_update();
-        if locked.paths.ephemeral
-            && observed.has_lifetime_client
+        if (observed.has_lifetime_client || locked.closing.load(Ordering::Acquire))
             && observed.count == 0
             && !locked.ready_transition_inflight.load(Ordering::Acquire)
         {
@@ -6942,7 +7018,7 @@ pub(crate) async fn run_locked_until_ready(
                     ));
                 }
             }
-            changed = client_presence.changed(), if locked.paths.ephemeral => {
+            changed = client_presence.changed() => {
                 if changed.is_err() {
                     anyhow::bail!("locked client lifetime publisher closed");
                 }

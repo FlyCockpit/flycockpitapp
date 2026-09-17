@@ -147,7 +147,6 @@ fn set_onboarding_stage(app: &mut App, stage: OnboardingStage) {
         app.config_snapshot.generation = 1;
         app.config_snapshot.providers.set_resolution_generation(1);
     }
-    app.startup_background.workspace_ready = true;
     app.apply_onboarding_bootstrap_snapshot(Some(onboarding_snapshot(stage)));
 }
 

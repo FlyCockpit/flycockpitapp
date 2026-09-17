@@ -70,26 +70,36 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             )
             .await
             {
-                tokio::time::timeout(
+                let stop_response = tokio::time::timeout(
                     remaining_command_budget(deadline),
-                    client.request_ok(Request::StopDaemon { grace_secs: grace }),
+                    client.request(Request::StopDaemon { grace_secs: grace }),
                 )
                 .await
-                .context("timed out delivering daemon stop within the command deadline")??;
-                drop(client);
-                if !daemon::wait_for_restart_release(
-                    &paths,
-                    release,
-                    remaining_command_budget(deadline),
-                )
-                .await
-                {
-                    bail!(
-                        "timed out waiting for the previous daemon process to exit and release its pid and socket"
-                    );
+                .context("timed out delivering daemon stop within the command deadline")?;
+                match stop_response? {
+                    Ok(_) => {
+                        drop(client);
+                        if !daemon::wait_for_restart_release(
+                            &paths,
+                            release,
+                            remaining_command_budget(deadline),
+                        )
+                        .await
+                        {
+                            bail!(
+                                "timed out waiting for the previous daemon process to exit and release its pid and socket"
+                            );
+                        }
+                        println!("daemon: stopped");
+                        return Ok(());
+                    }
+                    Err(error) if error.code == proto::ErrorCode::BootstrapLocked => {
+                        drop(client);
+                        // Older locked-bootstrap daemons reject StopDaemon.
+                        // Fall through to the receipt-bound platform signal.
+                    }
+                    Err(error) => bail!("daemon error: {error}"),
                 }
-                println!("daemon: stopped");
-                return Ok(());
             }
             let stop_paths = paths.clone();
             let stop_budget = remaining_command_budget(deadline);
@@ -145,22 +155,29 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             let resume = !no_resume;
 
             if should_stop {
+                let mut signal_fallback = true;
                 if let Ok(Ok(client)) = tokio::time::timeout(
                     remaining_command_budget(deadline),
                     DaemonClient::connect(&paths.socket),
                 )
                 .await
                 {
-                    tokio::time::timeout(
+                    let response = tokio::time::timeout(
                         remaining_command_budget(deadline),
-                        client.request_ok(Request::StopDaemon { grace_secs: grace }),
+                        client.request(Request::StopDaemon { grace_secs: grace }),
                     )
                     .await
                     .context(
                         "timed out delivering daemon restart stop within the command deadline",
                     )??;
                     drop(client);
-                } else {
+                    match response {
+                        Ok(_) => signal_fallback = false,
+                        Err(error) if error.code == proto::ErrorCode::BootstrapLocked => {}
+                        Err(error) => bail!("daemon error: {error}"),
+                    }
+                }
+                if signal_fallback {
                     let stop_paths = paths.clone();
                     let stop_budget = remaining_command_budget(deadline);
                     let _ = tokio::task::spawn_blocking(move || {
@@ -213,6 +230,11 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                                 Some(&versions),
                                 None,
                             )
+                        );
+                    }
+                    RunningStatusVersionRead::BootstrapLocked { protocol_version } => {
+                        println!(
+                            "daemon: running; onboarding bootstrap is in progress (protocol v{protocol_version})"
                         );
                     }
                     RunningStatusVersionRead::ProtocolMismatch => {
@@ -422,6 +444,7 @@ struct DaemonVersions {
 
 enum RunningStatusVersionRead {
     Versions(DaemonVersions),
+    BootstrapLocked { protocol_version: u32 },
     ProtocolMismatch,
     ReadFailed(String),
 }
@@ -466,6 +489,9 @@ async fn read_daemon_versions(socket: &Path) -> RunningStatusVersionRead {
             daemon_version,
             protocol_version,
         }),
+        Response::LockedBootstrapHello(hello) => RunningStatusVersionRead::BootstrapLocked {
+            protocol_version: hello.protocol_version,
+        },
         other => RunningStatusVersionRead::ReadFailed(format!(
             "unexpected daemon status response: {other:?}"
         )),

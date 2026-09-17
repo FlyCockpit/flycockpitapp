@@ -529,6 +529,15 @@ impl App {
             return false;
         }
 
+        // Full-screen onboarding owns Ctrl-C / Ctrl-Shift-C (quit) and every
+        // other key while it is open, so this must sit ahead of the chat
+        // interrupt/exit chords.
+        if self.startup_modal_on_top() != Some(StartupModal::WorkspaceTrust)
+            && self.onboarding_shell.is_some()
+        {
+            return self.handle_onboarding_shell_key(key);
+        }
+
         // Ctrl+C: interrupt the running agent; exit only on a second press
         // within the 0.5s window (GOALS §3a). Routed through the
         // double-press state machine. Explicitly exclude Shift so that
@@ -797,13 +806,6 @@ impl App {
                 return self.apply_workspace_trust_choice(root, mode);
             }
             return false;
-        }
-
-        // Full-screen onboarding shell: while active it owns every key —
-        // native screens handle their own input and engine stages route to
-        // the embedded settings dialog (still `self.dialog`).
-        if self.onboarding_shell.is_some() {
-            return self.handle_onboarding_shell_key(key);
         }
 
         // Answering dialog (GOALS §3b) — same modal rule. It replaces the

@@ -108,6 +108,62 @@ pub fn assert_onboarding_welcome() {
     );
 }
 
+/// Settled Secure store screen — issue #427 chrome dump.
+pub fn onboarding_secure_store_shell() -> OnboardingShell {
+    let snapshot = OnboardingBootstrapSnapshot {
+        run_id: uuid::Uuid::from_u128(1),
+        attempt_id: uuid::Uuid::from_u128(2),
+        revision: 3,
+        stage: OnboardingStage::SecureStore,
+        bootstrap_state: cockpit_proto::OnboardingBootstrapState::AwaitingChoice,
+        limited_mode: false,
+        lifetime_selection: None,
+        host_capabilities: {
+            let mut capabilities = cockpit_proto::HostCapabilitySnapshot::unpublished();
+            capabilities.features = vec![
+                cockpit_proto::FeatureCapabilityRow {
+                    id: "secret_store.keyring".into(),
+                    state: cockpit_proto::FeatureCapabilityState::Available,
+                    reason: "keyring is available".into(),
+                    fix_command: None,
+                    remedy_text: None,
+                    dependency_ids: Vec::new(),
+                },
+                cockpit_proto::FeatureCapabilityRow {
+                    id: "secret_store.file".into(),
+                    state: cockpit_proto::FeatureCapabilityState::Available,
+                    reason: "encrypted file vault is available".into(),
+                    fix_command: None,
+                    remedy_text: None,
+                    dependency_ids: Vec::new(),
+                },
+            ];
+            capabilities
+        },
+        last_receipt: None,
+    };
+    OnboardingShell::new(&snapshot, false)
+}
+
+pub fn render_onboarding_secure_store(width: u16, height: u16) -> Buffer {
+    let mut shell = onboarding_secure_store_shell();
+    let engine = Dialog::None;
+    let mut links = crate::tui::links::LinkRegistry::default();
+    render_frame(width, height, |frame| {
+        shell.render(frame, frame.area(), &engine, &mut links);
+    })
+}
+
+pub fn assert_onboarding_secure_store() {
+    let _pins = GoldenPins::install();
+    assert_golden_sizes("onboarding", "secure-store", render_onboarding_secure_store);
+    let preview = buffer_text(&render_onboarding_secure_store(80, 24));
+    assert!(
+        preview.contains("‹ Back") && preview.contains("[ Continue ]"),
+        "secure-store dump must include chrome"
+    );
+}
+
 #[cfg(test)]
 mod seed_tests {
     use super::*;
@@ -133,5 +189,11 @@ mod seed_tests {
     fn golden_onboarding_welcome() {
         let _env = isolate_render_env();
         assert_onboarding_welcome();
+    }
+
+    #[test]
+    fn golden_onboarding_secure_store() {
+        let _env = isolate_render_env();
+        assert_onboarding_secure_store();
     }
 }

@@ -652,7 +652,10 @@ fn no_provider_status_is_surfaced_and_draft_preserved() {
         .map(|cell| cell.symbol())
         .collect();
     assert!(rendered.contains("Cockpit setup"), "{rendered}");
-    assert!(rendered.contains("Search providers:"), "{rendered}");
+    assert!(
+        rendered.contains("Filter") || rendered.contains("type to filter"),
+        "{rendered}"
+    );
     assert!(
         !rendered.contains("draft message"),
         "the shell replaces the chat surface; the draft lives on in state"

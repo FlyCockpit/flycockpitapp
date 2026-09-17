@@ -7,7 +7,13 @@
 //! by byte position; the cursor moves by char boundary.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::{Position, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
+
+/// Masked fields render this glyph once per character instead of the text.
+const MASK: char = '•';
 
 /// Defensive backstop for the kitty keyboard protocol: when a printable
 /// char arrives with a *bare* SHIFT modifier (exactly SHIFT — no CONTROL,
@@ -41,6 +47,18 @@ impl TextField {
         &self.buffer
     }
 
+    pub fn trimmed(&self) -> &str {
+        self.buffer.trim()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    pub fn len_chars(&self) -> usize {
+        self.buffer.chars().count()
+    }
+
     pub fn cursor(&self) -> usize {
         self.cursor
     }
@@ -61,10 +79,7 @@ impl TextField {
     /// drop that newline and everything after it; an empty paste (or one
     /// empty after that truncation) is a no-op.
     pub fn paste(&mut self, text: &str) {
-        let first_line = match text.find('\n') {
-            Some(nl) => &text[..nl],
-            None => text,
-        };
+        let first_line = text.split(['\n', '\r']).next().unwrap_or("");
         if first_line.is_empty() {
             return;
         }
@@ -72,62 +87,173 @@ impl TextField {
         self.cursor += first_line.len();
     }
 
-    /// Apply a key event; returns true if the event was consumed.
+    fn insert(&mut self, ch: char) {
+        self.buffer.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let prev = self.buffer[..self.cursor]
+            .char_indices()
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        self.buffer.drain(prev..self.cursor);
+        self.cursor = prev;
+    }
+
+    fn delete(&mut self) {
+        if self.cursor >= self.buffer.len() {
+            return;
+        }
+        let next_len = self.buffer[self.cursor..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(0);
+        self.buffer.drain(self.cursor..self.cursor + next_len);
+    }
+
+    fn left(&mut self) {
+        if let Some((i, _)) = self.buffer[..self.cursor].char_indices().last() {
+            self.cursor = i;
+        }
+    }
+
+    fn right(&mut self) {
+        if let Some(ch) = self.buffer[self.cursor..].chars().next() {
+            self.cursor += ch.len_utf8();
+        }
+    }
+
+    fn home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn end(&mut self) {
+        self.cursor = self.buffer.len();
+    }
+
+    fn clear(&mut self) {
+        self.buffer.clear();
+        self.cursor = 0;
+    }
+
+    fn delete_word(&mut self) {
+        let before = &self.buffer[..self.cursor];
+        let without_trail = before.trim_end_matches(|c: char| !c.is_alphanumeric());
+        let cut = without_trail.trim_end_matches(char::is_alphanumeric).len();
+        self.buffer.replace_range(cut..self.cursor, "");
+        self.cursor = cut;
+    }
+
+    /// Apply an edit key. Returns true when the buffer changed, so callers can
+    /// clear a stale validation error. Caret-only motion returns false.
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
+            KeyCode::Char('u' | 'U') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.clear();
+                true
+            }
+            KeyCode::Char('w' | 'W') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_word();
+                true
+            }
+            KeyCode::Char(_)
+                if key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                false
+            }
             KeyCode::Char(ch) => {
-                let ch = normalize_shift_char(&key, ch);
-                self.buffer.insert(self.cursor, ch);
-                self.cursor += ch.len_utf8();
+                self.insert(normalize_shift_char(&key, ch));
                 true
             }
             KeyCode::Backspace => {
-                if self.cursor == 0 {
-                    return true;
-                }
-                let prev = self.buffer[..self.cursor]
-                    .char_indices()
-                    .last()
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                self.buffer.drain(prev..self.cursor);
-                self.cursor = prev;
+                self.backspace();
                 true
             }
             KeyCode::Delete => {
-                if self.cursor >= self.buffer.len() {
-                    return true;
-                }
-                let next_len = self.buffer[self.cursor..]
-                    .chars()
-                    .next()
-                    .map(char::len_utf8)
-                    .unwrap_or(0);
-                self.buffer.drain(self.cursor..self.cursor + next_len);
+                self.delete();
                 true
             }
             KeyCode::Left => {
-                if let Some((i, _)) = self.buffer[..self.cursor].char_indices().last() {
-                    self.cursor = i;
-                }
-                true
+                self.left();
+                false
             }
             KeyCode::Right => {
-                if let Some(ch) = self.buffer[self.cursor..].chars().next() {
-                    self.cursor += ch.len_utf8();
-                }
-                true
+                self.right();
+                false
             }
             KeyCode::Home => {
-                self.cursor = 0;
-                true
+                self.home();
+                false
             }
             KeyCode::End => {
-                self.cursor = self.buffer.len();
-                true
+                self.end();
+                false
             }
             _ => false,
         }
+    }
+
+    /// The spans to draw inside `inner_width` columns, plus the caret column
+    /// (relative to the field's inner origin) so the screen can place the real
+    /// terminal cursor. `mask` renders the bullet glyph instead of the text;
+    /// `placeholder` shows when the buffer is empty.
+    pub fn render(
+        &self,
+        inner_width: u16,
+        mask: bool,
+        placeholder: &str,
+        ink: Color,
+        placeholder_fg: Color,
+    ) -> (Line<'static>, u16) {
+        let avail = usize::from(inner_width).max(1);
+        let cursor_col = self.cursor_col();
+        // Keep the caret in view by scrolling the visible window right.
+        let scroll = cursor_col.saturating_sub(avail.saturating_sub(1));
+
+        if self.buffer.is_empty() {
+            let line = Line::from(Span::styled(
+                placeholder.to_string(),
+                Style::new()
+                    .fg(placeholder_fg)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+            return (line, 0);
+        }
+
+        let visible: String = if mask {
+            std::iter::repeat_n(MASK, self.len_chars())
+                .skip(scroll)
+                .take(avail)
+                .collect()
+        } else {
+            self.buffer.chars().skip(scroll).take(avail).collect()
+        };
+        let caret = (cursor_col - scroll).min(avail.saturating_sub(1)) as u16;
+        (
+            Line::from(Span::styled(visible, Style::new().fg(ink))),
+            caret,
+        )
+    }
+
+    /// Absolute caret position for [`ratatui::Frame::set_cursor_position`],
+    /// given the field's inner drawing area.
+    pub fn caret_position(&self, inner: Rect) -> Option<Position> {
+        if inner.width == 0 || inner.height == 0 {
+            return None;
+        }
+        let avail = usize::from(inner.width).max(1);
+        let cursor_col = self.cursor_col();
+        let scroll = cursor_col.saturating_sub(avail.saturating_sub(1));
+        let col = (cursor_col - scroll).min(avail.saturating_sub(1)) as u16;
+        Some(Position::new(inner.x + col, inner.y))
     }
 
     /// Char column (not byte). For cursor placement only.
@@ -320,5 +446,77 @@ mod tests {
         assert_eq!(normalize_shift_char(&ctrl, 'a'), 'a');
         let ctrl_shift = modifiers(KeyModifiers::CONTROL | KeyModifiers::SHIFT);
         assert_eq!(normalize_shift_char(&ctrl_shift, 'a'), 'a');
+    }
+
+    fn ctrl(ch: char) -> KeyEvent {
+        let mut key = key(KeyCode::Char(ch));
+        key.modifiers = KeyModifiers::CONTROL;
+        key
+    }
+
+    fn typed(text: &str) -> TextField {
+        let mut field = TextField::new("");
+        for ch in text.chars() {
+            field.handle_key(key(KeyCode::Char(ch)));
+        }
+        field
+    }
+
+    #[test]
+    fn ctrl_u_clears_and_ctrl_w_drops_a_word() {
+        let mut field = typed("hello world");
+        field.handle_key(ctrl('w'));
+        assert_eq!(field.text(), "hello ");
+        field.handle_key(ctrl('u'));
+        assert!(field.is_empty());
+    }
+
+    #[test]
+    fn caret_motion_does_not_report_a_buffer_change() {
+        let mut field = typed("ab");
+        assert!(!field.handle_key(key(KeyCode::Left)));
+        assert!(!field.handle_key(key(KeyCode::Home)));
+        assert!(!field.handle_key(key(KeyCode::End)));
+        assert_eq!(field.text(), "ab");
+    }
+
+    #[test]
+    fn masked_render_hides_the_text_but_keeps_the_length() {
+        let field = typed("secret");
+        let (line, caret) = field.render(40, true, "type", Color::White, Color::Gray);
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(rendered, "••••••");
+        assert!(!rendered.contains("secret"));
+        assert_eq!(caret, 6);
+    }
+
+    #[test]
+    fn render_scrolls_to_keep_the_caret_visible() {
+        let field = typed("0123456789");
+        let (line, caret) = field.render(4, false, "", Color::White, Color::Gray);
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(rendered, "789");
+        assert_eq!(caret, 3);
+    }
+
+    #[test]
+    fn empty_field_shows_the_placeholder() {
+        let field = TextField::new("");
+        let (line, caret) = field.render(20, false, "type here", Color::White, Color::Gray);
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(rendered, "type here");
+        assert_eq!(caret, 0);
+    }
+
+    #[test]
+    fn caret_position_parks_inside_the_inner_rect() {
+        let field = typed("hi");
+        let inner = Rect {
+            x: 4,
+            y: 2,
+            width: 10,
+            height: 1,
+        };
+        assert_eq!(field.caret_position(inner), Some(Position::new(6, 2)));
     }
 }

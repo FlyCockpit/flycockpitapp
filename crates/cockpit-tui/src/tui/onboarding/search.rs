@@ -8,12 +8,12 @@
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use super::theme::{BRASS, FOG, INK};
 use crate::tui::textfield::TextField;
-use crate::tui::theme::MUTED_COLOR_INDEX;
 use cockpit_core::providers::ProviderTemplate;
 
 /// Ordered onboarding catalog: subscription logins first, then the rest of
@@ -88,6 +88,18 @@ impl ProviderSearchScreen {
         self.status = status;
     }
 
+    pub(crate) fn query_field(&self) -> &TextField {
+        &self.query
+    }
+
+    pub(crate) fn offset_for_scroll(&self) -> usize {
+        self.offset
+    }
+
+    pub(crate) fn activate_focused(&mut self) -> Option<&'static ProviderTemplate> {
+        self.activate(self.selected_template())
+    }
+
     #[cfg(test)]
     pub(crate) fn query(&self) -> &str {
         self.query.text()
@@ -147,13 +159,13 @@ impl ProviderSearchScreen {
     /// re-clamp, and Enter resolves the cursor's canonical registry entry.
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Option<&'static ProviderTemplate> {
         match key.code {
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::Tab => {
                 let len = self.filtered().len();
                 self.cursor = crate::tui::nav::wrap_next(self.cursor, len);
                 self.status = None;
                 self.clamp();
             }
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::BackTab => {
                 let len = self.filtered().len();
                 self.cursor = crate::tui::nav::wrap_prev(self.cursor, len);
                 self.status = None;
@@ -235,9 +247,15 @@ impl ProviderSearchScreen {
                 let index = row_rects
                     .iter()
                     .position(|rect| rect.contains((mouse.column, mouse.row).into()))?;
-                self.cursor = self.offset + index;
-                self.status = None;
-                self.activate(self.selected_template())
+                let next = self.offset + index;
+                if self.cursor == next {
+                    self.status = None;
+                    self.activate(self.selected_template())
+                } else {
+                    self.cursor = next;
+                    self.status = None;
+                    None
+                }
             }
             _ => None,
         }
@@ -274,21 +292,10 @@ impl ProviderSearchScreen {
         self.cursor
     }
 
-    /// Render the query line (the search input with its caret).
-    pub(crate) fn render_query_line(&self) -> Line<'static> {
-        let (before, after) = self.query.split_at_cursor();
-        Line::from(vec![
-            Span::styled("Search providers: ", Style::default().fg(Color::Cyan)),
-            Span::raw(before.to_string()),
-            Span::styled("│", Style::default().fg(Color::Yellow)),
-            Span::raw(after.to_string()),
-        ])
-    }
-
     /// Render one catalog row.
     pub(crate) fn render_row(&self, row: &ProviderRow<'_>) -> Line<'static> {
         let template = row.template;
-        let marker = if row.selected { "▸ " } else { "  " };
+        let marker = if row.selected { "› " } else { "  " };
         let auth = match template.auth {
             cockpit_config::providers::AuthKind::ApiKey => "API key",
             cockpit_config::providers::AuthKind::OAuth => "OAuth login",
@@ -297,27 +304,22 @@ impl ProviderSearchScreen {
         };
         let disabled = template.is_disabled();
         let label_style = if disabled {
-            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX))
+            Style::default().fg(FOG)
         } else if row.selected {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(BRASS).add_modifier(Modifier::BOLD)
         } else {
-            Style::default()
+            Style::default().fg(INK)
         };
         let mut spans = vec![
             Span::raw(marker),
             Span::styled(template.display_label().into_owned(), label_style),
             Span::raw("  "),
-            Span::styled(
-                format!("({auth})"),
-                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
-            ),
+            Span::styled(format!("({auth})"), Style::default().fg(FOG)),
         ];
         if disabled {
             spans.push(Span::styled(
                 "  — unavailable in this build",
-                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                Style::default().fg(FOG),
             ));
         }
         Line::from(spans)
@@ -342,7 +344,7 @@ impl ProviderSearchScreen {
         self.status.as_ref().map(|status| {
             Paragraph::new(Line::from(Span::styled(
                 status.clone(),
-                Style::default().fg(Color::Red),
+                Style::default().fg(super::theme::BAD),
             )))
         })
     }

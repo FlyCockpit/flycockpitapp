@@ -21,21 +21,26 @@
 //! deterministic static alternative.
 
 pub(crate) mod agent;
+mod chrome;
 mod search;
 mod secure_store;
+mod theme;
+mod ui;
 
 #[cfg(test)]
 mod tests;
 
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
 
 use crate::tui::settings::Dialog;
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use chrome::ActionBar;
 use cockpit_core::providers::ProviderTemplate;
 use cockpit_proto::{
     OnboardingBootstrapSnapshot, OnboardingBootstrapState, OnboardingStage,
@@ -43,6 +48,7 @@ use cockpit_proto::{
 };
 use search::ProviderSearchScreen;
 use secure_store::SecureStoreScreen;
+use theme::{BRASS, FOG, HOVER_BG, INK, NIGHT};
 
 pub use secure_store::SecureStoreSubmission;
 
@@ -270,6 +276,7 @@ struct EscapeMenu {
     cursor: usize,
     choices: Vec<EscapeChoice>,
     row_rects: Vec<Rect>,
+    hover: Option<usize>,
 }
 
 impl EscapeMenu {
@@ -314,6 +321,7 @@ impl EscapeMenu {
             cursor: 0,
             choices,
             row_rects: Vec::new(),
+            hover: None,
         })
     }
 
@@ -332,17 +340,42 @@ impl EscapeMenu {
         }
     }
 
-    fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<EscapeChoice> {
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return None;
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> EscapeMenuPointer {
+        let pos = Position::new(mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                self.hover = self
+                    .row_rects
+                    .iter()
+                    .position(|rect| chrome::hit(*rect, pos));
+                if let Some(index) = self.hover {
+                    self.cursor = index;
+                }
+                EscapeMenuPointer::Tracked
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(index) = self
+                    .row_rects
+                    .iter()
+                    .position(|rect| chrome::hit(*rect, pos))
+                else {
+                    return EscapeMenuPointer::Dismiss;
+                };
+                self.cursor = index;
+                match self.choices.get(index).copied() {
+                    Some(choice) => EscapeMenuPointer::Chosen(choice),
+                    None => EscapeMenuPointer::Dismiss,
+                }
+            }
+            _ => EscapeMenuPointer::Tracked,
         }
-        let index = self
-            .row_rects
-            .iter()
-            .position(|rect| rect.contains((mouse.column, mouse.row).into()))?;
-        self.cursor = index;
-        self.choices.get(index).copied()
     }
+}
+
+enum EscapeMenuPointer {
+    Tracked,
+    Dismiss,
+    Chosen(EscapeChoice),
 }
 
 /// The single onboarding renderer.
@@ -375,6 +408,11 @@ pub struct OnboardingShell {
     /// Row rects of the active pointer-selectable list (secure-store
     /// choices, provider search rows) recorded at the last render.
     list_row_rects: Vec<Rect>,
+    /// Hit area of the last-rendered list body; wheel events are gated on it.
+    list_area: Rect,
+    back_rect: Rect,
+    back_hover: bool,
+    actions: ActionBar,
 }
 
 impl OnboardingShell {
@@ -395,6 +433,10 @@ impl OnboardingShell {
             completion_detour: false,
             pending_transition: None,
             list_row_rects: Vec::new(),
+            list_area: Rect::default(),
+            back_rect: Rect::default(),
+            back_hover: false,
+            actions: ActionBar::default(),
         }
     }
 
@@ -731,6 +773,99 @@ impl OnboardingShell {
         }
     }
 
+    fn welcome_is_flying(&self) -> bool {
+        matches!(self.screen, OnboardingScreen::Welcome)
+            && !self.reduced_motion
+            && self.frame < WELCOME_ANIMATION_FRAMES
+    }
+
+    /// Back is withheld where the daemon rejects the transition (`Welcome`,
+    /// `Provider`) and during the welcome fly-in (no chrome). The completion
+    /// detour's back is a local return, not a daemon Back.
+    fn back_enabled(&self) -> bool {
+        if self.welcome_is_flying() {
+            return false;
+        }
+        if self.completion_detour {
+            return true;
+        }
+        !matches!(
+            self.stage,
+            OnboardingStage::Welcome | OnboardingStage::Provider
+        )
+    }
+
+    fn is_quit_chord(key: &KeyEvent) -> bool {
+        key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    }
+
+    fn accepts_key(key: &KeyEvent) -> bool {
+        matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+    }
+
+    fn activate_primary(&mut self, engine: &mut Dialog) -> Option<OnboardingShellAction> {
+        match &mut self.screen {
+            OnboardingScreen::Welcome => {
+                if self.stage == OnboardingStage::Welcome {
+                    Some(OnboardingShellAction::Transition(
+                        OnboardingTransitionKind::Advance,
+                        None,
+                    ))
+                } else {
+                    None
+                }
+            }
+            OnboardingScreen::SecureStore(screen) => {
+                screen.confirm_focused();
+                screen
+                    .take_submission()
+                    .map(OnboardingShellAction::SecureIntent)
+            }
+            OnboardingScreen::ProviderSearch(screen) => screen
+                .activate_focused()
+                .map(OnboardingShellAction::SelectTemplate),
+            OnboardingScreen::AgentAuthoring(screen) => screen
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .map(OnboardingShellAction::AgentAuthoring),
+            OnboardingScreen::Complete { cursor, .. } => {
+                if *cursor == 0 {
+                    self.begin_completion_provider_detour(Some(
+                        "Add another provider; live validation is required.".into(),
+                    ));
+                    None
+                } else {
+                    Some(OnboardingShellAction::Close)
+                }
+            }
+            OnboardingScreen::Engine(current) => {
+                let stage = *current;
+                let closed = engine.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                if closed {
+                    self.open_escape_menu(engine);
+                }
+                if stage == EngineStage::Provider {
+                    self.reconcile_provider_engine(engine);
+                }
+                None
+            }
+        }
+    }
+
+    fn activate_back(&mut self) -> Option<OnboardingShellAction> {
+        if !self.back_enabled() {
+            return None;
+        }
+        if self.completion_detour {
+            self.return_to_completion();
+            return Some(OnboardingShellAction::ReturnToCompletion);
+        }
+        Some(OnboardingShellAction::Transition(
+            OnboardingTransitionKind::Back,
+            None,
+        ))
+    }
+
     /// Route a key through the shell. `engine` is the app's settings dialog
     /// that renders engine-stage content.
     pub(crate) fn handle_key(
@@ -738,6 +873,13 @@ impl OnboardingShell {
         key: KeyEvent,
         engine: &mut Dialog,
     ) -> Option<OnboardingShellAction> {
+        if !Self::accepts_key(&key) {
+            return None;
+        }
+        if Self::is_quit_chord(&key) {
+            return Some(OnboardingShellAction::Close);
+        }
+
         if let Some(menu) = self.escape.as_mut() {
             if matches!(key.code, KeyCode::Esc) {
                 self.escape = None;
@@ -803,8 +945,12 @@ impl OnboardingShell {
                         // the choice visible instead of silently closing.
                         self.open_escape_menu(engine);
                     }
-                    KeyCode::Up => *cursor = cursor.saturating_sub(1),
-                    KeyCode::Down => *cursor = (*cursor + 1).min(1),
+                    KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
+                        *cursor = cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+                        *cursor = (*cursor + 1).min(1);
+                    }
                     KeyCode::Enter | KeyCode::Char(' ') => {
                         if *cursor == 0 {
                             // Local detour: the daemon stage stays Complete.
@@ -871,51 +1017,109 @@ impl OnboardingShell {
     }
 
     /// Pointer routing for the shell's own chrome and native screens. The
-    /// escape menu is modal; otherwise only native list surfaces consume
-    /// events, so engine pointer routing keeps flowing through the app's
-    /// ordinary settings path.
-    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent) -> PointerOutcome {
+    /// escape menu is modal; otherwise chrome (back → action bar → rows)
+    /// is hit-tested in that order. Engine pointer routing that misses
+    /// chrome keeps flowing through the app's ordinary settings path.
+    pub(crate) fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        engine: &mut Dialog,
+    ) -> PointerOutcome {
+        let pos = Position::new(mouse.column, mouse.row);
         if let Some(menu) = self.escape.as_mut() {
-            if matches!(mouse.kind, MouseEventKind::Moved) {
-                return PointerOutcome::ignored();
-            }
             return match menu.handle_mouse(mouse) {
-                Some(choice) => {
+                EscapeMenuPointer::Chosen(choice) => {
                     self.escape = None;
                     PointerOutcome::acted(self.apply_escape_choice(choice))
                 }
-                // The menu is modal: clicks that miss its rows dismiss it
-                // without effect, and other events stop here.
-                None => {
+                EscapeMenuPointer::Dismiss
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
+                {
                     self.escape = None;
+                    PointerOutcome::consumed()
+                }
+                EscapeMenuPointer::Tracked | EscapeMenuPointer::Dismiss => {
                     PointerOutcome::consumed()
                 }
             };
         }
-        match &mut self.screen {
-            OnboardingScreen::SecureStore(screen) => match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    screen.cursor = screen.cursor.saturating_sub(1);
-                    PointerOutcome::consumed()
+
+        self.back_hover = chrome::hit(self.back_rect, pos);
+        self.actions.track(pos);
+        match mouse.kind {
+            MouseEventKind::Moved | MouseEventKind::Drag(_) => PointerOutcome::consumed(),
+            MouseEventKind::Down(MouseButton::Left) if chrome::hit(self.back_rect, pos) => {
+                match self.activate_back() {
+                    Some(action) => PointerOutcome::acted(action),
+                    None => PointerOutcome::consumed(),
                 }
-                MouseEventKind::ScrollDown => {
-                    screen.cursor = (screen.cursor + 1).min(2);
-                    PointerOutcome::consumed()
-                }
-                MouseEventKind::Down(MouseButton::Left) => {
-                    let rects = std::mem::take(&mut self.list_row_rects);
-                    screen.handle_mouse(mouse, &rects);
-                    self.list_row_rects = rects;
-                    match screen.take_submission() {
-                        Some(submission) => {
-                            PointerOutcome::acted(OnboardingShellAction::SecureIntent(submission))
-                        }
-                        None => PointerOutcome::consumed(),
-                    }
-                }
-                _ => PointerOutcome::ignored(),
+            }
+            MouseEventKind::Down(MouseButton::Left) if self.actions.clicked(pos).is_some() => {
+                let index = self.actions.clicked(pos);
+                self.handle_action_bar_click(index, engine)
+            }
+            _ => self.handle_content_mouse(mouse, pos),
+        }
+    }
+
+    fn handle_action_bar_click(
+        &mut self,
+        index: Option<usize>,
+        engine: &mut Dialog,
+    ) -> PointerOutcome {
+        match (&self.screen, index) {
+            (OnboardingScreen::Complete { .. }, Some(0)) => {
+                self.begin_completion_provider_detour(Some(
+                    "Add another provider; live validation is required.".into(),
+                ));
+                PointerOutcome::consumed()
+            }
+            (OnboardingScreen::Complete { .. }, Some(1)) => {
+                PointerOutcome::acted(OnboardingShellAction::Close)
+            }
+            _ => match self.activate_primary(engine) {
+                Some(action) => PointerOutcome::acted(action),
+                None => PointerOutcome::consumed(),
             },
+        }
+    }
+
+    fn handle_content_mouse(&mut self, mouse: MouseEvent, pos: Position) -> PointerOutcome {
+        match &mut self.screen {
+            OnboardingScreen::SecureStore(screen) => {
+                let over_list = chrome::hit(self.list_area, pos);
+                match mouse.kind {
+                    MouseEventKind::ScrollUp if over_list => {
+                        screen.cursor = crate::tui::nav::wrap_prev(screen.cursor, 3);
+                        PointerOutcome::consumed()
+                    }
+                    MouseEventKind::ScrollDown if over_list => {
+                        screen.cursor = crate::tui::nav::wrap_next(screen.cursor, 3);
+                        PointerOutcome::consumed()
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let rects = std::mem::take(&mut self.list_row_rects);
+                        screen.handle_mouse(mouse, &rects);
+                        self.list_row_rects = rects;
+                        match screen.take_submission() {
+                            Some(submission) => PointerOutcome::acted(
+                                OnboardingShellAction::SecureIntent(submission),
+                            ),
+                            None => PointerOutcome::consumed(),
+                        }
+                    }
+                    _ => PointerOutcome::ignored(),
+                }
+            }
             OnboardingScreen::ProviderSearch(screen) => {
+                let over_list = chrome::hit(self.list_area, pos);
+                if matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ) && !over_list
+                {
+                    return PointerOutcome::ignored();
+                }
                 let rects = std::mem::take(&mut self.list_row_rects);
                 let action = screen.handle_mouse(mouse, &rects);
                 self.list_row_rects = rects;
@@ -923,8 +1127,6 @@ impl OnboardingShell {
                     Some(template) => {
                         PointerOutcome::acted(OnboardingShellAction::SelectTemplate(template))
                     }
-                    // The search screen owns the whole content area while
-                    // active; wheel scrolls and row clicks are its input.
                     None if matches!(
                         mouse.kind,
                         MouseEventKind::ScrollUp
@@ -960,18 +1162,22 @@ impl OnboardingShell {
                 let index = self
                     .list_row_rects
                     .iter()
-                    .position(|rect| rect.contains((mouse.column, mouse.row).into()));
+                    .position(|rect| chrome::hit(*rect, pos));
                 let Some(index) = index else {
                     return PointerOutcome::consumed();
                 };
-                *cursor = index.min(1);
-                if *cursor == 0 {
-                    self.begin_completion_provider_detour(Some(
-                        "Add another provider; live validation is required.".into(),
-                    ));
-                    PointerOutcome::consumed()
+                if *cursor == index.min(1) {
+                    if *cursor == 0 {
+                        self.begin_completion_provider_detour(Some(
+                            "Add another provider; live validation is required.".into(),
+                        ));
+                        PointerOutcome::consumed()
+                    } else {
+                        PointerOutcome::acted(OnboardingShellAction::Close)
+                    }
                 } else {
-                    PointerOutcome::acted(OnboardingShellAction::Close)
+                    *cursor = index.min(1);
+                    PointerOutcome::consumed()
                 }
             }
             _ => PointerOutcome::ignored(),
@@ -1000,51 +1206,111 @@ impl OnboardingShell {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        // Full-screen frame: the shell replaces the chat UI entirely.
-        let mut title = format!(
-            " Cockpit setup · step {}/{} ",
+        frame.render_widget(Clear, area);
+
+        let back_visible = !self.welcome_is_flying();
+        let back_enabled = self.back_enabled();
+        self.back_rect =
+            chrome::render_back_button(frame, area, back_visible, back_enabled, self.back_hover);
+
+        let col = ui::column(area);
+        let rows = Layout::vertical([
+            Constraint::Length(3), // header
+            Constraint::Length(1), // progress
+            Constraint::Min(1),    // content
+            Constraint::Length(1), // help + action bar
+        ])
+        .split(col);
+
+        let title = format!(
+            "Cockpit setup · step {}/{}",
             progress_index(self.stage) + 1,
             PROGRESS_STEPS.len()
         );
-        if self.limited_mode {
-            title.push_str("· limited mode ");
-        }
-        let block = Block::default().borders(Borders::ALL).title(title);
-        let inner = block.inner(area);
-        frame.render_widget(Clear, area);
-        frame.render_widget(block, area);
-        let rows = Layout::vertical([
-            Constraint::Length(1), // progress
-            Constraint::Min(1),    // content
-            Constraint::Length(1), // status
-            Constraint::Length(1), // help
-        ])
-        .split(inner);
-        self.render_progress(frame, rows[0]);
+        let subtitle = self.header_subtitle();
+        ui::render_header(frame, rows[0], &title, &subtitle);
+        self.render_progress(frame, rows[1]);
+        self.list_area = rows[2];
         match &mut self.screen {
             OnboardingScreen::Welcome => {
-                Self::render_welcome(self.reduced_motion, self.frame, frame, rows[1]);
+                Self::render_welcome(self.reduced_motion, self.frame, frame, rows[2]);
             }
             OnboardingScreen::SecureStore(screen) => {
-                Self::render_secure_store(frame, rows[1], screen, &mut self.list_row_rects);
+                Self::render_secure_store(frame, rows[2], screen, &mut self.list_row_rects);
             }
             OnboardingScreen::ProviderSearch(screen) => {
-                Self::render_search(frame, rows[1], screen, &mut self.list_row_rects);
+                self.list_area =
+                    Self::render_search(frame, rows[2], screen, &mut self.list_row_rects);
             }
             OnboardingScreen::AgentAuthoring(screen) => {
-                screen.render(frame, rows[1]);
+                screen.render(frame, rows[2]);
             }
             OnboardingScreen::Complete { summary, cursor } => {
-                Self::render_complete(frame, rows[1], summary, *cursor, &mut self.list_row_rects);
+                Self::render_complete(frame, rows[2], summary, *cursor, &mut self.list_row_rects);
             }
             OnboardingScreen::Engine(_) => {
-                engine.render(frame, rows[1], links);
+                engine.render(frame, rows[2], links);
             }
         }
-        self.render_status(frame, rows[2]);
-        self.render_help(frame, rows[3]);
+        let buttons = Self::action_buttons(&self.screen);
+        let bar_width = chrome::action_bar_width(&buttons);
+        let help_width = rows[3].width.saturating_sub(bar_width.saturating_add(1));
+        ui::render_help(
+            frame,
+            Rect {
+                x: rows[3].x,
+                y: rows[3].y,
+                width: help_width,
+                height: 1,
+            },
+            self.help_text(),
+        );
+        self.actions.render(frame, rows[3], &buttons);
         if let Some(menu) = self.escape.as_mut() {
             Self::render_escape_menu(frame, area, menu);
+        }
+    }
+
+    fn header_subtitle(&self) -> String {
+        let mut parts = Vec::new();
+        if self.limited_mode {
+            parts.push("limited mode".to_string());
+        }
+        match self.bootstrap_state {
+            OnboardingBootstrapState::Materializing => {
+                parts.push("Preparing the secure store…".to_string());
+            }
+            OnboardingBootstrapState::Failed => {
+                parts.push("Onboarding bootstrap failed; retrying ready construction…".to_string());
+            }
+            _ => {}
+        }
+        parts.join(" · ")
+    }
+
+    fn help_text(&self) -> &'static str {
+        match &self.screen {
+            OnboardingScreen::Welcome => "any key: begin setup  esc: options",
+            OnboardingScreen::SecureStore(screen) => screen.help_text(),
+            OnboardingScreen::ProviderSearch(screen) => screen.help_text(),
+            OnboardingScreen::AgentAuthoring(screen) => screen.help_text(),
+            OnboardingScreen::Engine(EngineStage::Provider) => "wizard  esc: options",
+            OnboardingScreen::Engine(_) => "wizard  esc: options",
+            OnboardingScreen::Complete { .. } => "↑/↓  enter: choose",
+        }
+    }
+
+    fn action_buttons(screen: &OnboardingScreen) -> Vec<chrome::Button<'static>> {
+        match screen {
+            OnboardingScreen::Welcome => vec![chrome::Button::primary("Continue")],
+            OnboardingScreen::SecureStore(_) => vec![chrome::Button::primary("Continue")],
+            OnboardingScreen::ProviderSearch(_) => vec![chrome::Button::primary("Choose")],
+            OnboardingScreen::AgentAuthoring(_) => vec![chrome::Button::primary("Continue")],
+            OnboardingScreen::Engine(_) => vec![chrome::Button::primary("Continue")],
+            OnboardingScreen::Complete { .. } => vec![
+                chrome::Button::secondary("Add another provider"),
+                chrome::Button::primary("Done"),
+            ],
         }
     }
 
@@ -1053,11 +1319,11 @@ impl OnboardingShell {
         let mut spans = Vec::new();
         for (index, step) in PROGRESS_STEPS.iter().enumerate() {
             let (mark, color) = if index < current {
-                ("●", Color::Green)
+                ("●", BRASS)
             } else if index == current {
-                ("◐", Color::Yellow)
+                ("◐", BRASS)
             } else {
-                ("○", Color::Indexed(MUTED_COLOR_INDEX))
+                ("○", NIGHT)
             };
             let mut style = Style::default().fg(color);
             if index == current {
@@ -1155,11 +1421,9 @@ impl OnboardingShell {
         logo_line.spans.push(Span::styled(
             format!("{mark}  FlyCockpit"),
             if reduced_motion {
-                Style::default()
+                Style::default().fg(INK)
             } else {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(BRASS).add_modifier(Modifier::BOLD)
             },
         ));
         lines.push(logo_line);
@@ -1181,7 +1445,7 @@ impl OnboardingShell {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
                 "Press any key to begin setup.",
-                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                Style::default().fg(FOG),
             )));
         }
         lines.truncate(lines.len().min(area.height as usize));
@@ -1198,84 +1462,90 @@ impl OnboardingShell {
         area: Rect,
         screen: &mut ProviderSearchScreen,
         list_row_rects: &mut Vec<Rect>,
-    ) {
-        // Layout inside the content area: query line, blank, rows, then a
-        // trailing status/hint row pair.
-        let capacity = area.height.saturating_sub(4) as usize;
+    ) -> Rect {
+        let chunks = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(area);
+        if let Some(caret) = ui::render_field(
+            frame,
+            chunks[0],
+            "Filter",
+            screen.query_field(),
+            true,
+            "type to filter",
+        ) {
+            frame.set_cursor_position(caret);
+        }
+        let list_area = chunks[2];
+        let capacity = list_area.height.saturating_sub(1) as usize;
         screen.observe_viewport(capacity);
         let rows = screen.visible_rows(capacity);
-        frame.render_widget(
-            Paragraph::new(screen.render_query_line()),
-            Rect {
-                x: area.x,
-                y: area.y,
-                width: area.width,
-                height: 1,
-            },
-        );
         list_row_rects.clear();
-        let mut row_y = area.y + 2;
+        let mut row_y = list_area.y;
         for row in &rows {
-            if row_y >= area.bottom() {
+            if row_y >= list_area.bottom() {
                 break;
             }
             frame.render_widget(
                 Paragraph::new(screen.render_row(row)),
                 Rect {
-                    x: area.x,
+                    x: list_area.x,
                     y: row_y,
-                    width: area.width,
+                    width: list_area.width.saturating_sub(1),
                     height: 1,
                 },
             );
             list_row_rects.push(Rect {
-                x: area.x,
+                x: list_area.x,
                 y: row_y,
-                width: area.width,
+                width: list_area.width.saturating_sub(1),
                 height: 1,
             });
             row_y += 1;
         }
         if rows.is_empty() {
-            let y = (area.y + 2).min(area.bottom().saturating_sub(1));
+            let y = list_area.y.min(list_area.bottom().saturating_sub(1));
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     "No provider matches this search.",
-                    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                    Style::default().fg(FOG),
                 ))),
                 Rect {
-                    x: area.x,
+                    x: list_area.x,
                     y,
-                    width: area.width,
+                    width: list_area.width,
                     height: 1,
                 },
             );
         }
+        ui::render_scrollbar(
+            frame,
+            Rect {
+                x: list_area.right().saturating_sub(1),
+                y: list_area.y,
+                width: 1,
+                height: list_area.height,
+            },
+            screen.filtered().len(),
+            capacity.max(1),
+            screen.offset_for_scroll(),
+        );
         if let Some(status) = screen.status_paragraph() {
-            let y = area.bottom().saturating_sub(2).max(area.y + 2);
+            let y = list_area.bottom().saturating_sub(1).max(list_area.y);
             frame.render_widget(
                 status,
                 Rect {
-                    x: area.x,
+                    x: list_area.x,
                     y,
-                    width: area.width,
+                    width: list_area.width.saturating_sub(1),
                     height: 1,
                 },
             );
         }
-        let help_y = area.bottom().saturating_sub(1);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                screen.help_text(),
-                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
-            ))),
-            Rect {
-                x: area.x,
-                y: help_y,
-                width: area.width,
-                height: 1,
-            },
-        );
+        list_area
     }
 
     fn render_complete(
@@ -1286,7 +1556,7 @@ impl OnboardingShell {
         list_row_rects: &mut Vec<Rect>,
     ) {
         list_row_rects.clear();
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(FOG);
         let head = vec![
             Line::from("Cockpit is ready."),
             Line::from(summary.to_string()),
@@ -1312,7 +1582,7 @@ impl OnboardingShell {
                 Paragraph::new(Line::from(Span::styled(
                     format!("{} {label}", if index == cursor { "›" } else { " " }),
                     if index == cursor {
-                        Style::default().fg(Color::Yellow)
+                        Style::default().fg(BRASS).add_modifier(Modifier::BOLD)
                     } else {
                         muted
                     },
@@ -1334,48 +1604,6 @@ impl OnboardingShell {
         }
     }
 
-    fn render_status(&self, frame: &mut Frame, area: Rect) {
-        let text = match self.bootstrap_state {
-            OnboardingBootstrapState::Materializing => {
-                Some("Preparing the secure store…".to_string())
-            }
-            OnboardingBootstrapState::Failed => {
-                Some("Onboarding bootstrap failed; retrying ready construction…".to_string())
-            }
-            _ => None,
-        };
-        if let Some(text) = text {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    text,
-                    Style::default().fg(Color::Yellow),
-                ))),
-                area,
-            );
-        }
-    }
-
-    fn render_help(&self, frame: &mut Frame, area: Rect) {
-        let help = match &self.screen {
-            OnboardingScreen::Welcome => "any key: begin setup  esc: options",
-            OnboardingScreen::SecureStore(screen) => screen.help_text(),
-            OnboardingScreen::ProviderSearch(screen) => screen.help_text(),
-            OnboardingScreen::AgentAuthoring(screen) => screen.help_text(),
-            OnboardingScreen::Engine(EngineStage::Provider) => {
-                "follow the provider wizard  esc: options"
-            }
-            OnboardingScreen::Engine(_) => "follow the wizard  esc: options",
-            OnboardingScreen::Complete { .. } => "↑/↓  enter: choose",
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                help.to_string(),
-                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
-            ))),
-            area,
-        );
-    }
-
     fn render_escape_menu(frame: &mut Frame, area: Rect, menu: &mut EscapeMenu) {
         let width = 48.min(area.width.saturating_sub(4));
         let height = (menu.choices.len() as u16 + 4)
@@ -1390,13 +1618,17 @@ impl OnboardingShell {
             height,
         };
         frame.render_widget(Clear, rect);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Leave setup? ");
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(BRASS))
+            .title(Span::styled(" Leave setup? ", Style::new().fg(BRASS)));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         let intro = [
-            Line::from("Unsaved entries in this step are discarded."),
+            Line::from(Span::styled(
+                "Unsaved entries in this step are discarded.",
+                Style::new().fg(FOG),
+            )),
             Line::default(),
         ];
         let mut y = inner.y;
@@ -1421,16 +1653,19 @@ impl OnboardingShell {
                 break;
             }
             let selected = index == menu.cursor;
+            let hovered = menu.hover == Some(index);
+            let mut style = if selected {
+                Style::default().fg(BRASS).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(INK)
+            };
+            if hovered {
+                style = style.bg(HOVER_BG);
+            }
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    format!("{} {}", if selected { "▸" } else { " " }, choice.label()),
-                    if selected {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                    },
+                    format!("{} {}", if selected { "›" } else { " " }, choice.label()),
+                    style,
                 ))),
                 Rect {
                     x: inner.x,

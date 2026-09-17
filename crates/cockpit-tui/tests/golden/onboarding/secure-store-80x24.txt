@@ -1,16 +1,14 @@
  ‹ Back                                                                         
-  Cockpit setup · step 1/8                                                      
+  Cockpit setup · step 3/8                                                      
                                                                                 
   ────────────────────────────                                                  
-  ◐Welcome ○Profile ○Secure store ○Provider ○Model ○Agent ○Lifetime ○Ready      
-                                  ✈  FlyCockpit                                 
+  ●Welcome ●Profile ◐Secure store ○Provider ○Model ○Agent ○Lifetime ○Ready      
+  Choose where Cockpit encrypts credentials before adding a provider.           
+  Automatic means the platform keyring only; a failure requires a new explicit  
                                                                                 
-  A focused cockpit for coding with the models you choose.                      
-                                                                                
-  No Cockpit telemetry is collected.                                            
-  Inference providers may have their own telemetry policies.                    
-                                                                                
-  Press any key to begin setup.                                                 
+  › Platform keyring (recommended)  No silent file fallback.                    
+    Passphrase-protected file  You must enter it again after a pre-commit       
+    Machine-bound encrypted file  Explicit fallback tied to this machine.       
                                                                                 
                                                                                 
                                                                                 
@@ -20,5 +18,7 @@
                                                                                 
                                                                                 
                                                                                 
-  any key: begin setup  esc: options                              [ Continue ]  
+                                                                                
+                                                                                
+  ↑/↓  enter: select  esc: options                                [ Continue ]  
                                                                                 

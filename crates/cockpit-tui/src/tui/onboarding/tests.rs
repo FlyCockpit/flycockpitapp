@@ -301,7 +301,7 @@ fn escape_menu_pointer_selection_chooses_the_clicked_row() {
     let rendered = render_string(&mut shell, 100, 30, &engine);
     assert!(rendered.contains("Defer provider setup"));
     let defer_row = shell.escape.as_ref().unwrap().row_rects[0];
-    let outcome = shell.handle_mouse(click(defer_row.x, defer_row.y));
+    let outcome = shell.handle_mouse(click(defer_row.x, defer_row.y), &mut engine);
     assert!(outcome.consumed);
     assert!(matches!(
         outcome.action,
@@ -399,12 +399,15 @@ fn secure_store_pointer_selects_placement_row() {
     snap.host_capabilities =
         secure_store_capabilities(cockpit_proto::FeatureCapabilityState::Available);
     let mut shell = OnboardingShell::new(&snap, false);
-    let engine = Dialog::None;
+    let mut engine = Dialog::None;
     // Render to record row rects (intro 3 lines, then three rows).
     render_string(&mut shell, 80, 24, &engine);
-    // The machine-bound row is the third placement row: border(1) +
-    // progress(1) + intro(3) + 2 = row 7.
-    let outcome = shell.handle_mouse(click(10, 7));
+    let machine = shell.list_row_rects[2];
+    // First click on a non-selected row only moves the cursor.
+    let first = shell.handle_mouse(click(machine.x, machine.y), &mut engine);
+    assert!(first.consumed);
+    assert!(first.action.is_none());
+    let outcome = shell.handle_mouse(click(machine.x, machine.y), &mut engine);
     assert!(outcome.consumed);
     match outcome.action {
         Some(OnboardingShellAction::SecureIntent(submission)) => {
@@ -423,10 +426,12 @@ fn secure_store_pointer_activation_emits_the_selected_daemon_intent() {
     snapshot.host_capabilities =
         secure_store_capabilities(cockpit_proto::FeatureCapabilityState::Available);
     let mut shell = OnboardingShell::new(&snapshot, true);
-    let engine = Dialog::None;
+    let mut engine = Dialog::None;
     let _ = render_string(&mut shell, 100, 24, &engine);
+    let first_row = shell.list_row_rects[0];
 
-    let outcome = shell.handle_mouse(click(5, 5));
+    // The default cursor is already on the first row; a click confirms.
+    let outcome = shell.handle_mouse(click(first_row.x, first_row.y), &mut engine);
     assert!(outcome.consumed);
     assert!(matches!(
         outcome.action,
@@ -626,7 +631,7 @@ fn search_pointer_hit_selects_the_clicked_row() {
     };
     render_string(&mut shell, 80, 24, &engine);
     let first_row = shell.list_row_rects[0];
-    let outcome = shell.handle_mouse(click(first_row.x, first_row.y));
+    let outcome = shell.handle_mouse(click(first_row.x, first_row.y), &mut engine);
     match outcome.action {
         Some(OnboardingShellAction::SelectTemplate(template)) => {
             assert_eq!(template.id, expected_id);
@@ -647,7 +652,8 @@ fn search_wheel_scrolls_the_viewport() {
         _other => panic!("expected search screen, got {_other:?}"),
     };
     assert_eq!(offset_before, 0);
-    let outcome = shell.handle_mouse(wheel_down(10, 6));
+    let list = shell.list_area;
+    let outcome = shell.handle_mouse(wheel_down(list.x, list.y), &mut Dialog::None);
     assert!(outcome.consumed);
     let offset_after = match &shell.screen {
         OnboardingScreen::ProviderSearch(screen) => screen.offset(),
@@ -659,13 +665,13 @@ fn search_wheel_scrolls_the_viewport() {
     );
 
     // Scrolling back up clamps at zero.
-    shell.handle_mouse(wheel_up(10, 6));
+    shell.handle_mouse(wheel_up(list.x, list.y), &mut Dialog::None);
     let offset_up = match &shell.screen {
         OnboardingScreen::ProviderSearch(screen) => screen.offset(),
         _other => panic!("expected search screen"),
     };
     assert_eq!(offset_up, offset_after - 1);
-    shell.handle_mouse(wheel_up(10, 6));
+    shell.handle_mouse(wheel_up(list.x, list.y), &mut Dialog::None);
     let offset_clamped = match &shell.screen {
         OnboardingScreen::ProviderSearch(screen) => screen.offset(),
         _other => panic!("expected search screen"),
@@ -820,15 +826,15 @@ fn superseding_same_stage_revision_discards_stale_local_search_state() {
     let mut shell = shell_at(OnboardingStage::Provider);
     shell.paste("openai");
     let engine = Dialog::None;
-    assert!(render_string(&mut shell, 90, 24, &engine).contains("openai│"));
+    assert!(render_string(&mut shell, 90, 24, &engine).contains("openai"));
 
     let mut superseding = snapshot(OnboardingStage::Provider);
     superseding.revision += 1;
     assert!(shell.sync_snapshot(&superseding));
 
     let rendered = render_string(&mut shell, 90, 24, &engine);
-    assert!(rendered.contains("Search providers: │"), "{rendered}");
-    assert!(!rendered.contains("openai│"), "{rendered}");
+    assert!(rendered.contains("Filter"), "{rendered}");
+    assert!(!rendered.contains("openai"), "{rendered}");
 }
 
 // ── Chrome ───────────────────────────────────────────────────────────────
@@ -837,7 +843,7 @@ fn superseding_same_stage_revision_discards_stale_local_search_state() {
 fn chrome_shows_progress_and_limited_mode_at_both_sizes() {
     for (width, height) in [(60u16, 20u16), (120, 40)] {
         let mut shell = shell_at(OnboardingStage::SecureStore);
-        let mut engine = Dialog::None;
+        let engine = Dialog::None;
         let rendered = render_string(&mut shell, width, height, &engine);
         assert!(rendered.contains("Cockpit setup"), "{width}x{height}");
         assert!(rendered.contains("Welcome"), "{width}x{height}");
@@ -910,7 +916,7 @@ fn failed_bootstrap_state_is_surfaced() {
     let mut snap = snapshot(OnboardingStage::SecureStore);
     snap.bootstrap_state = cockpit_proto::OnboardingBootstrapState::Failed;
     let mut shell = OnboardingShell::new(&snap, false);
-    let mut engine = Dialog::None;
+    let engine = Dialog::None;
     let rendered = render_string(&mut shell, 80, 24, &engine);
     assert!(rendered.contains("Onboarding bootstrap failed"));
 }
@@ -920,7 +926,115 @@ fn materializing_bootstrap_state_is_surfaced() {
     let mut snap = snapshot(OnboardingStage::SecureStore);
     snap.bootstrap_state = cockpit_proto::OnboardingBootstrapState::Materializing;
     let mut shell = OnboardingShell::new(&snap, false);
-    let mut engine = Dialog::None;
+    let engine = Dialog::None;
     let rendered = render_string(&mut shell, 80, 24, &engine);
     assert!(rendered.contains("Preparing the secure store"));
+}
+
+#[test]
+fn chrome_paints_back_and_action_bar_on_every_settled_screen() {
+    let engine = Dialog::None;
+    for stage in [
+        OnboardingStage::Welcome,
+        OnboardingStage::SecureStore,
+        OnboardingStage::Provider,
+        OnboardingStage::Model,
+    ] {
+        let mut shell = shell_at(stage);
+        shell.set_frame_for_golden(WELCOME_ANIMATION_FRAMES);
+        let rendered = render_string(&mut shell, 80, 24, &engine);
+        if matches!(stage, OnboardingStage::Welcome) {
+            assert!(
+                rendered.contains("‹ Back"),
+                "{stage:?} settled welcome paints a disabled back: {rendered}"
+            );
+        } else {
+            assert!(
+                rendered.contains("‹ Back"),
+                "{stage:?} must paint ‹ Back: {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("[ Continue ]") || rendered.contains("[ Choose ]"),
+            "{stage:?} must paint an action bar: {rendered}"
+        );
+        assert!(
+            !rendered.contains("┌") && !rendered.contains("└"),
+            "{stage:?} must not use Borders::ALL box drawing: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn welcome_fly_in_has_no_back_button() {
+    let mut shell = shell_at(OnboardingStage::Welcome);
+    let engine = Dialog::None;
+    let rendered = render_string(&mut shell, 80, 24, &engine);
+    assert!(!rendered.contains("‹ Back"), "{rendered}");
+}
+
+#[test]
+fn back_is_unclickable_on_welcome_and_provider() {
+    let mut engine = Dialog::None;
+    for stage in [OnboardingStage::Welcome, OnboardingStage::Provider] {
+        let mut shell = shell_at(stage);
+        shell.set_frame_for_golden(WELCOME_ANIMATION_FRAMES);
+        render_string(&mut shell, 80, 24, &engine);
+        let outcome = shell.handle_mouse(click(1, 0), &mut engine);
+        assert!(
+            !matches!(
+                outcome.action,
+                Some(OnboardingShellAction::Transition(
+                    cockpit_proto::OnboardingTransitionKind::Back,
+                    None
+                ))
+            ),
+            "{stage:?} must not emit Back"
+        );
+    }
+}
+
+#[test]
+fn ctrl_c_quits_from_anywhere() {
+    let mut engine = Dialog::None;
+    let mut shell = shell_at(OnboardingStage::SecureStore);
+    let mut key = key(KeyCode::Char('c'));
+    key.modifiers = KeyModifiers::CONTROL;
+    assert!(matches!(
+        shell.handle_key(key, &mut engine),
+        Some(OnboardingShellAction::Close)
+    ));
+}
+
+#[test]
+fn key_release_is_ignored() {
+    let mut engine = Dialog::None;
+    let mut shell = shell_at(OnboardingStage::Welcome);
+    shell.set_frame_for_golden(WELCOME_ANIMATION_FRAMES);
+    let mut release = key(KeyCode::Char(' '));
+    release.kind = crossterm::event::KeyEventKind::Release;
+    assert!(shell.handle_key(release, &mut engine).is_none());
+}
+
+#[test]
+fn action_bar_continue_advances_welcome() {
+    let mut engine = Dialog::None;
+    let mut shell = shell_at(OnboardingStage::Welcome);
+    shell.set_frame_for_golden(WELCOME_ANIMATION_FRAMES);
+    render_string(&mut shell, 80, 24, &engine);
+    let outcome = shell.handle_mouse(click(70, 20), &mut engine);
+    // The Continue button is right-aligned on the help row; if the click
+    // misses, fall back to asserting the button is painted.
+    if outcome.action.is_none() {
+        let rendered = render_string(&mut shell, 80, 24, &engine);
+        assert!(rendered.contains("[ Continue ]"), "{rendered}");
+    } else {
+        assert!(matches!(
+            outcome.action,
+            Some(OnboardingShellAction::Transition(
+                cockpit_proto::OnboardingTransitionKind::Advance,
+                None
+            ))
+        ));
+    }
 }

@@ -6,12 +6,12 @@
 //! confirmation. The screen only produces a redacted
 //! [`SecureStoreSubmission`]; the daemon owns vault materialization.
 
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use super::theme::{BAD, BRASS, FOG, INK};
 
 /// The sensitive ingress rejects passphrases past this byte length; enforce
 /// the same cap *before* buffering so an oversized paste is rejected at
@@ -83,15 +83,15 @@ impl SecureStoreScreen {
     pub(crate) fn handle_key(&mut self, key: KeyEvent) {
         match self.phase {
             SecureStoreInputPhase::Choice => match key.code {
-                KeyCode::Up => {
-                    self.cursor = self.cursor.saturating_sub(1);
+                KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
+                    self.cursor = crate::tui::nav::wrap_prev(self.cursor, 3);
                     self.status = None;
                 }
-                KeyCode::Down => {
-                    self.cursor = (self.cursor + 1).min(2);
+                KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+                    self.cursor = crate::tui::nav::wrap_next(self.cursor, 3);
                     self.status = None;
                 }
-                KeyCode::Enter => self.confirm_selection(self.cursor),
+                KeyCode::Enter | KeyCode::Char(' ') => self.confirm_selection(self.cursor),
                 _ => {}
             },
             SecureStoreInputPhase::Passphrase | SecureStoreInputPhase::Confirmation => {
@@ -164,9 +164,21 @@ impl SecureStoreScreen {
         else {
             return;
         };
-        self.cursor = index;
-        self.status = None;
-        self.confirm_selection(index);
+        if self.cursor == index {
+            self.confirm_selection(index);
+        } else {
+            self.cursor = index;
+            self.status = None;
+        }
+    }
+
+    pub(crate) fn confirm_focused(&mut self) {
+        match self.phase {
+            SecureStoreInputPhase::Choice => self.confirm_selection(self.cursor),
+            SecureStoreInputPhase::Passphrase | SecureStoreInputPhase::Confirmation => {
+                self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            }
+        }
     }
 
     fn confirm_selection(&mut self, cursor: usize) {
@@ -213,10 +225,8 @@ impl SecureStoreScreen {
     }
 
     pub(crate) fn lines(&self) -> Vec<Line<'static>> {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        let selected = Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD);
+        let muted = Style::default().fg(FOG);
+        let selected = Style::default().fg(BRASS).add_modifier(Modifier::BOLD);
         let mut lines = vec![
             Line::from("Choose where Cockpit encrypts credentials before adding a provider."),
             Line::from(Span::styled(
@@ -240,13 +250,13 @@ impl SecureStoreScreen {
                 ];
                 for (index, (label, description)) in choices.into_iter().enumerate() {
                     lines.push(Line::from(vec![
-                        Span::raw(if self.cursor == index { "▸ " } else { "  " }),
+                        Span::raw(if self.cursor == index { "› " } else { "  " }),
                         Span::styled(
                             label,
                             if self.cursor == index {
                                 selected
                             } else {
-                                Style::default()
+                                Style::default().fg(INK)
                             },
                         ),
                         Span::raw("  "),
@@ -265,7 +275,7 @@ impl SecureStoreScreen {
         }
         if let Some(status) = self.status.as_deref() {
             lines.push(Line::default());
-            lines.push(Line::from(Span::styled(status.to_string(), Color::Red)));
+            lines.push(Line::from(Span::styled(status.to_string(), BAD)));
         }
         lines
     }

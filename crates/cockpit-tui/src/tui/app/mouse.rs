@@ -80,7 +80,7 @@ impl App {
                 .onboarding_shell
                 .as_mut()
                 .expect("shell presence checked above")
-                .handle_mouse(mouse);
+                .handle_mouse(mouse, &mut self.dialog);
             if outcome.consumed {
                 self.apply_onboarding_shell_action(outcome.action);
                 return;

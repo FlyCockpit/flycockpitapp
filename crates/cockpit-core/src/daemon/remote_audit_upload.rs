@@ -811,9 +811,9 @@ mod tests {
         .unwrap();
         let credential = credential("http://127.0.0.1:1".to_string());
         let vault = crate::secure_key::vault_for_db(&db).unwrap();
-        let error = build_batch(&db, &credential, 0, Some(&vault))
-            .await
-            .expect_err("unreadable table must fail the batch");
+        let Err(error) = build_batch(&db, &credential, 0, Some(&vault)).await else {
+            panic!("unreadable table must fail the batch");
+        };
         assert!(
             crate::redact::RedactionTableUnavailable::in_chain(&error),
             "unreadable table must be a typed redaction failure: {error:#}"

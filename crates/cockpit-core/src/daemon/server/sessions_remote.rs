@@ -4,12 +4,13 @@
 //! FCOR identities, remote replay/outbox state, and transactional remote
 //! mutation composition for sessions.
 
-use super::authz::{ClientPrincipal, session_access_for_row};
+use super::authz::session_access_for_row;
 use super::sessions::{
     btw_info_to_proto, detach_if_attached_to_discard_lineage, stop_ephemeral_discard_lineage,
     stop_subtree,
 };
 use super::*;
+use crate::daemon::principal::ClientPrincipal;
 
 #[derive(Debug, thiserror::Error)]
 #[error("unknown session {0}")]
@@ -536,7 +537,7 @@ pub(super) async fn delete_session(
                     result_blob_dir.display()
                 )));
             }
-            Err(error) => return Err(internal(error.into())),
+            Err(error) => return Err(internal(error)),
         }
     }
     let now_wall_ms = super::run_invocation::wall_ms_now();

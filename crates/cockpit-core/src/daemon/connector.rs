@@ -1186,7 +1186,9 @@ mod tests {
                 }
                 other => panic!("expected legacy relay scopes, got {other:?}"),
             },
-            ClientPrincipal::Owner => panic!("relay wire must not self-assert owner"),
+            ClientPrincipal::Owner | ClientPrincipal::Local(_) => {
+                panic!("relay wire must not produce a local principal")
+            }
         }
     }
 
@@ -1213,7 +1215,9 @@ mod tests {
                 }
                 other => panic!("expected legacy relay scopes, got {other:?}"),
             },
-            ClientPrincipal::Owner => panic!("relay wire must not self-assert owner"),
+            ClientPrincipal::Owner | ClientPrincipal::Local(_) => {
+                panic!("relay wire must not produce a local principal")
+            }
         }
     }
 

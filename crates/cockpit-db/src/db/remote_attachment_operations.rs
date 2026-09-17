@@ -1665,7 +1665,7 @@ mod tests {
             now_ms: 1,
         };
         let applied = db
-            .execute_transactional_remote_operation(request(), |conn| {
+            .execute_transactional_remote_operation(request(), move |conn| {
                 conn.execute(
                     "UPDATE remote_attachment_operations SET updated_at_ms=2 WHERE operation_id=?1",
                     [operation],
@@ -1709,7 +1709,7 @@ mod tests {
         failed.operation_id = failed_operation;
         failed.request_hash = [7; 32];
         assert!(
-            db.execute_transactional_remote_operation::<(), _>(failed, |conn| {
+            db.execute_transactional_remote_operation::<(), _>(failed, move |conn| {
                 conn.execute(
                     "UPDATE remote_attachment_operations SET updated_at_ms=2 WHERE operation_id=?1",
                     [failed_operation],
@@ -1720,13 +1720,14 @@ mod tests {
             .is_err()
         );
         assert_eq!(
-            db.read(|conn| {
-                conn.query_row(
-                    "SELECT updated_at_ms FROM remote_attachment_operations WHERE operation_id=?1",
-                    [failed_operation],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()
+            db.read(move |conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT updated_at_ms FROM remote_attachment_operations WHERE operation_id=?1",
+                        [failed_operation],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?)
             })
             .await
             .unwrap(),
@@ -1737,7 +1738,7 @@ mod tests {
         retry.operation_id = failed_operation;
         retry.request_hash = [7; 32];
         let retried = db
-            .execute_transactional_remote_operation(retry, |conn| {
+            .execute_transactional_remote_operation(retry, |_conn| {
                 Ok(TransactionalRemoteMutation {
                     value: 2_u8,
                     safe_response: b"two".to_vec(),

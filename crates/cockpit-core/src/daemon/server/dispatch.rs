@@ -4692,7 +4692,12 @@ pub(super) fn bulk_user_message_transfer_owner_local(
     principal: &ClientPrincipal,
     session_id: Uuid,
 ) -> std::result::Result<crate::daemon::bulk_staging::BulkTransferOwner, ErrorPayload> {
-    bulk_user_message_transfer_owner_impl(principal, session_id)
+    bulk_user_message_transfer_owner_impl(
+        principal,
+        session_id,
+        #[cfg(feature = "remote")]
+        None,
+    )
 }
 
 #[cfg(feature = "remote")]
@@ -4735,7 +4740,11 @@ fn bulk_user_message_replay_actor_impl(
 pub(super) fn bulk_user_message_replay_actor_local(
     principal: &ClientPrincipal,
 ) -> std::result::Result<crate::db::message_attachments::MessageActor, ErrorPayload> {
-    bulk_user_message_replay_actor_impl(principal)
+    bulk_user_message_replay_actor_impl(
+        principal,
+        #[cfg(feature = "remote")]
+        None,
+    )
 }
 
 #[cfg(feature = "remote")]
@@ -5048,7 +5057,14 @@ pub(super) async fn handle_serialized_request_with_id(
     effects: &mut ClientRequestEffects,
 ) -> std::result::Result<Response, ErrorPayload> {
     Box::pin(handle_serialized_request_impl(
-        request_id, request, state, shared, ctx, effects,
+        request_id,
+        request,
+        state,
+        shared,
+        ctx,
+        effects,
+        #[cfg(feature = "remote")]
+        None,
     ))
     .await
 }
@@ -5656,11 +5672,11 @@ pub(super) async fn execute_remote_staged_rename_with_hook(
         PrepareRemoteRenameOutcome::Prepared(value)
         | PrepareRemoteRenameOutcome::Reconcile(value) => value,
         PrepareRemoteRenameOutcome::Replay(bytes) => {
-            cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
+            cleanup_remote_rename_artifacts(ctx, &journal, &attachment, &operation_id).await;
             return serde_json::from_slice(&bytes).map_err(internal);
         }
         PrepareRemoteRenameOutcome::OutcomeUnknown(_) => {
-            cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
+            cleanup_remote_rename_artifacts(ctx, &journal, &attachment, &operation_id).await;
             return Err(ErrorPayload {
                 code: ErrorCode::Conflict,
                 message: "remote rename outcome is unknown and will not be redispatched".into(),
@@ -5694,7 +5710,7 @@ pub(super) async fn execute_remote_staged_rename_with_hook(
             )
             .await
             .map_err(internal)?;
-        cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
+        cleanup_remote_rename_artifacts(ctx, &journal, &attachment, &operation_id).await;
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
             message: "rename authority changed during recovery".into(),
@@ -5724,7 +5740,7 @@ pub(super) async fn execute_remote_staged_rename_with_hook(
                 )
                 .await
                 .map_err(internal)?;
-            cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
+            cleanup_remote_rename_artifacts(ctx, &journal, &attachment, &operation_id).await;
             return Err(ErrorPayload {
                 code: ErrorCode::Conflict,
                 message: "rename artifact binding mismatch; outcome is unknown".into(),
@@ -5742,7 +5758,7 @@ pub(super) async fn execute_remote_staged_rename_with_hook(
                     )
                     .await
                     .map_err(internal)?;
-                cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
+                cleanup_remote_rename_artifacts(ctx, &journal, &attachment, &operation_id).await;
                 return Err(internal(error));
             }
         }
@@ -5757,7 +5773,7 @@ pub(super) async fn execute_remote_staged_rename_with_hook(
                 )
                 .await
                 .map_err(internal)?;
-            cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
+            cleanup_remote_rename_artifacts(ctx, &journal, &attachment, &operation_id).await;
             return Err(internal(error));
         }
     }
@@ -5774,7 +5790,7 @@ pub(super) async fn execute_remote_staged_rename_with_hook(
                 )
                 .await
                 .map_err(internal)?;
-            cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
+            cleanup_remote_rename_artifacts(ctx, &journal, &attachment, &operation_id).await;
             return Err(ErrorPayload {
                 code: ErrorCode::Conflict,
                 message: "rename source changed after reservation; outcome is closed as unknown"
@@ -5784,7 +5800,7 @@ pub(super) async fn execute_remote_staged_rename_with_hook(
         if target_parent.require_entry_absent(&target_name).is_err() {
             return close_remote_rename_effect_unknown(
                 ctx,
-                journal,
+                &journal,
                 &attachment,
                 &operation_id,
                 evidence.dispatch_generation,
@@ -5825,7 +5841,7 @@ pub(super) async fn execute_remote_staged_rename_with_hook(
                 if target_parent.require_entry_absent(&target_name).is_err() {
                     return close_remote_rename_effect_unknown(
                         ctx,
-                        journal,
+                        &journal,
                         &attachment,
                         &operation_id,
                         evidence.dispatch_generation,
@@ -5851,7 +5867,7 @@ pub(super) async fn execute_remote_staged_rename_with_hook(
                             )
                             .await
                             .map_err(internal)?;
-                        cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id)
+                        cleanup_remote_rename_artifacts(ctx, &journal, &attachment, &operation_id)
                             .await;
                         return Err(ErrorPayload { code: ErrorCode::Conflict, message: "rename target appeared during dispatch; outcome is closed as unknown".into() });
                     }
@@ -5871,7 +5887,7 @@ pub(super) async fn execute_remote_staged_rename_with_hook(
                             )
                             .await
                             .map_err(internal)?;
-                        cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id)
+                        cleanup_remote_rename_artifacts(ctx, &journal, &attachment, &operation_id)
                             .await;
                         return Err(ErrorPayload {
                             code: ErrorCode::Conflict,
@@ -5895,7 +5911,7 @@ pub(super) async fn execute_remote_staged_rename_with_hook(
                     )
                     .await
                     .map_err(internal)?;
-                cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
+                cleanup_remote_rename_artifacts(ctx, &journal, &attachment, &operation_id).await;
                 return Err(ErrorPayload {
                     code: ErrorCode::Conflict,
                     message: "rename filesystem evidence is ambiguous; outcome is unknown".into(),
@@ -5983,7 +5999,7 @@ pub(super) async fn execute_remote_staged_rename_with_hook(
     {
         CommitRemoteOperationOutcome::Committed { .. } => {
             after_barrier("ledger_committed")?;
-            cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
+            cleanup_remote_rename_artifacts(ctx, &journal, &attachment, &operation_id).await;
             Ok(response)
         }
         _ => Err(ErrorPayload {
@@ -21241,7 +21257,14 @@ pub(super) async fn handle_concurrent_request(
     shared: Arc<SharedClientState>,
     ctx: Arc<DaemonContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    handle_concurrent_request_impl(request, shared, ctx).await
+    handle_concurrent_request_impl(
+        request,
+        shared,
+        ctx,
+        #[cfg(feature = "remote")]
+        None,
+    )
+    .await
 }
 
 #[cfg(feature = "remote")]
@@ -25812,7 +25835,6 @@ fn retain_only_stale_provider_credentials(
     cleanup.retain(|_, references| !references.is_empty());
 }
 
-#[cfg(any(unix, test))]
 pub(super) async fn recover_all_provider_config_journals(
     ctx: &DaemonContext,
     publication: crate::daemon::config_publication_recovery::PreSocketConfigPublication,
@@ -27873,7 +27895,6 @@ fn reconcile_mcp_journal_file(
     Ok(())
 }
 
-#[cfg(any(unix, test))]
 pub(super) async fn recover_all_mcp_config_journals(
     ctx: &DaemonContext,
     publication: crate::daemon::config_publication_recovery::PreSocketConfigPublication,

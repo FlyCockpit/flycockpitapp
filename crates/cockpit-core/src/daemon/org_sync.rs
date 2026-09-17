@@ -912,7 +912,7 @@ mod tests {
             .await
             .unwrap();
         crate::session::lifecycle::write_redaction_table_json_to_vault(
-            db,
+            &db,
             session.session_id,
             &RedactionTable::empty().to_persisted_json().unwrap(),
         )
@@ -1172,7 +1172,7 @@ mod tests {
             .await
             .unwrap();
         crate::session::lifecycle::write_redaction_table_json_to_vault(
-            db,
+            &db,
             session.session_id,
             &RedactionTable::empty().to_persisted_json().unwrap(),
         )

@@ -1913,8 +1913,8 @@ mod tests {
         );
         let args: Vec<_> = invocation.get_args().collect();
         assert_eq!(args[0], "-NoProfile");
-        assert!(args.contains(&"-NonInteractive"));
-        assert!(args.contains(&"-Command"));
+        assert!(args.contains(&std::ffi::OsStr::new("-NonInteractive")));
+        assert!(args.contains(&std::ffi::OsStr::new("-Command")));
         let script = args
             .last()
             .expect("the script is the final argument")

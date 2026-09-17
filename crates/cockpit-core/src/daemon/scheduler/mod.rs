@@ -3067,6 +3067,7 @@ mod tests {
             shutdown.clone(),
             Arc::new(RecordingSleeper::default()),
             None,
+            None,
         );
         let callback = callback_job(
             "system-boundary",

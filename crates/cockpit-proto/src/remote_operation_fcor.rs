@@ -843,6 +843,97 @@ impl CanonicalFcorValueV1 for crate::RedactedOccurrenceMutation {
     }
 }
 
+macro_rules! canonical_serde_json_value {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl CanonicalFcorValueV1 for $ty {
+                fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+                    serde_json::to_string(self)
+                        .with_context(|| concat!("encoding ", stringify!($ty), " for F-COR"))?
+                        .encode_fcor_value_v1(out)
+                }
+            }
+        )+
+    };
+}
+
+canonical_unit_enum16!(crate::NonCodeSessionEntryMode, {
+    Assistant = 1,
+    Computer = 2,
+});
+canonical_unit_enum16!(crate::QueueDeliveryClass, {
+    Steering = 1,
+    Held = 2,
+});
+canonical_unit_enum16!(crate::InputPredictionMode, {
+    Short = 1,
+    Long = 2,
+});
+canonical_unit_enum16!(crate::image_sidecar_authority::ImageSidecarGrantScopeV1, {
+    Once = 1,
+    Session = 2,
+    Project = 3,
+});
+canonical_unit_enum16!(crate::GuidanceProposalDecision, {
+    Reject = 1,
+    AcceptSession = 2,
+    AcceptPersistent = 3,
+});
+canonical_unit_enum16!(crate::QueueEditAction, {
+    Reserve = 1,
+    Commit = 2,
+    Release = 3,
+});
+
+impl CanonicalFcorValueV1 for crate::GitReadSource {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        let mut nested = CanonicalParamsV1::new();
+        match self {
+            crate::GitReadSource::Worktree => nested.push_u16(1),
+            crate::GitReadSource::Staged => nested.push_u16(2),
+            crate::GitReadSource::Unstaged => nested.push_u16(3),
+            crate::GitReadSource::Unpushed => nested.push_u16(4),
+            crate::GitReadSource::PullRequest(value) => {
+                nested.push_u16(5);
+                value.encode_fcor_value_v1(&mut nested)?;
+            }
+        }
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
+
+canonical_struct!(crate::AgentTreeCursor, self, out, [created_at_unix_ms, id]);
+canonical_struct!(
+    crate::QueueItemReplacement,
+    self,
+    out,
+    [operation_id, action, text, display_text, tag_expansions]
+);
+
+canonical_serde_json_value!(
+    crate::BeginOrReopenOnboarding,
+    crate::ApplyOnboardingTransition,
+    crate::OnboardingReceiptQuery,
+    crate::AgentDecisionAnswer,
+    crate::SealedActionDeclaration,
+    crate::session_override::AgentSessionOverrideFieldV1,
+    crate::ProviderMutationBatch,
+    crate::InputPredictionTurn,
+    crate::StorageCleanupTarget,
+    crate::CreateCodeRootV1Request,
+    crate::AttachExistingCodeRootV1Request,
+    crate::CloseCodeRootAttachmentV1Request,
+    crate::DiscoverCodeRootsV1Request,
+    crate::ReadCodeRootV1Request,
+    crate::ReadCodeRootDeliveriesV1Request,
+    crate::AckCodeRootDeliveriesV1Request,
+    crate::CreateCodeRootWithAcpIngressV1Request,
+    crate::AttachExistingCodeRootWithAcpIngressV1Request,
+    crate::CloseAcpCodeRootAttachmentV1Request,
+    crate::ResolveCodeRootInterruptV1,
+);
+
 // The denylist literal and the redacted-occurrence replacement are
 // `SensitiveWireLiteral`, so the nested encodings above resolve to the
 // sealed-literal placeholder and no plaintext reaches this canonical buffer.

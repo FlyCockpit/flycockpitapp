@@ -7244,7 +7244,7 @@ pub(super) async fn run_worker(
                             .base_tier_known_cost_threshold_usd_micros(),
                         (*extended_cfg.media_resources).clone(),
                         Arc::new(SessionImageClock(image_generation_started_at)),
-                        media_storage_recovery,
+                        media_storage_recovery.clone(),
                         extended_cfg.image_generation.clone(),
                         adapters,
                     );

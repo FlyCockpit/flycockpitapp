@@ -143,6 +143,7 @@ impl Db {
         updated_at: i64,
     ) -> Result<ConditionalScheduledJob<ScheduledJobRow>> {
         self.write(move |conn| {
+            let job_id = expected.id.clone();
             let changed = conn
                 .execute(
                     "UPDATE scheduled_jobs
@@ -163,9 +164,9 @@ impl Db {
                 )
                 .context("conditionally updating scheduled job enabled state")?;
             if changed == 0 {
-                return conditional_scheduled_job_result(conn, &expected.id, changed, ());
+                return conditional_scheduled_job_result(conn, &job_id, changed, expected);
             }
-            let row = get_scheduled_job_conn(conn, &expected.id)?
+            let row = get_scheduled_job_conn(conn, &job_id)?
                 .ok_or_else(|| anyhow::anyhow!("scheduled job missing after conditional update"))?;
             Ok(ConditionalScheduledJob::Applied(row))
         })
@@ -180,6 +181,7 @@ impl Db {
         expected: ScheduledJobRow,
     ) -> Result<ConditionalScheduledJob<ScheduledJobRow>> {
         self.write(move |conn| {
+            let job_id = expected.id.clone();
             let changed = conn
                 .execute(
                     "UPDATE scheduled_jobs
@@ -189,9 +191,9 @@ impl Db {
                 )
                 .context("conditionally claiming scheduled job manual run")?;
             if changed == 0 {
-                return conditional_scheduled_job_result(conn, &expected.id, changed, ());
+                return conditional_scheduled_job_result(conn, &job_id, changed, expected);
             }
-            let row = get_scheduled_job_conn(conn, &expected.id)?
+            let row = get_scheduled_job_conn(conn, &job_id)?
                 .ok_or_else(|| anyhow::anyhow!("scheduled job missing after conditional claim"))?;
             Ok(ConditionalScheduledJob::Applied(row))
         })

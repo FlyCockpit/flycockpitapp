@@ -25,6 +25,7 @@
 
 pub(crate) mod agent;
 mod chrome;
+mod profile;
 mod search;
 mod secure_store;
 mod theme;
@@ -41,7 +42,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph, Wrap};
 
 use crate::tui::settings::Dialog;
 use chrome::ActionBar;
@@ -50,9 +51,10 @@ use cockpit_proto::{
     OnboardingBootstrapSnapshot, OnboardingBootstrapState, OnboardingStage,
     OnboardingStageSettlement, OnboardingTransitionKind,
 };
-use search::ProviderSearchScreen;
+use profile::ProfileScreen;
+use search::{ProviderSearchScreen, onboarding_catalog};
 use secure_store::SecureStoreScreen;
-use theme::{BRASS, FOG, HOVER_BG, INK, NIGHT};
+use theme::{BRASS, FOG, GOOD, HOVER_BG, INK, NIGHT};
 
 pub use secure_store::SecureStoreSubmission;
 
@@ -113,7 +115,7 @@ fn welcome_cloud_seed() -> u64 {
 /// `Dialog` daemon-effect accessors; the shell records the pairing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EngineStage {
-    Profile,
+    Generic,
     Provider,
     Model,
     Agent,
@@ -123,14 +125,14 @@ pub(crate) enum EngineStage {
 impl EngineStage {
     fn for_stage(stage: OnboardingStage) -> Option<Self> {
         match stage {
-            OnboardingStage::Profile => Some(Self::Profile),
             OnboardingStage::Provider => Some(Self::Provider),
             OnboardingStage::Model => Some(Self::Model),
             OnboardingStage::Agent => Some(Self::Agent),
             OnboardingStage::Lifetime => Some(Self::Lifetime),
-            OnboardingStage::Welcome | OnboardingStage::SecureStore | OnboardingStage::Complete => {
-                None
-            }
+            OnboardingStage::Welcome
+            | OnboardingStage::Profile
+            | OnboardingStage::SecureStore
+            | OnboardingStage::Complete => None,
         }
     }
 }
@@ -140,6 +142,7 @@ impl EngineStage {
 /// setup wizard); the shell still owns chrome, navigation, and semantics.
 pub(crate) enum OnboardingScreen {
     Welcome,
+    Profile(ProfileScreen),
     SecureStore(Box<SecureStoreScreen>),
     ProviderSearch(Box<ProviderSearchScreen>),
     AgentAuthoring(Box<agent::AgentAuthoringScreen>),
@@ -152,6 +155,7 @@ pub(crate) enum OnboardingScreen {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OnboardingScreenKind {
     Welcome,
+    Profile,
     SecureStore,
     ProviderSearch,
     AgentAuthoring,
@@ -165,6 +169,7 @@ impl std::fmt::Debug for OnboardingScreen {
         // passphrase state that must never be formatted.
         match self {
             Self::Welcome => formatter.write_str("Welcome"),
+            Self::Profile(_) => formatter.write_str("Profile"),
             Self::SecureStore(_) => formatter.write_str("SecureStore([REDACTED])"),
             Self::ProviderSearch(_) => formatter.write_str("ProviderSearch"),
             Self::AgentAuthoring(_) => formatter.write_str("AgentAuthoring"),
@@ -183,6 +188,8 @@ pub(crate) enum OnboardingShellAction {
     /// Apply the chosen secure-store placement through the sensitive
     /// daemon ingress.
     SecureIntent(SecureStoreSubmission),
+    /// Apply the native profile field through the existing setup-wizard authority.
+    ApplyProfile(String),
     /// Seed the provider engine with the selected canonical template.
     SelectTemplate(&'static ProviderTemplate),
     /// Leave the "add another provider" detour and present the stored
@@ -208,6 +215,7 @@ impl std::fmt::Debug for OnboardingShellAction {
             // The submission may carry the passphrase ingress; it never
             // receives a payload-bearing representation.
             Self::SecureIntent(_) => formatter.write_str("SecureIntent([REDACTED])"),
+            Self::ApplyProfile(_) => formatter.write_str("ApplyProfile([REDACTED])"),
             Self::SelectTemplate(template) => formatter
                 .debug_tuple("SelectTemplate")
                 .field(&template.id)
@@ -464,6 +472,7 @@ impl OnboardingShell {
             // still show the profile step (esc: options, back) instead of a
             // "press any key" screen whose key handler is a no-op (#425).
             OnboardingStage::Welcome => OnboardingScreen::Welcome,
+            OnboardingStage::Profile => OnboardingScreen::Profile(ProfileScreen::new()),
             OnboardingStage::SecureStore => OnboardingScreen::SecureStore(Box::new(
                 SecureStoreScreen::new(snapshot.host_capabilities.clone()),
             )),
@@ -566,6 +575,7 @@ impl OnboardingShell {
     pub(crate) fn screen_kind(&self) -> OnboardingScreenKind {
         match &self.screen {
             OnboardingScreen::Welcome => OnboardingScreenKind::Welcome,
+            OnboardingScreen::Profile(_) => OnboardingScreenKind::Profile,
             OnboardingScreen::SecureStore(_) => OnboardingScreenKind::SecureStore,
             OnboardingScreen::ProviderSearch(_) => OnboardingScreenKind::ProviderSearch,
             OnboardingScreen::AgentAuthoring(_) => OnboardingScreenKind::AgentAuthoring,
@@ -828,6 +838,9 @@ impl OnboardingShell {
         if self.completion_detour {
             return true;
         }
+        if let OnboardingScreen::SecureStore(screen) = &self.screen {
+            return !matches!(screen.phase, secure_store::SecureStoreInputPhase::Choice);
+        }
         !matches!(
             self.stage,
             OnboardingStage::Welcome | OnboardingStage::Provider
@@ -857,6 +870,9 @@ impl OnboardingShell {
                 } else {
                     None
                 }
+            }
+            OnboardingScreen::Profile(screen) => {
+                screen.submit().map(OnboardingShellAction::ApplyProfile)
             }
             OnboardingScreen::SecureStore(screen) => {
                 screen.confirm_focused();
@@ -901,6 +917,10 @@ impl OnboardingShell {
         if self.completion_detour {
             self.return_to_completion();
             return Some(OnboardingShellAction::ReturnToCompletion);
+        }
+        if let OnboardingScreen::SecureStore(screen) = &mut self.screen {
+            screen.return_to_choice();
+            return None;
         }
         Some(OnboardingShellAction::Transition(
             OnboardingTransitionKind::Back,
@@ -952,6 +972,15 @@ impl OnboardingShell {
                     ));
                 }
                 None
+            }
+            OnboardingScreen::Profile(screen) => {
+                if matches!(key.code, KeyCode::Esc) {
+                    self.open_escape_menu(engine);
+                    return None;
+                }
+                screen
+                    .handle_key(key)
+                    .map(OnboardingShellAction::ApplyProfile)
             }
             OnboardingScreen::SecureStore(screen) => {
                 if matches!(key.code, KeyCode::Esc)
@@ -1092,7 +1121,7 @@ impl OnboardingShell {
         self.back_hover = chrome::hit(self.back_rect, pos);
         self.actions.track(pos);
         match mouse.kind {
-            MouseEventKind::Moved | MouseEventKind::Drag(_) => PointerOutcome::consumed(),
+            MouseEventKind::Moved => PointerOutcome::consumed(),
             MouseEventKind::Down(MouseButton::Left) if chrome::hit(self.back_rect, pos) => {
                 match self.activate_back() {
                     Some(action) => PointerOutcome::acted(action),
@@ -1125,6 +1154,22 @@ impl OnboardingShell {
         engine: &mut Dialog,
     ) -> PointerOutcome {
         match (&self.screen, index) {
+            (OnboardingScreen::SecureStore(screen), Some(0))
+                if !matches!(screen.phase, secure_store::SecureStoreInputPhase::Choice) =>
+            {
+                if let OnboardingScreen::SecureStore(screen) = &mut self.screen {
+                    screen.toggle_reveal();
+                }
+                PointerOutcome::consumed()
+            }
+            (OnboardingScreen::SecureStore(screen), Some(1))
+                if !matches!(screen.phase, secure_store::SecureStoreInputPhase::Choice) =>
+            {
+                match self.activate_primary(engine) {
+                    Some(action) => PointerOutcome::acted(action),
+                    None => PointerOutcome::consumed(),
+                }
+            }
             (OnboardingScreen::Complete { .. }, Some(0)) => {
                 self.begin_completion_provider_detour(Some(
                     "Add another provider; live validation is required.".into(),
@@ -1143,6 +1188,15 @@ impl OnboardingShell {
 
     fn handle_content_mouse(&mut self, mouse: MouseEvent, pos: Position) -> PointerOutcome {
         match &mut self.screen {
+            OnboardingScreen::Profile(screen) => {
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    && chrome::hit(screen.field_rect(), pos)
+                {
+                    PointerOutcome::consumed()
+                } else {
+                    PointerOutcome::ignored()
+                }
+            }
             OnboardingScreen::SecureStore(screen) => {
                 let over_list = chrome::hit(self.list_area, pos);
                 match mouse.kind {
@@ -1244,6 +1298,7 @@ impl OnboardingShell {
     /// Paste into the focused shell field (search query or passphrase).
     pub(crate) fn paste(&mut self, text: &str) {
         match &mut self.screen {
+            OnboardingScreen::Profile(screen) => screen.paste(text),
             OnboardingScreen::ProviderSearch(screen) => screen.paste_query(text),
             OnboardingScreen::SecureStore(screen) => screen.paste(text),
             OnboardingScreen::AgentAuthoring(screen) => screen.paste(text),
@@ -1284,7 +1339,11 @@ impl OnboardingShell {
             return;
         }
 
-        let back_visible = true;
+        let back_visible = !matches!(
+            &self.screen,
+            OnboardingScreen::SecureStore(screen)
+                if matches!(screen.phase, secure_store::SecureStoreInputPhase::Choice)
+        );
         let back_enabled = self.back_enabled();
         self.back_rect =
             chrome::render_back_button(frame, area, back_visible, back_enabled, self.back_hover);
@@ -1299,18 +1358,25 @@ impl OnboardingShell {
         .split(col);
 
         let title = format!(
-            "Cockpit setup · step {}/{}",
+            "{} · step {}/{}",
+            self.screen_title(),
             progress_index(self.stage) + 1,
             PROGRESS_STEPS.len()
         );
-        let subtitle = self.header_subtitle();
+        let subtitle = self.screen_subtitle();
         ui::render_header(frame, rows[0], &title, &subtitle);
         self.render_progress(frame, rows[1]);
         self.list_area = rows[2];
         match &mut self.screen {
             OnboardingScreen::Welcome => unreachable!("welcome returned above"),
+            OnboardingScreen::Profile(screen) => screen.render(frame, rows[2]),
             OnboardingScreen::SecureStore(screen) => {
-                Self::render_secure_store(frame, rows[2], screen, &mut self.list_row_rects);
+                if matches!(screen.phase, secure_store::SecureStoreInputPhase::Choice) {
+                    Self::render_secure_store(frame, rows[2], screen, &mut self.list_row_rects);
+                } else {
+                    self.list_row_rects.clear();
+                    screen.render_password(frame, rows[2]);
+                }
             }
             OnboardingScreen::ProviderSearch(screen) => {
                 self.list_area =
@@ -1345,8 +1411,29 @@ impl OnboardingShell {
         }
     }
 
-    fn header_subtitle(&self) -> String {
+    fn screen_title(&self) -> &'static str {
+        match self.screen {
+            OnboardingScreen::Welcome => "Welcome",
+            OnboardingScreen::Profile(_) => "What should Cockpit call you?",
+            OnboardingScreen::SecureStore(_) => "Secure your secrets",
+            OnboardingScreen::ProviderSearch(_) => "Let's add a provider",
+            OnboardingScreen::Complete { .. } => "You're ready to fly",
+            OnboardingScreen::AgentAuthoring(_) => "Create your agent",
+            OnboardingScreen::Engine(_) => "Cockpit setup",
+        }
+    }
+
+    fn screen_subtitle(&self) -> String {
         let mut parts = Vec::new();
+        let base = match self.screen {
+            OnboardingScreen::Profile(_) => "Set an optional display name.".to_string(),
+            OnboardingScreen::SecureStore(_) => {
+                "Choose how Cockpit protects your API keys and sealed values.".to_string()
+            }
+            OnboardingScreen::ProviderSearch(_) => "Pick who you'll fly with.".to_string(),
+            OnboardingScreen::Complete { .. } => "Your setup is complete.".to_string(),
+            _ => String::new(),
+        };
         if self.limited_mode {
             parts.push("limited mode".to_string());
         }
@@ -1359,12 +1446,18 @@ impl OnboardingShell {
             }
             _ => {}
         }
+        if !base.is_empty() {
+            parts.push(base);
+        }
         parts.join(" · ")
     }
 
     fn help_text(&self) -> &'static str {
         match &self.screen {
             OnboardingScreen::Welcome => "any key: begin setup  esc: options",
+            OnboardingScreen::Profile(_) => {
+                "type a name or leave blank  enter: continue  esc: options"
+            }
             OnboardingScreen::SecureStore(screen) => screen.help_text(),
             OnboardingScreen::ProviderSearch(screen) => screen.help_text(),
             OnboardingScreen::AgentAuthoring(screen) => screen.help_text(),
@@ -1377,13 +1470,26 @@ impl OnboardingShell {
     fn action_buttons(screen: &OnboardingScreen) -> Vec<chrome::Button<'static>> {
         match screen {
             OnboardingScreen::Welcome => vec![chrome::Button::primary("Continue")],
-            OnboardingScreen::SecureStore(_) => vec![chrome::Button::primary("Continue")],
-            OnboardingScreen::ProviderSearch(_) => vec![chrome::Button::primary("Choose")],
+            OnboardingScreen::Profile(_) => vec![chrome::Button::primary("Continue")],
+            OnboardingScreen::SecureStore(screen)
+                if !matches!(screen.phase, secure_store::SecureStoreInputPhase::Choice) =>
+            {
+                vec![
+                    chrome::Button::secondary("Reveal"),
+                    chrome::Button::primary("Save"),
+                ]
+            }
+            OnboardingScreen::SecureStore(screen) => {
+                vec![chrome::Button::primary("Continue").enabled(screen.row_enabled(screen.cursor))]
+            }
+            OnboardingScreen::ProviderSearch(screen) => {
+                vec![chrome::Button::primary("Choose").enabled(screen.choose_enabled())]
+            }
             OnboardingScreen::AgentAuthoring(_) => vec![chrome::Button::primary("Continue")],
             OnboardingScreen::Engine(_) => vec![chrome::Button::primary("Continue")],
             OnboardingScreen::Complete { .. } => vec![
                 chrome::Button::secondary("Add another provider"),
-                chrome::Button::primary("Done"),
+                chrome::Button::primary("Start coding"),
             ],
         }
     }
@@ -1441,21 +1547,33 @@ impl OnboardingShell {
             );
             y += 1;
         }
-        // Record the three selectable placement rows for pointer input:
-        // they start after the two intro lines and one blank line.
         list_row_rects.clear();
         if matches!(screen.phase, secure_store::SecureStoreInputPhase::Choice) {
             for index in 0..3u16 {
-                let y = area.y + 3 + index;
+                let y = area.y + index;
                 if y < area.bottom() {
-                    list_row_rects.push(Rect {
-                        x: area.x,
-                        y,
-                        width: area.width,
-                        height: 1,
+                    list_row_rects.push(if screen.row_enabled(index as usize) {
+                        Rect {
+                            x: area.x,
+                            y,
+                            width: area.width,
+                            height: 1,
+                        }
+                    } else {
+                        Rect::default()
                     });
                 }
             }
+            let detail_area = Rect {
+                x: area.x,
+                y: (area.y + 4).min(area.bottom()),
+                width: area.width,
+                height: area.height.saturating_sub(4),
+            };
+            frame.render_widget(
+                Paragraph::new(screen.detail_lines()).wrap(Wrap { trim: true }),
+                detail_area,
+            );
         }
     }
 
@@ -1468,7 +1586,8 @@ impl OnboardingShell {
         let chunks = Layout::vertical([
             Constraint::Length(3),
             Constraint::Length(1),
-            Constraint::Min(1),
+            Constraint::Min(6),
+            Constraint::Length(4),
         ])
         .split(area);
         if let Some(caret) = ui::render_field(
@@ -1477,12 +1596,25 @@ impl OnboardingShell {
             "Filter",
             screen.query_field(),
             true,
-            "type to filter",
+            "filter by name",
         ) {
             frame.set_cursor_position(caret);
         }
-        let list_area = chunks[2];
-        let capacity = list_area.height.saturating_sub(1) as usize;
+        let total = onboarding_catalog().len();
+        let filtered = screen.filtered().len();
+        let title = if filtered == total {
+            format!(" Providers  ·  {total} ")
+        } else {
+            format!(" Providers  ·  {filtered} of {total} ")
+        };
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(NIGHT))
+            .title(Span::styled(title, Style::new().fg(INK)))
+            .padding(Padding::horizontal(1));
+        let list_area = block.inner(chunks[2]);
+        frame.render_widget(block, chunks[2]);
+        let capacity = list_area.height as usize;
         screen.observe_viewport(capacity);
         let rows = screen.visible_rows(capacity);
         list_row_rects.clear();
@@ -1523,28 +1655,31 @@ impl OnboardingShell {
                 },
             );
         }
+        let scrollbar_area = Rect {
+            x: list_area.right().saturating_sub(1),
+            y: list_area.y,
+            width: 1,
+            height: list_area.height,
+        };
+        screen.set_scrollbar_area(scrollbar_area);
         ui::render_scrollbar(
             frame,
-            Rect {
-                x: list_area.right().saturating_sub(1),
-                y: list_area.y,
-                width: 1,
-                height: list_area.height,
-            },
+            scrollbar_area,
             screen.filtered().len(),
             capacity.max(1),
             screen.offset_for_scroll(),
         );
         if let Some(status) = screen.status_paragraph() {
-            let y = list_area.bottom().saturating_sub(1).max(list_area.y);
+            frame.render_widget(status, chunks[3]);
+        } else if let Some(lines) = screen.selected_detail() {
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), chunks[3]);
+        } else {
             frame.render_widget(
-                status,
-                Rect {
-                    x: list_area.x,
-                    y,
-                    width: list_area.width.saturating_sub(1),
-                    height: 1,
-                },
+                Paragraph::new(Span::styled(
+                    "Type a few letters to narrow the list.",
+                    Style::new().fg(FOG),
+                )),
+                chunks[3],
             );
         }
         list_area
@@ -1558,7 +1693,6 @@ impl OnboardingShell {
         list_row_rects: &mut Vec<Rect>,
     ) {
         list_row_rects.clear();
-        let muted = Style::default().fg(FOG);
         let head = vec![
             Line::from("Cockpit is ready."),
             Line::from(summary.to_string()),
@@ -1566,44 +1700,18 @@ impl OnboardingShell {
             Line::from("Next: run /setup security to choose project trust and approval defaults."),
             Line::from("Use /help any time to see available commands."),
         ];
-        frame.render_widget(
-            Paragraph::new(head).wrap(Wrap { trim: false }),
-            Rect {
-                x: area.x,
-                y: area.y,
-                width: area.width,
-                height: 5.min(area.height),
-            },
-        );
-        let mut y = area.y + 5;
-        for (index, label) in ["Add another provider", "Start coding"].iter().enumerate() {
-            if y >= area.bottom() {
-                break;
-            }
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    format!("{} {label}", if index == cursor { "›" } else { " " }),
-                    if index == cursor {
-                        Style::default().fg(BRASS).add_modifier(Modifier::BOLD)
-                    } else {
-                        muted
-                    },
-                ))),
-                Rect {
-                    x: area.x,
-                    y,
-                    width: area.width,
-                    height: 1,
-                },
-            );
-            list_row_rects.push(Rect {
-                x: area.x,
-                y,
-                width: area.width,
-                height: 1,
-            });
-            y += 1;
-        }
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(GOOD))
+            .title(Span::styled(
+                " Summary ",
+                Style::new().fg(GOOD).add_modifier(Modifier::BOLD),
+            ))
+            .padding(Padding::horizontal(1));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        frame.render_widget(Paragraph::new(head).wrap(Wrap { trim: false }), inner);
+        let _ = cursor;
     }
 
     fn render_escape_menu(frame: &mut Frame, area: Rect, menu: &mut EscapeMenu) {

@@ -1,10 +1,10 @@
 //! Reducer, render, and pointer tests for the full-screen onboarding shell.
 
-use super::search::{ProviderSearchScreen, filter_catalog, onboarding_catalog};
+use super::search::{filter_catalog, onboarding_catalog, ProviderSearchScreen};
 use super::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::Terminal;
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
@@ -101,11 +101,9 @@ fn render_string(shell: &mut OnboardingShell, width: u16, height: u16, engine: &
 fn welcome_any_key_requests_advance_only_on_welcome_stage() {
     let mut shell = shell_at(OnboardingStage::Welcome);
     let mut engine = Dialog::None;
-    assert!(
-        shell
-            .handle_key(key(KeyCode::Char(' ')), &mut engine)
-            .is_none()
-    );
+    assert!(shell
+        .handle_key(key(KeyCode::Char(' ')), &mut engine)
+        .is_none());
     shell.set_frame_for_golden(WELCOME_ANIMATION_FRAMES);
     assert!(matches!(
         shell.handle_key(key(KeyCode::Char(' ')), &mut engine),
@@ -128,20 +126,20 @@ fn welcome_ignores_early_clicks_but_escape_opens_options() {
 }
 
 #[test]
-fn profile_stage_presents_its_own_engine_screen_and_step() {
-    // Profile is un-collapsed from Welcome (#425): the stage owns the second
-    // progress step and its engine screen, so a failed profile-engine mount
-    // can no longer strand the user on a "press any key" screen whose key
-    // handler ignores the stage.
+fn profile_stage_presents_its_native_screen_and_step() {
     let mut shell = shell_at(OnboardingStage::Profile);
     let mut engine = Dialog::None;
-    assert_eq!(shell.screen_kind(), OnboardingScreenKind::Engine);
+    assert_eq!(shell.screen_kind(), OnboardingScreenKind::Profile);
     let rendered = render_string(&mut shell, 110, 32, &engine);
     assert!(rendered.contains("step 2/8"), "{rendered}");
-    assert!(rendered.contains("Profile"), "{rendered}");
-    // A bare key neither advances the stage nor strands it: keys route to
-    // the (unmounted) engine and only Escape offers the escape hatch.
-    assert!(shell.handle_key(key(KeyCode::Enter), &mut engine).is_none());
+    assert!(
+        rendered.contains("What should Cockpit call you?"),
+        "{rendered}"
+    );
+    assert!(matches!(
+        shell.handle_key(key(KeyCode::Enter), &mut engine),
+        Some(OnboardingShellAction::ApplyProfile(_))
+    ));
     assert!(shell.handle_key(key(KeyCode::Esc), &mut engine).is_none());
     let rendered = render_string(&mut shell, 110, 32, &engine);
     assert!(rendered.contains("Leave setup?"), "{rendered}");
@@ -564,6 +562,7 @@ fn search_disabled_template_surfaces_reason_and_blocks_selection() {
         .find(|template| template.id == "grok-oauth")
         .expect("grok-oauth stays visible for discoverability");
     assert!(disabled.is_disabled());
+    shell.handle_key(key(KeyCode::Down), &mut engine);
     let action = shell.handle_key(key(KeyCode::Enter), &mut engine);
     assert!(
         action.is_none(),
@@ -677,6 +676,9 @@ fn search_pointer_hit_selects_the_clicked_row() {
     };
     render_string(&mut shell, 80, 24, &engine);
     let first_row = shell.list_row_rects[0];
+    let first = shell.handle_mouse(click(first_row.x, first_row.y), &mut engine);
+    assert!(first.consumed);
+    assert!(first.action.is_none(), "first click only selects");
     let outcome = shell.handle_mouse(click(first_row.x, first_row.y), &mut engine);
     match outcome.action {
         Some(OnboardingShellAction::SelectTemplate(template)) => {
@@ -891,7 +893,7 @@ fn chrome_shows_progress_and_limited_mode_at_both_sizes() {
         let mut shell = shell_at(OnboardingStage::SecureStore);
         let engine = Dialog::None;
         let rendered = render_string(&mut shell, width, height, &engine);
-        assert!(rendered.contains("Cockpit setup"), "{width}x{height}");
+        assert!(rendered.contains("Secure your secrets"), "{width}x{height}");
         assert!(rendered.contains("Welcome"), "{width}x{height}");
         assert!(rendered.contains("Provider"), "{width}x{height}");
         assert!(rendered.contains("Secure store"), "{width}x{height}");
@@ -933,16 +935,10 @@ fn provider_auth_engine_renders_inside_full_screen_chrome_at_narrow_and_wide_siz
 fn setup_engine_stages_share_shell_chrome_at_narrow_and_wide_sizes() {
     let home = tempfile::tempdir().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(home.path());
-    let cases = [
-        (
-            OnboardingStage::Profile,
-            cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
-        ),
-        (
-            OnboardingStage::Lifetime,
-            cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
-        ),
-    ];
+    let cases = [(
+        OnboardingStage::Lifetime,
+        cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
+    )];
 
     for (stage, wizard_id) in cases {
         let engine = Dialog::onboarding_wizard_engine(wizard_id, None, None).unwrap();

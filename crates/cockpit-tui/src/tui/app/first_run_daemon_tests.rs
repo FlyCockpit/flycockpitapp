@@ -268,7 +268,7 @@ fn sync_config_generation_after_agent_apply(app: &mut App, generation: u64) {
 }
 
 fn settle_agent_via_real_daemon_rpc(app: &mut App) {
-    use cockpit_core::authoring_draft::{AgentAuthoringDraft, build_package_draft};
+    use cockpit_core::authoring_draft::{build_package_draft, AgentAuthoringDraft};
     use cockpit_proto::{ApplyAuthoredAgentPackageRequest, AuthoredAgentOnboardingCorrelation};
 
     pump_onboarding(
@@ -443,8 +443,7 @@ fn advance_real_first_run_to_provider(app: &mut App, root: &std::path::Path) {
         app,
         |app| {
             stage(app) == Some(OnboardingStage::Profile)
-                && app.dialog.test_page_name()
-                    == Some(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID)
+                && shell_kind(app) == Some(crate::tui::onboarding::OnboardingScreenKind::Profile)
         },
         "the real locked Welcome→Profile advance",
     );
@@ -458,12 +457,6 @@ fn advance_real_first_run_to_provider(app: &mut App, root: &std::path::Path) {
     for ch in "Ada".chars() {
         shell_key(app, KeyCode::Char(ch));
     }
-    shell_key(app, KeyCode::Enter);
-    assert_eq!(
-        app.dialog.test_setup_step(),
-        Some("profile-save"),
-        "the profile wizard must reach its daemon-save action step"
-    );
     shell_key(app, KeyCode::Enter);
     pump_onboarding(
         app,
@@ -496,20 +489,13 @@ fn advance_real_first_run_to_provider(app: &mut App, root: &std::path::Path) {
         app,
         |app| {
             stage(app) == Some(OnboardingStage::Profile)
-                && app.dialog.test_page_name()
-                    == Some(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID)
+                && shell_kind(app) == Some(crate::tui::onboarding::OnboardingScreenKind::Profile)
         },
-        "the locked Back transition from the secure-store choice to remount the profile engine",
+        "the locked Back transition from the secure-store choice to remount the profile screen",
     );
     for ch in "Ada".chars() {
         shell_key(app, KeyCode::Char(ch));
     }
-    shell_key(app, KeyCode::Enter);
-    assert_eq!(
-        app.dialog.test_setup_step(),
-        Some("profile-save"),
-        "the remounted profile wizard must reach its daemon-save action step"
-    );
     shell_key(app, KeyCode::Enter);
     pump_onboarding(
         app,

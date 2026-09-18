@@ -6,7 +6,7 @@ use ratatui::buffer::Buffer;
 
 use super::{App, Overlay};
 use crate::tui::golden::{
-    GoldenPins, assert_golden_sizes, buffer_text, hover_allowed, pinned_frame, render_frame,
+    assert_golden_sizes, buffer_text, hover_allowed, pinned_frame, render_frame, GoldenPins,
 };
 use crate::tui::onboarding::OnboardingShell;
 use crate::tui::settings::Dialog;
@@ -206,6 +206,45 @@ pub fn assert_onboarding_secure_store() {
     );
 }
 
+fn onboarding_shell_at(stage: OnboardingStage) -> OnboardingShell {
+    let snapshot = OnboardingBootstrapSnapshot {
+        run_id: uuid::Uuid::from_u128(1),
+        attempt_id: uuid::Uuid::from_u128(2),
+        revision: 3,
+        stage,
+        bootstrap_state: cockpit_proto::OnboardingBootstrapState::Ready,
+        limited_mode: false,
+        lifetime_selection: None,
+        host_capabilities: cockpit_proto::HostCapabilitySnapshot::unpublished(),
+        last_receipt: None,
+    };
+    OnboardingShell::new(&snapshot, false)
+}
+
+fn render_onboarding_stage(stage: OnboardingStage, width: u16, height: u16) -> Buffer {
+    let mut shell = onboarding_shell_at(stage);
+    if stage == OnboardingStage::Complete {
+        shell.present_completion("Name: Amelia · Provider: OpenAI · Agent: cockpit".to_string());
+    }
+    let engine = Dialog::None;
+    let mut links = crate::tui::links::LinkRegistry::default();
+    render_frame(width, height, |frame| {
+        shell.render(frame, frame.area(), &engine, &mut links)
+    })
+}
+
+pub fn assert_onboarding_native_screens() {
+    for (name, stage) in [
+        ("profile", OnboardingStage::Profile),
+        ("provider", OnboardingStage::Provider),
+        ("completion", OnboardingStage::Complete),
+    ] {
+        assert_golden_sizes("onboarding", name, |width, height| {
+            render_onboarding_stage(stage, width, height)
+        });
+    }
+}
+
 #[cfg(test)]
 mod seed_tests {
     use super::*;
@@ -218,6 +257,7 @@ mod seed_tests {
         env.remove_var("COCKPIT_REDUCE_MOTION");
         env.remove_var("REDUCE_MOTION");
         env.set_var("TERM", "xterm-256color");
+        env.set_var("USER", "amelia");
         env
     }
 
@@ -237,5 +277,11 @@ mod seed_tests {
     fn golden_onboarding_secure_store() {
         let _env = isolate_render_env();
         assert_onboarding_secure_store();
+    }
+
+    #[test]
+    fn golden_onboarding_native_screens() {
+        let _env = isolate_render_env();
+        assert_onboarding_native_screens();
     }
 }

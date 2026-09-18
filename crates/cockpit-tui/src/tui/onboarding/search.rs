@@ -65,12 +65,15 @@ pub(crate) struct ProviderSearchScreen {
     /// [`ProviderSearchScreen::remap_selection`]) so filtering can never
     /// silently move the selection onto a different visible row.
     cursor: usize,
+    selection_started: bool,
     /// First visible row index of the viewport.
     offset: usize,
     /// Row capacity observed at the last render; used to clamp scrolling
     /// whenever the list or the terminal size changes.
     viewport_capacity: usize,
     status: Option<String>,
+    scrollbar_area: Rect,
+    dragging_scrollbar: bool,
 }
 
 impl ProviderSearchScreen {
@@ -78,9 +81,12 @@ impl ProviderSearchScreen {
         Self {
             query: TextField::default(),
             cursor: 0,
+            selection_started: false,
             offset: 0,
             viewport_capacity: 0,
             status: None,
+            scrollbar_area: Rect::default(),
+            dragging_scrollbar: false,
         }
     }
 
@@ -97,6 +103,10 @@ impl ProviderSearchScreen {
     }
 
     pub(crate) fn activate_focused(&mut self) -> Option<&'static ProviderTemplate> {
+        if !self.selection_started {
+            self.status = Some("Select a provider first.".to_string());
+            return None;
+        }
         self.activate(self.selected_template())
     }
 
@@ -128,11 +138,20 @@ impl ProviderSearchScreen {
         self.cursor = self.cursor.min(len.saturating_sub(1));
         let capacity = self.viewport_capacity.max(1);
         self.offset = self.offset.min(len.saturating_sub(capacity));
-        if self.cursor < self.offset {
-            self.offset = self.cursor;
-        } else if self.cursor >= self.offset + capacity {
-            self.offset = self.cursor + 1 - capacity;
+        if self.selection_started {
+            if self.cursor < self.offset {
+                self.offset = self.cursor;
+            } else if self.cursor >= self.offset + capacity {
+                self.offset = self.cursor + 1 - capacity;
+            }
         }
+    }
+
+    fn clamp_viewport(&mut self) {
+        let len = self.filtered().len();
+        let capacity = self.viewport_capacity.max(1);
+        self.cursor = self.cursor.min(len.saturating_sub(1));
+        self.offset = self.offset.min(len.saturating_sub(capacity));
     }
 
     /// Re-anchor the cursor to the previously selected canonical template
@@ -160,29 +179,33 @@ impl ProviderSearchScreen {
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Option<&'static ProviderTemplate> {
         match key.code {
             KeyCode::Down | KeyCode::Tab => {
+                self.selection_started = true;
                 let len = self.filtered().len();
                 self.cursor = crate::tui::nav::wrap_next(self.cursor, len);
                 self.status = None;
                 self.clamp();
             }
             KeyCode::Up | KeyCode::BackTab => {
+                self.selection_started = true;
                 let len = self.filtered().len();
                 self.cursor = crate::tui::nav::wrap_prev(self.cursor, len);
                 self.status = None;
                 self.clamp();
             }
             KeyCode::PageDown => {
+                self.selection_started = true;
                 let capacity = self.viewport_capacity.max(1);
                 self.cursor = (self.cursor + capacity).min(self.filtered().len().saturating_sub(1));
                 self.clamp();
             }
             KeyCode::PageUp => {
+                self.selection_started = true;
                 let capacity = self.viewport_capacity.max(1);
                 self.cursor = self.cursor.saturating_sub(capacity);
                 self.clamp();
             }
             KeyCode::Enter => {
-                return self.activate(self.selected_template());
+                return self.activate_focused();
             }
             _ => {
                 let previous = self.selected_template();
@@ -221,13 +244,26 @@ impl ProviderSearchScreen {
         row_rects: &[Rect],
     ) -> Option<&'static ProviderTemplate> {
         match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left)
+                if self
+                    .scrollbar_area
+                    .contains((mouse.column, mouse.row).into()) =>
+            {
+                self.dragging_scrollbar = true;
+                self.drag_scrollbar(mouse.row);
+                None
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging_scrollbar => {
+                self.drag_scrollbar(mouse.row);
+                None
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.dragging_scrollbar = false;
+                None
+            }
             MouseEventKind::ScrollUp => {
                 self.offset = self.offset.saturating_sub(1);
-                let capacity = self.viewport_capacity.max(1);
-                if self.cursor >= self.offset + capacity {
-                    self.cursor = self.offset + capacity - 1;
-                }
-                self.clamp();
+                self.clamp_viewport();
                 None
             }
             MouseEventKind::ScrollDown => {
@@ -237,10 +273,7 @@ impl ProviderSearchScreen {
                 if self.offset < max_offset {
                     self.offset += 1;
                 }
-                if self.cursor < self.offset {
-                    self.cursor = self.offset;
-                }
-                self.clamp();
+                self.clamp_viewport();
                 None
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -248,17 +281,74 @@ impl ProviderSearchScreen {
                     .iter()
                     .position(|rect| rect.contains((mouse.column, mouse.row).into()))?;
                 let next = self.offset + index;
-                if self.cursor == next {
+                if self.selection_started && self.cursor == next {
                     self.status = None;
                     self.activate(self.selected_template())
                 } else {
                     self.cursor = next;
+                    self.selection_started = true;
                     self.status = None;
                     None
                 }
             }
             _ => None,
         }
+    }
+
+    fn drag_scrollbar(&mut self, row: u16) {
+        let len = self.filtered().len();
+        let capacity = self.viewport_capacity.max(1);
+        let max_offset = len.saturating_sub(capacity);
+        if self.scrollbar_area.height <= 1 || max_offset == 0 {
+            self.offset = 0;
+            return;
+        }
+        let relative = row
+            .saturating_sub(self.scrollbar_area.y)
+            .min(self.scrollbar_area.height - 1) as usize;
+        self.offset = relative * max_offset / usize::from(self.scrollbar_area.height - 1);
+        self.clamp_viewport();
+    }
+
+    pub(crate) fn set_scrollbar_area(&mut self, area: Rect) {
+        self.scrollbar_area = area;
+    }
+
+    pub(crate) fn choose_enabled(&self) -> bool {
+        self.selection_started
+            && self
+                .selected_template()
+                .is_some_and(|template| !template.is_disabled())
+    }
+
+    pub(crate) fn selected_detail(&self) -> Option<Vec<Line<'static>>> {
+        if !self.selection_started {
+            return None;
+        }
+        let template = self.selected_template()?;
+        let auth = match template.auth {
+            cockpit_config::providers::AuthKind::ApiKey => "API key",
+            cockpit_config::providers::AuthKind::OAuth => "OAuth login",
+            cockpit_config::providers::AuthKind::Command => "auth command",
+            cockpit_config::providers::AuthKind::None => "no authentication",
+        };
+        let mut lines = vec![Line::from(vec![
+            Span::styled(auth, Style::default().fg(BRASS)),
+            Span::styled("  ·  ", Style::default().fg(FOG)),
+            Span::styled(template.id.to_string(), Style::default().fg(FOG)),
+        ])];
+        if let Some(hint) = template.hint {
+            lines.push(Line::from(Span::styled(
+                hint.to_string(),
+                Style::default().fg(FOG),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                template.url.to_string(),
+                Style::default().fg(FOG),
+            )));
+        }
+        Some(lines)
     }
 
     /// Record the rendered row capacity so scrolling and clamping track the
@@ -277,7 +367,7 @@ impl ProviderSearchScreen {
             .take(capacity)
             .map(|(index, template)| ProviderRow {
                 template,
-                selected: index == self.cursor,
+                selected: self.selection_started && index == self.cursor,
             })
             .collect()
     }
@@ -336,7 +426,7 @@ impl ProviderSearchScreen {
 
     /// Help text under the list.
     pub(crate) fn help_text(&self) -> &'static str {
-        "type to filter  ↑/↓: move  enter: select  esc: options"
+        "type to filter   ↑↓ move   click select · dbl-click choose   enter choose   esc back"
     }
 
     /// Muted status paragraph, when present.

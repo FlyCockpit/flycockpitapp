@@ -12,8 +12,8 @@ use cockpit_config::providers::{ConfigDoc, ModelEntry, ProviderEntry, ProvidersC
 use cockpit_proto::OnboardingStage;
 use cockpit_test_support::TestEnvGuard;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 fn write_config(cwd: &std::path::Path, cfg: &ProvidersConfig) {
@@ -162,11 +162,11 @@ fn shell_screen_kind(app: &App) -> Option<crate::tui::onboarding::OnboardingScre
 
 fn settle_onboarding_agent_stage(app: &mut App) {
     use cockpit_proto::{
-        AGENT_AUTHORING_DTO_VERSION, AgentAuthoringCatalogOrigin, AgentAuthoringCompatibleRoute,
-        AgentAuthoringProjection, AgentAuthoringSource, AgentAuthoringSourceKind, AgentPolicyRoute,
-        AgentPolicySnapshot, AgentPolicyTrustClassification, ApplyAuthoredAgentPackageOutcome,
+        AgentAuthoringCatalogOrigin, AgentAuthoringCompatibleRoute, AgentAuthoringProjection,
+        AgentAuthoringSource, AgentAuthoringSourceKind, AgentPolicyRoute, AgentPolicySnapshot,
+        AgentPolicyTrustClassification, ApplyAuthoredAgentPackageOutcome,
         ApplyAuthoredAgentPackageReceipt, AuthoredAgentReceiptStatus, AuthoredAgentReview,
-        AuthoredAgentReviewGrant,
+        AuthoredAgentReviewGrant, AGENT_AUTHORING_DTO_VERSION,
     };
     let operation_id = "first-run-agent-op".to_string();
     app.onboarding_agent_operation_id = Some(operation_id.clone());
@@ -250,7 +250,7 @@ fn type_into_search(app: &mut App, text: &str) {
 }
 
 /// Walk Welcome → Profile → SecureStore → (Provider handled by the caller).
-fn advance_through_secure_store(app: &mut App, cwd: &std::path::Path) {
+fn advance_through_secure_store(app: &mut App, _cwd: &std::path::Path) {
     set_onboarding_stage(app, OnboardingStage::Welcome);
     assert_eq!(
         shell_screen_kind(app),
@@ -260,11 +260,10 @@ fn advance_through_secure_store(app: &mut App, cwd: &std::path::Path) {
 
     set_onboarding_stage(app, OnboardingStage::Profile);
     assert_eq!(
-        app.dialog.test_page_name(),
-        Some(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID)
+        shell_screen_kind(app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::Profile)
     );
-    app.dialog.test_mark_setup_complete("profile-save");
-    assert!(with_trusted_workspace(cwd, || app.service_onboarding_shell()));
+    assert!(matches!(app.dialog, crate::tui::settings::Dialog::None));
 
     set_onboarding_stage(app, OnboardingStage::SecureStore);
     assert_eq!(
@@ -285,6 +284,7 @@ fn advance_through_secure_store(app: &mut App, cwd: &std::path::Path) {
 /// the provider engine.
 fn select_provider_template(app: &mut App, query: &str) {
     type_into_search(app, query);
+    shell_key(app, KeyCode::Down);
     shell_key(app, KeyCode::Enter);
     assert!(
         app.dialog.is_provider_add(),
@@ -448,11 +448,10 @@ fn completion_detour_ends_when_the_added_provider_settles() {
         shell_screen_kind(&app),
         Some(crate::tui::onboarding::OnboardingScreenKind::ProviderSearch)
     );
-    assert!(
-        app.onboarding_shell
-            .as_ref()
-            .is_some_and(|shell| shell.completion_detour_active())
-    );
+    assert!(app
+        .onboarding_shell
+        .as_ref()
+        .is_some_and(|shell| shell.completion_detour_active()));
     shell_key(&mut app, KeyCode::Esc);
     shell_key(&mut app, KeyCode::Enter);
     assert_eq!(
@@ -547,11 +546,10 @@ fn complete_authority_refresh_preserves_the_local_provider_detour() {
         app.dialog.is_provider_add(),
         "the detour's engine must survive the Complete refresh"
     );
-    assert!(
-        app.onboarding_shell
-            .as_ref()
-            .is_some_and(|shell| shell.completion_detour_active())
-    );
+    assert!(app
+        .onboarding_shell
+        .as_ref()
+        .is_some_and(|shell| shell.completion_detour_active()));
 
     // The detour still ends through its own local path: once the added
     // provider settles, the stored summary is presented again.
@@ -651,7 +649,7 @@ fn no_provider_status_is_surfaced_and_draft_preserved() {
         .iter()
         .map(|cell| cell.symbol())
         .collect();
-    assert!(rendered.contains("Cockpit setup"), "{rendered}");
+    assert!(rendered.contains("Let's add a provider"), "{rendered}");
     assert!(
         rendered.contains("Filter") || rendered.contains("type to filter"),
         "{rendered}"

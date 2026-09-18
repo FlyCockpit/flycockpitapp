@@ -85,6 +85,9 @@ static TEST_SEAM: std::sync::Mutex<Option<GuidanceMaintenanceTestSeam>> =
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
+static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 pub(crate) struct GuidanceMaintenanceTestGuard;
 
 #[cfg(test)]
@@ -140,32 +143,60 @@ mod tests {
         run_guidance_maintenance_loop(ctx, period).await;
     }
 
+    fn serial_lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_SERIAL
+            .lock()
+            .expect("guidance maintenance test serial lock")
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn accept_loop_does_not_await_guidance_maintenance() {
+        let _serial = serial_lock();
         let ctx = test_ctx();
         let dir = cockpit_test_support::isolated_tempdir();
         let socket = dir.path().join("guidance-accept.sock");
         let listener = tokio::net::UnixListener::bind(&socket).expect("bind test unix socket");
-        let _hold = ctx.guidance_proposals.lock().await;
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (pause_tx, pause_rx) = oneshot::channel();
+        let _guard = install_test_seam(Some(entered_tx), Some(pause_rx), false);
+        let worker = tokio::spawn(run_guidance_maintenance_with_period(
+            ctx.clone(),
+            Duration::from_millis(10),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), entered_rx)
+            .await
+            .expect("guidance maintenance pass should admit")
+            .expect("entered");
         let accept = tokio::spawn(crate::daemon::server::run_accept_loop(
             ctx.clone(),
             listener,
         ));
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let started = Instant::now();
         assert!(
             ctx.shutdown_signal().begin_drain(),
             "test owns the first drain"
         );
-        tokio::time::timeout(Duration::from_millis(400), accept)
+        tokio::time::timeout(Duration::from_secs(5), accept)
             .await
-            .expect("accept loop must exit without waiting on the guidance mutex")
+            .expect("accept loop must exit without waiting on guidance maintenance")
             .expect("accept task")
             .expect("accept loop ok");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "accept loop took {:?} while guidance maintenance pass is paused",
+            started.elapsed()
+        );
+        pause_tx.send(()).expect("release admitted pass");
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .expect("worker should exit after the admitted pass finishes")
+            .expect("worker join");
     }
 
     #[tokio::test]
     async fn drain_allows_admitted_pass_to_finish() {
+        let _serial = serial_lock();
         let ctx = test_ctx();
         let (entered_tx, entered_rx) = oneshot::channel();
         let (pause_tx, pause_rx) = oneshot::channel();
@@ -194,6 +225,7 @@ mod tests {
 
     #[tokio::test]
     async fn force_cancels_admitted_pass_promptly() {
+        let _serial = serial_lock();
         let ctx = test_ctx();
         let (entered_tx, entered_rx) = oneshot::channel();
         let (_pause_tx, pause_rx) = oneshot::channel();
@@ -218,6 +250,7 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_writer_does_not_defeat_forced_shutdown() {
+        let _serial = serial_lock();
         let dir = cockpit_test_support::isolated_tempdir();
         let db_path = dir.path().join("guidance.db");
         let spool = dir.path().join("spool");
@@ -246,6 +279,7 @@ mod tests {
 
     #[tokio::test]
     async fn worker_does_not_admit_after_drain_starts() {
+        let _serial = serial_lock();
         let ctx = test_ctx();
         assert!(ctx.shutdown_signal().begin_drain());
         let worker = tokio::spawn(run_guidance_maintenance_with_period(

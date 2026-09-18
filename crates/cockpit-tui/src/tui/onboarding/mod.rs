@@ -26,6 +26,7 @@ mod search;
 mod secure_store;
 mod theme;
 mod ui;
+pub(crate) mod welcome;
 
 #[cfg(test)]
 mod tests;
@@ -52,8 +53,8 @@ use theme::{BRASS, FOG, HOVER_BG, INK, NIGHT};
 
 pub use secure_store::SecureStoreSubmission;
 
-/// Frames the welcome fly-in runs for before settling on the static layout.
-pub(crate) const WELCOME_ANIMATION_FRAMES: usize = 18;
+/// Frame at which the complete fly-in has landed and its prompt is visible.
+pub(crate) const WELCOME_ANIMATION_FRAMES: usize = welcome::PROMPT_FRAME;
 
 /// Ordered progress chrome. Maps the daemon stage enum onto the eight
 /// user-visible checkpoints; `Profile` owns its own slot so a failed
@@ -94,6 +95,14 @@ pub(crate) fn reduced_motion_enabled() -> bool {
 
 fn reduced_motion_for(no_color: bool, term: Option<&str>, controls: [Option<String>; 2]) -> bool {
     no_color || term == Some("dumb") || controls.iter().flatten().any(|value| value.as_str() != "0")
+}
+
+fn welcome_cloud_seed() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0x5EED);
+    nanos ^ u64::from(std::process::id()).rotate_left(32)
 }
 
 /// Which onboarding stage the embedded settings-dialog engine renders.
@@ -390,6 +399,8 @@ pub struct OnboardingShell {
     /// Explicit frame counter for the welcome fly-in; advanced only by
     /// [`Self::tick`].
     frame: usize,
+    /// Cloud entropy is chosen once per shell and injectable by golden tests.
+    welcome_cloud_seed: u64,
     screen: OnboardingScreen,
     escape: Option<EscapeMenu>,
     /// Summary text computed when the lifetime stage settled; presented on
@@ -427,6 +438,7 @@ impl OnboardingShell {
             bootstrap_state: snapshot.bootstrap_state,
             reduced_motion,
             frame: 0,
+            welcome_cloud_seed: welcome_cloud_seed(),
             screen,
             escape: None,
             completion_summary: None,
@@ -759,6 +771,12 @@ impl OnboardingShell {
         self.frame = frame;
     }
 
+    /// Pin procedural cloud generation for deterministic screen dumps.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_welcome_cloud_seed_for_golden(&mut self, seed: u64) {
+        self.welcome_cloud_seed = seed;
+    }
+
     /// Advance the welcome fly-in exactly one frame. Returns whether the
     /// frame changed (redraw needed).
     pub(crate) fn tick(&mut self) -> bool {
@@ -777,6 +795,11 @@ impl OnboardingShell {
         matches!(self.screen, OnboardingScreen::Welcome)
             && !self.reduced_motion
             && self.frame < WELCOME_ANIMATION_FRAMES
+    }
+
+    fn welcome_prompt_visible(&self) -> bool {
+        matches!(self.screen, OnboardingScreen::Welcome)
+            && (self.reduced_motion || self.frame >= welcome::PROMPT_FRAME)
     }
 
     /// Back is withheld where the daemon rejects the transition (`Welcome`,
@@ -807,6 +830,9 @@ impl OnboardingShell {
     fn activate_primary(&mut self, engine: &mut Dialog) -> Option<OnboardingShellAction> {
         match &mut self.screen {
             OnboardingScreen::Welcome => {
+                if !self.welcome_prompt_visible() {
+                    return None;
+                }
                 if self.stage == OnboardingStage::Welcome {
                     Some(OnboardingShellAction::Transition(
                         OnboardingTransitionKind::Advance,
@@ -895,6 +921,9 @@ impl OnboardingShell {
             OnboardingScreen::Welcome => {
                 if matches!(key.code, KeyCode::Esc) {
                     self.open_escape_menu(engine);
+                    return None;
+                }
+                if !self.welcome_prompt_visible() {
                     return None;
                 }
                 // Any other key begins setup. Only the authoritative Welcome
@@ -1058,6 +1087,18 @@ impl OnboardingShell {
                 let index = self.actions.clicked(pos);
                 self.handle_action_bar_click(index, engine)
             }
+            MouseEventKind::Down(MouseButton::Left)
+                if matches!(self.screen, OnboardingScreen::Welcome) =>
+            {
+                if self.welcome_prompt_visible() {
+                    match self.activate_primary(engine) {
+                        Some(action) => PointerOutcome::acted(action),
+                        None => PointerOutcome::consumed(),
+                    }
+                } else {
+                    PointerOutcome::consumed()
+                }
+            }
             _ => self.handle_content_mouse(mouse, pos),
         }
     }
@@ -1208,7 +1249,26 @@ impl OnboardingShell {
         }
         frame.render_widget(Clear, area);
 
-        let back_visible = !self.welcome_is_flying();
+        // Welcome is an edge-to-edge cinematic scene. Its own prompt is the
+        // only action affordance, and this stage never paints a Back button.
+        if matches!(self.screen, OnboardingScreen::Welcome) {
+            self.back_rect = Rect::default();
+            self.actions = ActionBar::default();
+            welcome::Scene::new(
+                area.width,
+                area.height,
+                self.frame,
+                self.reduced_motion,
+                self.welcome_cloud_seed,
+            )
+            .render(frame, area);
+            if let Some(menu) = self.escape.as_mut() {
+                Self::render_escape_menu(frame, area, menu);
+            }
+            return;
+        }
+
+        let back_visible = true;
         let back_enabled = self.back_enabled();
         self.back_rect =
             chrome::render_back_button(frame, area, back_visible, back_enabled, self.back_hover);
@@ -1232,9 +1292,7 @@ impl OnboardingShell {
         self.render_progress(frame, rows[1]);
         self.list_area = rows[2];
         match &mut self.screen {
-            OnboardingScreen::Welcome => {
-                Self::render_welcome(self.reduced_motion, self.frame, frame, rows[2]);
-            }
+            OnboardingScreen::Welcome => unreachable!("welcome returned above"),
             OnboardingScreen::SecureStore(screen) => {
                 Self::render_secure_store(frame, rows[2], screen, &mut self.list_row_rects);
             }
@@ -1383,78 +1441,6 @@ impl OnboardingShell {
                 }
             }
         }
-    }
-
-    fn render_welcome(reduced_motion: bool, frame_count: usize, frame: &mut Frame, area: Rect) {
-        let flying = !reduced_motion && frame_count < WELCOME_ANIMATION_FRAMES;
-        // Fly-in: the mark travels from the left edge toward its resting
-        // column over the animation window, then the static layout remains.
-        let progress = if flying {
-            frame_count as f64 / WELCOME_ANIMATION_FRAMES as f64
-        } else {
-            1.0
-        };
-        let rest_col = f64::from(area.width.saturating_sub(12) / 2);
-        let mark_col = if reduced_motion {
-            rest_col
-        } else {
-            rest_col * progress
-        };
-        let mark_col = mark_col.round() as u16;
-        let mark = if reduced_motion {
-            "✈"
-        } else if flying {
-            match (frame_count / 3) % 4 {
-                0 => "·",
-                1 => "✦",
-                2 => "✈",
-                _ => "✦",
-            }
-        } else {
-            "✈"
-        };
-        let mut lines = Vec::new();
-        let mut logo_line = Line::default();
-        logo_line
-            .spans
-            .push(Span::raw(" ".repeat(mark_col as usize)));
-        logo_line.spans.push(Span::styled(
-            format!("{mark}  FlyCockpit"),
-            if reduced_motion {
-                Style::default().fg(INK)
-            } else {
-                Style::default().fg(BRASS).add_modifier(Modifier::BOLD)
-            },
-        ));
-        lines.push(logo_line);
-        lines.push(Line::default());
-        let description = if area.width < 54 {
-            "Your coding cockpit."
-        } else {
-            "A focused cockpit for coding with the models you choose."
-        };
-        lines.push(Line::from(description));
-        lines.push(Line::default());
-        lines.push(Line::from("No Cockpit telemetry is collected."));
-        lines.push(Line::from(
-            "Inference providers may have their own telemetry policies.",
-        ));
-        // The call to action appears once the fly-in settles; the
-        // deterministic reduced-motion layout shows it immediately.
-        if !flying {
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                "Press any key to begin setup.",
-                Style::default().fg(FOG),
-            )));
-        }
-        lines.truncate(lines.len().min(area.height as usize));
-        frame.render_widget(
-            Paragraph::new(lines)
-                .alignment(ratatui::layout::Alignment::Left)
-                .wrap(Wrap { trim: false }),
-            area,
-        );
     }
 
     fn render_search(

@@ -56,7 +56,7 @@ pub fn empty_chat_banner_app() -> App {
 }
 
 /// Settled onboarding Welcome shell — seed dump (b).
-pub fn onboarding_welcome_shell() -> OnboardingShell {
+pub fn onboarding_welcome_shell_at(frame: usize, reduced_motion: bool) -> OnboardingShell {
     let snapshot = OnboardingBootstrapSnapshot {
         run_id: uuid::Uuid::from_u128(1),
         attempt_id: uuid::Uuid::from_u128(2),
@@ -68,14 +68,33 @@ pub fn onboarding_welcome_shell() -> OnboardingShell {
         host_capabilities: cockpit_proto::HostCapabilitySnapshot::unpublished(),
         last_receipt: None,
     };
-    let mut shell = OnboardingShell::new(&snapshot, false);
-    shell.set_frame_for_golden(pinned_frame());
+    let mut shell = OnboardingShell::new(&snapshot, reduced_motion);
+    shell.set_frame_for_golden(frame);
+    shell.set_welcome_cloud_seed_for_golden(crate::tui::golden::cloud_seed());
     shell
+}
+
+pub fn onboarding_welcome_shell() -> OnboardingShell {
+    onboarding_welcome_shell_at(pinned_frame(), false)
 }
 
 /// Render the settled Welcome screen.
 pub fn render_onboarding_welcome(width: u16, height: u16) -> Buffer {
     let mut shell = onboarding_welcome_shell();
+    let engine = Dialog::None;
+    let mut links = crate::tui::links::LinkRegistry::default();
+    render_frame(width, height, |frame| {
+        shell.render(frame, frame.area(), &engine, &mut links);
+    })
+}
+
+pub fn render_onboarding_welcome_at(
+    width: u16,
+    height: u16,
+    frame_count: usize,
+    reduced_motion: bool,
+) -> Buffer {
+    let mut shell = onboarding_welcome_shell_at(frame_count, reduced_motion);
     let engine = Dialog::None;
     let mut links = crate::tui::links::LinkRegistry::default();
     render_frame(width, height, |frame| {
@@ -100,10 +119,33 @@ pub fn assert_empty_chat_banner() {
 /// Compare onboarding Welcome dumps at both review sizes.
 pub fn assert_onboarding_welcome() {
     let _pins = GoldenPins::install();
-    assert_golden_sizes("onboarding", "welcome", render_onboarding_welcome);
+    let scenes = [
+        ("welcome-t0", 0, false),
+        (
+            "welcome-mid-flight",
+            crate::tui::onboarding::welcome::FLIGHT_FRAMES / 2,
+            false,
+        ),
+        (
+            "welcome-landed-wordmarks",
+            crate::tui::onboarding::welcome::COCKPIT_FRAME,
+            false,
+        ),
+        (
+            "welcome-prompt",
+            crate::tui::onboarding::welcome::PROMPT_FRAME,
+            false,
+        ),
+        ("welcome-reduced-motion", 0, true),
+    ];
+    for (name, frame_count, reduced_motion) in scenes {
+        assert_golden_sizes("onboarding", name, |width, height| {
+            render_onboarding_welcome_at(width, height, frame_count, reduced_motion)
+        });
+    }
     let preview = buffer_text(&render_onboarding_welcome(80, 24));
     assert!(
-        preview.contains("Press any key"),
+        preview.contains("[press any button to continue]"),
         "welcome dump must be the settled screen"
     );
 }

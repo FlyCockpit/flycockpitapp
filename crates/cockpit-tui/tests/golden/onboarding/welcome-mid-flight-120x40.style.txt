@@ -1,0 +1,42 @@
+# style runs: count:fg/bg/mod  (mod is - or BOLD+DIM+…)
+120x40
+0	106:Reset/Reset/- 6:Rgb(166,172,179)/Reset/- 8:Reset/Reset/-
+1	84:Reset/Reset/- 4:Rgb(210,211,209)/Reset/- 12:Reset/Reset/- 3:Rgb(166,172,179)/Reset/- 2:Reset/Reset/- 12:Rgb(166,172,179)/Reset/- 3:Reset/Reset/-
+2	78:Reset/Reset/- 2:Rgb(210,211,209)/Reset/- 3:Reset/Reset/- 15:Rgb(210,211,209)/Reset/- 1:Reset/Reset/- 20:Rgb(166,172,179)/Reset/- 1:Reset/Reset/-
+3	75:Reset/Reset/- 26:Rgb(210,211,209)/Reset/- 4:Rgb(166,172,179)/Reset/- 1:Reset/Reset/- 13:Rgb(166,172,179)/Reset/- 1:Reset/Reset/-
+4	75:Reset/Reset/- 27:Rgb(210,211,209)/Reset/- 18:Reset/Reset/-
+5	75:Reset/Reset/- 27:Rgb(210,211,209)/Reset/- 18:Reset/Reset/-
+6	120:Reset/Reset/-
+7	120:Reset/Reset/-
+8	77:Reset/Reset/- 4:Rgb(166,172,179)/Reset/- 8:Reset/Reset/- 4:Rgb(166,172,179)/Reset/- 27:Reset/Reset/-
+9	75:Reset/Reset/- 10:Rgb(166,172,179)/Reset/- 1:Reset/Reset/- 9:Rgb(166,172,179)/Reset/- 25:Reset/Reset/-
+10	31:Reset/Reset/- 6:Rgb(255,250,240)/Reset/- 38:Reset/Reset/- 21:Rgb(166,172,179)/Reset/- 24:Reset/Reset/-
+11	29:Reset/Reset/- 11:Rgb(255,250,240)/Reset/- 6:Reset/Reset/- 6:Rgb(255,250,240)/Reset/- 24:Reset/Reset/- 19:Rgb(166,172,179)/Reset/- 25:Reset/Reset/-
+12	29:Reset/Reset/- 11:Rgb(255,250,240)/Reset/- 2:Reset/Reset/- 2:Indexed(15)/Reset/- 4:Reset/Reset/- 1:Rgb(255,250,240)/Reset/- 5:Reset/Reset/- 1:Indexed(7)/Reset/- 2:Indexed(15)/Reset/- 2:Reset/Reset/- 2:Rgb(255,250,240)/Reset/- 59:Reset/Reset/-
+13	29:Reset/Reset/- 11:Rgb(255,250,240)/Reset/- 2:Reset/Reset/- 3:Indexed(15)/Reset/- 1:Indexed(8)/Reset/- 5:Reset/Reset/- 1:Indexed(6)/Reset/- 1:Indexed(14)/Reset/- 1:Indexed(8)/Indexed(7)/- 2:Indexed(7)/Indexed(8)/- 64:Reset/Reset/-
+14	30:Reset/Reset/- 10:Rgb(255,250,240)/Reset/- 2:Reset/Reset/- 1:Indexed(15)/Indexed(7)/- 2:Indexed(15)/Indexed(8)/- 2:Indexed(15)/Reset/- 3:Indexed(15)/Indexed(7)/- 1:Indexed(15)/Reset/- 3:Indexed(6)/Indexed(15)/- 1:Indexed(15)/Indexed(6)/- 4:Indexed(15)/Indexed(0)/- 1:Indexed(8)/Indexed(11)/- 60:Reset/Reset/-
+15	32:Reset/Reset/- 8:Rgb(255,250,240)/Reset/- 7:Reset/Reset/- 2:Indexed(7)/Reset/- 1:Indexed(8)/Indexed(7)/- 5:Indexed(8)/Reset/- 1:Indexed(7)/Indexed(8)/- 3:Indexed(7)/Reset/- 1:Indexed(8)/Reset/- 60:Reset/Reset/-
+16	47:Reset/Reset/- 1:Indexed(15)/Reset/- 1:Indexed(7)/Indexed(15)/- 3:Indexed(7)/Reset/- 68:Reset/Reset/-
+17	46:Reset/Reset/- 3:Indexed(15)/Reset/- 71:Reset/Reset/-
+18	3:Reset/Reset/- 7:Rgb(210,211,209)/Reset/- 110:Reset/Reset/-
+19	1:Rgb(210,211,209)/Reset/- 1:Reset/Reset/- 8:Rgb(210,211,209)/Reset/- 65:Reset/Reset/- 9:Rgb(78,94,118)/Reset/- 36:Reset/Reset/-
+20	1:Rgb(210,211,209)/Reset/- 1:Reset/Reset/- 8:Rgb(210,211,209)/Reset/- 31:Reset/Reset/- 3:Rgb(78,94,118)/Reset/- 1:Reset/Reset/- 4:Rgb(78,94,118)/Reset/- 71:Reset/Reset/-
+21	2:Reset/Reset/- 8:Rgb(210,211,209)/Reset/- 30:Reset/Reset/- 11:Rgb(78,94,118)/Reset/- 69:Reset/Reset/-
+22	120:Reset/Reset/-
+23	120:Reset/Reset/-
+24	120:Reset/Reset/-
+25	120:Reset/Reset/-
+26	120:Reset/Reset/-
+27	120:Reset/Reset/-
+28	120:Reset/Reset/-
+29	120:Reset/Reset/-
+30	120:Reset/Reset/-
+31	41:Reset/Reset/- 4:Rgb(210,211,209)/Reset/- 4:Reset/Reset/- 1:Rgb(210,211,209)/Reset/- 5:Reset/Reset/- 4:Rgb(210,211,209)/Reset/- 61:Reset/Reset/-
+32	39:Reset/Reset/- 13:Rgb(210,211,209)/Reset/- 1:Reset/Reset/- 7:Rgb(210,211,209)/Reset/- 33:Reset/Reset/- 11:Rgb(255,250,240)/Reset/- 5:Reset/Reset/- 5:Rgb(255,250,240)/Reset/- 2:Reset/Reset/- 3:Rgb(255,250,240)/Reset/- 1:Reset/Reset/-
+33	38:Reset/Reset/- 14:Rgb(210,211,209)/Reset/- 1:Reset/Reset/- 8:Rgb(210,211,209)/Reset/- 31:Reset/Reset/- 28:Rgb(255,250,240)/Reset/-
+34	38:Reset/Reset/- 14:Rgb(210,211,209)/Reset/- 1:Reset/Reset/- 8:Rgb(210,211,209)/Reset/- 30:Reset/Reset/- 29:Rgb(255,250,240)/Reset/-
+35	2:Reset/Reset/- 15:Rgb(122,133,148)/Reset/- 21:Reset/Reset/- 8:Rgb(210,211,209)/Reset/- 1:Reset/Reset/- 4:Rgb(210,211,209)/Reset/- 3:Reset/Reset/- 5:Rgb(210,211,209)/Reset/- 33:Reset/Reset/- 28:Rgb(255,250,240)/Reset/-
+36	2:Reset/Reset/- 16:Rgb(122,133,148)/Reset/- 75:Reset/Reset/- 20:Rgb(255,250,240)/Reset/- 1:Reset/Reset/- 6:Rgb(255,250,240)/Reset/-
+37	120:Reset/Reset/-
+38	120:Reset/Reset/-
+39	120:Reset/Reset/-

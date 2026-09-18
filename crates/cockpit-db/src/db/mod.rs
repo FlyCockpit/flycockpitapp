@@ -21,12 +21,12 @@
 //!   the prior committed snapshot. Dropping a write/transaction future after
 //!   enqueue does not dequeue the job: the writer thread still runs it, and
 //!   the cancelled caller must not report success.
-//! - Async file-backed enqueue (`Db::write` / `Db::transaction`) never blocks
-//!   the Tokio runtime. A saturated writer queue returns
-//!   [`WriterQueueSaturated`] and does not drop the caller's durability
-//!   obligation — the write never started and remains retryable. Dropping the
-//!   wait does not dequeue the job. Blocking wrappers park on enqueue until
-//!   the writer has room or shuts down, then park on the reply.
+//! - Async file-backed enqueue (`Db::write` / `Db::transaction`) parks on the
+//!   writer queue with a bounded timeout so durability-bearing writes are not
+//!   dropped under saturation. [`Writer::submit`] still uses non-blocking
+//!   `try_send` for callers where queue saturation is acceptable (tests and
+//!   explicit drop paths). Blocking wrappers park on enqueue until the writer
+//!   has room or shuts down, then park on the reply.
 //! - Composing two async accessors is not atomic. Any multi-statement
 //!   invariant that must not interleave with another writer belongs in a
 //!   single [`Db::transaction`] closure.
@@ -217,6 +217,7 @@ impl Drop for WriterStallGuard {
 }
 
 const WRITER_QUEUE_CAPACITY: usize = 1024;
+const WRITER_DURABLE_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
 #[error("database transaction rollback failed after {primary:#}: {rollback}")]
@@ -355,6 +356,9 @@ impl Writer {
             .context("db writer is shut down")
     }
 
+    /// Non-blocking enqueue for callers where queue saturation is acceptable
+    /// (tests and explicit drop paths). Durability-bearing async callers use
+    /// [`Self::submit_durable`] instead.
     fn submit<F, T>(&self, f: F) -> Result<tokio::sync::oneshot::Receiver<WriteReply>>
     where
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
@@ -371,6 +375,28 @@ impl Writer {
                 Err(anyhow::anyhow!("db writer is shut down"))
             }
         }
+    }
+
+    async fn submit_durable<F, T>(&self, f: F) -> Result<tokio::sync::oneshot::Receiver<WriteReply>>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let request = WriteRequest {
+            job: box_write_job(f),
+            reply: WriteReplySink::Async(reply),
+        };
+        let sender = self.queue_sender()?;
+        tokio::time::timeout(WRITER_DURABLE_ENQUEUE_TIMEOUT, async {
+            tokio::task::spawn_blocking(move || sender.send(request))
+                .await
+                .context("db writer enqueue worker joined")?
+                .map_err(|_| anyhow::anyhow!("db writer is shut down"))
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for db writer queue capacity"))??;
+        Ok(rx)
     }
 
     fn submit_blocking<F, T>(&self, f: F) -> Result<T>
@@ -1091,7 +1117,7 @@ impl Db {
             anyhow::bail!("read-only diagnostic database does not permit writes");
         }
         if let Some(writer) = &self.writer {
-            let rx = writer.submit(f)?;
+            let rx = writer.submit_durable(f).await?;
             recv_write_reply(rx).await
         } else {
             let inner = self
@@ -1123,7 +1149,9 @@ impl Db {
             anyhow::bail!("read-only diagnostic database does not permit transactions");
         }
         if let Some(writer) = &self.writer {
-            let rx = writer.submit(move |conn| run_transaction(conn, f))?;
+            let rx = writer
+                .submit_durable(move |conn| run_transaction(conn, f))
+                .await?;
             recv_write_reply(rx).await
         } else {
             let inner = self
@@ -2836,6 +2864,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value, 7);
+    }
+
+    #[tokio::test]
+    async fn durable_write_preserves_session_log_row_under_queue_saturation() {
+        let tmp = TempDir::new().unwrap();
+        let db =
+            Db::open_with_writer_capacity_for_test(&tmp.path().join("session-saturation.db"), 1)
+                .unwrap();
+        let session = db.create_session("p", "/p", "Build").await.unwrap();
+        let stall = db.stall_writer_for_test().expect("stall writer");
+        let write = {
+            let db = db.clone();
+            let session_id = session.session_id;
+            tokio::spawn(async move {
+                db.insert_session_event(
+                    session_id,
+                    crate::db::session_log::SessionEventKind::UserNote,
+                    Some("Build"),
+                    None,
+                    &serde_json::json!({ "text": "saturation survivor" }),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(stall);
+        let seq = tokio::time::timeout(Duration::from_secs(5), write)
+            .await
+            .expect("session log write must not be dropped under saturation")
+            .expect("spawn join")
+            .expect("insert session event");
+        assert!(seq > 0);
+        let session_id = session.session_id.to_string();
+        let count: i64 = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM session_events WHERE session_id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "session log row must survive writer queue saturation"
+        );
     }
 
     #[tokio::test]

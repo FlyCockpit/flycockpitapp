@@ -1,21 +1,20 @@
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
+use ratatui::Terminal;
 
 use crate::tui::button::{
-    ButtonDispatch, ButtonId, ButtonPointerOutcome, ButtonRegistry, ButtonSpec, ControlKind,
-    InventoryMember, bracketed_label, button_inventory, clip_to_display_width, display_width,
-    settings_pointer_control_kind,
+    bracketed_label, button_inventory, clip_to_display_width, display_width,
+    settings_pointer_control_kind, ButtonDispatch, ButtonId, ButtonPointerOutcome, ButtonRegistry,
+    ButtonSpec, ControlKind, InventoryMember,
 };
 use crate::tui::composer_controls::ComposerControlKind;
 use crate::tui::settings::pointer_actions::SettingsPointerAction;
 use crate::tui::settings::shell::SettingsHeaderAction;
 use crate::tui::theme::{
-    BUTTON_DESTRUCTIVE_BG, BUTTON_DESTRUCTIVE_BG_ANSI, BUTTON_DESTRUCTIVE_FG, BUTTON_FOCUS_BG,
-    BUTTON_FOCUS_BG_ANSI, BUTTON_FOCUS_FG, BUTTON_HOVER_BG, BUTTON_HOVER_BG_ANSI, BUTTON_HOVER_FG,
-    BUTTON_PRESSED_BG, BUTTON_PRESSED_BG_ANSI, BUTTON_PRESSED_FG, button_hover_style,
+    button_hover_style, BUTTON_DESTRUCTIVE_BG, BUTTON_DESTRUCTIVE_FG, BUTTON_FOCUS_BG,
+    BUTTON_FOCUS_FG, BUTTON_HOVER_BG, BUTTON_HOVER_FG, BUTTON_PRESSED_BG, BUTTON_PRESSED_FG,
 };
 
 fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -318,30 +317,22 @@ fn tui_button_inventory_is_complete() {
     assert!(inventory.iter().any(|item| item.surface == "quick"));
     assert!(inventory.iter().any(|item| item.surface == "notes"));
     assert!(inventory.iter().any(|item| item.surface == "diff"));
-    assert!(
-        inventory
-            .iter()
-            .any(|item| item.surface == "workspace_trust")
-    );
+    assert!(inventory
+        .iter()
+        .any(|item| item.surface == "workspace_trust"));
     assert!(inventory.iter().any(|item| item.surface == "pick_config"));
     assert!(inventory.iter().any(|item| item.surface == "create_config"));
-    assert!(
-        inventory
-            .iter()
-            .any(|item| item.surface == "create_scoped_config")
-    );
+    assert!(inventory
+        .iter()
+        .any(|item| item.surface == "create_scoped_config"));
     assert!(inventory.iter().any(|item| item.surface == "wizard_menu"));
-    assert!(
-        inventory
-            .iter()
-            .any(|item| item.surface == "model_setup_choice")
-    );
+    assert!(inventory
+        .iter()
+        .any(|item| item.surface == "model_setup_choice"));
     assert!(inventory.iter().any(|item| item.surface == "setup_wizard"));
-    assert!(
-        inventory
-            .iter()
-            .any(|item| item.surface == "first_run_complete")
-    );
+    assert!(inventory
+        .iter()
+        .any(|item| item.surface == "first_run_complete"));
     assert!(inventory.iter().any(|item| item.surface == "question"));
     assert!(inventory.iter().any(|item| item.surface == "context_menu"));
     assert!(
@@ -397,26 +388,17 @@ fn tui_button_inventory_is_complete() {
 #[test]
 fn interaction_theme_contrast_matrix() {
     let pairs = [
-        (BUTTON_HOVER_FG, BUTTON_HOVER_BG, BUTTON_HOVER_BG_ANSI),
-        (BUTTON_FOCUS_FG, BUTTON_FOCUS_BG, BUTTON_FOCUS_BG_ANSI),
-        (BUTTON_PRESSED_FG, BUTTON_PRESSED_BG, BUTTON_PRESSED_BG_ANSI),
-        (
-            BUTTON_DESTRUCTIVE_FG,
-            BUTTON_DESTRUCTIVE_BG,
-            BUTTON_DESTRUCTIVE_BG_ANSI,
-        ),
+        (BUTTON_HOVER_FG, BUTTON_HOVER_BG),
+        (BUTTON_FOCUS_FG, BUTTON_FOCUS_BG),
+        (BUTTON_PRESSED_FG, BUTTON_PRESSED_BG),
+        (BUTTON_DESTRUCTIVE_FG, BUTTON_DESTRUCTIVE_BG),
     ];
-    for (fg, bg, ansi) in pairs {
+    for (fg, bg) in pairs {
         assert!(
             contrast_ratio(fg, bg) >= 4.5,
             "contrast {fg:?} on {bg:?} is {}",
             contrast_ratio(fg, bg)
         );
-        assert_ne!(ansi, Color::Reset);
-        match ansi {
-            Color::Indexed(_) | Color::Rgb(_, _, _) => {}
-            other => panic!("ANSI fallback must be explicit, got {other:?}"),
-        }
     }
     assert_ne!(BUTTON_HOVER_BG, BUTTON_FOCUS_BG);
     assert_ne!(BUTTON_HOVER_BG, BUTTON_PRESSED_BG);

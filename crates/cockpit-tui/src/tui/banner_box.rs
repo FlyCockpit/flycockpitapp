@@ -1,7 +1,7 @@
 //! In-TUI launch banner box.
 //!
 //! Renders the full welcome header (P-51 art + version / welcome /
-//! provider / path-branch lines) inside a rounded, accent-blue box that
+//! provider / path-branch lines) inside a rounded, brass-accent box that
 //! lives in the chat pane as the topmost scroll entry. Replaces the old
 //! pre-alt-screen stdout banner (`welcome::print_header`), which was
 //! only ever visible in scrollback after the TUI exited.
@@ -14,12 +14,12 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::banner;
-use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
+use crate::tui::theme::{BRASS, FOG};
 use cockpit_core::welcome::APP_NAME;
 use cockpit_proto::LaunchInfo;
 
-const ACCENT: Color = Color::Indexed(ACCENT_BLUE_INDEX);
-const GREY: Color = Color::Indexed(MUTED_COLOR_INDEX);
+const ACCENT: Color = BRASS;
+const GREY: Color = FOG;
 /// One space of breathing room inside each vertical rail.
 const INNER_PAD: usize = 1;
 

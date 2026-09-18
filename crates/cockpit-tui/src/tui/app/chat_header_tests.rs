@@ -238,12 +238,12 @@ fn header_session_status_tracks_real_state() {
     let buf = render(&mut app, 100, 30);
     let layout = app.chat_header_layout.clone().expect("header rendered");
     let title = row_text(&buf, layout.area.y);
-    assert!(title.contains("idle"), "idle by default: {title:?}");
+    assert!(title.contains("Idle"), "idle by default: {title:?}");
 
     app.busy = true;
     let buf = render(&mut app, 100, 30);
     let title = row_text(&buf, 0);
-    assert!(title.contains("working"), "busy span: {title:?}");
+    assert!(title.contains("Working"), "busy span: {title:?}");
     app.attention_interrupt = Some(AttentionInterruptState {
         interrupt_id: Uuid::new_v4(),
         kind: AttentionInterruptKind::Question,
@@ -254,7 +254,7 @@ fn header_session_status_tracks_real_state() {
     let buf = render(&mut app, 100, 30);
     let title = row_text(&buf, 0);
     assert!(
-        title.contains("attention"),
+        title.contains("Waiting"),
         "attention outranks busy: {title:?}"
     );
 }

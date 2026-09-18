@@ -1,4 +1,4 @@
-╭ sessions all ──────────────╮                                                                                      idle
+╭ sessions all ──────────────╮                                                                                    ● Idle
 │ search                     │~/project                                                                                 
 │no active sessions in all pr│──────────────────────────────────────────────────────────────────────────────────────────
 │                            │                                                                                          

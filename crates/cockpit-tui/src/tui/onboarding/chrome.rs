@@ -3,13 +3,14 @@
 //! (Continue / Save / Retry / …) so every step can be driven with the mouse
 //! alone, not just the keyboard.
 
-use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use ratatui::Frame;
 
-use super::theme::{BRASS, DISABLED, FOG, HOVER_BG, INK};
+use super::theme::{BRASS, DISABLED, FOG, INK};
+use crate::tui::chrome::chip_style;
 
 const BACK_LABEL: &str = " ‹ Back ";
 
@@ -41,19 +42,18 @@ pub(super) fn render_back_button(
     };
     let style = if !enabled {
         Style::new().fg(DISABLED)
-    } else if hovered {
-        Style::new()
-            .fg(BRASS)
-            .bg(HOVER_BG)
-            .add_modifier(Modifier::BOLD)
     } else {
-        Style::new().fg(BRASS)
+        chip_style(Style::new().fg(BRASS), hovered)
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(BACK_LABEL, style))),
         rect,
     );
-    if enabled { rect } else { Rect::default() }
+    if enabled {
+        rect
+    } else {
+        Rect::default()
+    }
 }
 
 /// Whether `pos` falls on a rect (empty rects never match). Used for the back
@@ -149,10 +149,10 @@ pub(super) fn render_action_bar(
         let style = if !button.enabled {
             Style::new().fg(DISABLED)
         } else if hovered {
-            Style::new()
-                .fg(if button.primary { BRASS } else { INK })
-                .bg(HOVER_BG)
-                .add_modifier(Modifier::BOLD)
+            chip_style(
+                Style::new().fg(if button.primary { BRASS } else { INK }),
+                true,
+            )
         } else if button.primary {
             Style::new().fg(BRASS).add_modifier(Modifier::BOLD)
         } else {
@@ -215,8 +215,8 @@ impl ActionBar {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     fn render(buttons: &[Button<'_>], hover: Option<usize>) -> (Vec<Rect>, String) {
         let backend = TestBackend::new(40, 1);

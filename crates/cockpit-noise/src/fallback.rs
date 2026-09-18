@@ -338,11 +338,11 @@ impl FallbackSendWindow {
         ciphertext: Vec<u8>,
         delivery_tracked: bool,
     ) -> Result<()> {
-        let outer = FallbackOuterRecordV1::decode(&ciphertext)?;
-        if outer.record_sequence != sequence {
+        let header = validate_outer_header(&ciphertext)?;
+        if header.record_sequence != sequence {
             return Err(NoiseError::InvalidFallback);
         }
-        let ciphertext_bytes = outer.ciphertext.len();
+        let ciphertext_bytes = header.ciphertext_len;
         if sequence != self.next_sequence
             || self.records.contains_key(&sequence)
             || self.records.len() >= FALLBACK_WINDOW_RECORDS

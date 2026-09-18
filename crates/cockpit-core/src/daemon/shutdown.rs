@@ -102,6 +102,11 @@ impl ShutdownSignal {
     }
 
     /// Current phase.
+    ///
+    /// Reads `admission.phase` under the admission mutex. Do not hold a
+    /// [`watch::Receiver::borrow`] across [`Self::begin_drain`] or
+    /// [`Self::force`]: those methods update phase under the same mutex and
+    /// call `send_replace`, which would deadlock if a borrow is active.
     pub fn phase(&self) -> ShutdownPhase {
         lock_or_recover(&self.admission).phase
     }
@@ -166,6 +171,22 @@ impl ShutdownSignal {
     /// can hold one of these to react the instant a drain begins.
     pub fn subscribe(&self) -> watch::Receiver<ShutdownPhase> {
         self.tx.subscribe()
+    }
+
+    /// Number of admitted maintenance passes still running.
+    pub(crate) fn admitted_guidance_passes(&self) -> usize {
+        lock_or_recover(&self.admission).admitted_guidance_passes
+    }
+
+    /// Wait until every admitted maintenance pass has finished.
+    pub(crate) async fn wait_for_admitted_maintenance_drain(&self, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if self.admitted_guidance_passes() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Resolves when the signal becomes `Forced` (or the publisher is dropped).

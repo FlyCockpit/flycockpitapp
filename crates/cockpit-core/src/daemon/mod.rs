@@ -1873,6 +1873,9 @@ async fn drain_daemon_context(
     ctx: &std::sync::Arc<server::DaemonContext>,
     grace: Duration,
 ) -> Result<()> {
+    ctx.shutdown_signal()
+        .wait_for_admitted_maintenance_drain(grace)
+        .await;
     // `drain_all` owns the ordered shutdown deadlines: first make every
     // resumable interrupt and paused-work row durable, then apply `grace` to
     // the remaining running work.  A parallel timer starting here would force

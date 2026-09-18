@@ -366,9 +366,10 @@ impl SecureStoreScreen {
             &self.confirmation,
             self.phase == SecureStoreInputPhase::Confirmation,
         );
-        let note = self.status.as_deref().unwrap_or(
-            "This password isn't recoverable — losing it means re-adding every secret.",
-        );
+        let note = self
+            .status
+            .as_deref()
+            .unwrap_or("This password isn't recoverable — losing it means re-adding every secret.");
         let style = if self.status.is_some() {
             Style::new().fg(BAD).add_modifier(Modifier::BOLD)
         } else {

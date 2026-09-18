@@ -12,8 +12,8 @@ use cockpit_config::providers::{ConfigDoc, ModelEntry, ProviderEntry, ProvidersC
 use cockpit_proto::OnboardingStage;
 use cockpit_test_support::TestEnvGuard;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::backend::TestBackend;
 use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 use tokio::sync::mpsc;
 
 fn write_config(cwd: &std::path::Path, cfg: &ProvidersConfig) {
@@ -162,11 +162,11 @@ fn shell_screen_kind(app: &App) -> Option<crate::tui::onboarding::OnboardingScre
 
 fn settle_onboarding_agent_stage(app: &mut App) {
     use cockpit_proto::{
-        AgentAuthoringCatalogOrigin, AgentAuthoringCompatibleRoute, AgentAuthoringProjection,
-        AgentAuthoringSource, AgentAuthoringSourceKind, AgentPolicyRoute, AgentPolicySnapshot,
-        AgentPolicyTrustClassification, ApplyAuthoredAgentPackageOutcome,
+        AGENT_AUTHORING_DTO_VERSION, AgentAuthoringCatalogOrigin, AgentAuthoringCompatibleRoute,
+        AgentAuthoringProjection, AgentAuthoringSource, AgentAuthoringSourceKind, AgentPolicyRoute,
+        AgentPolicySnapshot, AgentPolicyTrustClassification, ApplyAuthoredAgentPackageOutcome,
         ApplyAuthoredAgentPackageReceipt, AuthoredAgentReceiptStatus, AuthoredAgentReview,
-        AuthoredAgentReviewGrant, AGENT_AUTHORING_DTO_VERSION,
+        AuthoredAgentReviewGrant,
     };
     let operation_id = "first-run-agent-op".to_string();
     app.onboarding_agent_operation_id = Some(operation_id.clone());
@@ -448,10 +448,11 @@ fn completion_detour_ends_when_the_added_provider_settles() {
         shell_screen_kind(&app),
         Some(crate::tui::onboarding::OnboardingScreenKind::ProviderSearch)
     );
-    assert!(app
-        .onboarding_shell
-        .as_ref()
-        .is_some_and(|shell| shell.completion_detour_active()));
+    assert!(
+        app.onboarding_shell
+            .as_ref()
+            .is_some_and(|shell| shell.completion_detour_active())
+    );
     shell_key(&mut app, KeyCode::Esc);
     shell_key(&mut app, KeyCode::Enter);
     assert_eq!(
@@ -546,10 +547,11 @@ fn complete_authority_refresh_preserves_the_local_provider_detour() {
         app.dialog.is_provider_add(),
         "the detour's engine must survive the Complete refresh"
     );
-    assert!(app
-        .onboarding_shell
-        .as_ref()
-        .is_some_and(|shell| shell.completion_detour_active()));
+    assert!(
+        app.onboarding_shell
+            .as_ref()
+            .is_some_and(|shell| shell.completion_detour_active())
+    );
 
     // The detour still ends through its own local path: once the added
     // provider settles, the stored summary is presented again.

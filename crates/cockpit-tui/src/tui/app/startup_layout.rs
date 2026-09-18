@@ -1645,21 +1645,21 @@ impl App {
             Ok(run) => run,
             Err(error) => {
                 self.show_toast(
-                    &format!("Could not prepare profile: {error}"),
+                    format!("Could not prepare profile: {error}"),
                     super::ToastKind::Error,
                 );
                 return;
             }
         };
         if let Err(error) = run.submit(cockpit_core::wizard::WizardAnswer::Text(name)) {
-            self.show_toast(&error, super::ToastKind::Error);
+            self.show_toast(error, super::ToastKind::Error);
             return;
         }
         let answers_json = match run.answers_json() {
             Ok(answers) => answers,
             Err(error) => {
                 self.show_toast(
-                    &format!("Could not prepare profile: {error}"),
+                    format!("Could not prepare profile: {error}"),
                     super::ToastKind::Error,
                 );
                 return;
@@ -1669,7 +1669,7 @@ impl App {
             Ok(root) => root.display().to_string(),
             Err(error) => {
                 self.show_toast(
-                    &format!("Could not resolve global Cockpit config: {error}"),
+                    format!("Could not resolve global Cockpit config: {error}"),
                     super::ToastKind::Error,
                 );
                 return;

@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::Rect;
 use ratatui::Frame;
+use ratatui::layout::Rect;
 
 use super::ui;
 use crate::tui::textfield::TextField;

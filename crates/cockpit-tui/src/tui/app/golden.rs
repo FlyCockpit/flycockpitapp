@@ -6,7 +6,7 @@ use ratatui::buffer::Buffer;
 
 use super::{App, Overlay};
 use crate::tui::golden::{
-    assert_golden_sizes, buffer_text, hover_allowed, pinned_frame, render_frame, GoldenPins,
+    GoldenPins, assert_golden_sizes, buffer_text, hover_allowed, pinned_frame, render_frame,
 };
 use crate::tui::onboarding::OnboardingShell;
 use crate::tui::settings::Dialog;

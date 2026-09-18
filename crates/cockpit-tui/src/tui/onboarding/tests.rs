@@ -1,10 +1,10 @@
 //! Reducer, render, and pointer tests for the full-screen onboarding shell.
 
-use super::search::{filter_catalog, onboarding_catalog, ProviderSearchScreen};
+use super::search::{ProviderSearchScreen, filter_catalog, onboarding_catalog};
 use super::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::backend::TestBackend;
 use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
@@ -101,9 +101,11 @@ fn render_string(shell: &mut OnboardingShell, width: u16, height: u16, engine: &
 fn welcome_any_key_requests_advance_only_on_welcome_stage() {
     let mut shell = shell_at(OnboardingStage::Welcome);
     let mut engine = Dialog::None;
-    assert!(shell
-        .handle_key(key(KeyCode::Char(' ')), &mut engine)
-        .is_none());
+    assert!(
+        shell
+            .handle_key(key(KeyCode::Char(' ')), &mut engine)
+            .is_none()
+    );
     shell.set_frame_for_golden(WELCOME_ANIMATION_FRAMES);
     assert!(matches!(
         shell.handle_key(key(KeyCode::Char(' ')), &mut engine),

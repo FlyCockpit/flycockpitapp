@@ -268,7 +268,7 @@ fn sync_config_generation_after_agent_apply(app: &mut App, generation: u64) {
 }
 
 fn settle_agent_via_real_daemon_rpc(app: &mut App) {
-    use cockpit_core::authoring_draft::{build_package_draft, AgentAuthoringDraft};
+    use cockpit_core::authoring_draft::{AgentAuthoringDraft, build_package_draft};
     use cockpit_proto::{ApplyAuthoredAgentPackageRequest, AuthoredAgentOnboardingCorrelation};
 
     pump_onboarding(

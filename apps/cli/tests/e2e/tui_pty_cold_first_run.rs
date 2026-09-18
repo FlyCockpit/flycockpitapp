@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use crate::support::{
-    sgr_left_click, CellPos, HermeticCockpit, HermeticProfile, INITIAL_PTY_COLS, INITIAL_PTY_ROWS,
+    CellPos, HermeticCockpit, HermeticProfile, INITIAL_PTY_COLS, INITIAL_PTY_ROWS, sgr_left_click,
 };
 
 /// Cold boot (daemon spawn + DB creation) is slower than the configured
@@ -23,7 +23,7 @@ fn click_text(session: &mut HermeticCockpit, needle: &str) {
     let (start, end) = snapshot
         .find_text_span(needle)
         .unwrap_or_else(|| panic!("expected `{needle}` on screen:\n{}", snapshot.contents()));
-    let col = (u16::from(start.col) + u16::from(end.col)) / 2;
+    let col = (start.col + end.col) / 2;
     let pos = CellPos {
         row: start.row,
         col,

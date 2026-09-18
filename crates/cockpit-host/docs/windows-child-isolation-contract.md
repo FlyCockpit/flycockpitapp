@@ -1,8 +1,14 @@
 # Windows agent-child isolation conformance gate
 
 **Issue:** #398
-**Status:** **Blocked — no production activation**
+**Status:** **Superseded by #438 — no production activation**
 **Checked:** 2026-09-12
+
+The owner decision in #438 selected the OS user account as the security
+boundary. See
+[`docs/security/same-user-boundary.md`](../../../docs/security/same-user-boundary.md).
+This file remains only as the research stop record explaining why the proposed
+same-user child-isolation contract could not be activated.
 
 This is an implementation-facing platform contract and a stop record, not a
 runtime isolation backend. `cockpit-host` must not expose a Windows agent-child

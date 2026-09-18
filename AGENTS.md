@@ -128,3 +128,12 @@ or fixture generator that CI invokes, declare it as a knip entry; do not restore
 `ignoreExportsUsedInFile`. Generated protocol fixtures and fuzz corpora that
 Biome would rewrite belong in `biome.json` `files.includes` as ignore patterns,
 not reformatted.
+
+Rust CLI CI (`.github/workflows/cli-ci.yml`) also runs workspace invariant
+scripts. `scripts/check-no-source-scan-tests.sh` fails if a test (`#[test]`,
+`#[cfg(test)]`, or a Cargo `tests/` target) `include_str!`s a `.rs` file
+instead of asserting behaviour. Remaining hits are a shrinking per-file
+count allowlist; do not add entries. Prove new coverage with a behavioural
+test, a compile-time property, or delete the scan if the property is already
+covered. `bash scripts/check-no-source-scan-tests.sh --self-test` must pass
+on a clean fixture tree and fail when a scan is reintroduced.

@@ -24,6 +24,9 @@ name: CLI CI
       - "scripts/check-unsafe-safety-comments.sh"
       - "scripts/check-feature-gated-test-coverage.sh"
       - "scripts/check-tenant-authority-acceptance-manifest.sh"
+      - "scripts/check-no-source-scan-tests.sh"
+      - "scripts/lib/check_no_source_scan_tests.py"
+      - "scripts/fixtures/no-source-scan-tests/**"
       - ".github/workflows/cli-ci.yml"
       - ".github/workflows/ci-runners.yml"
   pull_request:
@@ -45,6 +48,9 @@ name: CLI CI
       - "scripts/check-unsafe-safety-comments.sh"
       - "scripts/check-feature-gated-test-coverage.sh"
       - "scripts/check-tenant-authority-acceptance-manifest.sh"
+      - "scripts/check-no-source-scan-tests.sh"
+      - "scripts/lib/check_no_source_scan_tests.py"
+      - "scripts/fixtures/no-source-scan-tests/**"
       - ".github/workflows/cli-ci.yml"
       - ".github/workflows/ci-runners.yml"
   # Weekly advisory sweep (issue #306): RustSec advisories and yanks can land
@@ -185,6 +191,9 @@ jobs:
 
       - name: Check test assertion integrity
         run: bash scripts/check-test-assertion-integrity.sh
+
+      - name: Check no source-scan tests
+        run: bash scripts/check-no-source-scan-tests.sh
 
       - name: Check Code-root constructor inventory
         run: bash scripts/check-code-root-constructors.sh

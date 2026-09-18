@@ -83,6 +83,42 @@ fn stale_and_duplicate_runner_attach_completions_are_ignored() {
 }
 
 #[test]
+fn latched_spawn_failure_shows_blocking_toast_and_clears_session_setup_loading() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = configured_app_body(&tmp);
+    seed_pending_runner_attach(
+        &mut app,
+        61,
+        vec![super::RunnerAttachContinuation::RetryRetainedSubmissions],
+    );
+    app.pending_runner_attach.as_mut().unwrap().latch_error = true;
+
+    app.apply_runner_attach_result(
+        crate::tui::async_action::AsyncActionId::from_raw_for_test(61),
+        Err("daemon spawn failed: bind failed: test reason".to_string()),
+    );
+
+    let toast = app.toast.as_ref().expect("blocking toast");
+    assert!(toast.persistent, "spawn errors must not auto-expire");
+    assert_eq!(toast.kind, super::ToastKind::Error);
+    assert!(
+        toast.text.contains("bind failed: test reason"),
+        "{}",
+        toast.text
+    );
+    let pane = app
+        .session_setup_inline
+        .as_ref()
+        .expect("inline session setup");
+    let error = pane.error_message().expect("session setup error");
+    assert!(
+        error.contains("bind failed: test reason"),
+        "session setup must show the spawn error, got {error}"
+    );
+    assert_eq!(app.launch.provider_line, "Daemon failed to start");
+}
+
+#[test]
 fn attach_coalescing_retains_typed_model_and_btw_continuations() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = configured_app_body(&tmp);

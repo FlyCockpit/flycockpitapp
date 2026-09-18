@@ -314,6 +314,10 @@ impl App {
             Err(error) => {
                 if pending.latch_error {
                     self.adopt_runner(Err(error.clone()));
+                    self.show_blocking_toast(error.clone(), ToastKind::Error);
+                    self.apply_session_setup_snapshot_error(error.clone());
+                    // Banner chrome otherwise stays on the startup placeholder.
+                    self.launch.provider_line = "Daemon failed to start".to_string();
                 } else {
                     self.display_attach_backoff.record_failure(Instant::now());
                 }

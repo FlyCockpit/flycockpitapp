@@ -15,6 +15,17 @@ impl App {
         });
     }
 
+    /// Spawn/boot failures stay on the status line until the user can act.
+    /// Unlike [`Self::show_toast`], this does not expire on a timer.
+    pub(super) fn show_blocking_toast(&mut self, text: impl Into<String>, kind: ToastKind) {
+        self.toast = Some(Toast {
+            text: text.into(),
+            kind,
+            expires_at: Instant::now() + Duration::from_secs(24 * 60 * 60),
+            persistent: true,
+        });
+    }
+
     pub(super) fn apply_idle_reason_status(&mut self, reason: cockpit_proto::IdleReason) {
         self.idle_reason_status = idle_reason_status(reason);
     }

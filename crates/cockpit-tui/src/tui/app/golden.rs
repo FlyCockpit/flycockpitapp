@@ -4,7 +4,7 @@ use std::path::Path;
 
 use ratatui::buffer::Buffer;
 
-use super::{App, Overlay};
+use super::{App, Overlay, ToastKind};
 use crate::tui::golden::{
     GoldenPins, assert_golden_sizes, buffer_text, hover_allowed, pinned_frame, render_frame,
 };
@@ -52,6 +52,17 @@ pub fn empty_chat_banner_app() -> App {
     app.launch.session_short_id = None;
     app.vim_setting = VimModeSetting::Disabled;
     app.composer.set_vim_enabled(false);
+    app
+}
+
+/// Spawn-failure surface: blocking toast + session-setup error in place of
+/// the loading placeholder.
+pub fn spawn_error_app() -> App {
+    let mut app = empty_chat_banner_app();
+    let error = "daemon spawn failed: socket path too long; set COCKPIT_SOCKET_DIR".to_string();
+    app.show_blocking_toast(error.clone(), ToastKind::Error);
+    app.apply_session_setup_snapshot_error(error);
+    app.launch.provider_line = "Daemon failed to start".to_string();
     app
 }
 
@@ -113,6 +124,23 @@ pub fn assert_empty_chat_banner() {
     assert!(
         preview.contains("FlyCockpit"),
         "empty chat dump must include the launch banner"
+    );
+}
+
+pub fn assert_spawn_error() {
+    let _pins = GoldenPins::install();
+    let mut app = spawn_error_app();
+    assert_golden_sizes("chat", "spawn-error", |width, height| {
+        render_app(&mut app, width, height)
+    });
+    let preview = buffer_text(&render_app(&mut app, 80, 24));
+    assert!(
+        preview.contains("COCKPIT_SOCKET_DIR"),
+        "spawn-error dump must include the spawn failure"
+    );
+    assert!(
+        !preview.contains("Loading session setup"),
+        "spawn-error dump must not stay on the loading placeholder"
     );
 }
 
@@ -266,6 +294,12 @@ mod seed_tests {
     fn golden_empty_chat_with_banner() {
         let _env = isolate_render_env();
         assert_empty_chat_banner();
+    }
+
+    #[test]
+    fn golden_spawn_error() {
+        let _env = isolate_render_env();
+        assert_spawn_error();
     }
 
     #[test]

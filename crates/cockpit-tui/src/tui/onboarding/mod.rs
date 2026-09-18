@@ -16,8 +16,11 @@
 //!   discardable it opens a visible Back / Defer / Cancel choice.
 //!
 //! The welcome fly-in is driven by an explicit frame counter advanced from
-//! the app wake loop (`tick`), never by sleeps. `NO_COLOR`, `TERM=dumb`, and
-//! the `COCKPIT_REDUCE_MOTION` / `REDUCE_MOTION` controls select the
+//! the app wake loop (`tick`), never by sleeps; the shell reports the
+//! animation as active so the app keeps its animation tick waking the loop,
+//! and after landing the counter keeps advancing the ambient prop/cloud
+//! motion instead of freezing at the prompt frame. `NO_COLOR`, `TERM=dumb`,
+//! and the `COCKPIT_REDUCE_MOTION` / `REDUCE_MOTION` controls select the
 //! deterministic static alternative.
 
 pub(crate) mod agent;
@@ -396,8 +399,9 @@ pub struct OnboardingShell {
     limited_mode: bool,
     bootstrap_state: OnboardingBootstrapState,
     reduced_motion: bool,
-    /// Explicit frame counter for the welcome fly-in; advanced only by
-    /// [`Self::tick`].
+    /// Explicit frame counter for the welcome scene; advanced only by
+    /// [`Self::tick`]. Past [`WELCOME_ANIMATION_FRAMES`] it keeps driving
+    /// the ambient prop bob and cloud drift while the screen is shown.
     frame: usize,
     /// Cloud entropy is chosen once per shell and injectable by golden tests.
     welcome_cloud_seed: u64,
@@ -777,18 +781,30 @@ impl OnboardingShell {
         self.welcome_cloud_seed = seed;
     }
 
-    /// Advance the welcome fly-in exactly one frame. Returns whether the
+    /// Advance the welcome scene exactly one frame. Returns whether the
     /// frame changed (redraw needed).
+    ///
+    /// The counter never stops while the Welcome screen is shown: the
+    /// fly-in itself settles at [`WELCOME_ANIMATION_FRAMES`] (the prompt
+    /// becomes visible), and past that the same counter keeps driving the
+    /// ambient prop bob and cloud drift so the landed scene never
+    /// freezes. Reduced motion never ticks — its static scene is drawn
+    /// landed with the prompt from frame 0.
     pub(crate) fn tick(&mut self) -> bool {
-        if !matches!(self.screen, OnboardingScreen::Welcome) || self.reduced_motion {
+        if !self.welcome_animation_active() {
             return false;
         }
-        if self.frame < WELCOME_ANIMATION_FRAMES {
-            self.frame += 1;
-            true
-        } else {
-            false
-        }
+        self.frame = self.frame.saturating_add(1);
+        true
+    }
+
+    /// True while the Welcome screen is animating — the fly-in or the
+    /// post-landing ambient motion — and therefore needs the app's
+    /// animation tick to keep waking the loop. Without that tick the
+    /// frame counter only advances on unrelated wakes and the fly-in
+    /// strands at frame 0.
+    pub(crate) fn welcome_animation_active(&self) -> bool {
+        matches!(self.screen, OnboardingScreen::Welcome) && !self.reduced_motion
     }
 
     fn welcome_is_flying(&self) -> bool {

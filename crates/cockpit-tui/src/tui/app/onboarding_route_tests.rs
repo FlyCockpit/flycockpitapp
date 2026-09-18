@@ -271,3 +271,27 @@ fn force_setup_flag_is_stored_for_bootstrap_reentry() {
     app.open_onboarding_setup(None);
     assert!(app.onboarding_force);
 }
+
+#[test]
+fn welcome_fly_in_drives_the_animation_tick() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = App::new(Some(tmp.path()), false);
+    assert!(!app.animation_tick_active());
+    app.onboarding_shell = Some(Box::new(crate::tui::onboarding::OnboardingShell::new(
+        &snapshot(cockpit_proto::OnboardingStage::Welcome),
+        false,
+    )));
+    assert!(
+        app.animation_tick_active(),
+        "the welcome fly-in must keep the 100ms animation tick alive instead of stranding at frame 0"
+    );
+    app.onboarding_shell = Some(Box::new(crate::tui::onboarding::OnboardingShell::new(
+        &snapshot(cockpit_proto::OnboardingStage::Welcome),
+        true,
+    )));
+    assert!(
+        !app.animation_tick_active(),
+        "reduced-motion welcome must not hold the animation tick"
+    );
+}

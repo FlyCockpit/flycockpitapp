@@ -104,7 +104,7 @@ impl Scene {
                     .filter(|cloud| cloud.layer == layer)
                 {
                     let elapsed = self.frame as f64 / 10.0;
-                    let x = cloud.x + cloud.speed * elapsed;
+                    let x = drifted_x(cloud.x, cloud.speed, elapsed, self.width, cloud.width());
                     for (row, cells) in cloud.cells.iter().enumerate() {
                         for (col, pixel) in cells.iter().enumerate() {
                             if let Some(pixel) = pixel {
@@ -219,6 +219,16 @@ struct Pixel {
     bg: Color,
 }
 
+/// Perpetual cloud drift position. The unwrapped position is preserved
+/// until the cloud's right edge exits the left margin; past that the
+/// cloud wraps to re-enter from the right edge, so the post-landing tick
+/// never leaves an empty sky.
+fn drifted_x(x: f64, speed: f64, elapsed: f64, width: u16, cloud_width: usize) -> f64 {
+    let cloud_width = f64::from(cloud_width as u16);
+    let span = f64::from(width) + cloud_width;
+    (x + speed * elapsed + cloud_width).rem_euclid(span) - cloud_width
+}
+
 fn ascii_pixels(area: Rect, lines: &[&str], top: i32, out: &mut Vec<Pixel>) {
     let left = i32::from(area.x) + (i32::from(area.width) - i32::from(titles::width(lines))) / 2;
     for (row, line) in lines.iter().enumerate() {
@@ -319,5 +329,22 @@ mod tests {
         let scene = Scene::new(80, 24, 0, true, 1);
         assert!(scene.prompt_visible());
         assert_eq!(scene.bob_offset(), 0);
+    }
+
+    #[test]
+    fn cloud_drift_is_identity_until_exit_then_wraps() {
+        // Still on screen: the unwrapped position is preserved exactly.
+        assert_eq!(drifted_x(10.0, -2.0, 5.0, 80, 12), 0.0);
+        assert_eq!(drifted_x(-11.0, -0.5, 1.0, 80, 12), -11.5);
+        // Once the cloud exits the left edge it re-enters from the right
+        // (left edge 72, cloud spans 72..84 on an 80-column sky), and the
+        // wrap is periodic with the full drift span.
+        assert_eq!(drifted_x(0.0, -2.0, 10.0, 80, 12), 72.0);
+        assert_eq!(drifted_x(0.0, -2.0, 56.0, 80, 12), 72.0);
+        // Wrapped positions always land inside [-cloud_width, width).
+        for elapsed in [0, 7, 91, 500, 5_000] {
+            let x = drifted_x(30.0, -20.0, f64::from(elapsed), 80, 24);
+            assert!((-24.0..80.0).contains(&x), "elapsed {elapsed}: {x}");
+        }
     }
 }

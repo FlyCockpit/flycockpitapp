@@ -55,6 +55,13 @@ impl Rng {
     }
 }
 
+impl Cloud {
+    /// Rasterized width in columns (every row has the same length).
+    pub(super) fn width(&self) -> usize {
+        self.cells.first().map_or(0, Vec::len)
+    }
+}
+
 pub(super) fn seed(width: u16, height: u16, seed: u64) -> Vec<Cloud> {
     let mut rng = Rng::new(seed);
     let mut out = Vec::new();

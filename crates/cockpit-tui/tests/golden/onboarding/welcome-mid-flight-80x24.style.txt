@@ -4,11 +4,11 @@
 1	52:Reset/Reset/- 4:Rgb(210,211,209)/Reset/- 8:Reset/Reset/- 3:Rgb(166,172,179)/Reset/- 1:Reset/Reset/- 8:Rgb(166,172,179)/Reset/- 4:Reset/Reset/-
 2	46:Reset/Reset/- 2:Rgb(210,211,209)/Reset/- 3:Reset/Reset/- 8:Rgb(210,211,209)/Reset/- 1:Reset/Reset/- 4:Rgb(210,211,209)/Reset/- 13:Rgb(166,172,179)/Reset/- 3:Reset/Reset/-
 3	45:Reset/Reset/- 5:Rgb(210,211,209)/Reset/- 1:Reset/Reset/- 13:Rgb(210,211,209)/Reset/- 4:Rgb(166,172,179)/Reset/- 1:Reset/Reset/- 8:Rgb(166,172,179)/Reset/- 3:Reset/Reset/-
-4	45:Reset/Reset/- 19:Rgb(210,211,209)/Reset/- 16:Reset/Reset/-
-5	12:Reset/Reset/- 4:Rgb(255,250,240)/Reset/- 29:Reset/Reset/- 6:Rgb(210,211,209)/Reset/- 2:Rgb(166,172,179)/Reset/- 11:Rgb(210,211,209)/Reset/- 16:Reset/Reset/-
-6	11:Reset/Reset/- 10:Rgb(255,250,240)/Reset/- 4:Reset/Reset/- 5:Rgb(255,250,240)/Reset/- 18:Reset/Reset/- 14:Rgb(166,172,179)/Reset/- 18:Reset/Reset/-
-7	10:Reset/Reset/- 21:Rgb(255,250,240)/Reset/- 18:Reset/Reset/- 12:Rgb(166,172,179)/Reset/- 19:Reset/Reset/-
-8	10:Reset/Reset/- 13:Rgb(255,250,240)/Reset/- 6:Reset/Reset/- 2:Rgb(255,250,240)/Reset/- 49:Reset/Reset/-
+4	45:Reset/Reset/- 19:Rgb(210,211,209)/Reset/- 11:Reset/Reset/- 5:Rgb(255,250,240)/Reset/-
+5	12:Reset/Reset/- 4:Rgb(255,250,240)/Reset/- 29:Reset/Reset/- 6:Rgb(210,211,209)/Reset/- 2:Rgb(166,172,179)/Reset/- 11:Rgb(210,211,209)/Reset/- 10:Reset/Reset/- 6:Rgb(255,250,240)/Reset/-
+6	11:Reset/Reset/- 10:Rgb(255,250,240)/Reset/- 4:Reset/Reset/- 5:Rgb(255,250,240)/Reset/- 18:Reset/Reset/- 14:Rgb(166,172,179)/Reset/- 12:Reset/Reset/- 6:Rgb(255,250,240)/Reset/-
+7	10:Reset/Reset/- 21:Rgb(255,250,240)/Reset/- 18:Reset/Reset/- 12:Rgb(166,172,179)/Reset/- 13:Reset/Reset/- 6:Rgb(255,250,240)/Reset/-
+8	10:Reset/Reset/- 13:Rgb(255,250,240)/Reset/- 6:Reset/Reset/- 2:Rgb(255,250,240)/Reset/- 44:Reset/Reset/- 5:Rgb(255,250,240)/Reset/-
 9	11:Reset/Reset/- 12:Rgb(255,250,240)/Reset/- 2:Reset/Reset/- 2:Indexed(15)/Reset/- 10:Reset/Reset/- 1:Indexed(7)/Reset/- 2:Indexed(15)/Reset/- 40:Reset/Reset/-
 10	3:Rgb(210,211,209)/Reset/- 10:Reset/Reset/- 10:Rgb(255,250,240)/Reset/- 2:Reset/Reset/- 3:Indexed(15)/Reset/- 1:Indexed(8)/Reset/- 5:Reset/Reset/- 1:Indexed(6)/Reset/- 1:Indexed(14)/Reset/- 1:Indexed(8)/Indexed(7)/- 2:Indexed(7)/Indexed(8)/- 41:Reset/Reset/-
 11	3:Rgb(210,211,209)/Reset/- 22:Reset/Reset/- 1:Indexed(15)/Indexed(7)/- 2:Indexed(15)/Indexed(8)/- 2:Indexed(15)/Reset/- 3:Indexed(15)/Indexed(7)/- 1:Indexed(15)/Reset/- 3:Indexed(6)/Indexed(15)/- 1:Indexed(15)/Indexed(6)/- 4:Indexed(15)/Indexed(0)/- 1:Indexed(8)/Indexed(11)/- 6:Reset/Reset/- 6:Rgb(78,94,118)/Reset/- 25:Reset/Reset/-
@@ -17,9 +17,9 @@
 14	29:Reset/Reset/- 3:Indexed(15)/Reset/- 48:Reset/Reset/-
 15	80:Reset/Reset/-
 16	80:Reset/Reset/-
-17	23:Reset/Reset/- 3:Rgb(210,211,209)/Reset/- 7:Reset/Reset/- 3:Rgb(210,211,209)/Reset/- 18:Reset/Reset/- 8:Rgb(255,250,240)/Reset/- 4:Reset/Reset/- 5:Rgb(255,250,240)/Reset/- 9:Reset/Reset/-
-18	22:Reset/Reset/- 9:Rgb(210,211,209)/Reset/- 1:Reset/Reset/- 5:Rgb(210,211,209)/Reset/- 16:Reset/Reset/- 18:Rgb(255,250,240)/Reset/- 9:Reset/Reset/-
-19	21:Reset/Reset/- 16:Rgb(210,211,209)/Reset/- 15:Reset/Reset/- 20:Rgb(255,250,240)/Reset/- 8:Reset/Reset/-
+17	23:Reset/Reset/- 3:Rgb(210,211,209)/Reset/- 7:Reset/Reset/- 3:Rgb(210,211,209)/Reset/- 18:Reset/Reset/- 8:Rgb(255,250,240)/Reset/- 4:Reset/Reset/- 5:Rgb(255,250,240)/Reset/- 7:Reset/Reset/- 2:Rgb(122,133,148)/Reset/-
+18	22:Reset/Reset/- 9:Rgb(210,211,209)/Reset/- 1:Reset/Reset/- 5:Rgb(210,211,209)/Reset/- 16:Reset/Reset/- 18:Rgb(255,250,240)/Reset/- 7:Reset/Reset/- 2:Rgb(122,133,148)/Reset/-
+19	21:Reset/Reset/- 16:Rgb(210,211,209)/Reset/- 15:Reset/Reset/- 20:Rgb(255,250,240)/Reset/- 6:Reset/Reset/- 2:Rgb(122,133,148)/Reset/-
 20	11:Rgb(122,133,148)/Reset/- 10:Reset/Reset/- 16:Rgb(210,211,209)/Reset/- 16:Reset/Reset/- 18:Rgb(255,250,240)/Reset/- 9:Reset/Reset/-
 21	11:Rgb(122,133,148)/Reset/- 11:Reset/Reset/- 4:Rgb(210,211,209)/Reset/- 1:Reset/Reset/- 4:Rgb(210,211,209)/Reset/- 1:Reset/Reset/- 4:Rgb(210,211,209)/Reset/- 18:Reset/Reset/- 17:Rgb(255,250,240)/Reset/- 9:Reset/Reset/-
 22	80:Reset/Reset/-

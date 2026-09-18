@@ -152,14 +152,44 @@ fn welcome_animation_is_tick_driven_and_settles() {
     let mut shell = shell_at(OnboardingStage::Welcome);
     let engine = Dialog::None;
     let frame_zero = render_string(&mut shell, 80, 24, &engine);
-    // Every intermediate frame reports a change until the window closes.
+    // Every intermediate frame reports a change until the fly-in lands.
     for _ in 0..WELCOME_ANIMATION_FRAMES {
         assert!(shell.tick());
     }
-    assert!(!shell.tick(), "the fly-in must settle, not loop forever");
-    let settled = render_string(&mut shell, 80, 24, &engine);
-    assert_ne!(frame_zero, settled);
-    assert!(settled.contains("[press any button to continue]"));
+    let landed = render_string(&mut shell, 80, 24, &engine);
+    assert_ne!(frame_zero, landed);
+    assert!(landed.contains("[press any button to continue]"));
+    // Landing is not a freeze: the same tick keeps advancing the ambient
+    // prop bob and cloud drift past the prompt frame.
+    for _ in 0..4 {
+        assert!(
+            shell.tick(),
+            "ambient motion must keep ticking after landing"
+        );
+    }
+    let ambient = render_string(&mut shell, 80, 24, &engine);
+    assert!(ambient.contains("[press any button to continue]"));
+    assert_ne!(
+        landed, ambient,
+        "prop bob and cloud drift must continue past the prompt frame"
+    );
+}
+
+#[test]
+fn welcome_animation_keeps_the_animation_tick_alive_until_navigation() {
+    let mut shell = shell_at(OnboardingStage::Welcome);
+    assert!(shell.welcome_animation_active());
+    for _ in 0..WELCOME_ANIMATION_FRAMES {
+        shell.tick();
+    }
+    assert!(
+        shell.welcome_animation_active(),
+        "the post-landing ambient motion still needs the animation tick"
+    );
+    let reduced = OnboardingShell::new(&snapshot(OnboardingStage::Welcome), true);
+    assert!(!reduced.welcome_animation_active());
+    let other_stage = shell_at(OnboardingStage::SecureStore);
+    assert!(!other_stage.welcome_animation_active());
 }
 
 #[test]

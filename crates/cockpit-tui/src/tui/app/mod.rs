@@ -4976,6 +4976,13 @@ impl App {
             // Keep the 100ms tick alive while a `/leaks` secret is revealed so
             // its 30s TTL expires (and clears the screen) even on an idle pane.
             || self.leaks_reveal_active()
+            // The welcome fly-in (and its post-landing ambient motion)
+            // advances on this tick; without it the frame counter only
+            // moves on unrelated wakes and the fly-in strands at frame 0.
+            || self
+                .onboarding_shell
+                .as_ref()
+                .is_some_and(|shell| shell.welcome_animation_active())
     }
 
     fn leaks_reveal_active(&self) -> bool {

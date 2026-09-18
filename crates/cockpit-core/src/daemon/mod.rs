@@ -111,7 +111,7 @@ pub mod turn_socket_provider;
 pub(crate) mod windows_pipe;
 
 #[cfg(unix)]
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -209,6 +209,15 @@ pub fn send_event(tx: &EventSender, redact: &Arc<RedactionTable>, event: proto::
 /// policy differs.
 const DAEMON_LIFETIME_ENV: &str = "COCKPIT_DAEMON_LIFETIME";
 const EPHEMERAL_LIFETIME: &str = "ephemeral";
+/// One-shot parent-to-child boot-status endpoint.  Unix uses an owner-only
+/// Unix-domain socket. Windows intentionally refuses detached startup until a
+/// named-pipe implementation lands: silently falling back to an unbounded
+/// socket poll would reintroduce the stuck-startup failure this endpoint fixes.
+const DAEMON_SPAWN_NOTIFY_ENV: &str = "COCKPIT_DAEMON_SPAWN_NOTIFY";
+const DAEMON_LOG_FILE: &str = "daemon.log";
+const DAEMON_LOG_ROTATED_FILE: &str = "daemon.log.1";
+const DAEMON_LOG_MAX_BYTES: u64 = 1024 * 1024;
+pub const DAEMON_SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Optional override for detached daemon spawn tests. Production callers use
 /// `current_exe()`; test builds require the `cockpit-daemon-spawn-harness`
 /// binary discovered via [`discover_daemon_spawn_harness_executable`].
@@ -567,6 +576,37 @@ impl DaemonPaths {
         }
         paths
     }
+}
+
+/// Validate every Unix-domain path this daemon binds before boot opens SQLite.
+/// `sockaddr_un` is platform-specific (104 bytes on macOS, 108 on Linux), so
+/// derive the limit from the target's libc definition instead of baking an OS
+/// table into the application.
+#[cfg(unix)]
+fn validate_bind_socket_paths(paths: &DaemonPaths) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    const SUN_LEN: usize = std::mem::size_of::<libc::sockaddr_un>()
+        - std::mem::size_of::<libc::sa_family_t>();
+
+    for socket in [paths.socket.clone(), paths.leak_reveal_socket()] {
+        let length = socket.as_os_str().as_bytes().len();
+        if length >= SUN_LEN {
+            anyhow::bail!(
+                "daemon socket path is too long ({} bytes; limit is {}): {}; set COCKPIT_SOCKET_DIR to a shorter directory",
+                length,
+                SUN_LEN - 1,
+                socket.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_bind_socket_paths(_paths: &DaemonPaths) -> Result<()> {
+    // Windows uses private named pipes, not `sockaddr_un` paths.
+    Ok(())
 }
 
 /// Filesystem roots a confined child must never reach: the daemon state

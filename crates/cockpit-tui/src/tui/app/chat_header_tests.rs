@@ -230,10 +230,13 @@ fn header_pills_draw_only_from_real_state() {
 }
 
 /// Session status on the title row tracks real state: attention pending,
-/// busy working, idle.
+/// busy working, done after a settled turn, idle before any turn.
 #[test]
 fn header_session_status_tracks_real_state() {
     let tmp = tempfile::tempdir().unwrap();
+    let bare_tmp = tempfile::tempdir().unwrap();
+    // Built before the `app` binding below shadows the constructor.
+    let mut bare = app(&bare_tmp);
     let mut app = app(&tmp);
     let buf = render(&mut app, 100, 30);
     let layout = app.chat_header_layout.clone().expect("header rendered");
@@ -257,6 +260,27 @@ fn header_session_status_tracks_real_state() {
         title.contains("Waiting"),
         "attention outranks busy: {title:?}"
     );
+
+    // Nothing in flight over a transcript that has carried a turn: done,
+    // the reference resting rule — not idle.
+    app.busy = false;
+    app.attention_interrupt = None;
+    app.history
+        .push(user_entry("hello header this is the user message"));
+    app.history
+        .push(agent_entry("agent reply that settled the turn"));
+    let buf = render(&mut app, 100, 30);
+    let title = row_text(&buf, 0);
+    assert!(title.contains("Done"), "settled turn: {title:?}");
+
+    // Tool chrome and system notes alone are not a turn: still idle.
+    bare.history.push(HistoryEntry::SkillAutoInjected {
+        name: "firecrawl".to_string(),
+        reason: None,
+    });
+    let buf = render(&mut bare, 100, 30);
+    let title = row_text(&buf, 0);
+    assert!(title.contains("Idle"), "no turn yet: {title:?}");
 }
 
 #[test]

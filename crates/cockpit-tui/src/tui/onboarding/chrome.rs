@@ -3,11 +3,11 @@
 //! (Continue / Save / Retry / …) so every step can be driven with the mouse
 //! alone, not just the keyboard.
 
+use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use super::theme::{BRASS, DISABLED, FOG, INK};
 use crate::tui::chrome::chip_style;
@@ -49,11 +49,7 @@ pub(super) fn render_back_button(
         Paragraph::new(Line::from(Span::styled(BACK_LABEL, style))),
         rect,
     );
-    if enabled {
-        rect
-    } else {
-        Rect::default()
-    }
+    if enabled { rect } else { Rect::default() }
 }
 
 /// Whether `pos` falls on a rect (empty rects never match). Used for the back
@@ -215,8 +211,8 @@ impl ActionBar {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn render(buttons: &[Button<'_>], hover: Option<usize>) -> (Vec<Rect>, String) {
         let backend = TestBackend::new(40, 1);

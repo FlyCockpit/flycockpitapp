@@ -21,7 +21,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::tui::button::{
-    clip_to_display_width, display_width, ButtonDispatch, ButtonId, ButtonSpec,
+    ButtonDispatch, ButtonId, ButtonSpec, clip_to_display_width, display_width,
 };
 use crate::tui::theme::{
     DISABLED, DIVIDER_DIM, GREEN, MUTED_COLOR_INDEX, RED, STATUS_BRANCH_BADGE, YELLOW,

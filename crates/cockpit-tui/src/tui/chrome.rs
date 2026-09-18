@@ -6,13 +6,13 @@
 //! pickers live on the composer bottom-border deck. This module keeps the
 //! additive transient indicators (longcache, caffeination, lock wait, …).
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, HighlightSpacing, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
-use ratatui::Frame;
 
 use crate::tui::theme::{BRASS, GOOD, HOVER_BG, NIGHT};
 
@@ -369,9 +369,9 @@ pub fn side_glyph_spans(active: bool) -> Vec<Span<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
-    use ratatui::Terminal;
 
     #[test]
     fn chip_style_applies_excoc_hover_rule() {

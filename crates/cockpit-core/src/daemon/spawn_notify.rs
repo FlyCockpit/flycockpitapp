@@ -1,0 +1,723 @@
+//! One-shot parent←child boot-status endpoint, daemon log capture, and
+//! spawn-wait timeout.
+//!
+//! The parent binds a private notify endpoint, passes its path (Unix) or pipe
+//! name (Windows) in [`super::DAEMON_SPAWN_NOTIFY_ENV`], and waits for a single
+//! `Ok{socket}` / `AddrInUse{path}` / `Err{reason}` line. The child reports
+//! after bind, or on any boot failure. A child that exits or stays silent is
+//! killed (timeout) and the last lines of `daemon.log` are appended to the
+//! error, matching the excoc lifecycle log-tail.
+
+use std::io::Write;
+#[cfg(unix)]
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::process::Child;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use super::{
+    DAEMON_LOG_FILE, DAEMON_LOG_MAX_BYTES, DAEMON_LOG_ROTATED_FILE, DAEMON_SPAWN_NOTIFY_ENV,
+    DaemonBindInUse,
+};
+
+const LOG_TAIL_LINES: usize = 20;
+const WAIT_POLL: Duration = Duration::from_millis(10);
+const REAP_GRACE: Duration = Duration::from_millis(200);
+
+#[cfg(unix)]
+static NOTIFY_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Parsed one-shot boot report from the child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SpawnReport {
+    Ready { socket: PathBuf },
+    AddrInUse { path: PathBuf },
+    Failed { reason: String },
+}
+
+pub(crate) struct SpawnNotifyServer {
+    #[cfg(unix)]
+    listener: std::os::unix::net::UnixListener,
+    #[cfg(unix)]
+    path: PathBuf,
+    #[cfg(windows)]
+    pipe_name: String,
+    #[cfg(windows)]
+    listener: crate::daemon::windows_pipe::NamedPipeListener,
+}
+
+impl SpawnNotifyServer {
+    pub(crate) fn bind() -> Result<Self> {
+        #[cfg(unix)]
+        {
+            unix_bind()
+        }
+        #[cfg(windows)]
+        {
+            windows_bind()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            bail!("daemon spawn notify is not supported on this platform")
+        }
+    }
+
+    pub(crate) fn endpoint(&self) -> String {
+        #[cfg(unix)]
+        {
+            self.path.to_string_lossy().into_owned()
+        }
+        #[cfg(windows)]
+        {
+            self.pipe_name.clone()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            String::new()
+        }
+    }
+
+    pub(crate) fn wait(
+        self,
+        child: &mut Child,
+        log_path: &Path,
+        timeout: Duration,
+    ) -> Result<SpawnReport> {
+        #[cfg(unix)]
+        {
+            unix_wait(self, child, log_path, timeout)
+        }
+        #[cfg(windows)]
+        {
+            windows_wait(self, child, log_path, timeout)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (child, log_path, timeout);
+            bail!("daemon spawn notify is not supported on this platform")
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SpawnNotifyServer {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Child-side report. No-op when the parent did not pass a notify endpoint.
+pub(crate) fn report_ready(socket: &Path) {
+    report_line(&format!("Ok{{{}}}", socket.display()));
+}
+
+pub(crate) fn report_err(error: &anyhow::Error) {
+    if let Some(bind) = error.downcast_ref::<DaemonBindInUse>() {
+        report_line(&format!("AddrInUse{{{}}}", bind.path.display()));
+        return;
+    }
+    let reason = sanitize_report_reason(&format!("{error:#}"));
+    report_line(&format!("Err{{{reason}}}"));
+}
+
+fn report_line(line: &str) {
+    let Ok(endpoint) = std::env::var(DAEMON_SPAWN_NOTIFY_ENV) else {
+        return;
+    };
+    if endpoint.is_empty() {
+        return;
+    }
+    if let Err(error) = write_report(&endpoint, line) {
+        tracing::warn!(%error, endpoint, "failed to report daemon spawn status to parent");
+    }
+}
+
+fn write_report(endpoint: &str, line: &str) -> Result<()> {
+    let payload = format!("{line}\n");
+    #[cfg(unix)]
+    {
+        let mut stream = std::os::unix::net::UnixStream::connect(Path::new(endpoint))
+            .with_context(|| format!("connecting spawn notify socket {endpoint}"))?;
+        stream
+            .write_all(payload.as_bytes())
+            .context("writing spawn notify report")?;
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        let pipe = cockpit_host::named_pipe::parse_pipe_name(endpoint)
+            .with_context(|| format!("parsing spawn notify pipe {endpoint}"))?;
+        let mut stream = cockpit_host::named_pipe::open_client_pipe_blocking(&pipe)
+            .with_context(|| format!("connecting spawn notify pipe {endpoint}"))?;
+        stream
+            .write_all(payload.as_bytes())
+            .context("writing spawn notify report")?;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (endpoint, payload);
+        bail!("daemon spawn notify is not supported on this platform")
+    }
+}
+
+pub(crate) fn parse_report_line(line: &str) -> Result<SpawnReport> {
+    let line = line.trim();
+    if let Some(body) = line.strip_prefix("Ok{") {
+        let socket = body
+            .strip_suffix('}')
+            .ok_or_else(|| anyhow::anyhow!("malformed Ok spawn notify: {line}"))?;
+        return Ok(SpawnReport::Ready {
+            socket: PathBuf::from(socket),
+        });
+    }
+    if let Some(body) = line.strip_prefix("AddrInUse{") {
+        let path = body
+            .strip_suffix('}')
+            .ok_or_else(|| anyhow::anyhow!("malformed AddrInUse spawn notify: {line}"))?;
+        return Ok(SpawnReport::AddrInUse {
+            path: PathBuf::from(path),
+        });
+    }
+    if let Some(body) = line.strip_prefix("Err{") {
+        let reason = body
+            .strip_suffix('}')
+            .ok_or_else(|| anyhow::anyhow!("malformed Err spawn notify: {line}"))?;
+        return Ok(SpawnReport::Failed {
+            reason: reason.to_string(),
+        });
+    }
+    bail!("malformed spawn notify: {line}")
+}
+
+fn sanitize_report_reason(reason: &str) -> String {
+    reason.replace(['}', '\n', '\r'], " ")
+}
+
+pub(crate) fn prepare_daemon_log(state_dir: &Path) -> Result<std::fs::File> {
+    cockpit_host::private_fs::ensure_private_dir(state_dir)
+        .with_context(|| format!("securing {}", state_dir.display()))?;
+    rotate_daemon_log_if_needed(state_dir)?;
+    open_daemon_log_append(state_dir)
+}
+
+fn rotate_daemon_log_if_needed(state_dir: &Path) -> Result<()> {
+    let log_path = state_dir.join(DAEMON_LOG_FILE);
+    let Ok(meta) = std::fs::metadata(&log_path) else {
+        return Ok(());
+    };
+    if meta.len() < DAEMON_LOG_MAX_BYTES {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        rotate_daemon_log_fd(state_dir)
+    }
+    #[cfg(not(unix))]
+    {
+        let rotated = state_dir.join(DAEMON_LOG_ROTATED_FILE);
+        let _ = std::fs::remove_file(&rotated);
+        std::fs::rename(&log_path, &rotated)
+            .with_context(|| format!("rotating {}", log_path.display()))?;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn rotate_daemon_log_fd(state_dir: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+
+    let dir_fd = cockpit_host::private_fs::open_private_dir_handle(state_dir)
+        .with_context(|| format!("opening {}", state_dir.display()))?;
+    let tolerate_enoent = |result: i32| -> std::io::Result<()> {
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    };
+    let current = CString::new(DAEMON_LOG_FILE).context("daemon.log name")?;
+    let rotated = CString::new(DAEMON_LOG_ROTATED_FILE).context("daemon.log.1 name")?;
+    // SAFETY: `dir_fd` is a live directory fd from `open_private_dir_handle`;
+    // `rotated` is a NUL-terminated CString of a trusted basename.
+    tolerate_enoent(unsafe { libc::unlinkat(dir_fd.as_raw_fd(), rotated.as_ptr(), 0) })
+        .context("removing rotated daemon.log.1")?;
+    // SAFETY: both names are NUL-terminated CStrings of trusted basenames;
+    // `dir_fd` is still the same live directory fd.
+    tolerate_enoent(unsafe {
+        libc::renameat(
+            dir_fd.as_raw_fd(),
+            current.as_ptr(),
+            dir_fd.as_raw_fd(),
+            rotated.as_ptr(),
+        )
+    })
+    .context("renaming daemon.log to daemon.log.1")?;
+    Ok(())
+}
+
+fn open_daemon_log_append(state_dir: &Path) -> Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        cockpit_host::private_fs::open_private_file_at(
+            state_dir,
+            std::ffi::OsStr::new(DAEMON_LOG_FILE),
+            cockpit_host::private_fs::PrivateFileAccess::Append,
+            "daemon log",
+        )
+        .with_context(|| format!("opening {}/{}", state_dir.display(), DAEMON_LOG_FILE))
+    }
+    #[cfg(not(unix))]
+    {
+        let path = state_dir.join(DAEMON_LOG_FILE);
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))
+    }
+}
+
+pub(crate) fn last_log_lines(log_path: &Path, n: usize) -> String {
+    let Ok(data) = std::fs::read(log_path) else {
+        return String::new();
+    };
+    const WINDOW: usize = 64 * 1024;
+    let slice = if data.len() > WINDOW {
+        &data[data.len() - WINDOW..]
+    } else {
+        &data
+    };
+    let text = String::from_utf8_lossy(slice);
+    let lines: Vec<&str> = text.lines().collect();
+    lines
+        .iter()
+        .rev()
+        .take(n)
+        .copied()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(crate) fn error_with_log_tail(
+    reason: impl std::fmt::Display,
+    log_path: &Path,
+) -> anyhow::Error {
+    let tail = last_log_lines(log_path, LOG_TAIL_LINES);
+    if tail.trim().is_empty() {
+        anyhow::anyhow!("{reason}")
+    } else {
+        anyhow::anyhow!("{reason}\n--- daemon.log (last {LOG_TAIL_LINES} lines) ---\n{tail}")
+    }
+}
+
+pub(crate) fn report_to_error(report: SpawnReport, log_path: &Path) -> anyhow::Error {
+    match report {
+        SpawnReport::Ready { socket } => {
+            anyhow::anyhow!(
+                "daemon reported ready at {} unexpectedly as an error",
+                socket.display()
+            )
+        }
+        SpawnReport::AddrInUse { path } => {
+            attach_log_tail(anyhow::Error::from(DaemonBindInUse { path }), log_path)
+        }
+        SpawnReport::Failed { reason } => error_with_log_tail(reason, log_path),
+    }
+}
+
+fn attach_log_tail(error: anyhow::Error, log_path: &Path) -> anyhow::Error {
+    let tail = last_log_lines(log_path, LOG_TAIL_LINES);
+    if tail.trim().is_empty() {
+        error
+    } else {
+        error.context(format!(
+            "--- daemon.log (last {LOG_TAIL_LINES} lines) ---\n{tail}"
+        ))
+    }
+}
+
+pub(crate) fn kill_spawned_daemon(child: &mut Child) {
+    let pid = child.id();
+    #[cfg(unix)]
+    {
+        cockpit_host::process::terminate_process_group(pid);
+        let deadline = Instant::now() + REAP_GRACE;
+        while Instant::now() < deadline {
+            if child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            std::thread::sleep(WAIT_POLL);
+        }
+        cockpit_host::process::kill_process_group(pid);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+pub(crate) fn reap_or_kill(child: &mut Child) {
+    let deadline = Instant::now() + REAP_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() >= deadline => break,
+            Ok(None) => std::thread::sleep(WAIT_POLL),
+            Err(_) => break,
+        }
+    }
+    kill_spawned_daemon(child);
+}
+
+#[cfg(unix)]
+fn unix_bind() -> Result<SpawnNotifyServer> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+
+    let path = short_notify_path()?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("removing leftover {}", path.display()));
+        }
+    }
+    let listener = UnixListener::bind(&path)
+        .with_context(|| format!("binding spawn notify socket {}", path.display()))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0600 {}", path.display()))?;
+    listener
+        .set_nonblocking(true)
+        .context("setting spawn notify socket non-blocking")?;
+    Ok(SpawnNotifyServer { listener, path })
+}
+
+#[cfg(unix)]
+fn short_notify_path() -> Result<PathBuf> {
+    let seq = NOTIFY_SEQ.fetch_add(1, Ordering::Relaxed);
+    let name = format!("ck-n-{}-{seq:x}.sock", std::process::id());
+    let candidates = [std::env::temp_dir(), PathBuf::from("/tmp")];
+    for dir in candidates {
+        let path = dir.join(&name);
+        if super::unix_socket_path_is_bindable(&path) {
+            return Ok(path);
+        }
+    }
+    bail!(
+        "could not place a spawn-notify socket shorter than SUN_LEN; set TMPDIR to a shorter directory"
+    )
+}
+
+#[cfg(unix)]
+fn unix_wait(
+    server: SpawnNotifyServer,
+    child: &mut Child,
+    log_path: &Path,
+    timeout: Duration,
+) -> Result<SpawnReport> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match server.listener.accept() {
+            Ok((stream, _)) => {
+                let mut line = String::new();
+                BufReader::new(stream)
+                    .read_line(&mut line)
+                    .context("reading spawn notify report")?;
+                return parse_report_line(&line);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                return Err(error).context("accepting spawn notify connection");
+            }
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return Err(error_with_log_tail(
+                    "timed out waiting for daemon to report ready: child exited before reporting",
+                    log_path,
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(error).context("polling spawned daemon child");
+            }
+        }
+        if Instant::now() >= deadline {
+            kill_spawned_daemon(child);
+            return Err(error_with_log_tail(
+                format!(
+                    "timed out waiting for daemon to report ready after {}s",
+                    timeout.as_secs().max(1)
+                ),
+                log_path,
+            ));
+        }
+        std::thread::sleep(WAIT_POLL);
+    }
+}
+
+#[cfg(windows)]
+fn windows_bind() -> Result<SpawnNotifyServer> {
+    let listener = crate::daemon::windows_pipe::NamedPipeListener::prepare()
+        .context("creating spawn notify named pipe")?;
+    let pipe_name = listener.pipe_name().as_str().to_string();
+    Ok(SpawnNotifyServer {
+        pipe_name,
+        listener,
+    })
+}
+
+#[cfg(windows)]
+fn windows_wait(
+    server: SpawnNotifyServer,
+    child: &mut Child,
+    log_path: &Path,
+    timeout: Duration,
+) -> Result<SpawnReport> {
+    let SpawnNotifyServer {
+        pipe_name: _,
+        listener,
+    } = server;
+    let join = std::thread::Builder::new()
+        .name("cockpit-spawn-notify".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("building spawn-notify runtime")?;
+            runtime.block_on(async move {
+                let mut listener = listener;
+                let stream = tokio::time::timeout(timeout, listener.accept())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("spawn notify accept timed out"))?
+                    .context("accepting spawn notify pipe")?;
+                let mut line = String::new();
+                let mut reader = tokio::io::BufReader::new(stream);
+                tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
+                    .await
+                    .context("reading spawn notify report")?;
+                parse_report_line(&line)
+            })
+        })
+        .context("starting spawn-notify waiter")?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if join.is_finished() {
+            return join
+                .join()
+                .map_err(|_| anyhow::anyhow!("spawn-notify waiter panicked"))?;
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return Err(error_with_log_tail(
+                    "timed out waiting for daemon to report ready: child exited before reporting",
+                    log_path,
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(error).context("polling spawned daemon child");
+            }
+        }
+        if Instant::now() >= deadline {
+            kill_spawned_daemon(child);
+            return Err(error_with_log_tail(
+                format!(
+                    "timed out waiting for daemon to report ready after {}s",
+                    timeout.as_secs().max(1)
+                ),
+                log_path,
+            ));
+        }
+        std::thread::sleep(WAIT_POLL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    #[test]
+    fn parse_report_line_accepts_ok_addr_in_use_and_err() {
+        match parse_report_line("Ok{/tmp/cockpit.sock}\n").unwrap() {
+            SpawnReport::Ready { socket } => {
+                assert_eq!(socket, PathBuf::from("/tmp/cockpit.sock"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse_report_line("AddrInUse{/tmp/cockpit.sock}").unwrap() {
+            SpawnReport::AddrInUse { path } => {
+                assert_eq!(path, PathBuf::from("/tmp/cockpit.sock"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse_report_line("Err{binding leak-reveal socket}").unwrap() {
+            SpawnReport::Failed { reason } => {
+                assert_eq!(reason, "binding leak-reveal socket");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn addr_in_use_report_keeps_dedicated_exit_code_with_log_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join(DAEMON_LOG_FILE);
+        std::fs::write(&log_path, "bind-line\n").unwrap();
+        let error = report_to_error(
+            SpawnReport::AddrInUse {
+                path: PathBuf::from("/tmp/cockpit.sock"),
+            },
+            &log_path,
+        );
+        assert_eq!(
+            super::super::daemon_error_exit_code(&error),
+            super::super::DAEMON_BIND_IN_USE_EXIT_CODE
+        );
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("already in use"),
+            "typed bind refusal must remain visible: {text}"
+        );
+        assert!(
+            text.contains("bind-line"),
+            "log tail must remain attached: {text}"
+        );
+    }
+
+    #[test]
+    fn last_log_lines_returns_the_trailing_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.log");
+        let mut body = String::new();
+        for i in 0..30 {
+            body.push_str(&format!("line-{i}\n"));
+        }
+        std::fs::write(&path, body).unwrap();
+        let tail = last_log_lines(&path, 20);
+        assert!(tail.starts_with("line-10"), "{tail}");
+        assert!(tail.ends_with("line-29"), "{tail}");
+        assert!(!tail.contains("line-9"), "{tail}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_child_err_report_becomes_the_user_facing_error() {
+        let dir = tempfile::tempdir().unwrap();
+        cockpit_host::private_fs::ensure_private_dir(dir.path()).unwrap();
+        let log_path = dir.path().join(DAEMON_LOG_FILE);
+        std::fs::write(&log_path, "ignored\n").unwrap();
+        let server = SpawnNotifyServer::bind().unwrap();
+        let notify = PathBuf::from(server.endpoint());
+        // SAFETY: `pre_exec` runs in the forked child before exec of `true`.
+        let mut child = unsafe {
+            use std::io::Write as _;
+            use std::os::unix::process::CommandExt;
+            let notify = notify.clone();
+            Command::new("true")
+                .pre_exec(move || {
+                    let mut stream = std::os::unix::net::UnixStream::connect(&notify)?;
+                    stream.write_all(b"Err{bind failed: test reason}\n")?;
+                    Ok(())
+                })
+                .spawn()
+                .unwrap()
+        };
+        let report = server
+            .wait(&mut child, &log_path, Duration::from_secs(2))
+            .expect("notify report");
+        let error = report_to_error(report, &log_path);
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("bind failed: test reason"),
+            "user-facing error must carry the child's Err payload: {text}"
+        );
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn silent_child_exit_yields_timeout_error_with_log_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        cockpit_host::private_fs::ensure_private_dir(dir.path()).unwrap();
+        let log_path = dir.path().join(DAEMON_LOG_FILE);
+        let mut body = String::new();
+        for i in 0..25 {
+            body.push_str(&format!("boot-line-{i}\n"));
+        }
+        std::fs::write(&log_path, &body).unwrap();
+        let server = SpawnNotifyServer::bind().unwrap();
+        let mut child = Command::new("true").spawn().unwrap();
+        let error = server
+            .wait(&mut child, &log_path, Duration::from_secs(2))
+            .expect_err("silent exit must fail");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("timed out waiting for daemon to report ready"),
+            "silent exit must use the timeout error: {text}"
+        );
+        assert!(
+            text.contains("boot-line-24"),
+            "timeout error must append the log tail: {text}"
+        );
+        assert!(
+            text.contains("child exited before reporting"),
+            "silent exit must name the child exit: {text}"
+        );
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hanging_child_is_killed_on_timeout_with_log_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        cockpit_host::private_fs::ensure_private_dir(dir.path()).unwrap();
+        let log_path = dir.path().join(DAEMON_LOG_FILE);
+        std::fs::write(&log_path, "still-booting\n").unwrap();
+        let server = SpawnNotifyServer::bind().unwrap();
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let error = server
+            .wait(&mut child, &log_path, Duration::from_millis(200))
+            .expect_err("hanging child must time out");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("timed out waiting for daemon to report ready"),
+            "{text}"
+        );
+        assert!(text.contains("still-booting"), "{text}");
+        let status = child.try_wait().unwrap();
+        assert!(
+            status.is_some(),
+            "timeout must kill the hanging child, got {status:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_daemon_log_rotates_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        cockpit_host::private_fs::ensure_private_dir(dir.path()).unwrap();
+        let log_path = dir.path().join(DAEMON_LOG_FILE);
+        std::fs::write(&log_path, vec![b'x'; (DAEMON_LOG_MAX_BYTES as usize) + 8]).unwrap();
+        let _file = prepare_daemon_log(dir.path()).unwrap();
+        let rotated = dir.path().join(DAEMON_LOG_ROTATED_FILE);
+        assert!(rotated.exists(), "oversized daemon.log must rotate to .1");
+        assert!(
+            std::fs::metadata(&log_path).unwrap().len() < DAEMON_LOG_MAX_BYTES,
+            "fresh log must start empty/small after rotation"
+        );
+    }
+}

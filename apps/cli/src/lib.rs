@@ -810,7 +810,7 @@ fn error_exit_code(err: &anyhow::Error) -> u8 {
     } else if let Some(error) = err.downcast_ref::<commands::agent::AgentCommandError>() {
         error.exit_code()
     } else {
-        1
+        cockpit_core::daemon::daemon_error_exit_code(err)
     }
 }
 
@@ -2184,6 +2184,18 @@ mod tests {
             );
         }
         assert!(drain_logs_on_exit(None));
+    }
+
+    #[test]
+    fn daemon_bind_in_use_uses_dedicated_exit_code() {
+        let err = anyhow::Error::new(cockpit_core::daemon::DaemonBindInUse {
+            path: PathBuf::from("/tmp/cockpit.sock"),
+        });
+        assert_eq!(
+            error_exit_code(&err),
+            cockpit_core::daemon::DAEMON_BIND_IN_USE_EXIT_CODE
+        );
+        assert_ne!(error_exit_code(&err), 1);
     }
 
     // FINDING B: rotation is fd-anchored. Given a held directory fd, the shift

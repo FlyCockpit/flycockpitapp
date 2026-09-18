@@ -14,7 +14,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error:#}");
-            ExitCode::FAILURE
+            ExitCode::from(cockpit_core::daemon::daemon_error_exit_code(&error))
         }
     }
 }

@@ -86,6 +86,8 @@ pub mod remote_project_resolver;
 #[cfg(feature = "extended")]
 pub mod scheduler;
 pub mod server;
+#[cfg(any(unix, windows))]
+pub(crate) mod spawn_notify;
 
 /// Current daemon-published configuration generation for client settlement
 /// correlation. Clients must read this from the daemon inventory, not infer it
@@ -111,7 +113,7 @@ pub mod turn_socket_provider;
 pub(crate) mod windows_pipe;
 
 #[cfg(unix)]
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -209,15 +211,51 @@ pub fn send_event(tx: &EventSender, redact: &Arc<RedactionTable>, event: proto::
 /// policy differs.
 const DAEMON_LIFETIME_ENV: &str = "COCKPIT_DAEMON_LIFETIME";
 const EPHEMERAL_LIFETIME: &str = "ephemeral";
-/// One-shot parent-to-child boot-status endpoint.  Unix uses an owner-only
-/// Unix-domain socket. Windows intentionally refuses detached startup until a
-/// named-pipe implementation lands: silently falling back to an unbounded
-/// socket poll would reintroduce the stuck-startup failure this endpoint fixes.
+/// One-shot parent←child boot-status endpoint. Unix uses an owner-only
+/// Unix-domain socket; Windows uses a private named pipe. The child reports
+/// `Ok{socket}` after bind or `AddrInUse{path}` / `Err{reason}` on boot
+/// failure so the parent never falls back to an unbounded socket poll.
 const DAEMON_SPAWN_NOTIFY_ENV: &str = "COCKPIT_DAEMON_SPAWN_NOTIFY";
 const DAEMON_LOG_FILE: &str = "daemon.log";
 const DAEMON_LOG_ROTATED_FILE: &str = "daemon.log.1";
 const DAEMON_LOG_MAX_BYTES: u64 = 1024 * 1024;
 pub const DAEMON_SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
+/// `sysexits.h` `EX_TEMPFAIL` — dedicated code for bind refusal / address in use.
+pub const DAEMON_BIND_IN_USE_EXIT_CODE: u8 = 75;
+
+/// Bind refused because the control or leak-reveal endpoint is already taken.
+#[derive(Debug, Clone)]
+pub struct DaemonBindInUse {
+    pub path: PathBuf,
+}
+
+impl std::fmt::Display for DaemonBindInUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "daemon socket address already in use: {}",
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for DaemonBindInUse {}
+
+/// Map a daemon-start failure onto a process exit status. Bind refusal is
+/// distinct from generic boot failure so supervisors can retry on contention.
+/// Walk the cause chain: spawn-notify may wrap [`DaemonBindInUse`] with a
+/// `daemon.log` tail context.
+pub fn daemon_error_exit_code(error: &anyhow::Error) -> u8 {
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<DaemonBindInUse>().is_some())
+    {
+        DAEMON_BIND_IN_USE_EXIT_CODE
+    } else {
+        1
+    }
+}
+
 /// Optional override for detached daemon spawn tests. Production callers use
 /// `current_exe()`; test builds require the `cockpit-daemon-spawn-harness`
 /// binary discovered via [`discover_daemon_spawn_harness_executable`].
@@ -579,23 +617,18 @@ impl DaemonPaths {
 }
 
 /// Validate every Unix-domain path this daemon binds before boot opens SQLite.
-/// `sockaddr_un` is platform-specific (104 bytes on macOS, 108 on Linux), so
-/// derive the limit from the target's libc definition instead of baking an OS
-/// table into the application.
+/// `sockaddr_un.sun_path` is platform-specific (104 bytes on macOS, 108 on
+/// Linux), so derive the limit from the target's libc definition instead of
+/// baking an OS table into the application.
 #[cfg(unix)]
 fn validate_bind_socket_paths(paths: &DaemonPaths) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt as _;
-
-    const SUN_LEN: usize = std::mem::size_of::<libc::sockaddr_un>()
-        - std::mem::size_of::<libc::sa_family_t>();
-
     for socket in [paths.socket.clone(), paths.leak_reveal_socket()] {
-        let length = socket.as_os_str().as_bytes().len();
-        if length >= SUN_LEN {
+        if !unix_socket_path_is_bindable(&socket) {
+            let length = unix_socket_path_len(&socket);
             anyhow::bail!(
                 "daemon socket path is too long ({} bytes; limit is {}): {}; set COCKPIT_SOCKET_DIR to a shorter directory",
                 length,
-                SUN_LEN - 1,
+                unix_socket_path_max().saturating_sub(1),
                 socket.display()
             );
         }
@@ -603,10 +636,40 @@ fn validate_bind_socket_paths(paths: &DaemonPaths) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+pub(crate) fn unix_socket_path_max() -> usize {
+    std::mem::size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path)
+}
+
+#[cfg(unix)]
+fn unix_socket_path_len(path: &Path) -> usize {
+    use std::os::unix::ffi::OsStrExt as _;
+    path.as_os_str().as_bytes().len()
+}
+
+#[cfg(unix)]
+pub(crate) fn unix_socket_path_is_bindable(path: &Path) -> bool {
+    unix_socket_path_len(path) < unix_socket_path_max()
+}
+
 #[cfg(windows)]
 fn validate_bind_socket_paths(_paths: &DaemonPaths) -> Result<()> {
     // Windows uses private named pipes, not `sockaddr_un` paths.
     Ok(())
+}
+
+fn is_addr_in_use(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::AddrInUse {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::EADDRINUSE)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 /// Filesystem roots a confined child must never reach: the daemon state
@@ -682,8 +745,18 @@ pub(crate) fn bind_private_socket(socket: &std::path::Path) -> Result<UnixListen
     // held-fd verification below: the listener fd points at the ORIGINAL socket,
     // so if the chmod hit a swapped victim, the socket's own mode stays wide and
     // the `fstat` check fails closed.
-    let listener =
-        UnixListener::bind(socket).with_context(|| format!("binding {}", socket.display()))?;
+    let listener = match UnixListener::bind(socket) {
+        Ok(listener) => listener,
+        Err(error) if is_addr_in_use(&error) => {
+            return Err(DaemonBindInUse {
+                path: socket.to_path_buf(),
+            }
+            .into());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("binding {}", socket.display()));
+        }
+    };
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod 0600 {}", socket.display()))?;
 
@@ -718,7 +791,22 @@ pub(crate) fn bind_private_socket(socket: &std::path::Path) -> Result<UnixListen
 
 #[cfg(windows)]
 pub(crate) fn bind_private_socket(socket: &std::path::Path) -> Result<DaemonListener> {
-    windows_pipe::NamedPipeListener::bind(socket)
+    match windows_pipe::NamedPipeListener::bind(socket) {
+        Ok(listener) => Ok(listener),
+        Err(error) => {
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(is_addr_in_use)
+            }) {
+                return Err(DaemonBindInUse {
+                    path: socket.to_path_buf(),
+                }
+                .into());
+            }
+            Err(error)
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -728,6 +816,7 @@ fn publish_socket_pair_with(
 ) -> Result<(DaemonListener, leak_reveal_socket::BoundRevealSocket)> {
     let reveal = leak_reveal_socket::bind_reveal_socket(paths)?;
     let control = publish_control()?;
+    spawn_notify::report_ready(&paths.socket);
     Ok((control, reveal))
 }
 
@@ -743,6 +832,7 @@ fn prepare_and_publish_socket_pair(
     // The control identity is the final observable readiness boundary. If it
     // fails, `reveal` drops here and retracts its own identity.
     control.publish(&paths.socket)?;
+    spawn_notify::report_ready(&paths.socket);
     Ok((control, reveal))
 }
 
@@ -1490,6 +1580,26 @@ fn spawn_detached_child(
     #[cfg(windows)]
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
+    let owned_paths;
+    let paths = match ephemeral {
+        Some(paths) => paths,
+        None => {
+            owned_paths =
+                DaemonPaths::resolve_canonical().context("resolving daemon paths for spawn")?;
+            &owned_paths
+        }
+    };
+    validate_bind_socket_paths(paths)?;
+    let state_dir = paths
+        .pid_file
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("daemon pid file has no parent directory"))?;
+    let log_file = spawn_notify::prepare_daemon_log(state_dir)?;
+    let log_path = state_dir.join(DAEMON_LOG_FILE);
+    let stderr = log_file
+        .try_clone()
+        .context("cloning daemon.log handle for stderr")?;
+    let notify = spawn_notify::SpawnNotifyServer::bind()?;
     let exe = resolve_daemon_spawn_executable().context("locating daemon spawn executable")?;
     let mut command = Command::new(exe);
     command
@@ -1497,8 +1607,8 @@ fn spawn_detached_child(
         .arg("start")
         .arg("--foreground")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(stderr));
     if no_sandbox {
         command.arg("--no-sandbox");
     }
@@ -1508,6 +1618,7 @@ fn spawn_detached_child(
     if ephemeral.is_some() {
         command.env(DAEMON_LIFETIME_ENV, EPHEMERAL_LIFETIME);
     }
+    command.env(DAEMON_SPAWN_NOTIFY_ENV, notify.endpoint());
     // Trusted launch provenance (issue #337): the daemon child receives a
     // one-time launch ticket through its spawn environment. The daemon
     // records it at boot, bound to this process's exact identity, so only
@@ -1524,25 +1635,25 @@ fn spawn_detached_child(
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
-    let child = command.spawn().context("spawning daemon child")?;
-    let socket_for_ticket = ephemeral.map(|paths| paths.socket.clone()).or_else(|| {
-        DaemonPaths::resolve_canonical()
-            .ok()
-            .map(|paths| paths.socket)
-    });
-    if let Some(socket) = socket_for_ticket
-        && let Err(error) = peer_authority::persist_launch_ticket(&socket, &launch_ticket)
-    {
+    let mut child = command.spawn().context("spawning daemon child")?;
+    if let Err(error) = peer_authority::persist_launch_ticket(&paths.socket, &launch_ticket) {
         tracing::warn!(
             %error,
-            socket = %socket.display(),
+            socket = %paths.socket.display(),
             "persisting launch ticket for follower cockpit processes"
         );
     }
-    // The child now exists, so this process is the daemon launcher: retain
-    // the matching launch ticket in memory for the peer-credential exchange.
-    cockpit_client::launch_provenance::set_process_launch_ticket(launch_ticket);
-    Ok(child)
+    match notify.wait(&mut child, &log_path, DAEMON_SPAWN_TIMEOUT) {
+        Ok(spawn_notify::SpawnReport::Ready { .. }) => {
+            cockpit_client::launch_provenance::set_process_launch_ticket(launch_ticket);
+            Ok(child)
+        }
+        Ok(report) => {
+            spawn_notify::reap_or_kill(&mut child);
+            Err(spawn_notify::report_to_error(report, &log_path))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -2512,6 +2623,28 @@ async fn run_foreground_inner_with_boot_db(
     terminal_factory: terminal::TerminalHostFactory,
     boot_db: Option<crate::db::Db>,
 ) -> Result<()> {
+    let result = run_foreground_inner_with_boot_db_impl(
+        paths,
+        drain_grace,
+        resume_all_sessions,
+        terminal_factory,
+        boot_db,
+    )
+    .await;
+    if let Err(error) = &result {
+        spawn_notify::report_err(error);
+    }
+    result
+}
+
+#[cfg(any(unix, windows))]
+async fn run_foreground_inner_with_boot_db_impl(
+    paths: DaemonPaths,
+    drain_grace: Duration,
+    resume_all_sessions: bool,
+    terminal_factory: terminal::TerminalHostFactory,
+    boot_db: Option<crate::db::Db>,
+) -> Result<()> {
     let mut timer = crate::startup::PhaseTimer::start("daemon::run_foreground");
     let boot_dbg_start = std::time::Instant::now();
     macro_rules! boot_dbg {
@@ -2522,6 +2655,7 @@ async fn run_foreground_inner_with_boot_db(
         };
     }
     boot_dbg!("entry");
+    validate_bind_socket_paths(&paths)?;
     let global_config_dir = (!paths.ephemeral).then(|| {
         tokio::task::spawn_blocking(crate::config::config::dirs::ensure_global_config_dir)
     });
@@ -4489,33 +4623,96 @@ mod tests {
         assert!(restart_no_sandbox_from_argv(&sandboxed, true));
     }
 
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn detached_spawn_does_no_cache_io_before_child_creation() {
-        let source = include_str!("mod.rs");
-        let start = source
-            .find("fn spawn_detached_child(\n")
-            .expect("detached spawn function");
-        let body = &source[start..];
-        let end = body
-            .find("#[cfg(not(any(unix, windows)))]")
-            .expect("end of platform detached spawn function");
-        let body = &body[..end];
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn long_socket_path_fails_before_opening_the_database() {
+        use std::os::unix::ffi::OsStrExt as _;
 
-        assert!(
-            body.contains(".stderr(Stdio::null())"),
-            "detached stdout/stderr must remain disconnected from the terminal"
-        );
-        assert!(
-            body.contains("command.spawn()"),
-            "detached child must spawn"
-        );
-        for forbidden in ["cache_dir", "ensure_private_dir", "OpenOptions"] {
-            assert!(
-                !body.contains(forbidden),
-                "detached launch must not perform cache filesystem I/O: {forbidden}"
-            );
+        let home = tempfile::tempdir().unwrap();
+        let env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(home.path()).await;
+        crate::test_env::reset_direct_ledger_open_count();
+
+        let max = unix_socket_path_max();
+        let mut runtime = home.path().join("rt");
+        loop {
+            let reveal = runtime.join("cockpit").join("cockpit-leak-reveal.sock");
+            if reveal.as_os_str().as_bytes().len() >= max {
+                break;
+            }
+            runtime.push("x");
         }
+        std::fs::create_dir_all(&runtime).unwrap();
+        env.set_var("XDG_RUNTIME_DIR", &runtime);
+
+        let paths = DaemonPaths::resolve_canonical().expect("resolve canonical paths");
+        assert!(
+            !unix_socket_path_is_bindable(&paths.leak_reveal_socket()),
+            "repro path must exceed SUN_LEN"
+        );
+        let db_path = crate::db::Db::default_path().expect("db path");
+        assert!(
+            !db_path.exists(),
+            "precondition: isolated home must not already contain cockpit.db"
+        );
+
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            run_foreground_inner_with_boot_db(
+                paths.clone(),
+                Duration::from_millis(50),
+                false,
+                crate::daemon::terminal::test_host_factory(),
+                None,
+            ),
+        )
+        .await
+        .expect("path validation must finish within 100ms")
+        .expect_err("oversized socket path must fail closed");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "validation must not wait on database boot"
+        );
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("too long"),
+            "error must name the length failure: {text}"
+        );
+        assert!(
+            text.contains("COCKPIT_SOCKET_DIR"),
+            "error must suggest COCKPIT_SOCKET_DIR: {text}"
+        );
+        let reveal = paths.leak_reveal_socket();
+        assert!(
+            text.contains(&reveal.display().to_string())
+                || text.contains(&paths.socket.display().to_string()),
+            "error must name the offending path: {text}"
+        );
+        assert_eq!(
+            crate::test_env::direct_ledger_open_count(),
+            0,
+            "oversized socket path must not open SQLite"
+        );
+        assert!(
+            !db_path.exists(),
+            "oversized socket path must not create {}",
+            db_path.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_private_socket_maps_address_in_use_to_dedicated_error() {
+        let dir = tempfile::tempdir().unwrap();
+        cockpit_host::private_fs::ensure_private_dir(dir.path()).unwrap();
+        let socket = dir.path().join("cockpit.sock");
+        let _first = bind_private_socket(&socket).expect("first bind");
+        let error = bind_private_socket(&socket).expect_err("second bind");
+        assert!(
+            error.downcast_ref::<DaemonBindInUse>().is_some(),
+            "address-in-use must be DaemonBindInUse, got {error:#}"
+        );
+        assert_eq!(daemon_error_exit_code(&error), DAEMON_BIND_IN_USE_EXIT_CODE);
     }
 
     #[test]

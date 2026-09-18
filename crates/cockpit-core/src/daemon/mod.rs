@@ -47,6 +47,7 @@ pub mod connector;
 pub mod control_replay;
 pub(crate) mod diagnostics_probe;
 pub(crate) mod dream_scheduler;
+pub(crate) mod editor_maintenance;
 pub mod effective_default_recovery;
 #[cfg(feature = "remote")]
 pub mod egress;
@@ -83,6 +84,7 @@ pub mod remote_audit_upload;
 pub(crate) mod remote_outbox_worker;
 #[cfg(feature = "remote")]
 pub mod remote_project_resolver;
+pub(crate) mod retention_maintenance;
 #[cfg(feature = "extended")]
 pub mod scheduler;
 pub mod server;
@@ -2965,6 +2967,11 @@ async fn run_foreground_inner_with_boot_db_impl(
     let mut guidance_maintenance_task = ForegroundTask::new(
         guidance_maintenance::spawn_guidance_maintenance(ctx.clone()),
     );
+    let mut retention_maintenance_task = ForegroundTask::new(
+        retention_maintenance::spawn_retention_maintenance(ctx.clone()),
+    );
+    let mut editor_maintenance_task =
+        ForegroundTask::new(editor_maintenance::spawn_editor_maintenance(ctx.clone()));
     let update_check_task =
         crate::updater::maybe_spawn_background(ctx.clone()).map(ForegroundTask::new);
     #[cfg(feature = "remote")]
@@ -3056,6 +3063,8 @@ async fn run_foreground_inner_with_boot_db_impl(
     signal_task.abort_and_join().await;
     lock_sweeper.abort_and_join().await;
     guidance_maintenance_task.abort_and_join().await;
+    retention_maintenance_task.abort_and_join().await;
+    editor_maintenance_task.abort_and_join().await;
     if let Some(mut task) = update_check_task {
         task.abort_and_join().await;
     }

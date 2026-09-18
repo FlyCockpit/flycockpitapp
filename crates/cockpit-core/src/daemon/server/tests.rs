@@ -15252,12 +15252,8 @@ fn authority_recovery_precedes_both_socket_binds() {
 
 #[test]
 fn oauth_expiry_maintenance_runs_without_new_admission() {
-    let server = include_str!("mod.rs");
-    let accept_loop = server
-        .split("pub async fn run_accept_loop")
-        .nth(1)
-        .expect("accept loop must exist");
-    assert!(accept_loop.contains("dispatch::maintain_durable_oauth_flows(&ctx).await"));
+    let editor_maintenance = include_str!("../editor_maintenance.rs");
+    assert!(editor_maintenance.contains("maintain_durable_oauth_flows(&ctx).await"));
 
     let dispatch = include_str!("dispatch.rs");
     let maintenance = dispatch

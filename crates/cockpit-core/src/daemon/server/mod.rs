@@ -6620,15 +6620,6 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, mut listener: DaemonListen
     dispatch::debug_assert_ledger_site_registry_consistent();
     let mut shutdown = ctx.shutdown.subscribe();
     let mut clients = tokio::task::JoinSet::new();
-    let retention_cfg = retention_config();
-    let mut retention_interval = tokio::time::interval(std::time::Duration::from_secs(
-        (retention_cfg.sweep_interval_hours.max(1) as u64) * 60 * 60,
-    ));
-    retention_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    retention_interval.tick().await;
-    let mut editor_maintenance_interval = tokio::time::interval(std::time::Duration::from_secs(60));
-    editor_maintenance_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    editor_maintenance_interval.tick().await;
     // A drain may already have begun before we subscribed (begin_drain on a
     // very fast StopDaemon); break immediately if so.
     if ctx.shutdown.is_draining() {
@@ -6649,17 +6640,6 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, mut listener: DaemonListen
             joined = clients.join_next(), if !clients.is_empty() => {
                 if let Some(Err(error)) = joined {
                     tracing::warn!(%error, "daemon client task failed");
-                }
-            }
-            _ = retention_interval.tick() => {
-                run_retention_tick(ctx.clone(), retention_cfg).await;
-            }
-            _ = editor_maintenance_interval.tick() => {
-                if let Err(error) = crate::daemon::agent_management::maintain_editor_leases(&ctx).await {
-                    tracing::warn!(message = %error.message, "editor lease maintenance failed");
-                }
-                if let Err(error) = dispatch::maintain_durable_oauth_flows(&ctx).await {
-                    tracing::warn!(message = %error.message, "OAuth flow maintenance failed");
                 }
             }
             accepted = accept_daemon_stream(&mut listener) => {
@@ -7210,7 +7190,7 @@ async fn accept_daemon_stream(listener: &mut DaemonListener) -> Result<DaemonStr
 }
 
 #[cfg(any(unix, windows, test))]
-async fn run_retention_tick(ctx: Arc<DaemonContext>, cfg: RetentionConfig) {
+pub(crate) async fn run_retention_tick(ctx: Arc<DaemonContext>, cfg: RetentionConfig) {
     let now_unix_ms = chrono::Utc::now().timestamp_millis();
     run_retention_tick_at(&ctx, cfg, now_unix_ms).await;
     if let Err(error) = crate::daemon::agent_management::maintain_editor_leases(&ctx).await {
@@ -9734,4 +9714,8 @@ fn internal<E: std::fmt::Display>(err: E) -> ErrorPayload {
 }
 pub(crate) fn spawn_lock_sweeper(ctx: Arc<DaemonContext>) -> tokio::task::JoinHandle<()> {
     dispatch::spawn_lock_sweeper(ctx)
+}
+
+pub(crate) async fn maintain_durable_oauth_flows(ctx: &DaemonContext) -> Result<(), ErrorPayload> {
+    dispatch::maintain_durable_oauth_flows(ctx).await
 }

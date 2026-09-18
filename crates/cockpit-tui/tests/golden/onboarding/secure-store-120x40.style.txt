@@ -1,6 +1,6 @@
 # style runs: count:fg/bg/mod  (mod is - or BOLD+DIM+…)
 120x40
-0	8:Rgb(224,177,86)/Reset/- 112:Reset/Reset/-
+0	120:Reset/Reset/-
 1	17:Reset/Reset/- 30:Rgb(244,239,230)/Reset/BOLD 73:Reset/Reset/-
 2	17:Reset/Reset/- 60:Rgb(138,155,176)/Reset/- 43:Reset/Reset/-
 3	17:Reset/Reset/- 28:Rgb(224,177,86)/Reset/- 75:Reset/Reset/-

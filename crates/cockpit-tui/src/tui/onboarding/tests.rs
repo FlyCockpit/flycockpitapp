@@ -977,7 +977,7 @@ fn materializing_bootstrap_state_is_surfaced() {
 fn chrome_paints_back_and_action_bar_on_every_settled_screen() {
     let engine = Dialog::None;
     for stage in [
-        OnboardingStage::Welcome,
+        OnboardingStage::Profile,
         OnboardingStage::SecureStore,
         OnboardingStage::Provider,
         OnboardingStage::Model,
@@ -985,24 +985,50 @@ fn chrome_paints_back_and_action_bar_on_every_settled_screen() {
         let mut shell = shell_at(stage);
         shell.set_frame_for_golden(WELCOME_ANIMATION_FRAMES);
         let rendered = render_string(&mut shell, 80, 24, &engine);
-        if !matches!(stage, OnboardingStage::Welcome) {
-            assert!(
-                rendered.contains("‹ Back"),
-                "{stage:?} must paint ‹ Back: {rendered}"
-            );
-            assert!(
-                rendered.contains("[ Continue ]") || rendered.contains("[ Choose ]"),
-                "{stage:?} must paint an action bar: {rendered}"
-            );
-        } else {
-            assert!(!rendered.contains("‹ Back"), "{rendered}");
-            assert!(!rendered.contains("[ Continue ]"), "{rendered}");
+        match stage {
+            OnboardingStage::SecureStore => {
+                assert!(
+                    !rendered.contains("‹ Back"),
+                    "{stage:?} must withhold Back on the choice screen: {rendered}"
+                );
+            }
+            _ => {
+                assert!(
+                    rendered.contains("‹ Back"),
+                    "{stage:?} must paint ‹ Back: {rendered}"
+                );
+            }
         }
+        assert!(
+            rendered.contains("[ Continue ]") || rendered.contains("[ Choose ]"),
+            "{stage:?} must paint an action bar: {rendered}"
+        );
         assert!(
             !rendered.contains("┌") && !rendered.contains("└"),
             "{stage:?} must not use Borders::ALL box drawing: {rendered}"
         );
     }
+
+    let mut welcome = shell_at(OnboardingStage::Welcome);
+    welcome.set_frame_for_golden(WELCOME_ANIMATION_FRAMES);
+    let rendered = render_string(&mut welcome, 80, 24, &engine);
+    assert!(!rendered.contains("‹ Back"), "{rendered}");
+    assert!(!rendered.contains("[ Continue ]"), "{rendered}");
+
+    let mut secure_store = shell_at(OnboardingStage::SecureStore);
+    secure_store.set_frame_for_golden(WELCOME_ANIMATION_FRAMES);
+    if let OnboardingScreen::SecureStore(screen) = &mut secure_store.screen {
+        screen.phase = secure_store::SecureStoreInputPhase::Passphrase;
+    }
+    let rendered = render_string(&mut secure_store, 80, 24, &engine);
+    assert!(
+        rendered.contains("‹ Back"),
+        "secure-store password sub-step must paint ‹ Back: {rendered}"
+    );
+    assert!(
+        rendered.contains("[ Reveal ]") && rendered.contains("[ Save ]"),
+        "secure-store password sub-step must paint Reveal/Save: {rendered}"
+    );
 }
 
 #[test]

@@ -1,4 +1,4 @@
- ‹ Back                                                                         
+                                                                                
   Secure your secrets · step 3/8                                                
   Choose how Cockpit protects your API keys and sealed values.                  
   ────────────────────────────                                                  

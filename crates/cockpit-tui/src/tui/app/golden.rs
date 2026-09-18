@@ -201,7 +201,7 @@ pub fn assert_onboarding_secure_store() {
     assert_golden_sizes("onboarding", "secure-store", render_onboarding_secure_store);
     let preview = buffer_text(&render_onboarding_secure_store(80, 24));
     assert!(
-        preview.contains("‹ Back") && preview.contains("[ Continue ]"),
+        preview.contains("[ Continue ]") && preview.contains("Secure your secrets"),
         "secure-store dump must include chrome"
     );
 }

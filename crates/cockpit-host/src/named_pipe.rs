@@ -191,9 +191,12 @@ fn is_lower_hex(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-/// Owner-only DACL for a local named pipe: exact ordinary-client data rights,
-/// protected (no inherited Everyone/Users ACEs). The server separately rejects
-/// remote clients when it creates an instance.
+/// Protected owner-only DACL for a local named pipe. The sole ACE grants the
+/// daemon's OS user exact data/synchronize rights plus the instance-creation
+/// bit needed to re-arm the listener. No non-owner principal receives
+/// `FILE_CREATE_PIPE_INSTANCE` (or any other pipe right). This does not
+/// distinguish processes running as the owner; the OS user is the boundary.
+/// The server separately rejects remote clients when it creates an instance.
 #[cfg(windows)]
 pub struct OwnerOnlyPipeSecurity {
     descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
@@ -213,10 +216,11 @@ impl OwnerOnlyPipeSecurity {
         // The daemon creates the first and every subsequent server instance as
         // this same user. Named-pipe instance creation is DACL-checked against
         // FILE_CREATE_PIPE_INSTANCE (the FILE_APPEND_DATA bit), so that right
-        // must be explicit here. Ordinary client helpers still request only
-        // read, write, and synchronize below; they never receive generic write.
-        // Do not replace this with Generic Write: its other generic rights are
-        // not part of either the client or server contract.
+        // must be explicit on the owner's sole ACE. There are no non-owner ACEs.
+        // Ordinary client helpers still request only read, write, and
+        // synchronize below; they never receive generic write. Do not replace
+        // this with Generic Write: its other generic rights are not part of
+        // either the client or server contract.
         Self::from_sddl(&format!("D:P(A;;0x00100007;;;{sid})"))
     }
 

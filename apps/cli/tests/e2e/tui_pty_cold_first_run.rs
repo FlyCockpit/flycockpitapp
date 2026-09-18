@@ -9,12 +9,33 @@
 
 use std::time::Duration;
 
-use crate::support::{HermeticCockpit, HermeticProfile, INITIAL_PTY_COLS, INITIAL_PTY_ROWS};
+use crate::support::{
+    sgr_left_click, CellPos, HermeticCockpit, HermeticProfile, INITIAL_PTY_COLS, INITIAL_PTY_ROWS,
+};
 
 /// Cold boot (daemon spawn + DB creation) is slower than the configured
 /// recipe; keep the Welcome budget generous.
 const COLD_WELCOME_TIMEOUT: Duration = Duration::from_secs(120);
 const TRANSITION_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn click_text(session: &mut HermeticCockpit, needle: &str) {
+    let snapshot = session.snapshot();
+    let (start, end) = snapshot
+        .find_text_span(needle)
+        .unwrap_or_else(|| panic!("expected `{needle}` on screen:\n{}", snapshot.contents()));
+    let col = (u16::from(start.col) + u16::from(end.col)) / 2;
+    let pos = CellPos {
+        row: start.row,
+        col,
+    };
+    session.write_bytes(&sgr_left_click(pos.sgr_x(), pos.sgr_y()));
+}
+
+fn double_click_text(session: &mut HermeticCockpit, needle: &str) {
+    click_text(session, needle);
+    session.checkpoint_input_with_redraw();
+    click_text(session, needle);
+}
 
 #[test]
 fn tui_pty_cold_first_run_advances_from_welcome_with_one_key() {
@@ -61,7 +82,7 @@ fn tui_pty_cold_first_run_advances_from_welcome_with_one_key() {
     let profile = session.snapshot().contents();
     assert!(
         profile.contains("What should Cockpit call you?"),
-        "the Profile stage must present its own wizard engine:\n{profile}"
+        "the Profile stage must present its native shell screen:\n{profile}"
     );
     assert!(
         !profile.contains("could not be applied"),
@@ -75,6 +96,87 @@ fn tui_pty_cold_first_run_advances_from_welcome_with_one_key() {
     // Cleanup: reap() only owns fixture-started daemons, and the locked
     // bootstrap matrix has no stop verb (#426), so the PTY-spawned daemon
     // is stopped through the receipt-verified process stop.
+    session.reap();
+    session.stop_child_spawned_daemon();
+    session.assert_reaped();
+}
+
+/// Mouse-only walkthrough Welcome → Provider catalog (#429). Keyboard input
+/// is used only where the screens require typing (the profile name field).
+#[test]
+fn tui_pty_cold_first_run_mouse_walkthrough_to_provider_catalog() {
+    let mut session = HermeticCockpit::prepare_fresh(HermeticProfile::Default);
+    session.set_extra_env("COCKPIT_REDUCE_MOTION", "1");
+    session.set_extra_env("USER", "amelia");
+    session
+        .spawn_pty(INITIAL_PTY_COLS, INITIAL_PTY_ROWS)
+        .expect("spawn cold first-run PTY child");
+
+    session
+        .wait_until_screen(
+            "cold first-run Welcome shell",
+            COLD_WELCOME_TIMEOUT,
+            |screen| {
+                screen.contains("Cockpit setup")
+                    && screen.contains("step 1/8")
+                    && screen.contains("[press any button to continue]")
+            },
+        )
+        .expect("cold first-run reaches the settled Welcome prompt");
+
+    // Welcome: pointer only — any click while the prompt is visible advances.
+    click_text(&mut session, "[press any button to continue]");
+    session.checkpoint_input_with_redraw();
+
+    session
+        .wait_until_screen(
+            "Profile stage after Welcome click",
+            TRANSITION_TIMEOUT,
+            |screen| {
+                screen.contains("step 2/8") && screen.contains("What should Cockpit call you?")
+            },
+        )
+        .expect("Welcome pointer advance reaches Profile");
+
+    // Profile: typing is allowed; navigation is pointer-only.
+    session.write_str("Ada");
+    click_text(&mut session, "[ Continue ]");
+    session.checkpoint_input_with_redraw();
+
+    session
+        .wait_until_screen(
+            "Secure store after profile save",
+            TRANSITION_TIMEOUT,
+            |screen| screen.contains("step 3/8") && screen.contains("Secure your secrets"),
+        )
+        .expect("profile settlement reaches Secure store");
+
+    // Secure store: second click on the selected row confirms (excoc idiom).
+    // Machine-bound file is available whenever `secret_store.file` is.
+    double_click_text(&mut session, "Machine-bound encrypted file");
+    session.checkpoint_input_with_redraw();
+
+    session
+        .wait_until_screen(
+            "Provider catalog after secure-store choice",
+            TRANSITION_TIMEOUT,
+            |screen| {
+                screen.contains("step 4/8")
+                    && screen.contains("Let's add a provider")
+                    && screen.contains("Providers")
+            },
+        )
+        .expect("secure-store pointer choice reaches the provider catalog");
+    let provider = session.snapshot().contents();
+    assert!(
+        provider.contains("Filter") || provider.contains("type to filter"),
+        "provider catalog must render the filter block:\n{provider}"
+    );
+    assert!(
+        !provider.contains("Choose workspace trust:"),
+        "workspace resolution must stay deferred while onboarding is open:\n{provider}"
+    );
+
     session.reap();
     session.stop_child_spawned_daemon();
     session.assert_reaped();

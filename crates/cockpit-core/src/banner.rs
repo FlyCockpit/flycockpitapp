@@ -155,6 +155,48 @@ pub fn active_cells() -> Vec<Vec<ResolvedCell>> {
     out
 }
 
+/// The P-51 art with a four-step propeller animation applied.
+///
+/// This deliberately bypasses the `COCKPIT_ROOSTER` selector: onboarding's
+/// fly-in is the P-51 scene, while still keeping the bitmap and cell packing
+/// owned by this module. `phase` is normalized to `0..=3`.
+pub fn p51_cells(phase: u8) -> Vec<Vec<ResolvedCell>> {
+    const PROP_TOP: [(usize, usize); 2] = [(34, 2), (34, 3)];
+    const PROP_BOTTOM: [(usize, usize); 2] = [(34, 7), (34, 8)];
+
+    let phase = phase % 4;
+    let top_visible = matches!(phase, 0 | 3);
+    let bottom_visible = matches!(phase, 0 | 1);
+    let hidden = |x: usize, y: usize| {
+        (!top_visible && PROP_TOP.contains(&(x, y)))
+            || (!bottom_visible && PROP_BOTTOM.contains(&(x, y)))
+    };
+    let pixel = |x: usize, y: usize| {
+        if hidden(x, y) {
+            '.'
+        } else {
+            P51_PLANE[y].as_bytes()[x] as char
+        }
+    };
+
+    let mut out = Vec::with_capacity(RENDERED_HEIGHT);
+    for y in (0..PLANE_HEIGHT).step_by(2) {
+        let mut row = Vec::with_capacity(RENDERED_WIDTH);
+        for x in (0..PLANE_WIDTH).step_by(2) {
+            row.push(cell_parts(
+                ColorDiscoveryOrder::Mirrored,
+                &P51_PALETTE,
+                pixel(x, y),
+                pixel(x + 1, y),
+                pixel(x, y + 1),
+                pixel(x + 1, y + 1),
+            ));
+        }
+        out.push(row);
+    }
+    out
+}
+
 /// Render the active art (rooster when `COCKPIT_ROOSTER` is truthy,
 /// else P-51) regardless of suppression rules. Useful for tests and for
 /// callers (e.g. `/banner` debug commands later) that want the art
@@ -270,6 +312,17 @@ mod tests {
     fn renders_six_lines() {
         let lines = render_unconditional();
         assert_eq!(lines.len(), RENDERED_HEIGHT);
+    }
+
+    #[test]
+    fn onboarding_propeller_phases_keep_banner_dimensions() {
+        for phase in 0..4 {
+            let cells = p51_cells(phase);
+            assert_eq!(cells.len(), RENDERED_HEIGHT);
+            assert!(cells.iter().all(|row| row.len() == RENDERED_WIDTH));
+        }
+        assert_ne!(p51_cells(0), p51_cells(2));
+        assert_eq!(p51_cells(0), p51_cells(4));
     }
 
     #[test]

@@ -101,6 +101,12 @@ fn render_string(shell: &mut OnboardingShell, width: u16, height: u16, engine: &
 fn welcome_any_key_requests_advance_only_on_welcome_stage() {
     let mut shell = shell_at(OnboardingStage::Welcome);
     let mut engine = Dialog::None;
+    assert!(
+        shell
+            .handle_key(key(KeyCode::Char(' ')), &mut engine)
+            .is_none()
+    );
+    shell.set_frame_for_golden(WELCOME_ANIMATION_FRAMES);
     assert!(matches!(
         shell.handle_key(key(KeyCode::Char(' ')), &mut engine),
         Some(OnboardingShellAction::Transition(
@@ -108,6 +114,17 @@ fn welcome_any_key_requests_advance_only_on_welcome_stage() {
             None
         ))
     ));
+}
+
+#[test]
+fn welcome_ignores_early_clicks_but_escape_opens_options() {
+    let mut shell = shell_at(OnboardingStage::Welcome);
+    let mut engine = Dialog::None;
+    let outcome = shell.handle_mouse(click(40, 12), &mut engine);
+    assert!(outcome.action.is_none());
+    assert!(shell.handle_key(key(KeyCode::Esc), &mut engine).is_none());
+    let rendered = render_string(&mut shell, 80, 24, &engine);
+    assert!(rendered.contains("Leave setup?"), "{rendered}");
 }
 
 #[test]
@@ -135,14 +152,44 @@ fn welcome_animation_is_tick_driven_and_settles() {
     let mut shell = shell_at(OnboardingStage::Welcome);
     let engine = Dialog::None;
     let frame_zero = render_string(&mut shell, 80, 24, &engine);
-    // Every intermediate frame reports a change until the window closes.
+    // Every intermediate frame reports a change until the fly-in lands.
     for _ in 0..WELCOME_ANIMATION_FRAMES {
         assert!(shell.tick());
     }
-    assert!(!shell.tick(), "the fly-in must settle, not loop forever");
-    let settled = render_string(&mut shell, 80, 24, &engine);
-    assert_ne!(frame_zero, settled);
-    assert!(settled.contains("Press any key"));
+    let landed = render_string(&mut shell, 80, 24, &engine);
+    assert_ne!(frame_zero, landed);
+    assert!(landed.contains("[press any button to continue]"));
+    // Landing is not a freeze: the same tick keeps advancing the ambient
+    // prop bob and cloud drift past the prompt frame.
+    for _ in 0..4 {
+        assert!(
+            shell.tick(),
+            "ambient motion must keep ticking after landing"
+        );
+    }
+    let ambient = render_string(&mut shell, 80, 24, &engine);
+    assert!(ambient.contains("[press any button to continue]"));
+    assert_ne!(
+        landed, ambient,
+        "prop bob and cloud drift must continue past the prompt frame"
+    );
+}
+
+#[test]
+fn welcome_animation_keeps_the_animation_tick_alive_until_navigation() {
+    let mut shell = shell_at(OnboardingStage::Welcome);
+    assert!(shell.welcome_animation_active());
+    for _ in 0..WELCOME_ANIMATION_FRAMES {
+        shell.tick();
+    }
+    assert!(
+        shell.welcome_animation_active(),
+        "the post-landing ambient motion still needs the animation tick"
+    );
+    let reduced = OnboardingShell::new(&snapshot(OnboardingStage::Welcome), true);
+    assert!(!reduced.welcome_animation_active());
+    let other_stage = shell_at(OnboardingStage::SecureStore);
+    assert!(!other_stage.welcome_animation_active());
 }
 
 #[test]
@@ -154,8 +201,7 @@ fn reduced_motion_welcome_is_deterministic_and_static() {
     assert!(!shell.tick(), "reduced motion must not animate");
     let second = render_string(&mut shell, 80, 24, &engine);
     assert_eq!(first, second);
-    assert!(first.contains("Press any key"));
-    assert!(first.contains("✈"));
+    assert!(first.contains("[press any button to continue]"));
 }
 
 #[test]
@@ -943,21 +989,19 @@ fn chrome_paints_back_and_action_bar_on_every_settled_screen() {
         let mut shell = shell_at(stage);
         shell.set_frame_for_golden(WELCOME_ANIMATION_FRAMES);
         let rendered = render_string(&mut shell, 80, 24, &engine);
-        if matches!(stage, OnboardingStage::Welcome) {
-            assert!(
-                rendered.contains("‹ Back"),
-                "{stage:?} settled welcome paints a disabled back: {rendered}"
-            );
-        } else {
+        if !matches!(stage, OnboardingStage::Welcome) {
             assert!(
                 rendered.contains("‹ Back"),
                 "{stage:?} must paint ‹ Back: {rendered}"
             );
+            assert!(
+                rendered.contains("[ Continue ]") || rendered.contains("[ Choose ]"),
+                "{stage:?} must paint an action bar: {rendered}"
+            );
+        } else {
+            assert!(!rendered.contains("‹ Back"), "{rendered}");
+            assert!(!rendered.contains("[ Continue ]"), "{rendered}");
         }
-        assert!(
-            rendered.contains("[ Continue ]") || rendered.contains("[ Choose ]"),
-            "{stage:?} must paint an action bar: {rendered}"
-        );
         assert!(
             !rendered.contains("┌") && !rendered.contains("└"),
             "{stage:?} must not use Borders::ALL box drawing: {rendered}"
@@ -1017,17 +1061,12 @@ fn key_release_is_ignored() {
 }
 
 #[test]
-fn action_bar_continue_advances_welcome() {
+fn click_after_prompt_advances_welcome() {
     let mut engine = Dialog::None;
     let mut shell = shell_at(OnboardingStage::Welcome);
     shell.set_frame_for_golden(WELCOME_ANIMATION_FRAMES);
     render_string(&mut shell, 80, 24, &engine);
-    let continue_btn = shell.actions.rects()[0];
-    assert!(
-        continue_btn.width > 0 && continue_btn.height > 0,
-        "Continue must occupy a clickable rect after render"
-    );
-    let outcome = shell.handle_mouse(click(continue_btn.x, continue_btn.y), &mut engine);
+    let outcome = shell.handle_mouse(click(40, 23), &mut engine);
     assert!(matches!(
         outcome.action,
         Some(OnboardingShellAction::Transition(

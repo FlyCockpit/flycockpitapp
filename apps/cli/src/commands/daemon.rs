@@ -204,8 +204,8 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                     .await;
                 }
                 if !released {
-                    let release = release
-                        .unwrap_or_else(|| daemon::capture_restart_release(&paths, old_pid));
+                    let release =
+                        release.unwrap_or_else(|| daemon::capture_restart_release(&paths, old_pid));
                     let stop_paths = paths.clone();
                     let stop_budget = remaining_command_budget(deadline);
                     let _ = tokio::task::spawn_blocking(move || {

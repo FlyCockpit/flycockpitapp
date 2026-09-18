@@ -22,7 +22,7 @@ struct EditorMaintenanceTestSeam {
 static TEST_SEAM: std::sync::Mutex<Option<EditorMaintenanceTestSeam>> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
-static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 pub(crate) struct EditorMaintenanceTestGuard;
@@ -118,10 +118,8 @@ mod tests {
     use std::time::{Duration, Instant};
     use tokio::sync::oneshot;
 
-    fn serial_lock() -> std::sync::MutexGuard<'static, ()> {
-        TEST_SERIAL
-            .lock()
-            .expect("editor maintenance test serial lock")
+    async fn serial_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        TEST_SERIAL.lock().await
     }
 
     async fn run_editor_maintenance_with_period(ctx: Arc<DaemonContext>, period: Duration) {
@@ -131,7 +129,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn accept_loop_does_not_await_editor_maintenance() {
-        let _serial = serial_lock();
+        let _serial = serial_lock().await;
         let ctx = test_ctx();
         let dir = cockpit_test_support::isolated_tempdir();
         let socket = dir.path().join("editor-accept.sock");

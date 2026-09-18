@@ -25,21 +25,35 @@ fn snapshot_for_named_wizard(wizard_id: &str) -> cockpit_proto::OnboardingBootst
 
 #[test]
 fn named_setup_wizard_table_is_exhaustive() {
-    let startup = include_str!("startup_layout.rs");
-    let open_setup = startup
-        .split("pub(super) fn open_onboarding_setup")
-        .nth(1)
-        .and_then(|tail| {
-            tail.split("fn mount_named_setup_wizard_in_onboarding_shell")
-                .next()
-        })
-        .expect("open_onboarding_setup");
-    for (wizard_id, constant) in cockpit_core::wizard::named_setup_wizard_const_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    for wizard_id in cockpit_core::wizard::named_setup_wizard_ids() {
+        let mut app = App::new(Some(tmp.path()), false);
+        app.apply_onboarding_bootstrap_snapshot(Some(snapshot_for_named_wizard(wizard_id)));
+        app.onboarding_shell = None;
+        app.dialog = Dialog::None;
+        app.open_onboarding_setup(Some(wizard_id));
         assert!(
-            open_setup.contains(&format!("Some(cockpit_core::wizard::{constant})")),
-            "open_onboarding_setup must handle `{wizard_id}`"
+            app.onboarding_shell.is_some(),
+            "open_onboarding_setup must handle named wizard `{wizard_id}`"
         );
     }
+}
+
+#[test]
+fn unknown_named_setup_wizard_does_not_mount() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = App::new(Some(tmp.path()), false);
+    app.apply_onboarding_bootstrap_snapshot(Some(snapshot(
+        cockpit_proto::OnboardingStage::Complete,
+    )));
+    app.open_onboarding_setup(Some("not-a-real-wizard"));
+    assert!(
+        app.onboarding_shell.is_none(),
+        "unknown setup wizards must not mount the onboarding shell"
+    );
+    assert_ne!(app.dialog.test_page_name(), Some("wizard_menu"));
 }
 
 #[test]
@@ -204,26 +218,58 @@ fn onboarding_agent_engine_rejects_legacy_wizard_descriptor() {
 
 #[test]
 fn agent_stage_mounts_authoring_not_setup_wizard() {
-    let startup = include_str!("startup_layout.rs");
-    let mount = startup
-        .split("OnboardingStage::Agent =>")
-        .nth(1)
-        .and_then(|tail| tail.split("OnboardingStage::Lifetime").next())
-        .expect("agent stage mount");
-    assert!(mount.contains("mount_onboarding_agent_authoring"));
-    assert!(!mount.contains("ONBOARDING_AGENT_WIZARD_ID"));
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = App::new(Some(tmp.path()), false);
+    app.apply_onboarding_bootstrap_snapshot(Some(snapshot(cockpit_proto::OnboardingStage::Agent)));
+    assert!(
+        app.onboarding_shell.is_some(),
+        "agent stage must present through the onboarding shell"
+    );
+    assert!(
+        app.onboarding_agent_operation_id.is_some(),
+        "agent stage must start nested authoring, not the setup-wizard engine"
+    );
+    assert!(
+        !app.dialog.is_active(),
+        "agent stage must not mount a settings-dialog wizard"
+    );
+    assert_ne!(
+        app.dialog.test_page_name(),
+        Some(cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID)
+    );
+
+    let mut named = App::new(Some(tmp.path()), false);
+    named
+        .apply_onboarding_bootstrap_snapshot(Some(snapshot(cockpit_proto::OnboardingStage::Agent)));
+    named.onboarding_shell = None;
+    named.dialog = Dialog::None;
+    named.onboarding_agent_operation_id = None;
+    named.open_onboarding_setup(Some(cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID));
+    assert!(named.onboarding_shell.is_some());
+    assert!(
+        named.onboarding_agent_operation_id.is_some(),
+        "named onboarding-agent route must start nested authoring"
+    );
+    assert!(!named.dialog.is_active());
 }
 
 #[test]
 fn setup_slash_adapter_does_not_open_legacy_menu() {
-    let slash = include_str!("slash.rs");
-    let run_setup = slash
-        .split("fn run_setup")
-        .nth(1)
-        .and_then(|tail| tail.split("fn run_gitignore_allow").next())
-        .expect("run_setup");
-    assert!(run_setup.contains("open_onboarding_setup"));
-    assert!(!run_setup.contains("Dialog::open_setup("));
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = App::new(Some(tmp.path()), false);
+    app.apply_onboarding_bootstrap_snapshot(Some(snapshot(
+        cockpit_proto::OnboardingStage::Complete,
+    )));
+    let cmd = *super::slash::slash_command_by_name("setup").expect("setup command");
+    app.composer.set("/setup not-a-wizard".to_string());
+    app.execute_slash(cmd);
+    assert!(
+        app.onboarding_shell.is_none(),
+        "unknown /setup targets must not mount a shell"
+    );
+    assert_ne!(app.dialog.test_page_name(), Some("wizard_menu"));
 }
 
 #[test]
@@ -245,21 +291,22 @@ fn reopen_onboarding_from_deferred_snapshot_uses_provider_search() {
 }
 
 #[test]
-fn provider_add_cli_dispatch_routes_through_shell_adapter() {
-    let lib = include_str!("../../../../../apps/cli/src/lib.rs");
-    assert!(
-        lib.contains("Command::Provider(crate::cli::ProvidersCommand::Add(args))"),
-        "provider add must have an interactive shell adapter"
-    );
-    assert!(
-        lib.contains("cockpit_core::wizard::PROVIDER_WIZARD_ID"),
+fn provider_add_named_route_uses_shell_adapter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = App::new(Some(tmp.path()), false);
+    app.apply_onboarding_bootstrap_snapshot(Some(snapshot(
+        cockpit_proto::OnboardingStage::Complete,
+    )));
+    app.open_onboarding_setup(Some(cockpit_core::wizard::PROVIDER_WIZARD_ID));
+    assert_eq!(
+        app.onboarding_shell
+            .as_ref()
+            .map(|shell| shell.screen_kind()),
+        Some(crate::tui::onboarding::OnboardingScreenKind::ProviderSearch),
         "provider add must mount the full-screen provider stage"
     );
-    let providers = include_str!("../../../../../apps/cli/src/commands/providers.rs");
-    assert!(
-        providers.contains("InteractiveOnboardingRequired::provider_add()"),
-        "non-interactive provider add must fail before any mutation"
-    );
+    assert_ne!(app.dialog.test_page_name(), Some("wizard_menu"));
 }
 
 #[test]

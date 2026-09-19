@@ -6269,9 +6269,6 @@ impl Dialog {
                     "the onboarding agent stage uses the nested agent authoring editor".into(),
                 );
             }
-            cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID => {
-                Some(cockpit_core::wizard::onboarding_lifetime_descriptor())
-            }
             cockpit_core::wizard::SECURITY_WIZARD_ID | cockpit_core::wizard::MODEL_WIZARD_ID => {
                 cockpit_core::wizard::descriptor_for_cwd(wizard_id, &global_root).or_else(|| {
                     (wizard_id == cockpit_core::wizard::MODEL_WIZARD_ID).then_some(
@@ -10138,9 +10135,7 @@ fn apply_setup_wizard_daemon_completion(
                 } else {
                     parts.join(" ")
                 }
-            } else if wizard.run.descriptor().id
-                == cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID
-            {
+            } else if wizard.run.descriptor().id == "onboarding-lifetime" {
                 "Saved the agent lifetime for future daemon acquisition.".to_string()
             } else {
                 "Saved global security settings through the daemon.".to_string()

@@ -1299,6 +1299,7 @@ impl App {
             AsyncActionKind::DaemonRpc(
                 label @ ("onboarding.transition"
                 | "onboarding.profile"
+                | "onboarding.lifetime"
                 | "onboarding.secure_intent"
                 | "onboarding.ready_retry"),
             ) => {

@@ -1190,14 +1190,20 @@ async fn probe_or_spawn_with_spawn_authorization(
     let (paths, pid, provisional_ephemeral_guard) = if ephemeral {
         let paths = DaemonPaths::resolve_canonical()?.with_ephemeral_lifetime();
         let spawn_paths = paths.clone();
-        let child = tokio::task::spawn_blocking(move || spawn_detached_ephemeral(&spawn_paths))
-            .await
-            .context("joining ephemeral daemon spawn")??;
-        let pid = child.id();
-        // Arm exact-child cleanup before any await or other cancellation
-        // point. Once the daemon has published its verified receipt, its own
-        // client reference count becomes the sole shutdown authority.
-        let guard = crate::daemon::ephemeral_guard::EphemeralDaemonGuard::new(paths.clone(), child);
+        // Arm exact-child cleanup inside the blocking closure so a cancelled
+        // join cannot drop an unguarded `DetachedEphemeralChild`.
+        let guard = tokio::task::spawn_blocking(
+            move || -> Result<crate::daemon::ephemeral_guard::EphemeralDaemonGuard> {
+                let child = spawn_detached_ephemeral(&spawn_paths)?;
+                Ok(crate::daemon::ephemeral_guard::EphemeralDaemonGuard::new(
+                    spawn_paths,
+                    child,
+                ))
+            },
+        )
+        .await
+        .context("joining ephemeral daemon spawn")??;
+        let pid = guard.id()?;
         (paths, pid, Some(guard))
     } else {
         // Auto-promoted persistent daemon: never `--no-sandbox` from a

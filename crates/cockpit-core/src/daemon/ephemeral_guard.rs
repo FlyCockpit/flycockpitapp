@@ -548,6 +548,20 @@ pub(crate) struct EphemeralDaemonGuard {
 }
 
 impl EphemeralDaemonGuard {
+    pub(crate) fn id(&self) -> anyhow::Result<u32> {
+        let process = self
+            .process
+            .as_ref()
+            .context("ephemeral guard has no owned child")?;
+        process
+            .child
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ephemeral child handle poisoned"))?
+            .as_ref()
+            .map(std::process::Child::id)
+            .context("ephemeral child already transferred")
+    }
+
     pub(crate) fn new(
         paths: crate::daemon::DaemonPaths,
         child: crate::daemon::DetachedEphemeralChild,
@@ -1395,6 +1409,39 @@ mod tests {
         assert!(!process_child_retained(&cleanup));
         assert!(!paths.pid_file.exists());
         assert!(!paths.socket.exists());
+    }
+
+    #[test]
+    fn transferred_child_without_guard_is_not_reaped_on_drop() {
+        initialize_process_reaper().expect("process reaper");
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::daemon::DaemonPaths {
+            socket: root.path().join("transferred.sock"),
+            pid_file: root.path().join("transferred.pid"),
+            ephemeral: true,
+        };
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn fixture child");
+        let pid = child.id();
+        let provisional = ProvisionalEphemeralChild::new(paths.clone(), child);
+        let transferred = provisional
+            .into_child()
+            .expect("transfer child out of provisional guard");
+        drop(transferred);
+        // SAFETY: `kill(pid, 0)` probes liveness and cannot fail when the child exists.
+        assert_eq!(
+            unsafe { libc::kill(pid as libc::pid_t, 0) },
+            0,
+            "dropping an unguarded transferred child must not reap it; \
+             EphemeralDaemonGuard must arm inside spawn_blocking"
+        );
+        assert_eq!(
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) },
+            0,
+            "cleanup fixture child"
+        );
     }
 
     #[test]

@@ -27,6 +27,8 @@ use super::{
 const LOG_TAIL_LINES: usize = 20;
 const WAIT_POLL: Duration = Duration::from_millis(10);
 const REAP_GRACE: Duration = Duration::from_millis(200);
+#[cfg(unix)]
+const PER_CONNECTION_READ_CAP: Duration = Duration::from_secs(1);
 
 #[cfg(unix)]
 static NOTIFY_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -147,6 +149,11 @@ fn write_report(endpoint: &str, line: &str) -> Result<()> {
         stream
             .write_all(payload.as_bytes())
             .context("writing spawn notify report")?;
+        // SAFETY: spawn notify is single-shot; clearing the env after the first
+        // report prevents late daemon shutdown from reporting to a reused pid.
+        unsafe {
+            std::env::remove_var(DAEMON_SPAWN_NOTIFY_ENV);
+        }
         Ok(())
     }
     #[cfg(windows)]
@@ -158,6 +165,11 @@ fn write_report(endpoint: &str, line: &str) -> Result<()> {
         stream
             .write_all(payload.as_bytes())
             .context("writing spawn notify report")?;
+        // SAFETY: spawn notify is single-shot; clearing the env after the first
+        // report prevents late daemon shutdown from reporting to a reused pid.
+        unsafe {
+            std::env::remove_var(DAEMON_SPAWN_NOTIFY_ENV);
+        }
         Ok(())
     }
     #[cfg(not(any(unix, windows)))]
@@ -341,12 +353,13 @@ pub(crate) fn report_to_error(report: SpawnReport, log_path: &Path) -> anyhow::E
 }
 
 fn attach_log_tail(error: anyhow::Error, log_path: &Path) -> anyhow::Error {
+    let reason = error.to_string();
     let tail = last_log_lines(log_path, LOG_TAIL_LINES);
     if tail.trim().is_empty() {
         error
     } else {
         error.context(format!(
-            "--- daemon.log (last {LOG_TAIL_LINES} lines) ---\n{tail}"
+            "{reason}\n--- daemon.log (last {LOG_TAIL_LINES} lines) ---\n{tail}"
         ))
     }
 }
@@ -397,26 +410,40 @@ fn unix_bind() -> Result<SpawnNotifyServer> {
     }
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("binding spawn notify socket {}", path.display()))?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 0600 {}", path.display()))?;
-    let meta =
-        std::fs::symlink_metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+    if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+        cleanup_notify_socket(&path);
+        return Err(error).with_context(|| format!("chmod 0600 {}", path.display()));
+    }
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(error) => {
+            cleanup_notify_socket(&path);
+            return Err(error).with_context(|| format!("stat {}", path.display()));
+        }
+    };
     let file_type = meta.file_type();
     let mode = meta.mode() & 0o777;
     let owner = meta.uid();
     // SAFETY: `geteuid` has no preconditions and cannot fail.
     let euid = unsafe { libc::geteuid() };
     if !file_type.is_socket() || owner != euid || mode != 0o600 {
+        cleanup_notify_socket(&path);
         anyhow::bail!(
             "refusing to use {}: expected owner-only socket (uid {euid}, mode 0600), \
              got uid {owner} mode {mode:03o}",
             path.display()
         );
     }
-    listener
-        .set_nonblocking(true)
-        .context("setting spawn notify socket non-blocking")?;
+    if let Err(error) = listener.set_nonblocking(true) {
+        cleanup_notify_socket(&path);
+        return Err(error).context("setting spawn notify socket non-blocking");
+    }
     Ok(SpawnNotifyServer { listener, path })
+}
+
+#[cfg(unix)]
+fn cleanup_notify_socket(path: &Path) {
+    let _ = std::fs::remove_file(path);
 }
 
 #[cfg(unix)]
@@ -454,11 +481,12 @@ fn unix_wait(
                         log_path,
                     ));
                 }
-                if verify_notify_peer(&stream).is_err() {
+                if verify_notify_peer(&stream, child.id()).is_err() {
                     continue;
                 }
+                let read_budget = remaining.min(PER_CONNECTION_READ_CAP);
                 stream
-                    .set_read_timeout(Some(remaining))
+                    .set_read_timeout(Some(read_budget))
                     .context("setting spawn notify read timeout")?;
                 let mut line = String::new();
                 match BufReader::new(stream).read_line(&mut line) {
@@ -470,6 +498,7 @@ fn unix_wait(
                         continue;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(error) => {
                         return Err(error).context("reading spawn notify report");
@@ -509,7 +538,10 @@ fn unix_wait(
 }
 
 #[cfg(unix)]
-fn verify_notify_peer(stream: &std::os::unix::net::UnixStream) -> Result<()> {
+fn verify_notify_peer(
+    stream: &std::os::unix::net::UnixStream,
+    expected_child_pid: u32,
+) -> Result<()> {
     let peer = cockpit_host::peer_cred::peer_identity_from_unix_stream(stream)
         .context("reading spawn notify peer credentials")?;
     // SAFETY: `geteuid` has no preconditions and cannot fail.
@@ -518,6 +550,12 @@ fn verify_notify_peer(stream: &std::os::unix::net::UnixStream) -> Result<()> {
         anyhow::bail!(
             "refusing spawn notify report from uid {} (expected {euid})",
             peer.uid
+        );
+    }
+    if peer.pid != expected_child_pid {
+        anyhow::bail!(
+            "refusing spawn notify report from pid {} (expected spawned child {expected_child_pid})",
+            peer.pid
         );
     }
     Ok(())
@@ -669,14 +707,23 @@ mod tests {
             super::super::daemon_error_exit_code(&error),
             super::super::DAEMON_BIND_IN_USE_EXIT_CODE
         );
-        let text = format!("{error:#}");
+        let display = format!("{error}");
         assert!(
-            text.contains("already in use"),
-            "typed bind refusal must remain visible: {text}"
+            display.contains("already in use"),
+            "Display must show bind refusal for TUI consumers: {display}"
         );
         assert!(
-            text.contains("bind-line"),
-            "log tail must remain attached: {text}"
+            !display.starts_with("--- daemon.log"),
+            "Display must not lead with the log-tail header: {display}"
+        );
+        assert!(
+            display.contains("bind-line"),
+            "Display must include the log tail: {display}"
+        );
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("already in use"),
+            "typed bind refusal must remain in the chain: {chain}"
         );
     }
 

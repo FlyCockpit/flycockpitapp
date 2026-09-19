@@ -241,6 +241,8 @@ fn verify_start(
     let mut radial_fr = None;
     let inherited_object_bbox = stack.last().is_some_and(|frame| frame.object_bbox);
     let mut object_bbox = inherited_object_bbox;
+    // Validate whitespace for every attribute in this complete first pass.
+    // The second pass can then focus on bounds, ordering, and value semantics.
     for attribute in event.attributes().with_checks(true) {
         let attribute = attribute.map_err(|_| error("attribute"))?;
         // The canonical serializer never writes literal XML whitespace to
@@ -268,9 +270,6 @@ fn verify_start(
     }
     for attribute in event.attributes().with_checks(true) {
         let attribute = attribute.map_err(|_| error("attribute"))?;
-        if attribute.value.as_ref().contains(&b'\t') || attribute.value.as_ref().contains(&b'\n') {
-            return fail(SvgSanitizeCode::StructuralVerify, "attribute-whitespace");
-        }
         attributes += 1;
         limits.attributes = limits
             .attributes
@@ -291,9 +290,6 @@ fn verify_start(
         let value = attribute
             .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
             .map_err(|_| error("attribute"))?;
-        if value.contains('\t') || value.contains('\n') {
-            return fail(SvgSanitizeCode::StructuralVerify, "attribute-whitespace");
-        }
         if key == b"xmlns" {
             if kind != Kind::Svg || saw_xmlns || value.as_ref() != SVG_NS {
                 return fail(SvgSanitizeCode::StructuralVerify, "namespace");

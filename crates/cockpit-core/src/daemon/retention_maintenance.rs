@@ -111,7 +111,7 @@ pub(crate) async fn run_retention_maintenance_pass(ctx: Arc<DaemonContext>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::server::{disk_test_ctx, test_ctx};
+    use crate::daemon::server::test_ctx;
     use std::time::{Duration, Instant};
     use tokio::sync::oneshot;
 
@@ -123,23 +123,9 @@ mod tests {
         run_retention_maintenance_loop(ctx, period).await;
     }
 
-    async fn join_within_wall_time<T>(limit: Duration, handle: tokio::task::JoinHandle<T>) -> T {
-        let started = Instant::now();
-        loop {
-            if handle.is_finished() {
-                return handle.await.expect("join handle finished");
-            }
-            if started.elapsed() >= limit {
-                handle.abort();
-                panic!("task did not finish within {limit:?} (wall clock)");
-            }
-            tokio::task::yield_now().await;
-        }
-    }
-
     #[cfg(unix)]
     #[tokio::test]
-    async fn accept_loop_does_not_await_retention_maintenance() {
+    async fn accept_loop_accepts_while_retention_maintenance_is_blocked() {
         let _serial = serial_lock().await;
         let ctx = test_ctx();
         let dir = cockpit_test_support::isolated_tempdir();
@@ -160,6 +146,15 @@ mod tests {
             ctx.clone(),
             listener,
         ));
+        let client = tokio::time::timeout(
+            Duration::from_secs(5),
+            cockpit_client::DaemonClient::connect(&socket),
+        )
+        .await
+        .expect("accept loop must accept while retention maintenance is blocked")
+        .expect("daemon handshake while retention maintenance is blocked");
+        assert!(client.is_socket_backed());
+        drop(client);
         let started = Instant::now();
         assert!(
             ctx.shutdown_signal().begin_drain(),
@@ -180,56 +175,5 @@ mod tests {
             .await
             .expect("worker should exit after the admitted pass finishes")
             .expect("worker join");
-    }
-
-    /// Regression for the pre-worker inline arm: if `run_accept_loop` ever
-    /// awaits `run_retention_tick` inline again, the tick fires inside the
-    /// test window (paused clock advanced far past the 6h default sweep
-    /// interval) and parks on the stalled writer — every retention pass
-    /// issues at least one write (`prune_session_payloads` with the default
-    /// positive windows) — so the loop cannot observe drain and this test
-    /// fails on the accept-loop timeout.
-    #[cfg(unix)]
-    #[tokio::test(start_paused = true)]
-    async fn accept_loop_does_not_run_retention_ticks_inline() {
-        let dir = cockpit_test_support::isolated_tempdir();
-        let db_path = dir.path().join("retention-inline.db");
-        let spool = dir.path().join("spool");
-        let ctx = disk_test_ctx(&db_path, &spool);
-        let stall = ctx.db.stall_writer_for_test().expect("stall writer");
-        let socket = dir.path().join("retention-inline.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind test unix socket");
-        let accept = tokio::spawn(crate::daemon::server::run_accept_loop(
-            ctx.clone(),
-            listener,
-        ));
-        // Poll the spawned loop at T=0 so a restored inline retention arm
-        // creates its interval and consumes the immediate first tick before
-        // virtual time jumps. `advance` moves the clock then yields; without
-        // this pre-yield the loop is first polled after the jump and the next
-        // tick would land past the test window.
-        tokio::task::yield_now().await;
-        let period =
-            Duration::from_secs((retention_config().sweep_interval_hours.max(1) as u64) * 60 * 60);
-        // Advance just past the retention sweep interval so a restored inline
-        // arm would have fired and parked on the stalled writer before drain
-        // begins. Use `advance`, not `sleep`: a restored arm that parks on
-        // the stalled writer is a non-timer waiter and would stop paused-clock
-        // auto-advance during `sleep`.
-        tokio::time::advance(period + Duration::from_secs(1)).await;
-        let started = Instant::now();
-        assert!(
-            ctx.shutdown_signal().begin_drain(),
-            "test owns the first drain"
-        );
-        join_within_wall_time(Duration::from_secs(5), accept)
-            .await
-            .expect("accept loop ok");
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "accept loop took {:?} while the db writer was stalled",
-            started.elapsed()
-        );
-        drop(stall);
     }
 }

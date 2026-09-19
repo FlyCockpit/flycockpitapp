@@ -376,6 +376,7 @@ impl Writer {
     /// Non-blocking enqueue for callers where queue saturation is acceptable
     /// (tests and explicit drop paths). Durability-bearing async callers use
     /// [`Self::submit_durable`] instead.
+    #[cfg(any(test, feature = "test-support"))]
     fn submit<F, T>(&self, f: F) -> Result<tokio::sync::oneshot::Receiver<WriteReply>>
     where
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,

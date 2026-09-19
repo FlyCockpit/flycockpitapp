@@ -51,7 +51,7 @@ ALLOWLIST: tuple[tuple[str, int], ...] = (
     ("crates/cockpit-core/src/daemon/server/attachments.rs", 1),
     ("crates/cockpit-core/src/daemon/server/dispatch.rs", 14),
     ("crates/cockpit-core/src/daemon/server/image_control_mutations/tests.rs", 2),
-    ("crates/cockpit-core/src/daemon/server/tests.rs", 37),
+    ("crates/cockpit-core/src/daemon/server/tests.rs", 35),
     ("crates/cockpit-core/src/daemon/session_worker/tests.rs", 1),
     ("crates/cockpit-core/src/engine/agent/hooks/tests.rs", 1),
     ("crates/cockpit-core/src/engine/agent/outcome.rs", 1),

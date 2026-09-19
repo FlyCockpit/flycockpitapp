@@ -19,8 +19,8 @@ pub struct QuickModelChoice {
     pub trust: ModelTrust,
 }
 
-impl From<crate::tui::model_picker::ModelChoice> for QuickModelChoice {
-    fn from(choice: crate::tui::model_picker::ModelChoice) -> Self {
+impl From<crate::tui::model_choice::ModelChoice> for QuickModelChoice {
+    fn from(choice: crate::tui::model_choice::ModelChoice) -> Self {
         Self {
             provider_id: choice.provider_id,
             model_id: choice.model_id,

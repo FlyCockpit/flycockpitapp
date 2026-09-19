@@ -388,7 +388,7 @@ fn composer_pills_open_hierarchical_pickers() {
 }
 
 #[test]
-fn ctrl_p_opens_model_picker_through_router_and_keyboard_moves() {
+fn ctrl_p_opens_composer_model_menu_through_router_and_keyboard_moves() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app(&tmp);
     let _ = render(&mut app, 120, 24);
@@ -601,7 +601,7 @@ fn ctrl_p_opens_the_picker_replacing_an_open_overlay_pane() {
 }
 
 #[test]
-fn focused_btw_cannot_intercept_model_picker_commit() {
+fn focused_btw_cannot_intercept_composer_model_menu_commit() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut app, mut control_rx) = app_with_runner(&tmp);
     let _ = render(&mut app, 120, 24);
@@ -653,7 +653,7 @@ fn focused_btw_cannot_intercept_model_picker_commit() {
 }
 
 #[test]
-fn queue_reentry_cannot_intercept_model_picker_navigation_or_commit() {
+fn queue_reentry_cannot_intercept_composer_model_menu_navigation_or_commit() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut app, mut control_rx) = app_with_runner(&tmp);
     let queued = queue_item("keep queued", QueueDeliveryClass::Held);
@@ -807,7 +807,7 @@ fn slash_model_opens_composer_picker_not_fullscreen_overlay() {
 }
 
 #[test]
-fn model_picker_pins_favorites_annotates_failures_usage_drift_and_add_action() {
+fn composer_model_menu_pins_favorites_annotates_failures_usage_drift_and_add_action() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app(&tmp);
     let provider = app
@@ -863,7 +863,7 @@ fn model_picker_pins_favorites_annotates_failures_usage_drift_and_add_action() {
 }
 
 #[test]
-fn model_picker_refresh_preserves_provider_cursor_across_config_drift_row() {
+fn composer_model_menu_refresh_preserves_provider_cursor_across_config_drift_row() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app(&tmp);
     app.config_drift = Some(super::ConfigDriftState {
@@ -881,7 +881,7 @@ fn model_picker_refresh_preserves_provider_cursor_across_config_drift_row() {
     };
     assert_eq!(selected_before, "openai");
 
-    app.refresh_open_composer_model_picker();
+    app.refresh_open_composer_model_menu();
 
     let picker = app.composer_controls.picker.as_ref().expect("picker");
     assert_eq!(picker.categories[picker.cursor].id, selected_before);
@@ -1297,7 +1297,7 @@ fn fenced_model_selection_failed_delivery_releases_ownership() {
     );
     assert!(app.composer_controls.picker.is_none());
     assert!(
-        !matches!(app.overlay, Overlay::ModelPicker(_)),
+        app.composer_controls.picker.is_none(),
         "fenced model rejection must not reopen the model picker"
     );
 

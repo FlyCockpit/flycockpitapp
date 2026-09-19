@@ -607,14 +607,7 @@ impl App {
                 incoming.as_ref(),
             );
         }
-        if let Overlay::ModelPicker(picker) = &mut self.overlay {
-            picker.set_active_slot_models(
-                self.prepared_slot_models.clone(),
-                self.prepared_slot_default.clone(),
-                &self.usage_models,
-            );
-        }
-        self.refresh_open_composer_model_picker();
+        self.refresh_open_composer_model_menu();
         if let Overlay::SessionSetup(pane) = &mut self.overlay {
             pane.apply_snapshot(snapshot.clone());
         }

@@ -70,9 +70,6 @@ pub(crate) enum RowDispatch {
     ContextMenu {
         index: usize,
     },
-    ModelPicker {
-        cursor: usize,
-    },
     QuickTab {
         index: usize,
     },

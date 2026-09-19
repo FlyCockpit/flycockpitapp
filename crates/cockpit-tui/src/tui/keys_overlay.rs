@@ -127,8 +127,6 @@ pub enum KeyContext {
     Composer,
     /// Slash-command menu is open in the composer.
     SlashMenu,
-    /// `/model` picker.
-    ModelPicker,
     /// Settings / config dialog.
     Settings,
     /// `/sessions` / `/resume` browser.
@@ -577,43 +575,6 @@ pub fn dialog_footer_bindings(
         .collect()
 }
 
-/// Model-picker bindings.
-const MODEL_PICKER: KeyGroup = KeyGroup {
-    title: "Model picker",
-    bindings: &[
-        KeyBinding {
-            key: "↑/↓",
-            action: "move",
-            desc: "highlight a model",
-        },
-        KeyBinding {
-            key: "type",
-            action: "filter",
-            desc: "filter the model list",
-        },
-        KeyBinding {
-            key: "Enter",
-            action: "select",
-            desc: "switch this session only; never changes the default",
-        },
-        KeyBinding {
-            key: "Ctrl+Enter",
-            action: "make default",
-            desc: "switch this session and set the default for new sessions in this config context",
-        },
-        KeyBinding {
-            key: "Ctrl+A",
-            action: "add model",
-            desc: "add a model to the scoped provider",
-        },
-        KeyBinding {
-            key: "Esc",
-            action: "cancel",
-            desc: "close without changing the model",
-        },
-    ],
-};
-
 /// Settings-dialog bindings.
 const SETTINGS: KeyGroup = KeyGroup {
     title: "Settings",
@@ -714,7 +675,6 @@ fn groups_for_owned(context: KeyContext, keyboard_enhancement_active: bool) -> V
         },
         KeyContext::Composer => COMPOSER.into(),
         KeyContext::SlashMenu => SLASH_MENU.into(),
-        KeyContext::ModelPicker => MODEL_PICKER.into(),
         KeyContext::Settings => SETTINGS.into(),
         KeyContext::Sessions => crate::tui::session_rail::SessionRail::keybindings().into(),
         KeyContext::Permissions => {
@@ -914,7 +874,6 @@ impl KeysOverlay {
         match self.context {
             KeyContext::Composer => "Composer",
             KeyContext::SlashMenu => "Slash menu",
-            KeyContext::ModelPicker => "Model picker",
             KeyContext::Settings => "Settings",
             KeyContext::Sessions => "Sessions",
             KeyContext::Permissions => "Permissions",
@@ -1158,7 +1117,6 @@ mod tests {
         for ctx in [
             KeyContext::Composer,
             KeyContext::SlashMenu,
-            KeyContext::ModelPicker,
             KeyContext::Settings,
             KeyContext::Sessions,
             KeyContext::Permissions,
@@ -1238,7 +1196,6 @@ mod tests {
         for ctx in [
             KeyContext::Composer,
             KeyContext::SlashMenu,
-            KeyContext::ModelPicker,
             KeyContext::Settings,
             KeyContext::Sessions,
             KeyContext::Permissions,

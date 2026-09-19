@@ -2747,26 +2747,38 @@ impl App {
         // open must update the held config, but must not consume the causal
         // reopen marker or rebuild the hidden picker underneath the dialog.
         if !self.dialog.is_active()
-            && let Some(provider) = self.reopen_model_picker_after_settings.take()
+            && let Some(provider) = self.reopen_composer_model_after_add_model.take()
         {
-            self.open_model_picker_for_provider(&provider);
-            if let (Some(draft), Overlay::ModelPicker(picker)) = (
-                self.reopen_model_picker_draft_after_settings.take(),
-                &mut self.overlay,
-            ) {
-                picker.restore_requested_selection(&draft);
+            self.open_composer_model_menu_for_provider(&provider);
+            if let Some(draft) = self.reopen_composer_model_draft_after_settings.take() {
+                self.restore_composer_model_menu_selection(&draft);
             }
         }
-        if let Some(provider) = self.refresh_reopened_model_picker_after_settings.take()
-            && matches!(self.overlay, Overlay::ModelPicker(_))
+        if let Some(provider) = self.refresh_reopened_composer_model_after_settings.take()
+            && self
+                .composer_controls
+                .picker
+                .as_ref()
+                .is_some_and(|picker| {
+                    picker.kind == crate::tui::composer_controls::ComposerControlKind::Model
+                })
         {
-            let draft = match &self.overlay {
-                Overlay::ModelPicker(picker) => picker.draft_active_model().cloned(),
-                _ => None,
-            };
-            self.open_model_picker_for_provider(&provider);
-            if let (Some(draft), Overlay::ModelPicker(picker)) = (draft, &mut self.overlay) {
-                picker.restore_requested_selection(&draft);
+            let draft = self.composer_controls.picker.as_ref().and_then(|picker| {
+                picker.categories.get(picker.category).and_then(|category| {
+                    category.items.get(picker.cursor).map(|item| {
+                        cockpit_config::providers::ActiveModelRef {
+                            provider: category.id.clone(),
+                            model: item.id.clone(),
+                            reasoning_effort: item.selected_reasoning_effort.clone(),
+                            thinking_mode: item.selected_thinking_mode,
+                            prompt_cache_retention: item.selected_prompt_cache_retention,
+                        }
+                    })
+                })
+            });
+            self.open_composer_model_menu_for_provider(&provider);
+            if let Some(draft) = draft {
+                self.restore_composer_model_menu_selection(&draft);
             }
         }
     }

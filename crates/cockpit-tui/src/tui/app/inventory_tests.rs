@@ -197,14 +197,14 @@ fn tui_performs_no_local_agent_resolution() {
 }
 
 #[test]
-fn model_picker_performs_no_local_credential_resolution() {
+fn model_choice_performs_no_local_credential_resolution() {
     let src = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/src/tui/model_picker.rs"
+        "/src/tui/model_choice.rs"
     ));
     assert!(
         !src.contains("secret_ref::load_effective"),
-        "model_picker.rs must not call secret_ref::load_effective"
+        "model_choice.rs must not call secret_ref::load_effective"
     );
 }
 

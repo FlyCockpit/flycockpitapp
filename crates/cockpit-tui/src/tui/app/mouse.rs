@@ -359,17 +359,6 @@ impl App {
             self.apply_settings_pointer_outcome(outcome);
             return;
         }
-        if self.mouse_capture
-            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && let Overlay::ModelPicker(picker) = &mut self.overlay
-        {
-            let should_close = picker.handle_mouse_row(mouse.row);
-            if should_close {
-                let accepted = picker.is_done();
-                self.close_model_picker(accepted);
-            }
-            return;
-        }
         // The `/sealed` no-echo overlay is modal: a left-click dismisses it,
         // which cancels the pending write and drops the minted capability (or
         // hides a recover reveal). Handled before the `&mut self.overlay` match
@@ -448,8 +437,7 @@ impl App {
                 }
                 return;
             }
-            Overlay::ModelPicker(_)
-            | Overlay::Multireview(_)
+            Overlay::Multireview(_)
             | Overlay::Quick(_)
             | Overlay::SessionSetup(_)
             | Overlay::AgentTree(_)
@@ -743,25 +731,23 @@ impl App {
         outcome: crate::tui::settings::SettingsPointerOutcome,
     ) {
         if matches!(outcome, crate::tui::settings::SettingsPointerOutcome::Close) {
-            let open_default_model_picker = self.dialog.take_pending_default_model_picker();
+            let open_default_model_from_settings =
+                self.dialog.take_pending_default_model_from_settings();
             self.capture_response_metrics_tokenizer_dirty_from_dialog();
             self.dialog = crate::tui::settings::Dialog::None;
             self.invalidate_primary_paste();
             self.sync_mouse_capture_from_dialog();
             self.resync_config_after_local_write();
-            if self.reopen_composer_model_picker_after_provider_settings() {
-                self.reopen_model_picker_draft_after_settings = None;
-            } else if let Some(provider) = self.reopen_model_picker_after_settings.take() {
-                self.open_model_picker_for_provider(&provider);
-                if let (Some(draft), Overlay::ModelPicker(picker)) = (
-                    self.reopen_model_picker_draft_after_settings.take(),
-                    &mut self.overlay,
-                ) {
-                    picker.restore_requested_selection(&draft);
+            if self.reopen_composer_model_after_provider_settings() {
+                self.reopen_composer_model_draft_after_settings = None;
+            } else if let Some(provider) = self.reopen_composer_model_after_add_model.take() {
+                self.open_composer_model_menu_for_provider(&provider);
+                if let Some(draft) = self.reopen_composer_model_draft_after_settings.take() {
+                    self.restore_composer_model_menu_selection(&draft);
                 }
-                self.refresh_reopened_model_picker_after_settings = Some(provider);
-            } else if open_default_model_picker {
-                self.open_default_model_picker_from_settings();
+                self.refresh_reopened_composer_model_after_settings = Some(provider);
+            } else if open_default_model_from_settings {
+                self.open_default_model_from_settings();
             }
         }
     }
@@ -980,7 +966,6 @@ impl App {
             || self.question_dialog.is_some()
             || self.context_menu.is_some()
             || self.keys_overlay.is_some()
-            || matches!(self.overlay, Overlay::ModelPicker(_))
             || self.composer_controls.picker.is_some()
             || matches!(
                 self.overlay,

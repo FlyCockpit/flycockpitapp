@@ -142,7 +142,7 @@ fn config_snapshot_values_match_previous_resolution() {
     );
     // Model-picker ordering comes from the daemon inventory projection; with
     // no inventory snapshot yet the ordered list is empty (pre-attach).
-    let choices = crate::tui::model_picker::ordered_model_choices_from_inventory(
+    let choices = crate::tui::model_choice::ordered_model_choices_from_inventory(
         &app.inventory_models(),
         &std::collections::HashMap::new(),
     );
@@ -186,7 +186,7 @@ fn tui_has_no_config_disk_reads_outside_bootstrap() {
     let mut hits = Vec::new();
     visit(&tui_dir, &mut hits);
 
-    // Inventory consumption removed secret_ref::load_effective from model_picker
+    // Inventory consumption removed secret_ref::load_effective from model choice helpers
     // production paths. No non-test TUI consumer may re-resolve providers from disk.
     assert!(
         hits.is_empty(),

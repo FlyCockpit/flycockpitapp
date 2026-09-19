@@ -1466,10 +1466,6 @@ impl App {
         } else {
             let overlay = std::mem::take(&mut self.overlay);
             match overlay {
-                Overlay::ModelPicker(mut picker) => {
-                    picker.render(frame, rects.body);
-                    self.overlay = Overlay::ModelPicker(picker);
-                }
                 Overlay::Multireview(dialog) => {
                     dialog.render(frame, rects.body);
                     self.overlay = Overlay::Multireview(dialog);

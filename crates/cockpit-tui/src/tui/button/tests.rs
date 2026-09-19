@@ -306,7 +306,6 @@ fn tui_button_inventory_is_complete() {
     assert!(inventory.iter().any(|item| item.surface == "queue"));
     assert!(inventory.iter().any(|item| item.surface == "notice"));
     assert!(inventory.iter().any(|item| item.surface == "sessions"));
-    assert!(inventory.iter().any(|item| item.surface == "model_picker"));
     assert!(inventory.iter().any(|item| item.surface == "multireview"));
     assert!(inventory.iter().any(|item| item.surface == "stats"));
     assert!(inventory.iter().any(|item| item.surface == "skills"));

@@ -684,7 +684,7 @@ impl App {
         };
         match kind {
             ComposerControlKind::Agent => self.fill_agent_picker(&mut picker),
-            ComposerControlKind::Model => self.fill_model_picker(&mut picker),
+            ComposerControlKind::Model => self.populate_model_menu(&mut picker),
             ComposerControlKind::Effort => self.fill_effort_picker(&mut picker),
             ComposerControlKind::Approval => self.fill_approval_picker(&mut picker),
             ComposerControlKind::Sandbox => self.fill_sandbox_picker(&mut picker),
@@ -828,7 +828,7 @@ impl App {
         }
     }
 
-    fn fill_model_picker(&self, picker: &mut ComposerPicker) {
+    fn populate_model_menu(&self, picker: &mut ComposerPicker) {
         let current = self.launch.active_model.clone();
         let mut by_provider: std::collections::BTreeMap<String, Vec<ComposerPickerItem>> =
             std::collections::BTreeMap::new();
@@ -1002,7 +1002,7 @@ impl App {
                 })
                 .then_with(|| a.id.cmp(&b.id))
         });
-        if let Some(drift) = self.model_picker_drift() {
+        if let Some(drift) = self.model_drift() {
             picker.status_text = Some(format!(
                 "Session: {} · config: {}",
                 drift.session_label, drift.config_label
@@ -1034,7 +1034,7 @@ impl App {
         picker.categories = categories;
     }
 
-    pub(super) fn refresh_open_composer_model_picker(&mut self) {
+    pub(super) fn refresh_open_composer_model_menu(&mut self) {
         let Some(previous) = self
             .composer_controls
             .picker
@@ -1077,7 +1077,7 @@ impl App {
             status_text: None,
             ..previous
         };
-        self.fill_model_picker(&mut refreshed);
+        self.populate_model_menu(&mut refreshed);
         if let Some((category_id, category_label)) = category_identity
             && let Some(category) = refreshed
                 .categories
@@ -1102,8 +1102,8 @@ impl App {
         self.composer_controls.picker = Some(refreshed);
     }
 
-    pub(super) fn reopen_composer_model_picker_after_provider_settings(&mut self) -> bool {
-        let Some(provider) = self.reopen_composer_model_picker_after_settings.take() else {
+    pub(super) fn reopen_composer_model_after_provider_settings(&mut self) -> bool {
+        let Some(provider) = self.reopen_composer_model_after_settings.take() else {
             return false;
         };
         self.open_composer_picker_from_chord(ComposerControlKind::Model);
@@ -1459,7 +1459,7 @@ impl App {
         if picker.kind == ComposerControlKind::Model && item.id == ADD_MODEL_ITEM_ID {
             self.composer_controls.selection = None;
             self.composer_controls.picker = None;
-            self.reopen_composer_model_picker_after_settings = Some(category.id.clone());
+            self.reopen_composer_model_after_settings = Some(category.id.clone());
             self.dialog =
                 crate::tui::settings::Dialog::open_provider_models(&self.launch.cwd, &category.id);
             return;
@@ -1531,6 +1531,13 @@ impl App {
                     thinking_mode,
                     prompt_cache_retention,
                 };
+                if self.default_model_settings_mode {
+                    self.default_model_settings_mode = false;
+                    self.request_default_model_only(active);
+                    self.composer_controls.picker = None;
+                    self.composer_controls.selection = None;
+                    return;
+                }
                 let _ = self.notify_active_model_selected(
                     active,
                     persist_as_default,

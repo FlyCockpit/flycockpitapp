@@ -54,7 +54,7 @@ use super::shell::{
     SettingsPointerTarget, TextColumnLayout, heading_style, muted_style, push_label_text_field_row,
     push_label_value_row, push_wrapped_text, selected_style, settings_text_columns, warning_style,
 };
-use super::ui_page::{InstructionsPage, RedactPatternsPage, UtilityModelPicker};
+use super::ui_page::{InstructionsPage, RedactPatternsPage, UtilityModelSelector};
 use cockpit_proto::Request;
 
 use super::{Nav, SettingsCx, SettingsPage, save_status};
@@ -1200,7 +1200,7 @@ pub(super) struct CategoryPage {
     /// after a Mouse-row toggle or a reset. `None` = untouched.
     pub(crate) pending_mouse_capture: Option<bool>,
     /// `Some` while the utility-model picker overlay is open (Behavior only).
-    pub(super) utility_picker: Option<Box<UtilityModelPicker>>,
+    pub(super) utility_picker: Option<Box<UtilityModelSelector>>,
     pub(super) utility_picker_target: Option<SettingId>,
     pub(super) shadowed_global: Option<ShadowedGlobalPrompt>,
     pub(super) secret_store_confirm: Option<crate::tui::dialog::DialogState>,
@@ -1726,7 +1726,7 @@ impl CategoryPage {
                 });
             }
             CategoryPointerFixtureMode::PickerList => {
-                page.utility_picker = Some(Box::new(UtilityModelPicker {
+                page.utility_picker = Some(Box::new(UtilityModelSelector {
                     entries: Vec::new(),
                     current: None,
                     mode: PickerMode::List {
@@ -1737,7 +1737,7 @@ impl CategoryPage {
                 page.utility_picker_target = Some(SettingId::UtilityModel);
             }
             CategoryPointerFixtureMode::PickerCustom => {
-                page.utility_picker = Some(Box::new(UtilityModelPicker {
+                page.utility_picker = Some(Box::new(UtilityModelSelector {
                     entries: Vec::new(),
                     current: None,
                     mode: PickerMode::Custom {
@@ -3484,7 +3484,7 @@ impl SettingsCx {
             | S::HarnessReportSummarizationModel
             | S::GoalSupervisionModel
             | S::CompactModel => {
-                p.utility_picker = Some(Box::new(UtilityModelPicker::new(
+                p.utility_picker = Some(Box::new(UtilityModelSelector::new(
                     &self.config,
                     self.model_setting_value(id),
                 )));

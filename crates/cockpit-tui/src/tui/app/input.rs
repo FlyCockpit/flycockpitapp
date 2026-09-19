@@ -976,7 +976,8 @@ impl App {
         if self.dialog.is_active() {
             if self.dialog.handle_key(key) {
                 self.drain_oauth_actions();
-                let open_default_model_picker = self.dialog.take_pending_default_model_picker();
+                let open_default_model_from_settings =
+                    self.dialog.take_pending_default_model_from_settings();
                 // Closing the settings dialog can change the active
                 // provider/model — reload launch info so the status
                 // line and header refresh. TUI-side settings (vim
@@ -995,25 +996,22 @@ impl App {
                 // cancel, so never make picker restoration depend on a push.
                 // If a changed snapshot already restored it, the marker is
                 // gone and this is a no-op.
-                if self.reopen_composer_model_picker_after_provider_settings() {
-                    self.reopen_model_picker_draft_after_settings = None;
-                } else if let Some(provider) = self.reopen_model_picker_after_settings.take() {
-                    self.open_model_picker_for_provider(&provider);
-                    if let (Some(draft), Overlay::ModelPicker(picker)) = (
-                        self.reopen_model_picker_draft_after_settings.take(),
-                        &mut self.overlay,
-                    ) {
-                        picker.restore_requested_selection(&draft);
+                if self.reopen_composer_model_after_provider_settings() {
+                    self.reopen_composer_model_draft_after_settings = None;
+                } else if let Some(provider) = self.reopen_composer_model_after_add_model.take() {
+                    self.open_composer_model_menu_for_provider(&provider);
+                    if let Some(draft) = self.reopen_composer_model_draft_after_settings.take() {
+                        self.restore_composer_model_menu_selection(&draft);
                     }
                     // A save may close before the daemon's changed snapshot
                     // arrives. Keep a refresh marker only while this picker
                     // remains open; the correlated/newer snapshot rebuilds
                     // its inventory without unexpectedly reopening a picker
                     // the user has since dismissed.
-                    self.refresh_reopened_model_picker_after_settings = Some(provider);
+                    self.refresh_reopened_composer_model_after_settings = Some(provider);
                 }
-                if open_default_model_picker {
-                    self.open_default_model_picker_from_settings();
+                if open_default_model_from_settings {
+                    self.open_default_model_from_settings();
                 }
             } else if let Some(req) = self.dialog.take_daemon_request() {
                 // A staged default-model request carries its own correlation
@@ -1075,26 +1073,6 @@ impl App {
 
         match std::mem::take(&mut self.overlay) {
             Overlay::None => {}
-            Overlay::ModelPicker(mut picker) => {
-                let should_close = picker.handle_key(key);
-                if should_close {
-                    let accepted = picker.is_done();
-                    let add_model_provider = picker.take_add_model_provider();
-                    let add_model_draft = picker.draft_active_model().cloned();
-                    self.overlay = Overlay::ModelPicker(picker);
-                    if let Some(provider) = add_model_provider {
-                        self.overlay = Overlay::None;
-                        self.reopen_model_picker_after_settings = Some(provider.clone());
-                        self.reopen_model_picker_draft_after_settings = add_model_draft;
-                        self.dialog = Dialog::open_provider_models(&self.launch.cwd, &provider);
-                    } else {
-                        self.close_model_picker(accepted);
-                    }
-                } else {
-                    self.overlay = Overlay::ModelPicker(picker);
-                }
-                return false;
-            }
             Overlay::Multireview(mut dialog) => {
                 let should_close = dialog.handle_key(key);
                 let kickoff = dialog.take_done();
@@ -2718,7 +2696,7 @@ impl App {
                     let requested = self
                         .expire_stale_model_selection()
                         .expect("stale model selection was just observed");
-                    self.open_model_picker_highlighting(Some(&requested));
+                    self.open_model_menu_highlighting(Some(&requested));
                     return false;
                 }
             }
@@ -3321,9 +3299,9 @@ impl App {
             .map(|active| active.provider.as_str())
             .filter(|provider| cfg.providers.contains_key(*provider));
         if let Some(provider) = scoped_provider {
-            self.open_model_picker_for_provider(provider);
+            self.open_composer_model_menu_for_provider(provider);
         } else {
-            self.open_model_picker();
+            self.open_model_menu();
         }
     }
 }
@@ -3842,10 +3820,6 @@ impl App {
             return;
         }
         match &mut self.overlay {
-            Overlay::ModelPicker(picker) => {
-                picker.paste(&data);
-                return;
-            }
             Overlay::Multireview(dialog) => {
                 dialog.paste(&data);
                 return;
@@ -4072,7 +4046,6 @@ impl App {
                     | Overlay::Quick(_)
                     | Overlay::Context(_)
                     | Overlay::Diff(_)
-                    | Overlay::ModelPicker(_)
                     | Overlay::Multireview(_)
                     | Overlay::Notes(_)
                     | Overlay::Leaks(_)

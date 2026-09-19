@@ -1704,6 +1704,7 @@ impl OnboardingShell {
                 filtered,
                 capacity.max(1),
                 screen.offset_for_scroll(),
+                screen.dragging_scrollbar(),
             );
         } else {
             screen.set_scrollbar_area(Rect::default());

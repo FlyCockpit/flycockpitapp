@@ -1317,6 +1317,14 @@ impl App {
                 self.apply_onboarding_secure_intent(submission);
             }
             Some(OnboardingShellAction::ApplyProfile(name)) => {
+                if self
+                    .onboarding_shell
+                    .as_ref()
+                    .is_some_and(|shell| shell.transition_pending())
+                {
+                    self.show_toast("Still applying the previous step…", super::ToastKind::Info);
+                    return;
+                }
                 self.apply_onboarding_profile(name);
             }
             Some(OnboardingShellAction::SelectTemplate(template)) => {
@@ -1685,6 +1693,12 @@ impl App {
             .startup_lifecycle
             .as_ref()
             .map(|selected| selected.endpoint.clone());
+        if let Some(shell) = self.onboarding_shell.as_mut() {
+            shell.latch_transition(
+                snapshot.revision,
+                cockpit_proto::OnboardingTransitionKind::Advance,
+            );
+        }
         let pending_request_id = request_id.clone();
         let started = self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.profile"),
@@ -1697,40 +1711,27 @@ impl App {
                 let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
                     .await
                     .map_err(|error| error.to_string())?;
-                let apply_id = uuid::Uuid::new_v4().to_string();
                 let response = client
                     .request(cockpit_proto::Request::ApplySetupWizard {
-                        client_operation_id: apply_id.clone(),
+                        client_operation_id: uuid::Uuid::new_v4().to_string(),
                         project_root,
                         wizard_id: cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID.to_string(),
                         answers_json,
                     })
                     .await
                     .map_err(|error| error.to_string())?;
-                let config_generation = match response {
-                    Ok(cockpit_proto::Response::SetupWizardApplied {
-                        config_generation, ..
-                    }) => config_generation,
+                match response {
+                    Ok(cockpit_proto::Response::SetupWizardApplied { .. }) => {}
                     Ok(other) => return Err(format!("unexpected profile response: {other:?}")),
                     Err(error) => return Err(error.to_string()),
-                };
-                let settlement = cockpit_proto::OnboardingStageSettlement {
-                    run_id,
-                    attempt_id,
-                    stage_revision: expected_revision,
-                    settlement_operation_id: apply_id,
-                    provider_id: None,
-                    mutation_intent_hash: None,
-                    wizard_id: Some(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID.to_string()),
-                    config_generation,
-                };
+                }
                 let transition = cockpit_proto::ApplyOnboardingTransition {
                     run_id,
                     attempt_id,
                     expected_revision,
                     client_operation_id: request_id.clone(),
                     transition: cockpit_proto::OnboardingTransitionKind::Advance,
-                    settlement: Some(settlement),
+                    settlement: None,
                 };
                 match client
                     .request(cockpit_proto::Request::ApplyOnboardingTransition(

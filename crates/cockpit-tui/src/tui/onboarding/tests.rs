@@ -249,6 +249,36 @@ fn profile_stage_presents_its_native_screen_and_step() {
 }
 
 #[test]
+fn profile_validation_errors_are_visible_and_do_not_submit() {
+    let mut engine = Dialog::None;
+    let mut too_long = shell_at(OnboardingStage::Profile);
+    too_long.paste(&"x".repeat(81));
+    assert!(
+        too_long
+            .handle_key(key(KeyCode::Enter), &mut engine)
+            .is_none()
+    );
+    let rendered = render_string(&mut too_long, 110, 32, &engine);
+    assert!(
+        rendered.contains("name must be 80 characters or fewer"),
+        "{rendered}"
+    );
+
+    let mut control = shell_at(OnboardingStage::Profile);
+    control.paste("name\u{7}");
+    assert!(
+        control
+            .handle_key(key(KeyCode::Enter), &mut engine)
+            .is_none()
+    );
+    let rendered = render_string(&mut control, 110, 32, &engine);
+    assert!(
+        rendered.contains("name cannot contain control characters"),
+        "{rendered}"
+    );
+}
+
+#[test]
 fn welcome_animation_is_tick_driven_and_settles() {
     let mut shell = shell_at(OnboardingStage::Welcome);
     let engine = Dialog::None;

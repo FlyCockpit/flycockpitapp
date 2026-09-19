@@ -1,13 +1,18 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
+use ratatui::text::Span;
+use ratatui::widgets::Paragraph;
 
+use super::theme::BAD;
 use super::ui;
 use crate::tui::textfield::TextField;
 
 pub(crate) struct ProfileScreen {
     name: TextField,
     field_rect: Rect,
+    status: Option<&'static str>,
 }
 
 impl ProfileScreen {
@@ -21,6 +26,7 @@ impl ProfileScreen {
         Self {
             name: TextField::new(prefill),
             field_rect: Rect::default(),
+            status: None,
         }
     }
 
@@ -29,16 +35,27 @@ impl ProfileScreen {
             return self.submit();
         }
         self.name.handle_key(key);
+        self.status = None;
         None
     }
 
-    pub(crate) fn submit(&self) -> Option<String> {
+    pub(crate) fn submit(&mut self) -> Option<String> {
         let name = self.name.text().to_string();
-        (name.chars().count() <= 80 && !name.chars().any(char::is_control)).then_some(name)
+        if name.chars().count() > 80 {
+            self.status = Some("name must be 80 characters or fewer");
+            return None;
+        }
+        if name.chars().any(char::is_control) {
+            self.status = Some("name cannot contain control characters");
+            return None;
+        }
+        self.status = None;
+        Some(name)
     }
 
     pub(crate) fn paste(&mut self, text: &str) {
         self.name.paste(text);
+        self.status = None;
     }
 
     pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
@@ -57,6 +74,19 @@ impl ProfileScreen {
             "leave blank to skip",
         ) {
             frame.set_cursor_position(caret);
+        }
+        if let Some(status) = self.status
+            && area.height > 4
+        {
+            frame.render_widget(
+                Paragraph::new(Span::styled(status, Style::new().fg(BAD))),
+                Rect {
+                    x: area.x,
+                    y: area.y.saturating_add(4),
+                    width: area.width,
+                    height: 1,
+                },
+            );
         }
     }
 

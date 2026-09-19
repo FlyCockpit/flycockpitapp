@@ -1174,6 +1174,48 @@ fn provider_auth_engine_renders_inside_full_screen_chrome_at_narrow_and_wide_siz
 }
 
 #[test]
+fn lifetime_continue_submits_the_recorded_choice_by_keyboard_and_pointer() {
+    let mut engine = Dialog::None;
+
+    // Cursor 0 is the persistent default: Enter submits true without any
+    // cursor motion.
+    let mut shell = shell_at(OnboardingStage::Lifetime);
+    assert_eq!(shell.screen_kind(), OnboardingScreenKind::Lifetime);
+    assert!(matches!(
+        shell.handle_key(key(KeyCode::Enter), &mut engine),
+        Some(OnboardingShellAction::ApplyLifetime(true))
+    ));
+
+    // Down moves to the ephemeral row; Enter submits false.
+    let mut shell = shell_at(OnboardingStage::Lifetime);
+    shell.handle_key(key(KeyCode::Down), &mut engine);
+    assert!(matches!(
+        shell.handle_key(key(KeyCode::Enter), &mut engine),
+        Some(OnboardingShellAction::ApplyLifetime(false))
+    ));
+
+    // Pointer: a row click only records the choice (#426 — the answer is
+    // applied when it is submitted, never when it is picked); the rendered
+    // Continue button then submits the clicked row.
+    const WIDTH: u16 = 100;
+    const HEIGHT: u16 = 30;
+    let mut shell = shell_at(OnboardingStage::Lifetime);
+    render_string(&mut shell, WIDTH, HEIGHT, &engine);
+    let ephemeral_row = shell.list_row_rects[1];
+    let choose = shell.handle_mouse(click(ephemeral_row.x, ephemeral_row.y), &mut engine);
+    assert!(choose.consumed);
+    assert!(
+        choose.action.is_none(),
+        "a row click must choose, not submit"
+    );
+    let submit = click_action(&mut shell, 0, WIDTH, HEIGHT, &mut engine);
+    assert!(matches!(
+        submit.action,
+        Some(OnboardingShellAction::ApplyLifetime(false))
+    ));
+}
+
+#[test]
 fn lifetime_native_screen_renders_inside_full_screen_chrome_at_narrow_and_wide_sizes() {
     let mut shell = shell_at(OnboardingStage::Lifetime);
     let engine = Dialog::None;

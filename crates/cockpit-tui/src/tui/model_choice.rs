@@ -26,14 +26,12 @@ pub struct ModelChoice {
 }
 
 #[derive(Clone)]
-struct Entry {
+pub(crate) struct Entry {
     provider_id: String,
     model_id: String,
-    display_name: Option<String>,
     is_favorite: bool,
     reasoning_effort: Option<ReasoningEffortCapability>,
     thinking_modes: Vec<ThinkingMode>,
-    failure_annotation: Option<String>,
     trust: cockpit_config::providers::ModelTrust,
 }
 
@@ -73,7 +71,6 @@ pub(crate) fn picker_entry(
     Entry {
         provider_id: provider_id.to_string(),
         model_id: model.id.clone(),
-        display_name: model.name.clone(),
         is_favorite: model.favorite,
         reasoning_effort,
         thinking_modes: if native_anthropic {
@@ -81,7 +78,6 @@ pub(crate) fn picker_entry(
         } else {
             model.thinking_modes.clone()
         },
-        failure_annotation: None,
         trust: cockpit_config::providers::ModelTrust::Untrusted,
     }
 }
@@ -97,11 +93,9 @@ pub fn ordered_model_choices_from_inventory(
         .map(|m| Entry {
             provider_id: m.provider.clone(),
             model_id: m.id.clone(),
-            display_name: m.display_name.clone(),
             is_favorite: m.favorite,
             reasoning_effort: m.reasoning_effort.clone(),
             thinking_modes: m.thinking_modes.clone(),
-            failure_annotation: None,
             trust: m.trust,
         })
         .collect();

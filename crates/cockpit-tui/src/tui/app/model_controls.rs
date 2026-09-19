@@ -170,29 +170,29 @@ impl App {
         self.open_composer_picker_from_chord(
             crate::tui::composer_controls::ComposerControlKind::Model,
         );
-        if let Some(picker) = self.composer_controls.picker.as_mut() {
-            if let Some(index) = picker
+        if let Some(picker) = self.composer_controls.picker.as_mut()
+            && let Some(index) = picker
                 .categories
                 .iter()
                 .position(|category| category.id == provider && category.label != "Config drift")
-            {
-                picker.cursor = index;
-                picker.category = index;
-                picker.level = 1;
-                picker.cursor = picker
-                    .categories
-                    .get(index)
-                    .and_then(|category| {
-                        category.items.iter().position(|item| {
-                            self.launch.active_model.as_ref().is_some_and(
-                                |(active_provider, model)| {
-                                    active_provider == &category.id && &item.id == model
-                                },
-                            )
-                        })
+        {
+            picker.cursor = index;
+            picker.category = index;
+            picker.level = 1;
+            picker.cursor = picker
+                .categories
+                .get(index)
+                .and_then(|category| {
+                    category.items.iter().position(|item| {
+                        self.launch
+                            .active_model
+                            .as_ref()
+                            .is_some_and(|(active_provider, model)| {
+                                active_provider == &category.id && &item.id == model
+                            })
                     })
-                    .unwrap_or(0);
-            }
+                })
+                .unwrap_or(0);
         }
     }
 
@@ -1141,16 +1141,6 @@ impl App {
         self.retry_model_selections
             .remove(&session_id)
             .filter(|retry| retry.session_id == session_id)
-    }
-
-    #[cfg(test)]
-    pub(super) fn set_current_model_selection_retry(
-        &mut self,
-        mut retry: super::ModelSelectionRetry,
-    ) {
-        retry.session_id = self.launch.session_id;
-        self.retry_model_selections
-            .insert(self.launch.session_id, retry);
     }
 
     /// Start a fresh runner/session model-state epoch. Every pending model

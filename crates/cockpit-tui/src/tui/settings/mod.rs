@@ -6242,8 +6242,8 @@ impl Dialog {
         }
     }
 
-    /// Wizard engine for the onboarding shell's profile/model/agent/lifetime
-    /// stages. The same wizard machinery (and daemon-effect settlement) as
+    /// Wizard engine for the onboarding shell's profile/model stages. The
+    /// same wizard machinery (and daemon-effect settlement) as
     /// the non-onboarding setup wizards, presented inside the full-screen
     /// shell instead of the settings modal. `preselected_model` seeds the
     /// model wizard's provider/model pair when the committed provider
@@ -10135,8 +10135,6 @@ fn apply_setup_wizard_daemon_completion(
                 } else {
                     parts.join(" ")
                 }
-            } else if wizard.run.descriptor().id == "onboarding-lifetime" {
-                "Saved the agent lifetime for future daemon acquisition.".to_string()
             } else {
                 "Saved global security settings through the daemon.".to_string()
             }

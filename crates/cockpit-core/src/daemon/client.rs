@@ -408,6 +408,7 @@ where
 fn lifecycle_resolution(connected: ConnectedDaemon) -> cockpit_client::LifecycleResolution {
     cockpit_client::LifecycleResolution {
         endpoint: connected.endpoint,
+        lifetime_client: Some(connected.client),
         owns_daemon: connected.owns_daemon,
         ephemeral_owner: connected.ephemeral_owner,
         socket: connected.socket,

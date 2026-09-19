@@ -371,6 +371,7 @@ mod notes_lifecycle_tests {
                     endpoint: cockpit_client::ClientEndpoint::InProcess(
                         cockpit_client::InProcessEndpoint::new(connections, sensitive),
                     ),
+                    lifetime_client: None,
                     owns_daemon: false,
                     ephemeral_owner: false,
                     socket: std::path::PathBuf::from("in-process"),

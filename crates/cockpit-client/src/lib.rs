@@ -215,6 +215,9 @@ impl LifecycleIntent {
 #[derive(Debug)]
 pub struct LifecycleResolution {
     pub endpoint: ClientEndpoint,
+    /// Connection that keeps a newly selected ephemeral owner alive until
+    /// the presentation establishes its next daemon connection.
+    pub lifetime_client: Option<DaemonClient>,
     pub owns_daemon: bool,
     /// Whether the resolved owner is reference-counted and therefore needs an
     /// explicit live-work detach decision.
@@ -2547,6 +2550,7 @@ mod tests {
                         connections,
                         sensitive,
                     )),
+                    lifetime_client: None,
                     owns_daemon: true,
                     ephemeral_owner: true,
                     socket: PathBuf::from("in-process"),

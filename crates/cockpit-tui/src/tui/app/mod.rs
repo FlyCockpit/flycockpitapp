@@ -3684,6 +3684,7 @@ impl App {
             endpoint: cockpit_client::ClientEndpoint::InProcess(
                 cockpit_client::InProcessEndpoint::new(connections, sensitive),
             ),
+            lifetime_client: None,
             owns_daemon: true,
             ephemeral_owner: false,
             socket: PathBuf::from("test.sock"),

@@ -1222,37 +1222,39 @@ fn model_catalog_with_distinct_policies() -> ProvidersConfig {
     };
 
     let mut config = ProvidersConfig::default();
-    let mut provider = ProviderEntry::default();
-    provider.models = vec![
-        ModelEntry {
-            id: "model-a".into(),
-            trust: Some(ModelTrust::Untrusted),
-            capabilities: ModelCapabilities {
-                image_input: CapabilityStatus::Supported,
-                reasoning: CapabilityStatus::Supported,
-                context_tokens: Some(4096),
-                max_output_tokens: Some(512),
+    let provider = ProviderEntry {
+        models: vec![
+            ModelEntry {
+                id: "model-a".into(),
+                trust: Some(ModelTrust::Untrusted),
+                capabilities: ModelCapabilities {
+                    image_input: CapabilityStatus::Supported,
+                    reasoning: CapabilityStatus::Supported,
+                    context_tokens: Some(4096),
+                    max_output_tokens: Some(512),
+                    ..Default::default()
+                },
+                default_thinking_mode: Some(ThinkingMode::High),
+                subagent_invokable: Some(false),
+                can_delegate: Some(true),
                 ..Default::default()
             },
-            default_thinking_mode: Some(ThinkingMode::High),
-            subagent_invokable: Some(false),
-            can_delegate: Some(true),
-            ..Default::default()
-        },
-        ModelEntry {
-            id: "model-b".into(),
-            trust: Some(ModelTrust::Trusted),
-            capabilities: ModelCapabilities {
-                tool_calling: CapabilityStatus::Supported,
-                structured_outputs: CapabilityStatus::Supported,
+            ModelEntry {
+                id: "model-b".into(),
+                trust: Some(ModelTrust::Trusted),
+                capabilities: ModelCapabilities {
+                    tool_calling: CapabilityStatus::Supported,
+                    structured_outputs: CapabilityStatus::Supported,
+                    ..Default::default()
+                },
+                default_thinking_mode: Some(ThinkingMode::Off),
+                subagent_invokable: Some(true),
+                can_delegate: Some(false),
                 ..Default::default()
             },
-            default_thinking_mode: Some(ThinkingMode::Off),
-            subagent_invokable: Some(true),
-            can_delegate: Some(false),
-            ..Default::default()
-        },
-    ];
+        ],
+        ..Default::default()
+    };
     config.providers.insert("provider".into(), provider);
     config
 }

@@ -123,10 +123,7 @@ mod tests {
         run_retention_maintenance_loop(ctx, period).await;
     }
 
-    async fn join_within_wall_time<T>(
-        limit: Duration,
-        mut handle: tokio::task::JoinHandle<T>,
-    ) -> T {
+    async fn join_within_wall_time<T>(limit: Duration, handle: tokio::task::JoinHandle<T>) -> T {
         let started = Instant::now();
         loop {
             if handle.is_finished() {

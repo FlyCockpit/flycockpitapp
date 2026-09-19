@@ -4,6 +4,7 @@
 //! `cockpit-client`; this module owns only process and daemon lifecycle.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -16,6 +17,13 @@ const SPAWN_DAEMON_TIMEOUT: Duration = Duration::from_secs(30);
 /// given one bounded recovery window. This prevents a permanently broken
 /// successor from serially wedging the lifecycle host forever.
 const PROMOTION_REPLACEMENT_TIMEOUT: Duration = Duration::from_secs(30);
+static SPAWN_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Set the process-wide CLI policy that discovery may attach but must not
+/// create a daemon. This is configured once, immediately after argument parse.
+pub fn set_spawn_disabled(disabled: bool) {
+    SPAWN_DISABLED.store(disabled, Ordering::Release);
+}
 
 /// One-line presentation notice emitted after an Assistant promotes the
 /// shared ledger owner from ephemeral to persistent mode.
@@ -997,9 +1005,7 @@ fn persistent_owner_identity(
     }
     let canonical = crate::daemon::DaemonPaths::resolve_canonical().ok()?;
     let endpoint = crate::daemon::read_endpoint_record(&canonical)?;
-    if endpoint.kind != crate::daemon::DaemonEndpointKind::Persistent
-        || endpoint.socket != paths.socket
-    {
+    if endpoint.ephemeral || endpoint.socket_path != paths.socket {
         return None;
     }
     let cockpit_host::daemon_lifecycle::DaemonPidRecord::Receipt(receipt) =
@@ -1007,7 +1013,7 @@ fn persistent_owner_identity(
     else {
         return None;
     };
-    (receipt == endpoint.receipt).then_some((endpoint.socket, receipt))
+    (receipt == endpoint.receipt).then_some((endpoint.socket_path, receipt))
 }
 
 /// Bind an ephemeral endpoint to the PID receipt published for that exact
@@ -1021,9 +1027,7 @@ fn ephemeral_owner_identity(
     }
     let canonical = crate::daemon::DaemonPaths::resolve_canonical().ok()?;
     let endpoint = crate::daemon::read_endpoint_record(&canonical)?;
-    if endpoint.kind != crate::daemon::DaemonEndpointKind::Ephemeral
-        || endpoint.socket != paths.socket
-    {
+    if !endpoint.ephemeral || endpoint.socket_path != paths.socket {
         return None;
     }
     let cockpit_host::daemon_lifecycle::DaemonPidRecord::Receipt(receipt) =
@@ -1031,7 +1035,7 @@ fn ephemeral_owner_identity(
     else {
         return None;
     };
-    (receipt == endpoint.receipt).then_some((endpoint.socket, receipt))
+    (receipt == endpoint.receipt).then_some((endpoint.socket_path, receipt))
 }
 
 /// Resolve a daemon under optional request-scoped spawn authority. The permit
@@ -1177,6 +1181,51 @@ async fn probe_or_spawn_with_spawn_authorization(
     // No reachable daemon to attach to — claim the request's spawn permit.
     // The permit is retained until the exact creation call returns, making
     // cancellation and owner creation mutually exclusive.
+    if SPAWN_DISABLED.load(Ordering::Acquire) {
+        anyhow::bail!("no daemon running (--no-spawn)");
+    }
+
+    // Serialize the cold-start decision across client processes. The winner
+    // holds this through #435's child-ready notification; after the loser
+    // acquires it, discovery can attach to the published owner instead of
+    // spawning another child.
+    let start_lock_path = {
+        let canonical = DaemonPaths::resolve_canonical()?;
+        canonical
+            .socket
+            .parent()
+            .context("daemon socket has no parent")?
+            .join("start.lock")
+    };
+    let _start_lock = tokio::task::spawn_blocking(move || {
+        crate::daemon::rendezvous::StartLock::acquire(&start_lock_path)
+    })
+    .await
+    .context("joining daemon start-lock acquisition")??;
+
+    let after_lock = discover().await;
+    match discover_attach_plan(after_lock.status, after_lock.hello.is_some()) {
+        DiscoverAttachPlan::AttachRunning => {
+            if matches!(mode, LifecycleMode::PromoteToPersistent) && after_lock.paths.ephemeral {
+                return promote_ephemeral_owner(&after_lock.paths, lifecycle_request).await;
+            }
+            return attach_running_with_skew_check(after_lock.paths, None).await;
+        }
+        DiscoverAttachPlan::FailIncompatible => {
+            if let Some(hello) = after_lock.hello {
+                anyhow::bail!(
+                    "{}",
+                    proto::incompatible_daemon_protocol_message(hello.protocol_version)
+                );
+            }
+            anyhow::bail!("daemon rendezvous reports an incompatible owner");
+        }
+        DiscoverAttachPlan::WaitForRestart | DiscoverAttachPlan::FailUnreachable => {
+            anyhow::bail!("daemon owner is live but its socket is not ready");
+        }
+        DiscoverAttachPlan::Spawn => {}
+    }
+
     let mut spawn_permit = lifecycle_request
         .map(cockpit_client::LifecycleRequest::authorize_owner_spawn)
         .transpose()

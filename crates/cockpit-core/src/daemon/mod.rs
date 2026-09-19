@@ -13,10 +13,9 @@
 //!
 //! Lifecycle:
 //!
-//! - PID file at `$XDG_STATE_HOME/cockpit/daemon.pid`.
-//! - Unix socket at `$XDG_RUNTIME_DIR/cockpit/cockpit.sock`, fallback
-//!   to `$XDG_STATE_HOME/cockpit/daemon.sock`. Socket file mode is
-//!   0600. On Windows the same path is an owner-only identity file naming a
+//! - PID file, rendezvous, and Unix socket under the DB-identity-hashed
+//!   per-user runtime directory selected by [`rendezvous`]. Socket file mode
+//!   is 0600. On Windows the same path is an owner-only identity file naming a
 //!   per-user private named pipe (`\\.\pipe\cockpit-<sid-fp>-<nonce>`), never
 //!   a well-known unprotected global pipe.
 //! - First `cockpit` invocation auto-promotes via setsid + double-fork
@@ -85,6 +84,7 @@ pub(crate) mod remote_outbox_worker;
 #[cfg(feature = "remote")]
 pub mod remote_project_resolver;
 pub(crate) mod retention_maintenance;
+pub mod rendezvous;
 #[cfg(feature = "extended")]
 pub mod scheduler;
 pub mod server;
@@ -145,9 +145,10 @@ use cockpit_host::daemon_lifecycle::{DaemonPidRecord, read_daemon_pid_record, re
 ))]
 use cockpit_host::daemon_lifecycle::{VerifiedProcessOutcome, acquire_verified_daemon_process};
 #[cfg(any(unix, windows))]
-use cockpit_host::daemon_lifecycle::{legacy_pid_identity, verify_cockpit_daemon_receipt_identity};
+use cockpit_host::daemon_lifecycle::{
+    legacy_pid_identity, read_process_start_identity, verify_cockpit_daemon_receipt_identity,
+};
 use cockpit_host::private_fs::ensure_private_dir;
-use serde::{Deserialize, Serialize};
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::NamedPipeClient;
 #[cfg(unix)]
@@ -276,20 +277,7 @@ pub struct DaemonPaths {
     pub ephemeral: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DaemonEndpointRecord {
-    version: u8,
-    socket: PathBuf,
-    receipt: DaemonPidReceipt,
-    kind: DaemonEndpointKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum DaemonEndpointKind {
-    Persistent,
-    Ephemeral,
-}
+type DaemonEndpointRecord = rendezvous::Record;
 
 #[derive(Debug, Clone)]
 pub struct DaemonProbe {
@@ -321,13 +309,17 @@ impl DaemonProbe {
 }
 
 fn endpoint_file() -> Result<PathBuf> {
+    let paths = DaemonPaths::resolve_canonical()?;
     Ok(endpoint_file_for_state(
-        &state_dir().context("could not locate state dir")?,
+        paths
+            .socket
+            .parent()
+            .context("daemon socket has no parent")?,
     ))
 }
 
 fn endpoint_file_for_state(state: &Path) -> PathBuf {
-    state.join("daemon-endpoint.json")
+    state.join("daemon.json")
 }
 
 fn read_endpoint_record(canonical: &DaemonPaths) -> Option<DaemonEndpointRecord> {
@@ -339,7 +331,7 @@ fn read_endpoint_record(canonical: &DaemonPaths) -> Option<DaemonEndpointRecord>
     read_published_endpoint_record_from(&configured_path, canonical)
 }
 
-/// True when a persistent canonical owner has published its endpoint for `socket`.
+/// True when the canonical owner has published its rendezvous for `socket`.
 pub fn canonical_socket_endpoint_published(socket: &Path) -> bool {
     let canonical = match DaemonPaths::resolve_canonical() {
         Ok(paths) => paths,
@@ -372,8 +364,7 @@ pub fn isolated_socket_transport_ready(socket: &Path, pid_file: &Path) -> bool {
 }
 
 fn read_endpoint_record_from(path: &Path) -> Option<DaemonEndpointRecord> {
-    let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    rendezvous::read(path)
 }
 
 fn read_bound_endpoint_record_from(
@@ -381,12 +372,11 @@ fn read_bound_endpoint_record_from(
     canonical: &DaemonPaths,
 ) -> Option<DaemonEndpointRecord> {
     let record = read_published_endpoint_record_from(path, canonical)?;
-    (record.socket == canonical.socket).then_some(record)
+    (record.socket_path == canonical.socket).then_some(record)
 }
 
-/// Shared-state endpoint publication may point at a different runtime
-/// socket than the queried canonical paths. Discovery follows that
-/// redirect; exact-path probe does not.
+/// Read only a rendezvous bound to this exact canonical directory and PID
+/// generation. Runtime-root changes never redirect discovery across dirs.
 fn read_published_endpoint_record_from(
     path: &Path,
     canonical: &DaemonPaths,
@@ -395,13 +385,13 @@ fn read_published_endpoint_record_from(
         return None;
     }
     let record = read_endpoint_record_from(path)?;
-    if record.version != 1 {
-        return None;
-    }
     let DaemonPidRecord::Receipt(receipt) = read_daemon_pid_record(&canonical.pid_file)? else {
         return None;
     };
-    (record.receipt == receipt).then_some(record)
+    (record.receipt == receipt
+        && record.pid == receipt.pid
+        && record.start_time == receipt.process_start)
+        .then_some(record)
 }
 
 fn write_endpoint_record(paths: &DaemonPaths) -> Result<()> {
@@ -420,8 +410,8 @@ fn write_endpoint_record_with_receipt_and_canonical(
 ) -> Result<()> {
     if paths.pid_file != canonical.pid_file || paths.socket != canonical.socket {
         if paths.ephemeral {
-            // Ephemeral owners are intentionally private to their launching
-            // client and must never create a process-global endpoint record.
+            // Test-only noncanonical ephemeral owners are private to their
+            // launching client and never publish the canonical rendezvous.
             return Ok(());
         }
         anyhow::bail!(
@@ -444,18 +434,15 @@ fn write_endpoint_record_with_receipt_and_canonical(
             anyhow::bail!("daemon PID receipt changed before endpoint publication");
         }
         let record = DaemonEndpointRecord {
-            version: 1,
-            socket: paths.socket.clone(),
+            pid: receipt.pid,
+            start_time: receipt.process_start,
+            socket_path: paths.socket.clone(),
+            protocol_version: proto::PROTOCOL_VERSION,
+            daemon_version: proto::DAEMON_VERSION.to_string(),
             receipt: receipt.clone(),
-            kind: if paths.ephemeral {
-                DaemonEndpointKind::Ephemeral
-            } else {
-                DaemonEndpointKind::Persistent
-            },
+            ephemeral: paths.ephemeral,
         };
-        let data = serde_json::to_vec_pretty(&record).context("serializing daemon endpoint")?;
-        cockpit_host::private_fs::write_private_file(&path, &data)
-            .with_context(|| format!("writing {}", path.display()))
+        rendezvous::write(&path, &record)
     })
 }
 
@@ -473,18 +460,11 @@ impl DaemonPaths {
     /// The canonical persistent daemon's path set. `cockpit daemon
     /// {start,stop,status}` operate exclusively on these.
     pub fn resolve_canonical() -> Result<Self> {
-        let state = state_dir().context("could not locate state dir")?;
-        ensure_private_dir(&state).with_context(|| format!("securing {}", state.display()))?;
-        let pid_file = state.join("daemon.pid");
-        let socket = if let Some(rt) = runtime_dir() {
-            ensure_private_dir(&rt).with_context(|| format!("securing {}", rt.display()))?;
-            rt.join("cockpit.sock")
-        } else {
-            state.join("daemon.sock")
-        };
+        let database = crate::db::Db::default_path().context("resolving daemon database path")?;
+        let files = rendezvous::resolve(&database)?;
         Ok(Self {
-            pid_file,
-            socket,
+            pid_file: files.pid,
+            socket: files.socket,
             ephemeral: false,
         })
     }
@@ -501,17 +481,12 @@ impl DaemonPaths {
     fn resolve_canonical_in(state_home: &Path, runtime_dir: Option<&Path>) -> Result<Self> {
         let state = state_home.join("cockpit");
         ensure_private_dir(&state).with_context(|| format!("securing {}", state.display()))?;
-        let pid_file = state.join("daemon.pid");
-        let socket = if let Some(rt) = runtime_dir {
-            let rt = rt.join("cockpit");
-            ensure_private_dir(&rt).with_context(|| format!("securing {}", rt.display()))?;
-            rt.join("cockpit.sock")
-        } else {
-            state.join("daemon.sock")
-        };
+        let directory = runtime_dir.unwrap_or(&state).join("cockpit");
+        ensure_private_dir(&directory)
+            .with_context(|| format!("securing {}", directory.display()))?;
         Ok(Self {
-            pid_file,
-            socket,
+            pid_file: directory.join("daemon.pid"),
+            socket: directory.join("cockpit.sock"),
             ephemeral: false,
         })
     }
@@ -540,14 +515,15 @@ impl DaemonPaths {
         let state = state_home.join("cockpit");
         ensure_private_dir(&state).with_context(|| format!("securing {}", state.display()))?;
         let stem = format!("cockpit-eph-{pid}-{nonce}");
-        let pid_file = state.join(format!("{stem}.pid"));
-        let socket = if let Some(rt) = runtime_dir {
+        let directory = if let Some(rt) = runtime_dir {
             let rt = rt.join("cockpit");
             ensure_private_dir(&rt).with_context(|| format!("securing {}", rt.display()))?;
-            rt.join(format!("{stem}.sock"))
+            rt
         } else {
-            state.join(format!("{stem}.sock"))
+            state
         };
+        let pid_file = directory.join(format!("{stem}.pid"));
+        let socket = directory.join(format!("{stem}.sock"));
         Ok(Self {
             pid_file,
             socket,
@@ -1027,9 +1003,19 @@ fn status_for_unreachable_pid(_paths: &DaemonPaths) -> DaemonStatus {
 fn endpoint_paths(canonical: &DaemonPaths, record: &DaemonEndpointRecord) -> DaemonPaths {
     DaemonPaths {
         pid_file: canonical.pid_file.clone(),
-        socket: record.socket.clone(),
-        ephemeral: record.kind == DaemonEndpointKind::Ephemeral,
+        socket: record.socket_path.clone(),
+        ephemeral: record.ephemeral,
     }
+}
+
+#[cfg(any(unix, windows))]
+fn rendezvous_owner_is_live(record: &DaemonEndpointRecord) -> bool {
+    read_process_start_identity(record.pid).is_ok_and(|start| start == record.start_time)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn rendezvous_owner_is_live(_record: &DaemonEndpointRecord) -> bool {
+    false
 }
 
 pub async fn discover() -> DaemonProbe {
@@ -1053,6 +1039,16 @@ pub async fn discover() -> DaemonProbe {
 
     if let Some(record) = read_endpoint_record(&canonical) {
         let recorded = endpoint_paths(&canonical, &record);
+        if record.protocol_version != proto::PROTOCOL_VERSION && rendezvous_owner_is_live(&record) {
+            return DaemonProbe::with_hello(
+                DaemonStatus::IncompatibleProtocol,
+                recorded,
+                Some(proto::DaemonHello {
+                    daemon_version: record.daemon_version,
+                    protocol_version: record.protocol_version,
+                }),
+            );
+        }
         if let Some(response) = socket_responds(&recorded.socket).await {
             return DaemonProbe::with_hello(
                 status_for_socket_response(&response),
@@ -1110,6 +1106,16 @@ pub fn discover_blocking() -> DaemonProbe {
 
     if let Some(record) = read_endpoint_record(&canonical) {
         let recorded = endpoint_paths(&canonical, &record);
+        if record.protocol_version != proto::PROTOCOL_VERSION && rendezvous_owner_is_live(&record) {
+            return DaemonProbe::with_hello(
+                DaemonStatus::IncompatibleProtocol,
+                recorded,
+                Some(proto::DaemonHello {
+                    daemon_version: record.daemon_version,
+                    protocol_version: record.protocol_version,
+                }),
+            );
+        }
         if let Some(response) = socket_responds_blocking(&recorded.socket) {
             return DaemonProbe::with_hello(
                 status_for_socket_response(&response),
@@ -1132,6 +1138,18 @@ fn discover_blocking_with_canonical(canonical: DaemonPaths) -> DaemonProbe {
         let endpoint = endpoint_file_for_state(state);
         if let Some(record) = read_published_endpoint_record_from(&endpoint, &canonical) {
             let recorded = endpoint_paths(&canonical, &record);
+            if record.protocol_version != proto::PROTOCOL_VERSION
+                && rendezvous_owner_is_live(&record)
+            {
+                return DaemonProbe::with_hello(
+                    DaemonStatus::IncompatibleProtocol,
+                    recorded,
+                    Some(proto::DaemonHello {
+                        daemon_version: record.daemon_version,
+                        protocol_version: record.protocol_version,
+                    }),
+                );
+            }
             if let Some(response) = socket_responds_blocking(&recorded.socket) {
                 return DaemonProbe::with_hello(
                     status_for_socket_response(&response),
@@ -2817,7 +2835,7 @@ async fn run_foreground_inner_with_boot_db_impl(
         None,
         pid_receipt.clone(),
         daemon_lifetime,
-    );
+    )?;
     // The product daemon is a process owner: its lifetime witness is released
     // by kernel process teardown, including every early-return and panic path.
     // Injected in-process daemons keep RAII ownership so their test process can
@@ -3754,10 +3772,8 @@ mod tests {
         let state_home = dir.path().join("state");
         let runtime_a = dir.path().join("rt-a");
         let runtime_b = dir.path().join("rt-b");
-        std::fs::create_dir_all(runtime_a.join("cockpit")).expect("runtime a");
-
-        let socket_a = runtime_a.join("cockpit/cockpit.sock");
         let paths = canonical_in(&state_home, &runtime_a);
+        let socket_a = runtime_a.join("cockpit/cockpit.sock");
         assert_eq!(paths.socket, socket_a);
         let receipt = write_pid_file(
             &paths.pid_file,
@@ -3772,7 +3788,7 @@ mod tests {
         assert_ne!(canonical_b.socket, socket_a);
 
         let probe = discover_blocking_with_canonical(canonical_b);
-        assert_eq!(probe.status, DaemonStatus::Stale);
+        assert_eq!(probe.status, DaemonStatus::NotRunning);
         assert_eq!(probe.paths.socket, runtime_b.join("cockpit/cockpit.sock"));
     }
 
@@ -3817,6 +3833,47 @@ mod tests {
     }
 
     #[test]
+    fn live_rendezvous_protocol_skew_is_rejected_before_socket_connect() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = canonical_in(&dir.path().join("state"), &dir.path().join("runtime"));
+        let receipt = write_pid_file(
+            &paths.pid_file,
+            std::process::id(),
+            &std::env::current_exe().expect("test executable"),
+        )
+        .expect("pid receipt");
+        let mut record = test_endpoint_record(paths.socket.clone(), receipt, false);
+        record.protocol_version = proto::PROTOCOL_VERSION + 1;
+        record.daemon_version = "future-daemon".to_string();
+        rendezvous::write(
+            &endpoint_file_for_state(paths.pid_file.parent().unwrap()),
+            &record,
+        )
+        .expect("rendezvous");
+        assert!(!paths.socket.exists(), "test must not provide a socket");
+
+        let probe = discover_blocking_with_canonical(paths);
+
+        assert_eq!(probe.status, DaemonStatus::IncompatibleProtocol);
+        assert_eq!(
+            probe.hello,
+            Some(proto::DaemonHello {
+                daemon_version: "future-daemon".to_string(),
+                protocol_version: proto::PROTOCOL_VERSION + 1,
+            })
+        );
+        let message = proto::incompatible_daemon_protocol_message(proto::PROTOCOL_VERSION + 1);
+        assert!(
+            message.contains(&format!("v{}", proto::PROTOCOL_VERSION + 1)),
+            "skew error must name the daemon version: {message}"
+        );
+        assert!(
+            message.contains(&format!("v{}", proto::PROTOCOL_VERSION)),
+            "skew error must name the client version: {message}"
+        );
+    }
+
+    #[test]
     fn no_endpoint_record_uses_explicit_canonical_socket() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_home = dir.path().join("state");
@@ -3834,12 +3891,11 @@ mod tests {
         let runtime_dir = dir.path().join("runtime");
         let paths = canonical_in(&state_home, &runtime_dir);
         std::fs::write(&paths.pid_file, "999999999").expect("pid file");
-        let record = DaemonEndpointRecord {
-            version: 1,
-            socket: runtime_dir.join("other/cockpit.sock"),
-            receipt: test_pid_receipt(999999999),
-            kind: DaemonEndpointKind::Persistent,
-        };
+        let record = test_endpoint_record(
+            runtime_dir.join("other/cockpit.sock"),
+            test_pid_receipt(999999999),
+            false,
+        );
         let endpoint = endpoint_file_for_state(paths.pid_file.parent().unwrap());
         std::fs::write(&endpoint, serde_json::to_vec(&record).unwrap()).expect("write endpoint");
 
@@ -3864,15 +3920,14 @@ mod tests {
         )
         .expect("pid receipt");
         let endpoint = endpoint_file_for_state(paths.pid_file.parent().unwrap());
-        let record = DaemonEndpointRecord {
-            version: 1,
-            socket: paths.socket.clone(),
-            receipt: DaemonPidReceipt {
+        let record = test_endpoint_record(
+            paths.socket.clone(),
+            DaemonPidReceipt {
                 executable: paths.pid_file.clone(),
                 ..receipt
             },
-            kind: DaemonEndpointKind::Persistent,
-        };
+            false,
+        );
         std::fs::write(&endpoint, serde_json::to_vec(&record).unwrap()).expect("endpoint");
 
         assert!(read_bound_endpoint_record_from(&endpoint, &paths).is_none());
@@ -3965,9 +4020,8 @@ mod tests {
         let state_home = dir.path().join("state");
         let runtime_a = dir.path().join("rt-a");
         let runtime_b = dir.path().join("rt-b");
-        std::fs::create_dir_all(runtime_a.join("cockpit")).expect("runtime a");
-
         let socket_a = runtime_a.join("cockpit/cockpit.sock");
+        std::fs::create_dir_all(socket_a.parent().unwrap()).expect("runtime a");
         let listener = spawn_hello_socket(socket_a.clone());
         wait_for_socket(&socket_a);
 
@@ -3985,9 +4039,10 @@ mod tests {
         assert_ne!(paths_b.socket, socket_a);
         assert_eq!(probe_blocking(&paths_b), DaemonStatus::NotRunning);
 
-        let discovered = discover_blocking_with_canonical(paths_b);
-        assert_eq!(discovered.status, DaemonStatus::Running);
-        assert_eq!(discovered.paths.socket, socket_a);
+        let discovered = discover_blocking_with_canonical(paths_b.clone());
+        assert_eq!(discovered.status, DaemonStatus::NotRunning);
+        assert_eq!(discovered.paths.socket, paths_b.socket);
+        assert_eq!(probe_blocking(&paths_a), DaemonStatus::Running);
         listener.join().expect("listener thread");
     }
 
@@ -4573,6 +4628,22 @@ mod tests {
         }
     }
 
+    fn test_endpoint_record(
+        socket_path: PathBuf,
+        receipt: DaemonPidReceipt,
+        ephemeral: bool,
+    ) -> DaemonEndpointRecord {
+        DaemonEndpointRecord {
+            pid: receipt.pid,
+            start_time: receipt.process_start,
+            socket_path,
+            protocol_version: proto::PROTOCOL_VERSION,
+            daemon_version: proto::DAEMON_VERSION.to_string(),
+            receipt,
+            ephemeral,
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn foreground_publication_failure_retires_reserved_metadata_before_any_task_spawn() {
@@ -4744,78 +4815,69 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn long_socket_path_fails_before_opening_the_database() {
+    async fn two_hundred_character_xdg_runtime_uses_short_per_user_root() {
         use std::os::unix::ffi::OsStrExt as _;
 
         let home = tempfile::tempdir().unwrap();
         let env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(home.path()).await;
         crate::test_env::reset_direct_ledger_open_count();
-
-        let max = unix_socket_path_max();
-        let mut runtime = home.path().join("rt");
-        loop {
-            let reveal = runtime.join("cockpit").join("cockpit-leak-reveal.sock");
-            if reveal.as_os_str().as_bytes().len() >= max {
-                break;
-            }
-            runtime.push("x");
-        }
-        std::fs::create_dir_all(&runtime).unwrap();
+        let runtime = PathBuf::from("/").join("x".repeat(199));
+        assert_eq!(runtime.as_os_str().as_bytes().len(), 200);
         env.set_var("XDG_RUNTIME_DIR", &runtime);
 
         let paths = DaemonPaths::resolve_canonical().expect("resolve canonical paths");
         assert!(
-            !unix_socket_path_is_bindable(&paths.leak_reveal_socket()),
-            "repro path must exceed SUN_LEN"
+            unix_socket_path_is_bindable(&paths.leak_reveal_socket()),
+            "fallback must leave reserve for sibling sockets"
         );
-        let db_path = crate::db::Db::default_path().expect("db path");
         assert!(
-            !db_path.exists(),
-            "precondition: isolated home must not already contain cockpit.db"
+            !paths.socket.starts_with(&runtime),
+            "an oversized XDG runtime must select the short per-user root"
         );
+        assert_eq!(mode(paths.socket.parent().unwrap()), 0o700);
+        assert_eq!(crate::test_env::direct_ledger_open_count(), 0);
+    }
 
-        let started = std::time::Instant::now();
-        let error = tokio::time::timeout(
-            Duration::from_millis(100),
-            run_foreground_inner_with_boot_db(
-                paths.clone(),
-                Duration::from_millis(50),
-                false,
-                crate::daemon::terminal::test_host_factory(),
-                None,
-            ),
-        )
-        .await
-        .expect("path validation must finish within 100ms")
-        .expect_err("oversized socket path must fail closed");
-        assert!(
-            started.elapsed() < Duration::from_millis(100),
-            "validation must not wait on database boot"
-        );
-        let text = format!("{error:#}");
-        assert!(
-            text.contains("too long"),
-            "error must name the length failure: {text}"
-        );
-        assert!(
-            text.contains("COCKPIT_SOCKET_DIR"),
-            "error must suggest COCKPIT_SOCKET_DIR: {text}"
-        );
-        let reveal = paths.leak_reveal_socket();
-        assert!(
-            text.contains(&reveal.display().to_string())
-                || text.contains(&paths.socket.display().to_string()),
-            "error must name the offending path: {text}"
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn socket_directory_identity_tracks_the_database_path() {
+        let home = tempfile::tempdir().unwrap();
+        let env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(home.path()).await;
+        let runtime = home.path().join("r");
+        env.set_var("XDG_RUNTIME_DIR", &runtime);
+
+        let first_database = crate::db::Db::default_path().expect("first database path");
+        let first = DaemonPaths::resolve_canonical().expect("first daemon paths");
+        env.set_var("XDG_DATA_HOME", home.path().join("other-data"));
+        let second_database = crate::db::Db::default_path().expect("second database path");
+        let second = DaemonPaths::resolve_canonical().expect("second daemon paths");
+
+        assert_ne!(first_database, second_database);
+        assert_ne!(first.socket, second.socket);
+        let first_hash = rendezvous::identity_hash(&first_database);
+        let second_hash = rendezvous::identity_hash(&second_database);
+        assert_eq!(
+            first.socket.parent().unwrap().file_name().unwrap(),
+            std::ffi::OsStr::new(&first_hash)
         );
         assert_eq!(
-            crate::test_env::direct_ledger_open_count(),
-            0,
-            "oversized socket path must not open SQLite"
+            second.socket.parent().unwrap().file_name().unwrap(),
+            std::ffi::OsStr::new(&second_hash)
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonexistent_socket_dir_override_fails_and_names_variable() {
+        let home = tempfile::tempdir().unwrap();
+        let env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(home.path()).await;
+        let missing = home.path().join("missing");
+        env.set_var("COCKPIT_SOCKET_DIR", &missing);
+        let error = DaemonPaths::resolve_canonical().expect_err("missing override must fail");
+        let text = format!("{error:#}");
         assert!(
-            !db_path.exists(),
-            "oversized socket path must not create {}",
-            db_path.display()
+            text.contains("COCKPIT_SOCKET_DIR") && !text.contains('\n'),
+            "one-line error must name the override: {text}"
         );
     }
 

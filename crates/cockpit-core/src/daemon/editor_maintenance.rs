@@ -126,6 +126,23 @@ mod tests {
         run_editor_maintenance_loop(ctx, period).await;
     }
 
+    async fn join_within_wall_time<T>(
+        limit: Duration,
+        mut handle: tokio::task::JoinHandle<T>,
+    ) -> T {
+        let started = Instant::now();
+        loop {
+            if handle.is_finished() {
+                return handle.await.expect("join handle finished");
+            }
+            if started.elapsed() >= limit {
+                handle.abort();
+                panic!("task did not finish within {limit:?} (wall clock)");
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn accept_loop_does_not_await_editor_maintenance() {
@@ -229,10 +246,8 @@ mod tests {
             ctx.shutdown_signal().begin_drain(),
             "test owns the first drain"
         );
-        tokio::time::timeout(Duration::from_secs(5), accept)
+        join_within_wall_time(Duration::from_secs(5), accept)
             .await
-            .expect("accept loop must not await editor maintenance inline")
-            .expect("accept task")
             .expect("accept loop ok");
         assert!(
             started.elapsed() < Duration::from_secs(1),

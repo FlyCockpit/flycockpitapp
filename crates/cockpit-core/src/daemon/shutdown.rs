@@ -395,7 +395,9 @@ mod tests {
             .expect("running daemon admits one pass");
         let started = Instant::now();
         let drained = sig
-            .wait_for_admitted_maintenance_drain(tokio::time::Instant::now() + Duration::from_millis(50))
+            .wait_for_admitted_maintenance_drain(
+                tokio::time::Instant::now() + Duration::from_millis(50),
+            )
             .await;
         assert!(
             !drained,
@@ -403,8 +405,11 @@ mod tests {
         );
         assert!(started.elapsed() >= Duration::from_millis(50));
         drop(_pass);
-        assert!(sig
-            .wait_for_admitted_maintenance_drain(tokio::time::Instant::now() + Duration::from_millis(50))
-            .await);
+        assert!(
+            sig.wait_for_admitted_maintenance_drain(
+                tokio::time::Instant::now() + Duration::from_millis(50)
+            )
+            .await
+        );
     }
 }

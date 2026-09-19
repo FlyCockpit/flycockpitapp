@@ -847,8 +847,11 @@ impl Db {
         // connection. Reopening and reapplying pragmas in a newly scheduled
         // thread adds no readiness guarantee and can indefinitely delay boot
         // under CPU contention before the daemon publishes its endpoint.
-        let writer =
-            Writer::start_with_capacity_and_timeout(conn, writer_capacity, durable_enqueue_timeout)?;
+        let writer = Writer::start_with_capacity_and_timeout(
+            conn,
+            writer_capacity,
+            durable_enqueue_timeout,
+        )?;
         let db = Self {
             memory: None,
             writer: Some(writer),
@@ -888,12 +891,7 @@ impl Db {
         writer_capacity: usize,
         durable_enqueue_timeout: Duration,
     ) -> Result<Self> {
-        Self::open_impl_with_writer_capacity(
-            path,
-            false,
-            writer_capacity,
-            durable_enqueue_timeout,
-        )
+        Self::open_impl_with_writer_capacity(path, false, writer_capacity, durable_enqueue_timeout)
     }
 
     /// Park the writer thread until the returned guard is released. Subsequent
@@ -2986,7 +2984,11 @@ mod tests {
             .expect("file-backed writer")
             .submit(|_| Ok(()))
             .expect_err("queue must still be saturated while the durable write waits");
-        assert!(still_saturated.downcast_ref::<WriterQueueSaturated>().is_some());
+        assert!(
+            still_saturated
+                .downcast_ref::<WriterQueueSaturated>()
+                .is_some()
+        );
 
         drop(stall);
         let seq = tokio::time::timeout(Duration::from_secs(5), write)
@@ -3042,7 +3044,9 @@ mod tests {
             .await
             .expect_err("saturated queue must time out the durable enqueue");
         assert!(
-            error.to_string().contains("timed out waiting for db writer queue capacity"),
+            error
+                .to_string()
+                .contains("timed out waiting for db writer queue capacity"),
             "unexpected error: {error:#}"
         );
         assert!(started.elapsed() >= Duration::from_millis(50));

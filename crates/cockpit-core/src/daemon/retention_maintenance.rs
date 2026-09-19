@@ -123,6 +123,23 @@ mod tests {
         run_retention_maintenance_loop(ctx, period).await;
     }
 
+    async fn join_within_wall_time<T>(
+        limit: Duration,
+        mut handle: tokio::task::JoinHandle<T>,
+    ) -> T {
+        let started = Instant::now();
+        loop {
+            if handle.is_finished() {
+                return handle.await.expect("join handle finished");
+            }
+            if started.elapsed() >= limit {
+                handle.abort();
+                panic!("task did not finish within {limit:?} (wall clock)");
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn accept_loop_does_not_await_retention_maintenance() {
@@ -190,25 +207,20 @@ mod tests {
             listener,
         ));
         // Advance the paused clock just past the retention sweep interval (6h
-        // default; a restored inline arm would also grind a 60s editor tick
-        // per virtual hour, so keep the jump small) so a restored inline
-        // retention arm would have fired and parked on the stalled writer
-        // before drain begins. With the dedicated worker owning retention,
-        // the accept loop has no such arm and never touches the database.
-        for hour in 0..7 {
-            eprintln!("PROBE hour={hour} virtual={:?} wall={:?}", tokio::time::Instant::now(), std::time::Instant::now());
+        // default) so a restored inline retention arm would have fired and
+        // parked on the stalled writer before drain begins. With the
+        // dedicated worker owning retention, the accept loop has no such arm
+        // and never touches the database.
+        for _ in 0..7 {
             tokio::time::sleep(Duration::from_secs(60 * 60)).await;
         }
-        eprintln!("PROBE sleep-done virtual={:?}", tokio::time::Instant::now());
         let started = Instant::now();
         assert!(
             ctx.shutdown_signal().begin_drain(),
             "test owns the first drain"
         );
-        tokio::time::timeout(Duration::from_secs(5), accept)
+        join_within_wall_time(Duration::from_secs(5), accept)
             .await
-            .expect("accept loop must not await retention ticks inline")
-            .expect("accept task")
             .expect("accept loop ok");
         assert!(
             started.elapsed() < Duration::from_secs(1),

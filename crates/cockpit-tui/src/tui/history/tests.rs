@@ -741,6 +741,30 @@ fn expanded_short_reasoning_renders_without_window_ui() {
 }
 
 #[test]
+fn narrow_expanded_reasoning_stays_between_chip_and_answer() {
+    let rendered = render_agent(
+        "builder",
+        "final answer",
+        "first thought\nsecond thought",
+        fixed_ts(),
+        true,
+        0,
+        None,
+        20,
+        false,
+        None,
+        None,
+        false,
+    );
+    let rows = rendered.lines.iter().map(line_text).collect::<Vec<_>>();
+
+    assert_eq!(rows[1].trim(), "▾ Thought", "{rows:?}");
+    assert_eq!(rows[2].trim(), "first thought", "{rows:?}");
+    assert_eq!(rows[3].trim(), "second thought", "{rows:?}");
+    assert_eq!(rows[4].trim(), "final answer", "{rows:?}");
+}
+
+#[test]
 fn expanded_long_reasoning_windows_and_keeps_answer_after_it() {
     let reasoning = (0..25)
         .map(|idx| format!("r{idx}"))
@@ -1861,7 +1885,8 @@ fn pending_reasoning_streams_the_live_thinking_block() {
     let mut long = msg.clone();
     long.reasoning = "word ".repeat(12).trim_end().to_string();
     long.text = String::new();
-    let wrapped = render_pending(&long, 40);
+    let mut state = PendingRenderState::default();
+    let wrapped = render_pending_incremental(&long, 40, &mut state).into_lines();
     let reasoning_rows = wrapped
         .iter()
         .skip(2)
@@ -1873,9 +1898,75 @@ fn pending_reasoning_streams_the_live_thinking_block() {
         wrapped.iter().map(line_text).collect::<Vec<_>>()
     );
     assert!(
+        !wrapped.iter().any(|line| line_text(line).contains("· · ·")),
+        "think-only rendering must put the caret on the thought, not add a placeholder"
+    );
+    assert!(
+        line_text(wrapped.last().expect("think-only rows")).ends_with('▌'),
+        "the streaming caret follows the final thought row"
+    );
+    assert!(
         wrapped.iter().all(|line| line_width(line) <= 40),
         "no row exceeds the pane width"
     );
+}
+
+#[test]
+fn user_and_agent_prose_use_ink_at_all_response_widths() {
+    let effective_fg = |line: &Line<'_>, span: &Span<'_>| line.style.patch(span.style).fg;
+
+    for markdown in [false, true] {
+        let text = if markdown {
+            "**Body prose**"
+        } else {
+            "Body prose"
+        };
+        let (user, _, _, _) = render_user(text, fixed_ts(), 40, markdown, None, false, None);
+        let user_line = user
+            .iter()
+            .find(|line| line_text(line).contains("Body prose"))
+            .expect("user prose row");
+        let user_span = user_line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("Body prose"))
+            .expect("user prose span");
+        assert_eq!(effective_fg(user_line, user_span), Some(INK));
+
+        for (reasoning, expanded) in [("", false), ("thought", false), ("thought", true)] {
+            for width in [20, 40] {
+                let agent = render_agent(
+                    "builder",
+                    text,
+                    reasoning,
+                    fixed_ts(),
+                    expanded,
+                    0,
+                    None,
+                    width,
+                    markdown,
+                    None,
+                    None,
+                    false,
+                );
+                let agent_line = agent
+                    .lines
+                    .iter()
+                    .find(|line| line_text(line).contains("Body prose"))
+                    .expect("agent prose row");
+                let agent_span = agent_line
+                    .spans
+                    .iter()
+                    .find(|span| span.content.contains("Body prose"))
+                    .expect("agent prose span");
+                assert_eq!(
+                    effective_fg(agent_line, agent_span),
+                    Some(INK),
+                    "markdown={markdown}, reasoning={reasoning:?}, expanded={expanded}, width={width}"
+                );
+            }
+        }
+    }
 }
 
 /// `pinned-messages`: visibility is preserved — with the control hidden

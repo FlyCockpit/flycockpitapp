@@ -1,0 +1,40 @@
+ ‹ Back                                                                                                                 
+                 Model limits · step 5/8                                                                                
+                 Keep detected token limits or enter an override.                                                       
+                 ────────────────────────────                                                                           
+                 ●Welcome ●Name ●Secure store ●Provider ◐Model ○Agent ○Lifetime ○Ready                                  
+                 ╭ Limits ────────────────────────────────────────────────────────────────────────────╮                 
+                 │ ◉ Context window tokens  Auto                                                      │                 
+                 │ ○ Max output tokens      Auto                                                      │                 
+                 │                                                                                    │                 
+                 │ Blank keeps Auto; overrides must be positive numbers.                              │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 ╰────────────────────────────────────────────────────────────────────────────────────╯                 
+                 tab switch field   type value   enter continue   esc back                 [ Continue ]                 
+                                                                                                                        

@@ -596,8 +596,7 @@ fn advance_real_first_run_from_provider_search_to_agent(app: &mut App) {
         app,
         |app| {
             stage(app) == Some(OnboardingStage::Model)
-                && app.dialog.test_page_name()
-                    == Some(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID)
+                && shell_kind(app) == Some(crate::tui::onboarding::OnboardingScreenKind::Model)
         },
         "the settled Provider→Model advance",
     );
@@ -611,17 +610,19 @@ fn advance_real_first_run_from_provider_search_to_agent(app: &mut App) {
 
     seed_computer_use_catalog_capabilities();
 
-    assert_eq!(app.dialog.test_setup_step(), Some("provider"));
-    shell_key(app, KeyCode::Enter);
-    assert_eq!(app.dialog.test_setup_step(), Some("model"));
     for ch in "manual-model".chars() {
         shell_key(app, KeyCode::Char(ch));
     }
-    shell_key(app, KeyCode::Enter);
-    assert_eq!(app.dialog.test_setup_step(), Some("configuration"));
-    shell_key(app, KeyCode::Enter);
-    assert_eq!(app.dialog.test_setup_step(), Some("model-save"));
-    shell_key(app, KeyCode::Enter);
+    for expected in crate::tui::onboarding::ModelPhase::ALL {
+        assert_eq!(
+            app.onboarding_shell
+                .as_ref()
+                .and_then(|shell| shell.model_phase()),
+            Some(expected),
+            "real first run must visit every native Model sub-step"
+        );
+        shell_key(app, KeyCode::Enter);
+    }
     pump_onboarding(
         app,
         |app| {
@@ -631,6 +632,16 @@ fn advance_real_first_run_from_provider_search_to_agent(app: &mut App) {
         },
         "the settled Model→Agent advance through the real model wizard",
     );
+    let global = ConfigDoc::load(
+        &cockpit_config::dirs::global_config_file().expect("isolated global config path"),
+    )
+    .expect("native model settlement wrote global config")
+    .providers();
+    let active = global
+        .active_model
+        .expect("native model settlement selected a default model");
+    assert_eq!(active.provider, "localtest");
+    assert_eq!(active.model, "manual-model");
 
     settle_agent_via_real_daemon_rpc(app);
 }
@@ -708,11 +719,6 @@ fn first_run_settles_stages_against_the_real_daemon_offline() {
                 .unwrap();
 
             let mut app = real_first_run_app(tmp.path());
-            pump_onboarding(
-                &mut app,
-                |app| app.startup_background.workspace_ready,
-                "the locked daemon workspace-trust RPC",
-            );
             advance_real_first_run_to_provider(&mut app, tmp.path());
             advance_real_first_run_from_provider_search_to_agent(&mut app);
 

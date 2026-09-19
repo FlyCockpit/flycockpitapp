@@ -104,7 +104,6 @@ fn named_setup_wizard_rejects_stale_complete_stage_for_first_run_wizards() {
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     for wizard_id in [
         cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID,
-        cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID,
         cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
     ] {
         let mut app = App::new(Some(tmp.path()), false);

@@ -26,6 +26,7 @@
 pub(crate) mod agent;
 mod chrome;
 mod lifetime;
+mod model;
 mod profile;
 mod search;
 mod secure_store;
@@ -53,6 +54,9 @@ use cockpit_proto::{
     OnboardingStageSettlement, OnboardingTransitionKind,
 };
 use lifetime::LifetimeScreen;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use model::ModelPhase;
+use model::ModelScreen;
 use profile::ProfileScreen;
 use search::{ProviderSearchScreen, onboarding_catalog};
 use secure_store::SecureStoreScreen;
@@ -119,7 +123,6 @@ fn welcome_cloud_seed() -> u64 {
 pub(crate) enum EngineStage {
     Generic,
     Provider,
-    Model,
     Agent,
     Lifetime,
 }
@@ -128,12 +131,12 @@ impl EngineStage {
     fn for_stage(stage: OnboardingStage) -> Option<Self> {
         match stage {
             OnboardingStage::Provider => Some(Self::Provider),
-            OnboardingStage::Model => Some(Self::Model),
             OnboardingStage::Agent => Some(Self::Agent),
             OnboardingStage::Lifetime => Some(Self::Lifetime),
             OnboardingStage::Welcome
             | OnboardingStage::Profile
             | OnboardingStage::SecureStore
+            | OnboardingStage::Model
             | OnboardingStage::Complete => None,
         }
     }
@@ -148,6 +151,7 @@ pub(crate) enum OnboardingScreen {
     SecureStore(Box<SecureStoreScreen>),
     ProviderSearch(Box<ProviderSearchScreen>),
     AgentAuthoring(Box<agent::AgentAuthoringScreen>),
+    Model(Box<ModelScreen>),
     Lifetime(LifetimeScreen),
     Engine(EngineStage),
     Complete { summary: String, cursor: usize },
@@ -162,6 +166,7 @@ pub(crate) enum OnboardingScreenKind {
     SecureStore,
     ProviderSearch,
     AgentAuthoring,
+    Model,
     Lifetime,
     Engine,
     Complete,
@@ -177,6 +182,7 @@ impl std::fmt::Debug for OnboardingScreen {
             Self::SecureStore(_) => formatter.write_str("SecureStore([REDACTED])"),
             Self::ProviderSearch(_) => formatter.write_str("ProviderSearch"),
             Self::AgentAuthoring(_) => formatter.write_str("AgentAuthoring"),
+            Self::Model(_) => formatter.write_str("Model"),
             Self::Lifetime(_) => formatter.write_str("Lifetime"),
             Self::Engine(stage) => formatter.debug_tuple("Engine").field(stage).finish(),
             Self::Complete { .. } => formatter.write_str("Complete"),
@@ -197,6 +203,8 @@ pub(crate) enum OnboardingShellAction {
     ApplyProfile(String),
     /// Apply the native lifetime choice through the existing setup-wizard authority.
     ApplyLifetime(bool),
+    /// Apply all six native model choices through the setup-wizard authority.
+    ApplyModel(cockpit_core::wizard::OnboardingModelSubmission),
     /// Seed the provider engine with the selected canonical template.
     SelectTemplate(&'static ProviderTemplate),
     /// Leave the "add another provider" detour and present the stored
@@ -226,6 +234,7 @@ impl std::fmt::Debug for OnboardingShellAction {
             Self::ApplyLifetime(value) => {
                 formatter.debug_tuple("ApplyLifetime").field(value).finish()
             }
+            Self::ApplyModel(_) => formatter.write_str("ApplyModel"),
             Self::SelectTemplate(template) => formatter
                 .debug_tuple("SelectTemplate")
                 .field(&template.id)
@@ -489,6 +498,10 @@ impl OnboardingShell {
                 OnboardingScreen::ProviderSearch(Box::new(ProviderSearchScreen::new()))
             }
             OnboardingStage::Lifetime => OnboardingScreen::Lifetime(LifetimeScreen::new()),
+            OnboardingStage::Model => OnboardingScreen::Model(Box::new(ModelScreen::new(
+                &cockpit_config::config::providers::ProvidersConfig::default(),
+                None,
+            ))),
             OnboardingStage::Complete => {
                 // A fresh construction at `Complete` only happens when a
                 // caller bypassed the occupancy fence; present the
@@ -523,6 +536,14 @@ impl OnboardingShell {
 
     pub(crate) fn screen_is_agent_authoring(&self) -> bool {
         matches!(self.screen, OnboardingScreen::AgentAuthoring(_))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_phase(&self) -> Option<ModelPhase> {
+        match &self.screen {
+            OnboardingScreen::Model(screen) => Some(screen.phase()),
+            _ => None,
+        }
     }
 
     #[cfg(test)]
@@ -573,6 +594,7 @@ impl OnboardingShell {
             OnboardingScreen::SecureStore(_) => OnboardingScreenKind::SecureStore,
             OnboardingScreen::ProviderSearch(_) => OnboardingScreenKind::ProviderSearch,
             OnboardingScreen::AgentAuthoring(_) => OnboardingScreenKind::AgentAuthoring,
+            OnboardingScreen::Model(_) => OnboardingScreenKind::Model,
             OnboardingScreen::Lifetime(_) => OnboardingScreenKind::Lifetime,
             OnboardingScreen::Engine(_) => OnboardingScreenKind::Engine,
             OnboardingScreen::Complete { .. } => OnboardingScreenKind::Complete,
@@ -628,6 +650,22 @@ impl OnboardingShell {
             client_operation_id,
         )));
         self.escape = None;
+    }
+
+    pub(crate) fn present_model(
+        &mut self,
+        config: &cockpit_config::config::providers::ProvidersConfig,
+        preselect: Option<(&str, &str)>,
+    ) {
+        self.screen = OnboardingScreen::Model(Box::new(ModelScreen::new(config, preselect)));
+        self.escape = None;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_model_phase_for_golden(&mut self, phase: ModelPhase) {
+        if let OnboardingScreen::Model(screen) = &mut self.screen {
+            screen.set_phase_for_golden(phase);
+        }
     }
 
     /// Adopt an authoritative `Complete` revision without rebuilding the
@@ -884,6 +922,9 @@ impl OnboardingShell {
             OnboardingScreen::Lifetime(screen) => {
                 Some(OnboardingShellAction::ApplyLifetime(screen.submit()))
             }
+            OnboardingScreen::Model(screen) => {
+                screen.advance().map(OnboardingShellAction::ApplyModel)
+            }
             OnboardingScreen::Complete { cursor, .. } => {
                 if *cursor == 0 {
                     self.begin_completion_provider_detour(Some(
@@ -918,6 +959,11 @@ impl OnboardingShell {
         }
         if let OnboardingScreen::SecureStore(screen) = &mut self.screen {
             screen.return_to_choice();
+            return None;
+        }
+        if let OnboardingScreen::Model(screen) = &mut self.screen
+            && screen.back()
+        {
             return None;
         }
         Some(OnboardingShellAction::Transition(
@@ -1017,6 +1063,19 @@ impl OnboardingShell {
                 }
                 if matches!(key.code, KeyCode::Enter) {
                     return Some(OnboardingShellAction::ApplyLifetime(screen.submit()));
+                }
+                screen.handle_key(key);
+                None
+            }
+            OnboardingScreen::Model(screen) => {
+                if matches!(key.code, KeyCode::Esc) {
+                    if !screen.back() {
+                        self.open_escape_menu(engine);
+                    }
+                    return None;
+                }
+                if matches!(key.code, KeyCode::Enter) {
+                    return screen.advance().map(OnboardingShellAction::ApplyModel);
                 }
                 screen.handle_key(key);
                 None
@@ -1265,6 +1324,10 @@ impl OnboardingShell {
                     _ => PointerOutcome::ignored(),
                 }
             }
+            OnboardingScreen::Model(screen) => {
+                screen.handle_mouse(mouse);
+                PointerOutcome::consumed()
+            }
             OnboardingScreen::ProviderSearch(screen) => {
                 let over_list = chrome::hit(self.list_area, pos);
                 if matches!(
@@ -1357,6 +1420,7 @@ impl OnboardingShell {
             OnboardingScreen::ProviderSearch(screen) => screen.paste_query(text),
             OnboardingScreen::SecureStore(screen) => screen.paste(text),
             OnboardingScreen::AgentAuthoring(screen) => screen.paste(text),
+            OnboardingScreen::Model(screen) => screen.paste(text),
             _ => {}
         }
     }
@@ -1443,6 +1507,7 @@ impl OnboardingShell {
             OnboardingScreen::Lifetime(screen) => {
                 Self::render_lifetime(frame, rows[2], screen, &mut self.list_row_rects);
             }
+            OnboardingScreen::Model(screen) => screen.render(frame, rows[2]),
             OnboardingScreen::Complete { summary, .. } => {
                 Self::render_complete(frame, rows[2], summary, &mut self.list_row_rects);
             }
@@ -1470,7 +1535,7 @@ impl OnboardingShell {
     }
 
     fn screen_title(&self) -> &'static str {
-        match self.screen {
+        match &self.screen {
             OnboardingScreen::Welcome => "Welcome",
             OnboardingScreen::Profile(_) => "What should Cockpit call you?",
             OnboardingScreen::SecureStore(_) => "Secure your secrets",
@@ -1478,13 +1543,14 @@ impl OnboardingShell {
             OnboardingScreen::Complete { .. } => "You're ready to fly",
             OnboardingScreen::AgentAuthoring(_) => "Create your agent",
             OnboardingScreen::Lifetime(_) => "Background agents",
+            OnboardingScreen::Model(screen) => screen.title(),
             OnboardingScreen::Engine(_) => "Cockpit setup",
         }
     }
 
     fn screen_subtitle(&self) -> String {
         let mut parts = Vec::new();
-        let base = match self.screen {
+        let base = match &self.screen {
             OnboardingScreen::Profile(_) => "Set an optional display name.".to_string(),
             OnboardingScreen::SecureStore(_) => {
                 "Choose how Cockpit protects your API keys and sealed values.".to_string()
@@ -1493,6 +1559,7 @@ impl OnboardingShell {
             OnboardingScreen::Lifetime(_) => {
                 "Choose what happens after the last Cockpit window closes.".to_string()
             }
+            OnboardingScreen::Model(screen) => screen.subtitle().to_string(),
             OnboardingScreen::Complete { .. } => "Your setup is complete.".to_string(),
             _ => String::new(),
         };
@@ -1526,6 +1593,7 @@ impl OnboardingShell {
             OnboardingScreen::Lifetime(_) => {
                 "↑↓ move   click choose   enter continue   esc options"
             }
+            OnboardingScreen::Model(screen) => screen.help_text(),
             OnboardingScreen::Engine(EngineStage::Provider) => "wizard  esc: options",
             OnboardingScreen::Engine(_) => "wizard  esc: options",
             OnboardingScreen::Complete { .. } => "↑/↓  enter: choose",
@@ -1552,6 +1620,7 @@ impl OnboardingShell {
             }
             OnboardingScreen::AgentAuthoring(_) => vec![chrome::Button::primary("Continue")],
             OnboardingScreen::Lifetime(_) => vec![chrome::Button::primary("Continue")],
+            OnboardingScreen::Model(_) => vec![chrome::Button::primary("Continue")],
             OnboardingScreen::Engine(_) => vec![chrome::Button::primary("Continue")],
             OnboardingScreen::Complete { cursor, .. } if *cursor == 0 => vec![
                 chrome::Button::primary("Add another provider"),

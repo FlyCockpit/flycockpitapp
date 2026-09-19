@@ -1,0 +1,24 @@
+ ‹ Back                                                                         
+  Provider trust · step 5/8                                                     
+  Choose the model's data-custody policy.                                       
+  ────────────────────────────                                                  
+  ●Welcome ●Name ●Secure store ●Provider ◐Model ○Agent ○Lifetime ○Ready         
+  ╭ Trust ───────────────────────────────────────────────────────────────────╮  
+  │ ◉ untrusted                                                              │  
+  │ ○ trusted                                                                │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  ╰──────────────────────────────────────────────────────────────────────────╯  
+  Redact secrets and sealed values from inference requests.                     
+                                                                                
+                                                                                
+  ↑↓ move   space choose   enter continue   esc back              [ Continue ]  
+                                                                                

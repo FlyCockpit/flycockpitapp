@@ -1319,6 +1319,7 @@ impl App {
             },
             AsyncActionKind::DaemonRpc(
                 label @ ("onboarding.transition"
+                | "onboarding.model"
                 | "onboarding.profile"
                 | "onboarding.lifetime"
                 | "onboarding.secure_intent"
@@ -1339,6 +1340,9 @@ impl App {
                         );
                         match verdict {
                             OnboardingTransitionCorrelation::Apply => {
+                                if label == "onboarding.model" {
+                                    self.refresh_bootstrap_config_snapshot();
+                                }
                                 // The lifetime settlement is the one
                                 // transition whose wizard apply rewrote the
                                 // global config this detached client runs
@@ -4188,6 +4192,7 @@ fn stale_completion_requires_reducer(kind: &AsyncActionKind) -> bool {
                 | "mcp.local"
                 | "onboarding.bootstrap"
                 | "onboarding.profile"
+                | "onboarding.model"
                 | "onboarding.ready_retry"
                 | "onboarding.secure_intent"
                 | "onboarding.transition"

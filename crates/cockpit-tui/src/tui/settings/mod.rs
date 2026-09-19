@@ -6242,12 +6242,10 @@ impl Dialog {
         }
     }
 
-    /// Wizard engine for the onboarding shell's profile/model stages. The
+    /// Wizard engine for the onboarding shell's remaining descriptor stages. The
     /// same wizard machinery (and daemon-effect settlement) as
     /// the non-onboarding setup wizards, presented inside the full-screen
-    /// shell instead of the settings modal. `preselected_model` seeds the
-    /// model wizard's provider/model pair when the committed provider
-    /// catalog already offers one.
+    /// shell instead of the settings modal.
     pub fn onboarding_wizard_engine(
         wizard_id: &str,
         preselected_model: Option<(&str, &str)>,
@@ -6257,12 +6255,6 @@ impl Dialog {
         let descriptor = match wizard_id {
             cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID => {
                 cockpit_core::wizard::descriptor_for_cwd(wizard_id, &global_root)
-            }
-            cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID => {
-                Some(cockpit_core::wizard::onboarding_model_descriptor_for_cwd(
-                    &global_root,
-                    preselected_model,
-                ))
             }
             cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID => {
                 return Err(
@@ -10116,11 +10108,7 @@ fn apply_setup_wizard_daemon_completion(
             }
             if !changed {
                 "Global setup is already up to date.".to_string()
-            } else if matches!(
-                wizard.run.descriptor().id,
-                cockpit_core::wizard::MODEL_WIZARD_ID
-                    | cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID
-            ) {
+            } else if wizard.run.descriptor().id == cockpit_core::wizard::MODEL_WIZARD_ID {
                 let mut parts = Vec::new();
                 if model_file_written {
                     parts.push("Saved global model settings.".to_string());

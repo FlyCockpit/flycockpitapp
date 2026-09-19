@@ -16,7 +16,11 @@ workspace = true
 default = []
 extended = ["cockpit-client/extended", "cockpit-config/extended", "cockpit-core/extended", "cockpit-proto/extended"]
 remote = ["cockpit-client/remote", "cockpit-core/remote", "cockpit-proto/remote"]
-test-support = ["cockpit-core/test-support"]
+# Compiles the golden and response-performance harnesses into the lib for
+# integration tests; dev-dependencies are invisible to a lib build, so the
+# optional dependency must ride the feature. Dev-only: a normal build never
+# enables it.
+test-support = ["cockpit-core/test-support", "dep:cockpit-test-support"]
 grok-subscription = ["cockpit-core/grok-subscription"]
 
 [[test]]
@@ -29,6 +33,7 @@ cockpit-config = { path = "../cockpit-config" }
 cockpit-core = { path = "../cockpit-core" }
 cockpit-host = { path = "../cockpit-host" }
 cockpit-proto = { path = "../cockpit-proto" }
+cockpit-test-support = { path = "../cockpit-test-support", optional = true }
 cockpit-tokenizer = { path = "../cockpit-tokenizer" }
 
 anyhow = { workspace = true }

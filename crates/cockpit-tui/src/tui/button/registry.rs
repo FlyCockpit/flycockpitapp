@@ -117,6 +117,20 @@ impl ButtonRegistry {
         Some(rect)
     }
 
+    /// Register a pointer target whose pixels were painted by a richer row
+    /// renderer rather than the bracketed button primitive.
+    pub fn register(&mut self, rect: Rect, spec: ButtonSpec) {
+        if self.capture && rect.width > 0 && rect.height > 0 {
+            self.targets.push(RegisteredButton {
+                id: spec.id,
+                rect,
+                enabled: spec.enabled,
+                dispatch: spec.dispatch,
+                generation: self.generation,
+            });
+        }
+    }
+
     pub fn hit(&self, column: u16, row: u16) -> Option<&RegisteredButton> {
         if !self.capture {
             return None;

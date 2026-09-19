@@ -200,6 +200,51 @@ const COMPOSER: KeyGroup = KeyGroup {
             desc: "insert a newline (Alt+Enter also)",
         },
         KeyBinding {
+            key: "Ctrl+P",
+            action: "model",
+            desc: "open the composer model picker",
+        },
+        KeyBinding {
+            key: "Ctrl+E",
+            action: "effort",
+            desc: "open the composer effort picker",
+        },
+        KeyBinding {
+            key: "Ctrl+B",
+            action: "sessions",
+            desc: "toggle the session sidebar",
+        },
+        KeyBinding {
+            key: "Ctrl+N",
+            action: "new session",
+            desc: "start a fresh session",
+        },
+        KeyBinding {
+            key: "Alt+↑/↓",
+            action: "switch session",
+            desc: "resume the previous or next session",
+        },
+        KeyBinding {
+            key: "Ctrl+↑",
+            action: "enter queue",
+            desc: "focus queued messages from an empty composer",
+        },
+        KeyBinding {
+            key: "Ctrl+K b",
+            action: "btw focus",
+            desc: "toggle focus for an open /btw pane",
+        },
+        KeyBinding {
+            key: "Ctrl+K n",
+            action: "scratchpad",
+            desc: "open the project scratchpad",
+        },
+        KeyBinding {
+            key: "Ctrl+K r",
+            action: "reveal",
+            desc: "toggle original inputs and compact briefs",
+        },
+        KeyBinding {
             key: "Ctrl+T",
             action: "thinking",
             desc: "toggle reasoning blocks",
@@ -238,11 +283,6 @@ const COMPOSER: KeyGroup = KeyGroup {
             key: "Home",
             action: "sticky header",
             desc: "jump to the pinned previous user message (empty composer)",
-        },
-        KeyBinding {
-            key: "Ctrl+N",
-            action: "scratchpad",
-            desc: "open the project scratchpad",
         },
         KeyBinding {
             key: "Ctrl+G",
@@ -306,7 +346,7 @@ const BTW_PANE: KeyGroup = KeyGroup {
     title: "BTW pane",
     bindings: &[
         KeyBinding {
-            key: "Ctrl+B",
+            key: "Ctrl+K b",
             action: "focus",
             desc: "toggle focus between the btw pane and main composer",
         },
@@ -441,21 +481,21 @@ pub const DIALOG_BINDINGS: &[DialogBinding] = &[
     },
     DialogBinding {
         id: DialogBindingId::Expand,
-        key: "Ctrl+E",
+        key: "Tab",
         action: "expand",
         desc: "expand or collapse the dialog",
-        footer: "ctrl+e: expand",
-        priority: 90,
+        footer: "tab: [More]",
+        priority: 4,
         requires_keyboard_enhancement: false,
         which_key: true,
     },
     DialogBinding {
         id: DialogBindingId::Collapse,
-        key: "Ctrl+E",
+        key: "Tab",
         action: "collapse",
         desc: "collapse the dialog",
-        footer: "ctrl+e: collapse",
-        priority: 90,
+        footer: "tab: [Less]",
+        priority: 4,
         requires_keyboard_enhancement: false,
         which_key: false,
     },
@@ -965,6 +1005,19 @@ mod tests {
         assert!(text.contains("live tail"));
         assert!(text.contains("Home"));
         assert!(text.contains("sticky header"));
+        for chord in [
+            "Ctrl+P",
+            "Ctrl+E",
+            "Ctrl+B",
+            "Ctrl+N",
+            "Alt+↑/↓",
+            "Ctrl+↑",
+            "Ctrl+K b",
+            "Ctrl+K n",
+            "Ctrl+K r",
+        ] {
+            assert!(text.contains(chord), "missing re-homed chord {chord}");
+        }
     }
 
     #[test]

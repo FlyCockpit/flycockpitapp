@@ -19,6 +19,6 @@
 │browse only — no daemon   │                                                    
 ╰──────────────────────────╯                                                    
 ╭──────────────────────────────────────────────────────────────────────────────╮
-│❯ Message FlyCockpit — / commands · Ctrl+K keys · /setup              0 tokens│
+│❯ Message FlyCockpit — Ctrl+P model · Ctrl+E effort · Ctrl+K keys     0 tokens│
 ╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────[Send]╯
 Setup: Code                                                                     

@@ -21,12 +21,21 @@ Conversation rules are lineage-scoped advisory directives. `/rules` opens the pa
 | --- | --- | --- |
 | `Enter` | send | submit the message |
 | `Shift+Enter` / `Alt+Enter` | newline | insert a newline |
+| `Ctrl+P` | model | open the composer model picker |
+| `Ctrl+E` | effort | open the composer effort picker |
+| `Ctrl+B` | sessions | toggle the session sidebar |
+| `Ctrl+N` | new session | start a fresh session |
+| `Alt+↑/↓` | switch session | resume the previous or next session |
+| `Ctrl+↑` | enter queue | focus queued messages from an empty composer |
+| `Ctrl+K b` | btw focus | toggle focus for an open `/btw` pane |
+| `Ctrl+K n` | scratchpad | open the project scratchpad |
+| `Ctrl+K r` | reveal | toggle original inputs and compact briefs |
 | `Ctrl+T` | thinking | toggle reasoning blocks |
 | `Ctrl+Y` | copy pick | pick a message or code block to copy |
 | `Shift+Tab` | cycle agent | switch the primary agent |
 | `@` | file tag | tag a file into the message |
 | `↑/↓` | history | recall previously sent messages |
-| `Alt+↑` | enter queue | on an empty composer, focus the queue box |
+| `Ctrl+↑` | enter queue | on an empty composer, focus the queue box |
 | `Esc` / `↓` | queue blur | return from a focused queued message to the composer |
 
 ## Queued messages
@@ -43,14 +52,14 @@ Messages submitted while a run is in flight sit in the queue box above the compo
 | `↑` (above first row) | edit all | merge every queued message into the composer |
 | `x` / `Delete` | cancel | drop this message; others stay queued |
 | `Shift+x` / `Shift+Delete` | cancel all | drop every editable queued message |
-| `Alt+↑` | enter queue | move focus from an empty composer into the queue |
+| `Ctrl+↑` | enter queue | move focus from an empty composer into the queue |
 | `↑/↓` | move | move among queued messages (next-turn group, then held) |
 
 Box-level `[Send now] [Steer] [Held] [edit] [cancel]` also sit on the top border (mouse). Per-message buttons appear on hover or when that row is focused. Action keys never fire while the composer has focus.
 | `PgUp/PgDn` | scroll | scroll the chat transcript; Shift+↑/↓ scrolls by line |
 | `End` | live tail | jump to the newest messages |
 | `Home` | sticky header | jump to the pinned previous user message when the composer is empty |
-| `Ctrl+N` | scratchpad | open the project scratchpad |
+| `Ctrl+K n` | scratchpad | open the project scratchpad |
 | `Ctrl+G` | $EDITOR | edit the composer text in $EDITOR |
 | `Esc` | normal/cancel | vim Normal mode, or cancel a slash query |
 
@@ -74,7 +83,7 @@ Box-level `[Send now] [Steer] [Held] [edit] [cancel]` also sit on the top border
 
 | Key | Action | Description |
 | --- | --- | --- |
-| `Ctrl+B` | focus | toggle focus between the btw pane and main composer |
+| `Ctrl+K b` | focus | toggle focus between the btw pane and main composer |
 | `F11` | zoom | toggle the btw pane full-screen |
 | `Esc` | main focus | return to main composer when the side composer is idle |
 | `Enter` | send | submit the side-pane message |
@@ -94,8 +103,8 @@ Box-level `[Send now] [Steer] [Held] [edit] [cancel]` also sit on the top border
 | `Enter` | select/confirm | select, then confirm permission choices |
 | `PgUp/PgDn` | prompt scroll | scroll dialog prompt content |
 | `Shift+PgUp/PgDn` | chat scroll | scroll the transcript behind the dialog |
-| `Ctrl+E` | expand | expand or collapse the dialog |
-| `Ctrl+E` | collapse | collapse the dialog |
+| `Tab` | expand | expand or collapse the dialog |
+| `Tab` | collapse | collapse the dialog |
 | `Esc` | cancel | cancel the dialog |
 | `type` | answer | type a free-text answer |
 | `Enter` | done | finish editing |
@@ -117,8 +126,8 @@ Box-level `[Send now] [Steer] [Held] [edit] [cancel]` also sit on the top border
 | `Enter` | select/confirm | select, then confirm permission choices |
 | `PgUp/PgDn` | prompt scroll | scroll dialog prompt content |
 | `Shift+PgUp/PgDn` | chat scroll | scroll the transcript behind the dialog |
-| `Ctrl+E` | expand | expand or collapse the dialog |
-| `Ctrl+E` | collapse | collapse the dialog |
+| `Tab` | expand | expand or collapse the dialog |
+| `Tab` | collapse | collapse the dialog |
 | `Esc` | cancel | cancel the dialog |
 | `type` | answer | type a free-text answer |
 | `Enter` | done | finish editing |

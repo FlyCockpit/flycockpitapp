@@ -50,7 +50,8 @@ const STATUS_GRACE: Duration = Duration::from_secs(2);
 /// A reasoning block must last at least this long before the indicator
 /// flips from the working line to the yellow `Thinking` override.
 const THINKING_FLIP_AFTER: Duration = Duration::from_secs(2);
-const COMPOSER_PLACEHOLDER: &str = "Message FlyCockpit — / commands · Ctrl+K keys · /setup";
+const COMPOSER_PLACEHOLDER: &str =
+    "Message FlyCockpit — Ctrl+P model · Ctrl+E effort · Ctrl+K keys";
 /// Maximum total wrapped visual rows retained across all cached history
 /// entries. Sized above normal viewports while bounding worst-case sessions.
 pub(super) const HISTORY_RENDER_CACHE_MAX_ROWS: usize = 20_000;
@@ -1453,7 +1454,7 @@ impl App {
                 // Sync both body regions' scroll viewports to the real
                 // overlay geometry so a long prompt and a long option list
                 // each stay in view (region split, GOALS §3b). The terminal
-                // height drives the Ctrl+E expanded cap.
+                // height drives the Tab-expanded cap.
                 dialog.sync_viewport(rects.compact, frame.area().height);
                 dialog.render(frame, rects.compact);
             }
@@ -1575,7 +1576,6 @@ impl App {
                         self.render_status_indicator(frame, rects.indicator);
                     }
                     let cursor_pos = self.render_input(frame, rects.input);
-                    self.paint_composer_picker(frame);
                     if geom.queue > 0 {
                         self.render_queue(frame, rects.queue);
                     } else {
@@ -1607,6 +1607,7 @@ impl App {
                     if geom.sandbox_notice > 0 {
                         self.render_sandbox_notice(frame, rects.sandbox_notice);
                     }
+                    self.paint_composer_picker(frame);
                     // Park the real cursor: in the focused pane (when the child
                     // shows one), otherwise in the composer.
                     if self.pane.is_some() && self.pane_focused {
@@ -4603,13 +4604,6 @@ impl App {
             left.push(Span::styled(" · ", Style::default().fg(DIVIDER_DIM)));
             left.push(Span::styled(
                 hint,
-                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
-            ));
-        }
-        if self.composer_controls.selection.is_some() {
-            left.push(Span::styled(" · ", Style::default().fg(DIVIDER_DIM)));
-            left.push(Span::styled(
-                "←/→ cycle · enter choose · esc clear".to_string(),
                 Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
             ));
         }

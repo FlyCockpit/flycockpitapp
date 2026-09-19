@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use super::osc52_observer::Osc52Observer;
 
 /// Ready-composer marker rendered by the production TUI.
-pub const COMPOSER_PLACEHOLDER: &str = "Message FlyCockpit — / commands · Ctrl+K keys · /setup";
+pub const COMPOSER_PLACEHOLDER: &str =
+    "Message FlyCockpit — Ctrl+P model · Ctrl+E effort · Ctrl+K keys";
 
 /// Startup surfaces that must not appear once the hermetic recipe has run.
 pub const UNWANTED_STARTUP_MARKERS: &[&str] = &[

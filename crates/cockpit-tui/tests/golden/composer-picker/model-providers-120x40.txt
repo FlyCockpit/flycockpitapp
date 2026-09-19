@@ -13,15 +13,6 @@
 │                            │                                                                                          
 │                            │                                                                                          
 │                            │                                                                                          
-│                            │                     ╭─────────────────────────────────────────────╮                      
-│                            │                     │ ▗▖          ▄█▛                             │                      
-│                            │                     │ ▐█▖▄     ▗▄▀▝▀   ▘   FlyCockpit v0.1.0      │                      
-│                            │                     │ ▀▀▀██▛▀▜█▀▀▀▟▛▀▀▘▘   Loading session setup… │                      
-│                            │                     │      ▀▀▀████▀▝▀▀▘▘   ~/project              │                      
-│                            │                     │      ▄▜█▀▘       ▘                          │                      
-│                            │                     │     ▝▀▀                                     │                      
-│                            │                     │ Tip: /help gets you oriented                │                      
-│                            │                     ╰─────────────────────────────────────────────╯                      
 │                            │                                                                                          
 │                            │                                                                                          
 │                            │                                                                                          
@@ -32,9 +23,18 @@
 │                            │                                                                                          
 │                            │                                                                                          
 │                            │                                                                                          
-│browse only — no daemon     │                                                                                          
-╰────────────────────────────╯                                                                                          
-╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│❯ Message FlyCockpit — Ctrl+P model · Ctrl+E effort · Ctrl+K keys                                             0 tokens│
-╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────────────────────────────────────────────[Send]╯
+│                            │                                                                                          
+│                            │                                                                                          
+│                            │                                                                                          
+│                            │                                                                                          
+│                            │                                                                                          
+│                            │                                                                                          
+│                            │                                                                                          
+│                            │                                                                                          
+│          ╭ model ──────────────────────────────────────╮                                                              
+│browse onl│› openai  2 models · 1 favorite  ›           │                                                              
+╰──────────│  anthropic  2 models · 1 favorite  ›        │                                                              
+╭──────────│↑/↓ move · enter choose · ctrl+enter default │─────────────────────────────────────────────────────────────╮
+│❯ Message ╰─────────────────────────────────────────────╯l+K keys                                             0 tokens│
+╰[Cockpit]─[openai/gpt-5]─[medium]─[permissions: manual]─[sandbox: on]───────────────────────────────────────────[Send]╯
 Setup: Code                                                                                                             

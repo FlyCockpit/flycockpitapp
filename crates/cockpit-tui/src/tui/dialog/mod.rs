@@ -296,7 +296,7 @@ pub struct DialogState {
     /// renderer reports it; the prompt region never scrolls while unbounded.
     prompt_viewport: usize,
     /// Whether the whole dialog is expanded (grown taller in place). Set by
-    /// the host's Ctrl+E binding; the renderer reads it to allocate more
+    /// the host's Tab binding; the renderer reads it to allocate more
     /// height to both regions. Shared here so every DialogState renderer
     /// (question + approval) gets the same toggle.
     expanded: bool,
@@ -517,7 +517,7 @@ impl DialogState {
         self.expanded
     }
 
-    /// Toggle the whole-dialog expand state (the host's `Ctrl+E`). On
+    /// Toggle the whole-dialog expand state (the host's `Tab`). On
     /// collapse the prompt-region scroll resets so the prompt re-anchors at
     /// the top.
     pub fn toggle_expanded(&mut self) {

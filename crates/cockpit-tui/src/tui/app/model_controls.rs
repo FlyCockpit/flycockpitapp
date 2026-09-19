@@ -273,6 +273,7 @@ impl App {
         if let Overlay::ModelPicker(picker) = &mut self.overlay {
             picker.set_config_drift(drift);
         }
+        self.refresh_open_composer_model_picker();
     }
 
     pub(super) fn model_picker_drift(&self) -> Option<crate::tui::model_picker::ModelPickerDrift> {

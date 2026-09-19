@@ -15,13 +15,30 @@ use cockpit_proto::SandboxMode;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
-use ratatui::text::Span;
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Clear, Paragraph};
 use uuid::Uuid;
+
+const ADD_MODEL_ITEM_ID: &str = "\u{0}add-model";
 
 fn point_in(rect: Rect, col: u16, row: u16) -> bool {
     col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+}
+
+fn is_picker_enter(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Enter
+        || (matches!(key.code, KeyCode::Char('j') | KeyCode::Char('m'))
+            && key.modifiers == KeyModifiers::CONTROL)
+}
+
+fn scroll_from_track(track: Rect, row: u16, max: usize) -> usize {
+    if track.height <= 1 || max == 0 {
+        return 0;
+    }
+    let relative = row.saturating_sub(track.y).min(track.height - 1) as usize;
+    let span = usize::from(track.height - 1);
+    (relative * max + span / 2) / span
 }
 
 #[derive(Debug, Clone, Default)]
@@ -31,6 +48,10 @@ pub(super) struct ComposerControlUi {
     pub picker: Option<ComposerPicker>,
     pub layout: Option<ComposerControlLayout>,
     pub picker_rect: Option<Rect>,
+    pub picker_scrollbar_rect: Option<Rect>,
+    pub picker_scroll: usize,
+    pub picker_view: usize,
+    pub picker_scroll_drag: bool,
     pub pending: Option<PendingComposerMutation>,
     /// Set while a composer commit is dispatching so `send_daemon_request`
     /// binds the originating `ControlRequestId` and failure paths refuse
@@ -56,12 +77,20 @@ pub(super) enum ComposerPickerStatus {
     Confirmed,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct ComposerPickerItem {
     pub id: String,
     pub label: String,
     pub hint: String,
     pub selectable: bool,
+    pub favorite: bool,
+    pub usage_count: u64,
+    pub reasoning_effort: Option<cockpit_config::providers::ReasoningEffortCapability>,
+    pub thinking_modes: Vec<ThinkingMode>,
+    pub config_target: bool,
+    pub selected_reasoning_effort: Option<cockpit_config::providers::ActiveReasoningEffort>,
+    pub selected_thinking_mode: Option<ThinkingMode>,
+    pub selected_prompt_cache_retention: Option<cockpit_config::providers::PromptCacheRetention>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +193,10 @@ impl App {
         self.composer_controls.generation = self.composer_controls.generation.wrapping_add(1);
         self.composer_controls.picker = None;
         self.composer_controls.picker_rect = None;
+        self.composer_controls.picker_scrollbar_rect = None;
+        self.composer_controls.picker_scroll = 0;
+        self.composer_controls.picker_view = 0;
+        self.composer_controls.picker_scroll_drag = false;
         if clear_selection {
             self.composer_controls.selection = None;
         }
@@ -303,6 +336,8 @@ impl App {
 
     pub(super) fn paint_composer_picker(&mut self, frame: &mut Frame<'_>) {
         self.composer_controls.picker_rect = None;
+        self.composer_controls.picker_scrollbar_rect = None;
+        self.composer_controls.picker_view = 0;
         if !self.composer_chrome_interactive() {
             return;
         }
@@ -328,33 +363,35 @@ impl App {
             .iter()
             .map(|(label, hint, _)| {
                 crate::tui::button::display_width(label)
-                    .saturating_add(2)
+                    .saturating_add(4)
                     .saturating_add(crate::tui::button::display_width(hint))
             })
             .max()
-            .unwrap_or(12)
+            .unwrap_or(16)
             .max(crate::tui::button::display_width(
                 status_line.as_deref().unwrap_or(""),
-            ));
+            ))
+            .max(44);
         let width = inner_w
-            .saturating_add(4)
+            .saturating_add(3)
             .min(layout.area.width.max(16))
             .max(16);
         let body_rows = rows.len().max(1) as u16;
         let status_h = u16::from(status_line.is_some());
-        let height = body_rows.saturating_add(2).saturating_add(status_h).min(14);
+        let footer_h = 1;
+        let height = body_rows
+            .saturating_add(2)
+            .saturating_add(status_h)
+            .saturating_add(footer_h)
+            .min(16);
         let screen = frame.area();
-        let y = anchor.y.saturating_sub(height);
-        let mut x = anchor.x;
-        if x.saturating_add(width) > screen.right() {
-            x = screen.right().saturating_sub(width);
-        }
-        let popover = Rect {
-            x,
-            y,
+        let popover = crate::tui::chrome::place_popover(
+            anchor,
             width,
             height,
-        };
+            screen,
+            crate::tui::chrome::PopoverSide::Above,
+        );
         frame.render_widget(Clear, popover);
         let title = match picker.level {
             0 => format!(" {} ", picker.kind.as_str()),
@@ -364,11 +401,7 @@ impl App {
                 .map(|c| format!(" {} ", c.label))
                 .unwrap_or_else(|| format!(" {} ", picker.kind.as_str())),
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(crate::tui::theme::ACCENT_BLUE))
-            .title(title);
+        let block = crate::tui::chrome::rounded_block(title, true);
         let inner = block.inner(popover);
         frame.render_widget(block, popover);
         let mut row_y = inner.y;
@@ -387,6 +420,27 @@ impl App {
             );
             row_y = row_y.saturating_add(1);
         }
+        let body_height = inner
+            .bottom()
+            .saturating_sub(row_y)
+            .saturating_sub(footer_h);
+        let body = Rect::new(inner.x, row_y, inner.width, body_height);
+        let view = usize::from(body.height);
+        self.composer_controls.picker_view = view;
+        let max_scroll = rows.len().saturating_sub(view);
+        let mut scroll = self.composer_controls.picker_scroll.min(max_scroll);
+        if picker.cursor < scroll {
+            scroll = picker.cursor;
+        } else if view > 0 && picker.cursor >= scroll.saturating_add(view) {
+            scroll = picker.cursor + 1 - view;
+        }
+        self.composer_controls.picker_scroll = scroll;
+        let content = crate::tui::chrome::scrollbar(frame, body, rows.len(), view, scroll);
+        if rows.len() > view {
+            self.composer_controls.picker_scrollbar_rect =
+                Some(crate::tui::chrome::scrollbar_track(body));
+        }
+
         use crate::tui::button::{ButtonDispatch, ButtonId, ButtonSpec};
         if rows.is_empty() {
             frame.render_widget(
@@ -395,35 +449,97 @@ impl App {
                     Style::default().fg(crate::tui::theme::MUTED_TEXT),
                 ))),
                 Rect {
-                    x: inner.x,
-                    y: row_y,
-                    width: inner.width,
+                    x: content.x,
+                    y: body.y,
+                    width: content.width,
                     height: 1,
                 },
             );
         } else {
-            for (index, (label, hint, selectable)) in rows.iter().enumerate() {
-                let y = row_y.saturating_add(index as u16);
-                if y >= inner.bottom() {
-                    break;
-                }
-                let shown = if hint.is_empty() {
-                    label.clone()
+            for (index, (label, hint, selectable)) in
+                rows.iter().enumerate().skip(scroll).take(view)
+            {
+                let y = body.y.saturating_add((index - scroll) as u16);
+                let selected = picker.cursor == index;
+                let item = (picker.level > 0)
+                    .then(|| picker.categories.get(picker.category)?.items.get(index))
+                    .flatten();
+                let favorite = item.is_some_and(|item| item.favorite);
+                let prefix = if selected {
+                    crate::tui::chrome::selection_highlight_symbol()
                 } else {
-                    format!("{label}  {hint}")
+                    "  "
                 };
+                let label = if favorite {
+                    format!("★ {label}")
+                } else {
+                    label.clone()
+                };
+                let base = if selected {
+                    crate::tui::chrome::selection_style()
+                } else {
+                    Style::default()
+                };
+                let label_style = if selected {
+                    base
+                } else if favorite {
+                    Style::default().fg(crate::tui::theme::FAVORITE_MODEL)
+                } else {
+                    Style::default().fg(crate::tui::theme::INK_ANSI)
+                };
+                let hint_style = if selected {
+                    base
+                } else {
+                    Style::default().fg(crate::tui::theme::FOG_ANSI)
+                };
+                let disabled = !*selectable;
+                let line = Line::from(vec![
+                    Span::styled(prefix, base),
+                    Span::styled(
+                        label.clone(),
+                        if disabled {
+                            label_style.add_modifier(Modifier::DIM)
+                        } else {
+                            label_style
+                        },
+                    ),
+                    Span::styled(
+                        if hint.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  {hint}")
+                        },
+                        if disabled {
+                            hint_style.add_modifier(Modifier::DIM)
+                        } else {
+                            hint_style
+                        },
+                    ),
+                ]);
+                let rect = Rect::new(content.x, y, content.width, 1);
+                frame.render_widget(Paragraph::new(line).style(base), rect);
                 let spec = ButtonSpec::new(
                     ButtonId::ComposerPickerRow { index },
-                    shown,
+                    label,
                     ButtonDispatch::ComposerPickerRow { index },
                 )
-                .focused(picker.cursor == index)
+                .focused(selected)
                 .enabled(*selectable);
-                let _ = self
-                    .button_registry
-                    .paint(frame, inner.x, y, inner.width, spec);
+                self.button_registry.register(rect, spec);
             }
         }
+        let footer = match picker.kind {
+            ComposerControlKind::Model => "↑/↓ move · enter choose · ctrl+enter default · esc back",
+            _ => "↑/↓ move · enter choose · esc back",
+        };
+        let footer_y = inner.bottom().saturating_sub(1);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                footer,
+                Style::default().fg(crate::tui::theme::FOG_ANSI),
+            ))),
+            Rect::new(inner.x, footer_y, inner.width, 1),
+        );
         self.composer_controls.picker_rect = Some(popover);
     }
 
@@ -437,6 +553,7 @@ impl App {
             && self.pins_review.is_none()
             && self.rules_review.is_none()
             && self.transcript_find.is_none()
+            && self.keys_overlay.is_none()
     }
 
     pub(super) fn close_composer_picker_on_outside_press(&mut self, column: u16, row: u16) -> bool {
@@ -488,6 +605,20 @@ impl App {
             return;
         }
         self.open_composer_picker(kind);
+        if kind == ComposerControlKind::Model {
+            self.request_session_setup_snapshot_refresh();
+        }
+    }
+
+    pub(super) fn open_composer_picker_from_chord(&mut self, kind: ComposerControlKind) {
+        if !self.composer_chrome_interactive() {
+            return;
+        }
+        self.composer_controls.selection = Some(kind);
+        self.open_composer_picker(kind);
+        if kind == ComposerControlKind::Model {
+            self.request_session_setup_snapshot_refresh();
+        }
     }
 
     pub(super) fn activate_composer_send(&mut self) {
@@ -518,7 +649,16 @@ impl App {
             ComposerControlKind::Approval => self.fill_approval_picker(&mut picker),
             ComposerControlKind::Sandbox => self.fill_sandbox_picker(&mut picker),
         }
-        if picker.categories.len() == 1 {
+        if kind == ComposerControlKind::Model
+            && let Some((provider, _)) = self.launch.active_model.as_ref()
+        {
+            picker.cursor = picker
+                .categories
+                .iter()
+                .position(|category| category.id == *provider)
+                .unwrap_or(0);
+        }
+        if picker.categories.len() == 1 && kind != ComposerControlKind::Model {
             picker.level = 1;
             picker.cursor = picker
                 .categories
@@ -530,7 +670,63 @@ impl App {
                 })
                 .unwrap_or(0);
         }
+        self.composer_controls.picker_scroll = 0;
+        self.composer_controls.picker_scroll_drag = false;
         self.composer_controls.picker = Some(picker);
+    }
+
+    pub(super) fn move_open_composer_picker(&mut self, delta: isize) -> bool {
+        let Some(picker) = self.composer_controls.picker.as_mut() else {
+            return false;
+        };
+        picker.move_cursor(delta);
+        true
+    }
+
+    pub(super) fn hover_composer_picker_row(&mut self, index: usize) {
+        if let Some(picker) = self.composer_controls.picker.as_mut()
+            && index < picker.row_count()
+        {
+            picker.cursor = index;
+        }
+    }
+
+    pub(super) fn begin_composer_picker_scroll_drag(&mut self, column: u16, row: u16) -> bool {
+        let Some(track) = self.composer_controls.picker_scrollbar_rect else {
+            return false;
+        };
+        if !point_in(track, column, row) {
+            return false;
+        }
+        self.composer_controls.picker_scroll_drag = true;
+        self.drag_composer_picker_scrollbar(row);
+        true
+    }
+
+    pub(super) fn drag_composer_picker_scrollbar(&mut self, row: u16) {
+        if !self.composer_controls.picker_scroll_drag {
+            return;
+        }
+        let Some(track) = self.composer_controls.picker_scrollbar_rect else {
+            return;
+        };
+        let total = self
+            .composer_controls
+            .picker
+            .as_ref()
+            .map(ComposerPicker::row_count)
+            .unwrap_or(0);
+        let max = total.saturating_sub(self.composer_controls.picker_view.max(1));
+        let scroll = scroll_from_track(track, row, max);
+        let cursor = scroll_from_track(track, row, total.saturating_sub(1));
+        self.composer_controls.picker_scroll = scroll;
+        if let Some(picker) = self.composer_controls.picker.as_mut() {
+            picker.cursor = cursor;
+        }
+    }
+
+    pub(super) fn end_composer_picker_scroll_drag(&mut self) {
+        self.composer_controls.picker_scroll_drag = false;
     }
 
     fn fill_agent_picker(&self, picker: &mut ComposerPicker) {
@@ -553,6 +749,7 @@ impl App {
                 selectable: self.agent_path.len() <= 1,
                 id: name.clone(),
                 label: name,
+                ..Default::default()
             })
             .collect();
         if items.is_empty() {
@@ -561,6 +758,7 @@ impl App {
                 label: current.to_string(),
                 hint: String::new(),
                 selectable: self.agent_path.len() <= 1,
+                ..Default::default()
             });
         }
         picker.categories.push(ComposerPickerCategory {
@@ -583,6 +781,7 @@ impl App {
                         label: name.clone(),
                         hint: "child".to_string(),
                         selectable: false,
+                        ..Default::default()
                     })
                     .collect(),
             });
@@ -595,6 +794,11 @@ impl App {
             std::collections::BTreeMap::new();
         for (provider_id, entry) in &self.config_snapshot.providers.providers {
             for model in &entry.models {
+                let usage_count = self
+                    .usage_models
+                    .get(&format!("{provider_id}/{}", model.id))
+                    .copied()
+                    .unwrap_or(0);
                 by_provider
                     .entry(provider_id.clone())
                     .or_default()
@@ -605,21 +809,31 @@ impl App {
                             .clone()
                             .filter(|name| !name.is_empty())
                             .unwrap_or_else(|| model.id.clone()),
-                        hint: if current
-                            .as_ref()
-                            .is_some_and(|(p, m)| p == provider_id && m == &model.id)
-                        {
-                            "current".to_string()
-                        } else {
-                            String::new()
-                        },
+                        hint: String::new(),
                         selectable: true,
+                        favorite: model.favorite,
+                        usage_count,
+                        reasoning_effort: model.capabilities.reasoning_effort.clone(),
+                        thinking_modes: model.thinking_modes.clone(),
+                        ..Default::default()
                     });
             }
         }
         for model in self.inventory_models() {
             let items = by_provider.entry(model.provider.clone()).or_default();
-            if items.iter().any(|item| item.id == model.id) {
+            if let Some(item) = items.iter_mut().find(|item| item.id == model.id) {
+                item.favorite |= model.favorite;
+                item.usage_count = self
+                    .usage_models
+                    .get(&format!("{}/{}", model.provider, model.id))
+                    .copied()
+                    .unwrap_or(item.usage_count);
+                if item.reasoning_effort.is_none() {
+                    item.reasoning_effort = model.reasoning_effort.clone();
+                }
+                if item.thinking_modes.is_empty() {
+                    item.thinking_modes = model.thinking_modes.clone();
+                }
                 continue;
             }
             items.push(ComposerPickerItem {
@@ -631,6 +845,15 @@ impl App {
                     .unwrap_or_else(|| model.id.clone()),
                 hint: String::new(),
                 selectable: true,
+                favorite: model.favorite,
+                usage_count: self
+                    .usage_models
+                    .get(&format!("{}/{}", model.provider, model.id))
+                    .copied()
+                    .unwrap_or(0),
+                reasoning_effort: model.reasoning_effort.clone(),
+                thinking_modes: model.thinking_modes.clone(),
+                ..Default::default()
             });
         }
         if by_provider.is_empty() {
@@ -638,15 +861,218 @@ impl App {
             picker.status_text = Some("Loading models…".to_string());
             return;
         }
-        for (provider, items) in by_provider {
+        let now = chrono::Utc::now().timestamp();
+        let slot_models = &self.prepared_slot_models;
+        let slot_default = self.prepared_slot_default.as_ref();
+        let mut categories = Vec::new();
+        for (provider, mut items) in by_provider {
+            items.sort_by(|a, b| {
+                let a_slot = slot_models
+                    .iter()
+                    .position(|(slot_provider, slot_model)| {
+                        slot_provider == &provider && slot_model == &a.id
+                    })
+                    .unwrap_or(usize::MAX);
+                let b_slot = slot_models
+                    .iter()
+                    .position(|(slot_provider, slot_model)| {
+                        slot_provider == &provider && slot_model == &b.id
+                    })
+                    .unwrap_or(usize::MAX);
+                a_slot
+                    .cmp(&b_slot)
+                    .then_with(|| b.favorite.cmp(&a.favorite))
+                    .then_with(|| b.usage_count.cmp(&a.usage_count))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            for item in &mut items {
+                let mut annotations = Vec::new();
+                if current
+                    .as_ref()
+                    .is_some_and(|(active_provider, active_model)| {
+                        active_provider == &provider && active_model == &item.id
+                    })
+                {
+                    annotations.push("current".to_string());
+                }
+                if slot_default.is_some_and(|(default_provider, default_model)| {
+                    default_provider == &provider && default_model == &item.id
+                }) {
+                    annotations.push("default".to_string());
+                }
+                if item.usage_count > 0 {
+                    annotations.push(format!("{} uses", item.usage_count));
+                }
+                if let Some(failure) = self
+                    .auth_failure_annotations
+                    .get(&(provider.clone(), item.id.clone()))
+                {
+                    annotations.push(crate::tui::auth_failure::annotation_suffix(failure, now));
+                }
+                item.hint = annotations.join(" · ");
+            }
             let count = items.len();
-            picker.categories.push(ComposerPickerCategory {
+            let favorite_count = items.iter().filter(|item| item.favorite).count();
+            items.push(ComposerPickerItem {
+                id: ADD_MODEL_ITEM_ID.to_string(),
+                label: "Add model…".to_string(),
+                hint: format!("configure {provider}"),
+                selectable: true,
+                ..Default::default()
+            });
+            categories.push(ComposerPickerCategory {
                 id: provider.clone(),
                 label: provider,
-                hint: format!("{count} models  ›"),
+                hint: if favorite_count > 0 {
+                    format!("{count} models · {favorite_count} favorite  ›")
+                } else {
+                    format!("{count} models  ›")
+                },
                 items,
             });
         }
+        categories.sort_by(|a, b| {
+            let slot_rank = |category: &ComposerPickerCategory| {
+                slot_models
+                    .iter()
+                    .position(|(provider, _)| provider == &category.id)
+                    .unwrap_or(usize::MAX)
+            };
+            slot_rank(a)
+                .cmp(&slot_rank(b))
+                .then_with(|| {
+                    b.items
+                        .iter()
+                        .any(|item| item.favorite)
+                        .cmp(&a.items.iter().any(|item| item.favorite))
+                })
+                .then_with(|| {
+                    b.items
+                        .iter()
+                        .map(|item| item.usage_count)
+                        .max()
+                        .unwrap_or(0)
+                        .cmp(
+                            &a.items
+                                .iter()
+                                .map(|item| item.usage_count)
+                                .max()
+                                .unwrap_or(0),
+                        )
+                })
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        if let Some(drift) = self.model_picker_drift() {
+            picker.status_text = Some(format!(
+                "Session: {} · config: {}",
+                drift.session_label, drift.config_label
+            ));
+            if let Some(active) = drift.config_model {
+                let provider = active.provider;
+                let model = active.model;
+                categories.insert(
+                    0,
+                    ComposerPickerCategory {
+                        id: provider.clone(),
+                        label: "Config drift".to_string(),
+                        hint: "switch to configured model  ›".to_string(),
+                        items: vec![ComposerPickerItem {
+                            id: model.clone(),
+                            label: format!("{provider}/{model}"),
+                            hint: "configured default".to_string(),
+                            selectable: true,
+                            config_target: true,
+                            selected_reasoning_effort: active.reasoning_effort,
+                            selected_thinking_mode: active.thinking_mode,
+                            selected_prompt_cache_retention: active.prompt_cache_retention,
+                            ..Default::default()
+                        }],
+                    },
+                );
+            }
+        }
+        picker.categories = categories;
+    }
+
+    pub(super) fn refresh_open_composer_model_picker(&mut self) {
+        let Some(previous) = self
+            .composer_controls
+            .picker
+            .as_ref()
+            .filter(|picker| picker.kind == ComposerControlKind::Model)
+            .cloned()
+        else {
+            return;
+        };
+        if self.composer_controls.pending.is_some() {
+            return;
+        }
+        let category_id = previous
+            .categories
+            .get(previous.category)
+            .map(|category| category.id.clone());
+        let item_id = (previous.level > 0)
+            .then(|| {
+                previous
+                    .categories
+                    .get(previous.category)?
+                    .items
+                    .get(previous.cursor)
+                    .map(|item| item.id.clone())
+            })
+            .flatten();
+        let mut refreshed = ComposerPicker {
+            categories: Vec::new(),
+            status: ComposerPickerStatus::Ready,
+            status_text: None,
+            ..previous
+        };
+        self.fill_model_picker(&mut refreshed);
+        if let Some(category_id) = category_id
+            && let Some(category) = refreshed
+                .categories
+                .iter()
+                .position(|category| category.id == category_id)
+        {
+            refreshed.category = category;
+            if refreshed.level == 0 {
+                refreshed.cursor = category;
+            } else if let Some(item_id) = item_id {
+                refreshed.cursor = refreshed.categories[category]
+                    .items
+                    .iter()
+                    .position(|item| item.id == item_id)
+                    .unwrap_or(0);
+            }
+        }
+        if refreshed.categories.len() == 1 && refreshed.kind != ComposerControlKind::Model {
+            refreshed.level = 1;
+            refreshed.category = 0;
+        }
+        self.composer_controls.picker = Some(refreshed);
+    }
+
+    pub(super) fn reopen_composer_model_picker_after_provider_settings(&mut self) -> bool {
+        let Some(provider) = self.reopen_composer_model_picker_after_settings.take() else {
+            return false;
+        };
+        self.open_composer_picker_from_chord(ComposerControlKind::Model);
+        let current = current_id_for(ComposerControlKind::Model, self);
+        if let Some(picker) = self.composer_controls.picker.as_mut()
+            && let Some(category) = picker
+                .categories
+                .iter()
+                .position(|category| category.id == provider)
+        {
+            picker.level = 1;
+            picker.category = category;
+            picker.cursor = picker.categories[category]
+                .items
+                .iter()
+                .position(|item| item.id == current)
+                .unwrap_or(0);
+        }
+        true
     }
 
     fn fill_effort_picker(&self, picker: &mut ComposerPicker) {
@@ -673,6 +1099,7 @@ impl App {
                         .unwrap_or_else(|| value.value.clone()),
                     hint: value.description.clone().unwrap_or_default(),
                     selectable: true,
+                    ..Default::default()
                 });
             }
         }
@@ -686,6 +1113,7 @@ impl App {
                     label: mode.as_str().to_string(),
                     hint: String::new(),
                     selectable: true,
+                    ..Default::default()
                 });
             }
         }
@@ -695,22 +1123,22 @@ impl App {
                 Some("This model does not expose effort or thinking levels.".to_string());
             return;
         }
-        if !effort_items.is_empty() {
-            picker.categories.push(ComposerPickerCategory {
-                id: "effort".to_string(),
-                label: "Reasoning effort".to_string(),
-                hint: format!("{} levels  ›", effort_items.len()),
-                items: effort_items,
-            });
-        }
-        if !thinking_items.is_empty() {
-            picker.categories.push(ComposerPickerCategory {
-                id: "thinking".to_string(),
-                label: "Thinking".to_string(),
-                hint: format!("{} levels  ›", thinking_items.len()),
-                items: thinking_items,
-            });
-        }
+        let effort_count = effort_items.len();
+        let thinking_count = thinking_items.len();
+        effort_items.extend(thinking_items);
+        let hint = match (effort_count, thinking_count) {
+            (effort, 0) => format!("{effort} reasoning levels"),
+            (0, thinking) => format!("{thinking} thinking modes"),
+            (effort, thinking) => {
+                format!("{effort} reasoning levels · {thinking} legacy thinking modes")
+            }
+        };
+        picker.categories.push(ComposerPickerCategory {
+            id: "effort".to_string(),
+            label: "Effort".to_string(),
+            hint,
+            items: effort_items,
+        });
     }
 
     fn fill_approval_picker(&self, picker: &mut ComposerPicker) {
@@ -733,6 +1161,7 @@ impl App {
                     label: mode.as_str().to_string(),
                     hint,
                     selectable,
+                    ..Default::default()
                 }
             })
             .collect();
@@ -786,6 +1215,7 @@ impl App {
                     label: slash::sandbox_mode_label(mode).to_string(),
                     hint,
                     selectable: selectable && available && self.sandbox_mode != SandboxMode::Refuse,
+                    ..Default::default()
                 }
             })
             .collect();
@@ -804,7 +1234,10 @@ impl App {
         if let Some(mut picker) = self.composer_controls.picker.take() {
             match key.code {
                 KeyCode::Esc => {
-                    if picker.level > 0 && picker.categories.len() > 1 {
+                    if picker.level > 0
+                        && (picker.kind == ComposerControlKind::Model
+                            || picker.categories.len() > 1)
+                    {
                         picker.level = 0;
                         picker.cursor = picker.category;
                         self.composer_controls.picker = Some(picker);
@@ -812,6 +1245,12 @@ impl App {
                         self.close_composer_picker();
                         self.composer_controls.selection = None;
                     }
+                    return true;
+                }
+                _ if is_picker_enter(&key) => {
+                    let persist =
+                        key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL);
+                    self.commit_composer_picker(picker, persist);
                     return true;
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -822,11 +1261,6 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => {
                     picker.move_cursor(1);
                     self.composer_controls.picker = Some(picker);
-                    return true;
-                }
-                KeyCode::Enter => {
-                    let persist = key.modifiers.contains(KeyModifiers::CONTROL);
-                    self.commit_composer_picker(picker, persist);
                     return true;
                 }
                 _ if !is_modifier_only(&key) => {
@@ -856,7 +1290,7 @@ impl App {
                 self.cycle_composer_pill(selected, 1);
                 true
             }
-            KeyCode::Enter => {
+            _ if is_picker_enter(&key) => {
                 self.activate_composer_pill(selected);
                 true
             }
@@ -922,7 +1356,17 @@ impl App {
             }
             picker.category = picker.cursor;
             picker.level = 1;
-            picker.cursor = 0;
+            picker.cursor = picker
+                .categories
+                .get(picker.category)
+                .and_then(|category| {
+                    category
+                        .items
+                        .iter()
+                        .position(|item| item.id == current_id_for(picker.kind, self))
+                })
+                .unwrap_or(0);
+            self.composer_controls.picker_scroll = 0;
             self.composer_controls.picker = Some(picker);
             return;
         }
@@ -944,6 +1388,14 @@ impl App {
             self.composer_controls.picker = Some(picker);
             return;
         }
+        if picker.kind == ComposerControlKind::Model && item.id == ADD_MODEL_ITEM_ID {
+            self.composer_controls.selection = None;
+            self.composer_controls.picker = None;
+            self.reopen_composer_model_picker_after_settings = Some(category.id.clone());
+            self.dialog =
+                crate::tui::settings::Dialog::open_provider_models(&self.launch.cwd, &category.id);
+            return;
+        }
         picker.status = ComposerPickerStatus::Loading;
         picker.status_text = Some("Applying…".to_string());
         let kind = picker.kind;
@@ -961,21 +1413,55 @@ impl App {
                 self.swap_primary_agent(&item.id);
             }
             ComposerControlKind::Model => {
+                let (reasoning_effort, thinking_mode, prompt_cache_retention) =
+                    if item.config_target {
+                        (
+                            item.selected_reasoning_effort,
+                            item.selected_thinking_mode,
+                            item.selected_prompt_cache_retention,
+                        )
+                    } else {
+                        let retained_reasoning = self
+                            .active_model_selection
+                            .as_ref()
+                            .and_then(|current| current.reasoning_effort.clone())
+                            .filter(|effort| {
+                                item.reasoning_effort.as_ref().is_some_and(|capability| {
+                                    capability
+                                        .values
+                                        .iter()
+                                        .any(|candidate| candidate.value == effort.value)
+                                })
+                            });
+                        let retained_thinking = self
+                            .active_model_selection
+                            .as_ref()
+                            .and_then(|current| current.thinking_mode)
+                            .filter(|mode| item.thinking_modes.contains(mode));
+                        let retained_cache = self
+                            .active_model_selection
+                            .as_ref()
+                            .and_then(|current| current.prompt_cache_retention)
+                            .filter(|retention| {
+                                retention.is_default()
+                                    || self
+                                        .config_snapshot
+                                        .providers
+                                        .resolve_prompt_cache_retention(
+                                            &category.id,
+                                            &item.id,
+                                            Some(*retention),
+                                        )
+                                        .is_some()
+                            });
+                        (retained_reasoning, retained_thinking, retained_cache)
+                    };
                 let active = ActiveModelRef {
                     provider: category.id,
                     model: item.id,
-                    reasoning_effort: self
-                        .active_model_selection
-                        .as_ref()
-                        .and_then(|current| current.reasoning_effort.clone()),
-                    thinking_mode: self
-                        .active_model_selection
-                        .as_ref()
-                        .and_then(|current| current.thinking_mode),
-                    prompt_cache_retention: self
-                        .active_model_selection
-                        .as_ref()
-                        .and_then(|current| current.prompt_cache_retention),
+                    reasoning_effort,
+                    thinking_mode,
+                    prompt_cache_retention,
                 };
                 let _ = self.notify_active_model_selected(
                     active,
@@ -1057,7 +1543,9 @@ impl App {
             active.reasoning_effort = Some(ActiveReasoningEffort {
                 value: value.to_string(),
             });
+            active.thinking_mode = None;
         } else if let Some(value) = id.strip_prefix("thinking:") {
+            active.reasoning_effort = None;
             active.thinking_mode = match value {
                 "off" => Some(ThinkingMode::Off),
                 "low" => Some(ThinkingMode::Low),

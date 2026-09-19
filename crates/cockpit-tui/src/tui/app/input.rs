@@ -76,6 +76,34 @@ async fn admit_image_ingress_via_daemon(
 }
 
 #[cfg(test)]
+mod rehomed_leader_chord_tests {
+    use super::{KeysLeaderAction, keys_leader_action};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn ctrl_k_continuation_table_routes_b_n_and_r() {
+        for (key, expected) in [
+            ('b', KeysLeaderAction::BtwFocus),
+            ('n', KeysLeaderAction::Scratchpad),
+            ('r', KeysLeaderAction::RevealTranscript),
+        ] {
+            assert_eq!(
+                keys_leader_action(&KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            keys_leader_action(&KeyEvent::new(
+                KeyCode::Char(char::from(b'b')),
+                KeyModifiers::CONTROL,
+            )),
+            None,
+            "continuations are plain keys after Ctrl+K"
+        );
+    }
+}
+
+#[cfg(test)]
 mod daemon_tag_coverage_tests {
     #[test]
     fn tag_inline_requires_bound_coverage() {
@@ -463,25 +491,6 @@ impl App {
         if self.handle_queue_key(key) {
             return false;
         }
-        if key.code == KeyCode::Up
-            && key.modifiers == KeyModifiers::ALT
-            && self.composer.is_empty()
-            && self.focus_queue_from_composer()
-        {
-            // Queue navigation is an explicit transition. Plain Up remains
-            // prompt-history recall while the composer owns keyboard input.
-            return false;
-        }
-        if is_btw_focus_toggle(&key)
-            && let Some(pane) = self.btw_pane.as_mut()
-        {
-            pane.focused = !pane.focused;
-            if pane.focused {
-                self.pane_focused = false;
-            }
-            return false;
-        }
-
         if self.btw_pane.as_ref().is_some_and(|pane| pane.focused)
             && let Some(pane) = self.btw_pane.as_mut()
         {
@@ -559,6 +568,58 @@ impl App {
         {
             return self.request_guarded_exit();
         }
+        if self.composer_chrome_interactive()
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+        {
+            match key.code {
+                KeyCode::Char('p') | KeyCode::Char('P') => {
+                    self.open_composer_picker_from_chord(
+                        crate::tui::composer_controls::ComposerControlKind::Model,
+                    );
+                    return false;
+                }
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    self.open_composer_picker_from_chord(
+                        crate::tui::composer_controls::ComposerControlKind::Effort,
+                    );
+                    return false;
+                }
+                KeyCode::Char(ch) if ch.eq_ignore_ascii_case(&'b') => {
+                    self.toggle_session_sidebar_from_chord();
+                    return false;
+                }
+                KeyCode::Char(ch) if ch.eq_ignore_ascii_case(&'n') => {
+                    self.pending_new_session = true;
+                    return false;
+                }
+                KeyCode::Up if self.composer.is_empty() && self.focus_queue_from_composer() => {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        if key.modifiers.contains(KeyModifiers::ALT)
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.pane.is_none()
+            && !self.dialog.is_active()
+            && matches!(self.overlay, Overlay::None)
+            && self.question_dialog.is_none()
+        {
+            match key.code {
+                KeyCode::Up => {
+                    self.switch_session_from_chord(-1);
+                    return false;
+                }
+                KeyCode::Down => {
+                    self.switch_session_from_chord(1);
+                    return false;
+                }
+                _ => {}
+            }
+        }
         if key.kind == KeyEventKind::Press
             && key.modifiers.contains(KeyModifiers::ALT)
             && self.pane.is_none()
@@ -568,7 +629,9 @@ impl App {
         {
             match key.code {
                 KeyCode::Char('m') if self.auth_failure_notice.is_some() => {
-                    self.open_model_picker();
+                    self.open_composer_picker_from_chord(
+                        crate::tui::composer_controls::ComposerControlKind::Model,
+                    );
                     return false;
                 }
                 KeyCode::Char('p') if self.auth_failure_notice.is_some() => {
@@ -598,6 +661,11 @@ impl App {
         if self.keys_overlay.is_some() {
             if is_keys_leader(&key) {
                 self.keys_overlay = None;
+                return false;
+            }
+            if let Some(action) = keys_leader_action(&key) {
+                self.keys_overlay = None;
+                self.dispatch_keys_leader_action(action);
                 return false;
             }
             if let Some(overlay) = self.keys_overlay.as_mut()
@@ -873,7 +941,9 @@ impl App {
                 // cancel, so never make picker restoration depend on a push.
                 // If a changed snapshot already restored it, the marker is
                 // gone and this is a no-op.
-                if let Some(provider) = self.reopen_model_picker_after_settings.take() {
+                if self.reopen_composer_model_picker_after_provider_settings() {
+                    self.reopen_model_picker_draft_after_settings = None;
+                } else if let Some(provider) = self.reopen_model_picker_after_settings.take() {
                     self.open_model_picker_for_provider(&provider);
                     if let (Some(draft), Overlay::ModelPicker(picker)) = (
                         self.reopen_model_picker_draft_after_settings.take(),
@@ -1263,23 +1333,6 @@ impl App {
             return false;
         }
 
-        // Ctrl+N opens the `/scratchpad` (the keyboard entry point;
-        // `/scratchpad` is the always-available equivalent). Reached only when
-        // no pane/modal is open — those are routed above and consume the key
-        // first — so it never clashes with a pane's own bindings. Ctrl+N is
-        // otherwise unbound in the composer.
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::SHIFT)
-            && matches!(key.code, KeyCode::Char('n'))
-            && !self.dialog.is_active()
-            && !self.overlay.is_open()
-            && self.question_dialog.is_none()
-            && self.pane.is_none()
-        {
-            self.open_scratchpad_pane();
-            return false;
-        }
-
         // Ctrl+T toggles every agent reasoning block's expand/collapse
         // state. (See the doc comment on `toggle_recent_reasoning` for
         // why this is a keybind rather than a click handler.) Only
@@ -1293,29 +1346,6 @@ impl App {
             })
         {
             self.toggle_recent_reasoning();
-            return false;
-        }
-
-        // Ctrl+E toggles every preflighted user message between its cleaned
-        // form and the original typed input, and toggles compact-boundary
-        // handoff briefs. Only intercepted when at least one revealable row
-        // exists — otherwise Ctrl+E falls through to its composer role.
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('e'))
-            && self.history.iter().any(|e| {
-                matches!(
-                    e,
-                    HistoryEntry::User {
-                        cleaned: Some(_),
-                        ..
-                    } | HistoryEntry::CompactBoundary {
-                        handoff: Some(_),
-                        ..
-                    }
-                )
-            })
-        {
-            self.toggle_ctrl_e_reveals();
             return false;
         }
 
@@ -2370,7 +2400,7 @@ impl App {
             KeyCode::Char('W') => {
                 self.apply_operator_motion(op, ComposerMotion::WordForward { big: true }, false)
             }
-            KeyCode::Char('b') => {
+            KeyCode::Char(ch) if ch == 'b' => {
                 self.apply_operator_motion(op, ComposerMotion::WordBackward { big: false }, false)
             }
             KeyCode::Char('B') => {
@@ -3358,8 +3388,9 @@ impl App {
             }
             KeyCode::Down | KeyCode::Tab => self.cycle_transcript_find(1),
             KeyCode::Up | KeyCode::BackTab => self.cycle_transcript_find(-1),
-            KeyCode::Char('n')
-                if key.modifiers.contains(KeyModifiers::CONTROL)
+            KeyCode::Char(ch)
+                if ch == 'n'
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
                 self.cycle_transcript_find(1);
@@ -4273,7 +4304,7 @@ impl App {
             KeyCode::Char('W') => self
                 .composer
                 .move_cursor(ComposerMotion::WordForward { big: true }),
-            KeyCode::Char('b') => self
+            KeyCode::Char(ch) if ch == 'b' => self
                 .composer
                 .move_cursor(ComposerMotion::WordBackward { big: false }),
             KeyCode::Char('B') => self
@@ -4354,6 +4385,75 @@ impl App {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeysLeaderAction {
+    BtwFocus,
+    Scratchpad,
+    RevealTranscript,
+}
+
+fn keys_leader_action(key: &KeyEvent) -> Option<KeysLeaderAction> {
+    if key.kind != KeyEventKind::Press || !key.modifiers.is_empty() {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('b') | KeyCode::Char('B') => Some(KeysLeaderAction::BtwFocus),
+        KeyCode::Char('n') | KeyCode::Char('N') => Some(KeysLeaderAction::Scratchpad),
+        KeyCode::Char('r') | KeyCode::Char('R') => Some(KeysLeaderAction::RevealTranscript),
+        _ => None,
+    }
+}
+
+impl App {
+    fn dispatch_keys_leader_action(&mut self, action: KeysLeaderAction) {
+        match action {
+            KeysLeaderAction::BtwFocus => {
+                if let Some(pane) = self.btw_pane.as_mut() {
+                    pane.focused = !pane.focused;
+                    if pane.focused {
+                        self.pane_focused = false;
+                    }
+                }
+            }
+            KeysLeaderAction::Scratchpad => self.open_scratchpad_pane(),
+            KeysLeaderAction::RevealTranscript => self.toggle_ctrl_e_reveals(),
+        }
+    }
+
+    /// Router seam for #447's hideable session rail. Until that rail owns a
+    /// hidden state, the chord toggles keyboard focus on the existing rail.
+    fn toggle_session_sidebar_from_chord(&mut self) {
+        if self.session_rail.is_focused() {
+            let outcome = self.session_rail.handle_key(KeyEvent::from(KeyCode::Esc));
+            self.apply_session_rail_outcome(outcome);
+        } else {
+            self.session_rail.focus();
+            self.maybe_start_session_rail_list();
+        }
+    }
+
+    /// Router seam for #447's active-session cycle. It reuses the rail's
+    /// authoritative ordering and resume action without leaving rail focus on.
+    fn switch_session_from_chord(&mut self, delta: isize) {
+        let was_focused = self.session_rail.is_focused();
+        self.session_rail.focus();
+        self.maybe_start_session_rail_list();
+        let direction = if delta < 0 {
+            KeyCode::Up
+        } else {
+            KeyCode::Down
+        };
+        let outcome = self.session_rail.handle_key(KeyEvent::from(direction));
+        self.apply_session_rail_outcome(outcome);
+        let outcome = self.session_rail.handle_key(KeyEvent::from(KeyCode::Enter));
+        self.apply_session_rail_outcome(outcome);
+        if !was_focused {
+            let outcome = self.session_rail.handle_key(KeyEvent::from(KeyCode::Esc));
+            self.apply_session_rail_outcome(outcome);
+        }
+    }
+}
+
 /// Build a [`FindSpec`] for a pending `f`/`F`/`t`/`T`. The target is a
 /// placeholder until the next char key resolves it.
 fn find_spec(till: bool, forward: bool) -> FindSpec {
@@ -4394,13 +4494,6 @@ fn is_pane_focus_toggle(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
         && !key.modifiers.contains(KeyModifiers::SHIFT)
         && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O'))
-}
-
-fn is_btw_focus_toggle(key: &KeyEvent) -> bool {
-    key.kind == KeyEventKind::Press
-        && key.modifiers.contains(KeyModifiers::CONTROL)
-        && !key.modifiers.contains(KeyModifiers::SHIFT)
-        && matches!(key.code, KeyCode::Char('b'))
 }
 
 fn is_ws_byte(b: u8) -> bool {
@@ -5061,14 +5154,14 @@ mod queued_message_edit_tests {
     }
 
     #[test]
-    fn alt_up_on_empty_composer_focuses_queue_instead_of_edit_all() {
+    fn ctrl_up_on_empty_composer_focuses_queue_instead_of_edit_all() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.prompt_history.push("previous prompt".to_string());
         app.queue.push(optimistic_queue_item("queued".to_string()));
         let id = app.queue[0].id;
 
-        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
 
         assert!(app.composer.is_empty());
         assert_eq!(app.prompt_history_cursor, 0);

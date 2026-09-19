@@ -6,13 +6,19 @@ use std::time::{Duration, Instant};
 use ratatui::buffer::Buffer;
 
 use super::{App, Overlay};
+use crate::tui::composer_controls::ComposerControlKind;
 use crate::tui::golden::{
     GoldenPins, assert_golden_sizes, buffer_text, hover_allowed, pinned_frame, render_frame,
 };
 use crate::tui::onboarding::OnboardingShell;
 use crate::tui::settings::Dialog;
 use cockpit_config::extended::VimModeSetting;
+use cockpit_config::providers::{
+    ActiveModelRef, ActiveReasoningEffort, CapabilityValue, ModelCapabilities, ModelEntry,
+    ProviderEntry, ReasoningEffortCapability, ThinkingMode,
+};
 use cockpit_proto::{OnboardingBootstrapSnapshot, OnboardingStage};
+use crossterm::event::{KeyCode, KeyEvent};
 
 fn golden_model_config() -> cockpit_config::config::providers::ProvidersConfig {
     let mut config = cockpit_config::config::providers::ProvidersConfig::default();
@@ -393,6 +399,109 @@ pub fn assert_spawn_error() {
     );
 }
 
+fn composer_picker_app(kind: ComposerControlKind, model_level: u8) -> App {
+    let mut app = empty_chat_banner_app();
+    app.launch.banner_enabled = false;
+    app.launch.active_model = Some(("openai".to_string(), "gpt-5".to_string()));
+    app.active_model_selection = Some(ActiveModelRef {
+        provider: "openai".to_string(),
+        model: "gpt-5".to_string(),
+        reasoning_effort: Some(ActiveReasoningEffort {
+            value: "medium".to_string(),
+        }),
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    });
+    let reasoning = ReasoningEffortCapability {
+        values: vec![
+            CapabilityValue {
+                value: "low".to_string(),
+                label: Some("Fast".to_string()),
+                description: Some("short reasoning pass".to_string()),
+            },
+            CapabilityValue {
+                value: "medium".to_string(),
+                label: Some("Balanced".to_string()),
+                description: Some("balanced speed and depth".to_string()),
+            },
+            CapabilityValue {
+                value: "high".to_string(),
+                label: Some("Thorough".to_string()),
+                description: Some("deep reasoning pass".to_string()),
+            },
+        ],
+        default: Some("medium".to_string()),
+        ..Default::default()
+    };
+    app.config_snapshot.providers.providers.clear();
+    app.config_snapshot.providers.providers.insert(
+        "anthropic".to_string(),
+        ProviderEntry {
+            models: vec![
+                ModelEntry {
+                    id: "claude-sonnet".to_string(),
+                    favorite: true,
+                    thinking_modes: vec![ThinkingMode::Low, ThinkingMode::High],
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "claude-opus".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+    );
+    app.config_snapshot.providers.providers.insert(
+        "openai".to_string(),
+        ProviderEntry {
+            models: vec![
+                ModelEntry {
+                    id: "gpt-5".to_string(),
+                    favorite: true,
+                    capabilities: ModelCapabilities {
+                        reasoning_effort: Some(reasoning.clone()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "gpt-5-mini".to_string(),
+                    capabilities: ModelCapabilities {
+                        reasoning_effort: Some(reasoning),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+    );
+    app.usage_models.insert("openai/gpt-5".to_string(), 12);
+    app.usage_models
+        .insert("anthropic/claude-sonnet".to_string(), 7);
+    app.composer_controls.selection = Some(kind);
+    app.open_composer_picker(kind);
+    if kind == ComposerControlKind::Model && model_level == 1 {
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+    }
+    app
+}
+
+pub fn assert_composer_pickers() {
+    let _pins = GoldenPins::install();
+    for (name, kind, level) in [
+        ("model-providers", ComposerControlKind::Model, 0),
+        ("model-models", ComposerControlKind::Model, 1),
+        ("effort", ComposerControlKind::Effort, 1),
+    ] {
+        assert_golden_sizes("composer-picker", name, |width, height| {
+            let mut app = composer_picker_app(kind, level);
+            render_app(&mut app, width, height)
+        });
+    }
+}
+
 /// Compare onboarding Welcome dumps at both review sizes.
 pub fn assert_onboarding_welcome() {
     let _pins = GoldenPins::install();
@@ -605,5 +714,11 @@ mod seed_tests {
     fn golden_onboarding_native_screens() {
         let _env = isolate_render_env();
         assert_onboarding_native_screens();
+    }
+
+    #[test]
+    fn golden_composer_pickers() {
+        let _env = isolate_render_env();
+        assert_composer_pickers();
     }
 }

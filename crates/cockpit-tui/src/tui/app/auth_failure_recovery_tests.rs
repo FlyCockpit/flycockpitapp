@@ -2,7 +2,7 @@ use std::fs;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::{App, Overlay};
+use super::App;
 use cockpit_client::presentation::TurnEvent;
 use cockpit_proto::{AuthFailureKind, InferenceErrorClass};
 
@@ -123,8 +123,10 @@ fn auth_failure_notice_actions() {
     assert!(notice.contains("[fix provider]"), "{notice}");
 
     app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
-    assert!(matches!(app.overlay, Overlay::ModelPicker(_)));
-    app.overlay = Overlay::None;
+    assert!(app.composer_controls.picker.as_ref().is_some_and(
+        |picker| picker.kind == crate::tui::composer_controls::ComposerControlKind::Model
+    ));
+    app.close_composer_picker();
 
     cockpit_config::trust::with_workspace_trust_policy(
         super::trusted_workspace_policy_for_tests(tmp.path()),

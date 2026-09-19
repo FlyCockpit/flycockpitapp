@@ -309,6 +309,24 @@ mod tests {
     }
 
     #[test]
+    fn alt_arrows_cycle_sessions_without_leaving_rail_focus() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = configured_app(&tmp);
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        seed_rail_sessions(&mut app, vec![summary(first, 20), summary(second, 10)]);
+        assert_eq!(app.session_rail.selected_id(), Some(first));
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+        assert_eq!(app.session_rail.selected_id(), Some(second));
+        assert!(!app.session_rail.is_focused());
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+        assert_eq!(app.session_rail.selected_id(), Some(first));
+        assert!(!app.session_rail.is_focused());
+    }
+
+    #[test]
     fn rail_shortcuts_do_not_steal_composer_when_unfocused() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = configured_app(&tmp);

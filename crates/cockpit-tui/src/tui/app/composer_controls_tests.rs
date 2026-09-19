@@ -418,6 +418,58 @@ fn ctrl_p_opens_the_picker_replacing_an_open_overlay_pane() {
 }
 
 #[test]
+fn focused_btw_cannot_intercept_model_picker_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, mut control_rx) = app_with_runner(&tmp);
+    let _ = render(&mut app, 120, 24);
+    app.btw_pane = Some(super::btw_pane::BtwPane::new(
+        cockpit_proto::BtwForkInfo {
+            session_id: Uuid::new_v4(),
+            parent_session_id: Uuid::new_v4(),
+            short_id: Some("btw001".to_string()),
+            tangent: false,
+            created_at: 1,
+            message_count: 0,
+        },
+        false,
+    ));
+    let pane = app.btw_pane.as_mut().expect("btw pane");
+    pane.focused = true;
+    pane.composer.insert_str("side draft");
+
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    app.handle_key(press(KeyCode::Enter));
+    app.handle_key(press(KeyCode::Up));
+    app.handle_key(press(KeyCode::Enter));
+
+    match control_rx
+        .try_recv()
+        .expect("picker commit sends SetActiveModel")
+        .request
+    {
+        Request::SetActiveModel {
+            model,
+            persist_as_default,
+            ..
+        } => {
+            assert_eq!(model, "gpt-other");
+            assert!(!persist_as_default, "plain Enter is session-only");
+        }
+        other => panic!("expected SetActiveModel, got {other:?}"),
+    }
+    let pane = app.btw_pane.as_ref().expect("btw pane");
+    assert!(
+        pane.focused,
+        "the picker does not silently change pane focus"
+    );
+    assert_eq!(pane.composer.text(), "side draft");
+    assert!(
+        pane.history.is_empty(),
+        "picker Enter must not send or error in the side composer"
+    );
+}
+
+#[test]
 fn ctrl_k_router_dispatches_b_n_and_r_continuations() {
     let tmp = tempfile::tempdir().unwrap();
 

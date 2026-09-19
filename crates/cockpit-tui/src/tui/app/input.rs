@@ -686,6 +686,14 @@ impl App {
             return false;
         }
 
+        // An open composer picker owns its modal keys even when `/btw` had
+        // focus before the global chord opened it. Route the picker first so
+        // Enter/Esc cannot leak into the side composer. Ordinary keys that
+        // dismiss the picker still fall through to `/btw` below.
+        if self.composer_controls.picker.is_some() && self.handle_composer_control_key(key) {
+            return false;
+        }
+
         // The adopted global chords and the which-key leader above outrank a
         // focused `/btw` composer. Plain editing keys still belong to `/btw`,
         // but Ctrl+K followed by a leader action must be able to leave it.

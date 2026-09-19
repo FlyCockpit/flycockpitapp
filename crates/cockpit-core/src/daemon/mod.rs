@@ -83,8 +83,8 @@ pub mod remote_audit_upload;
 pub(crate) mod remote_outbox_worker;
 #[cfg(feature = "remote")]
 pub mod remote_project_resolver;
-pub(crate) mod retention_maintenance;
 pub mod rendezvous;
+pub(crate) mod retention_maintenance;
 #[cfg(feature = "extended")]
 pub mod scheduler;
 pub mod server;

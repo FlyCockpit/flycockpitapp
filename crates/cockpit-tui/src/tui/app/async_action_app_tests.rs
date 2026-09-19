@@ -95,14 +95,19 @@ fn latched_spawn_failure_shows_blocking_toast_and_clears_session_setup_loading()
 
     app.apply_runner_attach_result(
         crate::tui::async_action::AsyncActionId::from_raw_for_test(61),
-        Err("daemon spawn failed: bind failed: test reason".to_string()),
+        Err(
+            "daemon exited before reporting ready: bind failed: test reason\n\
+--- daemon.log (last 20 lines) ---\n\
+bind-line\n"
+                .to_string(),
+        ),
     );
 
     let toast = app.toast.as_ref().expect("blocking toast");
     assert!(toast.persistent, "spawn errors must not auto-expire");
     assert_eq!(toast.kind, super::ToastKind::Error);
     assert!(
-        toast.text.contains("bind failed: test reason"),
+        toast.text.contains("daemon exited before reporting ready"),
         "{}",
         toast.text
     );
@@ -112,10 +117,46 @@ fn latched_spawn_failure_shows_blocking_toast_and_clears_session_setup_loading()
         .expect("inline session setup");
     let error = pane.error_message().expect("session setup error");
     assert!(
-        error.contains("bind failed: test reason"),
+        error.contains("bind-line"),
         "session setup must show the spawn error, got {error}"
     );
     assert_eq!(app.launch.provider_line, "Daemon failed to start");
+}
+
+#[test]
+fn latched_non_spawn_attach_failure_does_not_claim_daemon_failed_to_start() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = configured_app_body(&tmp);
+    seed_pending_runner_attach(
+        &mut app,
+        63,
+        vec![super::RunnerAttachContinuation::RetryRetainedSubmissions],
+    );
+    app.pending_runner_attach.as_mut().unwrap().latch_error = true;
+
+    app.apply_runner_attach_result(
+        crate::tui::async_action::AsyncActionId::from_raw_for_test(63),
+        Err("session not found".to_string()),
+    );
+
+    assert!(
+        app.toast.is_none(),
+        "non-spawn attach errors must not block the UI"
+    );
+    assert_ne!(app.launch.provider_line, "Daemon failed to start");
+    let pane = app
+        .session_setup_inline
+        .as_ref()
+        .expect("inline session setup");
+    let error = pane.error_message().expect("session setup error");
+    assert!(
+        error.contains("session not found"),
+        "pane must show the attach error, got {error}"
+    );
+    assert!(
+        !error.contains("Daemon failed to start"),
+        "pane must not mislabel attach failures as daemon spawn errors: {error}"
+    );
 }
 
 #[test]

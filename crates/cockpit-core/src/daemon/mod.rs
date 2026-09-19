@@ -2727,10 +2727,12 @@ async fn run_foreground_inner_with_boot_db_impl(
                     | DaemonStatus::UnverifiedPid
             )
         {
-            return Err(DaemonBindInUse {
-                path: paths.socket.clone(),
-            }
-            .into());
+            anyhow::bail!(
+                "another daemon is already running or owns the shared pid file \
+                 (pid file: {}, socket: {})",
+                paths.pid_file.display(),
+                discovered.paths.socket.display()
+            );
         }
     }
     timer.phase("discover");

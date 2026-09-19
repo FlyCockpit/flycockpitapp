@@ -29,6 +29,10 @@ const WAIT_POLL: Duration = Duration::from_millis(10);
 const REAP_GRACE: Duration = Duration::from_millis(200);
 #[cfg(unix)]
 const PER_CONNECTION_READ_CAP: Duration = Duration::from_secs(1);
+#[cfg(unix)]
+const MIN_NOTIFY_READ_TIMEOUT: Duration = Duration::from_millis(1);
+#[cfg(unix)]
+const NOTIFY_BIND_ATTEMPTS: u32 = 32;
 
 #[cfg(unix)]
 static NOTIFY_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -400,45 +404,56 @@ fn unix_bind() -> Result<SpawnNotifyServer> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     use std::os::unix::net::UnixListener;
 
-    let path = short_notify_path()?;
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error).with_context(|| format!("removing leftover {}", path.display()));
+    for _ in 0..NOTIFY_BIND_ATTEMPTS {
+        let path = short_notify_path()?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("removing leftover {}", path.display()));
+            }
         }
-    }
-    let listener = UnixListener::bind(&path)
-        .with_context(|| format!("binding spawn notify socket {}", path.display()))?;
-    if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
-        cleanup_notify_socket(&path);
-        return Err(error).with_context(|| format!("chmod 0600 {}", path.display()));
-    }
-    let meta = match std::fs::symlink_metadata(&path) {
-        Ok(meta) => meta,
-        Err(error) => {
+        let listener = match UnixListener::bind(&path) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("binding spawn notify socket {}", path.display()));
+            }
+        };
+        if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        {
             cleanup_notify_socket(&path);
-            return Err(error).with_context(|| format!("stat {}", path.display()));
+            return Err(error).with_context(|| format!("chmod 0600 {}", path.display()));
         }
-    };
-    let file_type = meta.file_type();
-    let mode = meta.mode() & 0o777;
-    let owner = meta.uid();
-    // SAFETY: `geteuid` has no preconditions and cannot fail.
-    let euid = unsafe { libc::geteuid() };
-    if !file_type.is_socket() || owner != euid || mode != 0o600 {
-        cleanup_notify_socket(&path);
-        anyhow::bail!(
-            "refusing to use {}: expected owner-only socket (uid {euid}, mode 0600), \
-             got uid {owner} mode {mode:03o}",
-            path.display()
-        );
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(error) => {
+                cleanup_notify_socket(&path);
+                return Err(error).with_context(|| format!("stat {}", path.display()));
+            }
+        };
+        let file_type = meta.file_type();
+        let mode = meta.mode() & 0o777;
+        let owner = meta.uid();
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        if !file_type.is_socket() || owner != euid || mode != 0o600 {
+            cleanup_notify_socket(&path);
+            anyhow::bail!(
+                "refusing to use {}: expected owner-only socket (uid {euid}, mode 0600), \
+                 got uid {owner} mode {mode:03o}",
+                path.display()
+            );
+        }
+        if let Err(error) = listener.set_nonblocking(true) {
+            cleanup_notify_socket(&path);
+            return Err(error).context("setting spawn notify socket non-blocking");
+        }
+        return Ok(SpawnNotifyServer { listener, path });
     }
-    if let Err(error) = listener.set_nonblocking(true) {
-        cleanup_notify_socket(&path);
-        return Err(error).context("setting spawn notify socket non-blocking");
-    }
-    Ok(SpawnNotifyServer { listener, path })
+    bail!("could not bind a spawn notify socket after {NOTIFY_BIND_ATTEMPTS} attempts")
 }
 
 #[cfg(unix)]
@@ -483,6 +498,13 @@ fn unix_wait(
                 }
                 if verify_notify_peer(&stream, child.id()).is_err() {
                     continue;
+                }
+                if remaining < MIN_NOTIFY_READ_TIMEOUT {
+                    kill_spawned_daemon(child);
+                    return Err(error_with_log_tail(
+                        "timed out waiting for daemon to report ready",
+                        log_path,
+                    ));
                 }
                 let read_budget = remaining.min(PER_CONNECTION_READ_CAP);
                 stream

@@ -662,6 +662,10 @@ impl App {
     }
 
     pub(super) fn open_composer_picker(&mut self, kind: ComposerControlKind) {
+        // The picker is modal for arrows and Enter. Relinquish any queue-row
+        // focus at the shared open funnel so keyboard, slash, auth-recovery,
+        // and pill-click entry paths cannot leave two controls owning them.
+        self.blur_queue_focus();
         if self.composer_controls.pending.is_some() {
             self.invalidate_composer_control_ownership(false, true);
         }

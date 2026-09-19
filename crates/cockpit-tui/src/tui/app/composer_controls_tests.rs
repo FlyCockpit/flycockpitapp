@@ -470,6 +470,61 @@ fn focused_btw_cannot_intercept_model_picker_commit() {
 }
 
 #[test]
+fn focused_queue_cannot_intercept_model_picker_navigation_or_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, mut control_rx) = app_with_runner(&tmp);
+    let queued = queue_item("keep queued", QueueDeliveryClass::Held);
+    let queued_id = queued.id;
+    app.queue.push(queued);
+    let _ = render(&mut app, 120, 24);
+
+    app.handle_key(ctrl(KeyCode::Up));
+    assert_eq!(
+        app.queue_focus,
+        Some(queued_id),
+        "Ctrl+Up focuses the queue"
+    );
+
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    assert!(
+        app.queue_focus.is_none(),
+        "opening a modal picker relinquishes queue key ownership"
+    );
+    app.handle_key(press(KeyCode::Enter));
+    assert_eq!(
+        app.composer_controls.picker.as_ref().expect("open").level,
+        1,
+        "Enter drills into the provider"
+    );
+    app.handle_key(press(KeyCode::Up));
+    let picker = app.composer_controls.picker.as_ref().expect("open");
+    assert_eq!(
+        picker.categories[picker.category].items[picker.cursor].id,
+        "gpt-other"
+    );
+    app.handle_key(press(KeyCode::Enter));
+
+    match control_rx
+        .try_recv()
+        .expect("picker commit sends SetActiveModel")
+        .request
+    {
+        Request::SetActiveModel {
+            model,
+            persist_as_default,
+            ..
+        } => {
+            assert_eq!(model, "gpt-other");
+            assert!(!persist_as_default, "plain Enter is session-only");
+        }
+        other => panic!("expected SetActiveModel, got {other:?}"),
+    }
+    assert_eq!(app.queue.len(), 1, "picker keys do not alter the queue");
+    assert_eq!(app.queue[0].id, queued_id);
+    assert_eq!(app.queue[0].text, "keep queued");
+}
+
+#[test]
 fn ctrl_k_router_dispatches_b_n_and_r_continuations() {
     let tmp = tempfile::tempdir().unwrap();
 

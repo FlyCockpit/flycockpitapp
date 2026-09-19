@@ -450,6 +450,39 @@ fn model_picker_pins_favorites_annotates_failures_usage_drift_and_add_action() {
 }
 
 #[test]
+fn model_picker_refresh_preserves_provider_cursor_across_config_drift_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    app.config_drift = Some(super::ConfigDriftState {
+        config_provider: Some("openai".to_string()),
+        config_model: Some("configured-model".to_string()),
+    });
+
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    let selected_before = {
+        let picker = app.composer_controls.picker.as_ref().expect("picker");
+        assert_eq!(picker.level, 0);
+        assert_eq!(picker.categories[0].label, "Config drift");
+        assert_eq!(picker.categories[picker.cursor].label, "openai");
+        picker.categories[picker.cursor].id.clone()
+    };
+    assert_eq!(selected_before, "openai");
+
+    app.refresh_open_composer_model_picker();
+
+    let picker = app.composer_controls.picker.as_ref().expect("picker");
+    assert_eq!(picker.categories[picker.cursor].id, selected_before);
+    app.handle_key(press(KeyCode::Enter));
+    let picker = app.composer_controls.picker.as_ref().expect("model rows");
+    assert_eq!(picker.level, 1);
+    assert_eq!(picker.categories[picker.category].id, "openai");
+    assert_eq!(
+        picker.categories[picker.category].items[picker.cursor].id,
+        "gpt-test"
+    );
+}
+
+#[test]
 fn open_picker_wheel_hover_and_scrollbar_drag_move_selection() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app(&tmp);

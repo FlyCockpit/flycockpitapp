@@ -73,7 +73,7 @@ fn tui_pty_ctrl_p_changes_session_model_and_ctrl_enter_persists_default() {
     session.write_bytes(b"\n");
     session
         .wait_until_screen("session model changed", Duration::from_secs(10), |screen| {
-            screen.contains("fallback") && !screen.contains("ctrl+enter default")
+            screen.contains("[local/fallback]") && !screen.contains("ctrl+enter default")
         })
         .expect("arrow plus Enter changes the session model");
 
@@ -91,9 +91,13 @@ fn tui_pty_ctrl_p_changes_session_model_and_ctrl_enter_persists_default() {
         .wait_until_screen(
             "model item picker again",
             Duration::from_secs(5),
-            |screen| screen.contains("scripted") && screen.contains("fallback"),
+            |screen| {
+                screen.contains("scripted")
+                    && screen.contains("fallback")
+                    && screen.contains("› fallback")
+            },
         )
-        .expect("Enter drills into models again");
+        .expect("Enter drills into models again with the session model selected");
     session.settle_visible_state(Duration::from_secs(3));
     session.write_bytes(b"\x1b[13;5u");
     session
@@ -105,10 +109,6 @@ fn tui_pty_ctrl_p_changes_session_model_and_ctrl_enter_persists_default() {
         .expect("Ctrl+Enter commits the selected model");
     let config_path = session.home().config_dir().join("config.json");
     session.settle_visible_state(Duration::from_secs(3));
-    eprintln!(
-        "config after Ctrl+Enter: {:?}",
-        std::fs::read_to_string(&config_path)
-    );
     wait_until_blocking(
         "Ctrl+Enter persisted fallback default",
         Duration::from_secs(10),

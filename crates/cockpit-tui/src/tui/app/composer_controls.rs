@@ -655,7 +655,7 @@ impl App {
             picker.cursor = picker
                 .categories
                 .iter()
-                .position(|category| category.id == *provider)
+                .position(|category| category.id == *provider && category.label != "Config drift")
                 .unwrap_or(0);
         }
         if picker.categories.len() == 1 && kind != ComposerControlKind::Model {
@@ -1007,10 +1007,20 @@ impl App {
         if self.composer_controls.pending.is_some() {
             return;
         }
-        let category_id = previous
+        // At provider level the cursor, not `category`, is authoritative.
+        // `category` still names the last drilled-in provider and may be zero
+        // while config drift has inserted a synthetic row ahead of the active
+        // provider.  An async snapshot refresh must preserve the highlighted
+        // provider or Enter can unexpectedly drill into the drift action.
+        let category_index = if previous.level == 0 {
+            previous.cursor
+        } else {
+            previous.category
+        };
+        let category_identity = previous
             .categories
-            .get(previous.category)
-            .map(|category| category.id.clone());
+            .get(category_index)
+            .map(|category| (category.id.clone(), category.label.clone()));
         let item_id = (previous.level > 0)
             .then(|| {
                 previous
@@ -1028,11 +1038,11 @@ impl App {
             ..previous
         };
         self.fill_model_picker(&mut refreshed);
-        if let Some(category_id) = category_id
+        if let Some((category_id, category_label)) = category_identity
             && let Some(category) = refreshed
                 .categories
                 .iter()
-                .position(|category| category.id == category_id)
+                .position(|category| category.id == category_id && category.label == category_label)
         {
             refreshed.category = category;
             if refreshed.level == 0 {

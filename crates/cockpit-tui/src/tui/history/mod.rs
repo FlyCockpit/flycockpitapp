@@ -1946,6 +1946,7 @@ fn render_agent(
             AGENT_BULLET.width() + 1 // bullet + space
         };
     let indent_span = || Span::raw(" ".repeat(AGENT_INDENT));
+    let has_text = !text.trim().is_empty();
     let has_reasoning = !reasoning.trim().is_empty();
     // Pin/Fork and the timestamp live on the role header, so body rows need no
     // right-edge chrome reservation.
@@ -2017,7 +2018,7 @@ fn render_agent(
         // Prepare body content now, then append it after any expanded thought
         // block so narrow and wide layouts preserve the same reading order.
         let body_content_w = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
-        if markdown {
+        if markdown && has_text {
             let body = render_markdown_message_block(
                 text,
                 body_content_w,
@@ -2028,7 +2029,7 @@ fn render_agent(
             body_copy = Some(RenderedCopy::from_block(0, &body));
             body_lines = body.lines;
             body_conts = body.continuations;
-        } else if !text.trim().is_empty() {
+        } else if has_text {
             let wrapped = wrap_with_reserved_first_line(text, body_content_w, 0);
             let indent = " ".repeat(AGENT_INDENT);
             for (i, chunk) in wrapped.iter().enumerate() {
@@ -2192,7 +2193,9 @@ fn render_agent(
         // wrapped continuations don't go all the way to the right
         // edge.
         let body_content_w = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
-        let (body_lines, body_conts, body_copy) = if markdown {
+        let (body_lines, body_conts, body_copy) = if !has_text {
+            (Vec::new(), Vec::new(), None)
+        } else if markdown {
             // Pre-wrap the markdown lines ourselves so ratatui's
             // Paragraph::wrap doesn't strip the indent on
             // continuation rows.
@@ -2381,6 +2384,11 @@ fn render_agent(
                 conts.push(true);
             }
         }
+    } else if !has_text {
+        // Empty Markdown intentionally renders one logical row. An Agent with
+        // no answer text has no body, though: think-only finalized turns keep
+        // just their Thought block, and the pending renderer can put its caret
+        // directly on the final live-thinking row.
     } else if markdown {
         // No reasoning + markdown: emit markdown lines, attaching the
         // timestamp to the first line via right-edge padding. Every

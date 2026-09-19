@@ -4436,19 +4436,20 @@ impl App {
         }
     }
 
-    /// Router seam for #447's hideable session rail. Until that rail owns a
-    /// hidden state, the chord toggles keyboard focus on the existing rail.
-    fn toggle_session_sidebar_from_chord(&mut self) {
+    /// Router seam for #447's persisted hideable session rail.
+    pub(super) fn toggle_session_sidebar_from_chord(&mut self) {
         // Moving focus to the rail must also relinquish the composer control
         // deck; otherwise its picker still owns arrows and Enter.
         self.close_composer_picker();
         self.composer_controls.selection = None;
-        if self.session_rail.is_focused() {
-            let outcome = self.session_rail.handle_key(KeyEvent::from(KeyCode::Esc));
-            self.apply_session_rail_outcome(outcome);
-        } else {
-            self.session_rail.focus();
-            self.maybe_start_session_rail_list();
+        let visible = self.session_rail.toggle_visibility();
+        self.config_snapshot.extended.tui.session_rail_visible = visible;
+        #[cfg(not(test))]
+        match cockpit_config::extended::persist_global_session_rail_visible(visible) {
+            Ok(()) => self.resync_config_after_local_write(),
+            Err(error) => {
+                self.push_plain(format!("session rail preference was not saved: {error}"));
+            }
         }
     }
 

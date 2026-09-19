@@ -1,0 +1,42 @@
+# style runs: count:fg/bg/mod  (mod is - or BOLD+DIM+…)
+120x40
+0	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+1	1:Reset/Rgb(28,38,48)/- 2:Rgb(224,177,86)/Rgb(28,38,48)/- 7:Rgb(244,239,230)/Rgb(28,38,48)/BOLD 13:Reset/Rgb(28,38,48)/- 6:Indexed(109)/Rgb(28,38,48)/- 1:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+2	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+3	1:Reset/Rgb(28,38,48)/- 15:Rgb(224,177,86)/Rgb(28,38,48)/- 14:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+4	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+5	1:Reset/Rgb(28,38,48)/- 8:Indexed(109)/Rgb(28,38,48)/BOLD 21:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+6	1:Reset/Rgb(28,38,48)/- 28:Rgb(224,177,86)/Rgb(44,56,70)/BOLD 1:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+7	1:Reset/Rgb(28,38,48)/- 28:Rgb(224,177,86)/Rgb(44,56,70)/BOLD 1:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+8	1:Reset/Rgb(28,38,48)/- 28:Rgb(224,177,86)/Rgb(44,56,70)/BOLD 1:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+9	2:Reset/Rgb(28,38,48)/- 2:Rgb(217,106,106)/Rgb(28,38,48)/- 20:Rgb(244,239,230)/Rgb(28,38,48)/- 6:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+10	4:Reset/Rgb(28,38,48)/- 13:Indexed(109)/Rgb(28,38,48)/- 13:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+11	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+12	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+13	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+14	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+15	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+16	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+17	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+18	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+19	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+20	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+21	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+22	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+23	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+24	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+25	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+26	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+27	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+28	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+29	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+30	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+31	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+32	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+33	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+34	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+35	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+36	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+37	1:Reset/Rgb(28,38,48)/- 2:Rgb(224,177,86)/Rgb(28,38,48)/- 9:Indexed(109)/Rgb(28,38,48)/- 2:Rgb(217,106,106)/Rgb(28,38,48)/- 9:Indexed(109)/Rgb(28,38,48)/- 2:Rgb(127,201,138)/Rgb(28,38,48)/- 4:Indexed(109)/Rgb(28,38,48)/- 1:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+38	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
+39	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-

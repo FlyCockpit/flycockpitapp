@@ -94,6 +94,41 @@ fn message(seq: i64, text: &str) -> SessionMessage {
     }
 }
 
+fn golden_rail(selected: bool, hovered: Option<usize>, visible: bool) -> ratatui::buffer::Buffer {
+    let mut first = summary(Uuid::from_u128(1), 1_725_582_480_000);
+    first.title = Some("Build session rail".into());
+    first.favorite = true;
+    first.pin_count = 2;
+    let mut second = summary(Uuid::from_u128(2), 1_725_496_800_000);
+    second.title = Some("Waiting for approval".into());
+    second.open_interrupts = 1;
+    let mut rail = test_rail(vec![
+        (first, Tier::Processing),
+        (second, Tier::PendingQuestion),
+    ]);
+    rail.current_mut().selected_session_id = selected.then_some(Uuid::from_u128(1));
+    rail.hovered_card = hovered;
+    rail.set_visible(visible);
+    crate::tui::golden::render_frame(120, 40, |frame| {
+        let persistent = visible.then_some(Rect::new(0, 0, 30, 40));
+        rail.render(frame, persistent, None, None, 120);
+    })
+}
+
+#[test]
+fn golden_session_rail_open_hidden_hovered_and_selected_120x40() {
+    let _pins = crate::tui::golden::GoldenPins::install().allow_hover();
+    for (name, selected, hovered, visible) in [
+        ("open", false, None, true),
+        ("hidden-show", false, None, false),
+        ("hovered-row", false, Some(1), true),
+        ("selected-row", true, None, true),
+    ] {
+        let buffer = golden_rail(selected, hovered, visible);
+        crate::tui::golden::assert_golden("session-rail", name, 120, 40, &buffer);
+    }
+}
+
 #[test]
 fn named_width_tests_80_79_56_55() {
     assert!(matches!(
@@ -105,6 +140,10 @@ fn named_width_tests_80_79_56_55() {
     assert_eq!(
         RailLayoutMode::from_width(55),
         RailLayoutMode::HiddenUntilFocused
+    );
+    assert_eq!(
+        RailLayoutMode::from_width_and_preference(120, false),
+        RailLayoutMode::HiddenByPreference
     );
 }
 
@@ -204,6 +243,43 @@ fn unknown_metrics_are_omitted() {
     assert!(!text.contains("inbox"));
     assert!(!text.contains("archived"));
     assert!(!text.contains('★'));
+}
+
+#[test]
+fn rows_are_two_lines_with_a_bounded_selected_metadata_extension() {
+    let mut s = summary(Uuid::from_u128(1), 10);
+    s.pin_count = 2;
+    let plain = super::render::card_lines(&s, Tier::ToolRunning, false, true, 80, false);
+    let selected = super::render::card_lines(&s, Tier::ToolRunning, true, true, 80, false);
+    assert_eq!(plain.len(), 2);
+    assert_eq!(selected.len(), 3);
+    let meta: String = selected[2]
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    assert!(meta.contains("tool running"));
+    assert!(meta.contains("[alpha]"));
+    assert!(meta.contains("pin 2"));
+    assert!(selected[0].spans[0].content.contains('▌'));
+    assert!(selected[1].spans[0].content.contains('▌'));
+}
+
+#[test]
+fn activity_tiers_collapse_to_four_reference_dot_colours() {
+    for tier in [
+        Tier::ActiveSchedules,
+        Tier::ToolRunning,
+        Tier::InferenceInProgress,
+        Tier::Processing,
+    ] {
+        assert_eq!(tier.color(), crate::tui::theme::YELLOW);
+    }
+    for tier in [Tier::Interrupted, Tier::PendingQuestion, Tier::Unread] {
+        assert_eq!(tier.color(), crate::tui::theme::RED);
+    }
+    assert_eq!(Tier::Done.color(), crate::tui::theme::GOOD);
+    assert_eq!(Tier::Idle.color(), crate::tui::theme::DISABLED);
 }
 
 #[test]
@@ -629,20 +705,6 @@ fn capability_parity_table_covers_sessions_pane_operations() {
     ] {
         assert!(names.contains(&required), "missing parity row: {required}");
     }
-    let proofs = format!(
-        "{}\n{}\n{}",
-        include_str!("tests.rs"),
-        include_str!("../app/session_rail.rs"),
-        include_str!("../app/selection_copy_state_tests.rs"),
-    );
-    for row in capability_parity_table() {
-        assert!(
-            proofs.contains(&format!("fn {}(", row.proof)),
-            "missing named proof {} for {}",
-            row.proof,
-            row.operation
-        );
-    }
 }
 
 #[test]
@@ -1026,7 +1088,7 @@ fn replacement_favorite_after_attachment_change_is_not_wedged_by_stale_receipt()
 }
 
 #[test]
-fn unselected_cards_do_not_record_action_hits() {
+fn hover_actions_belong_only_to_the_hovered_row() {
     let selected = Uuid::from_u128(1);
     let other = Uuid::from_u128(2);
     let mut rail = test_rail(vec![
@@ -1041,30 +1103,107 @@ fn unselected_cards_do_not_record_action_hits() {
             rail.render(frame, Some(Rect::new(0, 0, 36, 24)), None, None, 80);
         })
         .unwrap();
-    assert!(
-        !rail.action_hits.is_empty(),
-        "selected card must expose action hits"
-    );
-    assert!(
-        rail.action_hits.iter().all(|hit| hit.index == 0),
-        "action hits must only cover the selected card"
-    );
     let other_card = rail
         .card_hits
         .iter()
         .find(|hit| hit.index == 1)
         .expect("unselected card hit");
-    let meta_row = other_card
-        .rect
-        .y
-        .saturating_add(other_card.rect.height.saturating_sub(2));
+    rail.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: other_card.rect.x.saturating_add(2),
+        row: other_card.rect.y,
+        modifiers: KeyModifiers::empty(),
+    });
+    terminal
+        .draw(|frame| {
+            rail.render(frame, Some(Rect::new(0, 0, 36, 24)), None, None, 80);
+        })
+        .unwrap();
+    assert!(
+        !rail.action_hits.is_empty(),
+        "hovered card must expose action hits"
+    );
+    assert!(
+        rail.action_hits.iter().all(|hit| hit.index == 1),
+        "action hits must only cover the hovered card"
+    );
+    let other_card = rail.card_hits.iter().find(|hit| hit.index == 1).unwrap();
     let outcome = rail.handle_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: other_card.rect.x.saturating_add(2),
-        row: meta_row,
+        row: other_card.rect.y,
         modifiers: KeyModifiers::empty(),
     });
     assert!(!matches!(outcome, Some(RailOutcome::Resume(_))));
     assert!(!matches!(outcome, Some(RailOutcome::SetFavorite { .. })));
     assert!(!matches!(outcome, Some(RailOutcome::Mutate(_))));
+
+    let delete = rail
+        .action_hits
+        .iter()
+        .find(|hit| hit.action == CardAction::Delete)
+        .expect("hovered row delete chip")
+        .rect;
+    let outcome = rail.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: delete.x,
+        row: delete.y,
+        modifiers: KeyModifiers::empty(),
+    });
+    assert!(outcome.is_none());
+    assert!(
+        matches!(rail.step, Step::Confirm { session_id, .. } if session_id == other),
+        "the × chip must enter the existing confirm-delete flow"
+    );
+}
+
+#[test]
+fn header_chips_route_visibility_and_new_session_outcomes() {
+    let mut rail = test_rail(vec![(summary(Uuid::from_u128(1), 10), Tier::Idle)]);
+    let backend = TestBackend::new(36, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            rail.render(frame, Some(Rect::new(0, 0, 36, 24)), None, None, 80);
+        })
+        .unwrap();
+
+    let toggle = rail.toggle_area.expect("hide chip hit area");
+    let new_session = rail.new_session_area.expect("new-session chip hit area");
+    assert!(matches!(
+        rail.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: toggle.x,
+            row: toggle.y,
+            modifiers: KeyModifiers::empty(),
+        }),
+        Some(RailOutcome::ToggleVisibility)
+    ));
+
+    assert!(matches!(
+        rail.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: new_session.x,
+            row: new_session.y,
+            modifiers: KeyModifiers::empty(),
+        }),
+        Some(RailOutcome::NewSession)
+    ));
+
+    rail.set_visible(false);
+    terminal
+        .draw(|frame| rail.render(frame, None, None, None, 80))
+        .unwrap();
+    let show = rail.toggle_area.expect("show chip hit area");
+    assert_eq!(show.x, 0);
+    assert_eq!(show.y, 0);
+    assert!(matches!(
+        rail.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: show.x,
+            row: show.y,
+            modifiers: KeyModifiers::empty(),
+        }),
+        Some(RailOutcome::ToggleVisibility)
+    ));
 }

@@ -146,6 +146,7 @@ impl App {
         self.clipboard_recovery = tui_cfg.clipboard_recovery;
         self.schedule_startup_clipboard_reconciliation();
         self.use_emojis = tui_cfg.use_emojis;
+        self.session_rail.set_visible(tui_cfg.session_rail_visible);
         self.file_icons = crate::tui::file_icons::file_icons_resolved(tui_cfg.file_icons);
         // Attention notification settings (implementation note):
         // pick up a `/settings` change so it takes effect immediately. The

@@ -77,6 +77,14 @@ impl App {
         match outcome {
             None => false,
             Some(RailOutcome::Unfocus) => true,
+            Some(RailOutcome::ToggleVisibility) => {
+                self.toggle_session_sidebar_from_chord();
+                true
+            }
+            Some(RailOutcome::NewSession) => {
+                self.pending_new_session = true;
+                true
+            }
             Some(RailOutcome::Resume(session_id)) => {
                 self.resume_session(session_id);
                 true
@@ -153,14 +161,14 @@ mod tests {
     fn configured_app(tmp: &tempfile::TempDir) -> App {
         let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         let cockpit = tmp.path().join(".cockpit");
-        std::fs::create_dir(&cockpit).unwrap();
+        std::fs::create_dir_all(&cockpit).unwrap();
         std::fs::write(
             cockpit.join("config.json"),
             r#"{"active_model":{"provider":"p","model":"m"}}"#,
         )
         .unwrap();
         let provider_dir = cockpit.join("providers");
-        std::fs::create_dir(&provider_dir).unwrap();
+        std::fs::create_dir_all(&provider_dir).unwrap();
         std::fs::write(
             provider_dir.join("p.json"),
             r#"{"url":"https://example.test","models":[{"id":"m"}]}"#,
@@ -295,6 +303,43 @@ mod tests {
     }
 
     #[test]
+    fn persistent_rail_remains_visible_under_owned_popover_surfaces() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let mut tools = configured_app(&tmp);
+        let command = *super::super::slash::SLASH_COMMANDS
+            .iter()
+            .find(|command| command.name == "tools")
+            .unwrap();
+        tools.execute_slash(command);
+        assert!(matches!(tools.overlay, Overlay::Tools(_)));
+        render_width(&mut tools, 120, 40);
+        assert!(tools.session_rail.rail_area().is_some());
+
+        let mut settings = configured_app(&tmp);
+        settings.dialog = Dialog::Settings(Box::new(crate::tui::settings::SettingsDialog::open(
+            tmp.path().join("config.json"),
+        )));
+        render_width(&mut settings, 120, 40);
+        assert!(settings.session_rail.rail_area().is_some());
+
+        let mut picker = configured_app(&tmp);
+        picker.open_model_picker();
+        assert!(matches!(picker.overlay, Overlay::ModelPicker(_)));
+        render_width(&mut picker, 120, 40);
+        assert!(picker.session_rail.rail_area().is_some());
+
+        let mut trust = configured_app(&tmp);
+        trust.dialog = Dialog::open_workspace_trust(cockpit_config::trust::TrustRoot {
+            opened_path: tmp.path().to_path_buf(),
+            root: tmp.path().to_path_buf(),
+            kind: cockpit_config::trust::TrustRootKind::Directory,
+        });
+        render_width(&mut trust, 120, 40);
+        assert!(trust.session_rail.rail_area().is_some());
+    }
+
+    #[test]
     fn ctrl_j_focuses_rail_and_escape_returns_to_composer() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = configured_app(&tmp);
@@ -345,6 +390,29 @@ mod tests {
             ),
             "Alt+↓ must leave a pending resume of the cycled-to session"
         );
+    }
+
+    #[test]
+    fn ctrl_b_visibility_survives_a_config_backed_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut first = configured_app(&tmp);
+        assert!(first.session_rail.is_visible());
+        first.handle_key(ctrl('b'));
+        assert!(!first.session_rail.is_visible());
+        assert!(!first.config_snapshot.extended.tui.session_rail_visible);
+
+        let persisted = first.config_snapshot.extended.clone();
+        let mut restarted = configured_app(&tmp);
+        restarted.config_snapshot.extended = persisted;
+        restarted.apply_tui_config_from_snapshot();
+        assert!(
+            !restarted.session_rail.is_visible(),
+            "a fresh app applies the persisted per-user TUI preference"
+        );
+
+        restarted.handle_key(ctrl('b'));
+        assert!(restarted.session_rail.is_visible());
+        assert!(restarted.config_snapshot.extended.tui.session_rail_visible);
     }
 
     #[test]

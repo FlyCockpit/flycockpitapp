@@ -65,6 +65,10 @@ pub struct TuiConfig {
     /// user opt in.
     #[serde(default)]
     pub use_emojis: bool,
+    /// Keep the session rail open when terminal width permits. This is a
+    /// user-level presentation preference, not session or project state.
+    #[serde(default = "default_true")]
+    pub session_rail_visible: bool,
     /// Nerd Font file-type icons on write/edit tool lines. `auto`
     /// (default) enables them on kitty, WezTerm, and Ghostty — terminals
     /// with builtin symbol fallback — and leaves them off elsewhere.
@@ -477,6 +481,7 @@ impl Default for TuiConfig {
             copy_on_release: true,
             exit_tail_lines: default_exit_tail_lines(),
             use_emojis: false,
+            session_rail_visible: true,
             file_icons: FileIconsSetting::default(),
             caffeinate_display_awake: false,
             attention: AttentionConfig::default(),

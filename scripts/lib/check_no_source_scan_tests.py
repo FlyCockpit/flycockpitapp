@@ -107,7 +107,6 @@ ALLOWLIST: tuple[tuple[str, int], ...] = (
     ("crates/cockpit-tui/src/tui/app/session_setup.rs", 4),
     ("crates/cockpit-tui/src/tui/app/startup_first_paint_tests.rs", 1),
     ("crates/cockpit-tui/src/tui/history/tests.rs", 2),
-    ("crates/cockpit-tui/src/tui/session_rail/tests.rs", 3),
     ("crates/cockpit-tui/src/tui/settings/image_sidecar/tests.rs", 1),
     ("crates/cockpit-tui/src/tui/settings/mcp_page.rs", 2),
     ("crates/cockpit-tui/src/tui/settings/pointer_acceptance_tests.rs", 2),

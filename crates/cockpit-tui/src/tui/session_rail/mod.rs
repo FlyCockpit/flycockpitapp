@@ -41,6 +41,8 @@ const DAEMON_UNAVAILABLE_HINT: &str =
 #[derive(Debug)]
 pub enum RailOutcome {
     Unfocus,
+    ToggleVisibility,
+    NewSession,
     Resume(Uuid),
     LoadList,
     LoadPreview {
@@ -286,6 +288,11 @@ pub struct SessionRail {
     last_frame_width: u16,
     confirm_buttons: crate::tui::button::ButtonRegistry,
     pointer_capture: bool,
+    visible: bool,
+    hovered_card: Option<usize>,
+    pointer_position: Option<(u16, u16)>,
+    toggle_area: Option<Rect>,
+    new_session_area: Option<Rect>,
     counts: RailRequestCounts,
 }
 
@@ -341,6 +348,11 @@ impl SessionRail {
             last_frame_width: 0,
             confirm_buttons: crate::tui::button::ButtonRegistry::default(),
             pointer_capture: false,
+            visible: true,
+            hovered_card: None,
+            pointer_position: None,
+            toggle_area: None,
+            new_session_area: None,
             counts: RailRequestCounts::default(),
         }
     }
@@ -362,8 +374,28 @@ impl SessionRail {
                 },
                 KeyBinding {
                     key: "Enter",
-                    action: "resume",
-                    desc: "resume the highlighted session",
+                    action: "open",
+                    desc: "open the highlighted session",
+                },
+                KeyBinding {
+                    key: "Tab",
+                    action: "preview",
+                    desc: "focus the selected session preview",
+                },
+                KeyBinding {
+                    key: "Ctrl+N",
+                    action: "new session",
+                    desc: "start a fresh session",
+                },
+                KeyBinding {
+                    key: "Alt+↑/↓",
+                    action: "switch",
+                    desc: "resume the previous or next session",
+                },
+                KeyBinding {
+                    key: "Ctrl+B",
+                    action: "hide/show",
+                    desc: "toggle the session rail",
                 },
                 KeyBinding {
                     key: "/",
@@ -469,6 +501,27 @@ impl SessionRail {
         self.use_emojis = use_emojis;
     }
 
+    pub fn set_visible(&mut self, visible: bool) {
+        self.visible = visible;
+        if !visible {
+            self.unfocus();
+        }
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    pub fn toggle_visibility(&mut self) -> bool {
+        self.set_visible(!self.visible);
+        self.visible
+    }
+
+    pub fn clear_hover(&mut self) {
+        self.hovered_card = None;
+        self.pointer_position = None;
+    }
+
     pub fn set_pointer_capture(&mut self, capture: bool) {
         self.pointer_capture = capture;
     }
@@ -484,6 +537,8 @@ impl SessionRail {
         self.search_area = None;
         self.compact_area = None;
         self.rail_area = None;
+        self.toggle_area = None;
+        self.new_session_area = None;
         self.confirm_buttons.begin_frame(self.pointer_capture, 1);
     }
 
@@ -499,7 +554,7 @@ impl SessionRail {
     }
 
     pub fn layout_mode(&self, width: u16) -> RailLayoutMode {
-        RailLayoutMode::from_width(width)
+        RailLayoutMode::from_width_and_preference(width, self.visible)
     }
 
     pub fn rail_area(&self) -> Option<Rect> {
@@ -1231,6 +1286,24 @@ impl SessionRail {
                 return self.pointer_activate_confirm(dispatch);
             }
             return None;
+        }
+        if matches!(mouse.kind, MouseEventKind::Moved) {
+            self.pointer_position = Some((mouse.column, mouse.row));
+            self.hovered_card = hit_card(&self.card_hits, mouse.column, mouse.row);
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self
+                .toggle_area
+                .is_some_and(|rect| point_in_rect(rect, mouse.column, mouse.row))
+        {
+            return Some(RailOutcome::ToggleVisibility);
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self
+                .new_session_area
+                .is_some_and(|rect| point_in_rect(rect, mouse.column, mouse.row))
+        {
+            return Some(RailOutcome::NewSession);
         }
         if let Some(compact) = self.compact_area
             && point_in_rect(compact, mouse.column, mouse.row)

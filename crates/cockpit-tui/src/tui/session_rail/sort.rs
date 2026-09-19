@@ -20,6 +20,8 @@ pub enum Tier {
     Unread,
     /// Read, with a pending question (`open_interrupts > 0`).
     PendingQuestion,
+    /// A viewed session with durable activity and no pending work.
+    Done,
     /// Read, idle, no pending question.
     Idle,
 }
@@ -34,6 +36,7 @@ impl Tier {
             Tier::Processing => "● working",
             Tier::Unread => "● unread",
             Tier::PendingQuestion => "● question pending",
+            Tier::Done => "● done",
             Tier::Idle => "idle",
         }
     }
@@ -48,17 +51,15 @@ impl Tier {
     }
 
     pub fn color(self) -> ratatui::style::Color {
-        use crate::tui::theme::MUTED_COLOR_INDEX;
-        use ratatui::style::Color;
+        use crate::tui::theme::{DISABLED, GOOD, RED, YELLOW};
         match self {
-            Tier::ActiveSchedules => Color::Green,
-            Tier::ToolRunning => Color::Blue,
-            Tier::InferenceInProgress => Color::Cyan,
-            Tier::Interrupted => Color::Red,
-            Tier::Processing => Color::Cyan,
-            Tier::Unread => Color::Yellow,
-            Tier::PendingQuestion => Color::Magenta,
-            Tier::Idle => Color::Indexed(MUTED_COLOR_INDEX),
+            Tier::ActiveSchedules
+            | Tier::ToolRunning
+            | Tier::InferenceInProgress
+            | Tier::Processing => YELLOW,
+            Tier::Interrupted | Tier::Unread | Tier::PendingQuestion => RED,
+            Tier::Done => GOOD,
+            Tier::Idle => DISABLED,
         }
     }
 
@@ -108,7 +109,11 @@ pub fn classify(summary: &SessionSummary, live: Option<(bool, bool)>) -> Tier {
     if summary.open_interrupts > 0 {
         return Tier::PendingQuestion;
     }
-    Tier::Idle
+    if summary.latest_activity_at_unix_ms.is_some() {
+        Tier::Done
+    } else {
+        Tier::Idle
+    }
 }
 
 fn is_unread(summary: &SessionSummary) -> bool {

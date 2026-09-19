@@ -1434,10 +1434,33 @@ impl App {
         self.session_rail.set_pointer_capture(self.mouse_capture);
         self.session_rail.begin_frame();
         let rects = geom.layout(frame.area());
+        let frame_width = frame.area().width;
+        // Stable rail seam for every chat-owned surface: carve the persistent
+        // column before choosing a dialog/overlay, so those surfaces can float
+        // in the remaining body without erasing navigation. #449/#450 build
+        // on this ordering; keep the split independent of overlay variants.
+        let (persistent_rail, chat_body) = self.session_rail.split_body(rects.body, frame_width);
+        let overlay_rail = self.session_rail.overlay_rail_rect(chat_body, frame_width);
+        let render_session_rail = self.onboarding_shell.is_none();
+        let popover_body = crate::tui::chrome::place_popover(
+            chat_body,
+            chat_body.width.saturating_sub(4).min(96).max(1),
+            geom.dialog
+                .max(12)
+                .min(chat_body.height.saturating_sub(2).max(1)),
+            chat_body,
+            crate::tui::chrome::PopoverSide::Center,
+        );
+        if self.startup_modal_on_top() == Some(StartupModal::WorkspaceTrust)
+            || self.dialog.is_active()
+            || self.overlay.is_open()
+        {
+            frame.render_widget(ratatui::widgets::Clear, popover_body);
+        }
 
         if self.startup_modal_on_top() == Some(StartupModal::WorkspaceTrust) {
             self.dialog
-                .render(frame, rects.body, &mut self.link_registry);
+                .render(frame, popover_body, &mut self.link_registry);
         } else if let Some(shell) = self.onboarding_shell.as_mut() {
             // Full-screen onboarding shell: it replaces the entire chat UI,
             // drawing its own chrome and delegating engine-stage content to
@@ -1449,7 +1472,7 @@ impl App {
             // it (codex bottom-pane style), so render the chat into `body`
             // and the dialog into the `compact` slot. The dialog owns the
             // cursor while it's open.
-            let body = self.render_chat_header(frame, rects.body);
+            let body = self.render_chat_header(frame, chat_body);
             self.render_chat_history_pane(frame, body);
             self.paint_transcript_control_buttons(frame);
             if let Some(dialog) = self.question_dialog.as_mut() {
@@ -1462,56 +1485,56 @@ impl App {
             }
         } else if self.dialog.is_active() {
             self.dialog
-                .render(frame, rects.body, &mut self.link_registry);
+                .render(frame, popover_body, &mut self.link_registry);
         } else {
             let overlay = std::mem::take(&mut self.overlay);
             match overlay {
                 Overlay::Multireview(dialog) => {
-                    dialog.render(frame, rects.body);
+                    dialog.render(frame, popover_body);
                     self.overlay = Overlay::Multireview(dialog);
                 }
                 Overlay::Stats(mut pane) => {
-                    pane.render(frame, rects.body);
+                    pane.render(frame, popover_body);
                     self.overlay = Overlay::Stats(pane);
                 }
                 Overlay::Usage(mut pane) => {
-                    pane.render(frame, rects.body);
+                    pane.render(frame, popover_body);
                     self.overlay = Overlay::Usage(pane);
                 }
                 Overlay::Skills(mut pane) => {
-                    pane.render(frame, rects.body);
+                    pane.render(frame, popover_body);
                     self.overlay = Overlay::Skills(pane);
                 }
                 Overlay::Tools(mut pane) => {
-                    pane.render(frame, rects.body);
+                    pane.render(frame, popover_body);
                     self.overlay = Overlay::Tools(pane);
                 }
                 Overlay::GoalSettings(mut pane) => {
-                    pane.render(frame, rects.body);
+                    pane.render(frame, popover_body);
                     self.overlay = Overlay::GoalSettings(pane);
                 }
                 Overlay::Permissions(mut pane) => {
-                    pane.render(frame, rects.body);
+                    pane.render(frame, popover_body);
                     self.overlay = Overlay::Permissions(pane);
                 }
                 Overlay::Resources(mut pane) => {
-                    pane.render_with_buttons(frame, rects.body, Some(&mut self.button_registry));
+                    pane.render_with_buttons(frame, popover_body, Some(&mut self.button_registry));
                     self.overlay = Overlay::Resources(pane);
                 }
                 Overlay::Quick(dialog) => {
-                    dialog.render(frame, rects.body);
+                    dialog.render(frame, popover_body);
                     self.overlay = Overlay::Quick(dialog);
                 }
                 Overlay::Context(mut pane) => {
-                    pane.render(frame, rects.body);
+                    pane.render(frame, popover_body);
                     self.overlay = Overlay::Context(pane);
                 }
                 Overlay::Notes(mut pane) => {
-                    pane.render(frame, rects.body);
+                    pane.render(frame, popover_body);
                     self.overlay = Overlay::Notes(pane);
                 }
                 Overlay::Leaks(mut pane) => {
-                    pane.render(frame, rects.body);
+                    pane.render(frame, popover_body);
                     // A render-time TTL expiry flags a clear; drive the screen
                     // scrub on the next wake.
                     if pane.take_pending_clear() {
@@ -1520,7 +1543,7 @@ impl App {
                     self.overlay = Overlay::Leaks(pane);
                 }
                 Overlay::Sealed(mut overlay) => {
-                    overlay.render(frame, rects.body);
+                    overlay.render(frame, popover_body);
                     // A render-time TTL expiry on a recover reveal flags a full
                     // clear so the plaintext cannot linger in the backbuffer.
                     if overlay.take_pending_clear() {
@@ -1529,30 +1552,26 @@ impl App {
                     self.overlay = Overlay::Sealed(overlay);
                 }
                 Overlay::Diff(mut pane) => {
-                    pane.render(frame, rects.body);
+                    pane.render(frame, popover_body);
                     self.overlay = Overlay::Diff(pane);
                 }
                 Overlay::SessionSetup(mut pane) => {
-                    pane.render(frame, rects.body);
+                    pane.render(frame, popover_body);
                     self.overlay = Overlay::SessionSetup(pane);
                 }
                 Overlay::AgentTree(mut pane) => {
-                    pane.render(frame, rects.body);
+                    pane.render(frame, popover_body);
                     self.overlay = Overlay::AgentTree(pane);
                 }
                 Overlay::GuidanceReview(mut pane) => {
-                    pane.render(frame, rects.body);
+                    pane.render(frame, popover_body);
                     self.overlay = Overlay::GuidanceReview(pane);
                 }
                 Overlay::Help(mut pane) => {
-                    pane.render(frame, rects.body);
+                    pane.render(frame, popover_body);
                     self.overlay = Overlay::Help(pane);
                 }
                 Overlay::None => {
-                    let frame_width = frame.area().width;
-                    let (persistent_rail, chat_body) =
-                        self.session_rail.split_body(rects.body, frame_width);
-                    let overlay_rail = self.session_rail.overlay_rail_rect(chat_body, frame_width);
                     // Carve the body for an embedded pane (GOALS §1i) when one
                     // is open: fullscreen fills the body, splits divide it. The
                     // chat history renders into whatever's left (or nowhere when
@@ -1591,14 +1610,6 @@ impl App {
                     if geom.pins > 0 {
                         self.render_pins_indicator(frame, rects.pins);
                     }
-                    self.session_rail.set_pointer_capture(self.mouse_capture);
-                    self.session_rail.render(
-                        frame,
-                        persistent_rail,
-                        overlay_rail,
-                        Some(&mut self.button_registry),
-                        frame_width,
-                    );
                     // Persistent below-input sandbox-down notice (§6.5). Shown while
                     // the shell sandbox can't initialize; geometry gives it rows.
                     // Persistent — it does not time out like a toast.
@@ -1619,6 +1630,16 @@ impl App {
                     }
                 }
             }
+        }
+        if render_session_rail {
+            self.session_rail.set_pointer_capture(self.mouse_capture);
+            self.session_rail.render(
+                frame,
+                persistent_rail,
+                overlay_rail,
+                Some(&mut self.button_registry),
+                frame_width,
+            );
         }
         // The collapsed-pill `more` popover floats over the transcript,
         // above the status row. Painted only when the header rendered.

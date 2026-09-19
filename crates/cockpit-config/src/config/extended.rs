@@ -2241,6 +2241,17 @@ pub fn load_global_daemon_lifetime_policy() -> Result<bool> {
     load_daemon_lifetime_policy_at(&path)
 }
 
+/// Persist the user-owned session-rail presentation preference in the global
+/// TUI config while preserving unknown and concurrently changed fields.
+pub fn persist_global_session_rail_visible(visible: bool) -> Result<()> {
+    let path = crate::config::dirs::global_config_file()?;
+    crate::config::dirs::ensure_global_config_dir()?;
+    let mut doc = ExtendedConfigDoc::load(&path)?;
+    let mut config = doc.config();
+    config.tui.session_rail_visible = visible;
+    doc.write(&config)
+}
+
 fn load_daemon_lifetime_policy_at(path: &Path) -> Result<bool> {
     if !path.exists() {
         return Ok(DaemonConfig::default().background_agents);

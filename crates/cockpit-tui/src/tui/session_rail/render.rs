@@ -2,24 +2,28 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
-    ActionHit, CardAction, CardHit, ColumnFocus, ConfirmChoice, LIST_LIMIT, PREVIEW_PAGE,
-    RailLayoutMode, SKELETON_CARDS, Scope, SessionRail, Step, card_description,
+    ActionHit, CardAction, CardHit, ConfirmChoice, LIST_LIMIT, PREVIEW_PAGE, RailLayoutMode,
+    SKELETON_CARDS, Scope, SessionRail, Step, card_description, point_in_rect,
 };
+use crate::tui::chrome::{clear_cells, fill_bg, paint_chip, scrollbar};
 use crate::tui::message_block::MessageBlockRole;
-use crate::tui::pane_shared::{boxed_row, short_id};
-use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
+use crate::tui::pane_shared::short_id;
+use crate::tui::theme::{
+    ACCENT_BLUE_INDEX, BRASS, BRASS_INDEX, GOOD, GOOD_INDEX, HOVER_BG, HOVER_BG_INDEX, INK,
+    INK_INDEX, MUTED_COLOR_INDEX, RED, RED_INDEX, SURFACE, SURFACE_INDEX, YELLOW, YELLOW_INDEX,
+    resolve_color,
+};
 use cockpit_proto::SessionSummary;
 
 impl SessionRail {
     /// Split the chat body into `(persistent_rail, remaining_chat)`. The
     /// overlay-sized focused rail is drawn later over `remaining_chat`.
     pub fn split_body(&self, body: Rect, frame_width: u16) -> (Option<Rect>, Rect) {
-        let mode = RailLayoutMode::from_width(frame_width);
+        let mode = self.layout_mode(frame_width);
         let persistent = mode.persistent_width(self.focused);
         if persistent == 0 || persistent >= body.width {
             return (None, body);
@@ -40,7 +44,7 @@ impl SessionRail {
     }
 
     pub fn overlay_rail_rect(&self, body: Rect, frame_width: u16) -> Option<Rect> {
-        let mode = RailLayoutMode::from_width(frame_width);
+        let mode = self.layout_mode(frame_width);
         if mode.shows_persistent_cards() || !self.focused {
             return None;
         }
@@ -64,16 +68,34 @@ impl SessionRail {
         self.last_frame_width = frame_width;
         self.begin_frame();
 
-        let mode = RailLayoutMode::from_width(frame_width);
+        let mode = self.layout_mode(frame_width);
+        if matches!(mode, RailLayoutMode::HiddenByPreference) {
+            self.render_show_toggle(frame);
+            return;
+        }
         if let Some(area) = overlay {
             self.render_wide(frame, area, extra);
         } else if let Some(area) = persistent {
             match mode {
                 RailLayoutMode::Wide { .. } => self.render_wide(frame, area, extra),
                 RailLayoutMode::Compact => self.render_compact_affordance(frame, area),
-                RailLayoutMode::HiddenUntilFocused => {}
+                RailLayoutMode::HiddenByPreference | RailLayoutMode::HiddenUntilFocused => {}
             }
         }
+    }
+
+    fn render_show_toggle(&mut self, frame: &mut Frame) {
+        let area = Rect::new(frame.area().x, frame.area().y, 6.min(frame.area().width), 1);
+        self.rail_area = Some(area);
+        self.toggle_area = Some(area);
+        paint_chip(
+            frame,
+            area,
+            "[Show]",
+            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+            self.pointer_position
+                .is_some_and(|(x, y)| point_in_rect(area, x, y)),
+        );
     }
 
     fn render_compact_affordance(&mut self, frame: &mut Frame, area: Rect) {
@@ -100,67 +122,111 @@ impl SessionRail {
         extra: Option<&mut crate::tui::button::ButtonRegistry>,
     ) {
         self.rail_area = Some(area);
-        let focused = self.focused;
-        let border = if focused {
-            Style::default().fg(Color::Indexed(ACCENT_BLUE_INDEX))
-        } else {
-            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX))
-        };
-        let title = self.title();
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(border)
-            .title(title);
-        let inner = block.inner(area);
-        frame.render_widget(Clear, area);
-        frame.render_widget(block, area);
+        let surface = resolve_color(SURFACE, SURFACE_INDEX);
+        fill_bg(frame, area, surface);
+        frame.render_widget(Block::default().style(Style::default().bg(surface)), area);
+        let inner = area.inner(ratatui::layout::Margin::new(1, 1));
         if inner.width == 0 || inner.height == 0 {
             return;
         }
-
-        let [search, body, help] = inner.layout(&Layout::vertical([
+        let [header, _, new_session, _, label, body, legend] = inner.layout(&Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ]));
-        self.search_area = Some(search);
-        self.render_search(frame, search);
+
+        let toggle_width = 6.min(header.width);
+        let title_area = Rect {
+            width: header.width.saturating_sub(toggle_width + 1),
+            ..header
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("◆ ", Style::default().fg(resolve_color(BRASS, BRASS_INDEX))),
+                Span::styled(
+                    "Cockpit",
+                    Style::default()
+                        .fg(resolve_color(INK, INK_INDEX))
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])),
+            title_area,
+        );
+        let toggle = Rect::new(
+            header.right().saturating_sub(toggle_width),
+            header.y,
+            toggle_width,
+            1,
+        );
+        self.toggle_area = Some(toggle);
+        paint_chip(
+            frame,
+            toggle,
+            "[Hide]",
+            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+            self.pointer_position
+                .is_some_and(|(x, y)| point_in_rect(toggle, x, y)),
+        );
+        let new_width = 15.min(new_session.width);
+        let new_area = Rect::new(new_session.x, new_session.y, new_width, 1);
+        self.new_session_area = Some(new_area);
+        paint_chip(
+            frame,
+            new_area,
+            " + New session ",
+            Style::default().fg(resolve_color(BRASS, BRASS_INDEX)),
+            self.pointer_position
+                .is_some_and(|(x, y)| point_in_rect(new_area, x, y)),
+        );
+        let label_text = if self.search.is_empty() {
+            "SESSIONS".to_string()
+        } else {
+            format!("SESSIONS /{}", self.search)
+        };
+        self.search_area = Some(label);
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                label_text,
+                Style::default()
+                    .fg(Color::Indexed(MUTED_COLOR_INDEX))
+                    .add_modifier(Modifier::BOLD),
+            )),
+            label,
+        );
         self.render_cards(frame, body);
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        frame.render_widget(Paragraph::new(self.help_line()).style(muted), help);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "● ",
+                    Style::default().fg(resolve_color(YELLOW, YELLOW_INDEX)),
+                ),
+                Span::styled(
+                    "working  ",
+                    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                ),
+                Span::styled("● ", Style::default().fg(resolve_color(RED, RED_INDEX))),
+                Span::styled(
+                    "waiting  ",
+                    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                ),
+                Span::styled("● ", Style::default().fg(resolve_color(GOOD, GOOD_INDEX))),
+                Span::styled(
+                    "done",
+                    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                ),
+            ])),
+            legend,
+        );
 
         if let Step::Confirm { .. } = &self.step {
             self.render_confirm(frame, inner, extra);
         } else {
             self.confirm_buttons.end_frame();
         }
-    }
-
-    fn render_search(&self, frame: &mut Frame, area: Rect) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        let focused = self.column_focus == ColumnFocus::Search && self.focused;
-        let prefix = if focused { "/" } else { " " };
-        let query = if self.search.is_empty() && !focused {
-            "search"
-        } else {
-            &self.search
-        };
-        let style = if focused {
-            Style::default().fg(Color::White)
-        } else {
-            muted
-        };
-        let disabled = self.loading && self.current().cards.is_empty();
-        let line = if disabled {
-            Line::from(Span::styled(" search disabled", muted))
-        } else {
-            Line::from(vec![
-                Span::styled(prefix.to_string(), style),
-                Span::styled(query.to_string(), style),
-            ])
-        };
-        frame.render_widget(Paragraph::new(line), area);
     }
 
     fn render_cards(&mut self, frame: &mut Frame, body: Rect) {
@@ -273,33 +339,35 @@ impl SessionRail {
         if let Some(level) = self.levels.last_mut() {
             level.row_offset = scroll;
         }
-        self.record_card_hits(body, scroll, &spans, &cards);
-        frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), body);
-        if self.last_content_rows > self.last_body_height && body.width > 1 && body.height > 0 {
-            let scrollbar_area = Rect::new(body.right().saturating_sub(1), body.y, 1, body.height);
-            let mut state = ScrollbarState::new(self.last_content_rows)
-                .position(scroll)
-                .viewport_content_length(self.last_body_height);
-            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(None)
-                .end_symbol(None)
-                .track_style(Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)))
-                .thumb_style(Style::default().fg(Color::Indexed(ACCENT_BLUE_INDEX)));
-            frame.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
+        let overflowing = self.last_content_rows > self.last_body_height;
+        let content_body = if overflowing && body.width > 1 {
+            Rect {
+                width: body.width - 1,
+                ..body
+            }
+        } else {
+            body
+        };
+        self.record_card_hits(content_body, scroll, &spans);
+        frame.render_widget(
+            Paragraph::new(lines).scroll((scroll as u16, 0)),
+            content_body,
+        );
+        if overflowing && body.width > 1 && body.height > 0 {
+            scrollbar(
+                frame,
+                body,
+                self.last_content_rows,
+                self.last_body_height,
+                scroll,
+            );
         }
+        self.paint_hover_actions(frame, content_body, scroll, &spans, &cards);
         let _ = (LIST_LIMIT, PREVIEW_PAGE);
     }
 
-    fn record_card_hits(
-        &mut self,
-        body: Rect,
-        scroll: usize,
-        spans: &[(usize, usize, usize)],
-        cards: &[(SessionSummary, super::Tier)],
-    ) {
+    fn record_card_hits(&mut self, body: Rect, scroll: usize, spans: &[(usize, usize, usize)]) {
         let mut hits = Vec::new();
-        let mut actions = Vec::new();
-        let selected_id = self.selected_id();
         for (index, start, end) in spans.iter().copied() {
             let visible_start = start.max(scroll);
             let visible_end = end.min(scroll + body.height as usize);
@@ -313,62 +381,97 @@ impl SessionRail {
                 height: (visible_end - visible_start) as u16,
             };
             hits.push(CardHit { index, rect });
-            let selected = Some(cards[index].0.session_id) == selected_id;
-            // Action labels are painted only on the selected card, on the
-            // second-to-last content line (above the bottom border). Hits
-            // exist only on that painted row.
-            let action_line = end.saturating_sub(2);
-            if selected
-                && rect.width >= 12
-                && action_line >= visible_start
-                && action_line < visible_end
-            {
-                let action_y = body.y + (action_line - scroll) as u16;
-                let mut x = rect.x.saturating_add(2);
-                for (label, action) in action_labels(&cards[index].0) {
-                    let width = (label.len() as u16).saturating_add(2).min(rect.width);
-                    if x.saturating_add(width) > rect.right() {
-                        break;
-                    }
-                    actions.push(ActionHit {
-                        index,
-                        action,
-                        rect: Rect {
-                            x,
-                            y: action_y,
-                            width,
-                            height: 1,
-                        },
-                    });
-                    x = x.saturating_add(width).saturating_add(1);
-                }
-            }
         }
         self.card_hits = hits;
-        self.action_hits = actions;
+        self.action_hits.clear();
+    }
+
+    /// excoc hover replacement: clear the datetime cells and right-align the
+    /// three pointer-only actions. Open/preview/forks/windows remain keyboard
+    /// operations and are intentionally absent from this row.
+    fn paint_hover_actions(
+        &mut self,
+        frame: &mut Frame,
+        body: Rect,
+        scroll: usize,
+        spans: &[(usize, usize, usize)],
+        cards: &[(SessionSummary, super::Tier)],
+    ) {
+        let Some(index) = self.hovered_card else {
+            return;
+        };
+        let Some((_, start, end)) = spans.iter().copied().find(|(i, _, _)| *i == index) else {
+            return;
+        };
+        let action_line = start + 1;
+        if action_line < scroll
+            || action_line >= scroll + body.height as usize
+            || action_line >= end
+        {
+            return;
+        }
+        let y = body.y + (action_line - scroll) as u16;
+        let selected = Some(cards[index].0.session_id) == self.selected_id();
+        let background = if selected {
+            resolve_color(HOVER_BG, HOVER_BG_INDEX)
+        } else {
+            resolve_color(SURFACE, SURFACE_INDEX)
+        };
+        let line = Rect::new(body.x, y, body.width, 1);
+        clear_cells(frame, line, background);
+        let labels = [
+            (
+                if cards[index].0.favorite {
+                    "[Unpin]"
+                } else {
+                    "[Pin]"
+                },
+                CardAction::Favorite,
+            ),
+            ("[Archive]", CardAction::Archive),
+            ("[×]", CardAction::Delete),
+        ];
+        let total = labels
+            .iter()
+            .map(|(label, _)| label.chars().count() as u16)
+            .sum::<u16>()
+            + 2;
+        if total + 1 > line.width {
+            return;
+        }
+        let mut x = line.right().saturating_sub(total + 1);
+        for (position, (label, action)) in labels.into_iter().enumerate() {
+            let width = label.chars().count() as u16;
+            let rect = Rect::new(x, y, width, 1);
+            let base = match action {
+                CardAction::Favorite if cards[index].0.favorite => {
+                    Style::default().fg(resolve_color(YELLOW, YELLOW_INDEX))
+                }
+                CardAction::Delete => Style::default().fg(resolve_color(RED, RED_INDEX)),
+                _ => Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+            };
+            let hovered = self
+                .pointer_position
+                .is_some_and(|(pointer_x, pointer_y)| point_in_rect(rect, pointer_x, pointer_y));
+            paint_chip(frame, rect, label, base.bg(background), hovered);
+            self.action_hits.push(ActionHit {
+                index,
+                action,
+                rect,
+            });
+            x = x.saturating_add(width);
+            if position < 2 {
+                x = x.saturating_add(1);
+            }
+        }
     }
 
     fn render_skeleton(&self, frame: &mut Frame, body: Rect) {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        let inner_w = (body.width as usize).saturating_sub(2).max(4);
         let mut lines = Vec::new();
         for _ in 0..SKELETON_CARDS {
-            lines.push(Line::from(Span::styled(
-                format!("╭{}╮", "─".repeat(inner_w)),
-                muted,
-            )));
-            lines.push(Line::from(Span::styled(
-                format!("│{}│", " ".repeat(inner_w)),
-                muted,
-            )));
-            lines.push(Line::from(Span::styled(
-                format!("│{}│", " ".repeat(inner_w)),
-                muted,
-            )));
-            lines.push(Line::from(Span::styled(
-                format!("╰{}╯", "─".repeat(inner_w)),
-                muted,
-            )));
+            lines.push(Line::from(Span::styled("  ••• loading".to_string(), muted)));
+            lines.push(Line::from(Span::styled("  —".to_string(), muted)));
         }
         frame.render_widget(Paragraph::new(lines), body);
     }
@@ -395,38 +498,6 @@ impl SessionRail {
         Line::from(Span::styled(text, muted))
     }
 
-    fn title(&self) -> Line<'static> {
-        let scope_label = match self.scope {
-            Scope::Project => "project",
-            Scope::All => "all",
-        };
-        let mut spans = vec![
-            Span::raw(" sessions "),
-            Span::styled(
-                format!("{scope_label} "),
-                Style::default().fg(Color::Yellow),
-            ),
-        ];
-        if self.show_archived {
-            spans.push(Span::styled(
-                "archived ",
-                Style::default().fg(Color::Magenta),
-            ));
-        }
-        if self.stale {
-            spans.push(Span::styled("stale ", Style::default().fg(Color::Yellow)));
-        }
-        Line::from(spans)
-    }
-
-    fn help_line(&self) -> Line<'static> {
-        if self.daemon_connected {
-            Line::from("↑/↓  ⏎ open  / search  f ★  a archived  Esc composer")
-        } else {
-            Line::from("browse only — no daemon")
-        }
-    }
-
     fn render_confirm(
         &mut self,
         frame: &mut Frame,
@@ -443,13 +514,13 @@ impl SessionRail {
         else {
             return;
         };
-        let h = 7u16.min(body.height);
-        let rect = Rect {
-            x: body.x,
-            y: body.y + body.height.saturating_sub(h),
-            width: body.width,
-            height: h,
-        };
+        let rect = crate::tui::chrome::place_popover(
+            body,
+            body.width.min(46),
+            body.height.min(7),
+            body,
+            crate::tui::chrome::PopoverSide::Center,
+        );
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -483,24 +554,6 @@ impl SessionRail {
             paint_confirm_buttons_into(extra, frame, inner, button_y, choice);
         }
     }
-}
-
-fn action_labels(summary: &SessionSummary) -> Vec<(&'static str, CardAction)> {
-    let mut out = vec![
-        ("Open", CardAction::Open),
-        ("Prev", CardAction::Preview),
-        (
-            if summary.favorite { "Un★" } else { "★" },
-            CardAction::Favorite,
-        ),
-    ];
-    if summary.archived_at_unix_ms.is_some() {
-        out.push(("Unarch", CardAction::Unarchive));
-    } else {
-        out.push(("Arch", CardAction::Archive));
-    }
-    out.push(("Del", CardAction::Delete));
-    out
 }
 
 fn paint_confirm_buttons_into(
@@ -556,117 +609,139 @@ pub fn card_lines(
     width: usize,
     use_emojis: bool,
 ) -> Vec<Line<'static>> {
-    let inner_w = width.saturating_sub(2).max(8);
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let border_style = if selected {
-        Style::default().fg(Color::Indexed(ACCENT_BLUE_INDEX))
+    let row_style = if selected {
+        Style::default()
+            .bg(resolve_color(HOVER_BG, HOVER_BG_INDEX))
+            .fg(resolve_color(BRASS, BRASS_INDEX))
+            .add_modifier(Modifier::BOLD)
     } else {
-        muted
+        Style::default().bg(resolve_color(SURFACE, SURFACE_INDEX))
     };
-
-    let mut out: Vec<Line<'static>> = Vec::new();
-    out.push(Line::from(Span::styled(
-        format!("╭{}╮", "─".repeat(inner_w)),
-        border_style,
-    )));
-
+    let prefix = if selected { "▌" } else { " " };
     let star = if s.favorite { "★ " } else { "" };
-    let desc = format!("{star}{}", card_description(s));
-    let status = Span::styled(tier.label_for(s), Style::default().fg(tier.color()));
-    out.push(boxed_row(
-        vec![
-            Span::styled(
-                desc,
-                if selected {
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::White)
-                },
-            ),
-            Span::raw("  "),
-            status,
-        ],
-        inner_w,
-        border_style,
-    ));
+    let title_budget = width.saturating_sub(3 + text_width(star));
+    let title = truncate_text(&card_description(s), title_budget);
+    let used = 3 + text_width(star) + text_width(&title);
+    let padding = " ".repeat(width.saturating_sub(used));
+    let title_line = Line::from(vec![
+        Span::styled(prefix, row_style),
+        Span::styled(
+            "● ",
+            if selected {
+                row_style
+            } else {
+                row_style.fg(tier.color())
+            },
+        ),
+        Span::styled(
+            star.to_string(),
+            if selected {
+                row_style
+            } else {
+                row_style.fg(resolve_color(YELLOW, YELLOW_INDEX))
+            },
+        ),
+        Span::styled(
+            title,
+            if selected {
+                row_style
+            } else {
+                row_style.fg(resolve_color(INK, INK_INDEX))
+            },
+        ),
+        Span::styled(padding, row_style),
+    ]);
 
-    let mut meta: Vec<Span<'static>> = vec![Span::styled(
-        fmt_time_with_relative(s.last_active_at_unix_ms),
-        muted,
-    )];
+    let when = fmt_time(s.last_active_at_unix_ms);
+    let when_text = format!("{prefix}  {when}");
+    let when_padding = " ".repeat(width.saturating_sub(text_width(&when_text)));
+    let when_line = Line::from(vec![
+        Span::styled(prefix, row_style),
+        Span::styled("  ", row_style),
+        Span::styled(
+            when,
+            if selected {
+                row_style
+            } else {
+                row_style.patch(muted)
+            },
+        ),
+        Span::styled(when_padding, row_style),
+    ]);
+
+    let mut out = vec![title_line, when_line];
+    if !selected {
+        return out;
+    }
+
+    // Bounded Cockpit product extension: only the selected row gets one
+    // additional line for its eight-tier label and durable product metadata.
+    // Every unselected row remains the reference's fixed two-line shape.
+    let mut meta = tier.label_for(s);
     if show_project {
-        meta.push(Span::raw("  "));
-        meta.push(Span::styled(
-            format!("[{}]", project_label(&s.project_root)),
-            muted,
-        ));
+        meta.push_str(&format!("  [{}]", project_label(&s.project_root)));
     }
     if s.archived_at_unix_ms.is_some() {
-        meta.push(Span::raw("  "));
-        meta.push(Span::styled(
-            "archived".to_string(),
-            Style::default().fg(Color::Magenta),
-        ));
+        meta.push_str("  archived");
     }
     if s.pin_count > 0 {
-        meta.push(Span::raw("  "));
         let pin = if use_emojis {
             format!("📌 {}", s.pin_count)
         } else {
             format!("pin {}", s.pin_count)
         };
-        meta.push(Span::styled(pin, Style::default().fg(Color::Yellow)));
+        meta.push_str(&format!("  {pin}"));
     }
     if s.assistant_inbox_unread > 0 {
-        meta.push(Span::raw("  "));
         let source = s
             .assistant_inbox_latest_source_session_id
             .map(|id| short_id(&id.to_string()))
             .unwrap_or_else(|| "unknown".to_string());
-        meta.push(Span::styled(
-            format!("inbox {} ← {source}", s.assistant_inbox_unread),
-            Style::default().fg(Color::Cyan),
-        ));
+        meta.push_str(&format!("  inbox {} ← {source}", s.assistant_inbox_unread));
     }
     if s.fork_count > 0 {
-        meta.push(Span::raw("  "));
-        meta.push(Span::styled(
-            format!("{} forks", s.fork_count),
-            Style::default().fg(Color::Cyan),
-        ));
+        meta.push_str(&format!("  {} forks", s.fork_count));
     }
     if s.lineage_window_count > 1 {
-        meta.push(Span::raw("  "));
-        meta.push(Span::styled(
-            format!("{} windows", s.lineage_window_count),
-            Style::default().fg(Color::Cyan),
-        ));
+        meta.push_str(&format!("  {} windows", s.lineage_window_count));
     }
-    out.push(boxed_row(meta, inner_w, border_style));
-
-    if selected {
-        let actions = action_labels(s)
-            .into_iter()
-            .map(|(label, _)| format!("[{label}]"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        out.push(boxed_row(
-            vec![Span::styled(
-                actions,
-                Style::default().fg(Color::Indexed(ACCENT_BLUE_INDEX)),
-            )],
-            inner_w,
-            border_style,
-        ));
-    }
-
-    out.push(Line::from(Span::styled(
-        format!("╰{}╯", "─".repeat(inner_w)),
-        border_style,
-    )));
+    let meta = truncate_text(&meta, width.saturating_sub(3));
+    let meta_text = format!("{prefix}  {meta}");
+    let padding = " ".repeat(width.saturating_sub(text_width(&meta_text)));
+    out.push(Line::from(vec![
+        Span::styled(prefix, row_style),
+        Span::styled("  ", row_style),
+        Span::styled(meta, row_style),
+        Span::styled(padding, row_style),
+    ]));
     out
+}
+
+fn truncate_text(text: &str, width: usize) -> String {
+    if text_width(text) <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let content_width = width.saturating_sub(1);
+    let mut used = 0;
+    let mut out = String::new();
+    for ch in text.chars() {
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + char_width > content_width {
+            break;
+        }
+        out.push(ch);
+        used += char_width;
+    }
+    out.push('…');
+    out
+}
+
+fn text_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
 }
 
 fn fmt_time(epoch_unix_ms: i64) -> String {
@@ -676,53 +751,9 @@ fn fmt_time(epoch_unix_ms: i64) -> String {
     }
     use chrono::{Local, TimeZone};
     match Local.timestamp_millis_opt(epoch_unix_ms).single() {
-        Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
+        Some(dt) => dt.format("%b %-d, %H:%M").to_string(),
         None => "—".to_string(),
     }
-}
-
-fn fmt_time_with_relative(epoch_unix_ms: i64) -> String {
-    #[cfg(any(test, feature = "test-support"))]
-    if let Some(pinned) = crate::tui::golden::pinned_datetime() {
-        return pinned.to_string();
-    }
-    let elapsed_ms = chrono::Utc::now()
-        .timestamp_millis()
-        .saturating_sub(epoch_unix_ms);
-    format!(
-        "{} · {}",
-        relative_time(elapsed_ms / 1_000),
-        fmt_time(epoch_unix_ms)
-    )
-}
-
-fn relative_time(elapsed_secs: i64) -> String {
-    fn unit(n: i64, singular: &str) -> String {
-        if n == 1 {
-            format!("1 {singular} ago")
-        } else {
-            format!("{n} {singular}s ago")
-        }
-    }
-    if elapsed_secs < 60 {
-        return "just now".to_string();
-    }
-    let minutes = elapsed_secs / 60;
-    if minutes < 60 {
-        return unit(minutes, "minute");
-    }
-    let hours = elapsed_secs / 3_600;
-    if hours < 48 {
-        return unit(hours, "hour");
-    }
-    let days = elapsed_secs / 86_400;
-    if days < 30 {
-        return unit(days, "day");
-    }
-    if days < 365 {
-        return unit(days / 30, "month");
-    }
-    unit(days / 365, "year")
 }
 
 fn project_label(root: &str) -> String {

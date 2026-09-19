@@ -1075,6 +1075,20 @@ fn vim_mode_round_trips_through_extended_doc() {
 }
 
 #[test]
+fn session_rail_visibility_round_trips_through_tui_config() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+    let mut config = doc.config();
+    assert!(config.tui.session_rail_visible);
+    config.tui.session_rail_visible = false;
+    doc.write(&config).unwrap();
+
+    let restarted = ExtendedConfigDoc::load(&path).unwrap().config();
+    assert!(!restarted.tui.session_rail_visible);
+}
+
+#[test]
 fn unknown_root_keys_survive_write() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");

@@ -124,6 +124,7 @@ fn transcript_json_from_history(history: &[proto::HistoryEntry]) -> Value {
                 original_input,
                 output,
                 hard_fail,
+                pre_write_content,
                 ..
             } => {
                 if is_edit_tool(tool)
@@ -141,14 +142,23 @@ fn transcript_json_from_history(history: &[proto::HistoryEntry]) -> Value {
                 }
                 let presentation =
                     crate::engine::tool::known_tool_presentation(tool, original_input);
-                if is_write_tool(tool) {
+                if is_write_tool(tool)
+                    && let Some((path, new)) = extract_write_args(original_input)
+                {
                     flush_tool_calls(&mut turns, &mut pending_tool_calls);
+                    let old = pre_write_content.as_deref().unwrap_or("");
+                    let verb = if pre_write_content.is_some() {
+                        "edited"
+                    } else {
+                        "created"
+                    };
                     turns.push(json!({
-                        "type": "tool_call",
-                        "call_id": call_id,
+                        "type": "diff",
+                        "verb": verb,
                         "tool": tool,
-                        "summary": presentation.summary,
-                        "state": tool_state_str(*hard_fail),
+                        "path": path,
+                        "old": old,
+                        "new": new,
                     }));
                     continue;
                 }
@@ -356,6 +366,10 @@ fn extract_edit_args(args: &Value) -> Option<(&str, &str, &str)> {
         args.get("old_string")?.as_str()?,
         args.get("new_string")?.as_str()?,
     ))
+}
+
+fn extract_write_args(args: &Value) -> Option<(&str, &str)> {
+    Some((args.get("path")?.as_str()?, args.get("content")?.as_str()?))
 }
 
 /// Sanitize a `provider`/`model` id for use in a tandem export filename:

@@ -329,8 +329,41 @@ impl Tool for WriteTool {
             message.push_str(&validation.confirmation_note());
         }
 
-        Ok(ToolOutput::text(message))
+        let pre_write_content = bounded_pre_write_content(&ctx.redact, existing_before.as_deref());
+        let mut output = ToolOutput::text(message);
+        output.pre_write_content = pre_write_content;
+        Ok(output)
     }
+}
+
+/// Byte cap for pre-write bodies surfaced to the TUI diff renderer (matches the
+/// approval write-preview diff budget).
+pub(crate) const PRE_WRITE_CONTENT_BYTE_CAP: usize = 12 * 1024;
+
+/// Capture the on-disk body immediately before a `write`, redacted and capped.
+/// `None` means the path did not exist (new file).
+pub(crate) fn bounded_pre_write_content(
+    redact: &crate::redact::RedactionTable,
+    existing: Option<&[u8]>,
+) -> Option<String> {
+    let bytes = existing?;
+    if crate::tools::common::looks_binary(bytes) {
+        return Some(format!("… [binary file, {} bytes]", bytes.len()));
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let scrubbed = redact.scrub(text.as_ref());
+    if scrubbed.len() <= PRE_WRITE_CONTENT_BYTE_CAP {
+        return Some(scrubbed);
+    }
+    let truncated = crate::tools::common::truncate_head_tail_redacted(
+        redact,
+        &scrubbed,
+        PRE_WRITE_CONTENT_BYTE_CAP,
+    );
+    let omitted = scrubbed.len().saturating_sub(truncated.len());
+    Some(format!(
+        "{truncated}\n… [pre-write content truncated; {omitted} bytes omitted]"
+    ))
 }
 
 #[async_trait]
@@ -2352,6 +2385,37 @@ mod tests {
             !ctx.locks
                 .has_read(&file, &ctx.lock_identity, ctx.session.id)
         );
+    }
+
+    #[tokio::test]
+    async fn write_new_file_omits_pre_write_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let out = WriteTool
+            .call(
+                serde_json::json!({"path": "created.md", "content": "hello\n"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.pre_write_content.is_none());
+    }
+
+    #[tokio::test]
+    async fn write_existing_file_surfaces_pre_write_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let file = tmp.path().join("existing.md");
+        std::fs::write(&file, "before\n").unwrap();
+        note_read(&ctx, &file).await;
+        let out = WriteTool
+            .call(
+                serde_json::json!({"path": "existing.md", "content": "after\n"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.pre_write_content.as_deref(), Some("before\n"));
     }
 
     #[tokio::test]

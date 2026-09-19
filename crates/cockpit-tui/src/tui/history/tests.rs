@@ -2103,6 +2103,7 @@ fn historical_lock_verb_tool_calls_still_render() {
         path: "src/lib.rs".to_string(),
         old: "old\n".to_string(),
         new: "new\n".to_string(),
+        verb: DiffVerb::Edited,
     };
     let rendered_edit = render_entry(
         &edit_diff,
@@ -2626,6 +2627,7 @@ fn tool_line_and_diff_use_reference_chrome_without_file_icons() {
         path: "src/lib.rs".to_string(),
         old: "old\n".to_string(),
         new: "new\n".to_string(),
+        verb: DiffVerb::Edited,
     };
     let diff_on = render_entry(
         &diff,
@@ -3601,6 +3603,7 @@ fn tool_call_view_filter_classifies_only_model_tool_presentations() {
             path: "src/lib.rs".to_string(),
             old: "old".to_string(),
             new: "new".to_string(),
+            verb: DiffVerb::Edited,
         }
         .is_tool_call_entry()
     );

@@ -694,6 +694,7 @@ impl McpChildEventRecorder {
                         truncated: false,
                         seq,
                         hint: None,
+                        pre_write_content: None,
                     })
                     .await;
             }

@@ -1119,6 +1119,10 @@ pub enum Event {
         /// keeps the NDJSON wire backward-compatible with older peers.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hint: Option<String>,
+        /// Pre-write file body for `write` tool calls (`None` when the path did
+        /// not exist). UI-only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pre_write_content: Option<String>,
     },
 
     /// A resource-managed tool call is waiting for scheduler permits. UI-only:

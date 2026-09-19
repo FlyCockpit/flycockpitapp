@@ -91,8 +91,7 @@ async fn build_redacted_transcript_json_bytes(
     let extended = crate::config::extended::load_for_cwd(&root);
     let base =
         RedactionTable::build_with_env_and_credential_store(&extended.redact, &root, &env, &store)?;
-    super::build_redacted_transcript_json_bytes(db, target, vault, resolver, Arc::new(base))
-        .await
+    super::build_redacted_transcript_json_bytes(db, target, vault, resolver, Arc::new(base)).await
 }
 
 async fn trusted_build_zip_with_options(
@@ -5858,4 +5857,59 @@ async fn assistant_message_export_retains_response_performance() {
     assert_eq!(arr[0]["response_performance"]["encoding"], "cl100k_base");
     // attempt_id must not appear in export.
     assert!(arr[0].get("attempt_id").is_none());
+}
+
+#[test]
+fn write_pre_write_content_scrubbed_in_transcript_and_export_json() {
+    const SECRET: &str = "sk-write-pre-write-redact-xyzzy";
+    let history = vec![proto::HistoryEntry::ToolCall {
+        seq: 1,
+        agent: "Build".to_string(),
+        call_id: "write-1".to_string(),
+        parent_call_id: None,
+        parent_child_index: None,
+        tool: "write".to_string(),
+        mcp_server: None,
+        mcp_builtin: None,
+        mcp_kind: None,
+        original_input: serde_json::json!({
+            "path": "src/main.rs",
+            "content": "after\n"
+        }),
+        wire_input: serde_json::json!({
+            "path": "src/main.rs",
+            "content": "after\n"
+        }),
+        recovery_kind: None,
+        recovery_stage: None,
+        output: "wrote".to_string(),
+        hard_fail: false,
+        truncated: false,
+        hint: None,
+        pre_write_content: Some(format!("before {SECRET}\n")),
+    }];
+    let transcript = super::transcript_json_from_history(&history);
+    let diff = transcript
+        .as_array()
+        .and_then(|turns| turns.first())
+        .expect("write diff turn");
+    assert_eq!(diff["type"], "diff");
+    assert_eq!(diff["verb"], "edited");
+    assert_eq!(diff["old"], format!("before {SECRET}\n"));
+
+    let table = RedactionTable::empty()
+        .with_forced_literal(SECRET.to_string(), "$redacted:pre-write".to_string())
+        .unwrap();
+    let scrubbed_old = table.scrub(diff["old"].as_str().expect("old string"));
+    assert!(
+        !scrubbed_old.contains(SECRET),
+        "pre-write body must be redacted before export: {scrubbed_old}"
+    );
+    let mut export_turn = diff.clone();
+    super::redact_value_for_export(&mut export_turn, &table);
+    let export_old = export_turn["old"].as_str().expect("export old");
+    assert!(
+        !export_old.contains(SECRET),
+        "export transcript turn must scrub pre-write content: {export_old}"
+    );
 }

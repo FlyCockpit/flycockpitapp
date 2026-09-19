@@ -2609,6 +2609,10 @@ pub enum HistoryEntry {
         /// compatible with rows/peers that predate the hint layer.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hint: Option<String>,
+        /// Pre-write file body for `write` tool calls (`None` when the path did
+        /// not exist). UI/timeline only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pre_write_content: Option<String>,
     },
     /// Display-only terminal inference failure restored into attach history.
     /// Never enters model-bound rehydration context.

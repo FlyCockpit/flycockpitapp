@@ -1203,6 +1203,9 @@ pub struct ToolOutput {
     /// persisting it onto the durable event, and the exporter writes it as a
     /// sidecar file.
     pub output_sidecar: Option<ToolOutputSidecar>,
+    /// Pre-write file body for `write` tool calls (`None` when the path did not
+    /// exist). UI/timeline only — never enters model-facing content.
+    pub pre_write_content: Option<String>,
     /// True when the dispatcher abandoned the call (timeout or cancel) after
     /// handing it to the tool. Host receipt is then unknown: a verification
     /// dispatch that already entered `executing` must settle `Unknown`, not
@@ -1583,7 +1586,8 @@ impl ToolOutput {
                 "resource": { "x-cockpit-model-ephemeral": true },
                 "exit_code": { "x-cockpit-model-ephemeral": true },
                 "output_sidecar": { "x-cockpit-model-ephemeral": true },
-                "display": { "x-cockpit-model-ephemeral": true }
+                "display": { "x-cockpit-model-ephemeral": true },
+                "pre_write_content": { "x-cockpit-model-ephemeral": true }
             }
         })
     }
@@ -1615,6 +1619,12 @@ impl ToolOutput {
         if let Some(display) = &self.display_content {
             metadata.insert("display".to_string(), Value::String(display.clone()));
         }
+        if let Some(pre_write_content) = &self.pre_write_content {
+            metadata.insert(
+                "pre_write_content".to_string(),
+                Value::String(pre_write_content.clone()),
+            );
+        }
         metadata
     }
 
@@ -1634,6 +1644,7 @@ impl ToolOutput {
             resource: None,
             exit_code: None,
             output_sidecar: None,
+            pre_write_content: None,
             host_effect_unknown: false,
         }
     }
@@ -1654,6 +1665,7 @@ impl ToolOutput {
             resource: None,
             exit_code: None,
             output_sidecar: None,
+            pre_write_content: None,
             host_effect_unknown: false,
         }
     }

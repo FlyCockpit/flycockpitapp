@@ -2998,6 +2998,10 @@ async fn execute_ordinary_call_unscoped(
                 // audit row and its session timeline row committed.
                 seq: tool_call_seq.filter(|_| tool_audit_committed),
                 hint: bash_hint.as_ref().map(|h| h.user_chip.text.clone()),
+                pre_write_content: result
+                    .as_ref()
+                    .ok()
+                    .and_then(|out| out.pre_write_content.clone()),
             })
             .await;
     }

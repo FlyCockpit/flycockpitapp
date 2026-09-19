@@ -223,6 +223,7 @@ fn converts_user_assistant_tool_call_to_tui_entries() {
             hard_fail: false,
             truncated: false,
             hint: None,
+            pre_write_content: None,
         },
     ];
 
@@ -310,6 +311,7 @@ fn consecutive_tool_calls_coalesce_into_one_box() {
         hard_fail: false,
         truncated: false,
         hint: None,
+        pre_write_content: None,
     };
     let entries = wire_history_to_entries(vec![tc("a"), tc("b"), tc("c")]);
     assert_eq!(entries.len(), 1, "one box holds all three calls");

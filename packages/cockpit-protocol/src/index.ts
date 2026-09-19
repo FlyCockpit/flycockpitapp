@@ -1877,6 +1877,7 @@ const historyEntryWireSchema = z.discriminatedUnion("role", [
       hard_fail: z.boolean(),
       truncated: z.boolean(),
       hint: z.string().optional(),
+      pre_write_content: z.string().optional(),
     })
     .passthrough(),
   z

@@ -652,16 +652,21 @@ fn is_addr_in_use(error: &std::io::Error) -> bool {
     }
 }
 
-/// Filesystem roots a confined child must never reach: the daemon state
-/// directory (pid, endpoint, capability file, fallback socket) and the
-/// runtime directory (canonical socket + leak-reveal socket).
+/// Filesystem roots a confined child must never reach: the legacy daemon
+/// state/runtime directories and the database-identity-scoped rendezvous
+/// directory that owns the current socket, pid, locks, and capabilities.
 pub fn control_plane_deny_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(state) = state_dir() {
-        paths.push(state);
+        push_unique_deny_path(&mut paths, state);
     }
     if let Some(rt) = runtime_dir() {
-        paths.push(rt);
+        push_unique_deny_path(&mut paths, rt);
+    }
+    if let Ok(canonical) = DaemonPaths::resolve_canonical()
+        && let Some(rendezvous) = canonical.socket.parent()
+    {
+        push_unique_deny_path(&mut paths, rendezvous.to_path_buf());
     }
     paths
 }

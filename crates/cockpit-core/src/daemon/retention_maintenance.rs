@@ -111,7 +111,7 @@ pub(crate) async fn run_retention_maintenance_pass(ctx: Arc<DaemonContext>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::server::test_ctx;
+    use crate::daemon::server::{disk_test_ctx, test_ctx};
     use std::time::{Duration, Instant};
     use tokio::sync::oneshot;
 
@@ -166,5 +166,55 @@ mod tests {
             .await
             .expect("worker should exit after the admitted pass finishes")
             .expect("worker join");
+    }
+
+    /// Regression for the pre-worker inline arm: if `run_accept_loop` ever
+    /// awaits `run_retention_tick` inline again, the tick fires inside the
+    /// test window (paused clock advanced far past the 6h default sweep
+    /// interval) and parks on the stalled writer — every retention pass
+    /// issues at least one write (`prune_session_payloads` with the default
+    /// positive windows) — so the loop cannot observe drain and this test
+    /// fails on the accept-loop timeout.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn accept_loop_does_not_run_retention_ticks_inline() {
+        let dir = cockpit_test_support::isolated_tempdir();
+        let db_path = dir.path().join("retention-inline.db");
+        let spool = dir.path().join("spool");
+        let ctx = disk_test_ctx(&db_path, &spool);
+        let stall = ctx.db.stall_writer_for_test().expect("stall writer");
+        let socket = dir.path().join("retention-inline.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind test unix socket");
+        let accept = tokio::spawn(crate::daemon::server::run_accept_loop(
+            ctx.clone(),
+            listener,
+        ));
+        // Advance the paused clock just past the retention sweep interval (6h
+        // default; a restored inline arm would also grind a 60s editor tick
+        // per virtual hour, so keep the jump small) so a restored inline
+        // retention arm would have fired and parked on the stalled writer
+        // before drain begins. With the dedicated worker owning retention,
+        // the accept loop has no such arm and never touches the database.
+        for hour in 0..7 {
+            eprintln!("PROBE hour={hour} virtual={:?} wall={:?}", tokio::time::Instant::now(), std::time::Instant::now());
+            tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+        }
+        eprintln!("PROBE sleep-done virtual={:?}", tokio::time::Instant::now());
+        let started = Instant::now();
+        assert!(
+            ctx.shutdown_signal().begin_drain(),
+            "test owns the first drain"
+        );
+        tokio::time::timeout(Duration::from_secs(5), accept)
+            .await
+            .expect("accept loop must not await retention ticks inline")
+            .expect("accept task")
+            .expect("accept loop ok");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "accept loop took {:?} while the db writer was stalled",
+            started.elapsed()
+        );
+        drop(stall);
     }
 }

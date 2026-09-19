@@ -1873,16 +1873,28 @@ async fn drain_daemon_context(
     ctx: &std::sync::Arc<server::DaemonContext>,
     grace: Duration,
 ) -> Result<()> {
-    ctx.shutdown_signal()
-        .wait_for_admitted_maintenance_drain(grace)
-        .await;
+    // One shared deadline: admitted maintenance passes and `drain_all` draw
+    // from the same grace window, so a stuck pass can stretch stop latency to
+    // the grace bound but never to a multiple of it.
+    let drain_deadline = tokio::time::Instant::now() + grace;
+    if !ctx
+        .shutdown_signal()
+        .wait_for_admitted_maintenance_drain(drain_deadline)
+        .await
+    {
+        tracing::warn!(
+            remaining = ctx.shutdown_signal().admitted_guidance_passes(),
+            "daemon: maintenance passes still admitted at the drain deadline; proceeding"
+        );
+    }
     // `drain_all` owns the ordered shutdown deadlines: first make every
-    // resumable interrupt and paused-work row durable, then apply `grace` to
-    // the remaining running work.  A parallel timer starting here would force
-    // the shared shutdown signal while the durability phase is still running;
-    // that can cancel the interrupt waiter before it is parked and let an
-    // apparently clean restart lose its resumable-work row.
-    let drain = ctx.registry.drain_all(grace).await;
+    // resumable interrupt and paused-work row durable, then apply the
+    // remaining grace to the running work.  A parallel timer starting here
+    // would force the shared shutdown signal while the durability phase is
+    // still running; that can cancel the interrupt waiter before it is parked
+    // and let an apparently clean restart lose its resumable-work row.
+    let remaining_grace = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
+    let drain = ctx.registry.drain_all(remaining_grace).await;
     let mut failures = Vec::new();
     if !drain.park_commit.is_clean() {
         failures.push(format!("interrupt park commit: {:?}", drain.park_commit));

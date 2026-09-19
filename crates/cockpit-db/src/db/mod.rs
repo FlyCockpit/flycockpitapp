@@ -191,12 +191,16 @@ struct WriteRequest {
     reply: WriteReplySink,
 }
 
-/// Returned when the file-backed writer queue cannot accept another job.
+/// Returned when the file-backed writer queue cannot accept another job via
+/// the non-blocking [`Writer::submit`].
 ///
-/// Async [`Db::write`] / [`Db::transaction`] fail closed here so a saturated
-/// queue never blocks the Tokio runtime; the write was not enqueued and did
-/// not run. Callers must treat this as a retryable durability error, never as
-/// success. Blocking wrappers wait for capacity instead of returning this.
+/// Durability-bearing async callers ([`Db::write`] / [`Db::transaction`]) do
+/// not surface this: they wait for capacity under
+/// [`Writer::submit_durable`]'s bounded deadline and fail with an enqueue
+/// timeout error instead. When this is returned the write was not enqueued
+/// and did not run; callers must treat it as a retryable durability error,
+/// never as success. Blocking wrappers wait for capacity instead of
+/// returning this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("db writer queue is saturated")]
 pub struct WriterQueueSaturated;
@@ -218,6 +222,10 @@ impl Drop for WriterStallGuard {
 
 const WRITER_QUEUE_CAPACITY: usize = 1024;
 const WRITER_DURABLE_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Pause between capacity retries in [`Writer::submit_durable`]. Waiters park
+/// on this timer instead of a blocking `send`, so a saturated queue never
+/// occupies a Tokio blocking-pool thread that [`Db::read`] may need.
+const WRITER_DURABLE_ENQUEUE_RETRY: Duration = Duration::from_millis(5);
 
 #[derive(Debug, thiserror::Error)]
 #[error("database transaction rollback failed after {primary:#}: {rollback}")]
@@ -283,6 +291,7 @@ struct Writer {
 struct WriterInner {
     tx: Mutex<Option<mpsc::SyncSender<WriteRequest>>>,
     join: Mutex<Option<std::thread::JoinHandle<Result<()>>>>,
+    durable_enqueue_timeout: Duration,
 }
 
 impl Drop for WriterInner {
@@ -303,7 +312,14 @@ impl Drop for WriterInner {
 }
 
 impl Writer {
-    fn start_with_capacity(conn: Connection, capacity: usize) -> Result<Self> {
+    /// `durable_enqueue_timeout` bounds [`Self::submit_durable`]'s wait for
+    /// queue capacity. Tests pass a short value to exercise the timeout path
+    /// without real-time delays.
+    fn start_with_capacity_and_timeout(
+        conn: Connection,
+        capacity: usize,
+        durable_enqueue_timeout: Duration,
+    ) -> Result<Self> {
         anyhow::ensure!(capacity > 0, "db writer queue capacity must be nonzero");
         let (tx, rx) = mpsc::sync_channel::<WriteRequest>(capacity);
         let join = std::thread::Builder::new()
@@ -340,6 +356,7 @@ impl Writer {
             inner: Arc::new(WriterInner {
                 tx: Mutex::new(Some(tx)),
                 join: Mutex::new(Some(join)),
+                durable_enqueue_timeout,
             }),
         })
     }
@@ -377,26 +394,46 @@ impl Writer {
         }
     }
 
+    /// Enqueue a durability-bearing write, waiting up to
+    /// [`WRITER_DURABLE_ENQUEUE_TIMEOUT`] for writer queue capacity.
+    ///
+    /// Cancellation-safe by construction: the request only leaves this future
+    /// inside a `try_send` that returned `Ok`, so a timeout (or caller
+    /// cancellation) drops the request without enqueueing it — a timed-out
+    /// write can never commit later. The error this returns therefore means
+    /// exactly "the write never started". Parking on a timer retry loop also
+    /// keeps saturated-queue waiters off the blocking pool.
     async fn submit_durable<F, T>(&self, f: F) -> Result<tokio::sync::oneshot::Receiver<WriteReply>>
     where
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        let request = WriteRequest {
+        let mut request = Some(WriteRequest {
             job: box_write_job(f),
             reply: WriteReplySink::Async(reply),
-        };
+        });
         let sender = self.queue_sender()?;
-        tokio::time::timeout(WRITER_DURABLE_ENQUEUE_TIMEOUT, async {
-            tokio::task::spawn_blocking(move || sender.send(request))
-                .await
-                .context("db writer enqueue worker joined")?
-                .map_err(|_| anyhow::anyhow!("db writer is shut down"))
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting for db writer queue capacity"))??;
-        Ok(rx)
+        let deadline = tokio::time::Instant::now() + self.inner.durable_enqueue_timeout;
+        loop {
+            match sender.try_send(request.take().expect("request staged between retries")) {
+                Ok(()) => return Ok(rx),
+                Err(TrySendError::Full(returned)) => {
+                    request = Some(returned);
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        return Err(anyhow::anyhow!(
+                            "timed out waiting for db writer queue capacity"
+                        ));
+                    }
+                    tokio::time::sleep_until((now + WRITER_DURABLE_ENQUEUE_RETRY).min(deadline))
+                        .await;
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(anyhow::anyhow!("db writer is shut down"));
+                }
+            }
+        }
     }
 
     fn submit_blocking<F, T>(&self, f: F) -> Result<T>
@@ -761,13 +798,19 @@ impl Db {
     }
 
     fn open_impl(path: &Path, daemon_owned: bool) -> Result<Self> {
-        Self::open_impl_with_writer_capacity(path, daemon_owned, WRITER_QUEUE_CAPACITY)
+        Self::open_impl_with_writer_capacity(
+            path,
+            daemon_owned,
+            WRITER_QUEUE_CAPACITY,
+            WRITER_DURABLE_ENQUEUE_TIMEOUT,
+        )
     }
 
     fn open_impl_with_writer_capacity(
         path: &Path,
         daemon_owned: bool,
         writer_capacity: usize,
+        durable_enqueue_timeout: Duration,
     ) -> Result<Self> {
         let mut timer = files::PhaseTimer::start("Db::open");
         files::ensure_parent_dir_private(path)
@@ -804,7 +847,8 @@ impl Db {
         // connection. Reopening and reapplying pragmas in a newly scheduled
         // thread adds no readiness guarantee and can indefinitely delay boot
         // under CPU contention before the daemon publishes its endpoint.
-        let writer = Writer::start_with_capacity(conn, writer_capacity)?;
+        let writer =
+            Writer::start_with_capacity_and_timeout(conn, writer_capacity, durable_enqueue_timeout)?;
         let db = Self {
             memory: None,
             writer: Some(writer),
@@ -826,7 +870,30 @@ impl Db {
     /// default capacity.
     #[cfg(any(test, feature = "test-support"))]
     pub fn open_with_writer_capacity_for_test(path: &Path, writer_capacity: usize) -> Result<Self> {
-        Self::open_impl_with_writer_capacity(path, false, writer_capacity)
+        Self::open_impl_with_writer_capacity(
+            path,
+            false,
+            writer_capacity,
+            WRITER_DURABLE_ENQUEUE_TIMEOUT,
+        )
+    }
+
+    /// Open a file-backed database whose writer queue holds at most
+    /// `writer_capacity` waiting jobs and whose durable-enqueue wait is
+    /// bounded by `durable_enqueue_timeout`. Test-only: production always
+    /// uses the defaults.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn open_with_writer_tuning_for_test(
+        path: &Path,
+        writer_capacity: usize,
+        durable_enqueue_timeout: Duration,
+    ) -> Result<Self> {
+        Self::open_impl_with_writer_capacity(
+            path,
+            false,
+            writer_capacity,
+            durable_enqueue_timeout,
+        )
     }
 
     /// Park the writer thread until the returned guard is released. Subsequent
@@ -2874,7 +2941,24 @@ mod tests {
                 .unwrap();
         let session = db.create_session("p", "/p", "Build").await.unwrap();
         let stall = db.stall_writer_for_test().expect("stall writer");
-        let write = {
+        // The stall job is *running* (not queued), so the capacity-1 queue is
+        // still empty. One filler job saturates it; a non-blocking submit now
+        // fails closed, proving the queue is genuinely full.
+        let filler = db
+            .writer
+            .as_ref()
+            .expect("file-backed writer")
+            .submit(|_| Ok(()))
+            .expect("fill the capacity-1 queue behind the stalled job");
+        let saturated = db
+            .writer
+            .as_ref()
+            .expect("file-backed writer")
+            .submit(|_| Ok(()))
+            .expect_err("queue must be saturated before the durable write starts");
+        assert!(saturated.downcast_ref::<WriterQueueSaturated>().is_some());
+
+        let mut write = {
             let db = db.clone();
             let session_id = session.session_id;
             tokio::spawn(async move {
@@ -2888,7 +2972,22 @@ mod tests {
                 .await
             })
         };
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // While the writer stays stalled the durable write must stay pending:
+        // neither dropped (the pre-backpressure loss path) nor errored.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut write)
+                .await
+                .is_err(),
+            "durable write finished while the writer queue was still saturated"
+        );
+        let still_saturated = db
+            .writer
+            .as_ref()
+            .expect("file-backed writer")
+            .submit(|_| Ok(()))
+            .expect_err("queue must still be saturated while the durable write waits");
+        assert!(still_saturated.downcast_ref::<WriterQueueSaturated>().is_some());
+
         drop(stall);
         let seq = tokio::time::timeout(Duration::from_secs(5), write)
             .await
@@ -2911,6 +3010,69 @@ mod tests {
         assert_eq!(
             count, 1,
             "session log row must survive writer queue saturation"
+        );
+        drop(filler);
+    }
+
+    #[tokio::test]
+    async fn timed_out_durable_write_is_never_enqueued() {
+        let tmp = TempDir::new().unwrap();
+        let db = Db::open_with_writer_tuning_for_test(
+            &tmp.path().join("enqueue-timeout.db"),
+            1,
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        let stall = db.stall_writer_for_test().expect("stall writer");
+        // Saturate the capacity-1 queue so the durable write below cannot
+        // enqueue and must hit its (short) enqueue deadline.
+        let filler = db
+            .writer
+            .as_ref()
+            .expect("file-backed writer")
+            .submit(|_| Ok(()))
+            .expect("fill the capacity-1 queue behind the stalled job");
+
+        let started = Instant::now();
+        let error = db
+            .write(|conn| {
+                conn.execute_batch("CREATE TABLE ghost_write (value INTEGER NOT NULL)")?;
+                Ok(())
+            })
+            .await
+            .expect_err("saturated queue must time out the durable enqueue");
+        assert!(
+            error.to_string().contains("timed out waiting for db writer queue capacity"),
+            "unexpected error: {error:#}"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(50));
+
+        // Release the writer, then wait for the filler to run. The timed-out
+        // request must never have been parked in a blocking `send`: if it had
+        // been, it would enqueue the moment the writer takes the filler and
+        // commit before the FIFO probe write below.
+        drop(stall);
+        let _ = filler.await;
+        db.write(|conn| {
+            conn.execute_batch("CREATE TABLE probe_after_timeout (value INTEGER NOT NULL)")?;
+            Ok(())
+        })
+        .await
+        .expect("fresh durable writes must work after the timeout");
+        let ghost_table: i64 = db
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'ghost_write'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            ghost_table, 0,
+            "a timed-out durable write must never commit later"
         );
     }
 

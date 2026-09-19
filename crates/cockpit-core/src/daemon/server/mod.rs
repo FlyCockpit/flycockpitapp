@@ -6620,6 +6620,15 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, mut listener: DaemonListen
     dispatch::debug_assert_ledger_site_registry_consistent();
     let mut shutdown = ctx.shutdown.subscribe();
     let mut clients = tokio::task::JoinSet::new();
+    let retention_cfg = retention_config();
+    let mut retention_interval = tokio::time::interval(std::time::Duration::from_secs(
+        (retention_cfg.sweep_interval_hours.max(1) as u64) * 60 * 60,
+    ));
+    retention_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    retention_interval.tick().await;
+    let mut editor_maintenance_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    editor_maintenance_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    editor_maintenance_interval.tick().await;
     // A drain may already have begun before we subscribed (begin_drain on a
     // very fast StopDaemon); break immediately if so.
     if ctx.shutdown.is_draining() {
@@ -6635,6 +6644,17 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, mut listener: DaemonListen
                 if changed.is_err() || ctx.shutdown.is_draining() {
                     tracing::info!("daemon: drain begun, closing accept loop");
                     break;
+                }
+            }
+            _ = retention_interval.tick() => {
+                run_retention_tick(ctx.clone(), retention_cfg).await;
+            }
+            _ = editor_maintenance_interval.tick() => {
+                if let Err(error) = crate::daemon::agent_management::maintain_editor_leases(&ctx).await {
+                    tracing::warn!(message = %error.message, "editor lease maintenance failed");
+                }
+                if let Err(error) = dispatch::maintain_durable_oauth_flows(&ctx).await {
+                    tracing::warn!(message = %error.message, "OAuth flow maintenance failed");
                 }
             }
             joined = clients.join_next(), if !clients.is_empty() => {
@@ -7192,10 +7212,10 @@ async fn accept_daemon_stream(listener: &mut DaemonListener) -> Result<DaemonStr
 #[cfg(any(unix, windows, test))]
 pub(crate) async fn run_retention_tick(ctx: Arc<DaemonContext>, cfg: RetentionConfig) {
     let now_unix_ms = chrono::Utc::now().timestamp_millis();
+    // Editor-lease and OAuth-flow maintenance is owned by the dedicated
+    // editor maintenance worker (60s cadence); the retention tick must not
+    // duplicate it now that the two no longer share one accept-loop arm.
     run_retention_tick_at(&ctx, cfg, now_unix_ms).await;
-    if let Err(error) = crate::daemon::agent_management::maintain_editor_leases(&ctx).await {
-        tracing::warn!(message = %error.message, "editor lease maintenance failed");
-    }
 }
 
 /// Injected-clock retention tick: media sweep first, then session payload expiry.

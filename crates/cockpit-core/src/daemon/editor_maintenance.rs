@@ -114,7 +114,7 @@ pub(crate) async fn run_editor_maintenance_pass(ctx: Arc<DaemonContext>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::server::test_ctx;
+    use crate::daemon::server::{disk_test_ctx, test_ctx};
     use std::time::{Duration, Instant};
     use tokio::sync::oneshot;
 
@@ -169,5 +169,76 @@ mod tests {
             .await
             .expect("worker should exit after the admitted pass finishes")
             .expect("worker join");
+    }
+
+    /// Regression for the pre-worker inline arm: if `run_accept_loop` ever
+    /// awaits editor-lease maintenance inline again, the tick fires inside
+    /// the test window (paused clock advanced past the 60s cadence) and
+    /// parks on the stalled writer — the seeded expired lease forces
+    /// `maintain_editor_leases` into `delete_editor_replay_and_row`'s
+    /// transaction — so the loop cannot observe drain and this test fails on
+    /// the accept-loop timeout.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn accept_loop_does_not_run_editor_maintenance_inline() {
+        let dir = cockpit_test_support::isolated_tempdir();
+        let db_path = dir.path().join("editor-inline.db");
+        let spool = dir.path().join("spool");
+        let ctx = disk_test_ctx(&db_path, &spool);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        ctx.db
+            .insert_agent_editor_lease(crate::db::agent_editor_leases::AgentEditorLeaseRow {
+                owner_digest: "inline-editor-owner".into(),
+                client_operation_id: "inline-editor-op".into(),
+                lease_id: "inline-editor-lease".into(),
+                project_root: "/inline-editor".into(),
+                agent_name: "Build".into(),
+                consumed_revision: "r0".into(),
+                // Any handle satisfies the open-lease schema check; the
+                // delete path that would consume it never gets past the
+                // stalled writer.
+                snapshot_handle: Some("editor-replay:inline-editor-lease".into()),
+                snapshot_identity: [0u8; 32],
+                state: "open".into(),
+                completion_identity: None,
+                completion_handle: None,
+                completion_operation_id: None,
+                publication_phase: "none".into(),
+                consumed_projection_identity: None,
+                intended_projection_identity: None,
+                publication_result_revision: None,
+                consumed_config_generation: None,
+                result_config_generation: None,
+                terminal_result_json: None,
+                terminal_error_json: None,
+                expires_at_unix_ms: now_ms - 3_600_000,
+                updated_at_unix_ms: now_ms - 3_600_000,
+            })
+            .await
+            .expect("seed one expired open editor lease");
+        let stall = ctx.db.stall_writer_for_test().expect("stall writer");
+        let socket = dir.path().join("editor-inline.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind test unix socket");
+        let accept = tokio::spawn(crate::daemon::server::run_accept_loop(
+            ctx.clone(),
+            listener,
+        ));
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        let started = Instant::now();
+        assert!(
+            ctx.shutdown_signal().begin_drain(),
+            "test owns the first drain"
+        );
+        tokio::time::timeout(Duration::from_secs(5), accept)
+            .await
+            .expect("accept loop must not await editor maintenance inline")
+            .expect("accept task")
+            .expect("accept loop ok");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "accept loop took {:?} while the db writer was stalled",
+            started.elapsed()
+        );
+        drop(stall);
     }
 }

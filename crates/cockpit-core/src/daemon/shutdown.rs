@@ -21,7 +21,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 use crate::sync::lock_or_recover;
 
@@ -66,6 +66,9 @@ struct GuidanceAdmission {
 pub struct ShutdownSignal {
     tx: watch::Sender<ShutdownPhase>,
     admission: Arc<Mutex<GuidanceAdmission>>,
+    /// Notified whenever an admitted maintenance pass is dropped. Drain
+    /// waiters park on this instead of polling the counter.
+    maintenance_drained: Arc<Notify>,
 }
 
 impl Default for ShutdownSignal {
@@ -79,12 +82,17 @@ impl Default for ShutdownSignal {
 #[must_use]
 pub(crate) struct GuidanceMaintenancePass {
     admission: Arc<Mutex<GuidanceAdmission>>,
+    maintenance_drained: Arc<Notify>,
 }
 
 impl Drop for GuidanceMaintenancePass {
     fn drop(&mut self) {
-        let mut inner = lock_or_recover(&self.admission);
-        inner.admitted_guidance_passes = inner.admitted_guidance_passes.saturating_sub(1);
+        {
+            let mut inner = lock_or_recover(&self.admission);
+            inner.admitted_guidance_passes = inner.admitted_guidance_passes.saturating_sub(1);
+        }
+        // Wake drain waiters without holding the admission mutex.
+        self.maintenance_drained.notify_one();
     }
 }
 
@@ -98,6 +106,7 @@ impl ShutdownSignal {
                 phase: ShutdownPhase::Running,
                 admitted_guidance_passes: 0,
             })),
+            maintenance_drained: Arc::new(Notify::new()),
         }
     }
 
@@ -164,6 +173,7 @@ impl ShutdownSignal {
         inner.admitted_guidance_passes = inner.admitted_guidance_passes.saturating_add(1);
         Some(GuidanceMaintenancePass {
             admission: Arc::clone(&self.admission),
+            maintenance_drained: Arc::clone(&self.maintenance_drained),
         })
     }
 
@@ -178,14 +188,29 @@ impl ShutdownSignal {
         lock_or_recover(&self.admission).admitted_guidance_passes
     }
 
-    /// Wait until every admitted maintenance pass has finished.
-    pub(crate) async fn wait_for_admitted_maintenance_drain(&self, timeout: Duration) {
-        let deadline = std::time::Instant::now() + timeout;
-        while std::time::Instant::now() < deadline {
-            if self.admitted_guidance_passes() == 0 {
-                return;
+    /// Wait until every admitted maintenance pass has finished, or `deadline`
+    /// passes. Returns `true` when all admitted passes finished and `false`
+    /// when the deadline expired with passes still admitted — the caller must
+    /// surface that (a pass may still own the writer) rather than proceed
+    /// silently.
+    ///
+    /// Event-driven: waiters park on the drop [`Notify`] rather than polling
+    /// the counter. Callers share this deadline with the rest of their drain
+    /// so a stuck pass consumes the same grace window, not an extra one.
+    pub(crate) async fn wait_for_admitted_maintenance_drain(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        loop {
+            if lock_or_recover(&self.admission).admitted_guidance_passes == 0 {
+                return true;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::select! {
+                _ = self.maintenance_drained.notified() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    return lock_or_recover(&self.admission).admitted_guidance_passes == 0;
+                }
+            }
         }
     }
 
@@ -332,5 +357,54 @@ mod tests {
             .expect("forced wait should resolve promptly")
             .expect("wait task");
         assert!(started.elapsed() < Duration::from_millis(200));
+    }
+
+    #[tokio::test]
+    async fn maintenance_drain_wait_wakes_on_pass_drop() {
+        let sig = ShutdownSignal::new();
+        let pass = sig
+            .admit_guidance_maintenance()
+            .expect("running daemon admits one pass");
+        let waiter = {
+            let sig = sig.clone();
+            tokio::spawn(async move {
+                sig.wait_for_admitted_maintenance_drain(
+                    tokio::time::Instant::now() + Duration::from_secs(60),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !waiter.is_finished(),
+            "drain wait must not resolve while a pass is admitted"
+        );
+        drop(pass);
+        let drained = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("pass drop must wake the drain waiter without polling")
+            .expect("waiter task");
+        assert!(drained);
+    }
+
+    #[tokio::test]
+    async fn maintenance_drain_wait_reports_deadline_expiry_instead_of_waiting() {
+        let sig = ShutdownSignal::new();
+        let _pass = sig
+            .admit_guidance_maintenance()
+            .expect("running daemon admits one pass");
+        let started = Instant::now();
+        let drained = sig
+            .wait_for_admitted_maintenance_drain(tokio::time::Instant::now() + Duration::from_millis(50))
+            .await;
+        assert!(
+            !drained,
+            "deadline expiry with a live admitted pass must be reported, not silent"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        drop(_pass);
+        assert!(sig
+            .wait_for_admitted_maintenance_drain(tokio::time::Instant::now() + Duration::from_millis(50))
+            .await);
     }
 }

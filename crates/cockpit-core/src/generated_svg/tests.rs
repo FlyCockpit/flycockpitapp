@@ -435,6 +435,16 @@ fn generated_svg_independent_verifier_rejects_literal_attribute_whitespace() {
             "{mutation:?}"
         );
     }
+
+    // Character references that decode to forbidden whitespace contain no
+    // literal tab/newline byte, so only the decoded-value guard catches them.
+    for encoded in ["&#9;", "&#10;"] {
+        let mutation = format!(r#"<svg xmlns="{SVG_NS}" viewBox="0{encoded}0 10 10"/>"#);
+        assert!(
+            super::verify::verify_canonical_svg(mutation.as_bytes()).is_err(),
+            "{mutation:?}"
+        );
+    }
 }
 
 #[test]

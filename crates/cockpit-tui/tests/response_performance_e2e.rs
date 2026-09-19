@@ -44,7 +44,7 @@ async fn response_performance_e2e_stream_produces_clickable_chip() {
         .expect("hit columns are inside the rendered row")
         .join("");
     assert_eq!(
-        chip, "0.1/20",
+        chip, "Agent",
         "rendered target range must contain exactly the chip cells, got {chip:?}"
     );
 

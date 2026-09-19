@@ -28,11 +28,65 @@ use crate::config::dirs::global_config_file;
 use crate::config::extended::ExtendedConfigDoc;
 use crate::config::providers::ConfigDoc;
 use crate::wizard::{
-    WizardDescriptor, WizardRun, approval_mode_answer, min_secret_length_answer,
-    model_capability_answers, model_context_tokens_answer, model_default_thinking_answer,
-    model_make_default_answer, model_max_output_tokens_answer, model_ref_answer,
-    model_subagent_answers, model_system_prompt_answer, model_trust_answer, sandbox_mode_answer,
+    WizardAnswer, WizardDescriptor, WizardRun, WritePolicy, action_step, approval_mode_answer,
+    min_secret_length_answer, model_capability_answers, model_context_tokens_answer,
+    model_default_thinking_answer, model_make_default_answer, model_max_output_tokens_answer,
+    model_ref_answer, model_subagent_answers, model_system_prompt_answer, model_trust_answer,
+    sandbox_mode_answer,
 };
+
+/// Wire id of the onboarding lifetime setup wizard: the daemon replays it
+/// and the native Lifetime screen sends it in `ApplySetupWizard`. The
+/// deleted public row constant from `named_setup_wizard_rows!` is gone
+/// (#430); this is the single remaining authority for the wire id.
+pub const LIFETIME_SETUP_WIZARD_ID: &str = "onboarding-lifetime";
+
+fn lifetime_setup_wizard_descriptor() -> WizardDescriptor {
+    WizardDescriptor {
+        id: LIFETIME_SETUP_WIZARD_ID,
+        title: "Background agents",
+        description: "Choose what happens after the last Cockpit window closes",
+        write_policy: WritePolicy::CommitAtEnd,
+        model_context: None,
+        onboarding_agent_models: std::collections::BTreeMap::new(),
+        onboarding_catalog_revision: None,
+        steps: vec![
+            crate::wizard::StepDescriptor {
+                id: "background-agents",
+                prompt: "Keep agents running in the background after I close all windows.",
+                help: "On keeps agents and sessions running so you can reattach later. Off uses an ephemeral lifetime: closing the last client stops agents and owned processes.",
+                help_hook: None,
+                kind: crate::wizard::StepKind::Confirm,
+                default_answer: Some(WizardAnswer::Confirm(true)),
+                prefill: None,
+                validate: None,
+                write: None,
+                branch: None,
+            },
+            action_step(
+                "lifetime-save",
+                "Save agent lifetime",
+                "Saving agent lifetime…",
+                None,
+            ),
+        ],
+    }
+}
+
+fn lifetime_background_agents_answer(run: &WizardRun) -> Option<bool> {
+    match run.answer("background-agents") {
+        Some(WizardAnswer::Confirm(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+/// Build the client-side lifetime answers payload for [`ApplySetupWizard`].
+pub fn onboarding_lifetime_client_answers_json(background_agents: bool) -> Result<String> {
+    let mut run = WizardRun::new(lifetime_setup_wizard_descriptor())?;
+    run.submit(WizardAnswer::Confirm(background_agents))
+        .map_err(|error| anyhow!(error))?;
+    run.answers_json().map_err(|error| anyhow!(error))
+}
 
 /// Compose a daemon-less host-capability snapshot for the setup wizard.
 /// Callers inject this; the wizard never consults a process-global cache.
@@ -95,8 +149,8 @@ pub fn descriptor_for_cwd_with_caps(
     if id == crate::wizard::ONBOARDING_PROFILE_WIZARD_ID {
         return Some(crate::wizard::onboarding_profile_descriptor());
     }
-    if id == crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID {
-        return Some(crate::wizard::onboarding_lifetime_descriptor());
+    if id == LIFETIME_SETUP_WIZARD_ID {
+        return Some(lifetime_setup_wizard_descriptor());
     }
     crate::wizard::descriptor(id)
 }
@@ -153,7 +207,7 @@ pub fn apply_setup_wizard_answers(
             | crate::wizard::MODEL_WIZARD_ID
             | crate::wizard::ONBOARDING_MODEL_WIZARD_ID
             | crate::wizard::ONBOARDING_PROFILE_WIZARD_ID
-            | crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID
+            | LIFETIME_SETUP_WIZARD_ID
     ) {
         return Err(anyhow!("unsupported setup wizard `{wizard_id}`"));
     }
@@ -164,7 +218,7 @@ pub fn apply_setup_wizard_answers(
         let changed = apply_onboarding_profile_answers(&run)?.is_some();
         return Ok((changed, false, None));
     }
-    if wizard_id == crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID {
+    if wizard_id == LIFETIME_SETUP_WIZARD_ID {
         let changed = apply_onboarding_lifetime_answers(&run)?.is_some();
         return Ok((changed, false, None));
     }
@@ -194,7 +248,7 @@ pub async fn apply_setup_wizard_answers_authoritative(
             | crate::wizard::MODEL_WIZARD_ID
             | crate::wizard::ONBOARDING_MODEL_WIZARD_ID
             | crate::wizard::ONBOARDING_PROFILE_WIZARD_ID
-            | crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID
+            | LIFETIME_SETUP_WIZARD_ID
     ) {
         return Err(anyhow!("unsupported setup wizard `{wizard_id}`"));
     }
@@ -206,7 +260,7 @@ pub async fn apply_setup_wizard_answers_authoritative(
         let changed = apply_onboarding_profile_answers(&run)?.is_some();
         return Ok((changed, false, None));
     }
-    if wizard_id == crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID {
+    if wizard_id == LIFETIME_SETUP_WIZARD_ID {
         let changed = apply_onboarding_lifetime_answers(&run)?.is_some();
         return Ok((changed, false, None));
     }
@@ -246,8 +300,8 @@ fn apply_onboarding_lifetime_answers(run: &WizardRun) -> Result<Option<PathBuf>>
     let target = global_config_file().context("resolving global config for onboarding lifetime")?;
     let mut doc = ExtendedConfigDoc::load(&target)?;
     let mut config = doc.config();
-    let background_agents = crate::wizard::onboarding_background_agents_answer(run)
-        .context("background agent lifetime answer")?;
+    let background_agents =
+        lifetime_background_agents_answer(run).context("background agent lifetime answer")?;
     if config.daemon.background_agents == background_agents {
         return Ok(None);
     }
@@ -1553,17 +1607,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = CockpitConfigEnvGuard::set(tmp.path());
         let config_path = global_config_file().unwrap();
-        let mut run = WizardRun::new(crate::wizard::onboarding_lifetime_descriptor()).unwrap();
+        let mut run = WizardRun::new(lifetime_setup_wizard_descriptor()).unwrap();
         run.submit(WizardAnswer::Confirm(false)).unwrap();
         assert_eq!(run.current_step_id(), Some("lifetime-save"));
         let answers_json = run.answers_json().unwrap();
 
-        let (changed, model_file, default_scope) = apply_setup_wizard_answers(
-            tmp.path(),
-            crate::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
-            &answers_json,
-        )
-        .expect("lifetime apply must replay the inferred save acknowledgement");
+        let (changed, model_file, default_scope) =
+            apply_setup_wizard_answers(tmp.path(), LIFETIME_SETUP_WIZARD_ID, &answers_json)
+                .expect("lifetime apply must replay the inferred save acknowledgement");
 
         assert!(changed);
         assert!(!model_file);

@@ -390,19 +390,14 @@ fn complete_real_first_run_lifetime(app: &mut App, persistent_background_agents:
         app,
         |app| {
             stage(app) == Some(OnboardingStage::Lifetime)
-                && app.dialog.test_page_name()
-                    == Some(cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID)
+                && shell_kind(app) == Some(crate::tui::onboarding::OnboardingScreenKind::Lifetime)
         },
         "the settled Agent→Lifetime advance through the real installation",
     );
 
-    assert_eq!(app.dialog.test_setup_step(), Some("background-agents"));
-    if persistent_background_agents {
-        shell_key(app, KeyCode::Enter);
-    } else {
-        shell_key(app, KeyCode::Char('n'));
+    if !persistent_background_agents {
+        shell_key(app, KeyCode::Down);
     }
-    assert_eq!(app.dialog.test_setup_step(), Some("lifetime-save"));
     shell_key(app, KeyCode::Enter);
     pump_onboarding(
         app,
@@ -543,6 +538,7 @@ fn advance_real_first_run_from_provider_search_to_agent(app: &mut App) {
     for ch in "compat".chars() {
         shell_key(app, KeyCode::Char(ch));
     }
+    shell_key(app, KeyCode::Down);
     shell_key(app, KeyCode::Enter);
     pump_onboarding(
         app,

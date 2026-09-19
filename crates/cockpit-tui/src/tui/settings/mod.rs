@@ -6242,8 +6242,8 @@ impl Dialog {
         }
     }
 
-    /// Wizard engine for the onboarding shell's profile/model/agent/lifetime
-    /// stages. The same wizard machinery (and daemon-effect settlement) as
+    /// Wizard engine for the onboarding shell's profile/model stages. The
+    /// same wizard machinery (and daemon-effect settlement) as
     /// the non-onboarding setup wizards, presented inside the full-screen
     /// shell instead of the settings modal. `preselected_model` seeds the
     /// model wizard's provider/model pair when the committed provider
@@ -6268,9 +6268,6 @@ impl Dialog {
                 return Err(
                     "the onboarding agent stage uses the nested agent authoring editor".into(),
                 );
-            }
-            cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID => {
-                Some(cockpit_core::wizard::onboarding_lifetime_descriptor())
             }
             cockpit_core::wizard::SECURITY_WIZARD_ID | cockpit_core::wizard::MODEL_WIZARD_ID => {
                 cockpit_core::wizard::descriptor_for_cwd(wizard_id, &global_root).or_else(|| {
@@ -10138,10 +10135,6 @@ fn apply_setup_wizard_daemon_completion(
                 } else {
                     parts.join(" ")
                 }
-            } else if wizard.run.descriptor().id
-                == cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID
-            {
-                "Saved the agent lifetime for future daemon acquisition.".to_string()
             } else {
                 "Saved global security settings through the daemon.".to_string()
             }

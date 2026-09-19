@@ -377,22 +377,6 @@ impl App {
                     None,
                 );
             }
-            Some(cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID) => {
-                if !self.require_onboarding_snapshot_for_named_route(
-                    cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
-                ) {
-                    return;
-                }
-                if !self
-                    .focus_named_setup_wizard(cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID)
-                {
-                    return;
-                }
-                self.mount_named_setup_wizard_in_onboarding_shell(
-                    cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
-                    None,
-                );
-            }
             Some(cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID) => {
                 if !self.require_onboarding_snapshot_for_named_route(
                     cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID,
@@ -443,9 +427,6 @@ impl App {
                         cockpit_core::wizard::MODEL_WIZARD_ID
                         | cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID => {
                             crate::tui::onboarding::EngineStage::Model
-                        }
-                        cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID => {
-                            crate::tui::onboarding::EngineStage::Lifetime
                         }
                         _ => crate::tui::onboarding::EngineStage::Model,
                     });
@@ -850,11 +831,7 @@ impl App {
                 self.mount_onboarding_agent_authoring();
             }
             OnboardingStage::Lifetime => {
-                self.mount_onboarding_wizard(
-                    cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
-                    None,
-                    Some("Choose what happens when the last Cockpit window closes.".to_string()),
-                );
+                self.dialog = crate::tui::settings::Dialog::None;
             }
             OnboardingStage::Complete => {}
         }
@@ -874,12 +851,7 @@ impl App {
             Ok(dialog) => {
                 self.dialog = dialog;
                 if let Some(shell) = self.onboarding_shell.as_mut() {
-                    shell.present_engine(match wizard_id {
-                        cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID => {
-                            crate::tui::onboarding::EngineStage::Lifetime
-                        }
-                        _ => crate::tui::onboarding::EngineStage::Model,
-                    });
+                    shell.present_engine(crate::tui::onboarding::EngineStage::Model);
                 }
             }
             Err(error) => {
@@ -1327,6 +1299,17 @@ impl App {
                 }
                 self.apply_onboarding_profile(name);
             }
+            Some(OnboardingShellAction::ApplyLifetime(background_agents)) => {
+                if self
+                    .onboarding_shell
+                    .as_ref()
+                    .is_some_and(|shell| shell.transition_pending())
+                {
+                    self.show_toast("Still applying the previous step…", super::ToastKind::Info);
+                    return;
+                }
+                self.apply_onboarding_lifetime(background_agents);
+            }
             Some(OnboardingShellAction::SelectTemplate(template)) => {
                 // Mount the provider engine seeded with the canonical
                 // template chosen from the searchable catalog.
@@ -1764,6 +1747,163 @@ impl App {
         }
     }
 
+    fn apply_onboarding_lifetime(&mut self, background_agents: bool) {
+        let Some(snapshot) = self.onboarding_snapshot.clone() else {
+            self.show_toast(
+                "Onboarding checkpoint is unavailable",
+                super::ToastKind::Error,
+            );
+            return;
+        };
+        let answers_json = match cockpit_core::wizard::onboarding_lifetime_client_answers_json(
+            background_agents,
+        ) {
+            Ok(answers) => answers,
+            Err(error) => {
+                self.show_toast(
+                    format!("Could not prepare lifetime choice: {error}"),
+                    super::ToastKind::Error,
+                );
+                return;
+            }
+        };
+        let project_root = match cockpit_config::config::dirs::global_config_dir() {
+            Ok(root) => root.display().to_string(),
+            Err(error) => {
+                self.show_toast(
+                    format!("Could not resolve global Cockpit config: {error}"),
+                    super::ToastKind::Error,
+                );
+                return;
+            }
+        };
+        let generation = self.startup_background.generation;
+        let run_id = snapshot.run_id;
+        let attempt_id = snapshot.attempt_id;
+        let expected_revision = snapshot.revision;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let lifecycle = self.lifecycle.clone();
+        let selected_endpoint = self
+            .startup_lifecycle
+            .as_ref()
+            .map(|selected| selected.endpoint.clone());
+        // Latch only. Every client-side adoption of the choice — the
+        // bootstrap config re-read (lifetime preference, default intent,
+        // default model), the completion summary, and the held-draft
+        // release — waits for the correlated completion in
+        // `finish_onboarding_lifetime_settlement`, because the wizard
+        // apply can still fail until its receipt lands (#426).
+        if let Some(shell) = self.onboarding_shell.as_mut() {
+            shell.latch_transition(
+                snapshot.revision,
+                cockpit_proto::OnboardingTransitionKind::Advance,
+            );
+        }
+        let pending_request_id = request_id.clone();
+        let started = self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.lifetime"),
+            crate::tui::async_action::AsyncActionPolicy::Dedupe(
+                crate::tui::async_action::AsyncActionKey::new("onboarding.lifetime"),
+            ),
+            async move {
+                let endpoint =
+                    onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref()).await?;
+                let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let response = client
+                    .request(cockpit_proto::Request::ApplySetupWizard {
+                        client_operation_id: uuid::Uuid::new_v4().to_string(),
+                        project_root,
+                        wizard_id: cockpit_core::wizard::LIFETIME_SETUP_WIZARD_ID.to_string(),
+                        answers_json,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+                match response {
+                    Ok(cockpit_proto::Response::SetupWizardApplied { .. }) => {}
+                    Ok(other) => return Err(format!("unexpected lifetime response: {other:?}")),
+                    Err(error) => return Err(error.to_string()),
+                }
+                let transition = cockpit_proto::ApplyOnboardingTransition {
+                    run_id,
+                    attempt_id,
+                    expected_revision,
+                    client_operation_id: request_id.clone(),
+                    transition: cockpit_proto::OnboardingTransitionKind::Advance,
+                    settlement: None,
+                };
+                match client
+                    .request(cockpit_proto::Request::ApplyOnboardingTransition(
+                        transition,
+                    ))
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    Ok(cockpit_proto::Response::OnboardingTransition(result)) => Ok(
+                        crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
+                            StartupOnboardingCompletion {
+                                generation,
+                                run_id,
+                                attempt_id,
+                                expected_revision,
+                                request_id,
+                                receipt: Some(result.receipt),
+                                snapshot: Some(result.snapshot),
+                            },
+                        ),
+                    ),
+                    Ok(other) => Err(format!("unexpected onboarding response: {other:?}")),
+                    Err(error) => Err(error.to_string()),
+                }
+            },
+        );
+        if let crate::tui::async_action::AsyncActionStart::Started(id) = started {
+            self.pending_startup_onboarding_operations
+                .insert(id, pending_request_id);
+        }
+    }
+
+    /// Adopt the committed lifetime settlement on the correlated
+    /// `onboarding.lifetime` completion. The wizard apply has written the
+    /// global config by then, so the bootstrap re-read (the sanctioned
+    /// detached first-run resolution) picks up the recorded
+    /// `background_agents` choice — resetting this process's lifetime
+    /// preference and default owner intent — plus the effective default
+    /// model and TUI chrome. The completion summary is recorded from that
+    /// authoritative view before the `Complete` revision presents it, and
+    /// a draft held behind model selection is released only now that the
+    /// choice is durable. Same post-commit order the pre-native
+    /// `service_onboarding_shell` poll arm used (#426).
+    pub(super) fn finish_onboarding_lifetime_settlement(&mut self) {
+        self.refresh_bootstrap_config_snapshot();
+        let configured_model = self.config_snapshot.providers.active_model.clone();
+        let summary = self.onboarding_completion_summary();
+        if let Some(shell) = self.onboarding_shell.as_mut() {
+            shell.note_completion_summary(summary);
+        }
+        if self.submit_after_model_selection {
+            match configured_model {
+                Some(active) => {
+                    if self.notify_active_model_selected(
+                        active,
+                        false,
+                        cockpit_proto::ActiveModelSwitchTrigger::Picker,
+                    ) {
+                        self.submit_after_model_selection = false;
+                        let _ = self.submit_input();
+                    }
+                }
+                None => {
+                    self.submit_after_model_selection = false;
+                    self.push_plain(
+                        "Your draft is still here; choose a model before sending.".to_string(),
+                    );
+                }
+            }
+        }
+    }
+
     /// Service the full-screen onboarding shell each wake: reconcile the
     /// provider-engine pairing, advance stages whose engine settled,
     /// commit the terminal transition once the lifetime stage settles, and
@@ -1874,54 +2014,7 @@ impl App {
                 );
                 true
             }
-            cockpit_proto::OnboardingStage::Lifetime => {
-                if shell.screen_is_complete() {
-                    return false;
-                }
-                if !shell.screen_is_engine(crate::tui::onboarding::EngineStage::Lifetime)
-                    || !self.dialog.setup_wizard_is_complete(
-                        cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
-                    )
-                {
-                    return false;
-                }
-                self.refresh_bootstrap_config_snapshot();
-                let configured_model = self.config_snapshot.providers.active_model.clone();
-                let summary = self.onboarding_completion_summary();
-                if let Some(shell) = self.onboarding_shell.as_mut() {
-                    shell.note_completion_summary(summary);
-                }
-                if self.submit_after_model_selection {
-                    match configured_model {
-                        Some(active) => {
-                            if self.notify_active_model_selected(
-                                active,
-                                false,
-                                cockpit_proto::ActiveModelSwitchTrigger::Picker,
-                            ) {
-                                self.submit_after_model_selection = false;
-                                let _ = self.submit_input();
-                            }
-                        }
-                        None => {
-                            self.submit_after_model_selection = false;
-                            self.push_plain(
-                                "Your draft is still here; choose a model before sending."
-                                    .to_string(),
-                            );
-                        }
-                    }
-                }
-                // Commit the terminal transition now that the lifetime
-                // stage settled: completion becomes an authoritative stage.
-                // The completion screen is presented from the stored
-                // summary when the resulting snapshot lands.
-                self.request_onboarding_transition(
-                    cockpit_proto::OnboardingTransitionKind::Complete,
-                    None,
-                );
-                true
-            }
+            cockpit_proto::OnboardingStage::Lifetime => false,
         }
     }
 

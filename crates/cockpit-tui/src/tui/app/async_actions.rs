@@ -1299,6 +1299,7 @@ impl App {
             AsyncActionKind::DaemonRpc(
                 label @ ("onboarding.transition"
                 | "onboarding.profile"
+                | "onboarding.lifetime"
                 | "onboarding.secure_intent"
                 | "onboarding.ready_retry"),
             ) => {
@@ -1317,6 +1318,17 @@ impl App {
                         );
                         match verdict {
                             OnboardingTransitionCorrelation::Apply => {
+                                // The lifetime settlement is the one
+                                // transition whose wizard apply rewrote the
+                                // global config this detached client runs
+                                // on: adopt the committed choice (lifetime
+                                // preference, default intent, default
+                                // model, summary, held draft) before the
+                                // authoritative `Complete` revision
+                                // presents (#426).
+                                if label == "onboarding.lifetime" {
+                                    self.finish_onboarding_lifetime_settlement();
+                                }
                                 self.apply_onboarding_bootstrap_snapshot(completion.snapshot);
                             }
                             OnboardingTransitionCorrelation::Inert(reason) => {

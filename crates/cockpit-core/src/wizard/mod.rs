@@ -11,10 +11,11 @@ use anyhow::{Context, Result, anyhow};
 mod apply;
 
 pub use apply::{
-    ModelAnswersOutcome, apply_model_answers, apply_security_answers,
+    LIFETIME_SETUP_WIZARD_ID, ModelAnswersOutcome, apply_model_answers, apply_security_answers,
     apply_security_answers_with_caps, apply_setup_wizard_answers,
     apply_setup_wizard_answers_authoritative, compose_wizard_host_capabilities, descriptor_for_cwd,
-    descriptor_for_cwd_with_caps, model_descriptor_for_cwd, onboarding_model_descriptor_for_cwd,
+    descriptor_for_cwd_with_caps, model_descriptor_for_cwd,
+    onboarding_lifetime_client_answers_json, onboarding_model_descriptor_for_cwd,
     security_config_path,
 };
 
@@ -52,9 +53,6 @@ named_setup_wizard_rows! {
     complete: false,
     ONBOARDING_PROFILE_WIZARD_ID = "onboarding-profile",
     stage: Some(cockpit_proto::OnboardingStage::Profile),
-    complete: false,
-    ONBOARDING_LIFETIME_WIZARD_ID = "onboarding-lifetime",
-    stage: Some(cockpit_proto::OnboardingStage::Lifetime),
     complete: false,
     ONBOARDING_AGENT_WIZARD_ID = "onboarding-agent",
     stage: Some(cockpit_proto::OnboardingStage::Agent),
@@ -664,47 +662,6 @@ pub fn onboarding_profile_descriptor() -> WizardDescriptor {
                 None,
             ),
         ],
-    }
-}
-
-/// One-time owner-lifetime choice. Persistent is pre-selected, but the user
-/// must explicitly continue through this screen before onboarding completes.
-pub fn onboarding_lifetime_descriptor() -> WizardDescriptor {
-    WizardDescriptor {
-        id: ONBOARDING_LIFETIME_WIZARD_ID,
-        title: "Background agents",
-        description: "Choose what happens after the last Cockpit window closes",
-        write_policy: WritePolicy::CommitAtEnd,
-        model_context: None,
-        onboarding_agent_models: BTreeMap::new(),
-        onboarding_catalog_revision: None,
-        steps: vec![
-            StepDescriptor {
-                id: "background-agents",
-                prompt: "Keep agents running in the background after I close all windows.",
-                help: "On keeps agents and sessions running so you can reattach later. Off uses an ephemeral lifetime: closing the last client stops agents and owned processes.",
-                help_hook: None,
-                kind: StepKind::Confirm,
-                default_answer: Some(WizardAnswer::Confirm(true)),
-                prefill: None,
-                validate: None,
-                write: None,
-                branch: None,
-            },
-            action_step(
-                "lifetime-save",
-                "Save agent lifetime",
-                "Saving agent lifetime…",
-                None,
-            ),
-        ],
-    }
-}
-
-pub fn onboarding_background_agents_answer(run: &WizardRun) -> Option<bool> {
-    match run.answer("background-agents") {
-        Some(WizardAnswer::Confirm(value)) => Some(*value),
-        _ => None,
     }
 }
 
@@ -2517,21 +2474,6 @@ mod tests {
     }
 
     #[test]
-    fn onboarding_lifetime_requires_explicit_persistent_or_ephemeral_choice() {
-        let mut run = WizardRun::new(onboarding_lifetime_descriptor()).unwrap();
-        assert_eq!(run.current_step_id(), Some("background-agents"));
-        assert_eq!(run.prefill(), Some(WizardAnswer::Confirm(true)));
-
-        run.submit(WizardAnswer::Confirm(false)).unwrap();
-
-        assert_eq!(run.current_step_id(), Some("lifetime-save"));
-        assert_eq!(onboarding_background_agents_answer(&run), Some(false));
-    }
-
-    /// Terminal profile-save must finish the wizard. Branching to a
-    /// provider-wizard `saving` step is a hard submit error and stalls
-    /// first-run at AwaitProfile.
-    #[test]
     fn onboarding_profile_save_completes_without_saving_step() {
         let mut live = WizardRun::new(onboarding_profile_descriptor()).unwrap();
         live.submit(WizardAnswer::Text("Ada".into())).unwrap();
@@ -2555,36 +2497,6 @@ mod tests {
         assert_eq!(
             onboarding_name_answer(&reconstructed).as_deref(),
             Some("Ada")
-        );
-    }
-
-    /// Terminal lifetime-save must finish the wizard the same way profile-save
-    /// does: the client omits the action from answers_json, and daemon replay
-    /// infers the acknowledgement.
-    #[test]
-    fn onboarding_lifetime_save_completes_without_a_saving_step() {
-        let mut live = WizardRun::new(onboarding_lifetime_descriptor()).unwrap();
-        live.submit(WizardAnswer::Confirm(false)).unwrap();
-        assert_eq!(live.current_step_id(), Some("lifetime-save"));
-        live.submit(WizardAnswer::Acknowledged)
-            .expect("lifetime-save is a terminal action");
-        assert!(live.is_complete());
-        assert_eq!(onboarding_background_agents_answer(&live), Some(false));
-
-        let mut client = WizardRun::new(onboarding_lifetime_descriptor()).unwrap();
-        client.submit(WizardAnswer::Confirm(false)).unwrap();
-        let json = client.answers_json().unwrap();
-        assert!(
-            !json.contains("lifetime-save"),
-            "the client acknowledges the save only after the daemon reply: {json}"
-        );
-
-        let reconstructed = WizardRun::from_answers_json(onboarding_lifetime_descriptor(), &json)
-            .expect("daemon reconstruction infers the terminal save acknowledgement");
-        assert!(reconstructed.is_complete());
-        assert_eq!(
-            onboarding_background_agents_answer(&reconstructed),
-            Some(false)
         );
     }
 

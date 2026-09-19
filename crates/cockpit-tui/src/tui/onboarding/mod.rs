@@ -25,6 +25,7 @@
 
 pub(crate) mod agent;
 mod chrome;
+mod lifetime;
 mod profile;
 mod search;
 mod secure_store;
@@ -51,6 +52,7 @@ use cockpit_proto::{
     OnboardingBootstrapSnapshot, OnboardingBootstrapState, OnboardingStage,
     OnboardingStageSettlement, OnboardingTransitionKind,
 };
+use lifetime::LifetimeScreen;
 use profile::ProfileScreen;
 use search::{ProviderSearchScreen, onboarding_catalog};
 use secure_store::SecureStoreScreen;
@@ -146,6 +148,7 @@ pub(crate) enum OnboardingScreen {
     SecureStore(Box<SecureStoreScreen>),
     ProviderSearch(Box<ProviderSearchScreen>),
     AgentAuthoring(Box<agent::AgentAuthoringScreen>),
+    Lifetime(LifetimeScreen),
     Engine(EngineStage),
     Complete { summary: String, cursor: usize },
 }
@@ -159,6 +162,7 @@ pub(crate) enum OnboardingScreenKind {
     SecureStore,
     ProviderSearch,
     AgentAuthoring,
+    Lifetime,
     Engine,
     Complete,
 }
@@ -173,6 +177,7 @@ impl std::fmt::Debug for OnboardingScreen {
             Self::SecureStore(_) => formatter.write_str("SecureStore([REDACTED])"),
             Self::ProviderSearch(_) => formatter.write_str("ProviderSearch"),
             Self::AgentAuthoring(_) => formatter.write_str("AgentAuthoring"),
+            Self::Lifetime(_) => formatter.write_str("Lifetime"),
             Self::Engine(stage) => formatter.debug_tuple("Engine").field(stage).finish(),
             Self::Complete { .. } => formatter.write_str("Complete"),
         }
@@ -190,6 +195,8 @@ pub(crate) enum OnboardingShellAction {
     SecureIntent(SecureStoreSubmission),
     /// Apply the native profile field through the existing setup-wizard authority.
     ApplyProfile(String),
+    /// Apply the native lifetime choice through the existing setup-wizard authority.
+    ApplyLifetime(bool),
     /// Seed the provider engine with the selected canonical template.
     SelectTemplate(&'static ProviderTemplate),
     /// Leave the "add another provider" detour and present the stored
@@ -216,6 +223,9 @@ impl std::fmt::Debug for OnboardingShellAction {
             // receives a payload-bearing representation.
             Self::SecureIntent(_) => formatter.write_str("SecureIntent([REDACTED])"),
             Self::ApplyProfile(_) => formatter.write_str("ApplyProfile([REDACTED])"),
+            Self::ApplyLifetime(value) => {
+                formatter.debug_tuple("ApplyLifetime").field(value).finish()
+            }
             Self::SelectTemplate(template) => formatter
                 .debug_tuple("SelectTemplate")
                 .field(&template.id)
@@ -478,6 +488,7 @@ impl OnboardingShell {
             OnboardingStage::Provider => {
                 OnboardingScreen::ProviderSearch(Box::new(ProviderSearchScreen::new()))
             }
+            OnboardingStage::Lifetime => OnboardingScreen::Lifetime(LifetimeScreen::new()),
             OnboardingStage::Complete => {
                 // A fresh construction at `Complete` only happens when a
                 // caller bypassed the occupancy fence; present the
@@ -501,6 +512,7 @@ impl OnboardingShell {
         self.stage
     }
 
+    #[cfg(test)]
     pub(crate) fn screen_is_complete(&self) -> bool {
         matches!(self.screen, OnboardingScreen::Complete { .. })
     }
@@ -517,14 +529,6 @@ impl OnboardingShell {
     pub(crate) fn test_agent_authoring_phase(&self) -> Option<agent::Phase> {
         match &self.screen {
             OnboardingScreen::AgentAuthoring(screen) => Some(screen.test_phase()),
-            _ => None,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_agent_authoring_status(&self) -> Option<String> {
-        match &self.screen {
-            OnboardingScreen::AgentAuthoring(screen) => screen.test_status().map(str::to_owned),
             _ => None,
         }
     }
@@ -562,15 +566,6 @@ impl OnboardingShell {
         }
     }
 
-    pub(crate) fn replace_agent_authoring_projection(
-        &mut self,
-        projection: cockpit_proto::AgentAuthoringProjection,
-    ) {
-        if let OnboardingScreen::AgentAuthoring(screen) = &mut self.screen {
-            screen.replace_projection(projection);
-        }
-    }
-
     pub(crate) fn screen_kind(&self) -> OnboardingScreenKind {
         match &self.screen {
             OnboardingScreen::Welcome => OnboardingScreenKind::Welcome,
@@ -578,6 +573,7 @@ impl OnboardingShell {
             OnboardingScreen::SecureStore(_) => OnboardingScreenKind::SecureStore,
             OnboardingScreen::ProviderSearch(_) => OnboardingScreenKind::ProviderSearch,
             OnboardingScreen::AgentAuthoring(_) => OnboardingScreenKind::AgentAuthoring,
+            OnboardingScreen::Lifetime(_) => OnboardingScreenKind::Lifetime,
             OnboardingScreen::Engine(_) => OnboardingScreenKind::Engine,
             OnboardingScreen::Complete { .. } => OnboardingScreenKind::Complete,
         }
@@ -885,6 +881,9 @@ impl OnboardingShell {
             OnboardingScreen::AgentAuthoring(screen) => screen
                 .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 .map(OnboardingShellAction::AgentAuthoring),
+            OnboardingScreen::Lifetime(screen) => {
+                Some(OnboardingShellAction::ApplyLifetime(screen.submit()))
+            }
             OnboardingScreen::Complete { cursor, .. } => {
                 if *cursor == 0 {
                     self.begin_completion_provider_detour(Some(
@@ -1010,6 +1009,17 @@ impl OnboardingShell {
                 screen
                     .handle_key(key)
                     .map(OnboardingShellAction::AgentAuthoring)
+            }
+            OnboardingScreen::Lifetime(screen) => {
+                if matches!(key.code, KeyCode::Esc) {
+                    self.open_escape_menu(engine);
+                    return None;
+                }
+                if matches!(key.code, KeyCode::Enter) {
+                    return Some(OnboardingShellAction::ApplyLifetime(screen.submit()));
+                }
+                screen.handle_key(key);
+                None
             }
             OnboardingScreen::Complete { cursor, .. } => {
                 match key.code {
@@ -1235,6 +1245,26 @@ impl OnboardingShell {
                     _ => PointerOutcome::ignored(),
                 }
             }
+            OnboardingScreen::Lifetime(screen) => {
+                let over_list = chrome::hit(self.list_area, pos);
+                match mouse.kind {
+                    MouseEventKind::ScrollUp if over_list => {
+                        screen.move_choice(-1);
+                        PointerOutcome::consumed()
+                    }
+                    MouseEventKind::ScrollDown if over_list => {
+                        screen.move_choice(1);
+                        PointerOutcome::consumed()
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let rects = std::mem::take(&mut self.list_row_rects);
+                        screen.handle_mouse(mouse, &rects);
+                        self.list_row_rects = rects;
+                        PointerOutcome::consumed()
+                    }
+                    _ => PointerOutcome::ignored(),
+                }
+            }
             OnboardingScreen::ProviderSearch(screen) => {
                 let over_list = chrome::hit(self.list_area, pos);
                 if matches!(
@@ -1410,6 +1440,9 @@ impl OnboardingShell {
             OnboardingScreen::AgentAuthoring(screen) => {
                 screen.render(frame, rows[2]);
             }
+            OnboardingScreen::Lifetime(screen) => {
+                Self::render_lifetime(frame, rows[2], screen, &mut self.list_row_rects);
+            }
             OnboardingScreen::Complete { summary, .. } => {
                 Self::render_complete(frame, rows[2], summary, &mut self.list_row_rects);
             }
@@ -1444,6 +1477,7 @@ impl OnboardingShell {
             OnboardingScreen::ProviderSearch(_) => "Let's add a provider",
             OnboardingScreen::Complete { .. } => "You're ready to fly",
             OnboardingScreen::AgentAuthoring(_) => "Create your agent",
+            OnboardingScreen::Lifetime(_) => "Background agents",
             OnboardingScreen::Engine(_) => "Cockpit setup",
         }
     }
@@ -1456,6 +1490,9 @@ impl OnboardingShell {
                 "Choose how Cockpit protects your API keys and sealed values.".to_string()
             }
             OnboardingScreen::ProviderSearch(_) => "Pick who you'll fly with.".to_string(),
+            OnboardingScreen::Lifetime(_) => {
+                "Choose what happens after the last Cockpit window closes.".to_string()
+            }
             OnboardingScreen::Complete { .. } => "Your setup is complete.".to_string(),
             _ => String::new(),
         };
@@ -1486,6 +1523,9 @@ impl OnboardingShell {
             OnboardingScreen::SecureStore(screen) => screen.help_text(),
             OnboardingScreen::ProviderSearch(screen) => screen.help_text(),
             OnboardingScreen::AgentAuthoring(screen) => screen.help_text(),
+            OnboardingScreen::Lifetime(_) => {
+                "↑↓ move   click choose   enter continue   esc options"
+            }
             OnboardingScreen::Engine(EngineStage::Provider) => "wizard  esc: options",
             OnboardingScreen::Engine(_) => "wizard  esc: options",
             OnboardingScreen::Complete { .. } => "↑/↓  enter: choose",
@@ -1511,6 +1551,7 @@ impl OnboardingShell {
                 vec![chrome::Button::primary("Choose").enabled(screen.choose_enabled())]
             }
             OnboardingScreen::AgentAuthoring(_) => vec![chrome::Button::primary("Continue")],
+            OnboardingScreen::Lifetime(_) => vec![chrome::Button::primary("Continue")],
             OnboardingScreen::Engine(_) => vec![chrome::Button::primary("Continue")],
             OnboardingScreen::Complete { cursor, .. } if *cursor == 0 => vec![
                 chrome::Button::primary("Add another provider"),
@@ -1604,6 +1645,51 @@ impl OnboardingShell {
                 detail_area,
             );
         }
+    }
+
+    fn render_lifetime(
+        frame: &mut Frame,
+        area: Rect,
+        screen: &LifetimeScreen,
+        list_row_rects: &mut Vec<Rect>,
+    ) {
+        let lines = screen.lines();
+        for (y, line) in (area.y..).zip(lines) {
+            if y >= area.bottom() {
+                break;
+            }
+            frame.render_widget(
+                Paragraph::new(line).wrap(Wrap { trim: false }),
+                Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: 1,
+                },
+            );
+        }
+        list_row_rects.clear();
+        for index in 0..2u16 {
+            let row_y = area.y + index;
+            if row_y < area.bottom() {
+                list_row_rects.push(Rect {
+                    x: area.x,
+                    y: row_y,
+                    width: area.width,
+                    height: 1,
+                });
+            }
+        }
+        let detail_area = Rect {
+            x: area.x,
+            y: (area.y + 3).min(area.bottom()),
+            width: area.width,
+            height: area.height.saturating_sub(3),
+        };
+        frame.render_widget(
+            Paragraph::new(screen.detail_lines()).wrap(Wrap { trim: true }),
+            detail_area,
+        );
     }
 
     fn render_search(

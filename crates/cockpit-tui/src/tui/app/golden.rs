@@ -236,6 +236,7 @@ fn render_onboarding_stage(stage: OnboardingStage, width: u16, height: u16) -> B
 pub fn assert_onboarding_native_screens() {
     for (name, stage) in [
         ("profile", OnboardingStage::Profile),
+        ("lifetime", OnboardingStage::Lifetime),
         ("provider", OnboardingStage::Provider),
         ("completion", OnboardingStage::Complete),
     ] {

@@ -160,6 +160,18 @@ fn shell_screen_kind(app: &App) -> Option<crate::tui::onboarding::OnboardingScre
         .map(|shell| shell.screen_kind())
 }
 
+fn render_app(app: &mut App, width: u16, height: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect()
+}
+
 fn submit_onboarding_lifetime(app: &mut App) {
     assert_eq!(
         shell_screen_kind(app),
@@ -399,6 +411,14 @@ fn first_run_chains_provider_then_model() {
         shell_screen_kind(&app),
         Some(crate::tui::onboarding::OnboardingScreenKind::Model)
     );
+    assert_eq!(
+        app.onboarding_shell
+            .as_ref()
+            .and_then(|shell| shell.model_selection()),
+        Some(("p", "m"))
+    );
+    let rendered = render_app(&mut app, 100, 30);
+    assert!(rendered.contains("◉ ★ m"), "{rendered}");
     assert!(!app.dialog.is_active());
 }
 
@@ -422,6 +442,25 @@ fn first_run_provider_without_catalog_offers_manual_model_entry() {
     assert_eq!(
         shell_screen_kind(&app),
         Some(crate::tui::onboarding::OnboardingScreenKind::Model)
+    );
+    let rendered = render_app(&mut app, 100, 30);
+    assert!(rendered.contains("Model ID"), "{rendered}");
+    assert!(rendered.contains("type model id"), "{rendered}");
+    for ch in "manual-model".chars() {
+        shell_key(&mut app, KeyCode::Char(ch));
+    }
+    assert_eq!(
+        app.onboarding_shell
+            .as_ref()
+            .and_then(|shell| shell.model_selection()),
+        Some(("p", "manual-model"))
+    );
+    shell_key(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.onboarding_shell
+            .as_ref()
+            .and_then(|shell| shell.model_phase()),
+        Some(crate::tui::onboarding::ModelPhase::Trust)
     );
     assert!(!app.dialog.is_active());
 }

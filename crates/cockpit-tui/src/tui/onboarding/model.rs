@@ -7,7 +7,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Padding, Paragraph, Wrap};
 
-use super::theme::{BRASS, FOG, INK, NIGHT};
+use super::theme::{BAD, BRASS, FOG, INK, NIGHT};
 use super::ui::{self, ListNav, STAR};
 use crate::tui::textfield::TextField;
 use cockpit_config::config::providers::{CapabilityStatus, ModelTrust, ProvidersConfig};
@@ -76,6 +76,7 @@ impl ModelPhase {
 
 pub(crate) struct ModelScreen {
     phase: ModelPhase,
+    config: ProvidersConfig,
     catalog: Vec<(String, String)>,
     selected_model: usize,
     provider_id: String,
@@ -127,6 +128,7 @@ impl ModelScreen {
             .unwrap_or_default();
         let mut screen = Self {
             phase: ModelPhase::DefaultModel,
+            config: config.clone(),
             catalog,
             selected_model,
             provider_id,
@@ -142,21 +144,22 @@ impl ModelScreen {
             field_rects: Vec::new(),
             error: None,
         };
-        screen.seed_policy(config);
+        screen.seed_policy();
+        screen.reset_nav_for_phase();
         screen
     }
 
-    fn seed_policy(&mut self, config: &ProvidersConfig) {
+    fn seed_policy(&mut self) {
         if self.provider_id.is_empty() || self.model_id.text().is_empty() {
             return;
         }
         let provider = self.provider_id.as_str();
         let model = self.model_id.text();
-        self.trust = usize::from(config.resolve_trust(provider, model) == ModelTrust::Trusted);
-        let caps = config.resolve_effective_model_capabilities(
+        self.trust = usize::from(self.config.resolve_trust(provider, model) == ModelTrust::Trusted);
+        let caps = self.config.resolve_effective_model_capabilities(
             provider,
             model,
-            config.resolution_generation,
+            self.config.resolution_generation,
         );
         self.capabilities = [
             caps.supports_image_input(),
@@ -174,7 +177,7 @@ impl ModelScreen {
                 .map(|value| value.to_string())
                 .unwrap_or_default(),
         );
-        self.thinking = match config.resolve_default_thinking_mode(provider, model) {
+        self.thinking = match self.config.resolve_default_thinking_mode(provider, model) {
             None => 0,
             Some(cockpit_config::config::providers::ThinkingMode::Off) => 1,
             Some(cockpit_config::config::providers::ThinkingMode::Low) => 2,
@@ -182,9 +185,29 @@ impl ModelScreen {
             Some(cockpit_config::config::providers::ThinkingMode::High) => 4,
         };
         self.delegation = [
-            config.resolve_subagent_invokable(provider, model),
-            config.resolve_can_delegate(provider, model),
+            self.config.resolve_subagent_invokable(provider, model),
+            self.config.resolve_can_delegate(provider, model),
         ];
+    }
+
+    fn reset_nav_for_phase(&mut self) {
+        self.nav = ListNav::new();
+        self.nav.cursor = match self.phase {
+            ModelPhase::DefaultModel => self.selected_model,
+            ModelPhase::Trust => self.trust,
+            ModelPhase::Thinking => self.thinking,
+            ModelPhase::Capabilities | ModelPhase::Limits | ModelPhase::Delegation => 0,
+        };
+    }
+
+    fn select_catalog_model(&mut self, index: usize) {
+        let Some((provider, model)) = self.catalog.get(index).cloned() else {
+            return;
+        };
+        self.selected_model = index;
+        self.provider_id = provider;
+        self.model_id = TextField::new(model);
+        self.seed_policy();
     }
 
     #[cfg(test)]
@@ -195,7 +218,7 @@ impl ModelScreen {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_phase_for_golden(&mut self, phase: ModelPhase) {
         self.phase = phase;
-        self.nav = ListNav::new();
+        self.reset_nav_for_phase();
     }
 
     pub(crate) fn title(&self) -> &'static str {
@@ -223,9 +246,11 @@ impl ModelScreen {
     pub(crate) fn help_text(&self) -> &'static str {
         match self.phase {
             ModelPhase::DefaultModel if self.catalog.is_empty() => {
-                "type model id   enter continue   esc back"
+                "type model id   enter continue   esc options"
             }
-            ModelPhase::DefaultModel => "↑↓ move   space set default   enter continue   esc back",
+            ModelPhase::DefaultModel => {
+                "↑↓ move   space set default   enter continue   esc options"
+            }
             ModelPhase::Limits => "tab switch field   type value   enter continue   esc back",
             ModelPhase::Capabilities | ModelPhase::Delegation => {
                 "↑↓ move   space toggle   enter continue   esc back"
@@ -240,12 +265,20 @@ impl ModelScreen {
             return false;
         }
         self.phase = ModelPhase::ALL[index - 1];
-        self.nav = ListNav::new();
+        self.reset_nav_for_phase();
         self.error = None;
         true
     }
 
     pub(crate) fn advance(&mut self) -> Option<cockpit_core::wizard::OnboardingModelSubmission> {
+        match self.phase {
+            ModelPhase::DefaultModel if !self.catalog.is_empty() => {
+                self.select_catalog_model(self.nav.cursor);
+            }
+            ModelPhase::Trust => self.trust = self.nav.cursor.min(1),
+            ModelPhase::Thinking => self.thinking = self.nav.cursor.min(THINKING.len() - 1),
+            _ => {}
+        }
         if self.phase == ModelPhase::DefaultModel
             && (self.provider_id.trim().is_empty() || self.model_id.text().trim().is_empty())
         {
@@ -266,7 +299,7 @@ impl ModelScreen {
         let index = self.phase.index();
         if index + 1 < ModelPhase::ALL.len() {
             self.phase = ModelPhase::ALL[index + 1];
-            self.nav = ListNav::new();
+            self.reset_nav_for_phase();
             return None;
         }
         Some(cockpit_core::wizard::OnboardingModelSubmission {
@@ -310,10 +343,7 @@ impl ModelScreen {
     fn activate_row(&mut self) {
         match self.phase {
             ModelPhase::DefaultModel if !self.catalog.is_empty() => {
-                self.selected_model = self.nav.cursor;
-                let (provider, model) = self.catalog[self.selected_model].clone();
-                self.provider_id = provider;
-                self.model_id = TextField::new(model);
+                self.select_catalog_model(self.nav.cursor);
             }
             ModelPhase::Trust => self.trust = self.nav.cursor.min(1),
             ModelPhase::Capabilities => {
@@ -333,7 +363,9 @@ impl ModelScreen {
         if self.phase == ModelPhase::Limits {
             match key.code {
                 KeyCode::Tab | KeyCode::Down => self.nav.cursor = (self.nav.cursor + 1) % 2,
-                KeyCode::BackTab | KeyCode::Up => self.nav.cursor = (self.nav.cursor + 1) % 2,
+                KeyCode::BackTab | KeyCode::Up => {
+                    self.nav.cursor = self.nav.cursor.checked_sub(1).unwrap_or(1)
+                }
                 _ if self.nav.cursor == 0 => {
                     self.context_tokens.handle_key(key);
                 }
@@ -370,8 +402,17 @@ impl ModelScreen {
             MouseEventKind::ScrollDown => self.nav.move_by(1, self.row_count()),
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(index) = self.row_rects.iter().position(|rect| rect.contains(pos)) {
-                    self.nav.cursor = self.nav.offset + index;
-                    self.activate_row();
+                    let index = self.nav.offset + index;
+                    let was_focused = self.nav.cursor == index;
+                    self.nav.cursor = index;
+                    if was_focused
+                        || !matches!(
+                            self.phase,
+                            ModelPhase::Capabilities | ModelPhase::Delegation
+                        )
+                    {
+                        self.activate_row();
+                    }
                 } else if let Some(index) =
                     self.field_rects.iter().position(|rect| rect.contains(pos))
                 {
@@ -389,6 +430,16 @@ impl ModelScreen {
             ModelPhase::Limits => self.max_output_tokens.paste(text),
             _ => {}
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selection(&self) -> (&str, &str) {
+        (&self.provider_id, self.model_id.text())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_row_rects(&self) -> &[Rect] {
+        &self.row_rects
     }
 
     pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
@@ -433,49 +484,43 @@ impl ModelScreen {
     }
 
     fn render_limits(&mut self, frame: &mut Frame, area: Rect) {
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(NIGHT))
-            .title(Span::styled(" Limits ", Style::new().fg(INK)))
-            .padding(Padding::horizontal(1));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        let value = |field: &TextField| {
-            if field.text().is_empty() {
-                "Auto".to_string()
-            } else {
-                field.text().to_string()
-            }
+        let first = Rect {
+            height: 3.min(area.height),
+            ..area
         };
-        let lines = [
-            Line::from(vec![
-                ui::radio_mark(self.nav.cursor == 0, self.nav.cursor == 0),
-                Span::styled("Context window tokens  ", Style::new().fg(INK)),
-                Span::styled(value(&self.context_tokens), Style::new().fg(BRASS)),
-            ]),
-            Line::from(vec![
-                ui::radio_mark(self.nav.cursor == 1, self.nav.cursor == 1),
-                Span::styled("Max output tokens      ", Style::new().fg(INK)),
-                Span::styled(value(&self.max_output_tokens), Style::new().fg(BRASS)),
-            ]),
-        ];
-        for (index, line) in lines.into_iter().enumerate() {
-            let rect = Rect {
-                x: inner.x,
-                y: inner.y + index as u16,
-                width: inner.width,
-                height: 1,
-            };
-            self.field_rects.push(rect);
-            frame.render_widget(Paragraph::new(line), rect);
+        let second = Rect {
+            x: area.x,
+            y: first.bottom().min(area.bottom()),
+            width: area.width,
+            height: 3.min(area.bottom().saturating_sub(first.bottom())),
+        };
+        self.field_rects.extend([first, second]);
+        let first_caret = ui::render_field(
+            frame,
+            first,
+            "Context window tokens",
+            &self.context_tokens,
+            self.nav.cursor == 0,
+            "Auto",
+        );
+        let second_caret = ui::render_field(
+            frame,
+            second,
+            "Max output tokens",
+            &self.max_output_tokens,
+            self.nav.cursor == 1,
+            "Auto",
+        );
+        if let Some(caret) = first_caret.or(second_caret) {
+            frame.set_cursor_position(caret);
         }
-        self.render_error(
+        self.render_detail(
             frame,
             Rect {
-                x: inner.x,
-                y: (inner.y + 3).min(inner.bottom()),
-                width: inner.width,
-                height: inner.height.saturating_sub(3),
+                x: area.x,
+                y: second.bottom().min(area.bottom()),
+                width: area.width,
+                height: area.bottom().saturating_sub(second.bottom()),
             },
         );
     }
@@ -566,7 +611,7 @@ impl ModelScreen {
             ModelPhase::DefaultModel => {
                 let (provider, model) = &self.catalog[index];
                 Line::from(vec![
-                    ui::check_mark(true, focused),
+                    ui::radio_mark(index == self.selected_model, focused),
                     Span::styled(
                         if index == self.selected_model {
                             format!("{STAR} ")
@@ -603,7 +648,11 @@ impl ModelScreen {
     }
 
     fn render_detail(&self, frame: &mut Frame, area: Rect) {
-        let text = match self.phase {
+        let (text, color) =
+            if let Some(error) = &self.error {
+                (error.clone(), BAD)
+            } else {
+                (match self.phase {
             ModelPhase::DefaultModel if self.catalog.is_empty() => {
                 "Enter the exact model ID for the provider configured in the previous step."
                     .to_string()
@@ -631,23 +680,11 @@ impl ModelScreen {
             ModelPhase::Limits => {
                 "Blank keeps Auto; overrides must be positive numbers.".to_string()
             }
-        };
+            }, FOG)
+            };
         frame.render_widget(
             Paragraph::new(text)
-                .style(Style::new().fg(FOG))
-                .wrap(Wrap { trim: true }),
-            area,
-        );
-    }
-
-    fn render_error(&self, frame: &mut Frame, area: Rect) {
-        let text = self
-            .error
-            .as_deref()
-            .unwrap_or("Blank keeps Auto; overrides must be positive numbers.");
-        frame.render_widget(
-            Paragraph::new(text)
-                .style(Style::new().fg(FOG))
+                .style(Style::new().fg(color))
                 .wrap(Wrap { trim: true }),
             area,
         );

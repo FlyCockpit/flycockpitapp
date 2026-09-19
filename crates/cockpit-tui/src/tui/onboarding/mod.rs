@@ -547,6 +547,22 @@ impl OnboardingShell {
     }
 
     #[cfg(test)]
+    pub(crate) fn model_selection(&self) -> Option<(&str, &str)> {
+        match &self.screen {
+            OnboardingScreen::Model(screen) => Some(screen.selection()),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_row_rects(&self) -> &[Rect] {
+        match &self.screen {
+            OnboardingScreen::Model(screen) => screen.test_row_rects(),
+            _ => &[],
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_agent_authoring_phase(&self) -> Option<agent::Phase> {
         match &self.screen {
             OnboardingScreen::AgentAuthoring(screen) => Some(screen.test_phase()),

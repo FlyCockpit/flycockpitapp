@@ -851,6 +851,101 @@ mod tests {
         }
     }
 
+    #[test]
+    fn onboarding_model_client_answers_replay_all_native_fields_and_skip_disabled_thinking() {
+        let mut providers = crate::config::providers::ProvidersConfig::default();
+        providers.providers.insert(
+            "provider".into(),
+            crate::config::providers::ProviderEntry::default(),
+        );
+        let descriptor =
+            crate::wizard::onboarding_model_descriptor_with_selection(&providers, None);
+        let submission = OnboardingModelSubmission {
+            provider_id: "provider".into(),
+            model_id: "manual-model".into(),
+            trust: "trusted".into(),
+            capabilities: vec!["images".into(), "reasoning".into()],
+            context_tokens: "131072".into(),
+            max_output_tokens: "16384".into(),
+            thinking: "high".into(),
+            subagent_flags: vec!["subagent_invokable".into()],
+        };
+
+        let json = onboarding_model_client_answers_json(descriptor.clone(), &submission).unwrap();
+        let answers: std::collections::BTreeMap<String, WizardAnswer> =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            answers.get("provider"),
+            Some(&WizardAnswer::Select("provider".into()))
+        );
+        assert_eq!(
+            answers.get("model"),
+            Some(&WizardAnswer::Text("manual-model".into()))
+        );
+        assert_eq!(
+            answers.get("configuration"),
+            Some(&WizardAnswer::Select("advanced".into()))
+        );
+        assert_eq!(
+            answers.get("trust"),
+            Some(&WizardAnswer::Select("trusted".into()))
+        );
+        assert_eq!(
+            answers.get("capabilities"),
+            Some(&WizardAnswer::MultiToggle(vec![
+                "images".into(),
+                "reasoning".into()
+            ]))
+        );
+        assert_eq!(
+            answers.get("context-tokens"),
+            Some(&WizardAnswer::Text("131072".into()))
+        );
+        assert_eq!(
+            answers.get("max-output-tokens"),
+            Some(&WizardAnswer::Text("16384".into()))
+        );
+        assert_eq!(
+            answers.get("thinking"),
+            Some(&WizardAnswer::Select("high".into()))
+        );
+        assert_eq!(
+            answers.get("subagent-flags"),
+            Some(&WizardAnswer::MultiToggle(vec![
+                "subagent_invokable".into()
+            ]))
+        );
+        assert_eq!(
+            answers.get("default-model"),
+            Some(&WizardAnswer::Confirm(true))
+        );
+        assert_eq!(
+            answers.get("system-prompt-choice"),
+            Some(&WizardAnswer::Select("skip".into()))
+        );
+        assert!(
+            WizardRun::from_answers_json(descriptor.clone(), &json)
+                .unwrap()
+                .is_complete()
+        );
+
+        let without_reasoning = OnboardingModelSubmission {
+            capabilities: vec!["tools".into()],
+            thinking: "high".into(),
+            ..submission
+        };
+        let json =
+            onboarding_model_client_answers_json(descriptor.clone(), &without_reasoning).unwrap();
+        let answers: std::collections::BTreeMap<String, WizardAnswer> =
+            serde_json::from_str(&json).unwrap();
+        assert!(!answers.contains_key("thinking"));
+        assert!(
+            WizardRun::from_answers_json(descriptor, &json)
+                .unwrap()
+                .is_complete()
+        );
+    }
+
     fn submit_security_wizard_prefills_until_save(run: &mut WizardRun) {
         submit_security_wizard_until_save(run, &[]);
     }

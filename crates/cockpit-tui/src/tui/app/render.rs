@@ -3034,7 +3034,7 @@ impl App {
                 // transcript is focused) ride each role header, before the
                 // independently width-gated timestamp. They cost no separate
                 // vertical space.
-                let pin = Self::entry_pin_seq(entry).and_then(|seq| {
+                let pin = Self::entry_pin_seq(entry).map(|seq| {
                     let is_pick = self
                         .pin_pick
                         .as_ref()
@@ -3046,12 +3046,12 @@ impl App {
                         || self
                             .copy_pick_selected_history_index()
                             .is_some_and(|selected| selected == idx);
-                    Some(crate::tui::history::PinControl {
+                    crate::tui::history::PinControl {
                         seq,
                         pinned: self.is_seq_pinned_for_render(seq),
                         show_control: true,
                         is_pick,
-                    })
+                    }
                 });
                 let preflight_dots_ms = self.started_at.elapsed().as_millis();
                 let version = *self
@@ -7078,7 +7078,7 @@ mod render_history_spacing_tests {
 
         for (idx, entry) in app.history.iter().enumerate() {
             msg_abs_line.insert(idx, all.len());
-            let pin = App::entry_pin_seq(entry).and_then(|seq| {
+            let pin = App::entry_pin_seq(entry).map(|seq| {
                 let is_pick = app
                     .pin_pick
                     .as_ref()
@@ -7090,12 +7090,12 @@ mod render_history_spacing_tests {
                     || app
                         .copy_pick_selected_history_index()
                         .is_some_and(|selected| selected == idx);
-                Some(crate::tui::history::PinControl {
+                crate::tui::history::PinControl {
                     seq,
                     pinned: app.is_seq_pinned_for_render(seq),
                     show_control: true,
                     is_pick,
-                })
+                }
             });
             let rendered = render_entry(
                 entry,

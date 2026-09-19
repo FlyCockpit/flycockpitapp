@@ -112,15 +112,17 @@ impl Drop for SpawnNotifyServer {
 
 /// Child-side report. No-op when the parent did not pass a notify endpoint.
 pub(crate) fn report_ready(socket: &Path) {
-    report_line(&format!("Ok{{{}}}", socket.display()));
+    let socket = sanitize_report_payload(&socket.display().to_string());
+    report_line(&format!("Ok{{{socket}}}"));
 }
 
 pub(crate) fn report_err(error: &anyhow::Error) {
     if let Some(bind) = error.downcast_ref::<DaemonBindInUse>() {
-        report_line(&format!("AddrInUse{{{}}}", bind.path.display()));
+        let path = sanitize_report_payload(&bind.path.display().to_string());
+        report_line(&format!("AddrInUse{{{path}}}"));
         return;
     }
-    let reason = sanitize_report_reason(&format!("{error:#}"));
+    let reason = sanitize_report_payload(&format!("{error:#}"));
     report_line(&format!("Err{{{reason}}}"));
 }
 
@@ -194,7 +196,7 @@ pub(crate) fn parse_report_line(line: &str) -> Result<SpawnReport> {
     bail!("malformed spawn notify: {line}")
 }
 
-fn sanitize_report_reason(reason: &str) -> String {
+fn sanitize_report_payload(reason: &str) -> String {
     reason.replace(['}', '\n', '\r'], " ")
 }
 
@@ -382,7 +384,7 @@ pub(crate) fn reap_or_kill(child: &mut Child) {
 
 #[cfg(unix)]
 fn unix_bind() -> Result<SpawnNotifyServer> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     use std::os::unix::net::UnixListener;
 
     let path = short_notify_path()?;
@@ -397,6 +399,20 @@ fn unix_bind() -> Result<SpawnNotifyServer> {
         .with_context(|| format!("binding spawn notify socket {}", path.display()))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod 0600 {}", path.display()))?;
+    let meta =
+        std::fs::symlink_metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+    let file_type = meta.file_type();
+    let mode = meta.mode() & 0o777;
+    let owner = meta.uid();
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if !file_type.is_socket() || owner != euid || mode != 0o600 {
+        anyhow::bail!(
+            "refusing to use {}: expected owner-only socket (uid {euid}, mode 0600), \
+             got uid {owner} mode {mode:03o}",
+            path.display()
+        );
+    }
     listener
         .set_nonblocking(true)
         .context("setting spawn notify socket non-blocking")?;
@@ -430,6 +446,18 @@ fn unix_wait(
     loop {
         match server.listener.accept() {
             Ok((stream, _)) => {
+                verify_notify_peer(&stream)?;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    kill_spawned_daemon(child);
+                    return Err(error_with_log_tail(
+                        "timed out waiting for daemon to report ready",
+                        log_path,
+                    ));
+                }
+                stream
+                    .set_read_timeout(Some(remaining))
+                    .context("setting spawn notify read timeout")?;
                 let mut line = String::new();
                 BufReader::new(stream)
                     .read_line(&mut line)
@@ -445,7 +473,7 @@ fn unix_wait(
         match child.try_wait() {
             Ok(Some(_)) => {
                 return Err(error_with_log_tail(
-                    "timed out waiting for daemon to report ready: child exited before reporting",
+                    "daemon exited before reporting ready",
                     log_path,
                 ));
             }
@@ -466,6 +494,21 @@ fn unix_wait(
         }
         std::thread::sleep(WAIT_POLL);
     }
+}
+
+#[cfg(unix)]
+fn verify_notify_peer(stream: &std::os::unix::net::UnixStream) -> Result<()> {
+    let peer = cockpit_host::peer_cred::peer_identity_from_unix_stream(stream)
+        .context("reading spawn notify peer credentials")?;
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if peer.uid != euid {
+        anyhow::bail!(
+            "refusing spawn notify report from uid {} (expected {euid})",
+            peer.uid
+        );
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -522,7 +565,7 @@ fn windows_wait(
         match child.try_wait() {
             Ok(Some(_)) => {
                 return Err(error_with_log_tail(
-                    "timed out waiting for daemon to report ready: child exited before reporting",
+                    "daemon exited before reporting ready",
                     log_path,
                 ));
             }
@@ -666,16 +709,12 @@ mod tests {
             .expect_err("silent exit must fail");
         let text = format!("{error:#}");
         assert!(
-            text.contains("timed out waiting for daemon to report ready"),
-            "silent exit must use the timeout error: {text}"
+            text.contains("daemon exited before reporting ready"),
+            "silent exit must name the child exit: {text}"
         );
         assert!(
             text.contains("boot-line-24"),
-            "timeout error must append the log tail: {text}"
-        );
-        assert!(
-            text.contains("child exited before reporting"),
-            "silent exit must name the child exit: {text}"
+            "silent exit must append the log tail: {text}"
         );
         let _ = child.wait();
     }

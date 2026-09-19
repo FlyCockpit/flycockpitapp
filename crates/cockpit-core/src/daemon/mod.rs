@@ -1235,6 +1235,24 @@ pub fn spawn_detached_with_resume(no_sandbox: bool, resume_all_sessions: bool) -
     spawn_detached_inner(None, no_sandbox, resume_all_sessions)
 }
 
+/// Async wrapper for [`spawn_detached`]. The spawn path blocks on child boot
+/// notification for up to [`DAEMON_SPAWN_TIMEOUT`]; run it off the runtime.
+pub async fn spawn_detached_async(no_sandbox: bool) -> Result<u32> {
+    tokio::task::spawn_blocking(move || spawn_detached(no_sandbox))
+        .await
+        .context("joining detached daemon spawn")?
+}
+
+/// Async wrapper for [`spawn_detached_with_resume`].
+pub async fn spawn_detached_with_resume_async(
+    no_sandbox: bool,
+    resume_all_sessions: bool,
+) -> Result<u32> {
+    tokio::task::spawn_blocking(move || spawn_detached_with_resume(no_sandbox, resume_all_sessions))
+        .await
+        .context("joining detached daemon spawn")?
+}
+
 pub fn restart_no_sandbox_from_argv(args: &[String], explicit_no_sandbox: bool) -> bool {
     explicit_no_sandbox
         || (argv_requests_daemon_start(args) && args.iter().any(|arg| arg == "--no-sandbox"))
@@ -1652,7 +1670,10 @@ fn spawn_detached_child(
             spawn_notify::reap_or_kill(&mut child);
             Err(spawn_notify::report_to_error(report, &log_path))
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            spawn_notify::reap_or_kill(&mut child);
+            Err(error)
+        }
     }
 }
 
@@ -2673,14 +2694,20 @@ async fn run_foreground_inner_with_boot_db_impl(
             .context("creating writable global Cockpit config directory")?;
     }
     timer.phase("global_config_dir");
-    if matches!(
-        probe(&paths).await,
-        DaemonStatus::Running | DaemonStatus::IncompatibleProtocol
-    ) {
-        anyhow::bail!(
-            "another daemon is already running (socket: {})",
-            paths.socket.display()
-        );
+    match probe(&paths).await {
+        DaemonStatus::Running => {
+            return Err(DaemonBindInUse {
+                path: paths.socket.clone(),
+            }
+            .into());
+        }
+        DaemonStatus::IncompatibleProtocol => {
+            anyhow::bail!(
+                "another daemon is already running (socket: {})",
+                paths.socket.display()
+            );
+        }
+        _ => {}
     }
     timer.phase("probe");
     if boot_db.is_none()
@@ -2691,18 +2718,19 @@ async fn run_foreground_inner_with_boot_db_impl(
             })
     {
         let discovered = discover().await;
-        if matches!(
-            discovered.status,
-            DaemonStatus::Running
-                | DaemonStatus::IncompatibleProtocol
-                | DaemonStatus::LivePidSocketUnreachable
-                | DaemonStatus::UnverifiedPid
-        ) && discovered.paths.socket != paths.socket
+        if discovered.paths.socket != paths.socket
+            && matches!(
+                discovered.status,
+                DaemonStatus::Running
+                    | DaemonStatus::IncompatibleProtocol
+                    | DaemonStatus::LivePidSocketUnreachable
+                    | DaemonStatus::UnverifiedPid
+            )
         {
-            anyhow::bail!(
-                "another daemon is already running or owns the shared pid file (pid file: {})",
-                paths.pid_file.display()
-            );
+            return Err(DaemonBindInUse {
+                path: paths.socket.clone(),
+            }
+            .into());
         }
     }
     timer.phase("discover");
@@ -4724,7 +4752,8 @@ mod tests {
 
     #[test]
     fn stop_routing_uses_exact_kqueue_witness_on_macos_and_freebsd() {
-        let source = include_str!("mod.rs");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon/mod.rs");
+        let source = std::fs::read_to_string(&path).expect("daemon mod.rs source");
         let start = source.find("pub fn stop(paths:").expect("stop entry");
         let exact = source
             .find("pub(crate) fn stop_exact")

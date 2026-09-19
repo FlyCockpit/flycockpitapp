@@ -474,6 +474,56 @@ fn after_restart_wait(error: SharedWaitError) -> RestartWaitPlan {
     }
 }
 
+async fn wait_for_restarting_owner(
+    discovered: crate::daemon::DaemonProbe,
+    mode: LifecycleMode,
+    lifecycle_request: Option<&cockpit_client::LifecycleRequest>,
+) -> Result<Option<ConnectedDaemon>> {
+    let observed_pid = cockpit_host::daemon_lifecycle::read_pid_file(&discovered.paths.pid_file);
+    let client = match wait_for_shared_daemon(&discovered.paths.socket, observed_pid).await {
+        Ok(client) => client,
+        Err(error) => match after_restart_wait(error) {
+            RestartWaitPlan::WaitForReplacement => {
+                tracing::info!(
+                    "canonical daemon pid released; waiting for the restart replacement"
+                );
+                match wait_for_shared_daemon(&discovered.paths.socket, None).await {
+                    Ok(client) => client,
+                    Err(_) => {
+                        tracing::info!("restart replacement never bound; spawning a replacement");
+                        return Ok(None);
+                    }
+                }
+            }
+            RestartWaitPlan::FailWedged => {
+                anyhow::bail!(
+                    "shared daemon pid is live but socket never became ready: {}",
+                    discovered.paths.socket.display()
+                );
+            }
+        },
+    };
+
+    if matches!(mode, LifecycleMode::PromoteToPersistent) && discovered.paths.ephemeral {
+        // A starting ephemeral owner can publish a handshake while either
+        // restart wait is in progress. It is never a valid terminal owner for
+        // an Assistant lifecycle request.
+        drop(client);
+        return promote_ephemeral_owner(&discovered.paths, lifecycle_request)
+            .await
+            .map(Some);
+    }
+    Ok(Some(ConnectedDaemon {
+        endpoint: local_daemon_endpoint(&discovered.paths.socket),
+        client,
+        owns_daemon: false,
+        ephemeral_owner: discovered.paths.ephemeral,
+        socket: discovered.paths.socket,
+        startup_notice: None,
+        promoted_from_ephemeral: false,
+    }))
+}
+
 /// Find the daemon socket, optionally spawn the daemon, return a
 /// connected client. Honors [`LifecycleMode`].
 pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
@@ -1070,83 +1120,10 @@ async fn probe_or_spawn_with_spawn_authorization(
                     }
                 }
                 DiscoverAttachPlan::WaitForRestart => {
-                    let observed_pid =
-                        cockpit_host::daemon_lifecycle::read_pid_file(&discovered.paths.pid_file);
-                    let startup_notice = None;
-                    match wait_for_shared_daemon(&discovered.paths.socket, observed_pid).await {
-                        Ok(client) => {
-                            if matches!(mode, LifecycleMode::PromoteToPersistent)
-                                && discovered.paths.ephemeral
-                            {
-                                // A starting ephemeral owner can publish a
-                                // handshake before the original discovery
-                                // completes. Do not let that restart wait
-                                // bypass Assistant promotion.
-                                drop(client);
-                                return promote_ephemeral_owner(
-                                    &discovered.paths,
-                                    lifecycle_request,
-                                )
-                                .await;
-                            }
-                            return Ok(ConnectedDaemon {
-                                endpoint: local_daemon_endpoint(&discovered.paths.socket),
-                                client,
-                                owns_daemon: false,
-                                ephemeral_owner: discovered.paths.ephemeral,
-                                socket: discovered.paths.socket,
-                                startup_notice,
-                                promoted_from_ephemeral: false,
-                            });
-                        }
-                        Err(error) => match after_restart_wait(error) {
-                            RestartWaitPlan::WaitForReplacement => {
-                                tracing::info!(
-                                    "canonical daemon pid released; waiting for the restart replacement"
-                                );
-                                match wait_for_shared_daemon(&discovered.paths.socket, None).await {
-                                    Ok(client) => {
-                                        if matches!(mode, LifecycleMode::PromoteToPersistent)
-                                            && discovered.paths.ephemeral
-                                        {
-                                            // As above, the replacement wait
-                                            // may observe the original
-                                            // ephemeral starter. It is never a
-                                            // valid terminal owner for an
-                                            // Assistant lifecycle request.
-                                            drop(client);
-                                            return promote_ephemeral_owner(
-                                                &discovered.paths,
-                                                lifecycle_request,
-                                            )
-                                            .await;
-                                        }
-                                        return Ok(ConnectedDaemon {
-                                            endpoint: local_daemon_endpoint(
-                                                &discovered.paths.socket,
-                                            ),
-                                            client,
-                                            owns_daemon: false,
-                                            ephemeral_owner: discovered.paths.ephemeral,
-                                            socket: discovered.paths.socket,
-                                            startup_notice,
-                                            promoted_from_ephemeral: false,
-                                        });
-                                    }
-                                    Err(_) => {
-                                        tracing::info!(
-                                            "restart replacement never bound; spawning a replacement"
-                                        );
-                                    }
-                                }
-                            }
-                            RestartWaitPlan::FailWedged => {
-                                anyhow::bail!(
-                                    "shared daemon pid is live but socket never became ready: {}",
-                                    discovered.paths.socket.display()
-                                );
-                            }
-                        },
+                    if let Some(connected) =
+                        wait_for_restarting_owner(discovered, mode, lifecycle_request).await?
+                    {
+                        return Ok(connected);
                     }
                 }
                 DiscoverAttachPlan::Spawn => {}
@@ -1220,8 +1197,15 @@ async fn probe_or_spawn_with_spawn_authorization(
             }
             anyhow::bail!("daemon rendezvous reports an incompatible owner");
         }
-        DiscoverAttachPlan::WaitForRestart | DiscoverAttachPlan::FailUnreachable => {
-            anyhow::bail!("daemon owner is live but its socket is not ready");
+        DiscoverAttachPlan::WaitForRestart => {
+            if let Some(connected) =
+                wait_for_restarting_owner(after_lock, mode, lifecycle_request).await?
+            {
+                return Ok(connected);
+            }
+        }
+        DiscoverAttachPlan::FailUnreachable => {
+            anyhow::bail!("daemon owner cannot be verified and its socket is not ready");
         }
         DiscoverAttachPlan::Spawn => {}
     }

@@ -58,14 +58,21 @@ pub fn resolve(database_path: &Path) -> Result<Files> {
             .map(|root| root.join("cockpit").join(&hash));
         match xdg {
             Some(candidate) if socket_path_fits(&candidate.join("cockpit.sock")) => candidate,
-            _ => per_user_tmp_root()?.join("cockpit").join(&hash),
+            _ => per_user_tmp_root(&hash)?.join("cockpit").join(&hash),
         }
     };
 
     let socket = directory.join("cockpit.sock");
     if !socket_path_fits(&socket) {
+        if std::env::var_os(SOCKET_DIR_ENV).is_some() {
+            anyhow::bail!(
+                "{SOCKET_DIR_ENV} produces a daemon socket path longer than the platform limit: {}",
+                socket.display()
+            );
+        }
         anyhow::bail!(
-            "{SOCKET_DIR_ENV} produces a daemon socket path longer than the platform limit: {}",
+            "computed daemon socket path is longer than the platform limit: {}; set \
+             {SOCKET_DIR_ENV} to a shorter existing directory",
             socket.display()
         );
     }
@@ -116,17 +123,48 @@ fn absolute_identity(path: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(unix)]
-fn per_user_tmp_root() -> Result<PathBuf> {
+fn per_user_tmp_root(hash: &str) -> Result<PathBuf> {
     // SAFETY: geteuid has no preconditions.
     let uid = unsafe { libc::geteuid() };
-    let root = std::env::temp_dir().join(format!("cockpit-{uid}"));
-    cockpit_host::private_fs::ensure_private_dir(&root)
-        .with_context(|| format!("securing per-user runtime root {}", root.display()))?;
-    Ok(root)
+    let name = format!("cockpit-{uid}");
+    let temp_root = std::env::temp_dir().join(&name);
+    let short_root = Path::new("/tmp").join(&name);
+    per_user_tmp_root_from_candidates(hash, [temp_root, short_root])
+}
+
+#[cfg(unix)]
+fn per_user_tmp_root_from_candidates(
+    hash: &str,
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Result<PathBuf> {
+    let mut attempted = Vec::new();
+    for root in candidates {
+        if attempted.iter().any(|(candidate, _)| candidate == &root) {
+            continue;
+        }
+        let socket = root.join("cockpit").join(hash).join("cockpit.sock");
+        if !socket_path_fits(&socket) {
+            attempted.push((root, "socket path is too long".to_string()));
+            continue;
+        }
+        match cockpit_host::private_fs::ensure_private_dir(&root) {
+            Ok(()) => return Ok(root),
+            Err(error) => attempted.push((root, format!("cannot secure directory: {error}"))),
+        }
+    }
+    let attempted = attempted
+        .into_iter()
+        .map(|(path, reason)| format!("{} ({reason})", path.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!(
+        "no short private per-user daemon socket root is available; set {SOCKET_DIR_ENV} to a \
+         shorter existing directory; tried: {attempted}"
+    )
 }
 
 #[cfg(windows)]
-fn per_user_tmp_root() -> Result<PathBuf> {
+fn per_user_tmp_root(_hash: &str) -> Result<PathBuf> {
     let root = std::env::temp_dir().join("cockpit-runtime");
     cockpit_host::private_fs::ensure_private_dir(&root)
         .with_context(|| format!("securing per-user runtime root {}", root.display()))?;
@@ -134,7 +172,7 @@ fn per_user_tmp_root() -> Result<PathBuf> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn per_user_tmp_root() -> Result<PathBuf> {
+fn per_user_tmp_root(_hash: &str) -> Result<PathBuf> {
     Ok(std::env::temp_dir().join("cockpit-runtime"))
 }
 
@@ -235,5 +273,60 @@ impl Drop for StartLock {
             // SAFETY: the handle remains live until this drop completes.
             let _ = unsafe { UnlockFile(self.0.as_raw_handle(), 0, 0, u32::MAX, u32::MAX) };
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    #[test]
+    fn oversized_darwin_style_temp_root_falls_back_to_short_candidate() {
+        let fixture = tempfile::tempdir().expect("temp root fixture");
+        let long = fixture.path().join("x".repeat(100)).join("cockpit-501");
+        let short = fixture.path().join("s");
+        let hash = "0123456789abcdef01234567";
+
+        let selected =
+            per_user_tmp_root_from_candidates(hash, [long.clone(), short.clone()]).unwrap();
+
+        assert_eq!(selected, short);
+        assert!(
+            long.join("cockpit")
+                .join(hash)
+                .join("cockpit.sock")
+                .as_os_str()
+                .as_bytes()
+                .len()
+                >= 72,
+            "fixture must exceed Darwin sun_path minus the leak-reveal reserve"
+        );
+        assert!(
+            Path::new("/tmp")
+                .join("cockpit-501")
+                .join("cockpit")
+                .join(hash)
+                .join("cockpit.sock")
+                .as_os_str()
+                .as_bytes()
+                .len()
+                < 72,
+            "the production /tmp fallback must fit Darwin with reserve"
+        );
+    }
+
+    #[test]
+    fn unavailable_computed_roots_suggest_an_override_without_claiming_one_was_set() {
+        let hash = "0123456789abcdef01234567";
+        let first = PathBuf::from("/").join("a".repeat(200));
+        let second = PathBuf::from("/").join("b".repeat(200));
+
+        let error = per_user_tmp_root_from_candidates(hash, [first, second])
+            .expect_err("oversized computed roots must fail");
+        let text = error.to_string();
+
+        assert!(text.contains("set COCKPIT_SOCKET_DIR"), "{text}");
+        assert!(!text.contains("COCKPIT_SOCKET_DIR produces"), "{text}");
     }
 }

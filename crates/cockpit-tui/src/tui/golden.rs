@@ -330,23 +330,11 @@ fn assert_files(area: &str, screen: &str, width: u16, height: u16, text: &str, s
 
 fn assert_file(path: &Path, actual: &str) {
     if update_golden() {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).unwrap_or_else(|error| {
-                panic!("create {}: {error}", parent.display());
-            });
-        }
-        std::fs::write(path, actual).unwrap_or_else(|error| {
-            panic!("write {}: {error}", path.display());
-        });
+        cockpit_test_support::write_fixture(path, actual);
         return;
     }
 
-    let expected = std::fs::read_to_string(path).unwrap_or_else(|error| {
-        panic!(
-            "read {}: {error}; regenerate with {UPDATE_ENV}=1 cargo test -p cockpit-tui golden",
-            path.display()
-        );
-    });
+    let expected = cockpit_test_support::read_fixture(path);
     if expected != actual {
         panic!(
             "{} drifted; regenerate with {UPDATE_ENV}=1 cargo test -p cockpit-tui golden\n{}",

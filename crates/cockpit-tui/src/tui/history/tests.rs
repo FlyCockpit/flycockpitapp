@@ -2588,11 +2588,12 @@ fn compact_duration_compact_under_and_over_a_minute() {
     assert_eq!(format_compact_duration(Duration::from_millis(1900)), "1s");
 }
 
-/// Whether any span on the line carries the orange child-name color.
-fn any_orange(line: &Line<'static>) -> bool {
-    line.spans
-        .iter()
-        .any(|s| s.style.fg == Some(crate::tui::theme::INK))
+/// Whether a span carries the reference child-name treatment.
+fn has_bold_ink_name(line: &Line<'static>) -> bool {
+    line.spans.iter().any(|span| {
+        span.style.fg == Some(crate::tui::theme::INK)
+            && span.style.add_modifier.contains(Modifier::BOLD)
+    })
 }
 
 fn render_sub(
@@ -2702,9 +2703,9 @@ fn fallback_chip_renders_for_non_none_decision() {
 }
 
 /// Running: one live line `{parent} delegated to {child}…
-/// (elapsed)`, child name orange, no expand chip.
+/// (elapsed)`, child name bold ink, no expand chip.
 #[test]
-fn subagent_running_is_one_orange_live_line() {
+fn subagent_running_uses_reference_live_line() {
     let r = render_sub("Build", "explore", std::time::Instant::now(), None, false);
     assert_eq!(r.lines.len(), 1);
     let text = line_text(&r.lines[0]);
@@ -2716,11 +2717,11 @@ fn subagent_running_is_one_orange_live_line() {
     assert!(!text.contains("Explore"));
     // Elapsed clock rendered (the `(…s)` readout).
     assert!(text.contains("s)"), "{text}");
-    assert!(any_orange(&r.lines[0]));
+    assert!(has_bold_ink_name(&r.lines[0]));
     assert!(r.chip_row.is_none());
 }
 
-/// Settled (normal): `{child} worked for {duration}` header (orange
+/// Settled (normal): `{child} worked for {duration}` header (bold ink
 /// child) + left-bar-quoted body, truncated with an expand chip.
 #[test]
 fn subagent_report_renders_header_and_quoted_body() {
@@ -2747,7 +2748,7 @@ fn subagent_report_renders_header_and_quoted_body() {
     assert!(header.contains("[claude-sonnet-4-6 · t]"), "{header}");
     assert!(!header.contains("[trusted]"), "{header}");
     assert!(header.contains("[private_remote]"), "{header}");
-    assert!(any_orange(&r.lines[0]));
+    assert!(has_bold_ink_name(&r.lines[0]));
     // Body rows use a quiet four-column indent without a sidebar.
     assert!(
         r.lines[1..]
@@ -2788,7 +2789,7 @@ fn subagent_expanded_reveals_full_body() {
     assert!(r.chip_row.is_some());
 }
 
-/// Failure: `{child} failed after {duration}` header, child orange,
+/// Failure: `{child} failed after {duration}` header, child bold ink,
 /// no dangling running line.
 #[test]
 fn subagent_failure_renders_failed_header() {
@@ -2807,7 +2808,7 @@ fn subagent_failure_renders_failed_header() {
     let header = line_text(&r.lines[0]);
     assert!(header.contains("explore failed after 7s"), "{header}");
     assert!(!header.contains("delegated to"));
-    assert!(any_orange(&r.lines[0]));
+    assert!(has_bold_ink_name(&r.lines[0]));
     let joined: String = r.lines.iter().map(line_text).collect();
     assert!(joined.contains("explore stopped with an error"), "{joined}");
 }
@@ -2994,15 +2995,20 @@ fn response_performance_chip_renders_and_expands_independently() {
         .map(line_text)
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(
-        joined.contains("[Agent stats]"),
-        "agent stats chip missing in:\n{joined}"
-    );
+    assert_eq!(line_text(&closed.lines[0]).matches("Agent").count(), 1);
     assert!(
         !joined.contains("TTFT:"),
         "detail must be collapsed by default"
     );
     assert!(closed.metric_region.is_some());
+    assert_eq!(
+        closed.metric_region.as_ref().unwrap().rows,
+        vec![MetricRow {
+            row: 0,
+            col_start: 2,
+            col_end: 7,
+        }]
+    );
     // Reasoning chip exists independently.
     assert!(closed.chip_row.is_some());
 
@@ -3063,7 +3069,6 @@ fn response_performance_chip_rounding_matches_detail() {
         encoding: "cl100k_base".to_string(),
     };
     assert_eq!(format_tps(&perf).as_deref(), Some("54"));
-    assert_eq!(metric_chip_text(&perf).as_deref(), Some("[Agent stats]"));
 
     // 53.5 → 54 half-up: tokens*1000/ms with remainder >= half.
     let half = ResponsePerformance {
@@ -3119,7 +3124,8 @@ fn response_performance_chip_narrow_layout_preserves_controls() {
     assert!(mid.metric_region.is_some());
     assert!(mid.pin_region.is_some());
 
-    // Width 24: stats remain accessible, while the grouped actions collapse.
+    // Width 24: stats and the grouped actions remain accessible; only the
+    // independently gated timestamp has collapsed.
     let floor = render_entry(
         &agent_with_perf("ok", "", Some(perf.clone()), false, false),
         24,
@@ -3136,9 +3142,10 @@ fn response_performance_chip_narrow_layout_preserves_controls() {
         floor.metric_region.is_some(),
         "metric retained at min width"
     );
-    assert!(floor.pin_region.is_none());
+    assert!(floor.pin_region.is_some());
 
-    // Below 24: ↔ resize state, no metric hit target.
+    // Below 24: ↔ resize state; the Agent label remains the metric target
+    // whenever all five label columns fit.
     for w in [23u16, 12, 1] {
         let narrow = render_entry(
             &agent_with_perf("ok", "", Some(perf.clone()), false, false),
@@ -3159,7 +3166,7 @@ fn response_performance_chip_narrow_layout_preserves_controls() {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("Agent"), "width {w}: {text}");
-        assert!(narrow.metric_region.is_none());
+        assert_eq!(narrow.metric_region.is_some(), w >= 7, "width {w}");
         assert!(narrow.pin_region.is_none());
     }
 }

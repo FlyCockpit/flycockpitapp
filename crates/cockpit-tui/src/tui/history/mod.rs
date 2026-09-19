@@ -265,12 +265,12 @@ pub enum HistoryEntry {
     /// driven by `spawned_at`. Once it returns, `outcome` is `Some` and
     /// the line becomes a `{child} worked for {duration}` (or `failed
     /// after`) header plus the markdown-rendered, left-bar-quoted,
-    /// truncatable response body. Child name renders in orange; parent
+    /// truncatable response body. Child name renders in bold ink; parent
     /// in the default style.
     Subagent {
         /// Delegating agent's name (default style).
         parent: String,
-        /// Delegated-to agent's name (orange).
+        /// Delegated-to agent's name (bold ink).
         child: String,
         task_call_id: String,
         label: String,
@@ -740,13 +740,8 @@ pub struct PinRegion {
     pub fork_col_end: Option<u16>,
 }
 
-/// Where the clickable response-performance metric chip landed: the
-/// half-open `[col_start, col_end)` column range on each row that
-/// belongs to the chip. The chip may span multiple rows when the
-/// metric is split across dedicated metadata rows on narrow terminals.
-/// The chrome offsets each `row` by the entry's position in the scroll
-/// buffer and hit-tests only the recorded ranges. Clicking toggles
-/// only `performance_expanded` — never the reasoning `expanded` field.
+/// Where the clickable `Agent` statistics chip landed. Clicking toggles only
+/// `performance_expanded` — never the reasoning `expanded` field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricRegion {
     /// The row ranges (within an entry's `lines`) and their column
@@ -1869,22 +1864,11 @@ fn format_tps(perf: &ResponsePerformance) -> Option<String> {
     Some(format!("{rounded}"))
 }
 
-/// Compact response-metadata chip, absent when the snapshot has no TPS.
-fn metric_chip_text(perf: &ResponsePerformance) -> Option<String> {
-    format_tps(perf)?;
-    Some("[Agent stats]".to_string())
-}
-
 /// Style for the response-metadata chip.
 fn metric_chip_style() -> Style {
     Style::default()
         .fg(crate::tui::theme::BRASS)
         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-}
-
-/// Style for the expanded metric detail line.
-fn metric_detail_style() -> Style {
-    Style::default().fg(crate::tui::theme::FOG)
 }
 
 /// Agent reply: `• text...` with timestamp right-aligned, optional
@@ -1920,19 +1904,29 @@ fn render_agent(
     // Pin/Fork and the timestamp live on the role header, so body rows need no
     // right-edge chrome reservation.
     // Filled in when the role header draws the clickable action group.
+    let agent_style = crate::tui::chrome::chip_style(
+        Style::default()
+            .fg(USER_BORDER_FG)
+            .add_modifier(Modifier::BOLD),
+        performance_expanded,
+    );
     let header_spans = vec![
         Span::styled("▌ ", Style::default().fg(USER_BORDER_FG)),
-        Span::styled(
-            "Agent",
-            Style::default()
-                .fg(USER_BORDER_FG)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("Agent", agent_style),
     ];
     let (header, header_pin_region) =
         render_first_line_with_pin_and_timestamp(header_spans, timestamp, width, pin);
     let mut pin_region = header_pin_region;
-    let mut metric_region = None;
+    let has_metrics = performance
+        .as_ref()
+        .is_some_and(|snapshot| format_tps(snapshot).is_some());
+    let mut metric_region = (has_metrics && width >= 7).then(|| MetricRegion {
+        rows: vec![MetricRow {
+            row: 0,
+            col_start: 2,
+            col_end: 7,
+        }],
+    });
     let mut copy_body_start: Option<RenderedCopy> = None;
 
     let mut out: Vec<Line<'static>> = vec![header.clone()];
@@ -1944,9 +1938,9 @@ fn render_agent(
     let mut chip_row = None;
     let mut reasoning_scroll_region: Option<ReasoningScrollRegion> = None;
 
-    // Compute the compact metric chip text (if any). The chip is absent
-    // for None or invalid/zero-duration snapshots (no TPS).
-    let metric_text: Option<String> = performance.as_ref().and_then(metric_chip_text);
+    // Agent statistics are opened from the `Agent` label itself, matching the
+    // reference transcript. No second compact stats label is inserted.
+    let metric_text: Option<String> = None;
 
     // Below the minimum supported width for response-header controls,
     // replace all header chrome (metric, detail, timestamp, fork, pin,
@@ -2088,7 +2082,7 @@ fn render_agent(
             tool_result_scroll_regions: Vec::new(),
             reasoning_scroll_region,
             pin_region: None,
-            metric_region: None,
+            metric_region,
         };
     }
 
@@ -2425,155 +2419,7 @@ fn render_agent(
         }
     }
 
-    // If the metric chip didn't fit inline, emit a dedicated metadata row
-    // (or rows) for it. This row is inserted after the first row (which
-    // carries the timestamp/pin) so the timestamp and controls are
-    // preserved. The dedicated row is clickable.
-    if let Some(chip_text) = metric_text.as_ref()
-        && metric_region.is_none()
-    {
-        let chip_w = chip_text.width();
-        let avail = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
-        let mut metric_rows: Vec<MetricRow> = Vec::new();
-
-        if chip_w + AGENT_INDENT <= avail + AGENT_INDENT {
-            // The chip fits on one row.
-            let (row_line, mr) = render_metric_metadata_row(chip_text, false, width);
-            let insert_at = 1.min(out.len());
-            out.insert(insert_at, row_line);
-            conts.insert(insert_at, false);
-            // Adjust chip_row if it was set.
-            if let Some(cr) = chip_row.as_mut()
-                && *cr >= insert_at
-            {
-                *cr += 1;
-            }
-            // Adjust copy_body_start if it was set.
-            if let Some(copy) = copy_body_start.as_mut() {
-                copy.start += 1;
-            }
-            // Adjust reasoning_scroll_region if set.
-            if let Some(region) = reasoning_scroll_region.as_mut() {
-                region.row_start += 1;
-                region.row_end += 1;
-            }
-            metric_rows.push(MetricRow {
-                row: insert_at,
-                col_start: mr.col_start,
-                col_end: mr.col_end,
-            });
-        } else {
-            // Long metric: split TTFT and TPS onto separate rows.
-            let perf = performance.as_ref().unwrap();
-            let ttft_label = format!("TTFT: {}", format_ttft(perf.ttft_ms));
-            let tps_label = match format_tps(perf) {
-                Some(tps) => format!("TPS: {tps}"),
-                None => "TPS: -".to_string(),
-            };
-            let insert_at = 1.min(out.len());
-            let mut current_row = insert_at;
-            for label in [&ttft_label, &tps_label] {
-                let label_w = label.width();
-                if label_w + AGENT_INDENT <= width as usize {
-                    let (row_line, mr) = render_metric_metadata_row(label, false, width);
-                    out.insert(current_row, row_line);
-                    conts.insert(current_row, false);
-                    metric_rows.push(MetricRow {
-                        row: current_row,
-                        col_start: mr.col_start,
-                        col_end: mr.col_end,
-                    });
-                    current_row += 1;
-                } else {
-                    // Label on one row, value on the next.
-                    let parts: Vec<&str> = label.splitn(2, ' ').collect();
-                    if parts.len() == 2 {
-                        let (l1, _) = render_metric_metadata_row(parts[0], false, width);
-                        out.insert(current_row, l1);
-                        conts.insert(current_row, false);
-                        current_row += 1;
-                        let (l2, mr2) = render_metric_metadata_row(parts[1], false, width);
-                        out.insert(current_row, l2);
-                        conts.insert(current_row, false);
-                        metric_rows.push(MetricRow {
-                            row: current_row,
-                            col_start: mr2.col_start,
-                            col_end: mr2.col_end,
-                        });
-                        current_row += 1;
-                    } else {
-                        let (row_line, mr) = render_metric_metadata_row(label, false, width);
-                        out.insert(current_row, row_line);
-                        conts.insert(current_row, false);
-                        metric_rows.push(MetricRow {
-                            row: current_row,
-                            col_start: mr.col_start,
-                            col_end: mr.col_end,
-                        });
-                        current_row += 1;
-                    }
-                }
-            }
-            // Adjust chip_row and copy_body_start for inserted rows.
-            let inserted = current_row - insert_at;
-            if let Some(cr) = chip_row.as_mut()
-                && *cr >= insert_at
-            {
-                *cr += inserted;
-            }
-            if let Some(copy) = copy_body_start.as_mut() {
-                copy.start += inserted;
-            }
-            if let Some(region) = reasoning_scroll_region.as_mut() {
-                region.row_start += inserted;
-                region.row_end += inserted;
-            }
-        }
-
-        // Expanded response metadata follows the compact chip.
-        if performance_expanded {
-            let perf = performance.as_ref().unwrap();
-            let detail_rows = [
-                format!("{:<5}  {}", "Model", name),
-                format!("{:<5}  {}s", "TTFT", format_ttft(perf.ttft_ms)),
-                format!(
-                    "{:<5}  {}",
-                    "TPS",
-                    format_tps(perf).unwrap_or_else(|| "-".to_string())
-                ),
-                format!("{:<5}  —", "Cache"),
-            ];
-            let detail_insert_at = metric_rows
-                .last()
-                .map_or(1.min(out.len()), |row| row.row + 1);
-            for (offset, d) in detail_rows.iter().enumerate() {
-                let (row_line, _) = render_metric_metadata_row(d, true, width);
-                out.insert(detail_insert_at + offset, row_line);
-                conts.insert(detail_insert_at + offset, false);
-            }
-            let inserted = detail_rows.len();
-            if let Some(cr) = chip_row.as_mut()
-                && *cr >= detail_insert_at
-            {
-                *cr += inserted;
-            }
-            if let Some(copy) = copy_body_start.as_mut()
-                && copy.start >= detail_insert_at
-            {
-                copy.start += inserted;
-            }
-            if let Some(region) = reasoning_scroll_region.as_mut()
-                && region.row_start >= detail_insert_at
-            {
-                region.row_start += inserted;
-                region.row_end += inserted;
-            }
-        }
-
-        if !metric_rows.is_empty() {
-            metric_region = Some(MetricRegion { rows: metric_rows });
-        }
-    } else if metric_region.is_some() && performance_expanded {
+    if metric_region.is_some() && performance_expanded {
         let perf = performance.as_ref().unwrap();
         let detail_rows = vec![
             format!("  {:<5}  {}", "Model", name),
@@ -2654,8 +2500,7 @@ pub fn subagent_child_name_style(_name: &str) -> Style {
 /// (expand)` affordance (the returned `chip_row`) unless `expanded`.
 /// An empty report renders the header alone with no quoted block.
 ///
-/// Only the child name carries orange; the parent uses the default
-/// style.
+/// The child name uses bold ink; the parent uses the default style.
 struct SubagentRenderInput<'a> {
     parent: &'a str,
     child: &'a str,
@@ -2741,7 +2586,7 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
         };
     };
 
-    // Settled: header line, child name in orange.
+    // Settled: header line, child name in bold ink.
     let verb = if outcome.failed {
         "failed after"
     } else {
@@ -3992,34 +3837,6 @@ fn format_timestamp(t: DateTime<Local>) -> String {
 /// Render a dedicated metric metadata row: the compact chip (or expanded
 /// detail) left-aligned at `AGENT_INDENT`. Returns the line and the
 /// metric hit row (column range covering the chip text).
-fn render_metric_metadata_row(
-    metric_text: &str,
-    detail: bool,
-    width: u16,
-) -> (Line<'static>, MetricRow) {
-    let indent = " ".repeat(AGENT_INDENT);
-    let text_w = metric_text.width();
-    let col_start = AGENT_INDENT as u16;
-    let style = if detail {
-        metric_detail_style()
-    } else {
-        metric_chip_style()
-    };
-    let line = Line::from(vec![
-        Span::raw(indent),
-        Span::styled(metric_text.to_string(), style),
-    ]);
-    let _ = width;
-    (
-        line,
-        MetricRow {
-            row: 0,
-            col_start,
-            col_end: col_start + text_w as u16,
-        },
-    )
-}
-
 /// Split `text` into chunks that fit within `area_width`, reserving
 /// `reserve_first` extra columns on the *first* line (so a timestamp
 /// can land at the right edge without overlapping the text). Greedy

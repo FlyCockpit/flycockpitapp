@@ -1,19 +1,16 @@
-▌ You                                                                                              [Pin] [Fork] 12:00  █
-▌ Restyle the complete transcript surface.                                                                             █
-                                                                                                                       █
-▌ Agent                                                                                            [Pin] [Fork] 12:00  █
-  [Agent stats]                                                                                                        █
-  ▸ Thought                                                                                                            █
-  The first response is interrupted.                                                                                   █
-                                                                                                                       █
-  ⎯ Stopped — you sent a message                                                                                       █
-▌ You                                                                                              [Pin] [Fork] 12:00  █
+▌ Restyle the complete transcript surface.                                                                              
+  ▸ Thought                                                                                                            │
+  The first response is interrupted.                                                                                   │
+                                                                                                                       │
+  ⎯ Stopped — you sent a message                                                                                       │
+▌ You                                                                                             [Pin] [Fork]  12:00  █
 ▌ Continue with every transcript element.                                                                              █
                                                                                                                        █
   ▸ You                                                                                                                █
   Prioritize the transcript chrome.                                                                                    █
-▌ Agent                                                                                            [Pin] [Fork] 12:00  █
-  [Agent stats]                                                                                                        █
+note to self                                                                                                    12:00  █
+┊ Keep product-only transcript variants.                                                                               █
+▌ Agent                                                                                           [Pin] [Fork]  12:00  █
   Model  Agent                                                                                                         █
   TTFT   0.9s                                                                                                          █
   TPS    40                                                                                                            █
@@ -36,5 +33,8 @@
    2 shared line                                            │  2 shared line                                           █
        ⋯ Compacted from abc123 · auto · ctx 82.0% · 9000→2400 tokens · 6 turns · tail 2/1 · 2 seed tools (~42) ⋯       █
   [show summary]                                                                                                       █
-                                                                                                                       │
-▌ Agent                                                                                                       ↓ Latest │
+                                                                                                                       █
+▌ Agent                                                                                                         12:00  █
+  Thinking                                                                                                             █
+  Streaming the final response with a stable caret while the viewport remains scrolled. The fixture deliberately       █
+  keeps live prose below the fold. The reserved scrollbar column stays visible. The jump-to-latest control re ↓ Latest █

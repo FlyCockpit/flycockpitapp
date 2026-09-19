@@ -1312,6 +1312,9 @@ impl DisplayAttachBackoff {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum AffordanceTarget {
+    Metric {
+        history_index: usize,
+    },
     Chip {
         history_index: usize,
     },

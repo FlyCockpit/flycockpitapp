@@ -26,8 +26,8 @@ use crate::tui::message_block::{
 };
 use crate::tui::progress::render_bar;
 use crate::tui::theme::{
-    BRASS, DISABLED, ERROR_TEXT, FOG, INFO_TEXT, PLAN_YELLOW, SUBAGENT_ORANGE, SUCCESS_TEXT, TEAL,
-    TOOL_OUTPUT, WARNING_TEXT,
+    BRASS, DISABLED, ERROR_TEXT, FOG, INFO_TEXT, INK, PLAN_YELLOW, SUBAGENT_ORANGE, SUCCESS_TEXT,
+    TEAL, TOOL_OUTPUT, WARNING_TEXT,
 };
 use cockpit_client::presentation::{ResponsePerformance, ToolProgress};
 use cockpit_config::extended::ThinkingDisplay;
@@ -1316,16 +1316,16 @@ pub fn render_pending_incremental(
     width: u16,
     state: &mut PendingRenderState,
 ) -> PendingRender {
-    if msg.text.trim().is_empty() {
-        state.reset();
-        return PendingRender::default();
-    }
     if !msg.reasoning.trim().is_empty() {
         state.reset();
         return PendingRender {
             committed: Vec::new(),
             tail: render_pending(msg, width),
         };
+    }
+    if msg.text.trim().is_empty() {
+        state.reset();
+        return PendingRender::default();
     }
 
     let body_width = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
@@ -1358,10 +1358,16 @@ pub fn render_pending_incremental(
                 state.committed_lines.push(Rc::new(Line::default()));
             }
             state.committed_lines.extend(
-                render_markdown_message_block(committed, body_width, 0, 0, Style::default())
-                    .lines
-                    .into_iter()
-                    .map(Rc::new),
+                render_markdown_message_block(
+                    committed,
+                    body_width,
+                    0,
+                    0,
+                    Style::default().fg(INK),
+                )
+                .lines
+                .into_iter()
+                .map(Rc::new),
             );
         }
         state.commit_byte = new_commit;
@@ -1391,8 +1397,9 @@ pub fn render_pending_incremental(
         if state.commit_byte > 0 && !state.committed_display.is_empty() {
             tail_markdown_lines.push(Line::default());
         }
-        tail_markdown_lines
-            .extend(render_markdown_message_block(tail, body_width, 0, 0, Style::default()).lines);
+        tail_markdown_lines.extend(
+            render_markdown_message_block(tail, body_width, 0, 0, Style::default().fg(INK)).lines,
+        );
     }
 
     state.source_len = msg.text.len();
@@ -1519,7 +1526,7 @@ fn render_pending_markdown_lines(
         body_content_w,
         0,
         AGENT_INDENT,
-        Style::default(),
+        Style::default().fg(INK),
     );
     let header = vec![
         Span::styled("▌ ", Style::default().fg(USER_BORDER_FG)),
@@ -1559,7 +1566,7 @@ fn render_pending_tail_lines(
         body_content_w,
         0,
         AGENT_INDENT,
-        Style::default(),
+        Style::default().fg(INK),
     )
     .lines
     .into_iter()
@@ -1625,7 +1632,7 @@ pub fn render_pending(msg: &PendingMsg, width: u16) -> Vec<Line<'static>> {
         }
         lines.splice(1..1, reasoning_rows);
     }
-    if msg.text.trim().is_empty() {
+    if msg.text.trim().is_empty() && msg.reasoning.trim().is_empty() {
         lines.push(Line::from(Span::styled(
             "  · · ·",
             Style::default().fg(crate::tui::theme::FOG),
@@ -1666,11 +1673,15 @@ fn render_user(
         render_first_line_with_pin_and_timestamp(header_spans, timestamp, width, pin);
     let body_width = usize::from(width).saturating_sub(2).max(1);
     let body = if markdown {
-        render_markdown_message_block(text, body_width, 0, 0, Style::default())
+        render_markdown_message_block(text, body_width, 0, 0, Style::default().fg(INK))
     } else {
         let chunks = wrap_with_reserved_first_line(text, body_width, 0);
         MessageBlock {
-            lines: chunks.iter().cloned().map(Line::from).collect(),
+            lines: chunks
+                .iter()
+                .cloned()
+                .map(|chunk| Line::from(Span::styled(chunk, Style::default().fg(INK))))
+                .collect(),
             continuations: (0..chunks.len()).map(|index| index > 0).collect(),
             copy_cells: Vec::new(),
             copy_newlines_before: Vec::new(),
@@ -1700,7 +1711,7 @@ fn render_user(
     for (line, continuation) in body.lines.into_iter().zip(body.continuations) {
         let mut spans = vec![Span::styled("▌ ", Style::default().fg(accent))];
         spans.extend(line.spans);
-        lines.push(Line::from(spans));
+        lines.push(Line::from(spans).style(Style::default().fg(INK)));
         continuations.push(continuation);
     }
     if lines.len() == 1 + chip_rows {
@@ -1999,9 +2010,12 @@ fn render_agent(
     if width < RESPONSE_HEADER_MIN_WIDTH {
         let mut out: Vec<Line<'static>> = vec![header];
         let mut conts: Vec<bool> = vec![false];
-        let mut copy_body_start: Option<RenderedCopy> = None;
+        let mut body_copy: Option<RenderedCopy> = None;
+        let mut body_lines = Vec::new();
+        let mut body_conts = Vec::new();
 
-        // Body content still renders below the compact role header.
+        // Prepare body content now, then append it after any expanded thought
+        // block so narrow and wide layouts preserve the same reading order.
         let body_content_w = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
         if markdown {
             let body = render_markdown_message_block(
@@ -2009,20 +2023,20 @@ fn render_agent(
                 body_content_w,
                 0,
                 AGENT_INDENT,
-                Style::default(),
+                Style::default().fg(INK),
             );
-            copy_body_start = Some(RenderedCopy::from_block(1, &body));
-            out.extend(body.lines);
-            conts.extend(body.continuations);
+            body_copy = Some(RenderedCopy::from_block(0, &body));
+            body_lines = body.lines;
+            body_conts = body.continuations;
         } else if !text.trim().is_empty() {
             let wrapped = wrap_with_reserved_first_line(text, body_content_w, 0);
             let indent = " ".repeat(AGENT_INDENT);
             for (i, chunk) in wrapped.iter().enumerate() {
-                out.push(Line::from(vec![
-                    Span::raw(indent.clone()),
-                    Span::raw(chunk.clone()),
-                ]));
-                conts.push(i > 0);
+                body_lines.push(Line::from(Span::styled(
+                    format!("{indent}{chunk}"),
+                    Style::default().fg(INK),
+                )));
+                body_conts.push(i > 0);
             }
         }
 
@@ -2042,10 +2056,6 @@ fn render_agent(
             ]);
             out.insert(1, chip_line);
             conts.insert(1, false);
-            if let Some(mut copy) = copy_body_start {
-                copy.start += 1;
-                copy_body_start = Some(copy);
-            }
             // Expanded reasoning renders below the chip.
             if expanded {
                 let reasoning_indent = AGENT_INDENT;
@@ -2075,11 +2085,10 @@ fn render_agent(
                 let window =
                     inner_scroll_window(reasoning_rows.len(), THINKING_VISIBLE, reasoning_offset);
                 // The reasoning window is a single contiguous block appended
-                // after the chip/resize/body rows. `region_start` must anchor
+                // after the chip and before the body. `region_start` must anchor
                 // to the first row of that block (the `more above` indicator
                 // when present, else the first visible reasoning row) so the
-                // scroll region covers only the reasoning window — never the
-                // resize/body rows above it.
+                // scroll region covers only the reasoning window.
                 let region_start = out.len();
                 if window.more_above > 0 {
                     out.push(Line::from(vec![
@@ -2120,6 +2129,13 @@ fn render_agent(
                 }
             }
         }
+
+        let copy_body_start = body_copy.map(|mut copy| {
+            copy.start = out.len();
+            copy
+        });
+        out.extend(body_lines);
+        conts.extend(body_conts);
 
         return Rendered {
             lines: out,
@@ -2185,14 +2201,19 @@ fn render_agent(
                 body_content_w,
                 0,
                 AGENT_INDENT,
-                Style::default(),
+                Style::default().fg(INK),
             );
             let copy = RenderedCopy::from_block(0, &body);
             (body.lines, body.continuations, Some(copy))
         } else {
             let lines = wrapped
                 .iter()
-                .map(|chunk| Line::from(vec![Span::raw(format!("{indent}{chunk}"))]))
+                .map(|chunk| {
+                    Line::from(Span::styled(
+                        format!("{indent}{chunk}"),
+                        Style::default().fg(INK),
+                    ))
+                })
                 .collect::<Vec<_>>();
             // wrapped[0] starts a fresh logical line; the rest are
             // soft-wrap continuations of the agent's text.
@@ -2332,7 +2353,10 @@ fn render_agent(
             let mut first_line_spans = chip_spans;
             if !collapsed_wrapped.is_empty() {
                 first_line_spans.push(Span::raw(" "));
-                first_line_spans.push(Span::raw(collapsed_wrapped[0].clone()));
+                first_line_spans.push(Span::styled(
+                    collapsed_wrapped[0].clone(),
+                    Style::default().fg(INK),
+                ));
             }
             let (line, region, metric_row) = render_agent_body_first_line(
                 first_line_spans,
@@ -2350,7 +2374,10 @@ fn render_agent(
             out.push(line);
             conts.push(false);
             for chunk in collapsed_wrapped.iter().skip(1) {
-                out.push(Line::from(vec![Span::raw(format!("{indent}{chunk}"))]));
+                out.push(Line::from(Span::styled(
+                    format!("{indent}{chunk}"),
+                    Style::default().fg(INK),
+                )));
                 conts.push(true);
             }
         }
@@ -2365,8 +2392,13 @@ fn render_agent(
         // into the normal wrap stream (filling row 2 at full width)
         // instead of being sliced off afterward as a one-word orphan.
         let body_content_w = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
-        let body =
-            render_markdown_message_block(text, body_content_w, 0, AGENT_INDENT, Style::default());
+        let body = render_markdown_message_block(
+            text,
+            body_content_w,
+            0,
+            AGENT_INDENT,
+            Style::default().fg(INK),
+        );
         copy_body_start = Some(RenderedCopy::from_block(out.len(), &body));
         if body.lines.is_empty() {
             let (line, region, metric_row) =
@@ -2387,13 +2419,14 @@ fn render_agent(
             // continuation (copy rejoins with a space, not a newline).
             let mut iter = body.lines.into_iter().zip(body.continuations);
             let (first, first_cont) = iter.next().expect("body non-empty");
-            let (line, region, metric_row) = render_agent_body_first_line(
+            let (mut line, region, metric_row) = render_agent_body_first_line(
                 first.spans,
                 timestamp,
                 width,
                 pin,
                 metric_text.as_deref(),
             );
+            line.style = Style::default().fg(INK);
             if region.is_some() {
                 pin_region = region;
             }
@@ -2442,7 +2475,7 @@ fn render_agent(
                             Style::default().fg(agent_color_rendered(name)),
                         ));
                     }
-                    spans.push(Span::raw(chunk.clone()));
+                    spans.push(Span::styled(chunk.clone(), Style::default().fg(INK)));
                     let (line, region, metric_row) = render_agent_body_first_line(
                         spans,
                         timestamp,
@@ -2460,7 +2493,10 @@ fn render_agent(
                     conts.push(false);
                 } else {
                     let indent = " ".repeat(bullet_width);
-                    out.push(Line::from(vec![Span::raw(format!("{indent}{chunk}"))]));
+                    out.push(Line::from(Span::styled(
+                        format!("{indent}{chunk}"),
+                        Style::default().fg(INK),
+                    )));
                     conts.push(true);
                 }
             }

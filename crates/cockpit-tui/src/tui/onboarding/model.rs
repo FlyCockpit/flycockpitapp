@@ -205,6 +205,9 @@ impl ModelScreen {
             return;
         };
         self.selected_model = index;
+        if self.provider_id == provider && self.model_id.text() == model {
+            return;
+        }
         self.provider_id = provider;
         self.model_id = TextField::new(model);
         self.seed_policy();
@@ -611,7 +614,7 @@ impl ModelScreen {
             ModelPhase::DefaultModel => {
                 let (provider, model) = &self.catalog[index];
                 Line::from(vec![
-                    ui::radio_mark(index == self.selected_model, focused),
+                    ui::radio_mark(focused, focused),
                     Span::styled(
                         if index == self.selected_model {
                             format!("{STAR} ")
@@ -627,7 +630,7 @@ impl ModelScreen {
             ModelPhase::Trust => {
                 let labels = ["untrusted", "trusted"];
                 Line::from(vec![
-                    ui::radio_mark(index == self.trust, focused),
+                    ui::radio_mark(focused, focused),
                     Span::styled(labels[index], style),
                 ])
             }
@@ -636,7 +639,7 @@ impl ModelScreen {
                 Span::styled(CAPABILITIES[index].1, style),
             ]),
             ModelPhase::Thinking => Line::from(vec![
-                ui::radio_mark(index == self.thinking, focused),
+                ui::radio_mark(focused, focused),
                 Span::styled(THINKING[index].0, style),
             ]),
             ModelPhase::Delegation => Line::from(vec![

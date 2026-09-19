@@ -405,15 +405,7 @@ impl App {
             Ok(dialog) => {
                 self.dialog = dialog;
                 if let Some(shell) = self.onboarding_shell.as_mut() {
-                    shell.present_engine(match wizard_id {
-                        cockpit_core::wizard::SECURITY_WIZARD_ID => {
-                            crate::tui::onboarding::EngineStage::Generic
-                        }
-                        cockpit_core::wizard::MODEL_WIZARD_ID => {
-                            crate::tui::onboarding::EngineStage::Generic
-                        }
-                        _ => crate::tui::onboarding::EngineStage::Generic,
-                    });
+                    shell.present_engine(crate::tui::onboarding::EngineStage::Generic);
                 }
             }
             Err(error) => self.show_toast(error, super::ToastKind::Error),

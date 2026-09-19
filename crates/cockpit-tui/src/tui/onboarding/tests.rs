@@ -1371,6 +1371,72 @@ fn model_back_walks_substeps_then_escape_opens_options() {
 }
 
 #[test]
+fn model_same_default_after_back_preserves_every_policy_edit() {
+    let mut shell = shell_at(OnboardingStage::Model);
+    shell.present_model(
+        &model_catalog_with_distinct_policies(),
+        Some(("provider", "model-b")),
+    );
+    let mut engine = Dialog::None;
+
+    // Change every policy group seeded by the selected catalog model.
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    shell.handle_key(key(KeyCode::Up), &mut engine);
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    shell.handle_key(key(KeyCode::Down), &mut engine);
+    shell.handle_key(key(KeyCode::Char(' ')), &mut engine);
+    shell.handle_key(key(KeyCode::Down), &mut engine);
+    shell.handle_key(key(KeyCode::Char(' ')), &mut engine);
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    for ch in "8192".chars() {
+        shell.handle_key(key(KeyCode::Char(ch)), &mut engine);
+    }
+    shell.handle_key(key(KeyCode::Tab), &mut engine);
+    for ch in "1024".chars() {
+        shell.handle_key(key(KeyCode::Char(ch)), &mut engine);
+    }
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    shell.handle_key(key(KeyCode::Down), &mut engine);
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    shell.handle_key(key(KeyCode::Char(' ')), &mut engine);
+    shell.handle_key(key(KeyCode::Down), &mut engine);
+    shell.handle_key(key(KeyCode::Char(' ')), &mut engine);
+
+    // Walk back to Default Model, then continue without changing the pair.
+    for expected in [
+        ModelPhase::Thinking,
+        ModelPhase::Limits,
+        ModelPhase::Capabilities,
+        ModelPhase::Trust,
+        ModelPhase::DefaultModel,
+    ] {
+        shell.handle_key(key(KeyCode::Esc), &mut engine);
+        assert_eq!(shell.model_phase(), Some(expected));
+    }
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    for _ in 0..4 {
+        shell.handle_key(key(KeyCode::Enter), &mut engine);
+    }
+    let Some(OnboardingShellAction::ApplyModel(submission)) =
+        shell.handle_key(key(KeyCode::Enter), &mut engine)
+    else {
+        panic!("same-model Continue must preserve edits and submit");
+    };
+
+    assert_eq!(submission.provider_id, "provider");
+    assert_eq!(submission.model_id, "model-b");
+    assert_eq!(submission.trust, "untrusted");
+    assert_eq!(
+        submission.capabilities,
+        vec!["reasoning", "structured_outputs"]
+    );
+    assert_eq!(submission.context_tokens, "8192");
+    assert_eq!(submission.max_output_tokens, "1024");
+    assert_eq!(submission.thinking, "low");
+    assert_eq!(submission.subagent_flags, vec!["can_delegate"]);
+}
+
+#[test]
 fn model_empty_catalog_shows_error_accepts_id_and_submits() {
     const WIDTH: u16 = 100;
     const HEIGHT: u16 = 30;

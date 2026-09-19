@@ -539,6 +539,18 @@ impl App {
             return;
         }
 
+        if self
+            .latest_chip_area
+            .is_some_and(|area| point_in(area, mouse.column, mouse.row))
+        {
+            self.invalidate_mouse_gesture(
+                MouseGestureInvalidation::ViewChange,
+                self.event_loop_monotonic_now,
+            );
+            self.set_chat_scroll_offset_from_interaction(0);
+            return;
+        }
+
         if self.mouse_in_sticky_header(mouse.column, mouse.row) {
             self.invalidate_mouse_gesture(
                 MouseGestureInvalidation::ViewChange,

@@ -35,13 +35,10 @@ pub const SIDE_BY_SIDE_MIN_WIDTH: u16 = 80;
 /// single `…` separator line.
 const CONTEXT_LINES: usize = 3;
 
-const COL_REMOVED: Color = Color::Rgb(255, 190, 190);
-const COL_ADDED: Color = Color::Rgb(178, 235, 190);
-const BG_REMOVED: Color = Color::Rgb(92, 28, 36);
-const BG_ADDED: Color = Color::Rgb(24, 84, 48);
-const COL_HEADER: Color = Color::Cyan;
-const COL_SEP: Color = Color::Indexed(244);
-const COL_ELLIPSIS: Color = Color::Indexed(244);
+const COL_REMOVED: Color = crate::tui::theme::RED;
+const COL_ADDED: Color = crate::tui::theme::GREEN;
+const COL_SEP: Color = crate::tui::theme::NIGHT;
+const COL_ELLIPSIS: Color = crate::tui::theme::FOG;
 
 /// Inline render mode prefixes (one column per character).
 const PREFIX_REM: &str = "- ";
@@ -122,33 +119,46 @@ fn is_diff_renderable_tool(tool: &str) -> bool {
     )
 }
 
-/// Diff header: `[glyph] label: path (+N −M)`. The glyph + label come
-/// from the shared tool-line helper so diffs match the tool-box styling
-/// and honor the emoji setting.
+/// Diff header matching the transcript reference chrome.
 fn header_line(
     tool: &str,
     path: &str,
     added: usize,
     removed: usize,
-    emojis: bool,
-    file_icons: bool,
+    _emojis: bool,
+    _file_icons: bool,
 ) -> Line<'static> {
-    let (glyph, label) =
-        crate::tui::history::tool_glyph_label_for(tool, emojis, file_icons, Some(path));
-    let mut spans = vec![Span::raw(LEFT_INDENT.to_string())];
-    if !glyph.is_empty() {
-        spans.push(Span::raw(glyph));
+    let label = if matches!(tool, "write" | "writeunlock") {
+        "Created"
+    } else {
+        "Edited"
+    };
+    let mut spans = vec![Span::styled(
+        "  ◇ ",
+        Style::default().fg(crate::tui::theme::BRASS),
+    )];
+    spans.push(Span::styled(
+        format!("{label} "),
+        Style::default().fg(crate::tui::theme::FOG),
+    ));
+    spans.push(Span::styled(
+        path.to_string(),
+        Style::default()
+            .fg(crate::tui::theme::INK)
+            .add_modifier(Modifier::BOLD),
+    ));
+    if added > 0 {
+        spans.push(Span::styled(
+            format!("  +{added}"),
+            Style::default().fg(COL_ADDED),
+        ));
     }
-    spans.push(Span::styled(
-        format!("{label}: "),
-        Style::default().fg(COL_HEADER),
-    ));
-    spans.push(Span::raw(path.to_string()));
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        format!("(+{added} −{removed})"),
-        Style::default().fg(COL_SEP),
-    ));
+    if removed > 0 {
+        spans.push(Span::styled(
+            format!(" -{removed}"),
+            Style::default().fg(COL_REMOVED),
+        ));
+    }
     Line::from(spans)
 }
 
@@ -169,32 +179,40 @@ fn count_changes<'a>(diff: &TextDiff<'a, 'a, str>) -> (usize, usize) {
 
 fn render_inline<'a>(diff: &TextDiff<'a, 'a, str>, width: u16) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    let gutter_width = line_number_width(diff);
-    let row_width = inline_row_width(width, gutter_width);
+    let row_width = usize::from(width).saturating_sub(6).max(1);
     for group in diff.grouped_ops(CONTEXT_LINES) {
         if !out.is_empty() {
-            out.push(ellipsis_line(gutter_width, false));
+            out.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("│ ", Style::default().fg(COL_SEP)),
+                Span::styled("  …", Style::default().fg(COL_ELLIPSIS)),
+            ]));
         }
         for op in group {
             for change in diff.iter_changes(&op) {
                 let value = strip_trailing_newline(change.value());
-                let old_ln = change.old_index().map(|i| i + 1);
-                let new_ln = change.new_index().map(|i| i + 1);
                 let (prefix, style) = match change.tag() {
                     ChangeTag::Delete => (PREFIX_REM, removed_style()),
                     ChangeTag::Insert => (PREFIX_ADD, added_style()),
-                    ChangeTag::Equal => (PREFIX_CTX, Style::default()),
+                    ChangeTag::Equal => (PREFIX_CTX, Style::default().fg(COL_ELLIPSIS)),
                 };
-                let text = pad_to_width(value, row_width);
-                out.push(Line::from(vec![
-                    Span::raw(LEFT_INDENT.to_string()),
-                    Span::styled(line_no(old_ln, gutter_width), Style::default().fg(COL_SEP)),
-                    Span::styled(" ".to_string(), Style::default().fg(COL_SEP)),
-                    Span::styled(line_no(new_ln, gutter_width), Style::default().fg(COL_SEP)),
-                    Span::styled(" ".to_string(), Style::default().fg(COL_SEP)),
-                    Span::styled(prefix.to_string(), style),
-                    Span::styled(text, style),
-                ]));
+                let (wrapped, _) = crate::tui::message_block::wrap_lines_to_width(
+                    vec![Line::from(Span::styled(value.to_string(), style))],
+                    row_width,
+                );
+                for (index, piece) in wrapped.into_iter().enumerate() {
+                    let mut spans = vec![
+                        Span::raw(LEFT_INDENT.to_string()),
+                        Span::styled("│ ", Style::default().fg(COL_SEP)),
+                        if index == 0 {
+                            Span::styled(prefix.to_string(), style)
+                        } else {
+                            Span::raw("  ")
+                        },
+                    ];
+                    spans.extend(piece.spans);
+                    out.push(Line::from(spans));
+                }
             }
         }
     }
@@ -350,14 +368,6 @@ fn side_by_side_column_width(width: u16, gutter_width: usize) -> usize {
     (usable / 2).max(4)
 }
 
-fn inline_row_width(width: u16, gutter_width: usize) -> usize {
-    (width as usize)
-        .saturating_sub(LEFT_INDENT.chars().count())
-        .saturating_sub((gutter_width + 1) * 2)
-        .saturating_sub(PREFIX_REM.chars().count())
-        .max(1)
-}
-
 fn pad_to_width(s: &str, width: usize) -> String {
     let display = UnicodeWidthStr::width(s);
     if display > width {
@@ -401,11 +411,11 @@ fn line_no(n: Option<usize>, width: usize) -> String {
 }
 
 fn removed_style() -> Style {
-    Style::default().fg(COL_REMOVED).bg(BG_REMOVED)
+    Style::default().fg(COL_REMOVED)
 }
 
 fn added_style() -> Style {
-    Style::default().fg(COL_ADDED).bg(BG_ADDED)
+    Style::default().fg(COL_ADDED)
 }
 
 fn ellipsis_line(gutter_width: usize, side_by_side: bool) -> Line<'static> {
@@ -466,8 +476,7 @@ mod tests {
         );
         assert_eq!(lines.len(), 1);
         let s = &lines_to_strings(&lines)[0];
-        assert!(s.contains("src/foo.rs"), "{s:?}");
-        assert!(s.contains("(+1 −1)"), "{s:?}");
+        assert_eq!(s, "  ◇ Edited src/foo.rs  +1 -1");
     }
 
     #[test]
@@ -483,15 +492,15 @@ mod tests {
             false,
         );
         let rendered = lines_to_strings(&lines);
-        assert!(rendered[0].contains("(+1 −1)"));
-        let body = rendered[1..].join("\n");
-        assert!(body.contains("- beta"));
-        assert!(body.contains("+ BETA"));
-        assert!(body.contains("  1  1   alpha"));
+        assert_eq!(rendered[0], "  ◇ Edited src/foo.rs  +1 -1");
+        assert_eq!(
+            rendered[1..],
+            ["  │   alpha", "  │ - beta", "  │ + BETA", "  │   gamma"]
+        );
     }
 
     #[test]
-    fn inline_renders_line_numbers_and_full_changed_band_style() {
+    fn inline_uses_exact_six_column_chrome_and_semantic_colors() {
         let lines = render_diff(
             "edit",
             "src/foo.rs",
@@ -503,14 +512,8 @@ mod tests {
             false,
         );
         let rendered = lines_to_strings(&lines);
-        assert!(
-            rendered.iter().any(|line| line.contains(" 2    - beta")),
-            "{rendered:?}"
-        );
-        assert!(
-            rendered.iter().any(|line| line.contains("    2 + BETA")),
-            "{rendered:?}"
-        );
+        assert!(rendered.iter().any(|line| line == "  │ - beta"));
+        assert!(rendered.iter().any(|line| line == "  │ + BETA"));
         let removed = lines
             .iter()
             .find(|line| {
@@ -519,14 +522,9 @@ mod tests {
                     .any(|span| span.content.as_ref().contains("beta"))
             })
             .expect("removed line");
-        assert!(
-            removed
-                .spans
-                .iter()
-                .any(|span| span.style.fg == Some(COL_REMOVED)
-                    && span.style.bg == Some(BG_REMOVED)
-                    && span.content.ends_with(' '))
-        );
+        assert!(removed.spans.iter().any(|span| {
+            span.style.fg == Some(COL_REMOVED) && span.style.bg.is_none() && span.content == "beta"
+        }));
         let added = lines
             .iter()
             .find(|line| {
@@ -535,14 +533,9 @@ mod tests {
                     .any(|span| span.content.as_ref().contains("BETA"))
             })
             .expect("added line");
-        assert!(
-            added
-                .spans
-                .iter()
-                .any(|span| span.style.fg == Some(COL_ADDED)
-                    && span.style.bg == Some(BG_ADDED)
-                    && span.content.ends_with(' '))
-        );
+        assert!(added.spans.iter().any(|span| {
+            span.style.fg == Some(COL_ADDED) && span.style.bg.is_none() && span.content == "BETA"
+        }));
     }
 
     #[test]
@@ -557,12 +550,9 @@ mod tests {
             false,
             false,
         );
-        // Narrow mode should look like the inline render (uses `- ` /
-        // `+ ` prefixes rather than the side-by-side `│` separator).
-        let rendered = lines_to_strings(&narrow).join("\n");
-        assert!(rendered.contains("- b"));
-        assert!(rendered.contains("+ B"));
-        assert!(!rendered.contains(COL_SEPARATOR));
+        let rendered = lines_to_strings(&narrow);
+        assert!(rendered.iter().any(|line| line == "  │ - b"));
+        assert!(rendered.iter().any(|line| line == "  │ + B"));
     }
 
     #[test]
@@ -607,9 +597,12 @@ mod tests {
                 false,
             );
             let rendered = lines_to_strings(&lines).join("\n");
+            assert!(
+                rendered.contains("◇ Created x.rs  +2"),
+                "{tool}: {rendered}"
+            );
             assert!(rendered.contains("+ alpha"), "{tool}: {rendered}");
             assert!(rendered.contains("+ beta"), "{tool}: {rendered}");
-            assert!(!rendered.contains(COL_SEPARATOR), "{tool}: {rendered}");
         }
     }
 

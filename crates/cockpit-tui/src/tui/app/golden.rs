@@ -1,6 +1,7 @@
 //! App- and onboarding-screen helpers for the golden harness.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use ratatui::buffer::Buffer;
 
@@ -33,6 +34,10 @@ fn golden_model_config() -> cockpit_config::config::providers::ProvidersConfig {
     );
     config
 }
+
+use crate::tui::history::{
+    HistoryEntry, PendingMsg, SubagentOutcome, SubagentRoutingChips, ToolCallState,
+};
 
 /// Clear mouse-hover unless the test opted in via [`GoldenPins::allow_hover`].
 pub fn pin_app(app: &mut App) {
@@ -85,6 +90,176 @@ pub fn spawn_error_app() -> App {
 bind-line\n";
     app.apply_daemon_spawn_failure(error);
     app
+}
+
+fn transcript_fixture_app() -> App {
+    let mut app = App::new(Some(Path::new("/tmp/project")), false);
+    app.dialog = Dialog::None;
+    app.overlay = Overlay::None;
+    app.launch.banner_enabled = false;
+    app.mouse_capture = false;
+    let now = chrono::Local::now();
+    let user = |text: &str, seq| HistoryEntry::User {
+        text: text.to_string(),
+        cleaned: None,
+        expanded: false,
+        timestamp: now,
+        seq: Some(seq),
+        optimistic_submission_id: None,
+        preflight_pending: false,
+        persist_failed: false,
+    };
+    let agent = |text: &str, reasoning: &str, expanded: bool, seq| HistoryEntry::Agent {
+        name: "Agent".to_string(),
+        text: text.to_string(),
+        reasoning: reasoning.to_string(),
+        timestamp: now,
+        expanded,
+        reasoning_offset: 0,
+        think_duration: Some(Duration::from_secs(2)),
+        seq: Some(seq),
+        performance: Some(cockpit_client::presentation::ResponsePerformance {
+            ttft_ms: 850,
+            generation_ms: 2_000,
+            displayed_tokens: 80,
+            encoding: "o200k_base".to_string(),
+        }),
+        performance_expanded: expanded,
+    };
+    app.history = vec![
+        user("Restyle the complete transcript surface.", 1),
+        agent(
+            "The first response is interrupted.",
+            "Inspect the current transcript hierarchy.",
+            false,
+            2,
+        ),
+        HistoryEntry::Plain {
+            line: "Stopped — you sent a message".to_string(),
+        },
+        user("Continue with every transcript element.", 3),
+        HistoryEntry::Plain {
+            line: "steer from You: Prioritize the transcript chrome.".to_string(),
+        },
+        agent(
+            "The open thought is followed by tool work.",
+            "Map each requested row to its owning renderer.",
+            true,
+            4,
+        ),
+        HistoryEntry::ToolLine {
+            call_id: "read-1".to_string(),
+            tool: "read".to_string(),
+            summary: "crates/cockpit-tui/src/tui/history/mod.rs".to_string(),
+            icon_path: None,
+            state: ToolCallState::Success,
+        },
+        HistoryEntry::Subagent {
+            parent: "Agent".to_string(),
+            child: "explore".to_string(),
+            task_call_id: "task-interactive".to_string(),
+            label: "interactive".to_string(),
+            model_trusted: false,
+            routing: SubagentRoutingChips::default(),
+            spawned_at: Instant::now(),
+            outcome: Some(SubagentOutcome {
+                report: "Interactive child inspected the rendering seam.".to_string(),
+                failed: false,
+                duration: Duration::from_secs(3),
+                status: None,
+            }),
+            expanded: true,
+        },
+        HistoryEntry::Subagent {
+            parent: "Agent".to_string(),
+            child: "runner".to_string(),
+            task_call_id: "task-background".to_string(),
+            label: "background".to_string(),
+            model_trusted: false,
+            routing: SubagentRoutingChips::default(),
+            spawned_at: Instant::now(),
+            outcome: Some(SubagentOutcome {
+                report: "Background child returned a compact report.".to_string(),
+                failed: false,
+                duration: Duration::from_secs(4),
+                status: None,
+            }),
+            expanded: false,
+        },
+        HistoryEntry::Diff {
+            tool: "edit".to_string(),
+            path: "src/transcript.rs".to_string(),
+            old: "old line\nshared line\n".to_string(),
+            new: "new line\nshared line\n".to_string(),
+        },
+        HistoryEntry::CompactBoundary {
+            predecessor_short_id: "abc123".to_string(),
+            seed_tool_count: 2,
+            seed_tool_tokens: 42,
+            source: "auto".to_string(),
+            trigger_ctx_pct: Some(82.0),
+            tokens_before: 9_000,
+            tokens_after: 2_400,
+            turns_summarized: 6,
+            tail_kept: 2,
+            tail_trimmed: 1,
+            handoff: Some("Summary of the compacted conversation.".to_string()),
+            expanded: false,
+            result_offset: 0,
+        },
+    ]
+    .into();
+    app.pending = Some(PendingMsg {
+        name: "Agent".to_string(),
+        text: "Streaming the final response".to_string(),
+        reasoning: "Check the final visual hierarchy.".to_string(),
+        timestamp: now,
+        started_at: Instant::now(),
+        text_started_at: Some(Instant::now()),
+        inside_think: false,
+        body_started: true,
+        tag_partial: String::new(),
+        attempt_id: None,
+        seq: Some(5),
+        strip_think: true,
+        response_performance: None,
+    });
+    app
+}
+
+pub fn render_transcript_fixture(width: u16, height: u16) -> Buffer {
+    let mut app = transcript_fixture_app();
+    let _ = render_frame(width, height, |frame| {
+        app.render_chat_history_pane(frame, frame.area());
+    });
+    app.set_chat_scroll_offset_from_interaction(6);
+    render_frame(width, height, |frame| {
+        app.render_chat_history_pane(frame, frame.area());
+    })
+}
+
+pub fn assert_transcript_fixture() {
+    let _pins = GoldenPins::install();
+    assert_golden_sizes("chat", "transcript-elements", render_transcript_fixture);
+    let preview = format!(
+        "{}\n{}",
+        buffer_text(&render_transcript_fixture(80, 24)),
+        buffer_text(&render_transcript_fixture(120, 40))
+    );
+    for marker in [
+        "↓ Latest",
+        "▌",
+        "Thought",
+        "Stopped — you sent a message",
+        "▸ You",
+        "interactive ✓",
+        "background ✓",
+        "◇ Edited",
+        "[show summary]",
+        "[Agent stats]",
+    ] {
+        assert!(preview.contains(marker), "fixture must contain {marker:?}");
+    }
 }
 
 /// Settled onboarding Welcome shell — seed dump (b).
@@ -353,6 +528,12 @@ mod seed_tests {
     fn golden_spawn_error() {
         let _env = isolate_render_env();
         assert_spawn_error();
+    }
+
+    #[test]
+    fn golden_transcript_elements() {
+        let _env = isolate_render_env();
+        assert_transcript_fixture();
     }
 
     #[test]

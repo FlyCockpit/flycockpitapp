@@ -229,14 +229,15 @@ fn rewritten_flow_shows_indicator_then_replaces_with_chip_and_reveals_original()
         400,
         None,
     );
-    let top: String = r.lines[0]
-        .spans
+    let rendered: String = r
+        .lines
         .iter()
-        .map(|s| s.content.as_ref())
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.as_ref())
         .collect();
     assert!(
-        top.contains("Preflight."),
-        "animated indicator on the border: {top}"
+        rendered.contains("Preflight."),
+        "animated indicator below the role header: {rendered}"
     );
     assert!(
         r.chip_row.is_none(),
@@ -272,14 +273,18 @@ fn rewritten_flow_shows_indicator_then_replaces_with_chip_and_reveals_original()
         0,
         None,
     );
-    let top: String = r.lines[0]
-        .spans
+    let rendered: String = r
+        .lines
         .iter()
-        .map(|s| s.content.as_ref())
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.as_ref())
         .collect();
-    assert!(top.contains("⚙ preflighted"), "resting chip: {top}");
-    assert!(!top.contains("Preflight."), "no lingering indicator");
-    assert_eq!(r.chip_row, Some(0), "the resting chip IS the reveal toggle");
+    assert!(
+        rendered.contains("⚙ preflighted"),
+        "resting chip: {rendered}"
+    );
+    assert!(!rendered.contains("Preflight."), "no lingering indicator");
+    assert_eq!(r.chip_row, Some(1), "the resting chip IS the reveal toggle");
 
     // Reveal toggles to the original typed input (unchanged behavior).
     app.toggle_ctrl_e_reveals();

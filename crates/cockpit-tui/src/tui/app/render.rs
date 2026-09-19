@@ -34,7 +34,7 @@ use crate::tui::history::{
 use crate::tui::theme::{
     BUSY_BORDER, CHIP_TEXT, DIVIDER_DIM, DIVIDER_FOCUSED, ERROR_TEXT, IDLE_BORDER, INFO_TEXT,
     MUTED_COLOR_INDEX, MUTED_TEXT, SHELL_MODE_BADGE_BG, SHELL_MODE_BORDER, SUCCESS_TEXT,
-    TRANSCRIPT_HOVER_BG, WARNING_TEXT,
+    WARNING_TEXT,
 };
 
 use super::{
@@ -261,7 +261,7 @@ pub(super) fn affordance_target_for_row(meta: &ChatRowMeta) -> Option<Affordance
 }
 
 fn hover_highlight_full_line(line: &mut Line<'static>) {
-    let hover = Style::default().bg(TRANSCRIPT_HOVER_BG);
+    let hover = crate::tui::chrome::chip_style(Style::default(), true);
     line.style = line.style.patch(hover);
     for span in &mut line.spans {
         span.style = span.style.patch(hover);
@@ -288,7 +288,7 @@ fn hover_highlight_range(
         return;
     }
 
-    let hover = Style::default().bg(TRANSCRIPT_HOVER_BG);
+    let hover = crate::tui::chrome::chip_style(Style::default(), true);
     let spans = std::mem::take(&mut line.spans);
     let mut patched = Vec::with_capacity(spans.len() + 3);
     let mut col = 0usize;
@@ -337,12 +337,21 @@ fn hover_highlight_line(line: &mut Line<'static>, width: u16) {
 }
 
 fn hover_highlight_control_chip(line: &mut Line<'static>, hit: PinHit) {
-    hover_highlight_range(
-        line,
-        hit.col_start as usize,
-        hit.col_end as usize,
-        Some(hit.col_end as usize),
-    );
+    let start = hit.col_start as usize;
+    let end = hit.col_end as usize;
+    let spans = std::mem::take(&mut line.spans);
+    let mut patched = Vec::with_capacity(spans.len() + 2);
+    let mut col = 0usize;
+    for span in spans {
+        for ch in span.content.chars() {
+            let width = ch.width().unwrap_or(0);
+            let hovered = col < end && col.saturating_add(width) > start;
+            let style = crate::tui::chrome::chip_style(span.style, hovered);
+            push_hover_char(&mut patched, ch, style);
+            col = col.saturating_add(width);
+        }
+    }
+    line.spans = patched;
 }
 
 fn control_chip_hit_for_row(meta: &ChatRowMeta, hovered: ControlChip) -> Option<PinHit> {
@@ -622,7 +631,6 @@ fn history_render_signature(
     emojis: bool,
     file_icons: bool,
     hide_tool_calls: bool,
-    sticky_user_message: bool,
     elided: &std::collections::HashSet<String>,
     preflight_dots_ms: u128,
     pin: Option<crate::tui::history::PinControl>,
@@ -637,7 +645,6 @@ fn history_render_signature(
     emojis.hash(&mut hasher);
     file_icons.hash(&mut hasher);
     hide_tool_calls.hash(&mut hasher);
-    sticky_user_message.hash(&mut hasher);
 
     if let HistoryEntry::User {
         preflight_pending: true,
@@ -1778,19 +1785,19 @@ impl App {
             let spec = if is_fork {
                 ButtonSpec::new(
                     ButtonId::TranscriptFork { seq },
-                    "fork",
+                    "Fork",
                     ButtonDispatch::TranscriptFork { seq },
                 )
             } else if self.is_seq_pinned_for_render(seq) {
                 ButtonSpec::new(
                     ButtonId::TranscriptUnpin { seq },
-                    "unpin",
+                    "Unpin",
                     ButtonDispatch::TranscriptUnpin { seq },
                 )
             } else {
                 ButtonSpec::new(
                     ButtonId::TranscriptPin { seq },
-                    "pin",
+                    "Pin",
                     ButtonDispatch::TranscriptPin { seq },
                 )
             };
@@ -2996,6 +3003,8 @@ impl App {
     }
 
     pub(super) fn render_history(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        let viewport = area;
+        let area = crate::tui::chrome::scrollbar_content(viewport);
         self.chat_area = Some(area);
         let area_h = area.height as usize;
         let previous_visible = self.chat_visible_lines;
@@ -3016,10 +3025,10 @@ impl App {
                 let entry = &self.history[idx];
                 // Pinned-message chrome (`pinned-messages`): the pick-mode arrow
                 // (when this entry is the pick selection) and/or the clickable
-                // mouse controls (`[fork]` + `[pin]`/`[unpin]`, only when mouse
-                // mode is on) ride the message itself — inline left of the
-                // timestamp for an agent reply, in the top-right border corner
-                // for a user bubble. They cost no separate vertical space.
+                // controls (`[Pin]`/`[Unpin]` + `[Fork]`, visible whenever the
+                // transcript is focused) ride each role header, before the
+                // independently width-gated timestamp. They cost no separate
+                // vertical space.
                 let pin = Self::entry_pin_seq(entry).and_then(|seq| {
                     let is_pick = self
                         .pin_pick
@@ -3032,11 +3041,10 @@ impl App {
                         || self
                             .copy_pick_selected_history_index()
                             .is_some_and(|selected| selected == idx);
-                    let show_control = self.mouse_capture;
-                    (is_pick || show_control).then_some(crate::tui::history::PinControl {
+                    Some(crate::tui::history::PinControl {
                         seq,
                         pinned: self.is_seq_pinned_for_render(seq),
-                        show_control,
+                        show_control: true,
                         is_pick,
                     })
                 });
@@ -3055,7 +3063,6 @@ impl App {
                     self.use_emojis,
                     self.file_icons,
                     self.hide_tool_calls,
-                    self.sticky_user_message,
                     &self.elided_event_ids,
                     preflight_dots_ms,
                     pin,
@@ -3423,16 +3430,6 @@ impl App {
                     .fg(Color::Indexed(MUTED_COLOR_INDEX))
                     .add_modifier(Modifier::DIM),
             );
-        } else {
-            render_chat_scroll_indicator(
-                frame.buffer_mut(),
-                area,
-                self.chat_scroll_offset,
-                self.busy || self.pending.is_some(),
-                Style::default()
-                    .fg(Color::Indexed(MUTED_COLOR_INDEX))
-                    .add_modifier(Modifier::DIM),
-            );
         }
 
         if let Some(find) = self.transcript_find.as_ref() {
@@ -3469,6 +3466,51 @@ impl App {
                 &chip_row_mask,
                 &self.chat_text_grid,
             );
+        }
+
+        let max_scroll = self
+            .chat_total_lines
+            .saturating_sub(self.chat_visible_lines);
+        let top_offset = max_scroll.saturating_sub(self.chat_scroll_offset);
+        crate::tui::chrome::scrollbar(
+            frame,
+            viewport,
+            self.chat_total_lines,
+            self.chat_visible_lines,
+            top_offset,
+        );
+
+        self.latest_chip_area = None;
+        if self.chat_scroll_offset > 0 && area.width > 0 && area.height > 0 {
+            let label = " ↓ Latest ";
+            let width = (label.chars().count() as u16).min(area.width);
+            let rect = Rect {
+                x: area.right().saturating_sub(width),
+                y: area.bottom().saturating_sub(1),
+                width,
+                height: 1,
+            };
+            crate::tui::chrome::fill_bg(
+                frame,
+                rect,
+                crate::tui::theme::resolve_color(
+                    crate::tui::theme::HOVER_BG,
+                    crate::tui::theme::HOVER_BG_INDEX,
+                ),
+            );
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(crate::tui::theme::resolve_color(
+                            crate::tui::theme::BRASS,
+                            crate::tui::theme::BRASS_INDEX,
+                        ))
+                        .add_modifier(Modifier::BOLD),
+                ))),
+                rect,
+            );
+            self.latest_chip_area = Some(rect);
         }
     }
 
@@ -4670,12 +4712,23 @@ fn append_pending_render_rows(
     tail_meta: &mut Vec<ChatRowMeta>,
     tail_find_lines: &mut Vec<String>,
 ) {
+    let cursor_in_committed = pending_render.tail.is_empty()
+        && pending_render
+            .committed
+            .last()
+            .and_then(|line| line.spans.last())
+            .is_some_and(|span| span.content.as_ref() == "▌");
     let committed_key = (cache.state.commit_byte(), width);
     if cache.committed_visual_key != Some(committed_key) {
         let mut committed_visual = Vec::new();
-        for line in pending_render.committed.iter() {
+        let committed_len = pending_render.committed.len();
+        for (index, line) in pending_render.committed.iter().enumerate() {
             record_pending_wrap_row();
-            for (visual, _, _) in wrap_line_to_visual_rows(line.as_ref().clone(), width as usize) {
+            let mut line = line.as_ref().clone();
+            if cursor_in_committed && index + 1 == committed_len {
+                line.spans.pop();
+            }
+            for (visual, _, _) in wrap_line_to_visual_rows(line, width as usize) {
                 committed_visual.push(Rc::new(visual));
             }
         }
@@ -4686,6 +4739,14 @@ fn append_pending_render_rows(
         tail_find_lines.push(rendered_line_text(line.as_ref()).to_lowercase());
         tail_rows.push(Rc::clone(line));
         tail_meta.push(ChatRowMeta::other());
+    }
+    if cursor_in_committed && let Some(last) = tail_rows.last_mut() {
+        let mut line = last.as_ref().clone();
+        line.spans.push(Span::styled(
+            "▌",
+            Style::default().fg(crate::tui::theme::BRASS),
+        ));
+        *last = Rc::new(line);
     }
     append_uncached_prewrapped_rows(
         tail_rows,
@@ -4918,38 +4979,6 @@ fn chat_offset_for_top(total: usize, visible: usize, top: usize) -> usize {
 /// In-content spaces (between words) are highlighted so the selection
 /// reads as a continuous bar rather than a gappy one. Chip rows
 /// (`chip_row_mask`) are skipped entirely.
-fn render_chat_scroll_indicator(
-    buf: &mut ratatui::buffer::Buffer,
-    area: Rect,
-    scroll_offset: usize,
-    in_progress: bool,
-    style: Style,
-) {
-    if scroll_offset == 0 || area.width == 0 || area.height == 0 {
-        return;
-    }
-    let full = if in_progress {
-        format!("↓ streaming ({scroll_offset} more)")
-    } else {
-        format!("↓ {scroll_offset} more")
-    };
-    let text = if area.width as usize > full.width() {
-        full
-    } else if in_progress && area.width as usize > "↓ streaming".width() {
-        "↓ streaming".to_string()
-    } else if area.width as usize > "↓".width() {
-        "↓".to_string()
-    } else {
-        return;
-    };
-    let start_x = area
-        .x
-        .saturating_add(area.width.saturating_sub(1))
-        .saturating_sub(text.width() as u16);
-    let y = area.y.saturating_add(area.height.saturating_sub(1));
-    buf.set_string(start_x, y, text, style);
-}
-
 fn rendered_line_text(line: &Line<'_>) -> String {
     line.spans
         .iter()
@@ -6005,7 +6034,6 @@ mod render_history_spacing_tests {
         clear_highlight_caches, grammar_build_count, highlight_run_count, highlight_test_lock,
         reset_highlight_counters,
     };
-    use crate::tui::theme::TRANSCRIPT_HOVER_BG;
     use cockpit_config::extended::{DiffStyle, ThinkingDisplay, VimModeSetting};
     use cockpit_core::engine::message::{QueueItemStatus, QueueTarget, QueuedUserMessage};
     use cockpit_tokenizer::{count_call_count, reset_count_call_count};
@@ -7037,6 +7065,7 @@ mod render_history_spacing_tests {
 
     fn full_wrap_reference(app: &mut App, width: u16, height: u16) -> FullWrapReference {
         app.sync_history_render_versions();
+        let content_width = width.saturating_sub(1);
         let mut all = Vec::new();
         let mut row_meta = Vec::new();
         let mut msg_abs_line = HashMap::new();
@@ -7056,17 +7085,16 @@ mod render_history_spacing_tests {
                     || app
                         .copy_pick_selected_history_index()
                         .is_some_and(|selected| selected == idx);
-                let show_control = app.mouse_capture;
-                (is_pick || show_control).then_some(crate::tui::history::PinControl {
+                Some(crate::tui::history::PinControl {
                     seq,
                     pinned: app.is_seq_pinned_for_render(seq),
-                    show_control,
+                    show_control: true,
                     is_pick,
                 })
             });
             let rendered = render_entry(
                 entry,
-                width,
+                content_width,
                 app.thinking_setting,
                 app.markdown_opts,
                 app.diff_style,
@@ -7080,7 +7108,7 @@ mod render_history_spacing_tests {
                 entry,
                 idx,
                 &rendered,
-                width as usize,
+                content_width as usize,
             ));
             all.extend(rendered.lines);
             if gap_after_entry(&app.history, idx, entry) {
@@ -7090,8 +7118,8 @@ mod render_history_spacing_tests {
         }
 
         let (rows, row_meta, msg_abs_line) =
-            reference_full_wrap_rows(all, row_meta, msg_abs_line, width as usize);
-        let box_lines = app.banner_box_lines(width, height);
+            reference_full_wrap_rows(all, row_meta, msg_abs_line, content_width as usize);
+        let box_lines = app.banner_box_lines(content_width, height);
         let chat_banner_lines = box_lines.len();
         let find_lines = box_lines
             .iter()
@@ -7852,7 +7880,11 @@ mod render_history_spacing_tests {
 
         msg.text.push_str("```rust\n");
         let (memoized, _, _) = memoized_pending_visual_rows(&msg, 88, &mut cache);
-        assert_eq!(memoized, full_pending_visual_rows(&msg, 88));
+        let full = full_pending_visual_rows(&msg, 88);
+        assert_eq!(memoized.len(), full.len());
+        for (row, (memoized, full)) in memoized.iter().zip(&full).enumerate() {
+            assert_eq!(memoized, full, "streaming fence diverged at row {row}");
+        }
 
         reset_pending_wrap_row_count();
         for chunk in (0..80)
@@ -8099,8 +8131,6 @@ mod render_history_spacing_tests {
         app.file_icons = !app.file_icons;
         assert_eq!(render_calls_after(&mut app, 81, 8), 1);
 
-        app.sticky_user_message = !app.sticky_user_message;
-        assert_eq!(render_calls_after(&mut app, 81, 8), 1);
         assert_eq!(render_calls_after(&mut app, 81, 8), 0);
     }
 
@@ -8110,6 +8140,9 @@ mod render_history_spacing_tests {
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = false;
         app.use_emojis = false;
+        let session_id = uuid::Uuid::new_v4();
+        app.launch.session_id = Some(session_id);
+        app.pinned_seqs_session = Some(session_id);
         app.history = vec![pinned_user("pin me", 42), tool_box()].into();
 
         assert_eq!(render_calls_after(&mut app, 80, 8), 2);
@@ -8117,8 +8150,15 @@ mod render_history_spacing_tests {
         app.mouse_capture = !app.mouse_capture;
         assert_eq!(
             render_calls_after(&mut app, 80, 8),
+            0,
+            "Pin/Fork chrome remains visible independent of mouse capture"
+        );
+
+        app.pinned_seqs_cache.insert(42);
+        assert_eq!(
+            render_calls_after(&mut app, 80, 8),
             1,
-            "pin chrome state should invalidate only the pinnable row"
+            "pin state should invalidate only the pinnable row"
         );
 
         app.elided_event_ids.insert("call-1".to_string());
@@ -9513,8 +9553,8 @@ mod render_history_spacing_tests {
         );
         assert_eq!(
             next_agent_row,
-            tool_row + 2,
-            "next distinct block starts after the toolbox separator"
+            tool_row + 3,
+            "next role body starts after the toolbox separator and Agent header"
         );
 
         assert_eq!(
@@ -9542,7 +9582,7 @@ mod render_history_spacing_tests {
         app.history = vec![compact_boundary("handoff line")].into();
 
         render_history(&mut app, 80, 20);
-        let call_row = find_row(&app, "compact:");
+        let call_row = find_row(&app, "[show summary]");
         assert!(
             !nonblank_rows(&app)
                 .iter()
@@ -9564,7 +9604,7 @@ mod render_history_spacing_tests {
             "tool-call click expands the compact handoff"
         );
 
-        let call_row = find_row(&app, "compact:");
+        let call_row = find_row(&app, "[hide summary]");
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 1,
@@ -9593,12 +9633,13 @@ mod render_history_spacing_tests {
         render_history(&mut app, 10, 6);
 
         let rows = nonblank_rows(&app);
-        assert_eq!(app.chat_total_lines, 3);
+        assert_eq!(app.chat_total_lines, 4);
         assert_eq!(app.chat_visible_lines, 6);
-        assert_eq!(rows.len(), 3);
-        assert!(rows[0].1.contains("  abcdefgh"));
-        assert!(rows[1].1.contains("ijklmnopqr"));
-        assert!(rows[2].1.contains("stuvwxyz"));
+        assert_eq!(rows.len(), 4);
+        assert!(rows[0].1.contains("⋯ abcdefg"));
+        assert!(rows[1].1.contains("hijklmnop"));
+        assert!(rows[2].1.contains("qrstuvwxy"));
+        assert!(rows[3].1.contains('⋯'));
     }
 
     #[test]
@@ -9614,10 +9655,10 @@ mod render_history_spacing_tests {
         render_history(&mut app, 10, 5);
 
         assert_eq!(row_text(&app, 0).trim(), "");
-        assert_eq!(row_text(&app, 1).trim(), "");
-        assert!(row_text(&app, 2).contains("  abcdefgh"));
-        assert!(row_text(&app, 3).contains("ijklmnopqr"));
-        assert!(row_text(&app, 4).contains("stuvwxyz"));
+        assert!(row_text(&app, 1).contains("⋯ abcdefg"));
+        assert!(row_text(&app, 2).contains("hijklmnop"));
+        assert!(row_text(&app, 3).contains("qrstuvwxy"));
+        assert!(row_text(&app, 4).contains('⋯'));
     }
 
     #[test]
@@ -9807,26 +9848,34 @@ mod render_history_spacing_tests {
     }
 
     fn row_has_hover_bg(buffer: &ratatui::buffer::Buffer, row: usize, width: u16) -> bool {
-        (0..width).any(|col| buffer[(col, row as u16)].style().bg == Some(TRANSCRIPT_HOVER_BG))
+        (0..width)
+            .any(|col| buffer[(col, row as u16)].style().bg == Some(resolved_transcript_hover_bg()))
+    }
+
+    fn resolved_transcript_hover_bg() -> Color {
+        crate::tui::chrome::chip_style(Style::default(), true)
+            .bg
+            .expect("hovered chip style has a background")
     }
 
     fn assert_row_has_inset_hover(buffer: &ratatui::buffer::Buffer, row: usize, width: u16) {
+        let content_width = width.saturating_sub(1);
         assert_ne!(
             buffer[(0, row as u16)].style().bg,
-            Some(TRANSCRIPT_HOVER_BG),
+            Some(resolved_transcript_hover_bg()),
             "left transcript margin should stay unhighlighted"
         );
         assert_ne!(
             buffer[(width - 1, row as u16)].style().bg,
-            Some(TRANSCRIPT_HOVER_BG),
+            Some(resolved_transcript_hover_bg()),
             "right transcript margin should stay unhighlighted"
         );
         for col in crate::tui::history::AGENT_INDENT as u16
-            ..width - crate::tui::history::AGENT_INDENT as u16
+            ..content_width - crate::tui::history::AGENT_INDENT as u16
         {
             assert_eq!(
                 buffer[(col, row as u16)].style().bg,
-                Some(TRANSCRIPT_HOVER_BG),
+                Some(resolved_transcript_hover_bg()),
                 "column {col} should carry the inset hover background"
             );
         }
@@ -9854,20 +9903,20 @@ mod render_history_spacing_tests {
         for col in fork.col_start..fork.col_end {
             assert_eq!(
                 fork_buffer[(col, row as u16)].style().bg,
-                Some(TRANSCRIPT_HOVER_BG),
+                Some(resolved_transcript_hover_bg()),
                 "fork column {col} should be highlighted"
             );
         }
         for col in pin.col_start..pin.col_end {
             assert_ne!(
                 fork_buffer[(col, row as u16)].style().bg,
-                Some(TRANSCRIPT_HOVER_BG),
+                Some(resolved_transcript_hover_bg()),
                 "pin column {col} should not be highlighted by fork hover"
             );
         }
         assert_ne!(
             fork_buffer[(fork.col_start - 1, row as u16)].style().bg,
-            Some(TRANSCRIPT_HOVER_BG)
+            Some(resolved_transcript_hover_bg())
         );
 
         app.hovered_control_chip = Some(ControlChip::Pin { seq: 42 });
@@ -9875,14 +9924,14 @@ mod render_history_spacing_tests {
         for col in pin.col_start..pin.col_end {
             assert_eq!(
                 pin_buffer[(col, row as u16)].style().bg,
-                Some(TRANSCRIPT_HOVER_BG),
+                Some(resolved_transcript_hover_bg()),
                 "pin column {col} should be highlighted"
             );
         }
         for col in fork.col_start..fork.col_end {
             assert_ne!(
                 pin_buffer[(col, row as u16)].style().bg,
-                Some(TRANSCRIPT_HOVER_BG),
+                Some(resolved_transcript_hover_bg()),
                 "fork column {col} should not be highlighted by pin hover"
             );
         }
@@ -10089,10 +10138,10 @@ mod render_history_spacing_tests {
         let copied = extract_full_selection(&app, 24, 5);
 
         assert!(
-            rendered.contains("more"),
-            "scroll indicator should be visible"
+            rendered.contains("↓ Latest"),
+            "latest chip should be visible"
         );
-        assert!(!copied.contains("more"));
+        assert!(!copied.contains("Latest"));
         assert!(!copied.contains('↓'));
     }
 
@@ -10108,7 +10157,7 @@ mod render_history_spacing_tests {
 
         render_history(&mut app, 10, 4);
 
-        let first = find_row(&app, "  abcdefgh");
+        let first = find_row(&app, "⋯ abcdefg");
         let second = first + 1;
         assert!(!app.chat_cont_rows[first]);
         assert!(app.chat_cont_rows[second]);
@@ -10123,7 +10172,7 @@ mod render_history_spacing_tests {
                 active: false,
             },
         );
-        assert_eq!(text, "abcdefgh ijklmnopqr");
+        assert_eq!(text, "⋯ abcdefg hijklmnop");
     }
 
     #[test]
@@ -10314,7 +10363,7 @@ mod render_history_spacing_tests {
         app.set_chat_scroll_offset_from_interaction(3);
         let buffer = render_history_buffer(&mut app, 24, 4);
         let rows = buffer_rows(&buffer, 24, 4);
-        assert!(rows.iter().any(|row| row.contains("↓ 3 more")));
+        assert!(rows.iter().any(|row| row.contains("↓ Latest")));
 
         app.set_chat_scroll_offset_from_interaction(0);
         let buffer = render_history_buffer(&mut app, 24, 4);
@@ -10337,8 +10386,7 @@ mod render_history_spacing_tests {
 
         let buffer = render_history_buffer(&mut app, 2, 3);
         let rows = buffer_rows(&buffer, 2, 3);
-        assert!(rows.iter().any(|row| row.contains('↓')));
-        assert!(rows.iter().all(|row| !row.contains("more")));
+        assert!(rows.iter().all(|row| !row.contains('↓')));
 
         app.chat_scroll_offset = 2;
         let buffer = render_history_buffer(&mut app, 1, 3);
@@ -10471,7 +10519,7 @@ mod render_history_spacing_tests {
     }
 
     #[test]
-    fn chat_scroll_indicator_distinguishes_streaming_below_viewport() {
+    fn latest_chip_is_stable_while_output_streams_below_viewport() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = false;
@@ -10486,7 +10534,7 @@ mod render_history_spacing_tests {
 
         let rows = buffer_rows(&render_history_buffer(&mut app, 32, 4), 32, 4);
 
-        assert!(rows.iter().any(|row| row.contains("streaming")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("↓ Latest")), "{rows:?}");
     }
 }
 

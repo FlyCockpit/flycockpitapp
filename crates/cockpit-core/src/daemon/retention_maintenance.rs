@@ -203,13 +203,19 @@ mod tests {
             ctx.clone(),
             listener,
         ));
-        // Advance the paused clock just past the retention sweep interval so a
-        // restored inline retention arm would have fired and parked on the
-        // stalled writer before drain begins. Use `advance`, not `sleep`: a
-        // restored arm that parks on the stalled writer is a non-timer waiter
-        // and would stop paused-clock auto-advance during `sleep`.
+        // Poll the spawned loop at T=0 so a restored inline retention arm
+        // creates its interval and consumes the immediate first tick before
+        // virtual time jumps. `advance` moves the clock then yields; without
+        // this pre-yield the loop is first polled after the jump and the next
+        // tick would land past the test window.
+        tokio::task::yield_now().await;
         let period =
             Duration::from_secs((retention_config().sweep_interval_hours.max(1) as u64) * 60 * 60);
+        // Advance just past the retention sweep interval so a restored inline
+        // arm would have fired and parked on the stalled writer before drain
+        // begins. Use `advance`, not `sleep`: a restored arm that parks on
+        // the stalled writer is a non-timer waiter and would stop paused-clock
+        // auto-advance during `sleep`.
         tokio::time::advance(period + Duration::from_secs(1)).await;
         let started = Instant::now();
         assert!(

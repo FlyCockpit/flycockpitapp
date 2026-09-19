@@ -237,6 +237,12 @@ mod tests {
             ctx.clone(),
             listener,
         ));
+        // Poll the spawned loop at T=0 so a restored inline editor arm creates
+        // its interval and consumes the immediate first tick before virtual
+        // time jumps. `advance` moves the clock then yields; without this
+        // pre-yield the loop is first polled after the jump and the next tick
+        // would land past the test window.
+        tokio::task::yield_now().await;
         // Advance past the 60s inline cadence without `sleep`: a restored arm
         // that parks on the stalled writer is a non-timer waiter and would
         // stop paused-clock auto-advance during `sleep`.

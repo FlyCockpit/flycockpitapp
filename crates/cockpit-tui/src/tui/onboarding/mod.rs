@@ -116,9 +116,6 @@ fn welcome_cloud_seed() -> u64 {
     nanos ^ u64::from(std::process::id()).rotate_left(32)
 }
 
-/// The shell embeds the app-held settings dialog (provider add or post-onboarding
-/// setup wizard) in its content area; the shell still owns chrome and navigation.
-
 /// The screen the shell is presenting. `EmbeddedSettings` screens delegate their
 /// content area to the app-held settings dialog (provider add wizard or
 /// setup wizard); the shell still owns chrome, navigation, and semantics.
@@ -504,10 +501,6 @@ impl OnboardingShell {
     #[cfg(test)]
     pub(crate) fn screen_is_complete(&self) -> bool {
         matches!(self.screen, OnboardingScreen::Complete { .. })
-    }
-
-    pub(crate) fn screen_is_embedded_settings(&self) -> bool {
-        matches!(self.screen, OnboardingScreen::EmbeddedSettings)
     }
 
     pub(crate) fn screen_is_embedded_provider_add(&self, engine: &Dialog) -> bool {

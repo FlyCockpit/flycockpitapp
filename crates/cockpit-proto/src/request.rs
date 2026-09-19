@@ -7410,6 +7410,39 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "remote")]
+    #[test]
+    fn apply_onboarding_profile_canonicalizes_into_fcor_params() {
+        let request = Request::ApplyOnboardingProfile(crate::ApplyOnboardingProfile {
+            client_operation_id: "op-1".into(),
+            display_name: "Ada".into(),
+        });
+        let params = request
+            .canonical_remote_operation_params_v1()
+            .expect("onboarding profile apply canonicalizes");
+        // The redacted display state is ordinary canonical input: the name
+        // reaches the FCOR key, deterministically.
+        let same_params = request
+            .canonical_remote_operation_params_v1()
+            .expect("canonicalization is deterministic");
+        assert_eq!(params, same_params);
+        let other_name = Request::ApplyOnboardingProfile(crate::ApplyOnboardingProfile {
+            client_operation_id: "op-1".into(),
+            display_name: "Blaise".into(),
+        });
+        assert_ne!(
+            params,
+            other_name
+                .canonical_remote_operation_params_v1()
+                .expect("renamed apply canonicalizes"),
+            "the display name must influence the FCOR canonical params"
+        );
+        assert_eq!(
+            request.typed_remote_operation_fcor_fields().0,
+            "apply_onboarding_profile"
+        );
+    }
+
     #[test]
     fn leak_rpcs_are_registered_in_both_macro_tables() {
         let requests = [

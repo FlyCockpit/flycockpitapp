@@ -323,20 +323,6 @@ fn ensure_global_layer_for_write() -> Result<()> {
     Ok(())
 }
 
-fn apply_onboarding_profile_answers(run: &WizardRun) -> Result<Option<PathBuf>> {
-    let target = global_config_file().context("resolving global config for onboarding profile")?;
-    let mut doc = ExtendedConfigDoc::load(&target)?;
-    let mut config = doc.config();
-    let next = crate::wizard::onboarding_name_answer(run);
-    if config.name == next {
-        return Ok(None);
-    }
-    config.name = next;
-    ensure_global_layer_for_write()?;
-    doc.write(&config)?;
-    Ok(Some(target))
-}
-
 /// Persist the native onboarding profile display name through the global layer.
 pub fn apply_onboarding_profile_display_name(display_name: &str) -> Result<bool> {
     let trimmed = display_name.trim();

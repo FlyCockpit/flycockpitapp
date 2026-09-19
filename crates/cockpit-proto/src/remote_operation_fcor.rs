@@ -914,6 +914,7 @@ canonical_struct!(
 canonical_serde_json_value!(
     crate::BeginOrReopenOnboarding,
     crate::ApplyOnboardingTransition,
+    crate::ApplyOnboardingProfile,
     crate::OnboardingReceiptQuery,
     crate::AgentDecisionAnswer,
     crate::SealedActionDeclaration,

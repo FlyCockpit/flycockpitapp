@@ -5921,7 +5921,7 @@ impl Dialog {
 
     #[cfg(test)]
     pub(crate) fn test_mark_setup_complete(&mut self, step_id: &str) {
-        let (Dialog::SetupWizard(wizard)) = self else {
+        let Dialog::SetupWizard(wizard) = self else {
             panic!("expected setup wizard");
         };
         wizard
@@ -5945,7 +5945,7 @@ impl Dialog {
         &self,
         step_id: &str,
     ) -> Option<cockpit_core::wizard::WizardAnswer> {
-        let (Dialog::SetupWizard(wizard)) = self else {
+        let Dialog::SetupWizard(wizard) = self else {
             return None;
         };
         wizard.run.answer(step_id).cloned()
@@ -5953,7 +5953,7 @@ impl Dialog {
 
     #[cfg(test)]
     pub(crate) fn test_setup_prefill(&self) -> Option<cockpit_core::wizard::WizardAnswer> {
-        let (Dialog::SetupWizard(wizard)) = self else {
+        let Dialog::SetupWizard(wizard) = self else {
             return None;
         };
         wizard.run.prefill()
@@ -5963,7 +5963,7 @@ impl Dialog {
     /// drive the wizard step by step.
     #[cfg(test)]
     pub(crate) fn test_setup_step(&self) -> Option<&'static str> {
-        let (Dialog::SetupWizard(wizard)) = self else {
+        let Dialog::SetupWizard(wizard) = self else {
             return None;
         };
         wizard.run.current_step().map(|step| step.id)
@@ -5971,7 +5971,7 @@ impl Dialog {
 
     #[cfg(test)]
     pub(crate) fn test_setup_status(&self) -> Option<&str> {
-        let (Dialog::SetupWizard(wizard)) = self else {
+        let Dialog::SetupWizard(wizard) = self else {
             return None;
         };
         wizard.status.as_deref()
@@ -5980,7 +5980,7 @@ impl Dialog {
     /// `confirm`, `info`, `action`, `multi`, `tools`, `secret`.
     #[cfg(test)]
     pub(crate) fn test_setup_step_kind(&self) -> Option<&'static str> {
-        let (Dialog::SetupWizard(wizard)) = self else {
+        let Dialog::SetupWizard(wizard) = self else {
             return None;
         };
         let step = wizard.run.current_step()?;
@@ -5999,7 +5999,7 @@ impl Dialog {
     /// Number of select options on the current wizard step.
     #[cfg(test)]
     pub(crate) fn test_setup_step_options(&self) -> usize {
-        let (Dialog::SetupWizard(wizard)) = self else {
+        let Dialog::SetupWizard(wizard) = self else {
             return 0;
         };
         wizard.run.select_options().len()
@@ -6010,7 +6010,7 @@ impl Dialog {
     /// instead of hardcoding cursor positions.
     #[cfg(test)]
     pub(crate) fn test_setup_step_option_ids(&self) -> Vec<String> {
-        let (Dialog::SetupWizard(wizard)) = self else {
+        let Dialog::SetupWizard(wizard) = self else {
             return Vec::new();
         };
         wizard
@@ -6024,7 +6024,7 @@ impl Dialog {
     /// Current text-buffer contents of the wizard's focused Text step.
     #[cfg(test)]
     pub(crate) fn test_setup_text(&self) -> Option<String> {
-        let (Dialog::SetupWizard(wizard)) = self else {
+        let Dialog::SetupWizard(wizard) = self else {
             return None;
         };
         Some(wizard.text.text().to_string())

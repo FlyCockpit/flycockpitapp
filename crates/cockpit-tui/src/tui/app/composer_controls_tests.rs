@@ -331,6 +331,75 @@ fn ctrl_b_and_ctrl_n_route_to_session_seams() {
 }
 
 #[test]
+fn ctrl_j_focuses_rail_while_picker_open_instead_of_committing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    let _ = render(&mut app, 120, 24);
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    assert!(app.composer_controls.picker.is_some());
+
+    app.handle_key(ctrl(KeyCode::Char('j')));
+
+    assert!(
+        app.session_rail.is_focused(),
+        "Ctrl+J must keep focusing the session rail while a picker is open"
+    );
+    assert!(app.composer_controls.picker.is_none());
+    assert_eq!(
+        app.launch.active_model,
+        Some(("openai".to_string(), "gpt-test".to_string())),
+        "Ctrl+J must not commit the highlighted picker row"
+    );
+}
+
+#[test]
+fn ctrl_m_is_the_cr_alias_for_picker_enter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    let _ = render(&mut app, 120, 24);
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    assert_eq!(
+        app.composer_controls.picker.as_ref().expect("open").level,
+        0,
+        "providers level"
+    );
+
+    // Under the kitty keyboard protocol a literal Ctrl+M press is reported
+    // as Char('m') + CONTROL, not Enter; it must still commit.
+    app.handle_key(ctrl(KeyCode::Char('m')));
+
+    let picker = app.composer_controls.picker.as_ref().expect("still open");
+    assert_eq!(
+        picker.level, 1,
+        "Ctrl+M drills into the provider like Enter"
+    );
+}
+
+#[test]
+fn ctrl_p_opens_the_picker_replacing_an_open_overlay_pane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    let _ = render(&mut app, 120, 24);
+    // Open a real overlay pane through the router (which-key → scratchpad).
+    app.handle_key(ctrl(KeyCode::Char('k')));
+    app.handle_key(press(KeyCode::Char('n')));
+    assert!(matches!(app.overlay, Overlay::Notes(_)));
+
+    app.handle_key(ctrl(KeyCode::Char('p')));
+
+    assert!(
+        matches!(app.overlay, Overlay::None),
+        "the picker chord replaces the open pane (excoc tui.rs:172)"
+    );
+    assert!(
+        app.composer_controls
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.kind == ComposerControlKind::Model)
+    );
+}
+
+#[test]
 fn ctrl_k_router_dispatches_b_n_and_r_continuations() {
     let tmp = tempfile::tempdir().unwrap();
 
@@ -426,8 +495,9 @@ fn model_picker_pins_favorites_annotates_failures_usage_drift_and_add_action() {
     assert!(category.items[0].favorite);
     assert!(category.items[0].hint.contains("3 uses"));
     assert!(
-        !category.items[0].hint.is_empty() && category.items[0].hint != category.items[1].hint,
-        "auth failure annotation is retained on the failed model"
+        category.items[0].hint.contains("failed"),
+        "auth failure annotation is retained on the failed model: {}",
+        category.items[0].hint
     );
     assert_eq!(
         category.items.last().expect("add action").id,

@@ -61,7 +61,9 @@ fn tui_pty_ctrl_p_changes_session_model_and_ctrl_enter_persists_default() {
         })
         .expect("Ctrl+P opens provider level");
     session.settle_visible_state(Duration::from_secs(3));
-    session.write_bytes(b"\n");
+    // Real Enter (`\r`). A raw `\n` byte is delivered as Ctrl+J in raw
+    // mode, which is the session-rail focus chord, not Enter.
+    session.send_enter();
     session
         .wait_until_screen("model item picker", Duration::from_secs(5), |screen| {
             screen.contains("scripted") && screen.contains("fallback")
@@ -70,7 +72,7 @@ fn tui_pty_ctrl_p_changes_session_model_and_ctrl_enter_persists_default() {
     session.settle_visible_state(Duration::from_secs(3));
     session.write_bytes(b"\x1b[A");
     session.settle_visible_state(Duration::from_secs(3));
-    session.write_bytes(b"\n");
+    session.send_enter();
     session
         .wait_until_screen("session model changed", Duration::from_secs(10), |screen| {
             screen.contains("[local/fallback]") && !screen.contains("ctrl+enter default")
@@ -86,7 +88,7 @@ fn tui_pty_ctrl_p_changes_session_model_and_ctrl_enter_persists_default() {
         )
         .expect("Ctrl+P reopens provider level");
     session.settle_visible_state(Duration::from_secs(3));
-    session.write_bytes(b"\n");
+    session.send_enter();
     session
         .wait_until_screen(
             "model item picker again",
@@ -126,6 +128,32 @@ fn tui_pty_ctrl_p_changes_session_model_and_ctrl_enter_persists_default() {
         },
     );
 
+    session.type_line("/exit");
+    session.wait_for_child_exit();
+    session.reap();
+    session.assert_reaped();
+}
+
+#[test]
+fn tui_pty_scratch_debug() {
+    let mut prep = HermeticCockpit::prepare(HermeticProfile::Default);
+    prep.set_extra_env("COCKPIT_DBG_KEYS", "1");
+    prep.start_trusted_daemon();
+    prep.spawn_pty(100, 30).expect("spawn hermetic PTY child");
+    let mut session = prep;
+    let _ = session.wait_until_ready(Duration::from_secs(20));
+    std::thread::sleep(Duration::from_secs(2));
+    session.write_bytes(b"\x10");
+    std::thread::sleep(Duration::from_secs(2));
+    session.send_enter();
+    std::thread::sleep(Duration::from_secs(2));
+    eprintln!("=== AFTER ENTER ===\n{}", session.snapshot().contents());
+    eprintln!(
+        "=== LOG TAIL ===\n{}",
+        crate::support::log_tail(session.home())
+    );
+    session.write_bytes(b"\x1b");
+    std::thread::sleep(Duration::from_secs(1));
     session.type_line("/exit");
     session.wait_for_child_exit();
     session.reap();

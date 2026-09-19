@@ -568,7 +568,13 @@ impl App {
         {
             return self.request_guarded_exit();
         }
-        if self.composer_chrome_interactive()
+        // Excoc's global chords (`reference/example-tui/src/tui.rs:157-201`):
+        // Ctrl first, then Alt, both routed ahead of the overlay/dialog and
+        // slash handling below. An open overlay pane does not block them
+        // (`composer_chords_available`); cockpit-only decision surfaces
+        // (dialogs, transcript find, transcript pick modes, the which-key
+        // overlay) do.
+        if self.composer_chords_available()
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && !key
                 .modifiers
@@ -595,7 +601,13 @@ impl App {
                     self.pending_new_session = true;
                     return false;
                 }
-                KeyCode::Up if self.composer.is_empty() && self.focus_queue_from_composer() => {
+                // `Ctrl+↑` is the re-homed cockpit queue shortcut, not an
+                // excoc global: it keeps requiring the composer chrome.
+                KeyCode::Up
+                    if self.composer_chrome_interactive()
+                        && self.composer.is_empty()
+                        && self.focus_queue_from_composer() =>
+                {
                     return false;
                 }
                 _ => {}
@@ -604,9 +616,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::ALT)
             && !key.modifiers.contains(KeyModifiers::CONTROL)
             && self.pane.is_none()
-            && !self.dialog.is_active()
-            && matches!(self.overlay, Overlay::None)
-            && self.question_dialog.is_none()
+            && self.composer_chords_available()
         {
             match key.code {
                 KeyCode::Up => {
@@ -623,9 +633,7 @@ impl App {
         if key.kind == KeyEventKind::Press
             && key.modifiers.contains(KeyModifiers::ALT)
             && self.pane.is_none()
-            && !self.dialog.is_active()
-            && matches!(self.overlay, Overlay::None)
-            && self.question_dialog.is_none()
+            && self.composer_chords_available()
         {
             match key.code {
                 KeyCode::Char('m') if self.auth_failure_notice.is_some() => {
@@ -4052,6 +4060,14 @@ impl App {
             && self.rules_review.is_none()
             && self.keys_overlay.is_none()
             && self.transcript_find.is_none()
+            // The composer control deck (open picker or pill selection)
+            // owns Enter/arrows/typing while it is up. Without this, an
+            // unmodified Enter is intake-buffered as a rapid-paste
+            // candidate and replayed through the frozen-composer route,
+            // never reaching the picker — so a live-terminal Enter could
+            // not commit it (#445).
+            && self.composer_controls.picker.is_none()
+            && self.composer_controls.selection.is_none()
     }
 
     fn start_paste_token_count(&mut self, block_id: u64, full: String) {

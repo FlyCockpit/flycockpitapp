@@ -26,10 +26,24 @@ fn point_in(rect: Rect, col: u16, row: u16) -> bool {
     col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
 }
 
+/// `Enter` commits. `Ctrl+M` is kept as the CR alias: under the kitty
+/// keyboard protocol a literal `Ctrl+M` press is reported as
+/// `Char('m')` + CONTROL instead of `KeyCode::Enter`, and it is bound
+/// nowhere else. `Ctrl+J` is deliberately absent — it is the
+/// session-rail focus chord (`is_session_rail_focus_chord`) and must
+/// reach it while a picker is open.
 fn is_picker_enter(key: &KeyEvent) -> bool {
     key.code == KeyCode::Enter
-        || (matches!(key.code, KeyCode::Char('j') | KeyCode::Char('m'))
-            && key.modifiers == KeyModifiers::CONTROL)
+        || (key.code == KeyCode::Char('m') && key.modifiers == KeyModifiers::CONTROL)
+}
+
+/// Plain vim-style motion characters (`j`/`k`/`h`/`l`) only: the letter
+/// without a chord modifier. `Ctrl+J` (rail focus) and any other
+/// CONTROL/ALT combination must fall through to its chord owner instead
+/// of moving a picker cursor or cycling a pill.
+fn is_plain_motion(key: &KeyEvent) -> bool {
+    !key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
 fn scroll_from_track(track: Rect, row: u16, max: usize) -> usize {
@@ -208,6 +222,9 @@ impl App {
         }
     }
 
+    /// Test-only ownership fence: force a generation bump so a test can
+    /// prove stale pickers/pendings are dropped across the boundary.
+    #[cfg(test)]
     pub(super) fn bump_composer_control_generation(&mut self) {
         self.invalidate_composer_control_ownership(true, true);
     }
@@ -544,8 +561,21 @@ impl App {
     }
 
     pub(super) fn composer_chrome_interactive(&self) -> bool {
-        matches!(self.overlay, Overlay::None)
-            && self.question_dialog.is_none()
+        matches!(self.overlay, Overlay::None) && self.composer_chords_available()
+    }
+
+    /// Whether the excoc-adopted global chords (`Ctrl+P/E/B/N`, `Alt+↑/↓`)
+    /// may act right now. They outrank overlay panes — excoc routes its
+    /// Ctrl and Alt chords before overlay and slash handling
+    /// (`reference/example-tui/src/tui.rs:157-201`), so an open
+    /// [`Overlay`] pane does not block them (a picker chord replaces the
+    /// pane; the session chords act underneath it). Cockpit-only decision
+    /// surfaces — the question/approval dialogs, transcript pick modes,
+    /// transcript find (where `Ctrl+P` stays find-previous), and the
+    /// which-key overlay — still swallow keys while they are up. The
+    /// embedded pane is excluded by the caller.
+    pub(super) fn composer_chords_available(&self) -> bool {
+        self.question_dialog.is_none()
             && !self.dialog.is_active()
             && self.pin_pick.is_none()
             && self.fork_pick.is_none()
@@ -611,9 +641,14 @@ impl App {
     }
 
     pub(super) fn open_composer_picker_from_chord(&mut self, kind: ComposerControlKind) {
-        if !self.composer_chrome_interactive() {
+        if !self.composer_chords_available() {
             return;
         }
+        // The chord outranks any open overlay pane: excoc's `Ctrl+P` /
+        // `Ctrl+E` replace the current overlay (`reference/example-tui/
+        // src/tui.rs:172` / `:178`), and the popover anchors to the
+        // composer, which a full-screen pane would cover.
+        self.overlay = Overlay::None;
         self.composer_controls.selection = Some(kind);
         self.open_composer_picker(kind);
         if kind == ComposerControlKind::Model {
@@ -1263,12 +1298,22 @@ impl App {
                     self.commit_composer_picker(picker, persist);
                     return true;
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     picker.move_cursor(-1);
                     self.composer_controls.picker = Some(picker);
                     return true;
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
+                    picker.move_cursor(1);
+                    self.composer_controls.picker = Some(picker);
+                    return true;
+                }
+                KeyCode::Char('k') if is_plain_motion(&key) => {
+                    picker.move_cursor(-1);
+                    self.composer_controls.picker = Some(picker);
+                    return true;
+                }
+                KeyCode::Char('j') if is_plain_motion(&key) => {
                     picker.move_cursor(1);
                     self.composer_controls.picker = Some(picker);
                     return true;
@@ -1292,11 +1337,19 @@ impl App {
                 self.composer_controls.selection = None;
                 true
             }
-            KeyCode::Left | KeyCode::Char('h') => {
+            KeyCode::Left => {
                 self.cycle_composer_pill(selected, -1);
                 true
             }
-            KeyCode::Right | KeyCode::Char('l') => {
+            KeyCode::Right => {
+                self.cycle_composer_pill(selected, 1);
+                true
+            }
+            KeyCode::Char('h') if is_plain_motion(&key) => {
+                self.cycle_composer_pill(selected, -1);
+                true
+            }
+            KeyCode::Char('l') if is_plain_motion(&key) => {
                 self.cycle_composer_pill(selected, 1);
                 true
             }

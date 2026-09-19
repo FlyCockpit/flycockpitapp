@@ -35,7 +35,6 @@ Conversation rules are lineage-scoped advisory directives. `/rules` opens the pa
 | `Shift+Tab` | cycle agent | switch the primary agent |
 | `@` | file tag | tag a file into the message |
 | `↑/↓` | history | recall previously sent messages |
-| `Ctrl+↑` | enter queue | on an empty composer, focus the queue box |
 | `Esc` / `↓` | queue blur | return from a focused queued message to the composer |
 
 ## Queued messages

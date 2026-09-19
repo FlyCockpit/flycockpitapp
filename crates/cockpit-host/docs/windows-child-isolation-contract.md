@@ -27,7 +27,8 @@ resource set for the arbitrary approved and `/sandbox off` routes. Granting
 `RC` broadly would be an unreviewed replacement for their existing authority,
 not an implementation of the current product contract.
 
-The only valid outcome for #398 is therefore **Blocked**. #399 remains deferred.
+The research outcome for #398 was therefore **Blocked**; #438 superseded that
+verdict by deciding the OS user account is the boundary. #399 remains deferred.
 An unavailable Windows fixture is also a blocked result, never supervisor
 activation evidence.
 

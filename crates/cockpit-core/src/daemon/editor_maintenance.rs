@@ -237,7 +237,10 @@ mod tests {
             ctx.clone(),
             listener,
         ));
-        tokio::time::sleep(Duration::from_secs(120)).await;
+        // Advance past the 60s inline cadence without `sleep`: a restored arm
+        // that parks on the stalled writer is a non-timer waiter and would
+        // stop paused-clock auto-advance during `sleep`.
+        tokio::time::advance(EDITOR_MAINTENANCE_PERIOD + Duration::from_secs(1)).await;
         let started = Instant::now();
         assert!(
             ctx.shutdown_signal().begin_drain(),

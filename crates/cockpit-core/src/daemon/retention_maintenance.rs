@@ -203,14 +203,14 @@ mod tests {
             ctx.clone(),
             listener,
         ));
-        // Advance the paused clock just past the retention sweep interval (6h
-        // default) so a restored inline retention arm would have fired and
-        // parked on the stalled writer before drain begins. With the
-        // dedicated worker owning retention, the accept loop has no such arm
-        // and never touches the database.
-        for _ in 0..7 {
-            tokio::time::sleep(Duration::from_secs(60 * 60)).await;
-        }
+        // Advance the paused clock just past the retention sweep interval so a
+        // restored inline retention arm would have fired and parked on the
+        // stalled writer before drain begins. Use `advance`, not `sleep`: a
+        // restored arm that parks on the stalled writer is a non-timer waiter
+        // and would stop paused-clock auto-advance during `sleep`.
+        let period =
+            Duration::from_secs((retention_config().sweep_interval_hours.max(1) as u64) * 60 * 60);
+        tokio::time::advance(period + Duration::from_secs(1)).await;
         let started = Instant::now();
         assert!(
             ctx.shutdown_signal().begin_drain(),

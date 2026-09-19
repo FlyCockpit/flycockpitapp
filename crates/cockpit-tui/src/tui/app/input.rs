@@ -488,6 +488,14 @@ impl App {
             self.jump_to_sticky_user_header();
             return false;
         }
+        // An open composer picker owns its modal keys before queue-row focus.
+        // This ordering is defensive: opening a picker clears queue focus, but
+        // a later Ctrl+Up must still move the picker instead of re-entering the
+        // queue and allowing it to swallow subsequent arrows or Enter.
+        // Ordinary keys that dismiss the picker continue through the router.
+        if self.composer_controls.picker.is_some() && self.handle_composer_control_key(key) {
+            return false;
+        }
         if self.handle_queue_key(key) {
             return false;
         }
@@ -683,14 +691,6 @@ impl App {
             && self.pending_stop_confirm.is_none()
         {
             self.toggle_keys_overlay();
-            return false;
-        }
-
-        // An open composer picker owns its modal keys even when `/btw` had
-        // focus before the global chord opened it. Route the picker first so
-        // Enter/Esc cannot leak into the side composer. Ordinary keys that
-        // dismiss the picker still fall through to `/btw` below.
-        if self.composer_controls.picker.is_some() && self.handle_composer_control_key(key) {
             return false;
         }
 

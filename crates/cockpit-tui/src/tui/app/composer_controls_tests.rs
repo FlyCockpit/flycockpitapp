@@ -470,7 +470,7 @@ fn focused_btw_cannot_intercept_model_picker_commit() {
 }
 
 #[test]
-fn focused_queue_cannot_intercept_model_picker_navigation_or_commit() {
+fn queue_reentry_cannot_intercept_model_picker_navigation_or_commit() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut app, mut control_rx) = app_with_runner(&tmp);
     let queued = queue_item("keep queued", QueueDeliveryClass::Held);
@@ -489,6 +489,15 @@ fn focused_queue_cannot_intercept_model_picker_navigation_or_commit() {
     assert!(
         app.queue_focus.is_none(),
         "opening a modal picker relinquishes queue key ownership"
+    );
+    app.handle_key(ctrl(KeyCode::Up));
+    assert!(
+        app.queue_focus.is_none(),
+        "Ctrl+Up after opening must remain picker-owned instead of re-entering the queue"
+    );
+    assert!(
+        app.composer_controls.picker.is_some(),
+        "Ctrl+Up keeps the picker open"
     );
     app.handle_key(press(KeyCode::Enter));
     assert_eq!(

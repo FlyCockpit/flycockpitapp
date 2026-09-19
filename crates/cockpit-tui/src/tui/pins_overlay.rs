@@ -17,16 +17,16 @@ use cockpit_proto::PinnedMessage;
 use crate::tui::composer::display_width;
 
 /// Grey for the `pin` half of the mouse control + muted chrome.
-pub const PIN_GREY: Color = Color::Indexed(244);
+pub const PIN_GREY: Color = crate::tui::theme::FOG;
 /// Yellow for the `unpin` half of the mouse control + the pick arrow.
-pub const PIN_YELLOW: Color = Color::Yellow;
+pub const PIN_YELLOW: Color = crate::tui::theme::YELLOW;
 
 /// The left-margin arrow `/pin` pick-mode draws next to the selected
 /// message. One glyph wide; the transcript text is inset to leave room.
 pub const PICK_ARROW: &str = "▶";
 
 /// Column width of the single mouse control actually shown for a row:
-/// `[unpin]` (7) when `pinned`, `[pin]` (5) when not. The mouse handler
+/// `[Unpin]` (7) when `pinned`, `[Pin]` (5) when not. The mouse handler
 /// hit-tests exactly this many leftmost columns so a click lands only on
 /// the visible control.
 pub fn pin_control_width(pinned: bool) -> u16 {
@@ -359,20 +359,23 @@ fn ellipsize_display_width(text: &str, width: usize, truncated: bool) -> String 
     prefix
 }
 
-/// The fork mouse control: grey `[fork]`, rendered unemphasized. It is drawn
+/// The fork mouse control: grey `[Fork]`, rendered unemphasized. It is drawn
 /// immediately left of the state-appropriate pin control when both fit.
 pub fn fork_control_spans() -> Vec<Span<'static>> {
-    vec![Span::styled("[fork]", Style::default().fg(PIN_GREY))]
+    vec![Span::styled("[Fork]", Style::default().fg(PIN_GREY))]
 }
 
-/// The single state-appropriate pin mouse control: yellow `[unpin]` when
-/// `pinned`, grey `[pin]` when not. Only one pin action is ever shown (no `|`
-/// separator), rendered unemphasized — clicking it toggles the pin state.
+/// The single state-appropriate pin mouse control: yellow `[Unpin]` when
+/// `pinned`, grey `[Pin]` when not. Only one pin action is ever shown (no `|`
+/// separator); the active Unpin action is emphasized.
 pub fn pin_control_spans(pinned: bool) -> Vec<Span<'static>> {
     if pinned {
-        vec![Span::styled("[unpin]", Style::default().fg(PIN_YELLOW))]
+        vec![Span::styled(
+            "[Unpin]",
+            Style::default().fg(PIN_YELLOW).add_modifier(Modifier::BOLD),
+        )]
     } else {
-        vec![Span::styled("[pin]", Style::default().fg(PIN_GREY))]
+        vec![Span::styled("[Pin]", Style::default().fg(PIN_GREY))]
     }
 }
 
@@ -581,27 +584,27 @@ mod tests {
 
     #[test]
     fn pin_control_shows_single_state_action() {
-        // Unpinned → lone grey `[pin]`, no separator, no second action.
+        // Unpinned → lone grey `[Pin]`, no separator, no second action.
         let spans = pin_control_spans(false);
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].content, "[pin]");
+        assert_eq!(spans[0].content, "[Pin]");
         assert_eq!(spans[0].style.fg, Some(PIN_GREY));
         assert!(!spans[0].style.add_modifier.contains(Modifier::BOLD));
 
-        // Pinned → lone yellow `[unpin]`, no separator, no second action.
+        // Pinned → lone yellow `[Unpin]`, no separator, no second action.
         let spans = pin_control_spans(true);
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].content, "[unpin]");
+        assert_eq!(spans[0].content, "[Unpin]");
         assert_eq!(spans[0].style.fg, Some(PIN_YELLOW));
-        assert!(!spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
     fn pin_control_width_matches_shown_action() {
         // Width is the width of the single control actually shown.
-        assert_eq!(pin_control_width(false), 5, "[pin] is 5 columns");
-        assert_eq!(pin_control_width(true), 7, "[unpin] is 7 columns");
-        assert_eq!(fork_control_width(), 6, "[fork] is 6 columns");
+        assert_eq!(pin_control_width(false), 5, "[Pin] is 5 columns");
+        assert_eq!(pin_control_width(true), 7, "[Unpin] is 7 columns");
+        assert_eq!(fork_control_width(), 6, "[Fork] is 6 columns");
 
         // The hit-test width equals the rendered span's column width.
         assert_eq!(
@@ -617,7 +620,7 @@ mod tests {
             fork_control_spans()[0].content.chars().count()
         );
 
-        // A click at column 6 (past `[pin]`) does NOT register on an
+        // A click at column 6 (past `[Pin]`) does NOT register on an
         // unpinned control — only columns 0..5 are live.
         assert!(6 >= pin_control_width(false));
     }

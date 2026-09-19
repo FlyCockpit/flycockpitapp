@@ -21,13 +21,13 @@ use crate::tui::markdown;
 #[cfg(test)]
 use crate::tui::message_block::wrap_lines_to_width_reserving_first;
 use crate::tui::message_block::{
-    layout_markdown_message_lines, render_markdown_message_block, slice_spans_at_width,
-    wrap_lines_to_width,
+    MessageBlock, layout_markdown_message_lines, render_markdown_message_block,
+    slice_spans_at_width, wrap_lines_to_width,
 };
 use crate::tui::progress::render_bar;
 use crate::tui::theme::{
-    ERROR_TEXT, INFO_TEXT, METADATA_TEXT, MUTED_COLOR_INDEX, PLAN_YELLOW, SUBAGENT_ORANGE,
-    SUCCESS_TEXT, TOOL_OUTPUT, TOOL_SIDEBAR, WARNING_TEXT,
+    BRASS, DISABLED, ERROR_TEXT, FOG, INFO_TEXT, INK, PLAN_YELLOW, SUBAGENT_ORANGE, SUCCESS_TEXT,
+    TEAL, TOOL_OUTPUT, WARNING_TEXT,
 };
 use cockpit_client::presentation::{ResponsePerformance, ToolProgress};
 use cockpit_config::extended::ThinkingDisplay;
@@ -205,6 +205,12 @@ pub enum HistoryEntry {
         /// closed on live/replay and is never persisted. Toggled
         /// independently of the reasoning `expanded` field.
         performance_expanded: bool,
+        /// The turn was cut short by the user (Ctrl+C or a message that
+        /// raced the stream). Set from `AgentIdle(Interrupted)` at
+        /// finalization — see `App::finalize_pending_interrupted` — so the
+        /// frozen entry renders the trailing `⎯ Stopped — you sent a
+        /// message` marker row instead of looking like a settled reply.
+        interrupted: bool,
     },
     /// Completed `edit` tool call. Rendered as a diff per `tui.diff_style`
     /// (side-by-side / inline / hidden). Stored instead of a `Plain` line so
@@ -265,12 +271,12 @@ pub enum HistoryEntry {
     /// driven by `spawned_at`. Once it returns, `outcome` is `Some` and
     /// the line becomes a `{child} worked for {duration}` (or `failed
     /// after`) header plus the markdown-rendered, left-bar-quoted,
-    /// truncatable response body. Child name renders in orange; parent
+    /// truncatable response body. Child name renders in bold ink; parent
     /// in the default style.
     Subagent {
         /// Delegating agent's name (default style).
         parent: String,
-        /// Delegated-to agent's name (orange).
+        /// Delegated-to agent's name (bold ink).
         child: String,
         task_call_id: String,
         label: String,
@@ -492,18 +498,13 @@ pub const THINKING_VISIBLE: usize = 20;
 /// (icon + padding) and every `tool:` label starts at the same column.
 const TOOL_GLYPH_COLUMN: usize = 3;
 
-/// Light grey for the tool-box sidebar.
-const SIDEBAR_FG: Color = TOOL_SIDEBAR;
 /// Dim grey for expanded tool output lines.
 const TOOL_OUTPUT_FG: Color = TOOL_OUTPUT;
 
-// Retained for the user-message background fill; not yet applied.
-#[allow(dead_code)]
-const USER_BG: Color = Color::Indexed(17); // dark blue (xterm 256-color)
-const USER_BORDER_FG: Color = crate::tui::theme::ACCENT_BLUE;
-const TIMESTAMP_FG: Color = METADATA_TEXT;
-const REASONING_FG: Color = TOOL_SIDEBAR;
-const THINKING_FG: Color = WARNING_TEXT;
+const USER_BORDER_FG: Color = BRASS;
+const TIMESTAMP_FG: Color = DISABLED;
+const REASONING_FG: Color = DISABLED;
+const THINKING_FG: Color = FOG;
 /// Width of an `HH:MM` timestamp string.
 pub const TIMESTAMP_WIDTH: usize = 5;
 
@@ -589,12 +590,6 @@ fn terminal_supports_truecolor() -> bool {
         .unwrap_or(false)
 }
 
-/// Outer gutter on either side of a user-message bubble (cells of
-/// terminal-default bg outside the rounded box).
-const USER_GUTTER: usize = 1;
-/// Inner padding between the bubble's vertical border and the text.
-const USER_INNER_PAD: usize = 1;
-
 /// Agent messages render with no leading marker — the active-agent
 /// indicator in the chrome and the thinking-chip (when present)
 /// already signal who's talking, and the bullet was visual noise that
@@ -640,17 +635,17 @@ pub struct Rendered {
     pub tool_result_scroll_regions: Vec<ToolResultScrollRegion>,
     /// Relative row range for a scrollable expanded reasoning window.
     pub reasoning_scroll_region: Option<ReasoningScrollRegion>,
-    /// Where the clickable `[fork]` and/or `[pin]`/`[unpin]` mouse controls
+    /// Where the clickable `[Pin]`/`[Unpin]` and `[Fork]` mouse controls
     /// landed within `lines`, when drawn. `None` when the entry is not
     /// pinnable, the controls are hidden (mouse mode off), or the line was
     /// too narrow to fit any control. Carries the seq + exact row/column
     /// ranges so hit-tests route only visible glyphs.
     pub pin_region: Option<PinRegion>,
     /// Where the clickable response-performance metric chip landed, when
-    /// drawn. `None` when the entry has no performance snapshot, the chip
-    /// was hidden (mouse mode off), or the terminal is below the minimum
-    /// supported width (24 columns) and the header is replaced by the
-    /// `↔` resize state. Carries exact row/column ranges so hit-tests
+    /// drawn. `None` when the entry has no performance snapshot or the
+    /// chip was hidden (mouse mode off); below the minimum supported
+    /// width (24 columns) the `Agent` label itself remains the chip's
+    /// union hit target. Carries exact row/column ranges so hit-tests
     /// route only visible glyphs; clicking toggles
     /// `performance_expanded` only.
     pub metric_region: Option<MetricRegion>,
@@ -695,11 +690,11 @@ fn prepend_copy_rows(copy: &mut RenderedCopy, count: usize) {
 pub struct PinControl {
     /// The message's pin seq (the DB key the toggle operates on).
     pub seq: i64,
-    /// `true` → the message is currently pinned (`[unpin]`, yellow);
-    /// `false` → not pinned (`[pin]`, grey). Drives the state-dependent
+    /// `true` → the message is currently pinned (`[Unpin]`, yellow);
+    /// `false` → not pinned (`[Pin]`, grey). Drives the state-dependent
     /// control width (7 vs 5).
     pub pinned: bool,
-    /// `true` → draw the clickable `[fork]` plus `[pin]`/`[unpin]` controls
+    /// `true` → draw the clickable `[Pin]`/`[Unpin]` plus `[Fork]` controls
     /// (mouse mode on). When `false` the controls are omitted and reserve no
     /// width.
     pub show_control: bool,
@@ -709,8 +704,8 @@ pub struct PinControl {
 }
 
 impl PinControl {
-    /// Width (columns) the `[pin]`/`[unpin]` glyphs occupy when shown,
-    /// else 0. State-dependent: 7 for `[unpin]`, 5 for `[pin]`.
+    /// Width (columns) the `[Pin]`/`[Unpin]` glyphs occupy when shown,
+    /// else 0. State-dependent: 7 for `[Unpin]`, 5 for `[Pin]`.
     fn pin_control_width(&self) -> usize {
         if self.show_control {
             crate::tui::pins_overlay::pin_control_width(self.pinned) as usize
@@ -751,13 +746,8 @@ pub struct PinRegion {
     pub fork_col_end: Option<u16>,
 }
 
-/// Where the clickable response-performance metric chip landed: the
-/// half-open `[col_start, col_end)` column range on each row that
-/// belongs to the chip. The chip may span multiple rows when the
-/// metric is split across dedicated metadata rows on narrow terminals.
-/// The chrome offsets each `row` by the entry's position in the scroll
-/// buffer and hit-tests only the recorded ranges. Clicking toggles
-/// only `performance_expanded` — never the reasoning `expanded` field.
+/// Where the clickable `Agent` statistics chip landed. Clicking toggles only
+/// `performance_expanded` — never the reasoning `expanded` field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricRegion {
     /// The row ranges (within an entry's `lines`) and their column
@@ -786,6 +776,59 @@ pub(crate) fn reset_render_entry_call_count() {
 #[cfg(test)]
 pub(crate) fn render_entry_call_count() -> usize {
     RENDER_ENTRY_CALLS.with(std::cell::Cell::get)
+}
+
+fn centered_note(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("⋯ {text} ⋯"),
+        Style::default()
+            .fg(crate::tui::theme::DISABLED)
+            .add_modifier(Modifier::ITALIC),
+    ))
+    .centered()
+}
+
+/// Trailing marker row for an agent turn the user cut short: a short `⎯`
+/// rule in warning yellow plus the muted explanation. Rendered as the last
+/// row of the frozen [`HistoryEntry::Agent`] entry so an interrupted turn
+/// reads as stopped rather than settled.
+fn interrupted_marker_line() -> Line<'static> {
+    Line::from(vec![
+        Span::styled("  ⎯ ", Style::default().fg(crate::tui::theme::YELLOW)),
+        Span::styled(
+            "Stopped — you sent a message".to_string(),
+            Style::default().fg(FOG),
+        ),
+    ])
+}
+
+fn render_plain(line: &str) -> Rendered {
+    let lines = if let Some((from, body)) = line
+        .strip_prefix("steer from ")
+        .and_then(|rest| rest.split_once(": "))
+    {
+        vec![
+            Line::from(Span::styled(
+                format!("  ▸ {from}"),
+                Style::default().fg(FOG),
+            )),
+            Line::from(Span::styled(format!("  {body}"), Style::default().fg(FOG))),
+        ]
+    } else {
+        vec![centered_note(line)]
+    };
+    let continuations = vec![false; lines.len()];
+    Rendered {
+        lines,
+        copy_body_start: None,
+        chip_row: None,
+        continuations,
+        tool_call_rows: Vec::new(),
+        tool_result_scroll_regions: Vec::new(),
+        reasoning_scroll_region: None,
+        pin_region: None,
+        metric_region: None,
+    }
 }
 
 /// Render one history entry. The renderer receives the area's `width`
@@ -860,10 +903,9 @@ pub fn render_entry(
                     *continuation = true;
                 }
             }
-            // The chip rides the bubble's top border row (row 0). Only a
-            // resolved cleaned form makes it the clickable reveal toggle; the
-            // transient `Preflight…` indicator is not toggleable.
-            let chip_row = toggleable.then_some(0);
+            // The chip sits immediately below the You role header. Only a
+            // resolved cleaned form makes it the clickable reveal toggle.
+            let chip_row = toggleable.then_some(1);
             Rendered {
                 lines,
                 copy_body_start,
@@ -876,20 +918,7 @@ pub fn render_entry(
                 metric_region: None,
             }
         }
-        HistoryEntry::Plain { line } => Rendered {
-            lines: vec![Line::from(vec![
-                Span::styled(" ".repeat(AGENT_INDENT), Style::default().fg(INFO_TEXT)),
-                Span::styled(line.clone(), Style::default().fg(INFO_TEXT)),
-            ])],
-            chip_row: None,
-            continuations: vec![false],
-            tool_call_rows: Vec::new(),
-            tool_result_scroll_regions: Vec::new(),
-            reasoning_scroll_region: None,
-            copy_body_start: None,
-            pin_region: None,
-            metric_region: None,
-        },
+        HistoryEntry::Plain { line } => render_plain(line),
         HistoryEntry::CommandError { line } => Rendered {
             lines: vec![Line::from(vec![
                 Span::styled(" ".repeat(AGENT_INDENT), Style::default().fg(ERROR_TEXT)),
@@ -905,10 +934,7 @@ pub fn render_entry(
             metric_region: None,
         },
         HistoryEntry::Maintenance { line } => Rendered {
-            lines: vec![Line::from(vec![
-                Span::styled(" ".repeat(AGENT_INDENT), Style::default().fg(INFO_TEXT)),
-                Span::styled(line.clone(), Style::default().fg(INFO_TEXT)),
-            ])],
+            lines: vec![centered_note(line)],
             chip_row: None,
             continuations: vec![false],
             tool_call_rows: Vec::new(),
@@ -1097,14 +1123,18 @@ pub fn render_entry(
             output,
             failed,
         } => {
-            let label_color = if *failed { ERROR_TEXT } else { Color::Cyan };
             let mut lines: Vec<Line<'static>> = Vec::new();
-            lines.push(Line::from(vec![Span::styled(
-                label.clone(),
-                Style::default()
-                    .fg(label_color)
-                    .add_modifier(Modifier::BOLD),
-            )]));
+            lines.push(if *failed {
+                Line::from(Span::styled(
+                    format!("⋯ {label} ⋯"),
+                    Style::default()
+                        .fg(ERROR_TEXT)
+                        .add_modifier(Modifier::ITALIC),
+                ))
+                .centered()
+            } else {
+                centered_note(label)
+            });
             for raw in output.lines() {
                 lines.push(Line::from(vec![
                     Span::raw("  ".to_string()),
@@ -1159,28 +1189,21 @@ pub fn render_entry(
             handoff,
             expanded,
             result_offset,
-        } => render_toolbox(
-            &[compact_tool_call(
-                predecessor_short_id,
-                *seed_tool_count,
-                *seed_tool_tokens,
-                source,
-                *trigger_ctx_pct,
-                *tokens_before,
-                *tokens_after,
-                *turns_summarized,
-                *tail_kept,
-                *tail_trimmed,
-                handoff.as_deref(),
-                *expanded,
-                *result_offset,
-            )],
-            0,
-            true,
+        } => render_compaction(
+            predecessor_short_id,
+            *seed_tool_count,
+            *seed_tool_tokens,
+            source,
+            *trigger_ctx_pct,
+            *tokens_before,
+            *tokens_after,
+            *turns_summarized,
+            *tail_kept,
+            *tail_trimmed,
+            handoff.as_deref(),
+            *expanded,
+            *result_offset,
             width,
-            emojis,
-            file_icons,
-            elided,
         ),
         HistoryEntry::Agent {
             name,
@@ -1192,6 +1215,7 @@ pub fn render_entry(
             think_duration,
             performance,
             performance_expanded,
+            interrupted,
             ..
         } => {
             let effective_reasoning: &str = match thinking {
@@ -1203,7 +1227,7 @@ pub fn render_entry(
                 ThinkingDisplay::Condensed => *expanded,
                 ThinkingDisplay::Hidden => false,
             };
-            render_agent(
+            let mut rendered = render_agent(
                 name,
                 text,
                 effective_reasoning,
@@ -1216,7 +1240,12 @@ pub fn render_entry(
                 pin,
                 performance.clone(),
                 *performance_expanded,
-            )
+            );
+            if *interrupted {
+                rendered.lines.push(interrupted_marker_line());
+                rendered.continuations.push(false);
+            }
+            rendered
         }
     }
 }
@@ -1287,16 +1316,16 @@ pub fn render_pending_incremental(
     width: u16,
     state: &mut PendingRenderState,
 ) -> PendingRender {
-    if msg.text.trim().is_empty() {
-        state.reset();
-        return PendingRender::default();
-    }
     if !msg.reasoning.trim().is_empty() {
         state.reset();
         return PendingRender {
             committed: Vec::new(),
             tail: render_pending(msg, width),
         };
+    }
+    if msg.text.trim().is_empty() {
+        state.reset();
+        return PendingRender::default();
     }
 
     let body_width = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
@@ -1306,11 +1335,13 @@ pub fn render_pending_incremental(
         state.body_width = body_width;
     }
 
-    if state.source_len == msg.text.len() && !state.rendered_lines.is_empty() {
-        return PendingRender {
-            committed: state.committed_display.clone(),
-            tail: state.rendered_lines.clone(),
-        };
+    if state.source_len == msg.text.len()
+        && (!state.committed_display.is_empty() || !state.rendered_lines.is_empty())
+    {
+        return pending_render_with_cursor(
+            state.committed_display.clone(),
+            state.rendered_lines.clone(),
+        );
     }
 
     let new_commit = stable_pending_commit_byte(&msg.text);
@@ -1327,9 +1358,16 @@ pub fn render_pending_incremental(
                 state.committed_lines.push(Rc::new(Line::default()));
             }
             state.committed_lines.extend(
-                markdown::render_with_width(committed, body_width)
-                    .into_iter()
-                    .map(Rc::new),
+                render_markdown_message_block(
+                    committed,
+                    body_width,
+                    0,
+                    0,
+                    Style::default().fg(INK),
+                )
+                .lines
+                .into_iter()
+                .map(Rc::new),
             );
         }
         state.commit_byte = new_commit;
@@ -1359,7 +1397,9 @@ pub fn render_pending_incremental(
         if state.commit_byte > 0 && !state.committed_display.is_empty() {
             tail_markdown_lines.push(Line::default());
         }
-        tail_markdown_lines.extend(markdown::render_with_width(tail, body_width));
+        tail_markdown_lines.extend(
+            render_markdown_message_block(tail, body_width, 0, 0, Style::default().fg(INK)).lines,
+        );
     }
 
     state.source_len = msg.text.len();
@@ -1369,10 +1409,25 @@ pub fn render_pending_incremental(
         width,
         state.committed_display.is_empty(),
     );
-    PendingRender {
-        committed: state.committed_display.clone(),
-        tail: state.rendered_lines.clone(),
+    pending_render_with_cursor(
+        state.committed_display.clone(),
+        state.rendered_lines.clone(),
+    )
+}
+
+fn pending_render_with_cursor(
+    mut committed: Vec<Rc<Line<'static>>>,
+    tail: Vec<Line<'static>>,
+) -> PendingRender {
+    if tail.is_empty()
+        && let Some(last) = committed.last_mut()
+    {
+        let mut line = last.as_ref().clone();
+        line.spans
+            .push(Span::styled("▌", Style::default().fg(USER_BORDER_FG)));
+        *last = Rc::new(line);
     }
+    PendingRender { committed, tail }
 }
 
 fn stable_pending_commit_byte(text: &str) -> usize {
@@ -1469,19 +1524,22 @@ fn render_pending_markdown_lines(
     let body = layout_markdown_message_lines(
         markdown_lines,
         body_content_w,
-        TIMESTAMP_WIDTH + 1 + TIMESTAMP_RIGHT_MARGIN,
+        0,
         AGENT_INDENT,
-        Style::default(),
+        Style::default().fg(INK),
     );
-    if body.lines.is_empty() {
-        return vec![render_first_line_with_pin_and_timestamp(vec![], timestamp, width, None).0];
-    }
-
-    let mut out = Vec::with_capacity(body.lines.len());
-    let mut iter = body.lines.into_iter().zip(body.continuations);
-    let (first, _) = iter.next().expect("body non-empty");
-    out.push(render_first_line_with_pin_and_timestamp(first.spans, timestamp, width, None).0);
-    out.extend(iter.map(|(line, _)| line));
+    let header = vec![
+        Span::styled("▌ ", Style::default().fg(USER_BORDER_FG)),
+        Span::styled(
+            "Agent",
+            Style::default()
+                .fg(USER_BORDER_FG)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    let mut out = Vec::with_capacity(1 + body.lines.len());
+    out.push(render_first_line_with_pin_and_timestamp(header, timestamp, width, None).0);
+    out.extend(body.lines);
     out
 }
 
@@ -1492,22 +1550,32 @@ fn render_pending_tail_lines(
     include_header: bool,
 ) -> Vec<Line<'static>> {
     if include_header {
-        return render_pending_markdown_lines(markdown_lines, timestamp, width);
+        let mut lines = render_pending_markdown_lines(markdown_lines, timestamp, width);
+        if let Some(last) = lines.last_mut() {
+            last.spans
+                .push(Span::styled("▌", Style::default().fg(USER_BORDER_FG)));
+        }
+        return lines;
     }
     if markdown_lines.is_empty() {
         return Vec::new();
     }
     let body_content_w = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
-    layout_markdown_message_lines(
+    let mut lines: Vec<Line<'static>> = layout_markdown_message_lines(
         markdown_lines,
         body_content_w,
         0,
         AGENT_INDENT,
-        Style::default(),
+        Style::default().fg(INK),
     )
     .lines
     .into_iter()
-    .collect()
+    .collect();
+    if let Some(last) = lines.last_mut() {
+        last.spans
+            .push(Span::styled("▌", Style::default().fg(USER_BORDER_FG)));
+    }
+    lines
 }
 
 /// Render an in-flight pending message: the agent's text as it streams
@@ -1515,12 +1583,10 @@ fn render_pending_tail_lines(
 /// owned by the status indicator (`render_status_indicator`), so before
 /// any text arrives this renders nothing — keeping a single live status
 /// line on screen instead of a duplicate "Thinking" in two places.
-/// Reasoning is captured but not displayed live (the user can expand
-/// once the turn finalizes).
+/// While reasoning is streaming it renders live: the `Thinking` header
+/// (FOG + italic) followed by the reasoning body wrapped to the pane
+/// (DISABLED + italic), above the answer body once it starts.
 pub fn render_pending(msg: &PendingMsg, width: u16) -> Vec<Line<'static>> {
-    if msg.text.trim().is_empty() {
-        return Vec::new();
-    }
     // Text streaming in — same rendering as Agent (no expansion in
     // live state; reasoning shown after finalization). Markdown is
     // rendered live mid-stream via the same path the finalized entry
@@ -1529,10 +1595,10 @@ pub fn render_pending(msg: &PendingMsg, width: u16) -> Vec<Line<'static>> {
     // the trailing text until the closer arrives, and an open ` ``` `
     // fence streams as a code block to end-of-input — accepted, since
     // it matches what the finalized render will show.
-    render_agent(
+    let mut lines = render_agent(
         &msg.name,
         &msg.text,
-        &msg.reasoning,
+        "",
         msg.timestamp,
         false,
         0,
@@ -1543,19 +1609,42 @@ pub fn render_pending(msg: &PendingMsg, width: u16) -> Vec<Line<'static>> {
         None,
         false,
     )
-    .lines
+    .lines;
+    if !msg.reasoning.trim().is_empty() {
+        // Live thinking block: the `Thinking` header plus the reasoning
+        // streamed so far, wrapped to `width - 2` (DISABLED + italic),
+        // matching the reference's live-thought rows. It sits above the
+        // answer body and is never treated as the agent's body text.
+        let reasoning_w = (width as usize).saturating_sub(2).max(1);
+        let mut reasoning_rows = vec![Line::from(Span::styled(
+            "  Thinking",
+            Style::default()
+                .fg(THINKING_FG)
+                .add_modifier(Modifier::ITALIC),
+        ))];
+        for chunk in wrap_with_reserved_first_line(&msg.reasoning, reasoning_w, 0) {
+            reasoning_rows.push(Line::from(Span::styled(
+                format!("  {chunk}"),
+                Style::default()
+                    .fg(REASONING_FG)
+                    .add_modifier(Modifier::ITALIC),
+            )));
+        }
+        lines.splice(1..1, reasoning_rows);
+    }
+    if msg.text.trim().is_empty() && msg.reasoning.trim().is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  · · ·",
+            Style::default().fg(crate::tui::theme::FOG),
+        )));
+    } else if let Some(last) = lines.last_mut() {
+        last.spans
+            .push(Span::styled("▌", Style::default().fg(USER_BORDER_FG)));
+    }
+    lines
 }
 
-/// User message: outline-only rounded box drawn with `╭ ╮ ╰ ╯ ─ │`.
-/// Text and interior cells sit on the terminal-default bg — just the
-/// border characters carry color. Padding cells inside the box are
-/// kept (so text doesn't slam into the border) but render as plain
-/// spaces.
-///
-/// When `markdown` is on, the bubble is dropped and we render the text
-/// through the markdown emitter with a left-edge `│` marker — wrapping
-/// styled markdown spans inside a bubble is more trouble than it's
-/// worth for the small visual win.
+/// User message: a barred `You` role header followed by barred body rows.
 fn render_user(
     text: &str,
     timestamp: DateTime<Local>,
@@ -1570,246 +1659,66 @@ fn render_user(
     Option<PinRegion>,
     Option<RenderedCopy>,
 ) {
-    if markdown {
-        return render_user_markdown(text, timestamp, width, chip, failed, pin);
-    }
-    let area = width as usize;
-    let bubble_w = area.saturating_sub(USER_GUTTER * 2).max(4);
-    let interior_w = bubble_w.saturating_sub(2);
-    let text_w = interior_w.saturating_sub(USER_INNER_PAD * 2);
-
-    let ts = format_timestamp(timestamp);
-    let border_style = Style::default().fg(if failed { ERROR_TEXT } else { USER_BORDER_FG });
-    let gutter = Span::raw(" ".repeat(USER_GUTTER));
-    let inner_pad = || Span::raw(" ".repeat(USER_INNER_PAD));
-
-    let mut out: Vec<Line<'static>> = Vec::new();
-    // Top border row, optionally carrying the `⚙ preflighted` chip
-    // (implementation note) appended past the box, and the mouse controls
-    // tucked into the top-right border corner (`pinned-messages`) — neither
-    // costs vertical space.
-    let (border_spans, pin_region) =
-        user_top_border(interior_w, border_style, pin, USER_GUTTER + 1);
-    let mut top = vec![gutter.clone()];
-    top.extend(border_spans);
-    top.push(gutter.clone());
-    if let Some(chip) = chip {
-        top.push(Span::raw("  "));
-        top.push(Span::styled(
-            chip.to_string(),
-            Style::default().fg(TIMESTAMP_FG),
-        ));
-    }
-    out.push(Line::from(top));
-
-    let wrapped = wrap_with_reserved_first_line(text, text_w, TIMESTAMP_WIDTH + 1);
-    for (i, chunk) in wrapped.iter().enumerate() {
-        let chunk_w = chunk.width();
-        let mut spans = vec![gutter.clone(), Span::styled("│", border_style), inner_pad()];
-        if i == 0 {
-            let used = chunk_w + TIMESTAMP_WIDTH + 1;
-            let middle = text_w.saturating_sub(used);
-            spans.push(Span::raw(chunk.clone()));
-            spans.push(Span::raw(" ".repeat(middle)));
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(ts.clone(), Style::default().fg(TIMESTAMP_FG)));
-        } else {
-            let middle = text_w.saturating_sub(chunk_w);
-            spans.push(Span::raw(chunk.clone()));
-            spans.push(Span::raw(" ".repeat(middle)));
-        }
-        spans.push(inner_pad());
-        spans.push(Span::styled("│", border_style));
-        spans.push(gutter.clone());
-        out.push(Line::from(spans));
-    }
-
-    out.push(Line::from(vec![
-        gutter.clone(),
-        Span::styled(format!("╰{}╯", "─".repeat(interior_w)), border_style),
-        gutter,
-    ]));
-
-    let continuations = vec![false; out.len()];
-    (out, continuations, pin_region, None)
-}
-
-/// Build the bubble's top border spans (`╭───╮`) with the fork/pin controls —
-/// the `▶` pick-arrow (when selected) + `[fork] [pin]`/`[unpin]` glyphs (when
-/// mouse mode is on) — tucked into the top-right corner, replacing the
-/// rightmost run of `─` glyphs just inside the `╮` (`pinned-messages`).
-/// `first_dash_col` is the chat-relative column of the first `─` (i.e. the
-/// `╭` column + 1), so the recorded region's columns line up with the
-/// chat-area-relative coordinates the click hit-test uses. Returns
-/// `(spans, region)`; `region` carries the clickable fork and pin columns,
-/// or `None` when no control was drawn (mouse off) or the bubble is too
-/// narrow to host even `[pin]` without breaking the box — the box width is
-/// preserved exactly in every case. When both chips do not fit, `[fork]`
-/// is dropped first.
-fn user_top_border(
-    interior_w: usize,
-    border_style: Style,
-    pin: Option<PinControl>,
-    first_dash_col: usize,
-) -> (Vec<Span<'static>>, Option<PinRegion>) {
-    let arrow_w = pin
-        .filter(|p| p.is_pick)
-        .map(|_| crate::tui::pins_overlay::PICK_ARROW.width())
-        .unwrap_or(0);
-    let (ctrl_w, include_fork) = match pin {
-        Some(p) if p.show_control => {
-            let full = p.control_width(true);
-            if arrow_w + full < interior_w {
-                (full, true)
-            } else {
-                let pin_only = p.control_width(false);
-                if arrow_w + pin_only < interior_w {
-                    (pin_only, false)
-                } else {
-                    (0, false)
-                }
-            }
-        }
-        _ => (0, false),
-    };
-    let corner = arrow_w + ctrl_w;
-    // Only host the corner controls when the box is wide enough to keep at
-    // least one `─` to the left of them — otherwise drop controls (box
-    // unbroken), falling back from `[fork] [pin]` to `[pin]` first.
-    if corner == 0 || corner >= interior_w {
-        return (
-            vec![Span::styled(
-                format!("╭{}╮", "─".repeat(interior_w)),
-                border_style,
-            )],
-            None,
-        );
-    }
-    let dashes = interior_w - corner;
-    let mut spans = vec![Span::styled(
-        format!("╭{}", "─".repeat(dashes)),
-        border_style,
-    )];
-    if arrow_w > 0 {
-        spans.push(Span::styled(
-            crate::tui::pins_overlay::PICK_ARROW.to_string(),
+    let accent = if failed { ERROR_TEXT } else { USER_BORDER_FG };
+    let header_spans = vec![
+        Span::styled("▌ ", Style::default().fg(accent)),
+        Span::styled(
+            "You",
             Style::default()
-                .fg(crate::tui::pins_overlay::PIN_YELLOW)
+                .fg(crate::tui::theme::INK)
                 .add_modifier(Modifier::BOLD),
-        ));
-    }
-    let mut region = None;
-    if ctrl_w > 0 {
-        let p = pin.expect("ctrl_w > 0 implies Some");
-        // The controls occupy the columns immediately left of the `╮`:
-        // first-dash column + the dashes + the arrow.
-        let control_start = first_dash_col + dashes + arrow_w;
-        let mut pin_start = control_start;
-        let mut fork_range = None;
-        if include_fork {
-            let fork_start = control_start;
-            let fork_end = fork_start + p.fork_control_width();
-            fork_range = Some((fork_start as u16, fork_end as u16));
-            spans.extend(crate::tui::pins_overlay::fork_control_spans());
-            spans.push(Span::styled("─".to_string(), border_style));
-            pin_start = fork_end + 1;
+        ),
+    ];
+    let (header, pin_region) =
+        render_first_line_with_pin_and_timestamp(header_spans, timestamp, width, pin);
+    let body_width = usize::from(width).saturating_sub(2).max(1);
+    let body = if markdown {
+        render_markdown_message_block(text, body_width, 0, 0, Style::default().fg(INK))
+    } else {
+        let chunks = wrap_with_reserved_first_line(text, body_width, 0);
+        MessageBlock {
+            lines: chunks
+                .iter()
+                .cloned()
+                .map(|chunk| Line::from(Span::styled(chunk, Style::default().fg(INK))))
+                .collect(),
+            continuations: (0..chunks.len()).map(|index| index > 0).collect(),
+            copy_cells: Vec::new(),
+            copy_newlines_before: Vec::new(),
+            copy_incomplete: Vec::new(),
+            copy_fragments: Rc::new(Vec::new()),
         }
-        let pin_w = p.pin_control_width();
-        let col_start = pin_start as u16;
-        region = Some(PinRegion {
-            seq: p.seq,
-            row: 0,
-            col_start,
-            col_end: col_start + pin_w as u16,
-            fork_col_start: fork_range.map(|(start, _)| start),
-            fork_col_end: fork_range.map(|(_, end)| end),
-        });
-        spans.extend(crate::tui::pins_overlay::pin_control_spans(p.pinned));
+    };
+    let chip_rows = usize::from(chip.is_some());
+    let mut copy = markdown.then(|| RenderedCopy::from_block(1 + chip_rows, &body));
+    if let Some(copy) = copy.as_mut() {
+        for cells in &mut copy.cells {
+            cells.splice(0..0, [None, None]);
+        }
     }
-    spans.push(Span::styled("╮".to_string(), border_style));
-    (spans, region)
-}
-
-/// Markdown-styled user message: no bubble, left-edge `│` marker in
-/// the user-message border color, timestamp right-aligned on row 1.
-fn render_user_markdown(
-    text: &str,
-    timestamp: DateTime<Local>,
-    width: u16,
-    chip: Option<&str>,
-    failed: bool,
-    pin: Option<PinControl>,
-) -> (
-    Vec<Line<'static>>,
-    Vec<bool>,
-    Option<PinRegion>,
-    Option<RenderedCopy>,
-) {
-    let bar_style = Style::default().fg(if failed { ERROR_TEXT } else { USER_BORDER_FG });
-    // Content width inside the `│ ` bar (and a matching right margin), so
-    // display-math blocks degrade to raw if they'd exceed the viewport.
-    let md_width = (width as usize).saturating_sub(2 + 2).max(1);
-    let reserve_first = TIMESTAMP_WIDTH + 1 + TIMESTAMP_RIGHT_MARGIN + agent_pin_reserve(pin);
-    let body = render_markdown_message_block(text, md_width, reserve_first, 0, Style::default());
-    let body_row_offset = chip.is_some() as usize;
-    let mut copy = RenderedCopy::from_block(body_row_offset, &body);
-    for cells in &mut copy.cells {
-        cells.splice(0..0, [None, None]);
-    }
-    if body_row_offset > 0 {
-        copy.cells.insert(0, Vec::new());
-        copy.newlines_before.insert(0, 0);
-        copy.incomplete.insert(0, false);
-    }
-    let mut body_continuations = body.continuations.into_iter();
-    let body = body.lines;
-
-    let mut out: Vec<Line<'static>> = Vec::with_capacity(body.len() + 1);
-    // The controls ride the first body line (no bubble to host a corner
-    // here), inline immediately left of the timestamp — same shape as an
-    // agent line (`pinned-messages`). The chip stays on its own row.
-    let mut pin_region: Option<PinRegion> = None;
-    // The control block lives on the first *body* line; once the chip takes
-    // row 0, the body's first line is offset by one.
-    // Request-preflight chip on its own row 0 (implementation note)
-    // — the clickable reveal-toggle row for the markdown render shape.
+    let mut lines = vec![header];
+    let mut continuations = vec![false];
     if let Some(chip) = chip {
-        out.push(Line::from(vec![Span::styled(
-            chip.to_string(),
-            Style::default().fg(TIMESTAMP_FG),
-        )]));
-    }
-    let mut continuations = vec![false; body_row_offset];
-    for (i, line) in body.into_iter().enumerate() {
-        continuations.push(body_continuations.next().unwrap_or(false));
-        let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 2);
-        spans.push(Span::styled("│ ".to_string(), bar_style));
-        spans.extend(line.spans);
-        if i == 0 {
-            let (timestamped, region) =
-                render_first_line_with_pin_and_timestamp(spans, timestamp, width, pin);
-            pin_region = region.map(|mut r| {
-                r.row += body_row_offset;
-                r
-            });
-            out.push(timestamped);
-        } else {
-            out.push(Line::from(spans));
-        }
-    }
-    if out.len() <= body_row_offset {
-        let spans: Vec<Span<'static>> = vec![Span::styled("│ ".to_string(), bar_style)];
-        let (timestamped, region) =
-            render_first_line_with_pin_and_timestamp(spans, timestamp, width, pin);
-        pin_region = region.map(|mut r| {
-            r.row += body_row_offset;
-            r
-        });
-        out.push(timestamped);
+        lines.push(Line::from(vec![
+            Span::styled("▌ ", Style::default().fg(accent)),
+            Span::styled(
+                chip.to_string(),
+                Style::default().fg(crate::tui::theme::FOG),
+            ),
+        ]));
         continuations.push(false);
     }
-    continuations.resize(out.len(), false);
-    (out, continuations, pin_region, Some(copy))
+    for (line, continuation) in body.lines.into_iter().zip(body.continuations) {
+        let mut spans = vec![Span::styled("▌ ", Style::default().fg(accent))];
+        spans.extend(line.spans);
+        lines.push(Line::from(spans).style(Style::default().fg(INK)));
+        continuations.push(continuation);
+    }
+    if lines.len() == 1 + chip_rows {
+        lines.push(Line::from(Span::styled("▌ ", Style::default().fg(accent))));
+        continuations.push(false);
+    }
+    (lines, continuations, pin_region, copy)
 }
 
 fn render_interrupt_decision(decision: &cockpit_proto::InterruptDecision) -> Vec<Line<'static>> {
@@ -1846,10 +1755,7 @@ fn render_interrupt_decision(decision: &cockpit_proto::InterruptDecision) -> Vec
                 Span::styled(prefix.to_string(), prefix_style),
                 Span::styled(": ", Style::default().fg(INFO_TEXT)),
                 Span::styled(line.prompt.clone(), Style::default().fg(INFO_TEXT)),
-                Span::styled(
-                    " → ",
-                    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
-                ),
+                Span::styled(" → ", Style::default().fg(FOG)),
                 Span::styled(answer.to_string(), answer_style),
             ])
         })
@@ -1864,7 +1770,7 @@ fn render_interrupt_decision(decision: &cockpit_proto::InterruptDecision) -> Vec
 /// is truncated. Display/export only; never model context. Emoji-free so it
 /// reads identically with glyphs on or off.
 fn render_user_note(text: &str, timestamp: DateTime<Local>, width: u16) -> Vec<Line<'static>> {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let muted = Style::default().fg(FOG);
     let muted_italic = muted.add_modifier(Modifier::ITALIC);
     let area = width as usize;
     let ts = format_timestamp(timestamp);
@@ -1918,9 +1824,7 @@ fn render_skill_auto_injected(
     let accent = Style::default()
         .fg(SUBAGENT_ORANGE)
         .add_modifier(Modifier::BOLD);
-    let muted_italic = Style::default()
-        .fg(Color::Indexed(MUTED_COLOR_INDEX))
-        .add_modifier(Modifier::ITALIC);
+    let muted_italic = Style::default().fg(FOG).add_modifier(Modifier::ITALIC);
 
     let mut lines: Vec<Line<'static>> = vec![Line::from(vec![
         Span::styled(format!("/{name}"), accent),
@@ -1957,8 +1861,10 @@ fn render_skill_auto_injected(
 }
 
 /// Minimum terminal width for response-header controls (metric chip,
-/// detail, timestamp, fork, pin, overflow menu). Below this the complete
-/// header is replaced by a noninteractive one-cell `↔` resize state.
+/// detail, timestamp, fork, pin, overflow menu). Below this the grouped
+/// controls collapse as one block — no glyphs are painted and no hit
+/// targets are recorded — while the role header (label, plus the
+/// timestamp whenever it fits) and the body stay readable.
 const RESPONSE_HEADER_MIN_WIDTH: u16 = 24;
 
 /// Format TTFT (time-to-first-token) for the compact chip per the spec:
@@ -2004,33 +1910,11 @@ fn format_tps(perf: &ResponsePerformance) -> Option<String> {
     Some(format!("{rounded}"))
 }
 
-/// The compact `<ttft>/<tps>` chip text, or `None` when the snapshot has
-/// no TPS (zero `generation_ms`).
-fn metric_chip_text(perf: &ResponsePerformance) -> Option<String> {
-    let tps = format_tps(perf)?;
-    Some(format!("{}/{}", format_ttft(perf.ttft_ms), tps))
-}
-
-/// The expanded detail line text: `TTFT: <value>s / TPS: <value>`,
-/// using the same rounded values as the chip. TPS is `-` when absent
-/// (zero generation).
-fn metric_detail_text(perf: &ResponsePerformance) -> String {
-    let ttft = format_ttft(perf.ttft_ms);
-    let tps = format_tps(perf).unwrap_or_else(|| "-".to_string());
-    format!("TTFT: {ttft}s / TPS: {tps}")
-}
-
-/// Style for the metric chip text -- a muted cyan accent, distinct from
-/// the timestamp's grey and the fork/pin yellow/grey.
+/// Style for the response-metadata chip.
 fn metric_chip_style() -> Style {
     Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::DIM | Modifier::UNDERLINED)
-}
-
-/// Style for the expanded metric detail line.
-fn metric_detail_style() -> Style {
-    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
+        .fg(crate::tui::theme::BRASS)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
 }
 
 /// Agent reply: `• text...` with timestamp right-aligned, optional
@@ -2048,14 +1932,13 @@ fn render_agent(
     timestamp: DateTime<Local>,
     expanded: bool,
     reasoning_offset: usize,
-    think_duration: Option<Duration>,
+    _think_duration: Option<Duration>,
     width: u16,
     markdown: bool,
     pin: Option<PinControl>,
     performance: Option<ResponsePerformance>,
     performance_expanded: bool,
 ) -> Rendered {
-    let _ = name;
     let bullet_width: usize = AGENT_INDENT
         + if AGENT_BULLET.is_empty() {
             0
@@ -2063,116 +1946,120 @@ fn render_agent(
             AGENT_BULLET.width() + 1 // bullet + space
         };
     let indent_span = || Span::raw(" ".repeat(AGENT_INDENT));
+    let has_text = !text.trim().is_empty();
     let has_reasoning = !reasoning.trim().is_empty();
-    // The inline control block (`▶ ` + `[fork] [pin]`/`[unpin]`) rides
-    // immediately left of the timestamp on the first content line, so the
-    // first line's right-edge reservation grows by the control block's columns
-    // (`pinned-messages`).
-    let pin_reserve = agent_pin_reserve(pin);
-    let reserve_first = TIMESTAMP_WIDTH + 1 + TIMESTAMP_RIGHT_MARGIN + pin_reserve;
-    // Filled in when the first content line actually draws a clickable
-    // control (mouse mode on and it fit). The `▶` pick-arrow alone is not
-    // clickable, so it leaves this `None`.
-    let mut pin_region: Option<PinRegion> = None;
-    let mut metric_region: Option<MetricRegion> = None;
+    // Pin/Fork and the timestamp live on the role header, so body rows need no
+    // right-edge chrome reservation.
+    // Filled in when the role header draws the clickable action group.
+    let agent_style = crate::tui::chrome::chip_style(
+        Style::default()
+            .fg(USER_BORDER_FG)
+            .add_modifier(Modifier::BOLD),
+        performance_expanded,
+    );
+    let header_spans = vec![
+        Span::styled("▌ ", Style::default().fg(USER_BORDER_FG)),
+        Span::styled("Agent", agent_style),
+    ];
+    let (header, header_pin_region) = render_first_line_with_pin_and_timestamp(
+        header_spans,
+        timestamp,
+        width,
+        // Below RESPONSE_HEADER_MIN_WIDTH the grouped controls collapse as
+        // one block — no `[Pin]`/`[Fork]` glyphs are painted and no hit
+        // targets are recorded, so the controls are never rendered dead.
+        // The role header (label + timestamp when it fits) stays readable.
+        if width >= RESPONSE_HEADER_MIN_WIDTH {
+            pin
+        } else {
+            None
+        },
+    );
+    let mut pin_region = header_pin_region;
+    let has_metrics = performance
+        .as_ref()
+        .is_some_and(|snapshot| format_tps(snapshot).is_some());
+    let mut metric_region = (has_metrics && width >= 7).then(|| MetricRegion {
+        rows: vec![MetricRow {
+            row: 0,
+            col_start: 2,
+            col_end: 7,
+        }],
+    });
     let mut copy_body_start: Option<RenderedCopy> = None;
 
-    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut out: Vec<Line<'static>> = vec![header.clone()];
     // Parallel to `out`: `conts[i]` is `true` when row `i` is a
     // soft-wrap continuation of the previous logical line. The copy
     // path uses this to rejoin soft-wraps with a space instead of a
     // newline.
-    let mut conts: Vec<bool> = Vec::new();
+    let mut conts: Vec<bool> = vec![false];
     let mut chip_row = None;
     let mut reasoning_scroll_region: Option<ReasoningScrollRegion> = None;
 
-    // Compute the compact metric chip text (if any). The chip is absent
-    // for None or invalid/zero-duration snapshots (no TPS).
-    let metric_text: Option<String> = performance.as_ref().and_then(metric_chip_text);
+    // Agent statistics are opened from the `Agent` label itself, matching the
+    // reference transcript. No second compact stats label is inserted.
+    let metric_text: Option<String> = None;
 
-    // Below the minimum supported width for response-header controls,
-    // replace all header chrome (metric, detail, timestamp, fork, pin,
-    // overflow menu) with a noninteractive one-cell `↔` resize state.
-    // It has no hit target, never clips horizontally, and retains no
-    // hidden mouse action; the complete accessible header returns only
-    // after resize to 24 columns or wider.
+    // Below the minimum supported width for response-header controls, the
+    // grouped controls (metric detail, timestamp, fork, pin, overflow menu)
+    // collapse as one block: no control glyphs are painted and no hit
+    // targets are recorded, so nothing renders dead. The role header —
+    // `Agent` label plus the timestamp whenever it fits — and the body
+    // stay readable at every width; the complete interactive header
+    // returns after resize to 24 columns or wider.
     if width < RESPONSE_HEADER_MIN_WIDTH {
-        let mut out: Vec<Line<'static>> = Vec::new();
-        let mut conts: Vec<bool> = Vec::new();
-        let mut copy_body_start: Option<RenderedCopy> = None;
+        let mut out: Vec<Line<'static>> = vec![header];
+        let mut conts: Vec<bool> = vec![false];
+        let mut body_copy: Option<RenderedCopy> = None;
+        let mut body_lines = Vec::new();
+        let mut body_conts = Vec::new();
 
-        // The resize indicator on its own row.
-        let resize_style = Style::default()
-            .fg(Color::Indexed(MUTED_COLOR_INDEX))
-            .add_modifier(Modifier::DIM);
-        out.push(Line::from(vec![
-            Span::raw(" ".repeat(AGENT_INDENT)),
-            Span::styled("↔", resize_style),
-        ]));
-        conts.push(false);
-
-        // Body content still renders below the resize indicator, just
-        // without any header chrome.
+        // Prepare body content now, then append it after any expanded thought
+        // block so narrow and wide layouts preserve the same reading order.
         let body_content_w = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
-        if markdown {
+        if markdown && has_text {
             let body = render_markdown_message_block(
                 text,
                 body_content_w,
                 0,
                 AGENT_INDENT,
-                Style::default(),
+                Style::default().fg(INK),
             );
-            copy_body_start = Some(RenderedCopy::from_block(1, &body));
-            out.extend(body.lines);
-            conts.extend(body.continuations);
-        } else if !text.trim().is_empty() {
+            body_copy = Some(RenderedCopy::from_block(0, &body));
+            body_lines = body.lines;
+            body_conts = body.continuations;
+        } else if has_text {
             let wrapped = wrap_with_reserved_first_line(text, body_content_w, 0);
             let indent = " ".repeat(AGENT_INDENT);
             for (i, chunk) in wrapped.iter().enumerate() {
-                out.push(Line::from(vec![
-                    Span::raw(indent.clone()),
-                    Span::raw(chunk.clone()),
-                ]));
-                conts.push(i > 0);
+                body_lines.push(Line::from(Span::styled(
+                    format!("{indent}{chunk}"),
+                    Style::default().fg(INK),
+                )));
+                body_conts.push(i > 0);
             }
         }
 
         // Reasoning chip still renders (it's content, not header chrome).
         if has_reasoning {
-            let arrow = if expanded { "▼" } else { "▶" };
-            let action_hint = if expanded {
-                "ctrl+t to collapse"
+            let label = if expanded {
+                "▾ Thought"
             } else {
-                "ctrl+t to expand"
-            };
-            let label = match think_duration {
-                Some(d) => format!(
-                    "{arrow} thought for {} ({action_hint})",
-                    format_think_duration(d)
-                ),
-                None => format!("{arrow} thinking ({action_hint})"),
-            };
-            chip_row = Some(0);
-            // Insert the reasoning chip as the first row, pushing the
-            // resize indicator + body down.
+                "▸ Thought"
+            }
+            .to_string();
+            chip_row = Some(1);
+            // Insert the reasoning chip after the role header.
             let chip_line = Line::from(vec![
                 Span::raw(" ".repeat(bullet_width)),
-                Span::styled(
-                    label,
-                    Style::default()
-                        .fg(THINKING_FG)
-                        .add_modifier(Modifier::DIM | Modifier::UNDERLINED),
-                ),
+                Span::styled(label, Style::default().fg(THINKING_FG)),
             ]);
-            out.insert(0, chip_line);
-            conts.insert(0, false);
-            if let Some(mut copy) = copy_body_start {
-                copy.start += 1;
-                copy_body_start = Some(copy);
-            }
+            out.insert(1, chip_line);
+            conts.insert(1, false);
             // Expanded reasoning renders below the chip.
             if expanded {
-                let reasoning_indent = AGENT_INDENT + 2;
+                let reasoning_indent = AGENT_INDENT;
                 let reasoning_w = (width as usize).saturating_sub(reasoning_indent).max(1);
                 let mut reasoning_rows: Vec<(Line<'static>, bool)> = Vec::new();
                 for raw_line in reasoning.lines() {
@@ -2185,7 +2072,12 @@ fn render_agent(
                         reasoning_rows.push((
                             Line::from(vec![
                                 Span::raw(" ".repeat(reasoning_indent)),
-                                Span::styled(chunk, Style::default().fg(REASONING_FG)),
+                                Span::styled(
+                                    chunk,
+                                    Style::default()
+                                        .fg(REASONING_FG)
+                                        .add_modifier(Modifier::ITALIC),
+                                ),
                             ]),
                             i > 0,
                         ));
@@ -2194,18 +2086,17 @@ fn render_agent(
                 let window =
                     inner_scroll_window(reasoning_rows.len(), THINKING_VISIBLE, reasoning_offset);
                 // The reasoning window is a single contiguous block appended
-                // after the chip/resize/body rows. `region_start` must anchor
+                // after the chip and before the body. `region_start` must anchor
                 // to the first row of that block (the `more above` indicator
                 // when present, else the first visible reasoning row) so the
-                // scroll region covers only the reasoning window — never the
-                // resize/body rows above it.
+                // scroll region covers only the reasoning window.
                 let region_start = out.len();
                 if window.more_above > 0 {
                     out.push(Line::from(vec![
                         Span::raw(" ".repeat(reasoning_indent)),
                         Span::styled(
                             format!("{} more above", window.more_above),
-                            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                            Style::default().fg(FOG),
                         ),
                     ]));
                     conts.push(false);
@@ -2223,7 +2114,7 @@ fn render_agent(
                         Span::raw(" ".repeat(reasoning_indent)),
                         Span::styled(
                             format!("{} more below", window.more_below),
-                            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                            Style::default().fg(FOG),
                         ),
                     ]));
                     conts.push(false);
@@ -2240,6 +2131,13 @@ fn render_agent(
             }
         }
 
+        let copy_body_start = body_copy.map(|mut copy| {
+            copy.start = out.len();
+            copy
+        });
+        out.extend(body_lines);
+        conts.extend(body_conts);
+
         return Rendered {
             lines: out,
             copy_body_start,
@@ -2249,7 +2147,7 @@ fn render_agent(
             tool_result_scroll_regions: Vec::new(),
             reasoning_scroll_region,
             pin_region: None,
-            metric_region: None,
+            metric_region,
         };
     }
 
@@ -2260,19 +2158,12 @@ fn render_agent(
     // first actual text line (render_first_line_with_pin_and_timestamp
     // handles that naturally for the first wrapped text chunk).
     if has_reasoning {
-        let arrow = if expanded { "▼" } else { "▶" };
-        let action_hint = if expanded {
-            "ctrl+t to collapse"
+        let label = if expanded {
+            "▾ Thought"
         } else {
-            "ctrl+t to expand"
-        };
-        let label = match think_duration {
-            Some(d) => format!(
-                "{arrow} thought for {} ({action_hint})",
-                format_think_duration(d)
-            ),
-            None => format!("{arrow} thinking ({action_hint})"),
-        };
+            "▸ Thought"
+        }
+        .to_string();
         chip_row = Some(out.len());
         let indent = " ".repeat(bullet_width);
         // Wrap to width minus left indent (bullet_width == AGENT_INDENT
@@ -2295,19 +2186,16 @@ fn render_agent(
                 Style::default().fg(agent_color_rendered(name)),
             ));
         }
-        chip_spans.push(Span::styled(
-            label,
-            Style::default()
-                .fg(THINKING_FG)
-                .add_modifier(Modifier::DIM | Modifier::UNDERLINED),
-        ));
+        chip_spans.push(Span::styled(label, Style::default().fg(THINKING_FG)));
 
         // Body content target width: full width minus left indent
         // (AGENT_INDENT) and a matching right pad (AGENT_INDENT) so
         // wrapped continuations don't go all the way to the right
         // edge.
         let body_content_w = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
-        let (body_lines, body_conts, body_copy) = if markdown {
+        let (body_lines, body_conts, body_copy) = if !has_text {
+            (Vec::new(), Vec::new(), None)
+        } else if markdown {
             // Pre-wrap the markdown lines ourselves so ratatui's
             // Paragraph::wrap doesn't strip the indent on
             // continuation rows.
@@ -2316,14 +2204,19 @@ fn render_agent(
                 body_content_w,
                 0,
                 AGENT_INDENT,
-                Style::default(),
+                Style::default().fg(INK),
             );
             let copy = RenderedCopy::from_block(0, &body);
             (body.lines, body.continuations, Some(copy))
         } else {
             let lines = wrapped
                 .iter()
-                .map(|chunk| Line::from(vec![Span::raw(format!("{indent}{chunk}"))]))
+                .map(|chunk| {
+                    Line::from(Span::styled(
+                        format!("{indent}{chunk}"),
+                        Style::default().fg(INK),
+                    ))
+                })
                 .collect::<Vec<_>>();
             // wrapped[0] starts a fresh logical line; the rest are
             // soft-wrap continuations of the agent's text.
@@ -2339,20 +2232,22 @@ fn render_agent(
             // lines wrap explicitly so the continuation keeps the same
             // left indent — otherwise ratatui's auto-wrap drops them
             // to column 0 and the block looks ragged.
-            let (line, region, metric_row) = render_first_line_with_pin_and_timestamp_metric(
+            let (line, region, metric_row) = render_agent_body_first_line(
                 chip_spans,
                 timestamp,
                 width,
                 pin,
                 metric_text.as_deref(),
             );
-            pin_region = region;
+            if region.is_some() {
+                pin_region = region;
+            }
             if let Some(mr) = metric_row {
                 metric_region = Some(MetricRegion { rows: vec![mr] });
             }
             out.push(line);
             conts.push(false);
-            let reasoning_indent = AGENT_INDENT + 2;
+            let reasoning_indent = AGENT_INDENT;
             let reasoning_w = (width as usize).saturating_sub(reasoning_indent).max(1);
             let mut reasoning_rows: Vec<(Line<'static>, bool)> = Vec::new();
             for raw_line in reasoning.lines() {
@@ -2365,7 +2260,12 @@ fn render_agent(
                     reasoning_rows.push((
                         Line::from(vec![
                             Span::raw(" ".repeat(reasoning_indent)),
-                            Span::styled(chunk, Style::default().fg(REASONING_FG)),
+                            Span::styled(
+                                chunk,
+                                Style::default()
+                                    .fg(REASONING_FG)
+                                    .add_modifier(Modifier::ITALIC),
+                            ),
                         ]),
                         i > 0,
                     ));
@@ -2379,7 +2279,7 @@ fn render_agent(
                     Span::raw(" ".repeat(reasoning_indent)),
                     Span::styled(
                         format!("{} more above", window.more_above),
-                        Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                        Style::default().fg(FOG),
                     ),
                 ]));
                 conts.push(false);
@@ -2397,7 +2297,7 @@ fn render_agent(
                     Span::raw(" ".repeat(reasoning_indent)),
                     Span::styled(
                         format!("{} more below", window.more_below),
-                        Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                        Style::default().fg(FOG),
                     ),
                 ]));
                 conts.push(false);
@@ -2422,14 +2322,16 @@ fn render_agent(
             // Collapsed + markdown: chip on its own row (folding
             // markdown spans onto the chip line is more visual jank than
             // it's worth), body markdown lines follow.
-            let (line, region, metric_row) = render_first_line_with_pin_and_timestamp_metric(
+            let (line, region, metric_row) = render_agent_body_first_line(
                 chip_spans,
                 timestamp,
                 width,
                 pin,
                 metric_text.as_deref(),
             );
-            pin_region = region;
+            if region.is_some() {
+                pin_region = region;
+            }
             if let Some(mr) = metric_row {
                 metric_region = Some(MetricRegion { rows: vec![mr] });
             }
@@ -2448,33 +2350,45 @@ fn render_agent(
             // The first chunk shares row 1 with `chip + " "` and the
             // right-edge timestamp, so re-wrap with both reserved —
             // otherwise the chunk pushes the timestamp onto row 2.
-            let collapsed_first_reserve =
-                label_width + 1 + TIMESTAMP_WIDTH + 1 + TIMESTAMP_RIGHT_MARGIN + pin_reserve;
+            let collapsed_first_reserve = label_width + 1;
             let collapsed_wrapped: Vec<String> =
                 wrap_with_reserved_first_line(text, text_width, collapsed_first_reserve);
             let mut first_line_spans = chip_spans;
             if !collapsed_wrapped.is_empty() {
                 first_line_spans.push(Span::raw(" "));
-                first_line_spans.push(Span::raw(collapsed_wrapped[0].clone()));
+                first_line_spans.push(Span::styled(
+                    collapsed_wrapped[0].clone(),
+                    Style::default().fg(INK),
+                ));
             }
-            let (line, region, metric_row) = render_first_line_with_pin_and_timestamp_metric(
+            let (line, region, metric_row) = render_agent_body_first_line(
                 first_line_spans,
                 timestamp,
                 width,
                 pin,
                 metric_text.as_deref(),
             );
-            pin_region = region;
+            if region.is_some() {
+                pin_region = region;
+            }
             if let Some(mr) = metric_row {
                 metric_region = Some(MetricRegion { rows: vec![mr] });
             }
             out.push(line);
             conts.push(false);
             for chunk in collapsed_wrapped.iter().skip(1) {
-                out.push(Line::from(vec![Span::raw(format!("{indent}{chunk}"))]));
+                out.push(Line::from(Span::styled(
+                    format!("{indent}{chunk}"),
+                    Style::default().fg(INK),
+                )));
                 conts.push(true);
             }
         }
+    } else if !has_text {
+        // Empty Markdown intentionally renders one logical row. An Agent with
+        // no answer text has no body, though: think-only finalized turns keep
+        // just their Thought block, and the pending renderer can put its caret
+        // directly on the final live-thinking row.
     } else if markdown {
         // No reasoning + markdown: emit markdown lines, attaching the
         // timestamp to the first line via right-edge padding. Every
@@ -2486,28 +2400,20 @@ fn render_agent(
         // into the normal wrap stream (filling row 2 at full width)
         // instead of being sliced off afterward as a one-word orphan.
         let body_content_w = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
-        // The reservation is relative to `body_content_w`, which already
-        // accounts for the left AGENT_INDENT applied by indent_lines;
-        // `render_first_line_with_pin_and_timestamp` adds AGENT_INDENT back
-        // to `used`, so reserving (TIMESTAMP_WIDTH + 1 + control block) here
-        // leaves the right-edge controls + timestamp + gap exactly clear on row 1.
         let body = render_markdown_message_block(
             text,
             body_content_w,
-            TIMESTAMP_WIDTH + 1 + TIMESTAMP_RIGHT_MARGIN + pin_reserve,
+            0,
             AGENT_INDENT,
-            Style::default(),
+            Style::default().fg(INK),
         );
-        copy_body_start = Some(RenderedCopy::from_block(0, &body));
+        copy_body_start = Some(RenderedCopy::from_block(out.len(), &body));
         if body.lines.is_empty() {
-            let (line, region, metric_row) = render_first_line_with_pin_and_timestamp_metric(
-                vec![],
-                timestamp,
-                width,
-                pin,
-                metric_text.as_deref(),
-            );
-            pin_region = region;
+            let (line, region, metric_row) =
+                render_agent_body_first_line(vec![], timestamp, width, pin, metric_text.as_deref());
+            if region.is_some() {
+                pin_region = region;
+            }
             if let Some(mr) = metric_row {
                 metric_region = Some(MetricRegion { rows: vec![mr] });
             }
@@ -2521,14 +2427,17 @@ fn render_agent(
             // continuation (copy rejoins with a space, not a newline).
             let mut iter = body.lines.into_iter().zip(body.continuations);
             let (first, first_cont) = iter.next().expect("body non-empty");
-            let (line, region, metric_row) = render_first_line_with_pin_and_timestamp_metric(
+            let (mut line, region, metric_row) = render_agent_body_first_line(
                 first.spans,
                 timestamp,
                 width,
                 pin,
                 metric_text.as_deref(),
             );
-            pin_region = region;
+            line.style = Style::default().fg(INK);
+            if region.is_some() {
+                pin_region = region;
+            }
             if let Some(mr) = metric_row {
                 metric_region = Some(MetricRegion { rows: vec![mr] });
             }
@@ -2550,18 +2459,15 @@ fn render_agent(
             (width as usize)
                 .saturating_sub(bullet_width + AGENT_INDENT)
                 .max(1),
-            reserve_first,
+            0,
             0,
         );
         if chunks.is_empty() {
-            let (line, region, metric_row) = render_first_line_with_pin_and_timestamp_metric(
-                vec![],
-                timestamp,
-                width,
-                pin,
-                metric_text.as_deref(),
-            );
-            pin_region = region;
+            let (line, region, metric_row) =
+                render_agent_body_first_line(vec![], timestamp, width, pin, metric_text.as_deref());
+            if region.is_some() {
+                pin_region = region;
+            }
             if let Some(mr) = metric_row {
                 metric_region = Some(MetricRegion { rows: vec![mr] });
             }
@@ -2577,16 +2483,17 @@ fn render_agent(
                             Style::default().fg(agent_color_rendered(name)),
                         ));
                     }
-                    spans.push(Span::raw(chunk.clone()));
-                    let (line, region, metric_row) =
-                        render_first_line_with_pin_and_timestamp_metric(
-                            spans,
-                            timestamp,
-                            width,
-                            pin,
-                            metric_text.as_deref(),
-                        );
-                    pin_region = region;
+                    spans.push(Span::styled(chunk.clone(), Style::default().fg(INK)));
+                    let (line, region, metric_row) = render_agent_body_first_line(
+                        spans,
+                        timestamp,
+                        width,
+                        pin,
+                        metric_text.as_deref(),
+                    );
+                    if region.is_some() {
+                        pin_region = region;
+                    }
                     if let Some(mr) = metric_row {
                         metric_region = Some(MetricRegion { rows: vec![mr] });
                     }
@@ -2594,164 +2501,37 @@ fn render_agent(
                     conts.push(false);
                 } else {
                     let indent = " ".repeat(bullet_width);
-                    out.push(Line::from(vec![Span::raw(format!("{indent}{chunk}"))]));
+                    out.push(Line::from(Span::styled(
+                        format!("{indent}{chunk}"),
+                        Style::default().fg(INK),
+                    )));
                     conts.push(true);
                 }
             }
         }
     }
 
-    // If the metric chip didn't fit inline, emit a dedicated metadata row
-    // (or rows) for it. This row is inserted after the first row (which
-    // carries the timestamp/pin) so the timestamp and controls are
-    // preserved. The dedicated row is clickable.
-    if let Some(chip_text) = metric_text.as_ref()
-        && metric_region.is_none()
-    {
-        let chip_w = chip_text.width();
-        let avail = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
-        let mut metric_rows: Vec<MetricRow> = Vec::new();
-
-        if chip_w + AGENT_INDENT <= avail + AGENT_INDENT {
-            // The chip fits on one row.
-            let (row_line, mr) = render_metric_metadata_row(chip_text, false, width);
-            let insert_at = 1.min(out.len());
-            out.insert(insert_at, row_line);
-            conts.insert(insert_at, false);
-            // Adjust chip_row if it was set.
-            if let Some(cr) = chip_row.as_mut()
-                && *cr >= insert_at
-            {
-                *cr += 1;
-            }
-            // Adjust copy_body_start if it was set.
-            if let Some(copy) = copy_body_start.as_mut() {
-                copy.start += 1;
-            }
-            // Adjust reasoning_scroll_region if set.
-            if let Some(region) = reasoning_scroll_region.as_mut() {
-                region.row_start += 1;
-                region.row_end += 1;
-            }
-            metric_rows.push(MetricRow {
-                row: insert_at,
-                col_start: mr.col_start,
-                col_end: mr.col_end,
-            });
-        } else {
-            // Long metric: split TTFT and TPS onto separate rows.
-            let perf = performance.as_ref().unwrap();
-            let ttft_label = format!("TTFT: {}", format_ttft(perf.ttft_ms));
-            let tps_label = match format_tps(perf) {
-                Some(tps) => format!("TPS: {tps}"),
-                None => "TPS: -".to_string(),
-            };
-            let insert_at = 1.min(out.len());
-            let mut current_row = insert_at;
-            for label in [&ttft_label, &tps_label] {
-                let label_w = label.width();
-                if label_w + AGENT_INDENT <= width as usize {
-                    let (row_line, mr) = render_metric_metadata_row(label, false, width);
-                    out.insert(current_row, row_line);
-                    conts.insert(current_row, false);
-                    metric_rows.push(MetricRow {
-                        row: current_row,
-                        col_start: mr.col_start,
-                        col_end: mr.col_end,
-                    });
-                    current_row += 1;
-                } else {
-                    // Label on one row, value on the next.
-                    let parts: Vec<&str> = label.splitn(2, ' ').collect();
-                    if parts.len() == 2 {
-                        let (l1, _) = render_metric_metadata_row(parts[0], false, width);
-                        out.insert(current_row, l1);
-                        conts.insert(current_row, false);
-                        current_row += 1;
-                        let (l2, mr2) = render_metric_metadata_row(parts[1], false, width);
-                        out.insert(current_row, l2);
-                        conts.insert(current_row, false);
-                        metric_rows.push(MetricRow {
-                            row: current_row,
-                            col_start: mr2.col_start,
-                            col_end: mr2.col_end,
-                        });
-                        current_row += 1;
-                    } else {
-                        let (row_line, mr) = render_metric_metadata_row(label, false, width);
-                        out.insert(current_row, row_line);
-                        conts.insert(current_row, false);
-                        metric_rows.push(MetricRow {
-                            row: current_row,
-                            col_start: mr.col_start,
-                            col_end: mr.col_end,
-                        });
-                        current_row += 1;
-                    }
-                }
-            }
-            // Adjust chip_row and copy_body_start for inserted rows.
-            let inserted = current_row - insert_at;
-            if let Some(cr) = chip_row.as_mut()
-                && *cr >= insert_at
-            {
-                *cr += inserted;
-            }
-            if let Some(copy) = copy_body_start.as_mut() {
-                copy.start += inserted;
-            }
-            if let Some(region) = reasoning_scroll_region.as_mut() {
-                region.row_start += inserted;
-                region.row_end += inserted;
-            }
-        }
-
-        // Expanded detail line (if the metric is expanded).
-        if performance_expanded {
-            let perf = performance.as_ref().unwrap();
-            let detail = metric_detail_text(perf);
-            let detail_w = detail.width();
-            let detail_rows = if detail_w + AGENT_INDENT <= width as usize {
-                vec![detail]
-            } else {
-                // Split detail across rows per the wrapping rule.
-                let ttft_part = format!("TTFT: {}s", format_ttft(perf.ttft_ms));
-                let tps_part = match format_tps(perf) {
-                    Some(tps) => format!("TPS: {tps}"),
-                    None => "TPS: -".to_string(),
-                };
-                vec![ttft_part, tps_part]
-            };
-            for d in &detail_rows {
-                let (row_line, _) = render_metric_metadata_row(d, true, width);
-                out.push(row_line);
-                conts.push(false);
-            }
-        }
-
-        if !metric_rows.is_empty() {
-            metric_region = Some(MetricRegion { rows: metric_rows });
-        }
-    } else if metric_region.is_some() && performance_expanded {
-        // Inline metric was placed; add expanded detail rows after the
-        // first row.
+    if metric_region.is_some() && performance_expanded {
         let perf = performance.as_ref().unwrap();
-        let detail = metric_detail_text(perf);
-        let detail_w = detail.width();
-        let detail_rows = if detail_w + AGENT_INDENT <= width as usize {
-            vec![detail]
-        } else {
-            let ttft_part = format!("TTFT: {}s", format_ttft(perf.ttft_ms));
-            let tps_part = match format_tps(perf) {
-                Some(tps) => format!("TPS: {tps}"),
-                None => "TPS: -".to_string(),
-            };
-            vec![ttft_part, tps_part]
-        };
+        let detail_rows = [
+            format!("  {:<5}  {}", "Model", name),
+            format!("  {:<5}  {}s", "TTFT", format_ttft(perf.ttft_ms)),
+            format!(
+                "  {:<5}  {}",
+                "TPS",
+                format_tps(perf).unwrap_or_else(|| "-".to_string())
+            ),
+            format!("  {:<5}  —", "Cache"),
+        ];
         let insert_at = 1.min(out.len());
         for (i, d) in detail_rows.iter().enumerate() {
-            let (row_line, _) = render_metric_metadata_row(d, true, width);
-            out.insert(insert_at + i, row_line);
+            out.insert(
+                insert_at + i,
+                Line::from(Span::styled(
+                    d.clone(),
+                    Style::default().fg(crate::tui::theme::FOG),
+                )),
+            );
             conts.insert(insert_at + i, false);
         }
         let inserted = detail_rows.len();
@@ -2782,19 +2562,16 @@ fn render_agent(
     }
 }
 
-/// Light grey for the subagent response body — the same chrome/banner
-/// muted grey used elsewhere for secondary text.
-const SUBAGENT_BODY_FG: Color = Color::Indexed(MUTED_COLOR_INDEX);
-/// Orange for a subagent's (child) name in both the running line and
-/// the settled header.
-const SUBAGENT_NAME_FG: Color = SUBAGENT_ORANGE;
-
+/// Light grey for the subagent response body.
+const SUBAGENT_BODY_FG: Color = FOG;
 /// Style for a delegated child agent's display name in history rows.
 ///
 /// Shared with chrome's active-agent slot so the bottom status color follows
 /// the same source of truth as the live/settled subagent history headers.
 pub fn subagent_child_name_style(_name: &str) -> Style {
-    Style::default().fg(SUBAGENT_NAME_FG)
+    Style::default()
+        .fg(crate::tui::theme::INK)
+        .add_modifier(Modifier::BOLD)
 }
 
 /// Render a [`HistoryEntry::Subagent`].
@@ -2808,14 +2585,14 @@ pub fn subagent_child_name_style(_name: &str) -> Style {
 ///
 /// Once the child reports, the line becomes a `{child} worked for
 /// {duration}` header (or `failed after` on error) followed by the
-/// response body: markdown-rendered, tinted light grey, sitting in a
-/// left-`│`-bar quoted block. The body is truncated to
+/// response body: markdown-rendered and tinted light grey. Interactive
+/// responses keep an active `▌` bar; background reports use a quiet indent.
+/// The body is truncated to
 /// [`SUBAGENT_PREVIEW_LINES`] leading lines with a clickable `…
 /// (expand)` affordance (the returned `chip_row`) unless `expanded`.
 /// An empty report renders the header alone with no quoted block.
 ///
-/// Only the child name carries orange; the parent uses the default
-/// style.
+/// The child name uses bold ink; the parent uses the default style.
 struct SubagentRenderInput<'a> {
     parent: &'a str,
     child: &'a str,
@@ -2840,8 +2617,8 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
         expanded,
         width,
     } = input;
-    let indent = " ".repeat(AGENT_INDENT);
     let name_style = subagent_child_name_style(child);
+    let bar_color = if label == "interactive" { TEAL } else { FOG };
     // Display the user-facing label; the internal `child` name still drives
     // settling/matching elsewhere.
     let child = agent_display_label(child);
@@ -2857,13 +2634,11 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
         // frame — the same source the working-span indicator uses.
         let elapsed = spawned_at.elapsed();
         let dots = thinking_dots_padded(elapsed.as_millis());
-        let mut spans = vec![Span::raw(indent)];
+        let mut spans = vec![Span::styled("▌ ", Style::default().fg(bar_color))];
         if let Some(label) = batch_label {
             spans.push(Span::styled(
                 format!("{label} "),
-                Style::default()
-                    .fg(Color::Indexed(MUTED_COLOR_INDEX))
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(FOG).add_modifier(Modifier::BOLD),
             ));
         }
         spans.extend([
@@ -2881,10 +2656,19 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
             ),
         ]);
         append_subagent_routing_chips(&mut spans, model_trusted, routing);
+        let mut lines = Vec::new();
+        if label == "interactive" {
+            lines.push(Line::from(Span::styled(
+                format!("  ─ {child}"),
+                Style::default().fg(DISABLED),
+            )));
+        }
+        lines.push(Line::from(spans));
+        let continuations = vec![false; lines.len()];
         return Rendered {
-            lines: vec![Line::from(spans)],
+            lines,
             chip_row: None,
-            continuations: vec![false],
+            continuations,
             tool_call_rows: Vec::new(),
             tool_result_scroll_regions: Vec::new(),
             reasoning_scroll_region: None,
@@ -2894,20 +2678,18 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
         };
     };
 
-    // Settled: header line, child name in orange.
+    // Settled: header line, child name in bold ink.
     let verb = if outcome.failed {
         "failed after"
     } else {
         "worked for"
     };
     let duration = format_compact_duration(outcome.duration);
-    let mut header_spans = vec![Span::raw(indent.clone())];
+    let mut header_spans = vec![Span::styled("▌ ", Style::default().fg(bar_color))];
     if let Some(label) = batch_label {
         header_spans.push(Span::styled(
             format!("{label} ✓ "),
-            Style::default()
-                .fg(Color::Indexed(MUTED_COLOR_INDEX))
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(FOG).add_modifier(Modifier::BOLD),
         ));
     }
     header_spans.extend([
@@ -2917,13 +2699,20 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
     append_subagent_routing_chips(&mut header_spans, model_trusted, routing);
     let header = Line::from(header_spans);
 
-    let mut out: Vec<Line<'static>> = vec![header];
-    let mut conts: Vec<bool> = vec![false];
+    let mut out: Vec<Line<'static>> = Vec::new();
+    if label == "interactive" {
+        out.push(Line::from(Span::styled(
+            format!("  ─ {child}"),
+            Style::default().fg(DISABLED),
+        )));
+    }
+    out.push(header);
+    let mut conts: Vec<bool> = vec![false; out.len()];
     let mut chip_row = None;
 
     if let Some(status) = &outcome.status {
         out.push(Line::from(vec![
-            Span::raw(indent.clone()),
+            Span::styled("▌ ", Style::default().fg(bar_color)),
             Span::styled(
                 status.clone(),
                 Style::default()
@@ -2948,13 +2737,10 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
         };
     }
 
-    // Quoted body: markdown-rendered, light grey, behind a left `│`
-    // bar. Pre-wrap to the bar-reduced width so continuations keep the
-    // bar instead of dropping to column 0.
-    let bar = "│ ";
-    let body_w = (width as usize)
-        .saturating_sub(AGENT_INDENT + bar.width())
-        .max(1);
+    // Interactive children retain an active left bar; settled background
+    // reports use only a quiet body indent.
+    let bar = if label == "interactive" { "▌ " } else { "  " };
+    let body_w = (width as usize).saturating_sub(bar.width()).max(1);
     let (wrapped, _conts) =
         wrap_lines_to_width(markdown::render_with_width(&outcome.report, body_w), body_w);
 
@@ -2968,10 +2754,10 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
     };
 
     for line in visible {
-        let mut spans: Vec<Span<'static>> = vec![
-            Span::raw(indent.clone()),
-            Span::styled(bar.to_string(), Style::default().fg(SUBAGENT_BODY_FG)),
-        ];
+        let mut spans: Vec<Span<'static>> = vec![Span::styled(
+            bar.to_string(),
+            Style::default().fg(bar_color),
+        )];
         for s in &line.spans {
             spans.push(Span::styled(
                 s.content.to_string(),
@@ -2986,7 +2772,7 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
         let hidden = wrapped.len() - SUBAGENT_PREVIEW_LINES;
         chip_row = Some(out.len());
         out.push(Line::from(vec![
-            Span::raw(indent.clone()),
+            Span::raw("  "),
             Span::styled(
                 format!("… ({hidden} more — click to expand)"),
                 Style::default()
@@ -2999,7 +2785,7 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
         // Expanded: offer a collapse affordance so it's reversible.
         chip_row = Some(out.len());
         out.push(Line::from(vec![
-            Span::raw(indent),
+            Span::raw("  "),
             Span::styled(
                 "(click to collapse)".to_string(),
                 Style::default()
@@ -3041,9 +2827,7 @@ fn append_subagent_routing_chips(
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
         trust_chip,
-        Style::default()
-            .fg(Color::Indexed(MUTED_COLOR_INDEX))
-            .add_modifier(Modifier::DIM),
+        Style::default().fg(FOG).add_modifier(Modifier::DIM),
     ));
     if let Some(location) = routing
         .location
@@ -3053,9 +2837,7 @@ fn append_subagent_routing_chips(
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             format!("[{location}]"),
-            Style::default()
-                .fg(Color::Indexed(MUTED_COLOR_INDEX))
-                .add_modifier(Modifier::DIM),
+            Style::default().fg(FOG).add_modifier(Modifier::DIM),
         ));
     }
     if let Some(fallback) = routing
@@ -3066,9 +2848,7 @@ fn append_subagent_routing_chips(
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             format!("[fallback:{fallback}]"),
-            Style::default()
-                .fg(Color::Indexed(MUTED_COLOR_INDEX))
-                .add_modifier(Modifier::DIM),
+            Style::default().fg(FOG).add_modifier(Modifier::DIM),
         ));
     }
 }
@@ -3215,7 +2995,7 @@ fn tool_state_style(state: ToolCallState) -> Style {
     match state {
         ToolCallState::Verifying => Style::default().fg(VERIFYING_TEXT),
         ToolCallState::Processing => Style::default().fg(WARNING_TEXT),
-        ToolCallState::Success => Style::default().fg(Color::White),
+        ToolCallState::Success => Style::default().fg(crate::tui::theme::FOG),
         ToolCallState::Failed => Style::default().fg(ERROR_TEXT),
         ToolCallState::BadCall => Style::default().fg(ERROR_TEXT).add_modifier(Modifier::BOLD),
     }
@@ -3248,18 +3028,12 @@ fn tool_call_spans(
     file_icons: bool,
     progress_width: Option<usize>,
 ) -> Vec<Span<'static>> {
-    let (glyph, label) = tool_call_glyph_label(call, emojis, file_icons);
+    let (_, label) = tool_call_glyph_label(call, emojis, file_icons);
     let style = tool_state_style(call.state);
-    let mut spans = Vec::new();
-    if !glyph.is_empty() {
-        spans.push(Span::raw(glyph));
-    }
-    spans.push(Span::styled(
-        format!("{label}:"),
-        style.add_modifier(Modifier::BOLD),
-    ));
+    let mut spans = vec![Span::styled("▸ ", style)];
+    spans.push(Span::styled(label, style));
     if !text.is_empty() {
-        spans.push(Span::raw(" ".to_string()));
+        spans.push(Span::raw("  ".to_string()));
         spans.push(Span::styled(text.to_string(), style));
     }
     if let Some(suffix) = progress_width.and_then(|width| tool_progress_suffix(call, width)) {
@@ -3281,18 +3055,12 @@ fn tool_line_spans(
     file_icons: bool,
     path: &str,
 ) -> Vec<Span<'static>> {
-    let (glyph, label) = tool_glyph_label_for(tool, emojis, file_icons, Some(path));
+    let (_, label) = tool_glyph_label_for(tool, emojis, file_icons, Some(path));
     let style = tool_state_style(state);
-    let mut spans = Vec::new();
-    if !glyph.is_empty() {
-        spans.push(Span::raw(glyph));
-    }
-    spans.push(Span::styled(
-        format!("{label}:"),
-        style.add_modifier(Modifier::BOLD),
-    ));
+    let mut spans = vec![Span::styled("▸ ", style)];
+    spans.push(Span::styled(label, style));
     if !text.is_empty() {
-        spans.push(Span::raw(" ".to_string()));
+        spans.push(Span::raw("  ".to_string()));
         spans.push(Span::styled(text.to_string(), style));
     }
     if state == ToolCallState::Verifying {
@@ -3451,20 +3219,6 @@ pub fn toolbox_top(len: usize, view_offset: usize, follow: bool) -> usize {
     }
 }
 
-/// Left sidebar glyph for row `i` of an `n`-row box: rounded caps top
-/// and bottom, a plain rule in between, a single rule for a 1-row box.
-fn sidebar_glyph(i: usize, n: usize) -> char {
-    if n <= 1 {
-        '│'
-    } else if i == 0 {
-        '╭'
-    } else if i + 1 == n {
-        '╰'
-    } else {
-        '│'
-    }
-}
-
 fn push_toolbox_content_row(
     content: &mut Vec<Vec<Span<'static>>>,
     tool_call_rows: &mut Vec<Option<usize>>,
@@ -3587,7 +3341,7 @@ fn render_toolbox(
         if elided.contains(&call.call_id) {
             spans.push(Span::styled(
                 "  (pruned)".to_string(),
-                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                Style::default().fg(FOG),
             ));
         }
         spans
@@ -3637,7 +3391,7 @@ fn render_toolbox(
             if is_elided {
                 first_spans.push(Span::styled(
                     "  (pruned — superseded by a newer read)".to_string(),
-                    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                    Style::default().fg(FOG),
                 ));
             }
             let (glyph, label) = tool_call_glyph_label(call, emojis, file_icons);
@@ -3674,7 +3428,7 @@ fn render_toolbox(
 
             if tool_shows_output(&call.tool) && !call.output.is_empty() {
                 let out_style = if is_elided {
-                    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX))
+                    Style::default().fg(FOG)
                 } else {
                     Style::default().fg(TOOL_OUTPUT_FG)
                 };
@@ -3703,7 +3457,7 @@ fn render_toolbox(
                         &mut tool_call_rows,
                         vec![Span::styled(
                             format!("    {} more above", window.more_above),
-                            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                            Style::default().fg(FOG),
                         )],
                         Some(call_index),
                     );
@@ -3726,7 +3480,7 @@ fn render_toolbox(
                         &mut tool_call_rows,
                         vec![Span::styled(
                             format!("    {} more below", window.more_below),
-                            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                            Style::default().fg(FOG),
                         )],
                         Some(call_index),
                     );
@@ -3753,9 +3507,7 @@ fn render_toolbox(
                     &mut tool_call_rows,
                     vec![Span::styled(
                         format!("    hint: {hint}"),
-                        Style::default()
-                            .fg(Color::Indexed(MUTED_COLOR_INDEX))
-                            .add_modifier(Modifier::ITALIC),
+                        Style::default().fg(FOG).add_modifier(Modifier::ITALIC),
                     )],
                     Some(call_index),
                 );
@@ -3778,16 +3530,9 @@ fn render_toolbox(
         tool_call_rows.push(None);
     }
 
-    let n = content.len();
-    let mut out: Vec<Line<'static>> = Vec::with_capacity(n);
-    for (i, mut spans) in content.into_iter().enumerate() {
-        let mut row = vec![
-            Span::styled(
-                sidebar_glyph(i, n).to_string(),
-                Style::default().fg(SIDEBAR_FG),
-            ),
-            Span::raw(" ".to_string()),
-        ];
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(content.len());
+    for mut spans in content {
+        let mut row = vec![Span::raw("  ".to_string())];
         row.append(&mut spans);
         out.push(Line::from(row));
     }
@@ -3805,11 +3550,10 @@ fn render_toolbox(
     }
 }
 
-/// Project the daemon-owned compaction record into the ordinary tool-call
-/// renderer. The handoff stays a user message on the model wire; this is
-/// presentation-only synthetic tool chrome.
+/// Render the daemon-owned compaction record as the reference's centred
+/// boundary plus a reversible summary chip.
 #[allow(clippy::too_many_arguments)]
-fn compact_tool_call(
+fn render_compaction(
     predecessor_short_id: &str,
     seed_tool_count: usize,
     seed_tool_tokens: u64,
@@ -3822,31 +3566,50 @@ fn compact_tool_call(
     tail_trimmed: usize,
     handoff: Option<&str>,
     expanded: bool,
-    result_offset: usize,
-) -> ToolCall {
+    _result_offset: usize,
+    width: u16,
+) -> Rendered {
     let ctx = trigger_ctx_pct
         .map(|pct| format!(" · ctx {pct:.1}%"))
         .unwrap_or_default();
-    let summary = format!("source={source}{ctx} · from {predecessor_short_id}");
-    let full_input = format!(
-        "source={source}{ctx}\n\
-         tokens={tokens_before}→{tokens_after}\n\
-         turns summarized={turns_summarized}\n\
-         tail kept={tail_kept}, trimmed={tail_trimmed}\n\
-         seed tools={seed_tool_count} (~{seed_tool_tokens} tokens)"
+    let notice = format!(
+        "Compacted from {predecessor_short_id} · {source}{ctx} · \
+         {tokens_before}→{tokens_after} tokens · {turns_summarized} turns · \
+         tail {tail_kept}/{tail_trimmed} · {seed_tool_count} seed tools (~{seed_tool_tokens})"
     );
-    ToolCall {
-        call_id: format!("compact-{predecessor_short_id}"),
-        tool: "compact".to_string(),
-        summary,
-        full_input,
-        output: handoff.unwrap_or("").to_string(),
-        expanded,
-        result_offset,
-        state: ToolCallState::Success,
-        hint: None,
-        progress: None,
-        mcp_child: None,
+    let mut lines =
+        wrap_with_reserved_first_line(&notice, usize::from(width).saturating_sub(6).max(1), 0)
+            .into_iter()
+            .map(|line| centered_note(&line))
+            .collect::<Vec<_>>();
+    let chip_row = lines.len();
+    lines.push(Line::from(Span::styled(
+        if expanded {
+            "  [hide summary]"
+        } else {
+            "  [show summary]"
+        },
+        Style::default().fg(crate::tui::theme::FOG),
+    )));
+    if expanded {
+        let summary = handoff.unwrap_or("");
+        for row in
+            wrap_with_reserved_first_line(summary, usize::from(width).saturating_sub(2).max(1), 0)
+        {
+            lines.push(Line::from(vec![Span::raw("  "), Span::raw(row)]));
+        }
+    }
+    let continuations = vec![false; lines.len()];
+    Rendered {
+        lines,
+        copy_body_start: None,
+        chip_row: Some(chip_row),
+        continuations,
+        tool_call_rows: Vec::new(),
+        tool_result_scroll_regions: Vec::new(),
+        reasoning_scroll_region: None,
+        pin_region: None,
+        metric_region: None,
     }
 }
 
@@ -3874,34 +3637,9 @@ fn render_first_line_timestamped(
     Line::from(spans)
 }
 
-/// Columns the inline control block (`▶ ` pick-arrow when selected + the
-/// `[fork] [pin]`/`[unpin]` controls when shown) reserves on an agent's
-/// first line, *plus* one separating space before the timestamp when the
-/// control is present (`pinned-messages`). Zero when neither arrow nor
-/// control is drawn — the line then reserves only the timestamp, exactly
-/// as before this feature.
-fn agent_pin_reserve(pin: Option<PinControl>) -> usize {
-    let Some(p) = pin else { return 0 };
-    let mut w = 0;
-    if p.is_pick {
-        // `▶ ` — arrow glyph + a trailing space.
-        w += crate::tui::pins_overlay::PICK_ARROW.width() + 1;
-    }
-    let ctrl = p.control_width(true);
-    if ctrl > 0 {
-        // The controls' glyphs + one space separating them from the ts.
-        w += ctrl + 1;
-    }
-    w
-}
-
-/// Build an agent first line with the inline control block sitting immediately
-/// left of the right-margin-aligned timestamp: `…content…  ▶ [fork] [pin] 12:00`
-/// (`pinned-messages`). The caller has already wrapped `spans`' text
-/// leaving the control block plus `TIMESTAMP_WIDTH + 1` columns clear on the
-/// right. Degrades gracefully on narrow widths: the timestamp always wins;
-/// if both chips cannot fit, `[fork]` is dropped before `[pin]`; if `[pin]`
-/// cannot fit either, no region is returned.
+/// Build a role header with the grouped Pin/Fork actions immediately left of
+/// the right-aligned timestamp. If the complete group cannot fit, both actions
+/// disappear and the timestamp remains.
 fn render_first_line_with_pin_and_timestamp(
     spans: Vec<Span<'static>>,
     timestamp: DateTime<Local>,
@@ -3911,6 +3649,18 @@ fn render_first_line_with_pin_and_timestamp(
     let (line, region, _) =
         render_first_line_with_pin_and_timestamp_metric(spans, timestamp, width, pin, None);
     (line, region)
+}
+
+/// Agent body rows are deliberately chrome-free: the role header owns the
+/// timestamp, Pin/Fork actions, and Agent stats target.
+fn render_agent_body_first_line(
+    spans: Vec<Span<'static>>,
+    _timestamp: DateTime<Local>,
+    _width: u16,
+    _pin: Option<PinControl>,
+    _metric_text: Option<&str>,
+) -> (Line<'static>, Option<PinRegion>, Option<MetricRow>) {
+    (Line::from(spans), None, None)
 }
 
 /// Like [`render_first_line_with_pin_and_timestamp`] but also places an
@@ -3929,6 +3679,11 @@ fn render_first_line_with_pin_and_timestamp_metric(
     let ts = format_timestamp(timestamp);
     let used: usize = spans.iter().map(|s| s.content.width()).sum();
     let metric_w = metric_text.map(|t| t.width()).unwrap_or(0);
+    if metric_text.is_none() {
+        let (line, region) =
+            render_first_line_with_pin_and_timestamp_inner(spans, timestamp, width, pin);
+        return (line, region, None);
+    }
 
     let Some(p) = pin else {
         // No pin: try to place metric + timestamp.
@@ -3972,14 +3727,11 @@ fn render_first_line_with_pin_and_timestamp_metric(
     };
     let pin_w = p.pin_control_width();
     let full_ctrl = p.control_width(true);
-    let pin_only_ctrl = p.control_width(false);
     let right_margin = TIMESTAMP_RIGHT_MARGIN.min(area.saturating_sub(used + TIMESTAMP_WIDTH + 1));
     let timestamp_reserve = TIMESTAMP_WIDTH + 1 + right_margin;
     let (control_w, include_fork) =
         if full_ctrl > 0 && used + arrow_w + full_ctrl + timestamp_reserve < area {
             (full_ctrl, true)
-        } else if pin_only_ctrl > 0 && used + arrow_w + pin_only_ctrl + timestamp_reserve < area {
-            (pin_only_ctrl, false)
         } else if arrow_w > 0 && used + arrow_w + TIMESTAMP_WIDTH + right_margin < area {
             (0, false)
         } else {
@@ -4109,62 +3861,61 @@ fn render_first_line_with_pin_and_timestamp_inner(
         0
     };
     let pin_w = p.pin_control_width();
-    let full_ctrl = p.control_width(true);
-    let pin_only_ctrl = p.control_width(false);
-    let right_margin = TIMESTAMP_RIGHT_MARGIN.min(area.saturating_sub(used + TIMESTAMP_WIDTH + 1));
-    let timestamp_reserve = TIMESTAMP_WIDTH + 1 + right_margin;
-    let (control_w, include_fork) =
-        if full_ctrl > 0 && used + arrow_w + full_ctrl + timestamp_reserve < area {
-            (full_ctrl, true)
-        } else if pin_only_ctrl > 0 && used + arrow_w + pin_only_ctrl + timestamp_reserve < area {
-            (pin_only_ctrl, false)
-        } else if arrow_w > 0 && used + arrow_w + TIMESTAMP_WIDTH + right_margin < area {
-            (0, false)
+    let fork_w = p.fork_control_width();
+    let actions_w = arrow_w + pin_w + 1 + fork_w;
+    let show_actions = p.show_control && area >= used + 1 + actions_w + TIMESTAMP_RIGHT_MARGIN;
+    let show_time = if show_actions {
+        area >= used + 1 + actions_w + 2 + TIMESTAMP_WIDTH + TIMESTAMP_RIGHT_MARGIN
+    } else {
+        area >= used + 1 + TIMESTAMP_WIDTH + TIMESTAMP_RIGHT_MARGIN
+    };
+
+    if show_actions {
+        let trailing_w = if show_time {
+            2 + TIMESTAMP_WIDTH + TIMESTAMP_RIGHT_MARGIN
         } else {
-            return (
-                render_first_line_timestamped(spans, timestamp, width, true),
-                None,
-            );
+            TIMESTAMP_RIGHT_MARGIN
         };
-    let pin_block = arrow_w + control_w + usize::from(control_w > 0);
-    let pad = area.saturating_sub(used + pin_block + TIMESTAMP_WIDTH + 1 + right_margin);
-    spans.push(Span::raw(" ".repeat(pad + 1)));
-    if p.is_pick {
-        spans.push(Span::styled(
-            format!("{} ", crate::tui::pins_overlay::PICK_ARROW),
-            Style::default()
-                .fg(crate::tui::pins_overlay::PIN_YELLOW)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-    let mut region = None;
-    if control_w > 0 {
-        let pin_end = area - right_margin - TIMESTAMP_WIDTH - 1;
-        let pin_start = pin_end - pin_w;
-        let fork_range = if include_fork {
-            let fork_end = pin_start - 1;
-            let fork_start = fork_end - p.fork_control_width();
-            spans.extend(crate::tui::pins_overlay::fork_control_spans());
-            spans.push(Span::raw(" "));
-            Some((fork_start as u16, fork_end as u16))
-        } else {
-            None
-        };
-        let col_start = pin_start as u16;
-        region = Some(PinRegion {
-            seq: p.seq,
-            row: 0,
-            col_start,
-            col_end: col_start + pin_w as u16,
-            fork_col_start: fork_range.map(|(start, _)| start),
-            fork_col_end: fork_range.map(|(_, end)| end),
-        });
+        let gap = area.saturating_sub(used + actions_w + trailing_w);
+        spans.push(Span::raw(" ".repeat(gap)));
+        if p.is_pick {
+            spans.push(Span::styled(
+                format!("{} ", crate::tui::pins_overlay::PICK_ARROW),
+                Style::default()
+                    .fg(crate::tui::pins_overlay::PIN_YELLOW)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        let pin_start = used + gap + arrow_w;
         spans.extend(crate::tui::pins_overlay::pin_control_spans(p.pinned));
         spans.push(Span::raw(" "));
+        let fork_start = pin_start + pin_w + 1;
+        spans.extend(crate::tui::pins_overlay::fork_control_spans());
+        if show_time {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(ts, Style::default().fg(TIMESTAMP_FG)));
+        }
+        spans.push(Span::raw(" ".repeat(TIMESTAMP_RIGHT_MARGIN)));
+        return (
+            Line::from(spans),
+            Some(PinRegion {
+                seq: p.seq,
+                row: 0,
+                col_start: pin_start as u16,
+                col_end: (pin_start + pin_w) as u16,
+                fork_col_start: Some(fork_start as u16),
+                fork_col_end: Some((fork_start + fork_w) as u16),
+            }),
+        );
     }
-    spans.push(Span::styled(ts, Style::default().fg(TIMESTAMP_FG)));
-    spans.push(Span::raw(" ".repeat(right_margin)));
-    (Line::from(spans), region)
+
+    if show_time {
+        let gap = area.saturating_sub(used + TIMESTAMP_WIDTH + TIMESTAMP_RIGHT_MARGIN);
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.push(Span::styled(ts, Style::default().fg(TIMESTAMP_FG)));
+        spans.push(Span::raw(" ".repeat(TIMESTAMP_RIGHT_MARGIN)));
+    }
+    (Line::from(spans), None)
 }
 
 fn format_timestamp(t: DateTime<Local>) -> String {
@@ -4178,34 +3929,6 @@ fn format_timestamp(t: DateTime<Local>) -> String {
 /// Render a dedicated metric metadata row: the compact chip (or expanded
 /// detail) left-aligned at `AGENT_INDENT`. Returns the line and the
 /// metric hit row (column range covering the chip text).
-fn render_metric_metadata_row(
-    metric_text: &str,
-    detail: bool,
-    width: u16,
-) -> (Line<'static>, MetricRow) {
-    let indent = " ".repeat(AGENT_INDENT);
-    let text_w = metric_text.width();
-    let col_start = AGENT_INDENT as u16;
-    let style = if detail {
-        metric_detail_style()
-    } else {
-        metric_chip_style()
-    };
-    let line = Line::from(vec![
-        Span::raw(indent),
-        Span::styled(metric_text.to_string(), style),
-    ]);
-    let _ = width;
-    (
-        line,
-        MetricRow {
-            row: 0,
-            col_start,
-            col_end: col_start + text_w as u16,
-        },
-    )
-}
-
 /// Split `text` into chunks that fit within `area_width`, reserving
 /// `reserve_first` extra columns on the *first* line (so a timestamp
 /// can land at the right edge without overlapping the text). Greedy

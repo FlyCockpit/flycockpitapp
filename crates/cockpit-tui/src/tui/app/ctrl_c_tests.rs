@@ -114,7 +114,7 @@ fn auto_prune_notice_renders_muted() {
 
     use super::App;
     use crate::tui::history::{MarkdownOpts, render_entry};
-    use crate::tui::theme::INFO_TEXT;
+    use crate::tui::theme::DISABLED;
     use cockpit_client::presentation::TurnEvent;
     use cockpit_config::extended::{DiffStyle, ThinkingDisplay};
 
@@ -150,15 +150,13 @@ fn auto_prune_notice_renders_muted() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
     assert!(rendered_line.contains("cache already cold"));
-    // #444 unified the muted metadata tokens onto the excoc fog grey
-    // (`INFO_TEXT`); the notice keeps painting every visible span in it.
-    assert_eq!(rendered.lines[0].spans[0].style.fg, Some(INFO_TEXT));
+    assert_eq!(rendered.lines[0].spans[0].style.fg, Some(DISABLED));
     assert!(
         rendered.lines[0]
             .spans
             .iter()
             .filter(|span| !span.content.is_empty())
-            .all(|span| span.style.fg == Some(INFO_TEXT)),
+            .all(|span| span.style.fg == Some(DISABLED)),
         "every visible span in the auto-prune notice should be muted"
     );
 
@@ -184,7 +182,7 @@ fn auto_prune_notice_renders_muted() {
     );
     assert_eq!(
         rendered.lines[0].spans[0].style.fg,
-        Some(INFO_TEXT),
+        Some(DISABLED),
         "manual /prune confirmation should use the shared plain-line muted styling"
     );
 }

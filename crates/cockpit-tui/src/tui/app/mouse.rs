@@ -539,6 +539,18 @@ impl App {
             return;
         }
 
+        if self
+            .latest_chip_area
+            .is_some_and(|area| point_in(area, mouse.column, mouse.row))
+        {
+            self.invalidate_mouse_gesture(
+                MouseGestureInvalidation::ViewChange,
+                self.event_loop_monotonic_now,
+            );
+            self.set_chat_scroll_offset_from_interaction(0);
+            return;
+        }
+
         if self.mouse_in_sticky_header(mouse.column, mouse.row) {
             self.invalidate_mouse_gesture(
                 MouseGestureInvalidation::ViewChange,
@@ -1008,6 +1020,12 @@ impl App {
         }
         let area = self.chat_area?;
         let rel = (mouse.row - area.y) as usize;
+        let rel_col = mouse.column.saturating_sub(area.x);
+        if let Some(hit) = self.performance_chip_hit_at(rel, rel_col) {
+            return Some(AffordanceTarget::Metric {
+                history_index: hit.history_index,
+            });
+        }
         self.chat_row_meta
             .get(rel)
             .and_then(crate::tui::app::render::affordance_target_for_row)
@@ -1223,7 +1241,9 @@ impl App {
             AffordanceTarget::ReasoningWindow { history_index } => {
                 self.scroll_reasoning_window(history_index, up)
             }
-            AffordanceTarget::Chip { .. } | AffordanceTarget::Subagent { .. } => false,
+            AffordanceTarget::Metric { .. }
+            | AffordanceTarget::Chip { .. }
+            | AffordanceTarget::Subagent { .. } => false,
         }
     }
 
@@ -2328,6 +2348,7 @@ mod affordance_hover_tests {
             seq: None,
             performance: None,
             performance_expanded: false,
+            interrupted: false,
         }
     }
 

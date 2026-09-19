@@ -669,6 +669,7 @@ fn agent_with_perf_entry(performance_expanded: bool) -> HistoryEntry {
             encoding: "cl100k_base".to_string(),
         }),
         performance_expanded,
+        interrupted: false,
     }
 }
 

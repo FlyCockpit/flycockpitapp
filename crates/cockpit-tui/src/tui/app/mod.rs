@@ -1322,6 +1322,9 @@ impl DisplayAttachBackoff {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum AffordanceTarget {
+    Metric {
+        history_index: usize,
+    },
     Chip {
         history_index: usize,
     },
@@ -2344,6 +2347,9 @@ pub struct App {
     /// Stable id of the user message currently shown in the sticky
     /// header. `None` when the header is hidden.
     pub(super) sticky_header_target: Option<HistoryEntryId>,
+    /// Floating `↓ Latest` chip shown while the transcript is detached from
+    /// the live tail.
+    pub(super) latest_chip_area: Option<Rect>,
     /// Last-rendered composer-input `Rect` (the outer rect — block
     /// border included). Used by `handle_mouse` to route clicks into
     /// click-to-position-cursor (plan.md T8.d).
@@ -2763,10 +2769,6 @@ pub struct App {
     /// keybind that copies the last agent message as HTML to the
     /// system clipboard (plan.md T8.g).
     pub(super) rich_text_copy: bool,
-    /// User's `tui.sticky_user_message` setting. When true, the most
-    /// recent user message scrolled above the viewport is pinned as a
-    /// two-line header at the top of the chat pane.
-    pub(super) sticky_user_message: bool,
     /// User's `tui.copy_on_release` setting. When true, a finalized drag
     /// or explicit double/triple selection schedules a copy through the
     /// centralized clipboard service. When false, the same gestures
@@ -3038,7 +3040,7 @@ pub struct App {
     pub(super) pin_count: usize,
     /// Click hit map: for each *visible* chat row, the clickable pin-control
     /// region (seq + `[col_start, col_end)` columns) of a pinnable
-    /// User/Agent message whose mouse `[pin]`/`[unpin]` control sits on that
+    /// User/Agent message whose mouse `[Pin]`/`[Unpin]` control sits on that
     /// row, or `None`. The control rides the message's own first line / top
     /// border, so a click only toggles when it lands inside the column range.
     /// Refreshed every render; consumed by the mouse handler.
@@ -3960,7 +3962,6 @@ impl App {
         let hyperlinks = tui_cfg.hyperlinks;
         let exit_tail_lines = tui_cfg.exit_tail_lines;
         let rich_text_copy = tui_cfg.rich_text_copy;
-        let sticky_user_message = tui_cfg.sticky_user_message;
         let copy_on_release = tui_cfg.copy_on_release;
         let clipboard_recovery = tui_cfg.clipboard_recovery;
         let use_emojis = tui_cfg.use_emojis;
@@ -4128,6 +4129,7 @@ impl App {
             chat_area: None,
             sticky_header_area: None,
             sticky_header_target: None,
+            latest_chip_area: None,
             input_area: None,
             suggestion_box_area: None,
             suggestion_row_hits: Vec::new(),
@@ -4262,7 +4264,6 @@ impl App {
             pending_link_activation: None,
             exit_tail_lines,
             rich_text_copy,
-            sticky_user_message,
             copy_on_release,
             clipboard_recovery,
             copy_file_cancel: None,

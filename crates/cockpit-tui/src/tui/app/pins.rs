@@ -1,6 +1,6 @@
 //! Pinned-messages TUI integration (`pinned-messages`): the `/pin`
-//! pick-a-message mode, the `/pins` review mode, the mouse `[fork]` and
-//! `[pin]`/`[unpin]` controls, and the below-input count indicator's data source.
+//! pick-a-message mode, the `/pins` review mode, the mouse `[Fork]` and
+//! `[Pin]`/`[Unpin]` controls, and the below-input count indicator's data source.
 //!
 //! Pins are daemon-owned state consumed through typed RPCs. Nothing here
 //! ever enters the outbound model prompt (token economy, priority #2).
@@ -105,7 +105,7 @@ impl App {
 
     /// Re-read this session's pin count and seq set from the DB into TUI
     /// state. Best-effort: a DB error clears the render cache for this
-    /// session so stale `[unpin]` chrome is not reused. Called after every
+    /// session so stale `[Unpin]` chrome is not reused. Called after every
     /// pin/unpin and on attach.
     pub(super) fn refresh_pin_count(&mut self) {
         #[cfg(test)]
@@ -987,6 +987,7 @@ mod tests {
             seq,
             performance: None,
             performance_expanded: false,
+            interrupted: false,
         }
     }
 
@@ -1031,7 +1032,7 @@ mod tests {
         use crate::tui::app::render::{ChatRowKind, ChatRowMeta, ControlChip, PinHit};
         let tmp = tempfile::tempdir().unwrap();
         let mut app = test_app(tmp.path());
-        // Agent `[pin]` control rides row 3, columns 52..57 (5 wide), seq 42.
+        // Agent `[Pin]` control rides row 3, columns 52..57 (5 wide), seq 42.
         let empty = ChatRowMeta {
             history_index: None,
             row_kind: ChatRowKind::Padding,
@@ -1669,6 +1670,7 @@ mod tests {
             seq: Some(1),
             performance: None,
             performance_expanded: false,
+            interrupted: false,
         }]
         .into();
         app.enter_copy_pick_mode();

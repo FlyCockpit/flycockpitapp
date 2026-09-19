@@ -60,13 +60,13 @@ fn agent(text: &str) -> HistoryEntry {
         seq: None,
         performance: None,
         performance_expanded: false,
+        interrupted: false,
     }
 }
 
 fn overflowing_app(root: &std::path::Path) -> App {
     let mut app = App::new(Some(root), false);
     app.launch.banner_enabled = false;
-    app.sticky_user_message = true;
     app.mouse_capture = true;
     let mut entries = Vec::new();
     for i in 0..12 {
@@ -137,7 +137,7 @@ fn prime_overflowing(app: &mut App, width: u16, height: u16) {
 }
 
 #[test]
-fn layout_carves_two_lines_when_header_is_on() {
+fn layout_carves_one_line_when_header_is_active() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = overflowing_app(tmp.path());
     prime_overflowing(&mut app, 40, 10);
@@ -159,38 +159,20 @@ fn layout_carves_two_lines_when_header_is_on() {
 }
 
 #[test]
-fn layout_hides_header_when_setting_is_off() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut app = overflowing_app(tmp.path());
-    app.sticky_user_message = false;
-    prime_overflowing(&mut app, 40, 10);
-    render_sticky(&mut app, 40, 10);
-
-    assert!(app.sticky_header_area.is_none());
-    assert_eq!(app.chat_visible_lines, 10);
-    let chat = app.chat_area.expect("full pane");
-    assert_eq!(chat.y, 0);
-    assert_eq!(chat.height, 10);
-    assert_eq!(app.chat_row_meta.len(), app.chat_visible_lines);
-}
-
-#[test]
-fn layout_keeps_two_line_header_at_narrow_width() {
+fn layout_keeps_one_line_header_at_narrow_width() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = overflowing_app(tmp.path());
     prime_overflowing(&mut app, 16, 10);
     let buf = render_sticky_buffer(&mut app, 16, 10);
     let header = app.sticky_header_area.expect("header at narrow width");
     assert_eq!(header.height, STICKY_USER_HEADER_HEIGHT);
-    assert_eq!(app.chat_visible_lines, 8);
+    assert_eq!(app.chat_visible_lines, 9);
     let top = row_text(&buf, 0, 16);
-    let second = row_text(&buf, 1, 16);
     assert!(
-        top.contains("you") || top.contains("user-msg"),
-        "narrow header row 0 should still show pinned chrome or preview: {top:?}"
+        top.contains('▌') && top.contains("user"),
+        "narrow header should retain the bar and condensed preview: {top:?}"
     );
     assert_ne!(top.trim(), "", "header row 0 must be painted");
-    let _ = second;
 }
 
 #[test]
@@ -207,12 +189,11 @@ fn header_preview_uses_raw_user_text() {
     };
     let needle = text.split_whitespace().next().unwrap();
     let row0 = row_text(&buf, header.y, 48);
-    let row1 = row_text(&buf, header.y + 1, 48);
     assert!(
-        row0.contains(needle) || row1.contains(needle),
-        "header should show raw user text {needle:?}: {row0:?} / {row1:?}"
+        row0.contains(needle),
+        "header should show raw user text {needle:?}: {row0:?}"
     );
-    assert!(row0.contains("you"), "pinned header label: {row0:?}");
+    assert!(row0.contains('▌'), "pinned header accent: {row0:?}");
 }
 
 #[test]
@@ -243,7 +224,6 @@ fn target_derivation_matrix() {
     // Short transcript at tail: nothing above.
     let mut short = App::new(Some(tmp.path()), false);
     short.launch.banner_enabled = false;
-    short.sticky_user_message = true;
     short.history = vec![user("only one"), agent("short reply")].into();
     render_history_direct(&mut short, 40, 20);
     assert!(
@@ -254,7 +234,6 @@ fn target_derivation_matrix() {
     // Banner occupying the viewport top.
     let mut banner = App::new(Some(tmp.path()), false);
     banner.launch.banner_enabled = true;
-    banner.sticky_user_message = true;
     banner.history = vec![user("hello")].into();
     render_history_direct(&mut banner, 100, 24);
     if banner.chat_banner_lines > 0 {
@@ -289,7 +268,7 @@ fn target_derivation_matrix() {
 }
 
 #[test]
-fn selection_clears_when_header_visibility_flips() {
+fn active_drag_clears_when_header_visibility_flips() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = overflowing_app(tmp.path());
     prime_overflowing(&mut app, 40, 10);
@@ -299,9 +278,10 @@ fn selection_clears_when_header_visibility_flips() {
     app.selection = Some(Selection {
         anchor: (0, 4),
         focus: (8, 6),
-        active: false,
+        active: true,
     });
-    app.sticky_user_message = false;
+    let max_offset = app.chat_total_lines.saturating_sub(10);
+    app.set_chat_scroll_offset_from_interaction(max_offset);
     render_sticky(&mut app, 40, 10);
     assert!(app.sticky_header_area.is_none());
     assert!(
@@ -311,7 +291,7 @@ fn selection_clears_when_header_visibility_flips() {
 }
 
 #[test]
-fn click_jump_lands_with_two_row_margin() {
+fn click_jump_lands_with_scroll_margin() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = overflowing_app(tmp.path());
     prime_overflowing(&mut app, 40, 10);
@@ -333,7 +313,7 @@ fn click_jump_lands_with_two_row_margin() {
     assert_eq!(
         top,
         abs.saturating_sub(2),
-        "click-jump uses the 2-row margin of scroll_abs_line_into_view"
+        "click-jump uses the transcript scroll margin"
     );
 }
 
@@ -451,36 +431,29 @@ fn anchor_round_trip_is_stable_across_header_appear_and_disappear() {
     );
     let offset_after_push = app.chat_scroll_offset;
 
-    app.sticky_user_message = false;
+    let max_offset = app.chat_total_lines.saturating_sub(10);
+    app.set_chat_scroll_offset_from_interaction(max_offset);
     render_sticky(&mut app, 40, 10);
     assert!(app.sticky_header_area.is_none());
-    // Offset-from-bottom is preserved across the flip so the round-trip
-    // cannot oscillate (header decision uses the uncarved pane height).
-    // Compare against the post-push offset: appending a bottom row may grow
-    // offset-from-bottom to keep the same history top.
-    assert_eq!(app.chat_scroll_offset, offset_after_push);
+    let offset_without_header = app.chat_scroll_offset;
+    render_sticky(&mut app, 40, 10);
+    assert_eq!(app.chat_scroll_offset, offset_without_header);
 
-    app.sticky_user_message = true;
+    app.set_chat_scroll_offset_from_interaction(offset_after_push);
     render_sticky(&mut app, 40, 10);
     assert!(app.sticky_header_area.is_some());
     assert_eq!(app.chat_scroll_offset, offset_after_push);
 }
 
 #[test]
-fn toggling_the_setting_repaints_the_header() {
+fn sticky_header_is_always_on_when_a_user_turn_is_above_the_viewport() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = overflowing_app(tmp.path());
     prime_overflowing(&mut app, 40, 10);
     render_sticky(&mut app, 40, 10);
     assert!(app.sticky_header_area.is_some());
 
-    app.sticky_user_message = false;
-    render_sticky(&mut app, 40, 10);
-    assert!(app.sticky_header_area.is_none());
-    assert_eq!(app.chat_visible_lines, 10);
-
-    app.sticky_user_message = true;
-    render_sticky(&mut app, 40, 10);
-    assert!(app.sticky_header_area.is_some());
-    assert_eq!(app.chat_visible_lines, 8);
+    let header = app.sticky_header_area.expect("always-on header");
+    assert_eq!(header.height, 1);
+    assert_eq!(app.chat_visible_lines, 9);
 }

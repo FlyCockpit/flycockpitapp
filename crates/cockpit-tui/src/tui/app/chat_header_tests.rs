@@ -105,6 +105,7 @@ fn agent_entry(text: &str) -> HistoryEntry {
         seq: Some(7),
         performance: None,
         performance_expanded: false,
+        interrupted: false,
     }
 }
 
@@ -617,25 +618,31 @@ fn header_and_transcript_hold_reserved_columns_at_probe_widths() {
             assert!(text.chars().count() <= width as usize);
         }
 
-        // Transcript: the agent row keeps its right-aligned HH:MM timestamp
-        // on the entry's first rendered row, and nothing overflows.
+        // Transcript: the agent role header owns the right-aligned timestamp;
+        // the unbarred body remains visible below it.
         let chat = app.chat_area.expect("history area");
         assert!(chat.y >= layout.area.y + 3);
         let ts = chrono::Local::now().format("%H:%M").to_string();
-        let agent_first_row = (chat.y..chat.bottom())
+        let agent_header = (chat.y..chat.bottom())
             .map(|y| row_text(&buf, y))
-            .find(|text| text.contains("agent reply"))
+            .find(|text| text.contains("▌ Agent"))
             .unwrap_or_else(|| {
                 panic!(
-                    "agent text visible at {width}: {:?}",
+                    "agent header visible at {width}: {:?}",
                     (chat.y..chat.bottom())
                         .map(|y| row_text(&buf, y))
                         .collect::<Vec<_>>()
                 )
             });
         assert!(
-            agent_first_row.contains(&ts) || agent_first_row.trim_end().ends_with(&ts),
-            "timestamp reserved at {width}: {agent_first_row:?}"
+            agent_header.contains(&ts) || agent_header.trim_end().ends_with(&ts),
+            "timestamp reserved at {width}: {agent_header:?}"
+        );
+        assert!(
+            (chat.y..chat.bottom())
+                .map(|y| row_text(&buf, y))
+                .any(|text| text.contains("agent reply")),
+            "agent body visible at {width}"
         );
         for y in chat.y..chat.bottom() {
             let text = row_text(&buf, y);
@@ -658,14 +665,14 @@ fn header_and_transcript_hold_reserved_columns_at_probe_widths() {
             if let Some(hit) = meta.fork_hit {
                 assert_eq!(
                     region(hit.col_start, hit.col_end),
-                    "[fork]",
+                    "[Fork]",
                     "fork columns reserved at {width}"
                 );
             }
             if let Some(hit) = meta.pin_hit {
                 let text = region(hit.col_start, hit.col_end);
                 assert!(
-                    text == "[pin]" || text == "[unpin]",
+                    text == "[Pin]" || text == "[Unpin]",
                     "pin columns reserved at {width}: {text:?}"
                 );
             }

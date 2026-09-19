@@ -628,6 +628,9 @@ impl BtwPane {
                 seq: p.seq,
                 performance: p.response_performance,
                 performance_expanded: false,
+                // The side pane's idle handling does not track the idle
+                // reason, so side turns always settle without the marker.
+                interrupted: false,
             });
         }
     }

@@ -1,4 +1,5 @@
-▌ Continue with every transcript element.                                       
+▌Continue with every transcript element.                                        
+  The open thought is followed by tool work.                                   │
                                                                                │
   ▸ read  crates/cockpit-tui/src/tui/history/mod.rs                            │
                                                                                │
@@ -9,7 +10,7 @@
 ▌ background ✓ runner worked for 4s [u]                                        │
   Background child returned a compact report.                                  │
                                                                                │
-  ◇ Edited src/transcript.rs  +1 -1                                            │
+  ◇ Edited src/transcript.rs  +1 -1                                            █
   │ - old line                                                                 █
   │ + new line                                                                 █
   │   shared line                                                              █
@@ -19,6 +20,5 @@
                                                                                █
 ▌ Agent                                                                 12:00  █
   Thinking                                                                     █
-  Streaming the final response with a stable caret while the viewport          █
-  remains scrolled. The fixture deliberately keeps live prose below the        █
-  fold. The reserved scrollbar column stays visible. The jump-to-late ↓ Latest │
+  Check the final visual hierarchy.                                            █
+  Streaming the final response with a stable caret while the viewport ↓ Latest █

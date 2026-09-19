@@ -59,8 +59,10 @@ pub fn empty_chat_banner_app() -> App {
 /// the loading placeholder.
 pub fn spawn_error_app() -> App {
     let mut app = empty_chat_banner_app();
-    let error = "daemon spawn failed: socket path too long; set COCKPIT_SOCKET_DIR".to_string();
-    app.apply_daemon_spawn_failure(&error);
+    let error = "daemon socket address already in use: /tmp/cockpit.sock\n\
+--- daemon.log (last 20 lines) ---\n\
+bind-line\n";
+    app.apply_daemon_spawn_failure(error);
     app
 }
 
@@ -133,8 +135,8 @@ pub fn assert_spawn_error() {
     });
     let preview = buffer_text(&render_app(&mut app, 80, 24));
     assert!(
-        preview.contains("COCKPIT_SOCKET_DIR"),
-        "spawn-error dump must include the spawn failure"
+        preview.contains("already in use"),
+        "spawn-error dump must include the spawn failure summary"
     );
     assert!(
         !preview.contains("Loading session setup"),

@@ -119,6 +119,35 @@ fn latched_spawn_failure_shows_blocking_toast_and_clears_session_setup_loading()
 }
 
 #[test]
+fn spawn_failure_pane_shows_log_tail_while_toast_shows_first_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = configured_app_body(&tmp);
+    let error = "daemon socket address already in use: /tmp/cockpit.sock\n\
+--- daemon.log (last 20 lines) ---\n\
+bind-line\n";
+    app.apply_daemon_spawn_failure(error);
+
+    let toast = app.toast.as_ref().expect("blocking toast");
+    assert_eq!(
+        toast.text, "daemon socket address already in use: /tmp/cockpit.sock",
+        "toast must summarize only the first line"
+    );
+    let pane = app
+        .session_setup_inline
+        .as_ref()
+        .expect("inline session setup");
+    let pane_error = pane.error_message().expect("session setup error");
+    assert!(
+        pane_error.contains("--- daemon.log (last 20 lines) ---"),
+        "pane must render the full spawn error including the log tail, got {pane_error}"
+    );
+    assert!(
+        pane_error.contains("bind-line"),
+        "pane must include daemon.log tail lines, got {pane_error}"
+    );
+}
+
+#[test]
 fn display_attach_spawn_failure_escalates_without_latching_first() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = configured_app_body(&tmp);

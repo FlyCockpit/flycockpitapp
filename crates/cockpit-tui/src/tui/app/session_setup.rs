@@ -632,8 +632,9 @@ impl App {
             "already in use",
             "daemon socket address already in use",
             "another daemon is already running",
-            "daemon.log",
-            "binding ",
+            "--- daemon.log (last ",
+            "binding /",
+            "binding leak-reveal",
             "spawn notify",
             "validating socket",
             "spawning daemon child",
@@ -650,7 +651,7 @@ impl App {
     pub(super) fn apply_daemon_spawn_failure(&mut self, error: &str) {
         let summary = Self::spawn_error_summary(error);
         self.show_blocking_toast(summary.clone(), ToastKind::Error);
-        let pane_message = format!("Daemon failed to start: {summary}");
+        let pane_message = format!("Daemon failed to start: {error}");
         if let Overlay::SessionSetup(pane) = &mut self.overlay {
             pane.set_error(pane_message.clone());
         }

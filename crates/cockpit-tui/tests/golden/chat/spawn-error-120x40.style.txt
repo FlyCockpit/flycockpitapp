@@ -39,4 +39,4 @@
 36	120:White/Reset/-
 37	3:White/Reset/- 54:Indexed(250)/Reset/- 54:Reset/Reset/- 8:Indexed(250)/Reset/- 1:White/Reset/-
 38	1:White/Reset/- 9:White/Reset/BOLD 1:White/Reset/- 7:White/Reset/BOLD 1:White/Reset/- 8:White/Reset/BOLD 1:White/Reset/- 21:White/Reset/BOLD 1:White/Reset/- 13:White/Reset/BOLD 50:White/Reset/- 6:White/Reset/BOLD 1:White/Reset/-
-39	67:Red/Reset/BOLD 53:Reset/Reset/-
+39	57:Red/Reset/BOLD 63:Reset/Reset/-

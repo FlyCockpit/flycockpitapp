@@ -21,4 +21,4 @@
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │❯ Message FlyCockpit — / commands · Ctrl+K keys · /setup              0 tokens│
 ╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────[Send]╯
- daemon spawn failed: socket path too long; set COCKPIT_SOCKET_DIR              
+ daemon socket address already in use: /tmp/cockpit.sock                        

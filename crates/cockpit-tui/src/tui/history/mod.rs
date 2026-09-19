@@ -2421,7 +2421,7 @@ fn render_agent(
 
     if metric_region.is_some() && performance_expanded {
         let perf = performance.as_ref().unwrap();
-        let detail_rows = vec![
+        let detail_rows = [
             format!("  {:<5}  {}", "Model", name),
             format!("  {:<5}  {}s", "TTFT", format_ttft(perf.ttft_ms)),
             format!(

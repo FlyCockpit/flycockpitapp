@@ -9,7 +9,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::theme::{BRASS, DISABLED, FOG, HOVER_BG, INK};
+use super::theme::{BRASS, DISABLED, FOG, INK};
+use crate::tui::chrome::chip_style;
 
 const BACK_LABEL: &str = " ‹ Back ";
 
@@ -41,13 +42,8 @@ pub(super) fn render_back_button(
     };
     let style = if !enabled {
         Style::new().fg(DISABLED)
-    } else if hovered {
-        Style::new()
-            .fg(BRASS)
-            .bg(HOVER_BG)
-            .add_modifier(Modifier::BOLD)
     } else {
-        Style::new().fg(BRASS)
+        chip_style(Style::new().fg(BRASS), hovered)
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(BACK_LABEL, style))),
@@ -149,10 +145,10 @@ pub(super) fn render_action_bar(
         let style = if !button.enabled {
             Style::new().fg(DISABLED)
         } else if hovered {
-            Style::new()
-                .fg(if button.primary { BRASS } else { INK })
-                .bg(HOVER_BG)
-                .add_modifier(Modifier::BOLD)
+            chip_style(
+                Style::new().fg(if button.primary { BRASS } else { INK }),
+                true,
+            )
         } else if button.primary {
             Style::new().fg(BRASS).add_modifier(Modifier::BOLD)
         } else {

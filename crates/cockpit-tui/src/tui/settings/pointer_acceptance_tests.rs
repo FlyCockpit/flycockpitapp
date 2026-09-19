@@ -286,6 +286,11 @@ fn settings_button_hover_is_glyph_scoped() {
 
 #[test]
 fn settings_hover_exact_button_style() {
+    // Button hover paints through the shared chip rule, which resolves
+    // through the terminal colour capability — pin truecolor so the
+    // rendered cells are the RGB hover token regardless of the ambient
+    // COLORTERM.
+    let _truecolor = crate::tui::theme::pin_truecolor(true);
     let tmp = TempDir::new().unwrap();
     let mut dialog = fresh_dialog(&tmp);
     dialog.extended.tui.mouse_capture = true;

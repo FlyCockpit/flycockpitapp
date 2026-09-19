@@ -12,6 +12,9 @@
 //! * frame — welcome fly-in uses [`PINNED_FRAME`]
 //! * cloud seed — [`CLOUD_SEED`] for `clouds::seed_with(w, h, entropy)` (#428)
 //! * hover — cleared unless the test calls [`GoldenPins::allow_hover`]
+//! * colour — the palette resolves its truecolor RGB tokens regardless of
+//!   the ambient `COLORTERM` (`theme::pin_truecolor(true)`), so dumps stay
+//!   byte-identical on truecolor and 256-color terminals alike (#444)
 //!
 //! Visual reference for future UI work: `reference/example-tui/`.
 
@@ -61,20 +64,26 @@ pub struct GoldenPins {
     prev_hover: bool,
     prev_cloud: Option<u64>,
     prev_frame: Option<usize>,
+    /// Holds the truecolour pin for the guard's lifetime; its own Drop
+    /// restores the previous capability when this guard drops.
+    _truecolor: crate::tui::theme::TruecolorPin,
 }
 
 impl GoldenPins {
-    /// Pin clock, frame, cloud seed, and disable hover.
+    /// Pin clock, frame, cloud seed, truecolour capability, and disable
+    /// hover.
     pub fn install() -> Self {
         let prev_clock = PINNED_CLOCK.with(|cell| cell.replace(true));
         let prev_hover = HOVER_ALLOWED.with(|cell| cell.replace(false));
         let prev_cloud = CLOUD.with(|cell| cell.replace(Some(CLOUD_SEED)));
         let prev_frame = FRAME.with(|cell| cell.replace(Some(PINNED_FRAME)));
+        let _truecolor = crate::tui::theme::pin_truecolor(true);
         Self {
             prev_clock,
             prev_hover,
             prev_cloud,
             prev_frame,
+            _truecolor,
         }
     }
 
@@ -377,6 +386,15 @@ mod tests {
         assert_eq!(cloud_seed(), CLOUD_SEED);
         assert_eq!(pinned_frame(), PINNED_FRAME);
         assert!(!hover_allowed());
+        // The colour pin makes every palette resolve deterministic: the
+        // RGB tokens paint as themselves regardless of ambient COLORTERM.
+        assert_eq!(
+            crate::tui::theme::resolve_color(
+                crate::tui::theme::BRASS,
+                crate::tui::theme::BRASS_INDEX
+            ),
+            crate::tui::theme::BRASS
+        );
         drop(pins.allow_hover());
         assert!(pinned_hhmm().is_none());
         assert!(!hover_allowed());

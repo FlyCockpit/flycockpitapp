@@ -63,7 +63,9 @@ impl App {
 
     /// Session status from authoritative state: a pending action-required
     /// interrupt outranks an inference reconnect, which outranks a busy
-    /// turn; otherwise idle.
+    /// turn. At rest, a transcript that has carried a conversation turn
+    /// reads done (the reference's resting rule); only a transcript with
+    /// no turns yet reads idle.
     fn chat_header_status(&self) -> HeaderSessionStatus {
         if self.header_attention_count() > 0 {
             return HeaderSessionStatus::Attention;
@@ -74,7 +76,23 @@ impl App {
         if self.busy || self.pending.is_some() {
             return HeaderSessionStatus::Working;
         }
+        if self.header_has_settled_turn() {
+            return HeaderSessionStatus::Done;
+        }
         HeaderSessionStatus::Idle
+    }
+
+    /// Whether the transcript holds any conversation message (user or
+    /// agent). Tool chrome and system notes alone do not count as a turn:
+    /// a session that has run a turn and has nothing in flight is done,
+    /// not idle.
+    fn header_has_settled_turn(&self) -> bool {
+        self.history.iter().any(|entry| {
+            matches!(
+                entry,
+                HistoryEntry::User { .. } | HistoryEntry::Agent { .. }
+            )
+        })
     }
 
     /// Pending action-required interrupts: the attached session's interrupt

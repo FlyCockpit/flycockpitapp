@@ -230,20 +230,23 @@ fn header_pills_draw_only_from_real_state() {
 }
 
 /// Session status on the title row tracks real state: attention pending,
-/// busy working, idle.
+/// busy working, done after a settled turn, idle before any turn.
 #[test]
 fn header_session_status_tracks_real_state() {
     let tmp = tempfile::tempdir().unwrap();
+    let bare_tmp = tempfile::tempdir().unwrap();
+    // Built before the `app` binding below shadows the constructor.
+    let mut bare = app(&bare_tmp);
     let mut app = app(&tmp);
     let buf = render(&mut app, 100, 30);
     let layout = app.chat_header_layout.clone().expect("header rendered");
     let title = row_text(&buf, layout.area.y);
-    assert!(title.contains("idle"), "idle by default: {title:?}");
+    assert!(title.contains("Idle"), "idle by default: {title:?}");
 
     app.busy = true;
     let buf = render(&mut app, 100, 30);
     let title = row_text(&buf, 0);
-    assert!(title.contains("working"), "busy span: {title:?}");
+    assert!(title.contains("Working"), "busy span: {title:?}");
     app.attention_interrupt = Some(AttentionInterruptState {
         interrupt_id: Uuid::new_v4(),
         kind: AttentionInterruptKind::Question,
@@ -254,9 +257,53 @@ fn header_session_status_tracks_real_state() {
     let buf = render(&mut app, 100, 30);
     let title = row_text(&buf, 0);
     assert!(
-        title.contains("attention"),
+        title.contains("Waiting"),
         "attention outranks busy: {title:?}"
     );
+
+    // An inference reconnect outranks a busy span, and the badge paints in
+    // the yellow token (fg pinned truecolor for a deterministic assert).
+    app.attention_interrupt = None;
+    app.reconnect = Some(super::ReconnectStatus {
+        attempt: 1,
+        provider: "anthropic".to_string(),
+        model: "claude".to_string(),
+        url: "https://api.anthropic.com".to_string(),
+    });
+    let _truecolor = crate::tui::theme::pin_truecolor(true);
+    let buf = render(&mut app, 100, 30);
+    let title = row_text(&buf, 0);
+    assert!(
+        title.contains("Reconnecting"),
+        "reconnect outranks busy: {title:?}"
+    );
+    let dot = (0..buf.area.width)
+        .find(|&col| buf[(col, 0)].symbol() == "●")
+        .expect("status dot on the title row");
+    assert_eq!(buf[(dot, 0)].fg, crate::tui::theme::YELLOW);
+    drop(_truecolor);
+    app.reconnect = None;
+
+    // Nothing in flight over a transcript that has carried a turn: done,
+    // the reference resting rule — not idle.
+    app.busy = false;
+    app.attention_interrupt = None;
+    app.history
+        .push(user_entry("hello header this is the user message"));
+    app.history
+        .push(agent_entry("agent reply that settled the turn"));
+    let buf = render(&mut app, 100, 30);
+    let title = row_text(&buf, 0);
+    assert!(title.contains("Done"), "settled turn: {title:?}");
+
+    // Tool chrome and system notes alone are not a turn: still idle.
+    bare.history.push(HistoryEntry::SkillAutoInjected {
+        name: "firecrawl".to_string(),
+        reason: None,
+    });
+    let buf = render(&mut bare, 100, 30);
+    let title = row_text(&buf, 0);
+    assert!(title.contains("Idle"), "no turn yet: {title:?}");
 }
 
 #[test]

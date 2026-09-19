@@ -30,7 +30,10 @@ fi
 # than a second dependency resolver that can fail before reaching the import.
 cargo check --quiet --locked -p cockpit-core
 dependency_dir="$CARGO_TARGET_DIR/debug/deps"
-core_rmeta="$(find "$dependency_dir" -maxdepth 1 -name 'libcockpit_core-*.rmeta' -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
+# An interrupted build can leave a zero-byte libcockpit_core-*.rmeta behind;
+# rustc refuses to load it (E0463) before the fixture can prove anything, so
+# only non-empty artifacts are candidates.
+core_rmeta="$(find "$dependency_dir" -maxdepth 1 -name 'libcockpit_core-*.rmeta' -size +1c -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
 if [[ -z "$core_rmeta" ]]; then
   echo "cockpit-core metadata artifact missing" >&2
   exit 1

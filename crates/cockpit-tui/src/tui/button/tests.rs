@@ -2,7 +2,7 @@ use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier};
+use ratatui::style::{Color, Modifier, Style};
 
 use crate::tui::button::{
     ButtonDispatch, ButtonId, ButtonPointerOutcome, ButtonRegistry, ButtonSpec, ControlKind,
@@ -13,9 +13,8 @@ use crate::tui::composer_controls::ComposerControlKind;
 use crate::tui::settings::pointer_actions::SettingsPointerAction;
 use crate::tui::settings::shell::SettingsHeaderAction;
 use crate::tui::theme::{
-    BUTTON_DESTRUCTIVE_BG, BUTTON_DESTRUCTIVE_BG_ANSI, BUTTON_DESTRUCTIVE_FG, BUTTON_FOCUS_BG,
-    BUTTON_FOCUS_BG_ANSI, BUTTON_FOCUS_FG, BUTTON_HOVER_BG, BUTTON_HOVER_BG_ANSI, BUTTON_HOVER_FG,
-    BUTTON_PRESSED_BG, BUTTON_PRESSED_BG_ANSI, BUTTON_PRESSED_FG, button_hover_style,
+    BUTTON_DESTRUCTIVE_BG, BUTTON_DESTRUCTIVE_FG, BUTTON_FOCUS_BG, BUTTON_FOCUS_FG,
+    BUTTON_HOVER_BG, BUTTON_HOVER_FG, BUTTON_PRESSED_BG, BUTTON_PRESSED_FG,
 };
 
 fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -395,28 +394,49 @@ fn tui_button_inventory_is_complete() {
 }
 
 #[test]
+fn button_hover_paints_through_the_chip_rule() {
+    // Buttons and every other chip share one hover paint: the button
+    // hover style is `chrome::chip_style`, in both capability branches —
+    // so a hardcoded button-only hover (or a chip rule that stops
+    // resolving) fails here.
+    let spec = ButtonSpec::new(ButtonId::NoteNew, "note", ButtonDispatch::NoteNew);
+    let (hover, chip) = {
+        let _pin = crate::tui::theme::pin_truecolor(true);
+        (
+            crate::tui::button::button_style(&spec, true, false),
+            crate::tui::chrome::chip_style(Style::default(), true),
+        )
+    };
+    assert_eq!(hover, chip, "button hover is the single excoc chip rule");
+    let (fallback, chip_fallback) = {
+        let _pin = crate::tui::theme::pin_truecolor(false);
+        (
+            crate::tui::button::button_style(&spec, true, false),
+            crate::tui::chrome::chip_style(Style::default(), true),
+        )
+    };
+    assert_eq!(fallback, chip_fallback);
+    assert_eq!(
+        fallback.fg,
+        Some(Color::Indexed(crate::tui::theme::BRASS_INDEX)),
+        "the shared hover rule resolves to the indexed fallback"
+    );
+}
+
+#[test]
 fn interaction_theme_contrast_matrix() {
     let pairs = [
-        (BUTTON_HOVER_FG, BUTTON_HOVER_BG, BUTTON_HOVER_BG_ANSI),
-        (BUTTON_FOCUS_FG, BUTTON_FOCUS_BG, BUTTON_FOCUS_BG_ANSI),
-        (BUTTON_PRESSED_FG, BUTTON_PRESSED_BG, BUTTON_PRESSED_BG_ANSI),
-        (
-            BUTTON_DESTRUCTIVE_FG,
-            BUTTON_DESTRUCTIVE_BG,
-            BUTTON_DESTRUCTIVE_BG_ANSI,
-        ),
+        (BUTTON_HOVER_FG, BUTTON_HOVER_BG),
+        (BUTTON_FOCUS_FG, BUTTON_FOCUS_BG),
+        (BUTTON_PRESSED_FG, BUTTON_PRESSED_BG),
+        (BUTTON_DESTRUCTIVE_FG, BUTTON_DESTRUCTIVE_BG),
     ];
-    for (fg, bg, ansi) in pairs {
+    for (fg, bg) in pairs {
         assert!(
             contrast_ratio(fg, bg) >= 4.5,
             "contrast {fg:?} on {bg:?} is {}",
             contrast_ratio(fg, bg)
         );
-        assert_ne!(ansi, Color::Reset);
-        match ansi {
-            Color::Indexed(_) | Color::Rgb(_, _, _) => {}
-            other => panic!("ANSI fallback must be explicit, got {other:?}"),
-        }
     }
     assert_ne!(BUTTON_HOVER_BG, BUTTON_FOCUS_BG);
     assert_ne!(BUTTON_HOVER_BG, BUTTON_PRESSED_BG);
@@ -449,7 +469,11 @@ fn links_and_selection_remain_semantic() {
     let link = crate::tui::links::base_link_style();
     assert_eq!(link.fg, Some(Color::Cyan));
     assert!(link.add_modifier.contains(Modifier::UNDERLINED));
-    assert_ne!(link, button_hover_style());
+    // Links stay distinct from the single hover rule (chip_style), which
+    // buttons also paint through.
+    let _truecolor = crate::tui::theme::pin_truecolor(true);
+    let button_hover = crate::tui::chrome::chip_style(Style::default(), true);
+    assert_ne!(link, button_hover);
 
     let hover = crate::tui::links::hovered_link_style();
     assert!(hover.add_modifier.contains(Modifier::UNDERLINED));
@@ -461,8 +485,8 @@ fn links_and_selection_remain_semantic() {
         "text selection must keep reverse-video"
     );
     assert!(
-        !src.contains("button_hover_style()") || src.contains("Selection"),
-        "selection path stays distinct from button hover"
+        !src.contains("chrome::chip_style"),
+        "selection path stays distinct from the shared chip hover rule"
     );
 }
 

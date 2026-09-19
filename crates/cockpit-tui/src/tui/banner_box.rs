@@ -1,7 +1,7 @@
 //! In-TUI launch banner box.
 //!
 //! Renders the full welcome header (P-51 art + version / welcome /
-//! provider / path-branch lines) inside a rounded, accent-blue box that
+//! provider / path-branch lines) inside a rounded, brass-accent box that
 //! lives in the chat pane as the topmost scroll entry. Replaces the old
 //! pre-alt-screen stdout banner (`welcome::print_header`), which was
 //! only ever visible in scrollback after the TUI exited.
@@ -10,16 +10,14 @@
 //! scrolls off) is owned by `render_history`; this module only builds
 //! the horizontally-centered, bordered lines.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::banner;
-use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
+use crate::tui::theme::{BRASS, BRASS_INDEX, FOG, FOG_INDEX, resolve_color};
 use cockpit_core::welcome::APP_NAME;
 use cockpit_proto::LaunchInfo;
 
-const ACCENT: Color = Color::Indexed(ACCENT_BLUE_INDEX);
-const GREY: Color = Color::Indexed(MUTED_COLOR_INDEX);
 /// One space of breathing room inside each vertical rail.
 const INNER_PAD: usize = 1;
 
@@ -76,7 +74,10 @@ fn build_box(info: &LaunchInfo, pane_w: u16, pane_h: u16) -> Option<Vec<Line<'st
 
     let left_pad = (pane_w as usize - box_w) / 2;
     let pad = || Span::raw(" ".repeat(left_pad));
-    let accent = Style::default().fg(ACCENT);
+    // The box accent and grey resolve through the terminal's colour
+    // capability: a non-truecolor terminal sees the indexed fallbacks,
+    // never 24-bit SGR.
+    let accent = Style::default().fg(resolve_color(BRASS, BRASS_INDEX));
 
     let mut out: Vec<Line<'static>> = Vec::with_capacity(box_h);
     out.push(Line::from(vec![
@@ -110,10 +111,11 @@ fn build_box(info: &LaunchInfo, pane_w: u16, pane_h: u16) -> Option<Vec<Line<'st
 /// bottom padding.
 fn content_lines(info: &LaunchInfo) -> Vec<Line<'static>> {
     let art = banner::render_styled_lines();
+    let grey = resolve_color(FOG, FOG_INDEX);
     let mut title = vec![
         Span::styled(APP_NAME, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" "),
-        Span::styled(format!("v{}", info.version), Style::default().fg(GREY)),
+        Span::styled(format!("v{}", info.version), Style::default().fg(grey)),
     ];
     // Current session's short id, right after the version in the same grey
     // (session-id-short-display). The short id is assigned by the daemon at
@@ -123,12 +125,12 @@ fn content_lines(info: &LaunchInfo) -> Vec<Line<'static>> {
         title.push(Span::raw("  "));
         title.push(Span::styled(
             short_id.to_string(),
-            Style::default().fg(GREY),
+            Style::default().fg(grey),
         ));
     }
     let provider = vec![Span::styled(
         info.provider_line.clone(),
-        Style::default().fg(GREY),
+        Style::default().fg(grey),
     )];
     // cwd + git-branch badge — built by the same span builder the chat
     // header's meta row uses, so the box matches the shell exactly.
@@ -142,10 +144,10 @@ fn content_lines(info: &LaunchInfo) -> Vec<Line<'static>> {
     let texts: Vec<Option<Vec<Span<'static>>>> = match info.user_name.as_deref() {
         Some(name) if !name.is_empty() => {
             let welcome = vec![
-                Span::styled("Welcome, ", Style::default().fg(GREY)),
+                Span::styled("Welcome, ", Style::default().fg(grey)),
                 Span::styled(
                     name.to_string(),
-                    Style::default().fg(GREY).add_modifier(Modifier::BOLD),
+                    Style::default().fg(grey).add_modifier(Modifier::BOLD),
                 ),
             ];
             vec![
@@ -173,12 +175,12 @@ fn content_lines(info: &LaunchInfo) -> Vec<Line<'static>> {
         })
         .collect();
     lines.push(Line::from(vec![
-        Span::styled("Tip: ", Style::default().fg(GREY)),
+        Span::styled("Tip: ", Style::default().fg(grey)),
         Span::styled(
             "/help",
-            Style::default().fg(GREY).add_modifier(Modifier::BOLD),
+            Style::default().fg(grey).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" gets you oriented", Style::default().fg(GREY)),
+        Span::styled(" gets you oriented", Style::default().fg(grey)),
     ]));
     lines
 }
@@ -186,6 +188,7 @@ fn content_lines(info: &LaunchInfo) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Color;
     use std::path::PathBuf;
 
     fn sample(enabled: bool, name: Option<&str>) -> LaunchInfo {
@@ -289,5 +292,46 @@ mod tests {
         // Skip (None) rather than clip, whether too narrow or too short.
         assert!(build_box(&sample(true, None), 10, 50).is_none());
         assert!(build_box(&sample(true, None), 200, 4).is_none());
+    }
+
+    #[test]
+    fn banner_paint_resolves_the_capability_fallback() {
+        // Truecolor terminals: the brass accent and fog grey paint as the
+        // RGB tokens themselves.
+        let lines = {
+            let _pin = crate::tui::theme::pin_truecolor(true);
+            build_box(&sample(true, None), 200, 50).expect("fits")
+        };
+        let border = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.style.fg.is_some())
+            .expect("accent border span");
+        assert_eq!(border.style.fg, Some(BRASS));
+        let version = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.starts_with("v9.9.9"))
+            .expect("version span");
+        assert_eq!(version.style.fg, Some(FOG));
+
+        // Non-truecolor terminals: the same spans resolve to the indexed
+        // fallbacks, never 24-bit SGR.
+        let lines = {
+            let _pin = crate::tui::theme::pin_truecolor(false);
+            build_box(&sample(true, None), 200, 50).expect("fits")
+        };
+        let border = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.style.fg.is_some())
+            .expect("accent border span");
+        assert_eq!(border.style.fg, Some(Color::Indexed(BRASS_INDEX)));
+        let version = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.starts_with("v9.9.9"))
+            .expect("version span");
+        assert_eq!(version.style.fg, Some(Color::Indexed(FOG_INDEX)));
     }
 }

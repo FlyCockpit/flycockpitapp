@@ -312,6 +312,18 @@ impl ProviderSearchScreen {
 
     pub(crate) fn set_scrollbar_area(&mut self, area: Rect) {
         self.scrollbar_area = area;
+        if area.is_empty() {
+            self.dragging_scrollbar = false;
+        }
+    }
+
+    pub(crate) fn dragging_scrollbar(&self) -> bool {
+        self.dragging_scrollbar
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scrollbar_area(&self) -> Rect {
+        self.scrollbar_area
     }
 
     pub(crate) fn choose_enabled(&self) -> bool {

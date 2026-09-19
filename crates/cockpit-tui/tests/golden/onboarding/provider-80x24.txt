@@ -2,7 +2,7 @@
   Let's add a provider · step 4/8                                               
   Pick who you'll fly with.                                                     
   ────────────────────────────                                                  
-  ●Welcome ●Profile ●Secure store ◐Provider ○Model ○Agent ○Lifetime ○Ready      
+  ●Welcome ●Name ●Secure store ◐Provider ○Model ○Agent ○Lifetime ○Ready         
   ╭ Filter ──────────────────────────────────────────────────────────────────╮  
   │ filter by name                                                           │  
   ╰──────────────────────────────────────────────────────────────────────────╯  

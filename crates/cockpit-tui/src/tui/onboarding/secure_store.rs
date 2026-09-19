@@ -47,7 +47,7 @@ pub(crate) struct SecureStoreScreen {
 
 impl SecureStoreScreen {
     pub(crate) fn new(capabilities: cockpit_proto::HostCapabilitySnapshot) -> Self {
-        Self {
+        let mut screen = Self {
             capabilities,
             cursor: 0,
             phase: SecureStoreInputPhase::Choice,
@@ -58,6 +58,17 @@ impl SecureStoreScreen {
             revealed: false,
             password_rect: Rect::default(),
             confirmation_rect: Rect::default(),
+        };
+        if !screen.row_enabled(screen.cursor) {
+            screen.move_choice(1);
+        }
+        screen
+    }
+
+    pub(crate) fn set_capabilities(&mut self, capabilities: cockpit_proto::HostCapabilitySnapshot) {
+        self.capabilities = capabilities;
+        if self.phase == SecureStoreInputPhase::Choice && !self.row_enabled(self.cursor) {
+            self.move_choice(1);
         }
     }
 
@@ -168,7 +179,7 @@ impl SecureStoreScreen {
         }
     }
 
-    fn move_choice(&mut self, delta: isize) {
+    pub(crate) fn move_choice(&mut self, delta: isize) {
         let mut next = self.cursor;
         for _ in 0..3 {
             next = if delta < 0 {
@@ -203,6 +214,9 @@ impl SecureStoreScreen {
         else {
             return;
         };
+        if !self.row_enabled(index) {
+            return;
+        }
         if self.cursor == index {
             self.confirm_selection(index);
         } else {
@@ -266,6 +280,10 @@ impl SecureStoreScreen {
             .is_some_and(|capability| capability.state.is_available())
     }
 
+    fn recommended_choice(&self) -> usize {
+        (0..3).find(|index| self.row_enabled(*index)).unwrap_or(0)
+    }
+
     pub(crate) fn detail_lines(&self) -> Vec<Line<'static>> {
         let descriptions = [
             "Use the operating system credential vault. No silent file fallback.",
@@ -309,23 +327,43 @@ impl SecureStoreScreen {
         match self.phase {
             SecureStoreInputPhase::Choice => {
                 let choices = [
-                    "Platform keyring (recommended)",
-                    "Passphrase-protected file",
-                    "Machine-bound encrypted file",
+                    ("Platform keyring", "recommended"),
+                    ("Passphrase-protected file", "works without a keyring"),
+                    ("Machine-bound encrypted file", "tied to this machine"),
                 ];
-                for (index, label) in choices.into_iter().enumerate() {
+                for (index, (title, available_tagline)) in choices.into_iter().enumerate() {
                     let enabled = self.row_enabled(index);
+                    let recommended = enabled && index == self.recommended_choice();
+                    let selected_row = self.cursor == index;
+                    let row_style = if !enabled {
+                        Style::default().fg(DISABLED)
+                    } else if selected_row {
+                        selected
+                    } else {
+                        Style::default().fg(INK)
+                    };
+                    let tag_style = if !enabled {
+                        Style::default().fg(DISABLED).add_modifier(Modifier::ITALIC)
+                    } else if recommended {
+                        Style::default().fg(BRASS).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(FOG)
+                    };
                     lines.push(Line::from(vec![
-                        Span::raw(if self.cursor == index { "› " } else { "  " }),
+                        Span::styled(if selected_row { "◉ " } else { "○ " }, row_style),
+                        Span::styled(title, row_style),
+                        Span::styled("  —  ", Style::default().fg(NIGHT)),
                         Span::styled(
-                            label,
-                            if !enabled {
-                                Style::default().fg(DISABLED)
-                            } else if self.cursor == index {
-                                selected
+                            if enabled {
+                                if recommended {
+                                    "recommended"
+                                } else {
+                                    available_tagline
+                                }
                             } else {
-                                Style::default().fg(INK)
+                                "unavailable"
                             },
+                            tag_style,
                         ),
                     ]));
                 }

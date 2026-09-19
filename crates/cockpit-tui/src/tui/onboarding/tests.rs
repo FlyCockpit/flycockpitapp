@@ -5,6 +5,7 @@ use super::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::layout::Position;
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
@@ -31,6 +32,24 @@ fn wheel_down(column: u16, row: u16) -> MouseEvent {
 fn wheel_up(column: u16, row: u16) -> MouseEvent {
     MouseEvent {
         kind: MouseEventKind::ScrollUp,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn drag_left(column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn release_left(column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
         column,
         row,
         modifiers: KeyModifiers::NONE,
@@ -95,6 +114,20 @@ fn render_string(shell: &mut OnboardingShell, width: u16, height: u16, engine: &
         .collect()
 }
 
+fn click_action(
+    shell: &mut OnboardingShell,
+    action_index: usize,
+    width: u16,
+    height: u16,
+    engine: &mut Dialog,
+) -> PointerOutcome {
+    let position = (0..height)
+        .flat_map(|row| (0..width).map(move |column| Position::new(column, row)))
+        .find(|position| shell.actions.clicked(*position) == Some(action_index))
+        .unwrap_or_else(|| panic!("action {action_index} must have a rendered hit target"));
+    shell.handle_mouse(click(position.x, position.y), engine)
+}
+
 // ── Welcome ──────────────────────────────────────────────────────────────
 
 #[test]
@@ -128,7 +161,75 @@ fn welcome_ignores_early_clicks_but_escape_opens_options() {
 }
 
 #[test]
+fn mouse_only_walkthrough_reaches_the_provider_catalog() {
+    const WIDTH: u16 = 100;
+    const HEIGHT: u16 = 30;
+
+    let mut shell = shell_at(OnboardingStage::Welcome);
+    let mut engine = Dialog::None;
+    shell.set_frame_for_golden(WELCOME_ANIMATION_FRAMES);
+    render_string(&mut shell, WIDTH, HEIGHT, &engine);
+    let welcome = shell.handle_mouse(click(WIDTH / 2, HEIGHT / 2), &mut engine);
+    assert!(matches!(
+        welcome.action,
+        Some(OnboardingShellAction::Transition(
+            cockpit_proto::OnboardingTransitionKind::Advance,
+            None
+        ))
+    ));
+
+    assert!(shell.sync_snapshot(&snapshot(OnboardingStage::Profile)));
+    shell.paste("Ada");
+    render_string(&mut shell, WIDTH, HEIGHT, &engine);
+    let profile = click_action(&mut shell, 0, WIDTH, HEIGHT, &mut engine);
+    assert!(
+        matches!(
+            profile.action,
+            Some(OnboardingShellAction::ApplyProfile(ref name)) if name.ends_with("Ada")
+        ),
+        "the rendered Continue button must submit the typed profile"
+    );
+
+    let mut secure = snapshot(OnboardingStage::SecureStore);
+    secure.host_capabilities =
+        secure_store_capabilities(cockpit_proto::FeatureCapabilityState::Available);
+    assert!(shell.sync_snapshot(&secure));
+    render_string(&mut shell, WIDTH, HEIGHT, &engine);
+    let machine = shell.list_row_rects[2];
+    let first = shell.handle_mouse(click(machine.x, machine.y), &mut engine);
+    assert!(first.consumed && first.action.is_none());
+    let second = shell.handle_mouse(click(machine.x, machine.y), &mut engine);
+    assert!(matches!(
+        second.action,
+        Some(OnboardingShellAction::SecureIntent(SecureStoreSubmission {
+            placement: cockpit_proto::OnboardingSecurePlacement::MachineBoundFile,
+            passphrase: None,
+        }))
+    ));
+
+    assert!(shell.sync_snapshot(&snapshot(OnboardingStage::Provider)));
+    let provider = render_string(&mut shell, WIDTH, HEIGHT, &engine);
+    assert_eq!(shell.screen_kind(), OnboardingScreenKind::ProviderSearch);
+    assert!(provider.contains("Filter"), "{provider}");
+    assert!(provider.contains("filter by name"), "{provider}");
+    assert!(provider.contains("Providers  ·  "), "{provider}");
+}
+
+#[test]
 fn profile_stage_presents_its_native_screen_and_step() {
+    assert_eq!(
+        PROGRESS_STEPS,
+        [
+            "Welcome",
+            "Name",
+            "Secure store",
+            "Provider",
+            "Model",
+            "Agent",
+            "Lifetime",
+            "Ready",
+        ]
+    );
     let mut shell = shell_at(OnboardingStage::Profile);
     let mut engine = Dialog::None;
     assert_eq!(shell.screen_kind(), OnboardingScreenKind::Profile);
@@ -367,7 +468,14 @@ fn unavailable_automatic_secure_store_never_silently_falls_back_to_file() {
         secure_store_capabilities(cockpit_proto::FeatureCapabilityState::Missing);
     let mut shell = OnboardingShell::new(&snap, false);
     let mut engine = Dialog::None;
-    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    let OnboardingScreen::SecureStore(screen) = &mut shell.screen else {
+        panic!("expected secure-store screen");
+    };
+    assert_eq!(
+        screen.cursor, 1,
+        "a missing keyring must start on the first selectable row"
+    );
+    screen.cursor = 0;
     let action = shell.handle_key(key(KeyCode::Enter), &mut engine);
     assert!(
         action.is_none(),
@@ -375,10 +483,11 @@ fn unavailable_automatic_secure_store_never_silently_falls_back_to_file() {
     );
     let rendered = render_string(&mut shell, 80, 24, &engine);
     assert!(rendered.contains("unlock-keyring"));
+    assert!(rendered.contains("Platform keyring  —  unavailable"));
+    assert!(rendered.contains("Passphrase-protected file  —  recommended"));
 
     // An explicit machine-bound selection still submits.
-    shell.handle_key(key(KeyCode::Down), &mut engine);
-    shell.handle_key(key(KeyCode::Down), &mut engine);
+    shell.handle_key(key(KeyCode::Up), &mut engine);
     match shell.handle_key(key(KeyCode::Enter), &mut engine) {
         Some(OnboardingShellAction::SecureIntent(submission)) => {
             assert_eq!(
@@ -389,6 +498,46 @@ fn unavailable_automatic_secure_store_never_silently_falls_back_to_file() {
         }
         other => panic!("expected machine-bound submission, got {other:?}"),
     }
+}
+
+#[test]
+fn secure_store_wheel_skips_disabled_rows_and_stops_on_password_step() {
+    let mut snapshot = snapshot(OnboardingStage::SecureStore);
+    snapshot.host_capabilities =
+        secure_store_capabilities(cockpit_proto::FeatureCapabilityState::Missing);
+    let mut shell = OnboardingShell::new(&snapshot, false);
+    let mut engine = Dialog::None;
+    render_string(&mut shell, 80, 24, &engine);
+    let list = shell.list_area;
+
+    let up = shell.handle_mouse(wheel_up(list.x, list.y), &mut engine);
+    assert!(up.consumed);
+    let OnboardingScreen::SecureStore(screen) = &shell.screen else {
+        panic!("expected secure-store screen");
+    };
+    assert_eq!(screen.cursor, 2, "wheel must skip the disabled keyring row");
+
+    let down = shell.handle_mouse(wheel_down(list.x, list.y), &mut engine);
+    assert!(down.consumed);
+    let OnboardingScreen::SecureStore(screen) = &shell.screen else {
+        panic!("expected secure-store screen");
+    };
+    assert_eq!(screen.cursor, 1);
+
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    let ignored = shell.handle_mouse(wheel_down(list.x, list.y), &mut engine);
+    assert!(
+        !ignored.consumed,
+        "password fields must not route wheel events to the hidden choice list"
+    );
+    let OnboardingScreen::SecureStore(screen) = &shell.screen else {
+        panic!("expected secure-store screen");
+    };
+    assert_eq!(screen.cursor, 1);
+    assert_eq!(
+        screen.phase,
+        secure_store::SecureStoreInputPhase::Passphrase
+    );
 }
 
 #[test]
@@ -730,6 +879,61 @@ fn search_wheel_scrolls_the_viewport() {
 }
 
 #[test]
+fn provider_catalog_scrollbar_drag_changes_the_viewport_and_consumes_gesture() {
+    let mut shell = shell_at(OnboardingStage::Provider);
+    let mut engine = Dialog::None;
+    render_string(&mut shell, 80, 12, &engine);
+    let scrollbar = match &shell.screen {
+        OnboardingScreen::ProviderSearch(screen) => screen.scrollbar_area(),
+        _other => panic!("expected search screen"),
+    };
+    assert!(!scrollbar.is_empty(), "small provider list must overflow");
+
+    let down = shell.handle_mouse(click(scrollbar.x, scrollbar.y), &mut engine);
+    assert!(down.consumed);
+    let OnboardingScreen::ProviderSearch(screen) = &shell.screen else {
+        panic!("expected search screen");
+    };
+    assert!(screen.dragging_scrollbar());
+    assert_eq!(screen.offset(), 0);
+
+    let bottom = scrollbar.bottom().saturating_sub(1);
+    let drag = shell.handle_mouse(drag_left(scrollbar.x, bottom), &mut engine);
+    assert!(drag.consumed);
+    let OnboardingScreen::ProviderSearch(screen) = &shell.screen else {
+        panic!("expected search screen");
+    };
+    assert!(
+        screen.offset() > 0,
+        "dragging down must change the viewport"
+    );
+    let dragged_offset = screen.offset();
+
+    let release = shell.handle_mouse(release_left(scrollbar.x, bottom), &mut engine);
+    assert!(release.consumed);
+    let after_release = shell.handle_mouse(drag_left(scrollbar.x, scrollbar.y), &mut engine);
+    assert!(!after_release.consumed);
+    let OnboardingScreen::ProviderSearch(screen) = &shell.screen else {
+        panic!("expected search screen");
+    };
+    assert!(!screen.dragging_scrollbar());
+    assert_eq!(screen.offset(), dragged_offset);
+}
+
+#[test]
+fn provider_catalog_hides_scrollbar_without_overflow() {
+    let mut shell = shell_at(OnboardingStage::Provider);
+    render_string(&mut shell, 120, 40, &Dialog::None);
+    let OnboardingScreen::ProviderSearch(screen) = &shell.screen else {
+        panic!("expected search screen");
+    };
+    assert!(
+        screen.scrollbar_area().is_empty(),
+        "a catalog that fits must not expose a scrollbar hit target"
+    );
+}
+
+#[test]
 fn search_resize_clamps_cursor_and_viewport() {
     let mut screen = ProviderSearchScreen::new();
     let total = screen.filtered().len();
@@ -796,11 +1000,17 @@ fn completion_screen_choices_are_distinct() {
     // The completion copy keeps pointing at the post-onboarding surfaces.
     assert!(rendered.contains("/setup security"));
     assert!(rendered.contains("/help"));
+    let buttons = OnboardingShell::action_buttons(&shell.screen);
+    assert!(!buttons[0].primary);
+    assert!(buttons[1].primary);
 
     // "Add another provider" is a shell-local detour (the daemon stage is
     // already Complete): the searchable catalog returns, and Escape offers
     // a local return to the stored summary instead of a daemon transition.
     shell.handle_key(key(KeyCode::Up), &mut engine);
+    let buttons = OnboardingShell::action_buttons(&shell.screen);
+    assert!(buttons[0].primary);
+    assert!(!buttons[1].primary);
     assert!(
         shell.handle_key(key(KeyCode::Enter), &mut engine).is_none(),
         "adding another provider is shell-local"

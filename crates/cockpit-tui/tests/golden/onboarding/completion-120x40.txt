@@ -2,7 +2,7 @@
                  You're ready to fly · step 8/8                                                                         
                  Your setup is complete.                                                                                
                  ────────────────────────────                                                                           
-                 ●Welcome ●Profile ●Secure store ●Provider ●Model ●Agent ●Lifetime ◐Ready                               
+                 ●Welcome ●Name ●Secure store ●Provider ●Model ●Agent ●Lifetime ◐Ready                                  
                  ╭ Summary ───────────────────────────────────────────────────────────────────────────╮                 
                  │ Cockpit is ready.                                                                  │                 
                  │ Name: Amelia · Provider: OpenAI · Agent: cockpit                                   │                 

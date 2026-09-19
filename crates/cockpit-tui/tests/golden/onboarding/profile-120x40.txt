@@ -2,7 +2,7 @@
                  What should Cockpit call you? · step 2/8                                                               
                  Set an optional display name.                                                                          
                  ────────────────────────────                                                                           
-                 ●Welcome ◐Profile ○Secure store ○Provider ○Model ○Agent ○Lifetime ○Ready                               
+                 ●Welcome ◐Name ○Secure store ○Provider ○Model ○Agent ○Lifetime ○Ready                                  
                  ╭ Name ──────────────────────────────────────────────────────────────────────────────╮                 
                  │ amelia                                                                             │                 
                  ╰────────────────────────────────────────────────────────────────────────────────────╯                 

@@ -67,7 +67,7 @@ pub(crate) const WELCOME_ANIMATION_FRAMES: usize = welcome::PROMPT_FRAME;
 /// any key" screen at a later stage (#425).
 const PROGRESS_STEPS: [&str; 8] = [
     "Welcome",
-    "Profile",
+    "Name",
     "Secure store",
     "Provider",
     "Model",
@@ -467,10 +467,9 @@ impl OnboardingShell {
     fn native_screen_for(snapshot: &OnboardingBootstrapSnapshot) -> OnboardingScreen {
         match snapshot.stage {
             // Only the authoritative Welcome stage presents the Welcome
-            // screen. `Profile` deliberately falls through to its engine
-            // screen: if the profile wizard fails to mount, the shell must
-            // still show the profile step (esc: options, back) instead of a
-            // "press any key" screen whose key handler is a no-op (#425).
+            // screen. Profile owns a native field so a failed daemon
+            // settlement keeps the user on the named step instead of
+            // remounting the legacy setup engine (#425).
             OnboardingStage::Welcome => OnboardingScreen::Welcome,
             OnboardingStage::Profile => OnboardingScreen::Profile(ProfileScreen::new()),
             OnboardingStage::SecureStore => OnboardingScreen::SecureStore(Box::new(
@@ -772,10 +771,10 @@ impl OnboardingShell {
         &mut self,
         capabilities: &cockpit_proto::HostCapabilitySnapshot,
     ) {
-        if let OnboardingScreen::SecureStore(screen) = &mut self.screen {
-            if capabilities.generation >= screen.capabilities.generation {
-                screen.capabilities = capabilities.clone();
-            }
+        if let OnboardingScreen::SecureStore(screen) = &mut self.screen
+            && capabilities.generation >= screen.capabilities.generation
+        {
+            screen.set_capabilities(capabilities.clone());
         }
     }
 
@@ -1200,12 +1199,26 @@ impl OnboardingShell {
             OnboardingScreen::SecureStore(screen) => {
                 let over_list = chrome::hit(self.list_area, pos);
                 match mouse.kind {
-                    MouseEventKind::ScrollUp if over_list => {
-                        screen.cursor = crate::tui::nav::wrap_prev(screen.cursor, 3);
+                    MouseEventKind::ScrollUp
+                        if over_list
+                            && matches!(
+                                screen.phase,
+                                secure_store::SecureStoreInputPhase::Choice
+                            ) =>
+                    {
+                        screen.move_choice(-1);
+                        screen.status = None;
                         PointerOutcome::consumed()
                     }
-                    MouseEventKind::ScrollDown if over_list => {
-                        screen.cursor = crate::tui::nav::wrap_next(screen.cursor, 3);
+                    MouseEventKind::ScrollDown
+                        if over_list
+                            && matches!(
+                                screen.phase,
+                                secure_store::SecureStoreInputPhase::Choice
+                            ) =>
+                    {
+                        screen.move_choice(1);
+                        screen.status = None;
                         PointerOutcome::consumed()
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
@@ -1232,7 +1245,9 @@ impl OnboardingShell {
                     return PointerOutcome::ignored();
                 }
                 let rects = std::mem::take(&mut self.list_row_rects);
+                let was_dragging_scrollbar = screen.dragging_scrollbar();
                 let action = screen.handle_mouse(mouse, &rects);
+                let is_dragging_scrollbar = screen.dragging_scrollbar();
                 self.list_row_rects = rects;
                 match action {
                     Some(template) => {
@@ -1244,6 +1259,16 @@ impl OnboardingShell {
                             | MouseEventKind::ScrollDown
                             | MouseEventKind::Down(MouseButton::Left)
                     ) =>
+                    {
+                        PointerOutcome::consumed()
+                    }
+                    None if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left))
+                        && (was_dragging_scrollbar || is_dragging_scrollbar) =>
+                    {
+                        PointerOutcome::consumed()
+                    }
+                    None if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
+                        && was_dragging_scrollbar =>
                     {
                         PointerOutcome::consumed()
                     }
@@ -1385,8 +1410,8 @@ impl OnboardingShell {
             OnboardingScreen::AgentAuthoring(screen) => {
                 screen.render(frame, rows[2]);
             }
-            OnboardingScreen::Complete { summary, cursor } => {
-                Self::render_complete(frame, rows[2], summary, *cursor, &mut self.list_row_rects);
+            OnboardingScreen::Complete { summary, .. } => {
+                Self::render_complete(frame, rows[2], summary, &mut self.list_row_rects);
             }
             OnboardingScreen::Engine(_) => {
                 engine.render(frame, rows[2], links);
@@ -1487,6 +1512,10 @@ impl OnboardingShell {
             }
             OnboardingScreen::AgentAuthoring(_) => vec![chrome::Button::primary("Continue")],
             OnboardingScreen::Engine(_) => vec![chrome::Button::primary("Continue")],
+            OnboardingScreen::Complete { cursor, .. } if *cursor == 0 => vec![
+                chrome::Button::primary("Add another provider"),
+                chrome::Button::secondary("Start coding"),
+            ],
             OnboardingScreen::Complete { .. } => vec![
                 chrome::Button::secondary("Add another provider"),
                 chrome::Button::primary("Start coding"),
@@ -1617,6 +1646,12 @@ impl OnboardingShell {
         let capacity = list_area.height as usize;
         screen.observe_viewport(capacity);
         let rows = screen.visible_rows(capacity);
+        let show_scrollbar = filtered > capacity && list_area.width >= 2;
+        let row_width = if show_scrollbar {
+            list_area.width.saturating_sub(1)
+        } else {
+            list_area.width
+        };
         list_row_rects.clear();
         let mut row_y = list_area.y;
         for row in &rows {
@@ -1628,14 +1663,14 @@ impl OnboardingShell {
                 Rect {
                     x: list_area.x,
                     y: row_y,
-                    width: list_area.width.saturating_sub(1),
+                    width: row_width,
                     height: 1,
                 },
             );
             list_row_rects.push(Rect {
                 x: list_area.x,
                 y: row_y,
-                width: list_area.width.saturating_sub(1),
+                width: row_width,
                 height: 1,
             });
             row_y += 1;
@@ -1655,20 +1690,24 @@ impl OnboardingShell {
                 },
             );
         }
-        let scrollbar_area = Rect {
-            x: list_area.right().saturating_sub(1),
-            y: list_area.y,
-            width: 1,
-            height: list_area.height,
-        };
-        screen.set_scrollbar_area(scrollbar_area);
-        ui::render_scrollbar(
-            frame,
-            scrollbar_area,
-            screen.filtered().len(),
-            capacity.max(1),
-            screen.offset_for_scroll(),
-        );
+        if show_scrollbar {
+            let scrollbar_area = Rect {
+                x: list_area.right().saturating_sub(1),
+                y: list_area.y,
+                width: 1,
+                height: list_area.height,
+            };
+            screen.set_scrollbar_area(scrollbar_area);
+            ui::render_scrollbar(
+                frame,
+                scrollbar_area,
+                filtered,
+                capacity.max(1),
+                screen.offset_for_scroll(),
+            );
+        } else {
+            screen.set_scrollbar_area(Rect::default());
+        }
         if let Some(status) = screen.status_paragraph() {
             frame.render_widget(status, chunks[3]);
         } else if let Some(lines) = screen.selected_detail() {
@@ -1689,7 +1728,6 @@ impl OnboardingShell {
         frame: &mut Frame,
         area: Rect,
         summary: &str,
-        cursor: usize,
         list_row_rects: &mut Vec<Rect>,
     ) {
         list_row_rects.clear();
@@ -1711,7 +1749,6 @@ impl OnboardingShell {
         let inner = block.inner(area);
         frame.render_widget(block, area);
         frame.render_widget(Paragraph::new(head).wrap(Wrap { trim: false }), inner);
-        let _ = cursor;
     }
 
     fn render_escape_menu(frame: &mut Frame, area: Rect, menu: &mut EscapeMenu) {

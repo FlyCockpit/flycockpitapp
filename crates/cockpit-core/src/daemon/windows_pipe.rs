@@ -186,13 +186,7 @@ mod tests {
 
         let sid = current_user_sid().expect("parent SID");
         let pipe_name = allocate_pipe_name(&sid).expect("allocate pipe name");
-        let child = TestChild::spawn(
-            SQUAT_FIRST_INSTANCE_MODE,
-            &pipe_name,
-            None,
-            &sid,
-            "first_instance_claim_fails_closed_on_squatted_pipe_name",
-        );
+        let child = TestChild::spawn(SQUAT_FIRST_INSTANCE_MODE, &pipe_name, None, &sid);
         wait_pipe_listening(&pipe_name);
         // Production construction claims FILE_FLAG_FIRST_PIPE_INSTANCE and
         // must fail closed while any same-user instance of the name exists.
@@ -257,7 +251,6 @@ mod tests {
             listener.pipe_name(),
             Some(&control_name),
             &sid,
-            "remote_client_is_rejected",
         )
         .finish(REMOTE_CLIENT_MODE);
         drop(control);
@@ -383,13 +376,22 @@ mod tests {
             pipe: &PipeName,
             control_pipe: Option<&PipeName>,
             sid: &str,
-            test_fn: &str,
         ) -> Self {
+            // Libtest names a test by its module path from the crate root —
+            // `daemon::windows_pipe::tests::…`, never crate-qualified — so a
+            // `module_path!()` filter (`cockpit_core::daemon::…`) matches zero
+            // tests and the child would exit 0 without ever entering its
+            // mode. The current test thread's name is exactly the full
+            // libtest name, so the filter self-maintains through renames.
+            let test_name = std::thread::current()
+                .name()
+                .expect("libtest names the test thread")
+                .to_string();
             let mut command =
                 Command::new(std::env::current_exe().expect("current test executable"));
             command
                 .arg("--exact")
-                .arg(format!("{}::{test_fn}", module_path!()))
+                .arg(&test_name)
                 .arg("--nocapture")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())

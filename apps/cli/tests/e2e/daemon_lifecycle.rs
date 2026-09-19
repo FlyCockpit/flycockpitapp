@@ -1,4 +1,23 @@
-use crate::support::{SpawnedDaemon, output_text};
+use crate::support::{IsolatedHome, SpawnedDaemon, assert_success, output_text};
+
+struct DetachedDaemonCleanup<'a>(&'a IsolatedHome);
+
+impl Drop for DetachedDaemonCleanup<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .0
+            .cockpit()
+            .args(["daemon", "stop", "--grace", "0"])
+            .output();
+        if let Some(pid) = cockpit_host::daemon_lifecycle::read_pid_file(&self.0.pid_file())
+            && cockpit_host::daemon_lifecycle::process_exists(pid)
+        {
+            // SAFETY: this best-effort test cleanup targets only the isolated
+            // daemon PID published under this test's private home.
+            let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+    }
+}
 
 #[cfg(unix)]
 #[test]
@@ -246,17 +265,71 @@ async fn sigterm_operation_allows_restart_against_same_home() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sigkill_operation_allows_restart_against_same_home() {
-    let daemon = SpawnedDaemon::start().await;
-    let old_pid = daemon.pid();
+async fn sigkill_then_client_reclaims_detached_daemon_without_manual_restart() {
+    let home = IsolatedHome::new();
+    let _cleanup = DetachedDaemonCleanup(&home);
+    home.trust_project();
 
-    daemon.sigkill().await;
-    daemon.restart_same_home().await;
+    let first = home
+        .cockpit()
+        .arg("stats")
+        .output()
+        .expect("cold stats client");
+    assert_success("cold stats client", &first, &home);
+    let old_pid = cockpit_host::daemon_lifecycle::read_pid_file(&home.pid_file())
+        .expect("cold client published detached daemon pid");
+    let rendezvous = home.pid_file().with_file_name("daemon.json");
+    assert!(home.socket_path().exists(), "cold daemon socket must exist");
+    assert!(rendezvous.exists(), "cold daemon rendezvous must exist");
 
-    let status = daemon.status().await;
-    assert_ne!(status.pid, old_pid);
+    // SAFETY: old_pid came from this test's isolated, hello-capable daemon.
+    let killed = unsafe { libc::kill(old_pid as libc::pid_t, libc::SIGKILL) };
     assert_eq!(
-        status.socket_path,
-        daemon.socket_path().display().to_string()
+        killed,
+        0,
+        "SIGKILL detached daemon {old_pid}: {}",
+        std::io::Error::last_os_error()
     );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while cockpit_host::daemon_lifecycle::process_exists(old_pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "detached daemon {old_pid} remained live after SIGKILL"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert!(home.pid_file().exists(), "SIGKILL must leave the pid file");
+    assert!(home.socket_path().exists(), "SIGKILL must leave the socket");
+    assert!(rendezvous.exists(), "SIGKILL must leave the rendezvous");
+
+    let reclaimed = home
+        .cockpit()
+        .arg("stats")
+        .output()
+        .expect("client after SIGKILL");
+    assert_success("client after SIGKILL", &reclaimed, &home);
+    let new_pid = cockpit_host::daemon_lifecycle::read_pid_file(&home.pid_file())
+        .expect("replacement daemon pid");
+    assert_ne!(new_pid, old_pid, "client must publish a new generation");
+    let replacement_status = home
+        .cockpit()
+        .args(["daemon", "status", "--json"])
+        .output()
+        .expect("replacement daemon status");
+    assert_success("replacement daemon status", &replacement_status, &home);
+    let status: serde_json::Value =
+        serde_json::from_slice(&replacement_status.stdout).expect("replacement status JSON");
+    assert_eq!(status["pid"].as_u64(), Some(u64::from(new_pid)));
+    assert_eq!(
+        status["socket_path"].as_str(),
+        Some(home.socket_path().to_string_lossy().as_ref())
+    );
+
+    let stopped = home
+        .cockpit()
+        .args(["daemon", "stop", "--grace", "0"])
+        .output()
+        .expect("stop reclaimed daemon");
+    assert_success("stop reclaimed daemon", &stopped, &home);
 }

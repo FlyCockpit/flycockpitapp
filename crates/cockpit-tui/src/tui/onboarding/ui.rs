@@ -90,6 +90,7 @@ pub(super) fn render_scrollbar(
     total: usize,
     view_h: usize,
     offset: usize,
+    dragging: bool,
 ) {
     let track = usize::from(area.height);
     if track == 0 {
@@ -106,7 +107,10 @@ pub(super) fn render_scrollbar(
     let buf = frame.buffer_mut();
     for row in 0..track {
         let (symbol, style) = if (start..start + len).contains(&row) {
-            (SCROLL_THUMB, Style::new().fg(BRASS))
+            (
+                SCROLL_THUMB,
+                Style::new().fg(if dragging { INK } else { BRASS }),
+            )
         } else {
             (SCROLL_TRACK, Style::new().fg(NIGHT))
         };

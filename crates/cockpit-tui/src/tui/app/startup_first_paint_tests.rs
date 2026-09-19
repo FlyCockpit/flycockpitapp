@@ -402,6 +402,7 @@ pub(super) async fn run_startup_trace_case(
         .reply
         .send(Ok(cockpit_client::LifecycleResolution {
             endpoint,
+            lifetime_client: None,
             owns_daemon: background_agents,
             ephemeral_owner: resolution_ephemeral,
             socket: runtime.join("fake-owner.sock"),
@@ -675,6 +676,7 @@ fn exit_rejects_every_late_startup_stage_completion() {
         endpoint: cockpit_client::ClientEndpoint::InProcess(
             cockpit_client::InProcessEndpoint::new(connections, sensitive),
         ),
+        lifetime_client: None,
         owns_daemon: true,
         ephemeral_owner: false,
         socket: std::path::PathBuf::from("late-owner.sock"),

@@ -1,0 +1,40 @@
+ ‹ Back                                                                                                                 
+                 Let's add a provider · step 4/8                                                                        
+                 Pick who you'll fly with.                                                                              
+                 ────────────────────────────                                                                           
+                 ●Welcome ●Name ●Secure store ◐Provider ○Model ○Agent ○Lifetime ○Ready                                  
+                 ╭ Filter ────────────────────────────────────────────────────────────────────────────╮                 
+                 │ filter by name                                                                     │                 
+                 ╰────────────────────────────────────────────────────────────────────────────────────╯                 
+                                                                                                                        
+                 ╭ Providers  ·  16 ──────────────────────────────────────────────────────────────────╮                 
+                 │   Codex (ChatGPT Plus/Pro)  (OAuth login)                                          │                 
+                 │   Grok (SuperGrok) — disabled pending xAI authorization  (OAuth login)  — unavaila │                 
+                 │   GitHub Copilot  (API key)                                                        │                 
+                 │   OpenAI-compatible  (API key)                                                     │                 
+                 │   OpenAI Platform API  (API key)                                                   │                 
+                 │   Grok (xAI API)  (API key)                                                        │                 
+                 │   CrofAI  (API key)                                                                │                 
+                 │   z.ai (GLM)  (API key)                                                            │                 
+                 │   Nous Research  (API key)                                                         │                 
+                 │   Baseten Model APIs  (API key)                                                    │                 
+                 │   MiniMax  (API key)                                                               │                 
+                 │   OpenCode Zen  (API key)                                                          │                 
+                 │   OpenRouter  (API key)                                                            │                 
+                 │   DeepSeek  (API key)                                                              │                 
+                 │   Anthropic (Claude API)  (API key)                                                │                 
+                 │   Xiaomi MiMo  (API key)                                                           │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 ╰────────────────────────────────────────────────────────────────────────────────────╯                 
+                 Type a few letters to narrow the list.                                                                 
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                 type to filter   ↑↓ move   click select · dbl-click choose   enter choose   [ Choose ]                 
+                                                                                                                        

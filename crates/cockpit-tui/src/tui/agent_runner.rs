@@ -2478,6 +2478,9 @@ pub async fn attach_to_session(
 #[derive(Debug, Clone)]
 pub(crate) struct SelectedLifecycle {
     pub(crate) endpoint: ClientEndpoint,
+    /// Keeps an ephemeral owner alive across lifecycle selection and the
+    /// presentation's first follow-up connection.
+    pub(crate) lifetime_client: Option<DaemonClient>,
     pub(crate) owns_daemon: bool,
     pub(crate) ephemeral_owner: bool,
     pub(crate) socket: PathBuf,
@@ -2489,6 +2492,7 @@ impl From<cockpit_client::LifecycleResolution> for SelectedLifecycle {
     fn from(value: cockpit_client::LifecycleResolution) -> Self {
         Self {
             endpoint: value.endpoint,
+            lifetime_client: value.lifetime_client,
             owns_daemon: value.owns_daemon,
             ephemeral_owner: value.ephemeral_owner,
             socket: value.socket,
@@ -2563,6 +2567,7 @@ async fn try_spawn_inner(
         let socket = daemon.socket.clone();
         let startup_notice = daemon.startup_notice.clone();
         let promoted_from_ephemeral = daemon.promoted_from_ephemeral;
+        let _lifetime_client = daemon.lifetime_client;
         let endpoint = daemon.endpoint;
         let client = DaemonClient::connect_endpoint(&endpoint)
             .await

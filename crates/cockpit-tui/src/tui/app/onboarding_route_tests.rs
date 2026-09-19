@@ -75,6 +75,15 @@ fn named_setup_wizards_mount_inside_onboarding_shell() {
                     .map(|shell| shell.screen_kind()),
                 Some(crate::tui::onboarding::OnboardingScreenKind::ProviderSearch)
             );
+        } else if wizard_id == cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID {
+            assert_eq!(
+                app.onboarding_shell
+                    .as_ref()
+                    .map(|shell| shell.screen_kind()),
+                Some(crate::tui::onboarding::OnboardingScreenKind::Profile),
+                "the profile wizard must use its native shell screen"
+            );
+            assert!(matches!(app.dialog, crate::tui::settings::Dialog::None));
         } else if wizard_id == cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID {
             // Agent authoring mounts asynchronously after the projection RPC.
         } else {

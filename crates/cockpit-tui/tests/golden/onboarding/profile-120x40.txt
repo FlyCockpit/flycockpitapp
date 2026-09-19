@@ -1,13 +1,11 @@
-                                                                                                                        
-                 Secure your secrets · step 3/8                                                                         
-                 Choose how Cockpit protects your API keys and sealed values.                                           
+ ‹ Back                                                                                                                 
+                 What should Cockpit call you? · step 2/8                                                               
+                 Set an optional display name.                                                                          
                  ────────────────────────────                                                                           
-                 ●Welcome ●Name ◐Secure store ○Provider ○Model ○Agent ○Lifetime ○Ready                                  
-                 ◉ Platform keyring  —  recommended                                                                     
-                 ○ Passphrase-protected file  —  works without a keyring                                                
-                 ○ Machine-bound encrypted file  —  tied to this machine                                                
-                                                                                                                        
-                 Use the operating system credential vault. No silent file fallback.                                    
+                 ●Welcome ◐Name ○Secure store ○Provider ○Model ○Agent ○Lifetime ○Ready                                  
+                 ╭ Name ──────────────────────────────────────────────────────────────────────────────╮                 
+                 │ amelia                                                                             │                 
+                 ╰────────────────────────────────────────────────────────────────────────────────────╯                 
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -36,5 +34,7 @@
                                                                                                                         
                                                                                                                         
                                                                                                                         
-                 ↑↓ move   click choose   enter choose   esc quit                          [ Continue ]                 
+                                                                                                                        
+                                                                                                                        
+                 type a name or leave blank  enter: continue  esc: options                 [ Continue ]                 
                                                                                                                         

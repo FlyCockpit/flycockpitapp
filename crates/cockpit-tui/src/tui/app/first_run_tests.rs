@@ -250,7 +250,7 @@ fn type_into_search(app: &mut App, text: &str) {
 }
 
 /// Walk Welcome → Profile → SecureStore → (Provider handled by the caller).
-fn advance_through_secure_store(app: &mut App, cwd: &std::path::Path) {
+fn advance_through_secure_store(app: &mut App, _cwd: &std::path::Path) {
     set_onboarding_stage(app, OnboardingStage::Welcome);
     assert_eq!(
         shell_screen_kind(app),
@@ -260,11 +260,10 @@ fn advance_through_secure_store(app: &mut App, cwd: &std::path::Path) {
 
     set_onboarding_stage(app, OnboardingStage::Profile);
     assert_eq!(
-        app.dialog.test_page_name(),
-        Some(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID)
+        shell_screen_kind(app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::Profile)
     );
-    app.dialog.test_mark_setup_complete("profile-save");
-    assert!(with_trusted_workspace(cwd, || app.service_onboarding_shell()));
+    assert!(matches!(app.dialog, crate::tui::settings::Dialog::None));
 
     set_onboarding_stage(app, OnboardingStage::SecureStore);
     assert_eq!(
@@ -285,6 +284,7 @@ fn advance_through_secure_store(app: &mut App, cwd: &std::path::Path) {
 /// the provider engine.
 fn select_provider_template(app: &mut App, query: &str) {
     type_into_search(app, query);
+    shell_key(app, KeyCode::Down);
     shell_key(app, KeyCode::Enter);
     assert!(
         app.dialog.is_provider_add(),
@@ -651,11 +651,8 @@ fn no_provider_status_is_surfaced_and_draft_preserved() {
         .iter()
         .map(|cell| cell.symbol())
         .collect();
-    assert!(rendered.contains("Cockpit setup"), "{rendered}");
-    assert!(
-        rendered.contains("Filter") || rendered.contains("type to filter"),
-        "{rendered}"
-    );
+    assert!(rendered.contains("Let's add a provider"), "{rendered}");
+    assert!(rendered.contains("Filter"), "{rendered}");
     assert!(
         !rendered.contains("draft message"),
         "the shell replaces the chat surface; the draft lives on in state"

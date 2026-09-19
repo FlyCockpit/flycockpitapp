@@ -6,8 +6,9 @@
 //! bootstrap (no vault authority), the bootstrap fetch runs
 //! `BeginOrReopenOnboarding` against the locked allowlist, Welcome advances
 //! through a real locked `ApplyOnboardingTransition`, the profile wizard's
-//! save settles through the locked bootstrap's one scoped config admission,
-//! and the secure-store choice is the real sensitive intent that
+//! save runs through the locked bootstrap's one scoped config admission and
+//! is followed by an ordinary revision-checked Profile advance, and the
+//! secure-store choice is the real sensitive intent that
 //! materializes a real vault and hands the daemon off to its ready services.
 //! From Provider onward every stage change is a real
 //! `ApplyOnboardingTransition` against the real revision CAS, and the
@@ -25,9 +26,9 @@
 //! (#391), so the settlement RPC would otherwise have no legal moment, and
 //! the locked allowlist scopes it to the onboarding profile wizard at the
 //! Profile stage (#388 deny-by-default otherwise) under the same
-//! publication gates the ready daemon enforces. The receipt settles the
-//! wizard, the shell's service poll issues the locked-admitted Advance, and
-//! the name is durable in the global config before the vault exists.
+//! publication gates the ready daemon enforces. The profile job waits for the
+//! wizard apply, then issues the locked-admitted ordinary Advance; the name is
+//! durable in the global config before the vault exists.
 //! Workspace trust is likewise a ready-service RPC, so the fixture seeds it
 //! only after the secure-store handoff.
 //!
@@ -427,8 +428,8 @@ fn complete_real_first_run_lifetime(app: &mut App, persistent_background_agents:
 
 /// Drive the real first run from the bootstrap fetch to the searchable
 /// provider catalog: Welcome key → real locked advance → the profile stage
-/// (its wizard save settled by the locked bootstrap's one scoped config
-/// admission, the shell's own service poll advancing the stage) → the real
+/// (its wizard save is admitted by the locked bootstrap's one scoped config
+/// admission, followed by an ordinary stage advance in the same job) → the real
 /// sensitive secure-store intent that materializes the vault and hands the
 /// daemon off to ready services → the Provider stage's catalog.
 fn advance_real_first_run_to_provider(app: &mut App, root: &std::path::Path) {
@@ -443,27 +444,19 @@ fn advance_real_first_run_to_provider(app: &mut App, root: &std::path::Path) {
         app,
         |app| {
             stage(app) == Some(OnboardingStage::Profile)
-                && app.dialog.test_page_name()
-                    == Some(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID)
+                && shell_kind(app) == Some(crate::tui::onboarding::OnboardingScreenKind::Profile)
         },
         "the real locked Welcome→Profile advance",
     );
 
     // Profile: type a name and submit the wizard's daemon save. The daemon
     // is still locked — no vault authority exists yet — and the profile
-    // settlement is the one config mutation the locked bootstrap admits
-    // (scoped to this wizard at this stage): the receipt settles the wizard,
-    // the shell's service poll issues the locked-admitted Advance, and the
-    // whole crossing happens on the keystroke path.
+    // save is the one config mutation the locked bootstrap admits (scoped to
+    // this wizard at this stage). The same async job waits for that apply and
+    // then issues an ordinary locked-admitted Advance.
     for ch in "Ada".chars() {
         shell_key(app, KeyCode::Char(ch));
     }
-    shell_key(app, KeyCode::Enter);
-    assert_eq!(
-        app.dialog.test_setup_step(),
-        Some("profile-save"),
-        "the profile wizard must reach its daemon-save action step"
-    );
     shell_key(app, KeyCode::Enter);
     pump_onboarding(
         app,
@@ -472,7 +465,7 @@ fn advance_real_first_run_to_provider(app: &mut App, root: &std::path::Path) {
                 && shell_kind(app)
                     == Some(crate::tui::onboarding::OnboardingScreenKind::SecureStore)
         },
-        "the locked profile settlement and the shell's own Advance to cross Profile",
+        "the locked profile save and ordinary Advance to cross Profile",
     );
     let profile_config_path = cockpit_config::dirs::global_config_dir()
         .expect("isolated global config dir")
@@ -483,7 +476,7 @@ fn advance_real_first_run_to_provider(app: &mut App, root: &std::path::Path) {
     assert_eq!(
         profile_config.name.as_deref(),
         Some("Ada"),
-        "the locked-admitted profile settlement must publish the name before the vault exists"
+        "the locked-admitted profile save must publish the name before the vault exists"
     );
 
     // Escape on the secure-store choice offers Back (AC5). The crossing is a
@@ -496,20 +489,13 @@ fn advance_real_first_run_to_provider(app: &mut App, root: &std::path::Path) {
         app,
         |app| {
             stage(app) == Some(OnboardingStage::Profile)
-                && app.dialog.test_page_name()
-                    == Some(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID)
+                && shell_kind(app) == Some(crate::tui::onboarding::OnboardingScreenKind::Profile)
         },
-        "the locked Back transition from the secure-store choice to remount the profile engine",
+        "the locked Back transition from the secure-store choice to remount the profile screen",
     );
     for ch in "Ada".chars() {
         shell_key(app, KeyCode::Char(ch));
     }
-    shell_key(app, KeyCode::Enter);
-    assert_eq!(
-        app.dialog.test_setup_step(),
-        Some("profile-save"),
-        "the remounted profile wizard must reach its daemon-save action step"
-    );
     shell_key(app, KeyCode::Enter);
     pump_onboarding(
         app,
@@ -518,7 +504,7 @@ fn advance_real_first_run_to_provider(app: &mut App, root: &std::path::Path) {
                 && shell_kind(app)
                     == Some(crate::tui::onboarding::OnboardingScreenKind::SecureStore)
         },
-        "the re-settled profile save to return to the secure-store choice",
+        "the repeated profile save and ordinary Advance to return to the secure-store choice",
     );
 
     // Secure store: choose a placement the daemon actually reports as
@@ -651,6 +637,63 @@ fn advance_real_first_run_from_provider_search_to_agent(app: &mut App) {
     );
 
     settle_agent_via_real_daemon_rpc(app);
+}
+
+#[test]
+fn real_daemon_profile_continue_advances_to_secure_store_and_persists_name() {
+    let tmp = cockpit_test_support::latency_isolated_tempdir();
+    let fixture = real_daemon_onboarding(tmp.path());
+    let _enter = fixture.runtime.enter();
+    crate::tui::settings::with_settings_daemon_effect(
+        Arc::new(InProcessSettingsDaemonEffect),
+        || {
+            let cockpit = tmp.path().join(".cockpit");
+            std::fs::create_dir_all(&cockpit).unwrap();
+            ConfigDoc::load(&cockpit.join("config.json"))
+                .unwrap()
+                .write(&ProvidersConfig::default())
+                .unwrap();
+
+            let mut app = real_first_run_app(tmp.path());
+            pump_onboarding(
+                &mut app,
+                |app| {
+                    shell_kind(app) == Some(crate::tui::onboarding::OnboardingScreenKind::Welcome)
+                },
+                "the locked bootstrap snapshot to open Welcome",
+            );
+            shell_key(&mut app, KeyCode::Enter);
+            pump_onboarding(
+                &mut app,
+                |app| {
+                    stage(app) == Some(OnboardingStage::Profile)
+                        && shell_kind(app)
+                            == Some(crate::tui::onboarding::OnboardingScreenKind::Profile)
+                },
+                "the ordinary Welcome advance to Profile",
+            );
+            for ch in "Ada".chars() {
+                shell_key(&mut app, KeyCode::Char(ch));
+            }
+            shell_key(&mut app, KeyCode::Enter);
+            pump_onboarding(
+                &mut app,
+                |app| {
+                    stage(app) == Some(OnboardingStage::SecureStore)
+                        && shell_kind(app)
+                            == Some(crate::tui::onboarding::OnboardingScreenKind::SecureStore)
+                },
+                "the profile wizard apply followed by an ordinary Profile advance",
+            );
+
+            let config = cockpit_config::extended::ExtendedConfigDoc::load(
+                &cockpit_config::dirs::global_config_file().expect("isolated global config path"),
+            )
+            .expect("profile Continue wrote the global config")
+            .config();
+            assert_eq!(config.name.as_deref(), Some("Ada"));
+        },
+    );
 }
 
 #[test]

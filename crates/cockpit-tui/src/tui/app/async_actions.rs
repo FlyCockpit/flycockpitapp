@@ -1298,6 +1298,7 @@ impl App {
             },
             AsyncActionKind::DaemonRpc(
                 label @ ("onboarding.transition"
+                | "onboarding.profile"
                 | "onboarding.secure_intent"
                 | "onboarding.ready_retry"),
             ) => {
@@ -4153,6 +4154,7 @@ fn stale_completion_requires_reducer(kind: &AsyncActionKind) -> bool {
                 | "goal-settings.effect"
                 | "mcp.local"
                 | "onboarding.bootstrap"
+                | "onboarding.profile"
                 | "onboarding.ready_retry"
                 | "onboarding.secure_intent"
                 | "onboarding.transition"

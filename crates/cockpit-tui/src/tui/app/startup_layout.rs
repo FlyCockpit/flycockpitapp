@@ -428,14 +428,17 @@ impl App {
                 crate::tui::onboarding::reduced_motion_enabled(),
             )));
         }
+        if wizard_id == cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID {
+            self.dialog = Dialog::None;
+            return;
+        }
         match Dialog::onboarding_wizard_engine(wizard_id, preselected_model, None) {
             Ok(dialog) => {
                 self.dialog = dialog;
                 if let Some(shell) = self.onboarding_shell.as_mut() {
                     shell.present_engine(match wizard_id {
-                        cockpit_core::wizard::SECURITY_WIZARD_ID
-                        | cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID => {
-                            crate::tui::onboarding::EngineStage::Profile
+                        cockpit_core::wizard::SECURITY_WIZARD_ID => {
+                            crate::tui::onboarding::EngineStage::Generic
                         }
                         cockpit_core::wizard::MODEL_WIZARD_ID
                         | cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID => {
@@ -798,15 +801,8 @@ impl App {
     fn mount_onboarding_engine(&mut self, stage: cockpit_proto::OnboardingStage) {
         use cockpit_proto::OnboardingStage;
         match stage {
-            OnboardingStage::Welcome | OnboardingStage::SecureStore => {
+            OnboardingStage::Welcome | OnboardingStage::Profile | OnboardingStage::SecureStore => {
                 self.dialog = crate::tui::settings::Dialog::None;
-            }
-            OnboardingStage::Profile => {
-                self.mount_onboarding_wizard(
-                    cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
-                    None,
-                    None,
-                );
             }
             OnboardingStage::Provider => {
                 if self.dialog.is_provider_add() {
@@ -879,9 +875,6 @@ impl App {
                 self.dialog = dialog;
                 if let Some(shell) = self.onboarding_shell.as_mut() {
                     shell.present_engine(match wizard_id {
-                        cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID => {
-                            crate::tui::onboarding::EngineStage::Profile
-                        }
                         cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID => {
                             crate::tui::onboarding::EngineStage::Lifetime
                         }
@@ -1323,6 +1316,17 @@ impl App {
             Some(OnboardingShellAction::SecureIntent(submission)) => {
                 self.apply_onboarding_secure_intent(submission);
             }
+            Some(OnboardingShellAction::ApplyProfile(name)) => {
+                if self
+                    .onboarding_shell
+                    .as_ref()
+                    .is_some_and(|shell| shell.transition_pending())
+                {
+                    self.show_toast("Still applying the previous step…", super::ToastKind::Info);
+                    return;
+                }
+                self.apply_onboarding_profile(name);
+            }
             Some(OnboardingShellAction::SelectTemplate(template)) => {
                 // Mount the provider engine seeded with the canonical
                 // template chosen from the searchable catalog.
@@ -1635,6 +1639,131 @@ impl App {
         }
     }
 
+    fn apply_onboarding_profile(&mut self, name: String) {
+        let Some(snapshot) = self.onboarding_snapshot.clone() else {
+            self.show_toast(
+                "Onboarding checkpoint is unavailable",
+                super::ToastKind::Error,
+            );
+            return;
+        };
+        let mut run = match cockpit_core::wizard::WizardRun::new(
+            cockpit_core::wizard::onboarding_profile_descriptor(),
+        ) {
+            Ok(run) => run,
+            Err(error) => {
+                self.show_toast(
+                    format!("Could not prepare profile: {error}"),
+                    super::ToastKind::Error,
+                );
+                return;
+            }
+        };
+        if let Err(error) = run.submit(cockpit_core::wizard::WizardAnswer::Text(name)) {
+            self.show_toast(error, super::ToastKind::Error);
+            return;
+        }
+        let answers_json = match run.answers_json() {
+            Ok(answers) => answers,
+            Err(error) => {
+                self.show_toast(
+                    format!("Could not prepare profile: {error}"),
+                    super::ToastKind::Error,
+                );
+                return;
+            }
+        };
+        let project_root = match cockpit_config::config::dirs::global_config_dir() {
+            Ok(root) => root.display().to_string(),
+            Err(error) => {
+                self.show_toast(
+                    format!("Could not resolve global Cockpit config: {error}"),
+                    super::ToastKind::Error,
+                );
+                return;
+            }
+        };
+        let generation = self.startup_background.generation;
+        let run_id = snapshot.run_id;
+        let attempt_id = snapshot.attempt_id;
+        let expected_revision = snapshot.revision;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let lifecycle = self.lifecycle.clone();
+        let selected_endpoint = self
+            .startup_lifecycle
+            .as_ref()
+            .map(|selected| selected.endpoint.clone());
+        if let Some(shell) = self.onboarding_shell.as_mut() {
+            shell.latch_transition(
+                snapshot.revision,
+                cockpit_proto::OnboardingTransitionKind::Advance,
+            );
+        }
+        let pending_request_id = request_id.clone();
+        let started = self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.profile"),
+            crate::tui::async_action::AsyncActionPolicy::Dedupe(
+                crate::tui::async_action::AsyncActionKey::new("onboarding.profile"),
+            ),
+            async move {
+                let endpoint =
+                    onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref()).await?;
+                let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let response = client
+                    .request(cockpit_proto::Request::ApplySetupWizard {
+                        client_operation_id: uuid::Uuid::new_v4().to_string(),
+                        project_root,
+                        wizard_id: cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID.to_string(),
+                        answers_json,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+                match response {
+                    Ok(cockpit_proto::Response::SetupWizardApplied { .. }) => {}
+                    Ok(other) => return Err(format!("unexpected profile response: {other:?}")),
+                    Err(error) => return Err(error.to_string()),
+                }
+                let transition = cockpit_proto::ApplyOnboardingTransition {
+                    run_id,
+                    attempt_id,
+                    expected_revision,
+                    client_operation_id: request_id.clone(),
+                    transition: cockpit_proto::OnboardingTransitionKind::Advance,
+                    settlement: None,
+                };
+                match client
+                    .request(cockpit_proto::Request::ApplyOnboardingTransition(
+                        transition,
+                    ))
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    Ok(cockpit_proto::Response::OnboardingTransition(result)) => Ok(
+                        crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
+                            StartupOnboardingCompletion {
+                                generation,
+                                run_id,
+                                attempt_id,
+                                expected_revision,
+                                request_id,
+                                receipt: Some(result.receipt),
+                                snapshot: Some(result.snapshot),
+                            },
+                        ),
+                    ),
+                    Ok(other) => Err(format!("unexpected onboarding response: {other:?}")),
+                    Err(error) => Err(error.to_string()),
+                }
+            },
+        );
+        if let crate::tui::async_action::AsyncActionStart::Started(id) = started {
+            self.pending_startup_onboarding_operations
+                .insert(id, pending_request_id);
+        }
+    }
+
     /// Service the full-screen onboarding shell each wake: reconcile the
     /// provider-engine pairing, advance stages whose engine settled,
     /// commit the terminal transition once the lifetime stage settles, and
@@ -1673,22 +1802,8 @@ impl App {
                 false
             }
             cockpit_proto::OnboardingStage::Welcome
+            | cockpit_proto::OnboardingStage::Profile
             | cockpit_proto::OnboardingStage::SecureStore => false,
-            cockpit_proto::OnboardingStage::Profile => {
-                if !shell.screen_is_engine(crate::tui::onboarding::EngineStage::Profile)
-                    || !self.dialog.setup_wizard_is_complete(
-                        cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
-                    )
-                {
-                    return false;
-                }
-                self.refresh_bootstrap_config_snapshot();
-                self.request_onboarding_transition(
-                    cockpit_proto::OnboardingTransitionKind::Advance,
-                    None,
-                );
-                true
-            }
             cockpit_proto::OnboardingStage::Provider => {
                 if !shell.screen_is_engine(crate::tui::onboarding::EngineStage::Provider) {
                     return false;

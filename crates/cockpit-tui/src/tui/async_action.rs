@@ -194,6 +194,7 @@ impl AsyncActionKind {
                 | "mcp.local"
                 | "note"
                 | "onboarding.bootstrap"
+                | "onboarding.profile"
                 | "onboarding.ready_retry"
                 | "onboarding.secure_intent"
                 | "onboarding.transition"

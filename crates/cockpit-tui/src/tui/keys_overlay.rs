@@ -22,7 +22,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -200,6 +200,51 @@ const COMPOSER: KeyGroup = KeyGroup {
             desc: "insert a newline (Alt+Enter also)",
         },
         KeyBinding {
+            key: "Ctrl+P",
+            action: "model",
+            desc: "open the composer model picker",
+        },
+        KeyBinding {
+            key: "Ctrl+E",
+            action: "effort",
+            desc: "open the composer effort picker",
+        },
+        KeyBinding {
+            key: "Ctrl+B",
+            action: "sessions",
+            desc: "toggle the session sidebar",
+        },
+        KeyBinding {
+            key: "Ctrl+N",
+            action: "new session",
+            desc: "start a fresh session",
+        },
+        KeyBinding {
+            key: "Alt+↑/↓",
+            action: "switch session",
+            desc: "resume the previous or next session",
+        },
+        KeyBinding {
+            key: "Ctrl+↑",
+            action: "enter queue",
+            desc: "focus queued messages from an empty composer",
+        },
+        KeyBinding {
+            key: "Ctrl+K b",
+            action: "btw focus",
+            desc: "toggle focus for an open /btw pane",
+        },
+        KeyBinding {
+            key: "Ctrl+K n",
+            action: "scratchpad",
+            desc: "open the project scratchpad",
+        },
+        KeyBinding {
+            key: "Ctrl+K r",
+            action: "reveal",
+            desc: "toggle original inputs and compact briefs",
+        },
+        KeyBinding {
             key: "Ctrl+T",
             action: "thinking",
             desc: "toggle reasoning blocks",
@@ -238,11 +283,6 @@ const COMPOSER: KeyGroup = KeyGroup {
             key: "Home",
             action: "sticky header",
             desc: "jump to the pinned previous user message (empty composer)",
-        },
-        KeyBinding {
-            key: "Ctrl+N",
-            action: "scratchpad",
-            desc: "open the project scratchpad",
         },
         KeyBinding {
             key: "Ctrl+G",
@@ -306,7 +346,7 @@ const BTW_PANE: KeyGroup = KeyGroup {
     title: "BTW pane",
     bindings: &[
         KeyBinding {
-            key: "Ctrl+B",
+            key: "Ctrl+K b",
             action: "focus",
             desc: "toggle focus between the btw pane and main composer",
         },
@@ -441,21 +481,21 @@ pub const DIALOG_BINDINGS: &[DialogBinding] = &[
     },
     DialogBinding {
         id: DialogBindingId::Expand,
-        key: "Ctrl+E",
+        key: "Tab",
         action: "expand",
         desc: "expand or collapse the dialog",
-        footer: "ctrl+e: expand",
-        priority: 90,
+        footer: "tab: [More]",
+        priority: 4,
         requires_keyboard_enhancement: false,
         which_key: true,
     },
     DialogBinding {
         id: DialogBindingId::Collapse,
-        key: "Ctrl+E",
+        key: "Tab",
         action: "collapse",
         desc: "collapse the dialog",
-        footer: "ctrl+e: collapse",
-        priority: 90,
+        footer: "tab: [Less]",
+        priority: 4,
         requires_keyboard_enhancement: false,
         which_key: false,
     },
@@ -782,8 +822,10 @@ impl KeysOverlay {
 
     /// Render the overlay into `area`. Bottom-anchored over the chat body so
     /// the fixed chrome (cwd + git branch + context + active agent) stays
-    /// visible — never permanently covered. Scrolls when the rows exceed the
-    /// available height.
+    /// visible — never permanently covered. The context group scrolls in
+    /// the body; the always-live Global group is pinned above the help row
+    /// so globals stay visible no matter how long the context group is
+    /// (the #445 chords grew Composer past a 24-row body).
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         // A clear under the overlay so the chat doesn't bleed through, then a
         // titled, rounded box. Anchored to the bottom of the body, capped to
@@ -792,9 +834,10 @@ impl KeysOverlay {
             self.last_body_height = 0;
             return;
         }
-        let lines = self.body_lines();
-        let want = (lines.len() as u16).saturating_add(3); // borders + help row
-        let h = want.min(area.height);
+        let context_lines = self.context_lines();
+        let global_lines = self.global_lines();
+        let want = (context_lines.len() + global_lines.len()).saturating_add(3); // borders + help row
+        let h = (want as u16).min(area.height);
         let y = area.y + area.height.saturating_sub(h);
         let rect = Rect::new(area.x, y, area.width, h);
 
@@ -806,18 +849,21 @@ impl KeysOverlay {
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
 
-        let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
-        let body = layout[0];
-        let help_area = layout[1];
+        let layout = self.split_sections(inner, global_lines.len());
+        let (body, globals, help_area) = layout;
 
-        self.last_content_rows = lines.len();
+        self.last_content_rows = context_lines.len();
         self.last_body_height = body.height as usize;
         let max_scroll = self.last_content_rows.saturating_sub(self.last_body_height);
         if self.scroll > max_scroll {
             self.scroll = max_scroll;
         }
 
-        frame.render_widget(Paragraph::new(lines).scroll((self.scroll as u16, 0)), body);
+        frame.render_widget(
+            Paragraph::new(context_lines).scroll((self.scroll as u16, 0)),
+            body,
+        );
+        frame.render_widget(Paragraph::new(global_lines), globals);
 
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         frame.render_widget(
@@ -827,6 +873,38 @@ impl KeysOverlay {
             ))),
             help_area,
         );
+    }
+
+    /// Split the boxed inner area into (scrolling body, pinned globals,
+    /// help row). Deterministic — no layout-solver arbitration: the help
+    /// row takes at most one row, the pinned globals are capped so at least
+    /// one context row keeps scrolling whenever anything is left above the
+    /// help row, and the context body takes the remainder.
+    fn split_sections(&self, inner: Rect, global_rows: usize) -> (Rect, Rect, Rect) {
+        let available = inner.height as usize;
+        let help_h = available.min(1);
+        let rest = available - help_h;
+        let globals_h = global_rows.min(rest.saturating_sub(1));
+        let body_h = rest - globals_h;
+        let body = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: body_h as u16,
+        };
+        let globals = Rect {
+            x: inner.x,
+            y: body.y + body.height,
+            width: inner.width,
+            height: globals_h as u16,
+        };
+        let help = Rect {
+            x: inner.x,
+            y: globals.y + globals.height,
+            width: inner.width,
+            height: help_h as u16,
+        };
+        (body, globals, help)
     }
 
     /// The title suffix naming the active context (the context group's
@@ -853,10 +931,61 @@ impl KeysOverlay {
         }
     }
 
-    /// Assemble every body row as owned [`Line`]s — a heading per group then
-    /// its key/action/desc rows. Pure (reads only `self.groups`), so the
-    /// listing is unit-testable without a terminal.
+    /// Assemble the full ordered listing — context rows, a blank separator,
+    /// then the pinned globals. Test-only mirror of what [`Self::render`]
+    /// draws; [`Self::context_lines`] and [`Self::global_lines`] are the
+    /// production halves.
+    #[cfg(test)]
     fn body_lines(&self) -> Vec<Line<'static>> {
+        let mut out = self.context_lines();
+        if !out.is_empty() {
+            out.push(Line::default());
+        }
+        out.extend(self.global_lines());
+        out
+    }
+
+    /// The scrolling body rows: every group except the last, in order,
+    /// separated by blank rows.
+    fn context_lines(&self) -> Vec<Line<'static>> {
+        let key_w = self.key_width();
+        let mut out: Vec<Line<'static>> = Vec::new();
+        let scrollable = self.groups.len().saturating_sub(1);
+        for (gi, group) in self.groups[..scrollable].iter().enumerate() {
+            if gi > 0 {
+                out.push(Line::default());
+            }
+            out.extend(Self::group_lines(group, key_w));
+        }
+        out
+    }
+
+    /// The pinned footer rows: the always-live last group (Global), so
+    /// globals stay visible no matter how long the context group is.
+    fn global_lines(&self) -> Vec<Line<'static>> {
+        let key_w = self.key_width();
+        self.groups
+            .last()
+            .map(|group| Self::group_lines(group, key_w))
+            .unwrap_or_default()
+    }
+
+    /// Column width for the key glyph — widest key across all groups,
+    /// capped so a stray long chord can't blow out the layout. Shared by
+    /// the scrolling body and the pinned footer so the columns line up.
+    fn key_width(&self) -> usize {
+        self.groups
+            .iter()
+            .flat_map(|g| g.bindings.iter())
+            .map(|b| b.key.chars().count())
+            .max()
+            .unwrap_or(0)
+            .clamp(1, 14)
+    }
+
+    /// One group as rendered rows: its styled heading, then a
+    /// key/action/desc row per binding.
+    fn group_lines(group: &OwnedKeyGroup, key_w: usize) -> Vec<Line<'static>> {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         let key_style = Style::default()
             .fg(Color::Yellow)
@@ -864,40 +993,22 @@ impl KeysOverlay {
         let action_style = Style::default()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD);
-
-        // Column width for the key glyph — widest key across all groups,
-        // capped so a stray long chord can't blow out the layout.
-        let key_w = self
-            .groups
-            .iter()
-            .flat_map(|g| g.bindings.iter())
-            .map(|b| b.key.chars().count())
-            .max()
-            .unwrap_or(0)
-            .clamp(1, 14);
-
-        let mut out: Vec<Line<'static>> = Vec::new();
-        for (gi, group) in self.groups.iter().enumerate() {
-            if gi > 0 {
-                out.push(Line::default());
-            }
-            out.push(Line::from(Span::styled(
-                group.title.to_string(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            for b in &group.bindings {
-                let pad = key_w.saturating_sub(b.key.chars().count());
-                out.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(b.key.to_string(), key_style),
-                    Span::raw(" ".repeat(pad + 2)),
-                    Span::styled(format!("{:<14}", b.action), action_style),
-                    Span::raw(" "),
-                    Span::styled(b.desc.to_string(), muted),
-                ]));
-            }
+        let mut out = vec![Line::from(Span::styled(
+            group.title.to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))];
+        for b in &group.bindings {
+            let pad = key_w.saturating_sub(b.key.chars().count());
+            out.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(b.key.to_string(), key_style),
+                Span::raw(" ".repeat(pad + 2)),
+                Span::styled(format!("{:<14}", b.action), action_style),
+                Span::raw(" "),
+                Span::styled(b.desc.to_string(), muted),
+            ]));
         }
         out
     }
@@ -965,6 +1076,19 @@ mod tests {
         assert!(text.contains("live tail"));
         assert!(text.contains("Home"));
         assert!(text.contains("sticky header"));
+        for chord in [
+            "Ctrl+P",
+            "Ctrl+E",
+            "Ctrl+B",
+            "Ctrl+N",
+            "Alt+↑/↓",
+            "Ctrl+↑",
+            "Ctrl+K b",
+            "Ctrl+K n",
+            "Ctrl+K r",
+        ] {
+            assert!(text.contains(chord), "missing re-homed chord {chord}");
+        }
     }
 
     #[test]

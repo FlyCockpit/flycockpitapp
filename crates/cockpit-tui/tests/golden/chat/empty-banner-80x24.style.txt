@@ -21,6 +21,6 @@
 18	28:Indexed(109)/Reset/- 52:Reset/Reset/-
 19	28:Indexed(109)/Reset/- 52:Reset/Reset/-
 20	80:White/Reset/-
-21	3:White/Reset/- 54:Indexed(109)/Reset/- 14:Reset/Reset/- 8:Rgb(138,155,176)/Reset/- 1:White/Reset/-
+21	3:White/Reset/- 63:Indexed(109)/Reset/- 5:Reset/Reset/- 8:Rgb(138,155,176)/Reset/- 1:White/Reset/-
 22	1:White/Reset/- 9:White/Reset/BOLD 1:White/Reset/- 7:White/Reset/BOLD 1:White/Reset/- 8:White/Reset/BOLD 1:White/Reset/- 21:White/Reset/BOLD 1:White/Reset/- 13:White/Reset/BOLD 10:White/Reset/- 6:White/Reset/BOLD 1:White/Reset/-
 23	11:Indexed(109)/Reset/- 69:Reset/Reset/-

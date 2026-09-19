@@ -528,7 +528,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "scratchpad",
-        description: "Open the project scratchpad (editable markdown notes; also Ctrl+N)",
+        description: "Open the project scratchpad (editable markdown notes; also Ctrl+K n)",
         takes_args: false,
         run: run_scratchpad,
         available: available_always,
@@ -916,7 +916,7 @@ fn run_fetch_models(app: &mut App, _: &str) -> bool {
 }
 
 fn run_model(app: &mut App, _: &str) -> bool {
-    app.open_model_picker();
+    app.open_composer_picker_from_chord(crate::tui::composer_controls::ComposerControlKind::Model);
     false
 }
 

@@ -150,8 +150,44 @@ impl App {
             }
             return;
         }
+        if self.composer_controls.picker_scroll_drag {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
+                    self.drag_composer_picker_scrollbar(mouse.row);
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.end_composer_picker_scroll_drag();
+                }
+                _ => {}
+            }
+            return;
+        }
+        let pointer_in_composer_picker = self
+            .composer_controls
+            .picker_rect
+            .is_some_and(|rect| point_in(rect, mouse.column, mouse.row));
+        if pointer_in_composer_picker {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.move_open_composer_picker(-1);
+                    return;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.move_open_composer_picker(1);
+                    return;
+                }
+                MouseEventKind::Down(MouseButton::Left)
+                    if self.begin_composer_picker_scroll_drag(mouse.column, mouse.row) =>
+                {
+                    return;
+                }
+                _ => {}
+            }
+        }
         if matches!(mouse.kind, MouseEventKind::Moved) {
-            if self.session_rail_owns_pointer(mouse.column, mouse.row) {
+            if !pointer_in_composer_picker
+                && self.session_rail_owns_pointer(mouse.column, mouse.row)
+            {
                 self.link_registry.clear_hover();
                 self.hovered_suggestion = None;
                 self.hovered_control_chip = None;
@@ -163,6 +199,18 @@ impl App {
             }
             if self.mouse_capture {
                 let _ = self.button_registry.handle_mouse(mouse);
+                let hovered_picker_row = self
+                    .button_registry
+                    .hit(mouse.column, mouse.row)
+                    .and_then(|target| match &target.dispatch {
+                        crate::tui::button::ButtonDispatch::ComposerPickerRow { index } => {
+                            Some(*index)
+                        }
+                        _ => None,
+                    });
+                if let Some(index) = hovered_picker_row {
+                    self.hover_composer_picker_row(index);
+                }
                 self.update_queue_pointer(mouse);
                 let _link_hover_changed = self.link_registry.update_hover(mouse.column, mouse.row);
             } else {
@@ -197,7 +245,7 @@ impl App {
         // Overlay/compact rails paint over the transcript. Hits in that rect
         // belong to the rail, not to hidden links or pin/fork chips. Body-owning
         // dialogs (settings/wizard) outrank the rail for every event kind.
-        if self.session_rail_owns_pointer(mouse.column, mouse.row) {
+        if !pointer_in_composer_picker && self.session_rail_owns_pointer(mouse.column, mouse.row) {
             self.link_registry.clear_hover();
             self.link_pointer_gesture.cancel();
             self.pending_link_activation = None;
@@ -700,7 +748,9 @@ impl App {
             self.invalidate_primary_paste();
             self.sync_mouse_capture_from_dialog();
             self.resync_config_after_local_write();
-            if let Some(provider) = self.reopen_model_picker_after_settings.take() {
+            if self.reopen_composer_model_picker_after_provider_settings() {
+                self.reopen_model_picker_draft_after_settings = None;
+            } else if let Some(provider) = self.reopen_model_picker_after_settings.take() {
                 self.open_model_picker_for_provider(&provider);
                 if let (Some(draft), Overlay::ModelPicker(picker)) = (
                     self.reopen_model_picker_draft_after_settings.take(),
@@ -741,7 +791,9 @@ impl App {
                 self.copy_persistent_notice_fix_command();
             }
             crate::tui::button::ButtonDispatch::PersistentNoticeSwitchModel => {
-                self.open_model_picker();
+                self.open_composer_picker_from_chord(
+                    crate::tui::composer_controls::ComposerControlKind::Model,
+                );
             }
             crate::tui::button::ButtonDispatch::PersistentNoticeFixProvider => {
                 self.open_auth_failure_provider();

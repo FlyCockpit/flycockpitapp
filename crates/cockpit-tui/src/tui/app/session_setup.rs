@@ -614,6 +614,7 @@ impl App {
                 &self.usage_models,
             );
         }
+        self.refresh_open_composer_model_picker();
         if let Overlay::SessionSetup(pane) = &mut self.overlay {
             pane.apply_snapshot(snapshot.clone());
         }

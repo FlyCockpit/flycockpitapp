@@ -5,7 +5,7 @@ use crate::support::{
     COMPOSER_PLACEHOLDER, EXCLUDED_POISON_KEYS, HERMETIC_ENV_KEYS, HERMETIC_LOCALE,
     HERMETIC_PTY_SHELL, HERMETIC_TERM, HermeticCockpit, HermeticLaunchKind, HermeticLaunchSpec,
     HermeticProfile, INITIAL_PTY_COLS, InheritedEnvironmentModel, REMOTE_OSC52_SSH_CONNECTION,
-    UNWANTED_STARTUP_MARKERS,
+    UNWANTED_STARTUP_MARKERS, wait_until_blocking,
 };
 
 #[test]
@@ -43,6 +43,90 @@ fn tui_pty_fixture_launches_and_reaps() {
             },
         )
         .expect("resize current-screen assertion");
+
+    session.type_line("/exit");
+    session.wait_for_child_exit();
+    session.reap();
+    session.assert_reaped();
+}
+
+#[test]
+fn tui_pty_ctrl_p_changes_session_model_and_ctrl_enter_persists_default() {
+    let mut session = HermeticCockpit::launch_ready(HermeticProfile::Default);
+
+    session.write_bytes(b"\x10");
+    session
+        .wait_until_screen("model provider picker", Duration::from_secs(5), |screen| {
+            screen.contains("local") && screen.contains("models")
+        })
+        .expect("Ctrl+P opens provider level");
+    session.settle_visible_state(Duration::from_secs(3));
+    // Real Enter (`\r`). A raw `\n` byte is delivered as Ctrl+J in raw
+    // mode, which is the session-rail focus chord, not Enter.
+    session.send_enter();
+    session
+        .wait_until_screen("model item picker", Duration::from_secs(5), |screen| {
+            screen.contains("scripted") && screen.contains("fallback")
+        })
+        .expect("Enter drills into models");
+    session.settle_visible_state(Duration::from_secs(3));
+    session.write_bytes(b"\x1b[A");
+    session.settle_visible_state(Duration::from_secs(3));
+    session.send_enter();
+    session
+        .wait_until_screen("session model changed", Duration::from_secs(10), |screen| {
+            screen.contains("[local/fallback]") && !screen.contains("ctrl+enter default")
+        })
+        .expect("arrow plus Enter changes the session model");
+
+    session.write_bytes(b"\x10");
+    session
+        .wait_until_screen(
+            "model provider picker again",
+            Duration::from_secs(5),
+            |screen| screen.contains("local") && screen.contains("models"),
+        )
+        .expect("Ctrl+P reopens provider level");
+    session.settle_visible_state(Duration::from_secs(3));
+    session.send_enter();
+    session
+        .wait_until_screen(
+            "model item picker again",
+            Duration::from_secs(5),
+            |screen| {
+                screen.contains("scripted")
+                    && screen.contains("fallback")
+                    && screen.contains("› fallback")
+            },
+        )
+        .expect("Enter drills into models again with the session model selected");
+    session.settle_visible_state(Duration::from_secs(3));
+    session.write_bytes(b"\x1b[13;5u");
+    session
+        .wait_until_screen(
+            "Ctrl+Enter closes the picker",
+            Duration::from_secs(5),
+            |screen| !screen.contains("ctrl+enter default"),
+        )
+        .expect("Ctrl+Enter commits the selected model");
+    let config_path = session.home().config_dir().join("config.json");
+    session.settle_visible_state(Duration::from_secs(3));
+    wait_until_blocking(
+        "Ctrl+Enter persisted fallback default",
+        Duration::from_secs(10),
+        || {
+            std::fs::read_to_string(&config_path)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .and_then(|raw| {
+                    raw.pointer("/active_model/model")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .as_deref()
+                == Some("fallback")
+        },
+    );
 
     session.type_line("/exit");
     session.wait_for_child_exit();

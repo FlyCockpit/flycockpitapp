@@ -2713,6 +2713,7 @@ pub struct App {
     /// editor restores the picker immediately; a later daemon snapshot may
     /// refresh that still-open picker's inventory exactly once.
     pub(super) reopen_model_picker_after_settings: Option<String>,
+    pub(super) reopen_composer_model_picker_after_settings: Option<String>,
     pub(super) reopen_model_picker_draft_after_settings:
         Option<cockpit_config::providers::ActiveModelRef>,
     pub(super) refresh_reopened_model_picker_after_settings: Option<String>,
@@ -4236,6 +4237,7 @@ impl App {
             pending_default_model_update_id: None,
             retry_model_selections: HashMap::new(),
             reopen_model_picker_after_settings: None,
+            reopen_composer_model_picker_after_settings: None,
             reopen_model_picker_draft_after_settings: None,
             refresh_reopened_model_picker_after_settings: None,
             submit_after_model_selection: false,

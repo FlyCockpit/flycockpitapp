@@ -676,10 +676,6 @@ impl BtwPane {
     }
 
     pub(super) fn handle_focused_key(&mut self, key: KeyEvent) -> BtwFocusedKeyOutcome {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('b')) {
-            self.focused = false;
-            return BtwFocusedKeyOutcome::Consumed;
-        }
         if matches!(key.code, KeyCode::F(11)) {
             self.zoomed = !self.zoomed;
             return BtwFocusedKeyOutcome::Consumed;

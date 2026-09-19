@@ -11,7 +11,10 @@ use crate::tui::composer_controls::{
 use crate::tui::tools_pane::ToolsOutcome;
 use cockpit_client::presentation::{ControlRequestId, ControlRequestOutcome};
 use cockpit_config::extended::ApprovalMode;
-use cockpit_config::providers::{ActiveModelRef, ModelEntry, ProviderEntry};
+use cockpit_config::providers::{
+    ActiveModelRef, CapabilityValue, ModelEntry, ProviderEntry, ReasoningEffortCapability,
+    ThinkingMode,
+};
 use cockpit_core::agents::{ToolTier, legal_tool_tiers};
 use cockpit_proto::{QueueDeliveryClass, QueueItemStatus, QueueTarget, Request, SandboxMode};
 use crossterm::event::{
@@ -26,6 +29,15 @@ fn press(code: KeyCode) -> KeyEvent {
     KeyEvent {
         code,
         modifiers: KeyModifiers::empty(),
+        kind: KeyEventKind::Press,
+        state: KeyEventState::empty(),
+    }
+}
+
+fn ctrl(code: KeyCode) -> KeyEvent {
+    KeyEvent {
+        code,
+        modifiers: KeyModifiers::CONTROL,
         kind: KeyEventKind::Press,
         state: KeyEventState::empty(),
     }
@@ -103,6 +115,189 @@ fn queue_item(text: &str, class: QueueDeliveryClass) -> cockpit_proto::QueueItem
         target: QueueTarget::root("Build"),
         delivery_class: class,
         send_now: false,
+    }
+}
+
+#[test]
+fn key_router_precedence_matrix_covers_every_focus_and_picker_state() {
+    use super::input::KeyRouterStage;
+
+    #[derive(Clone, Copy, Debug)]
+    enum FocusState {
+        Composer,
+        Queue,
+        Btw,
+        Rail,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PickerState {
+        Closed,
+        Model,
+        Effort,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Chord {
+        CtrlP,
+        CtrlE,
+        CtrlB,
+        CtrlN,
+        CtrlKb,
+        CtrlKn,
+        CtrlKr,
+        CtrlUp,
+        AltUp,
+        AltDown,
+        Enter,
+        Esc,
+        Up,
+        Down,
+        CtrlJ,
+    }
+
+    impl Chord {
+        fn keys(self) -> Vec<KeyEvent> {
+            match self {
+                Self::CtrlP => vec![ctrl(KeyCode::Char('p'))],
+                Self::CtrlE => vec![ctrl(KeyCode::Char('e'))],
+                Self::CtrlB => vec![ctrl(KeyCode::Char('b'))],
+                Self::CtrlN => vec![ctrl(KeyCode::Char('n'))],
+                Self::CtrlKb => vec![ctrl(KeyCode::Char('k')), press(KeyCode::Char('b'))],
+                Self::CtrlKn => vec![ctrl(KeyCode::Char('k')), press(KeyCode::Char('n'))],
+                Self::CtrlKr => vec![ctrl(KeyCode::Char('k')), press(KeyCode::Char('r'))],
+                Self::CtrlUp => vec![ctrl(KeyCode::Up)],
+                Self::AltUp => vec![KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)],
+                Self::AltDown => vec![KeyEvent::new(KeyCode::Down, KeyModifiers::ALT)],
+                Self::Enter => vec![press(KeyCode::Enter)],
+                Self::Esc => vec![press(KeyCode::Esc)],
+                Self::Up => vec![press(KeyCode::Up)],
+                Self::Down => vec![press(KeyCode::Down)],
+                Self::CtrlJ => vec![ctrl(KeyCode::Char('j'))],
+            }
+        }
+
+        fn expected(self, focus: FocusState, picker: PickerState) -> KeyRouterStage {
+            match self {
+                Self::CtrlP
+                | Self::CtrlE
+                | Self::CtrlB
+                | Self::CtrlN
+                | Self::CtrlKb
+                | Self::CtrlKn
+                | Self::CtrlKr
+                | Self::CtrlJ => KeyRouterStage::CtrlChord,
+                Self::AltUp | Self::AltDown => KeyRouterStage::AltChord,
+                Self::CtrlUp | Self::Enter | Self::Esc | Self::Up | Self::Down
+                    if !matches!(picker, PickerState::Closed) =>
+                {
+                    KeyRouterStage::ComposerPicker
+                }
+                Self::Enter | Self::Esc | Self::Up | Self::Down => match focus {
+                    FocusState::Queue => KeyRouterStage::Queue,
+                    FocusState::Btw if matches!(self, Self::Enter | Self::Esc) => {
+                        KeyRouterStage::Btw
+                    }
+                    FocusState::Rail => KeyRouterStage::Rail,
+                    FocusState::Composer | FocusState::Btw => KeyRouterStage::Composer,
+                },
+                Self::CtrlUp => match focus {
+                    FocusState::Rail => KeyRouterStage::Rail,
+                    FocusState::Composer | FocusState::Queue | FocusState::Btw => {
+                        KeyRouterStage::Composer
+                    }
+                },
+            }
+        }
+    }
+
+    const FOCUSES: [FocusState; 4] = [
+        FocusState::Composer,
+        FocusState::Queue,
+        FocusState::Btw,
+        FocusState::Rail,
+    ];
+    const PICKERS: [PickerState; 3] =
+        [PickerState::Closed, PickerState::Model, PickerState::Effort];
+    const CHORDS: [Chord; 15] = [
+        Chord::CtrlP,
+        Chord::CtrlE,
+        Chord::CtrlB,
+        Chord::CtrlN,
+        Chord::CtrlKb,
+        Chord::CtrlKn,
+        Chord::CtrlKr,
+        Chord::CtrlUp,
+        Chord::AltUp,
+        Chord::AltDown,
+        Chord::Enter,
+        Chord::Esc,
+        Chord::Up,
+        Chord::Down,
+        Chord::CtrlJ,
+    ];
+
+    for picker in PICKERS {
+        for focus in FOCUSES {
+            for chord in CHORDS {
+                let tmp = tempfile::tempdir().unwrap();
+                let mut app = app(&tmp);
+                match picker {
+                    PickerState::Closed => {}
+                    PickerState::Model => {
+                        app.composer_controls.selection = Some(ComposerControlKind::Model);
+                        app.open_composer_picker(ComposerControlKind::Model);
+                    }
+                    PickerState::Effort => {
+                        app.composer_controls.selection = Some(ComposerControlKind::Effort);
+                        app.open_composer_picker(ComposerControlKind::Effort);
+                    }
+                }
+                match focus {
+                    FocusState::Composer => {}
+                    FocusState::Queue => {
+                        let item = queue_item("queued", QueueDeliveryClass::Held);
+                        app.queue_focus = Some(item.id);
+                        app.queue.push(item);
+                    }
+                    FocusState::Btw => {
+                        app.btw_pane = Some(super::btw_pane::BtwPane::new(
+                            cockpit_proto::BtwForkInfo {
+                                session_id: Uuid::new_v4(),
+                                parent_session_id: Uuid::new_v4(),
+                                short_id: Some("btw001".to_string()),
+                                tangent: false,
+                                created_at: 1,
+                                message_count: 0,
+                            },
+                            false,
+                        ));
+                        app.btw_pane.as_mut().expect("btw pane").focused = true;
+                    }
+                    FocusState::Rail => app.session_rail.focus(),
+                }
+
+                let keys = chord.keys();
+                let mut actual = KeyRouterStage::Composer;
+                for (index, key) in keys.iter().copied().enumerate() {
+                    actual = app
+                        .handle_precedence_key(key)
+                        .unwrap_or(KeyRouterStage::Composer);
+                    if index + 1 < keys.len() {
+                        assert_eq!(
+                            actual,
+                            KeyRouterStage::CtrlChord,
+                            "leader must own prefix: chord={chord:?} focus={focus:?} picker={picker:?}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    actual,
+                    chord.expected(focus, picker),
+                    "chord={chord:?} focus={focus:?} picker={picker:?}"
+                );
+            }
+        }
     }
 }
 
@@ -193,11 +388,19 @@ fn composer_pills_open_hierarchical_pickers() {
 }
 
 #[test]
-fn composer_picker_keyboard_and_mouse_parity() {
+fn ctrl_p_opens_model_picker_through_router_and_keyboard_moves() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app(&tmp);
     let _ = render(&mut app, 120, 24);
-    app.activate_composer_pill(ComposerControlKind::Approval);
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    assert_eq!(
+        app.composer_controls.selection,
+        Some(ComposerControlKind::Model)
+    );
+    let picker = app.composer_controls.picker.as_ref().expect("open");
+    assert_eq!(picker.kind, ComposerControlKind::Model);
+    assert_eq!(picker.level, 0, "Ctrl+P always starts at providers");
+    app.handle_key(press(KeyCode::Enter));
     let before = app.composer_controls.picker.as_ref().expect("open").cursor;
     app.handle_key(press(KeyCode::Down));
     let after = app
@@ -208,8 +411,22 @@ fn composer_picker_keyboard_and_mouse_parity() {
         .cursor;
     assert_ne!(before, after);
     app.handle_key(press(KeyCode::Esc));
+    assert_eq!(
+        app.composer_controls
+            .picker
+            .as_ref()
+            .expect("provider list")
+            .level,
+        0
+    );
+    app.handle_key(press(KeyCode::Esc));
     assert!(app.composer_controls.picker.is_none());
+}
 
+#[test]
+fn composer_picker_mouse_opens_from_pill() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
     let _ = render(&mut app, 120, 24);
     let layout = app.composer_controls.layout.clone().expect("layout");
     let agent = layout.pill_rect(ComposerControlKind::Agent).expect("agent");
@@ -226,6 +443,557 @@ fn composer_picker_keyboard_and_mouse_parity() {
             .as_ref()
             .is_some_and(|p| p.kind == ComposerControlKind::Agent)
     );
+}
+
+#[test]
+fn ctrl_e_opens_effort_picker_through_router() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    let model = &mut app
+        .config_snapshot
+        .providers
+        .providers
+        .get_mut("openai")
+        .expect("provider")
+        .models[0];
+    model.capabilities.reasoning_effort = Some(ReasoningEffortCapability {
+        values: vec![CapabilityValue {
+            value: "medium".to_string(),
+            label: Some("Balanced".to_string()),
+            description: None,
+        }],
+        ..Default::default()
+    });
+    model.thinking_modes = vec![ThinkingMode::Low, ThinkingMode::High];
+    let _ = render(&mut app, 120, 24);
+
+    app.handle_key(ctrl(KeyCode::Char('e')));
+
+    assert_eq!(
+        app.composer_controls.selection,
+        Some(ComposerControlKind::Effort)
+    );
+    let picker = app
+        .composer_controls
+        .picker
+        .as_ref()
+        .expect("effort picker");
+    assert_eq!(picker.kind, ComposerControlKind::Effort);
+    assert_eq!(
+        picker
+            .categories
+            .iter()
+            .map(|category| category.id.as_str())
+            .collect::<Vec<_>>(),
+        ["effort"],
+        "native reasoning effort and legacy thinking modes remain available"
+    );
+    assert!(
+        picker.categories[0]
+            .items
+            .iter()
+            .any(|item| item.id == "thinking:high"),
+        "legacy thinking modes are included in the effort choices"
+    );
+}
+
+#[test]
+fn ctrl_b_and_ctrl_n_route_to_session_seams() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    assert!(!app.session_rail.is_focused());
+    assert!(!app.pending_new_session);
+
+    app.handle_key(ctrl(KeyCode::Char('b')));
+    assert!(app.session_rail.is_focused());
+    app.handle_key(ctrl(KeyCode::Char('b')));
+    assert!(!app.session_rail.is_focused());
+
+    app.handle_key(ctrl(KeyCode::Char('n')));
+    assert!(app.pending_new_session);
+}
+
+#[test]
+fn ctrl_b_dismisses_an_open_picker_before_focusing_the_session_rail() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    let _ = render(&mut app, 120, 24);
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    assert!(app.composer_controls.picker.is_some());
+
+    app.handle_key(ctrl(KeyCode::Char('b')));
+
+    assert!(app.session_rail.is_focused());
+    assert!(
+        app.composer_controls.picker.is_none(),
+        "rail focus must release picker ownership of arrows and Enter"
+    );
+    assert!(app.composer_controls.selection.is_none());
+}
+
+#[test]
+fn ctrl_j_focuses_rail_while_picker_open_instead_of_committing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    let _ = render(&mut app, 120, 24);
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    assert!(app.composer_controls.picker.is_some());
+
+    app.handle_key(ctrl(KeyCode::Char('j')));
+
+    assert!(
+        app.session_rail.is_focused(),
+        "Ctrl+J must keep focusing the session rail while a picker is open"
+    );
+    assert!(app.composer_controls.picker.is_none());
+    assert_eq!(
+        app.launch.active_model,
+        Some(("openai".to_string(), "gpt-test".to_string())),
+        "Ctrl+J must not commit the highlighted picker row"
+    );
+}
+
+#[test]
+fn ctrl_m_is_the_cr_alias_for_picker_enter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    let _ = render(&mut app, 120, 24);
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    assert_eq!(
+        app.composer_controls.picker.as_ref().expect("open").level,
+        0,
+        "providers level"
+    );
+
+    // Under the kitty keyboard protocol a literal Ctrl+M press is reported
+    // as Char('m') + CONTROL, not Enter; it must still commit.
+    app.handle_key(ctrl(KeyCode::Char('m')));
+
+    let picker = app.composer_controls.picker.as_ref().expect("still open");
+    assert_eq!(
+        picker.level, 1,
+        "Ctrl+M drills into the provider like Enter"
+    );
+}
+
+#[test]
+fn ctrl_p_opens_the_picker_replacing_an_open_overlay_pane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    let _ = render(&mut app, 120, 24);
+    // Open a real overlay pane through the router (which-key → scratchpad).
+    app.handle_key(ctrl(KeyCode::Char('k')));
+    app.handle_key(press(KeyCode::Char('n')));
+    assert!(matches!(app.overlay, Overlay::Notes(_)));
+
+    app.handle_key(ctrl(KeyCode::Char('p')));
+
+    assert!(
+        matches!(app.overlay, Overlay::None),
+        "the picker chord replaces the open pane (excoc tui.rs:172)"
+    );
+    assert!(
+        app.composer_controls
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.kind == ComposerControlKind::Model)
+    );
+}
+
+#[test]
+fn focused_btw_cannot_intercept_model_picker_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, mut control_rx) = app_with_runner(&tmp);
+    let _ = render(&mut app, 120, 24);
+    app.btw_pane = Some(super::btw_pane::BtwPane::new(
+        cockpit_proto::BtwForkInfo {
+            session_id: Uuid::new_v4(),
+            parent_session_id: Uuid::new_v4(),
+            short_id: Some("btw001".to_string()),
+            tangent: false,
+            created_at: 1,
+            message_count: 0,
+        },
+        false,
+    ));
+    let pane = app.btw_pane.as_mut().expect("btw pane");
+    pane.focused = true;
+    pane.composer.insert_str("side draft");
+
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    app.handle_key(press(KeyCode::Enter));
+    app.handle_key(press(KeyCode::Up));
+    app.handle_key(press(KeyCode::Enter));
+
+    match control_rx
+        .try_recv()
+        .expect("picker commit sends SetActiveModel")
+        .request
+    {
+        Request::SetActiveModel {
+            model,
+            persist_as_default,
+            ..
+        } => {
+            assert_eq!(model, "gpt-other");
+            assert!(!persist_as_default, "plain Enter is session-only");
+        }
+        other => panic!("expected SetActiveModel, got {other:?}"),
+    }
+    let pane = app.btw_pane.as_ref().expect("btw pane");
+    assert!(
+        pane.focused,
+        "the picker does not silently change pane focus"
+    );
+    assert_eq!(pane.composer.text(), "side draft");
+    assert!(
+        pane.history.is_empty(),
+        "picker Enter must not send or error in the side composer"
+    );
+}
+
+#[test]
+fn queue_reentry_cannot_intercept_model_picker_navigation_or_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, mut control_rx) = app_with_runner(&tmp);
+    let queued = queue_item("keep queued", QueueDeliveryClass::Held);
+    let queued_id = queued.id;
+    app.queue.push(queued);
+    let _ = render(&mut app, 120, 24);
+
+    app.handle_key(ctrl(KeyCode::Up));
+    assert_eq!(
+        app.queue_focus,
+        Some(queued_id),
+        "Ctrl+Up focuses the queue"
+    );
+
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    assert!(
+        app.queue_focus.is_none(),
+        "opening a modal picker relinquishes queue key ownership"
+    );
+    app.handle_key(ctrl(KeyCode::Up));
+    assert!(
+        app.queue_focus.is_none(),
+        "Ctrl+Up after opening must remain picker-owned instead of re-entering the queue"
+    );
+    assert!(
+        app.composer_controls.picker.is_some(),
+        "Ctrl+Up keeps the picker open"
+    );
+    app.handle_key(press(KeyCode::Enter));
+    assert_eq!(
+        app.composer_controls.picker.as_ref().expect("open").level,
+        1,
+        "Enter drills into the provider"
+    );
+    app.handle_key(press(KeyCode::Up));
+    let picker = app.composer_controls.picker.as_ref().expect("open");
+    assert_eq!(
+        picker.categories[picker.category].items[picker.cursor].id,
+        "gpt-other"
+    );
+    app.handle_key(press(KeyCode::Enter));
+
+    match control_rx
+        .try_recv()
+        .expect("picker commit sends SetActiveModel")
+        .request
+    {
+        Request::SetActiveModel {
+            model,
+            persist_as_default,
+            ..
+        } => {
+            assert_eq!(model, "gpt-other");
+            assert!(!persist_as_default, "plain Enter is session-only");
+        }
+        other => panic!("expected SetActiveModel, got {other:?}"),
+    }
+    assert_eq!(app.queue.len(), 1, "picker keys do not alter the queue");
+    assert_eq!(app.queue[0].id, queued_id);
+    assert_eq!(app.queue[0].text, "keep queued");
+}
+
+#[test]
+fn ctrl_k_router_dispatches_b_n_and_r_continuations() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut btw = app(&tmp);
+    btw.btw_pane = Some(super::btw_pane::BtwPane::new(
+        cockpit_proto::BtwForkInfo {
+            session_id: Uuid::new_v4(),
+            parent_session_id: Uuid::new_v4(),
+            short_id: Some("btw001".to_string()),
+            tangent: false,
+            created_at: 1,
+            message_count: 0,
+        },
+        false,
+    ));
+    btw.handle_key(ctrl(KeyCode::Char('k')));
+    btw.handle_key(press(KeyCode::Char('b')));
+    assert!(btw.btw_pane.as_ref().expect("btw pane").focused);
+
+    let pane = btw.btw_pane.as_mut().expect("btw pane");
+    pane.composer.insert_str("draft");
+    btw.handle_key(ctrl(KeyCode::Char('k')));
+    btw.handle_key(press(KeyCode::Char('b')));
+    let pane = btw.btw_pane.as_ref().expect("btw pane");
+    assert!(
+        !pane.focused,
+        "Ctrl+K b must also leave a focused /btw pane"
+    );
+    assert_eq!(
+        pane.composer.text(),
+        "draft",
+        "the leader continuation must not be inserted into /btw"
+    );
+
+    btw.btw_pane.as_mut().expect("btw pane").focused = true;
+    btw.handle_key(ctrl(KeyCode::Char('b')));
+    assert!(
+        btw.session_rail.is_focused(),
+        "bare Ctrl+B uses the global session-sidebar seam"
+    );
+    assert!(
+        btw.btw_pane.as_ref().expect("btw pane").focused,
+        "bare Ctrl+B must not trigger the old /btw focus toggle"
+    );
+
+    let mut scratchpad = app(&tmp);
+    scratchpad.handle_key(ctrl(KeyCode::Char('k')));
+    scratchpad.handle_key(press(KeyCode::Char('n')));
+    assert!(matches!(scratchpad.overlay, Overlay::Notes(_)));
+
+    let mut transcript = app(&tmp);
+    transcript.history.push(HistoryEntry::User {
+        text: "original".to_string(),
+        cleaned: Some("cleaned".to_string()),
+        expanded: false,
+        timestamp: chrono::Local::now(),
+        seq: Some(1),
+        optimistic_submission_id: None,
+        preflight_pending: false,
+        persist_failed: false,
+    });
+    transcript.handle_key(ctrl(KeyCode::Char('k')));
+    transcript.handle_key(press(KeyCode::Char('r')));
+    assert!(matches!(
+        transcript.history.last(),
+        Some(HistoryEntry::User { expanded: true, .. })
+    ));
+}
+
+#[test]
+fn slash_model_opens_composer_picker_not_fullscreen_overlay() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    let command = *super::slash::SLASH_COMMANDS
+        .iter()
+        .find(|command| command.name == "model")
+        .expect("/model command");
+
+    app.execute_slash(command);
+
+    assert!(matches!(app.overlay, Overlay::None));
+    assert!(
+        app.composer_controls
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.kind == ComposerControlKind::Model)
+    );
+}
+
+#[test]
+fn model_picker_pins_favorites_annotates_failures_usage_drift_and_add_action() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    let provider = app
+        .config_snapshot
+        .providers
+        .providers
+        .get_mut("openai")
+        .expect("provider");
+    provider.models[1].favorite = true;
+    app.usage_models.insert("openai/gpt-test".to_string(), 99);
+    app.usage_models.insert("openai/gpt-other".to_string(), 3);
+    app.auth_failure_annotations.insert(
+        ("openai".to_string(), "gpt-other".to_string()),
+        crate::tui::auth_failure::AuthFailureRecord {
+            kind: cockpit_proto::AuthFailureKind::CredentialsRejected { status: 401 },
+            failed_at_epoch_secs: chrono::Utc::now().timestamp(),
+        },
+    );
+
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    let category = &app
+        .composer_controls
+        .picker
+        .as_ref()
+        .expect("picker")
+        .categories[0];
+    assert_eq!(category.items[0].id, "gpt-other");
+    assert!(category.items[0].favorite);
+    assert!(category.items[0].hint.contains("3 uses"));
+    assert!(
+        category.items[0].hint.contains("failed"),
+        "auth failure annotation is retained on the failed model: {}",
+        category.items[0].hint
+    );
+    assert_eq!(
+        category.items.last().expect("add action").id,
+        "\u{0}add-model"
+    );
+
+    app.config_drift = Some(super::ConfigDriftState {
+        config_provider: Some("openai".to_string()),
+        config_model: Some("gpt-other".to_string()),
+    });
+    app.refresh_config_drift_surfaces();
+    let picker = app.composer_controls.picker.as_ref().expect("picker");
+    assert_eq!(picker.categories[0].label, "Config drift");
+    assert!(
+        picker
+            .status_text
+            .as_deref()
+            .is_some_and(|text| text.contains("config: openai/gpt-other"))
+    );
+}
+
+#[test]
+fn model_picker_refresh_preserves_provider_cursor_across_config_drift_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    app.config_drift = Some(super::ConfigDriftState {
+        config_provider: Some("openai".to_string()),
+        config_model: Some("configured-model".to_string()),
+    });
+
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    let selected_before = {
+        let picker = app.composer_controls.picker.as_ref().expect("picker");
+        assert_eq!(picker.level, 0);
+        assert_eq!(picker.categories[0].label, "Config drift");
+        assert_eq!(picker.categories[picker.cursor].label, "openai");
+        picker.categories[picker.cursor].id.clone()
+    };
+    assert_eq!(selected_before, "openai");
+
+    app.refresh_open_composer_model_picker();
+
+    let picker = app.composer_controls.picker.as_ref().expect("picker");
+    assert_eq!(picker.categories[picker.cursor].id, selected_before);
+    app.handle_key(press(KeyCode::Enter));
+    let picker = app.composer_controls.picker.as_ref().expect("model rows");
+    assert_eq!(picker.level, 1);
+    assert_eq!(picker.categories[picker.category].id, "openai");
+    assert_eq!(
+        picker.categories[picker.category].items[picker.cursor].id,
+        "gpt-test"
+    );
+}
+
+#[test]
+fn open_picker_wheel_hover_and_scrollbar_drag_move_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    let provider = app
+        .config_snapshot
+        .providers
+        .providers
+        .get_mut("openai")
+        .expect("provider");
+    for index in 0..20 {
+        provider.models.push(ModelEntry {
+            id: format!("gpt-{index:02}"),
+            ..Default::default()
+        });
+    }
+    let _ = render(&mut app, 80, 24);
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    app.handle_key(press(KeyCode::Enter));
+    let _ = render(&mut app, 80, 24);
+    let picker_rect = app.composer_controls.picker_rect.expect("picker rect");
+    let before = app
+        .composer_controls
+        .picker
+        .as_ref()
+        .expect("picker")
+        .cursor;
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: picker_rect.x + 1,
+        row: picker_rect.y + 1,
+        modifiers: KeyModifiers::empty(),
+    });
+    assert_ne!(
+        app.composer_controls
+            .picker
+            .as_ref()
+            .expect("picker")
+            .cursor,
+        before,
+        "wheel steps one picker row"
+    );
+
+    let _ = render(&mut app, 80, 24);
+    let hover = app
+        .button_registry
+        .targets()
+        .iter()
+        .find_map(|target| match &target.dispatch {
+            crate::tui::button::ButtonDispatch::ComposerPickerRow { index } if *index >= 2 => {
+                Some((*index, target.rect))
+            }
+            _ => None,
+        })
+        .expect("visible picker row");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: hover.1.x,
+        row: hover.1.y,
+        modifiers: KeyModifiers::empty(),
+    });
+    assert_eq!(
+        app.composer_controls
+            .picker
+            .as_ref()
+            .expect("picker")
+            .cursor,
+        hover.0,
+        "hover owns the highlighted row"
+    );
+
+    let track = app
+        .composer_controls
+        .picker_scrollbar_rect
+        .expect("overflowing picker scrollbar");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: track.x,
+        row: track.bottom() - 1,
+        modifiers: KeyModifiers::empty(),
+    });
+    assert!(app.composer_controls.picker_scroll_drag);
+    assert!(
+        app.composer_controls
+            .picker
+            .as_ref()
+            .expect("picker")
+            .cursor
+            > hover.0,
+        "scrollbar track drag moves toward the bottom"
+    );
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: track.x,
+        row: track.bottom() - 1,
+        modifiers: KeyModifiers::empty(),
+    });
+    assert!(!app.composer_controls.picker_scroll_drag);
 }
 
 fn arm_approval_mutation(app: &mut App) -> ControlRequestId {

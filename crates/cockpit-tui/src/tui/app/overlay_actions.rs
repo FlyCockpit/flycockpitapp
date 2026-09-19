@@ -55,7 +55,7 @@ fn cancel_leak_capability_blocking(
 
 impl App {
     /// Open the project scratchpad dialog. Shared by the `/scratchpad`
-    /// slash command and the Ctrl+N keyboard shortcut. The editor mirrors the
+    /// slash command and the Ctrl+K n leader chord. The editor mirrors the
     /// composer's vim setting so vim users get vim editing in their scratchpad.
     pub(super) fn open_scratchpad_pane(&mut self) {
         if !self.guard_startup_workspace_effects() {

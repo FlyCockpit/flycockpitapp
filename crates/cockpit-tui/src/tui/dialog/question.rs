@@ -35,7 +35,7 @@ use cockpit_proto::{
 
 /// Hard ceiling on the *collapsed* overlay's height (rows, incl. border +
 /// footer) so a giant question can't eat the whole screen. The dialog
-/// sizes to content up to this; beyond it the regions scroll. `Ctrl+E`
+/// sizes to content up to this; beyond it the regions scroll. `Tab`
 /// expands past this up to [`EXPANDED_HEIGHT_NUM`]/[`EXPANDED_HEIGHT_DEN`]
 /// of the terminal height.
 const MAX_DIALOG_HEIGHT: u16 = 16;
@@ -244,7 +244,7 @@ impl QuestionDialog {
     }
 
     /// Intercept the whole-dialog expand toggle and the prompt-region
-    /// scroll keys before the generic dialog sees them. `Ctrl+E` toggles
+    /// scroll keys before the generic dialog sees them. `Tab` toggles
     /// expand; `PageUp`/`PageDown` scroll the prompt region. These are
     /// no-ops in [`DialogState`]'s page handler (it ignores unmatched keys),
     /// but intercepting here keeps them off option navigation. Returns
@@ -256,7 +256,7 @@ impl QuestionDialog {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Char('e') if ctrl => {
+            KeyCode::Tab if key.modifiers.is_empty() => {
                 self.state.toggle_expanded();
                 true
             }
@@ -322,7 +322,7 @@ impl QuestionDialog {
     }
 
     /// Content-sized height (rows) the bottom-anchored overlay wants.
-    /// Collapsed: capped at [`MAX_DIALOG_HEIGHT`]. Expanded (`Ctrl+E`): grows
+    /// Collapsed: capped at [`MAX_DIALOG_HEIGHT`]. Expanded (`Tab`): grows
     /// up to a share of the terminal height (the overlay grows upward,
     /// shrinking history; the status row stays pinned). Includes the top +
     /// bottom border and the footer row. Beyond the cap the two body regions
@@ -768,7 +768,7 @@ impl QuestionDialog {
         }
     }
 
-    /// Footer fragment for the whole-dialog `Ctrl+E` expand toggle. Shown
+    /// Footer fragment for the whole-dialog `Tab` expand toggle. Shown
     /// whenever the dialog is collapsible (expanded) or has more content than
     /// fits (worth expanding); empty when it already fits collapsed.
     fn expand_hint(&self) -> String {
@@ -778,7 +778,7 @@ impl QuestionDialog {
     }
 
     /// Whether the current view's content exceeds the collapsed overlay's
-    /// body budget (so expanding would reveal more). Drives the `ctrl+e:
+    /// body budget (so expanding would reveal more). Drives the `tab: [More]`
     /// expand` footer hint.
     fn has_more_than_collapsed_fits(&self) -> bool {
         let collapsed_body = (MAX_DIALOG_HEIGHT.saturating_sub(3)) as usize;
@@ -825,7 +825,7 @@ impl QuestionDialog {
         // the confined attempt's exit + stderr, and the cascade warning that
         // a remembered scope can preauthorize future unconfined reruns after
         // trusted confined failures. Rendered here in the scrollable prompt
-        // region (PageUp/PageDown, Ctrl+E), never asserting the sandbox
+        // region (PageUp/PageDown, Tab), never asserting the sandbox
         // blocked the command.
         if let Some(esc) = self.sandbox_escalation() {
             lines.push(Line::default());
@@ -1069,7 +1069,7 @@ impl QuestionDialog {
     /// then the full verbatim command rendered as an indented monospace-ish
     /// quoted block with the current constituent's char span highlighted
     /// (underline + accent). The command is shown in full; the enclosing
-    /// prompt region scrolls (PageUp/PageDown) and expands (`Ctrl+E`) to
+    /// prompt region scrolls (PageUp/PageDown) and expands (`Tab`) to
     /// reveal long / multi-line commands.
     fn command_block_lines(&self, cd: &CommandDetail) -> Vec<Line<'static>> {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
@@ -2511,16 +2511,16 @@ mod tests {
     }
 
     #[test]
-    fn dialog_ux_ctrl_e_still_expands_prompt() {
+    fn dialog_ux_tab_expands_prompt() {
         let mut d = tall_approval_dialog();
         d.sync_viewport(Rect::new(0, 0, 80, 16), 40);
         let collapsed = d.desired_height();
 
-        assert!(!d.handle_key(ctrl(KeyCode::Char('e'))));
+        assert!(!d.handle_key(press(KeyCode::Tab)));
         d.sync_viewport(Rect::new(0, 0, 80, 16), 40);
 
         assert!(d.desired_height() > collapsed);
-        assert!(d.footer_hint().contains("ctrl+e: collapse"));
+        assert!(d.footer_hint().contains("tab: [Less]"));
     }
 
     #[test]
@@ -3172,7 +3172,7 @@ mod tests {
         let mut d = d;
         d.sync_viewport(Rect::new(0, 0, 80, 16), 24);
         assert!(
-            d.footer_hint().contains("ctrl+e: expand"),
+            d.footer_hint().contains("tab: [More]"),
             "expand hint: {}",
             d.footer_hint()
         );
@@ -3184,8 +3184,8 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_e_expands_whole_dialog_upward() {
-        // Ctrl+E grows the overlay's desired height beyond the collapsed cap
+    fn tab_expands_whole_dialog_upward() {
+        // Tab grows the overlay's desired height beyond the collapsed cap
         // (it grows upward in place; the geometry shrinks history above it).
         let cmd: String = (0..200)
             .map(|i| format!("line {i}"))
@@ -3211,8 +3211,8 @@ mod tests {
         d.sync_viewport(Rect::new(0, 0, 80, 16), 40);
         let collapsed = d.desired_height();
         assert_eq!(collapsed, MAX_DIALOG_HEIGHT, "collapsed caps at the max");
-        // Ctrl+E expands; the overlay now wants more than the collapsed cap.
-        assert!(!d.handle_key(ctrl(KeyCode::Char('e'))));
+        // Tab expands; the overlay now wants more than the collapsed cap.
+        assert!(!d.handle_key(press(KeyCode::Tab)));
         assert!(d.state.is_expanded());
         d.sync_viewport(Rect::new(0, 0, 80, 16), 40);
         assert!(
@@ -3220,9 +3220,9 @@ mod tests {
             "expanded overlay grows past the collapsed cap"
         );
         // Footer flips to the collapse affordance.
-        assert!(d.footer_hint().contains("ctrl+e: collapse"));
-        // Ctrl+E again collapses back.
-        assert!(!d.handle_key(ctrl(KeyCode::Char('e'))));
+        assert!(d.footer_hint().contains("tab: [Less]"));
+        // Tab again collapses back.
+        assert!(!d.handle_key(press(KeyCode::Tab)));
         assert!(!d.state.is_expanded());
         assert_eq!(d.desired_height(), MAX_DIALOG_HEIGHT);
     }
@@ -3231,7 +3231,7 @@ mod tests {
     fn expanded_cap_respects_short_terminal() {
         let mut d = tall_approval_dialog();
         d.sync_viewport(Rect::new(0, 0, 80, 10), 12);
-        assert!(!d.handle_key(ctrl(KeyCode::Char('e'))));
+        assert!(!d.handle_key(press(KeyCode::Tab)));
         d.sync_viewport(Rect::new(0, 0, 80, 10), 12);
 
         let height = d.desired_height();
@@ -3244,7 +3244,7 @@ mod tests {
     fn expanded_cap_tall_terminal_unchanged() {
         let mut d = tall_approval_dialog();
         d.sync_viewport(Rect::new(0, 0, 80, 16), 40);
-        assert!(!d.handle_key(ctrl(KeyCode::Char('e'))));
+        assert!(!d.handle_key(press(KeyCode::Tab)));
         d.sync_viewport(Rect::new(0, 0, 80, 16), 40);
 
         let height = d.desired_height();
@@ -3265,7 +3265,7 @@ mod tests {
     #[test]
     fn cap_zero_term_height_returns_max() {
         let mut d = tall_approval_dialog();
-        assert!(!d.handle_key(ctrl(KeyCode::Char('e'))));
+        assert!(!d.handle_key(press(KeyCode::Tab)));
 
         assert!(d.desired_height() >= 4);
     }
@@ -3274,7 +3274,7 @@ mod tests {
     fn expanded_request_leaves_status_and_history() {
         let mut d = tall_approval_dialog();
         d.sync_viewport(Rect::new(0, 0, 80, 10), 12);
-        assert!(!d.handle_key(ctrl(KeyCode::Char('e'))));
+        assert!(!d.handle_key(press(KeyCode::Tab)));
         d.sync_viewport(Rect::new(0, 0, 80, 10), 12);
 
         let geometry =
@@ -3288,7 +3288,7 @@ mod tests {
     fn tiny_terminal_no_panic_height_request_is_affordable() {
         let mut d = tall_approval_dialog();
         d.sync_viewport(Rect::new(0, 0, 80, 3), 5);
-        assert!(!d.handle_key(ctrl(KeyCode::Char('e'))));
+        assert!(!d.handle_key(press(KeyCode::Tab)));
         d.sync_viewport(Rect::new(0, 0, 80, 3), 5);
 
         assert!(d.desired_height() + STATUS_HEIGHT + MIN_HISTORY_HEIGHT <= 5);
@@ -3350,7 +3350,7 @@ mod tests {
 
     #[test]
     fn expand_and_scroll_keys_do_not_leak_to_option_navigation() {
-        // Ctrl+E and PageUp/PageDown must not move the option cursor or submit.
+        // Tab and PageUp/PageDown must not move the option cursor or submit.
         let mut d = approval_dialog(CommandDetail {
             full_command: (0..50)
                 .map(|i| format!("l{i}"))
@@ -3372,7 +3372,7 @@ mod tests {
         });
         d.sync_viewport(Rect::new(0, 0, 80, 16), 24);
         let before = d.state.cursor();
-        assert!(!d.handle_key(ctrl(KeyCode::Char('e'))));
+        assert!(!d.handle_key(press(KeyCode::Tab)));
         assert!(!d.handle_key(press(KeyCode::PageDown)));
         assert!(!d.handle_key(press(KeyCode::PageUp)));
         assert_eq!(
@@ -3397,7 +3397,7 @@ mod tests {
                 .any(|s| s.content.contains("step ") || s.content.contains("&&"))
         }));
         // A short question fits collapsed: no expand affordance in the footer.
-        assert!(!d.footer_hint().contains("ctrl+e"));
+        assert!(!d.footer_hint().contains("tab: [More]"));
     }
 
     // ---- permission-prompt presentation (radio marker, no freeform) -----

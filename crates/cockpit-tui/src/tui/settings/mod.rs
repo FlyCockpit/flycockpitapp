@@ -2613,10 +2613,6 @@ pub enum Dialog {
         cursor: usize,
     },
     SetupWizard(Box<SetupWizardDialog>),
-    /// Wizard engine hosted exclusively by the full-screen onboarding shell.
-    /// Keeping it distinct prevents first-run routing from entering the
-    /// generic settings/setup dialog path.
-    OnboardingWizard(Box<SetupWizardDialog>),
     /// Boxed because [`SettingsDialog`] dwarfs the other variants
     /// (~1.1KB vs <100 bytes), which would otherwise bloat every
     /// [`Dialog`] on the stack.
@@ -2804,7 +2800,6 @@ fn setup_wizard_dialog(
     cwd: &std::path::Path,
     descriptor: cockpit_core::wizard::WizardDescriptor,
     status: Option<String>,
-    onboarding: bool,
 ) -> Result<Dialog, String> {
     let run = cockpit_core::wizard::WizardRun::new(descriptor).map_err(|e| e.to_string())?;
     let mut cursor = 0;
@@ -2840,11 +2835,7 @@ fn setup_wizard_dialog(
         settled_operation_id: None,
         settled_config_generation: None,
     });
-    Ok(if onboarding {
-        Dialog::OnboardingWizard(wizard)
-    } else {
-        Dialog::SetupWizard(wizard)
-    })
+    Ok(Dialog::SetupWizard(wizard))
 }
 
 impl Deref for SettingsDialog {
@@ -5758,7 +5749,7 @@ impl Dialog {
         matches!(self, Dialog::Settings(settings) if settings.authority_operation_pending())
             || matches!(
                 self,
-                Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)
+                Dialog::SetupWizard(wizard)
                     if wizard.pending_operation_id.is_some()
             )
     }
@@ -5829,9 +5820,7 @@ impl Dialog {
             Dialog::Settings(settings) => Some(settings.page.test_name()),
             Dialog::WorkspaceTrust { .. } => Some("workspace_trust"),
             Dialog::WizardMenu { .. } => Some("wizard_menu"),
-            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard) => {
-                Some(wizard.run.descriptor().id)
-            }
+            Dialog::SetupWizard(wizard) => Some(wizard.run.descriptor().id),
             _ => None,
         }
     }
@@ -5932,7 +5921,7 @@ impl Dialog {
 
     #[cfg(test)]
     pub(crate) fn test_mark_setup_complete(&mut self, step_id: &str) {
-        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
+        let (Dialog::SetupWizard(wizard)) = self else {
             panic!("expected setup wizard");
         };
         wizard
@@ -5956,7 +5945,7 @@ impl Dialog {
         &self,
         step_id: &str,
     ) -> Option<cockpit_core::wizard::WizardAnswer> {
-        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
+        let (Dialog::SetupWizard(wizard)) = self else {
             return None;
         };
         wizard.run.answer(step_id).cloned()
@@ -5964,7 +5953,7 @@ impl Dialog {
 
     #[cfg(test)]
     pub(crate) fn test_setup_prefill(&self) -> Option<cockpit_core::wizard::WizardAnswer> {
-        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
+        let (Dialog::SetupWizard(wizard)) = self else {
             return None;
         };
         wizard.run.prefill()
@@ -5974,7 +5963,7 @@ impl Dialog {
     /// drive the wizard step by step.
     #[cfg(test)]
     pub(crate) fn test_setup_step(&self) -> Option<&'static str> {
-        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
+        let (Dialog::SetupWizard(wizard)) = self else {
             return None;
         };
         wizard.run.current_step().map(|step| step.id)
@@ -5982,7 +5971,7 @@ impl Dialog {
 
     #[cfg(test)]
     pub(crate) fn test_setup_status(&self) -> Option<&str> {
-        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
+        let (Dialog::SetupWizard(wizard)) = self else {
             return None;
         };
         wizard.status.as_deref()
@@ -5991,7 +5980,7 @@ impl Dialog {
     /// `confirm`, `info`, `action`, `multi`, `tools`, `secret`.
     #[cfg(test)]
     pub(crate) fn test_setup_step_kind(&self) -> Option<&'static str> {
-        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
+        let (Dialog::SetupWizard(wizard)) = self else {
             return None;
         };
         let step = wizard.run.current_step()?;
@@ -6010,7 +5999,7 @@ impl Dialog {
     /// Number of select options on the current wizard step.
     #[cfg(test)]
     pub(crate) fn test_setup_step_options(&self) -> usize {
-        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
+        let (Dialog::SetupWizard(wizard)) = self else {
             return 0;
         };
         wizard.run.select_options().len()
@@ -6021,7 +6010,7 @@ impl Dialog {
     /// instead of hardcoding cursor positions.
     #[cfg(test)]
     pub(crate) fn test_setup_step_option_ids(&self) -> Vec<String> {
-        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
+        let (Dialog::SetupWizard(wizard)) = self else {
             return Vec::new();
         };
         wizard
@@ -6035,7 +6024,7 @@ impl Dialog {
     /// Current text-buffer contents of the wizard's focused Text step.
     #[cfg(test)]
     pub(crate) fn test_setup_text(&self) -> Option<String> {
-        let (Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)) = self else {
+        let (Dialog::SetupWizard(wizard)) = self else {
             return None;
         };
         Some(wizard.text.text().to_string())
@@ -6236,31 +6225,21 @@ impl Dialog {
             cockpit_core::wizard::SECURITY_WIZARD_ID | cockpit_core::wizard::MODEL_WIZARD_ID => {
                 let descriptor = cockpit_core::wizard::descriptor_for_cwd(wizard_id, &global_root)
                     .ok_or_else(|| format!("unknown setup wizard `{wizard_id}`"))?;
-                setup_wizard_dialog(&global_root, descriptor, None, false)
+                setup_wizard_dialog(&global_root, descriptor, None)
             }
             other => Err(format!("unknown setup wizard `{other}`")),
         }
     }
 
-    /// Wizard engine for the onboarding shell's remaining descriptor stages. The
-    /// same wizard machinery (and daemon-effect settlement) as
-    /// the non-onboarding setup wizards, presented inside the full-screen
-    /// shell instead of the settings modal.
-    pub fn onboarding_wizard_engine(
+    /// Setup wizard presented inside the full-screen onboarding shell (post-onboarding
+    /// `/setup security|model` detours at `Complete`).
+    pub fn shell_setup_wizard_engine(
         wizard_id: &str,
         preselected_model: Option<(&str, &str)>,
         status: Option<String>,
     ) -> Result<Self, String> {
         let global_root = global_config_dir().map_err(|error| error.to_string())?;
         let descriptor = match wizard_id {
-            cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID => {
-                cockpit_core::wizard::descriptor_for_cwd(wizard_id, &global_root)
-            }
-            cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID => {
-                return Err(
-                    "the onboarding agent stage uses the nested agent authoring editor".into(),
-                );
-            }
             cockpit_core::wizard::SECURITY_WIZARD_ID | cockpit_core::wizard::MODEL_WIZARD_ID => {
                 cockpit_core::wizard::descriptor_for_cwd(wizard_id, &global_root).or_else(|| {
                     (wizard_id == cockpit_core::wizard::MODEL_WIZARD_ID).then_some(
@@ -6271,10 +6250,10 @@ impl Dialog {
                     )
                 })
             }
-            other => return Err(format!("unknown onboarding wizard `{other}`")),
+            other => return Err(format!("unknown shell setup wizard `{other}`")),
         }
-        .ok_or_else(|| format!("could not build onboarding wizard `{wizard_id}`"))?;
-        setup_wizard_dialog(&global_root, descriptor, status, true)
+        .ok_or_else(|| format!("could not build shell setup wizard `{wizard_id}`"))?;
+        setup_wizard_dialog(&global_root, descriptor, status)
     }
 
     pub fn open_model_setup_preselected(
@@ -6288,7 +6267,7 @@ impl Dialog {
             &global_root,
             Some((provider_id, model_id)),
         );
-        setup_wizard_dialog(&global_root, descriptor, status, false)
+        setup_wizard_dialog(&global_root, descriptor, status)
     }
 
     pub fn open_model_setup_choice(
@@ -6368,53 +6347,17 @@ impl Dialog {
         })
     }
 
-    pub fn onboarding_wizard_settlement(
-        &self,
-        wizard_id: &str,
-        run_id: uuid::Uuid,
-        attempt_id: uuid::Uuid,
-        stage_revision: u64,
-    ) -> Option<cockpit_proto::OnboardingStageSettlement> {
-        let Dialog::OnboardingWizard(wizard) = self else {
-            return None;
-        };
-        if wizard.run.descriptor().id != wizard_id {
-            return None;
-        }
-        let operation_id = wizard.settled_operation_id?.to_string();
-        // The settlement's generation authority is the apply receipt itself:
-        // the daemon published that generation as part of the apply's durable
-        // commit and proves the stage advance against it. A wizard that
-        // completed without a daemon receipt has no settlement to claim, so
-        // the stage cannot advance on local state alone.
-        let config_generation = wizard
-            .settled_config_generation
-            .filter(|generation| *generation > 0)?;
-        Some(cockpit_proto::OnboardingStageSettlement {
-            run_id,
-            attempt_id,
-            stage_revision,
-            settlement_operation_id: operation_id,
-            provider_id: None,
-            mutation_intent_hash: None,
-            wizard_id: Some(wizard_id.to_string()),
-            config_generation,
-        })
-    }
-
     pub fn setup_wizard_is_complete(&self, wizard_id: &str) -> bool {
         matches!(
             self,
-            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)
+            Dialog::SetupWizard(wizard)
                 if wizard.run.descriptor().id == wizard_id && wizard.run.is_complete()
         )
     }
 
     pub(crate) fn setup_wizard_settled_config_generation(&self) -> Option<u64> {
         match self {
-            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard) => {
-                wizard.settled_config_generation
-            }
+            Dialog::SetupWizard(wizard) => wizard.settled_config_generation,
             _ => None,
         }
     }
@@ -6422,7 +6365,7 @@ impl Dialog {
     pub fn setup_wizard_is_complete_any(&self, wizard_ids: &[&str]) -> bool {
         matches!(
             self,
-            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)
+            Dialog::SetupWizard(wizard)
                 if wizard_ids.contains(&wizard.run.descriptor().id) && wizard.run.is_complete()
         )
     }
@@ -6430,7 +6373,7 @@ impl Dialog {
     pub fn setup_wizard_is_active(&self, wizard_id: &str) -> bool {
         matches!(
             self,
-            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)
+            Dialog::SetupWizard(wizard)
                 if wizard.run.descriptor().id == wizard_id
         )
     }
@@ -6725,9 +6668,7 @@ impl Dialog {
                     }
                 }
             }
-            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard) => {
-                handle_setup_wizard_key(wizard, key)
-            }
+            Dialog::SetupWizard(wizard) => handle_setup_wizard_key(wizard, key),
             Dialog::Settings(s) => {
                 let close = s.handle_key(key);
                 if close
@@ -6750,7 +6691,7 @@ impl Dialog {
     pub fn paste(&mut self, text: &str) {
         match self {
             Dialog::Settings(s) => s.paste(text),
-            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard) => wizard.paste(text),
+            Dialog::SetupWizard(wizard) => wizard.paste(text),
             _ => {}
         }
     }
@@ -6773,9 +6714,7 @@ impl Dialog {
     pub(crate) fn take_settings_daemon_effect(&mut self) -> Option<SettingsDaemonEffectRequest> {
         match self {
             Dialog::Settings(settings) => settings.cx.take_daemon_effect(),
-            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard) => {
-                wizard.queued_daemon_effect.take()
-            }
+            Dialog::SetupWizard(wizard) => wizard.queued_daemon_effect.take(),
             _ => None,
         }
     }
@@ -6806,9 +6745,7 @@ impl Dialog {
         completion: SettingsDaemonEffectCompletion,
     ) {
         match self {
-            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard)
-                if completion.dialog_id == wizard.dialog_id =>
-            {
+            Dialog::SetupWizard(wizard) if completion.dialog_id == wizard.dialog_id => {
                 apply_setup_wizard_daemon_completion(wizard, completion);
             }
             Dialog::Settings(settings) if completion.dialog_id == settings.cx.dialog_id => {
@@ -7051,9 +6988,7 @@ impl Dialog {
                 pending.as_ref(),
                 *cursor,
             ),
-            Dialog::SetupWizard(wizard) | Dialog::OnboardingWizard(wizard) => {
-                render_setup_wizard(frame, area, wizard)
-            }
+            Dialog::SetupWizard(wizard) => render_setup_wizard(frame, area, wizard),
             Dialog::Settings(s) => s.render(frame, area, links),
         }
     }

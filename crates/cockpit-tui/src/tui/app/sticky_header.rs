@@ -14,12 +14,15 @@ use ratatui::widgets::Paragraph;
 
 use super::render::chat_visible_top;
 use super::{App, HistoryEntryId, MouseGestureInvalidation};
+use crate::tui::chrome::fill_bg;
 use crate::tui::history::HistoryEntry;
-use crate::tui::pins_overlay::{PIN_YELLOW, preview_text_rows};
-use crate::tui::theme::{MUTED_COLOR_INDEX, TRANSCRIPT_HOVER_BG};
+use crate::tui::pins_overlay::preview_text;
+use crate::tui::theme::{
+    BRASS, BRASS_INDEX, INK, INK_INDEX, SURFACE, SURFACE_INDEX, TEAL, TEAL_INDEX, resolve_color,
+};
 
-/// Two content lines. Stable: never 1, never a mid-frame change.
-pub(super) const STICKY_USER_HEADER_HEIGHT: u16 = 2;
+/// The always-on sticky turn header occupies exactly one row.
+pub(super) const STICKY_USER_HEADER_HEIGHT: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct StickyUserTarget {
@@ -58,7 +61,7 @@ impl App {
     }
 
     fn sticky_user_target_for_pane(&self, pane: Rect) -> Option<StickyUserTarget> {
-        if !self.sticky_user_message || pane.height <= STICKY_USER_HEADER_HEIGHT {
+        if pane.height <= STICKY_USER_HEADER_HEIGHT {
             return None;
         }
         // The message must leave the existing viewport before it becomes sticky;
@@ -71,13 +74,10 @@ impl App {
         if was_visible != visible {
             // A completed selection belongs to transcript content, not to a
             // particular viewport origin. Keep it attached to that content
-            // while the sticky header carves (or restores) its two rows.
+            // while the sticky header carves (or restores) its row.
             // An in-progress drag must still be cancelled: its pointer
             // coordinates can no longer describe a valid gesture.
-            let completed_selection = self
-                .sticky_user_message
-                .then(|| self.selection.filter(|selection| !selection.active))
-                .flatten();
+            let completed_selection = self.selection.filter(|selection| !selection.active);
             let completed_spans = completed_selection.and_then(|_| self.selection_spans.clone());
             self.invalidate_mouse_gesture(
                 MouseGestureInvalidation::ViewChange,
@@ -171,45 +171,30 @@ impl App {
             .and_then(|idx| self.history.get(idx))
             .and_then(user_raw_text)
             .unwrap_or("");
-        let label = " you ";
-        let indent = "     ";
-        let show_label = area.width as usize > label.len() + 1;
-        let preview_width = if show_label {
-            (area.width as usize).saturating_sub(label.len())
+        let surface = resolve_color(SURFACE, SURFACE_INDEX);
+        fill_bg(frame, area, surface);
+        let accent = if self.active_subagent_view().is_some() {
+            resolve_color(TEAL, TEAL_INDEX)
         } else {
-            area.width as usize
-        }
-        .max(1);
-        let mut rows = preview_text_rows(raw, preview_width, STICKY_USER_HEADER_HEIGHT as usize);
-        rows.resize(STICKY_USER_HEADER_HEIGHT as usize, String::new());
-
-        let bg = Style::default().bg(TRANSCRIPT_HOVER_BG);
-        let label_style = Style::default()
-            .fg(PIN_YELLOW)
-            .bg(TRANSCRIPT_HOVER_BG)
-            .add_modifier(Modifier::BOLD);
-        let body_style = Style::default()
-            .fg(ratatui::style::Color::Indexed(MUTED_COLOR_INDEX))
-            .bg(TRANSCRIPT_HOVER_BG);
-
-        let lines = if show_label {
-            vec![
-                Line::from(vec![
-                    Span::styled(label, label_style),
-                    Span::styled(rows[0].clone(), body_style),
-                ]),
-                Line::from(vec![
-                    Span::styled(indent, bg),
-                    Span::styled(rows[1].clone(), body_style),
-                ]),
-            ]
-        } else {
-            vec![
-                Line::from(vec![Span::styled(rows[0].clone(), body_style)]),
-                Line::from(vec![Span::styled(rows[1].clone(), body_style)]),
-            ]
+            resolve_color(BRASS, BRASS_INDEX)
         };
-        frame.render_widget(Paragraph::new(lines).style(bg), area);
+        let condensed = preview_text(
+            &raw.replace('\n', " "),
+            usize::from(area.width).saturating_sub(2),
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("▌ ", Style::default().fg(accent).bg(surface)),
+                Span::styled(
+                    condensed,
+                    Style::default()
+                        .fg(resolve_color(INK, INK_INDEX))
+                        .bg(surface)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])),
+            area,
+        );
     }
 
     pub(super) fn jump_to_sticky_user_header(&mut self) {

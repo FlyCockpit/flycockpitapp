@@ -337,7 +337,7 @@ fn render_user_note_is_a_distinct_labeled_row() {
 }
 
 #[test]
-fn plain_and_maintenance_lines_are_indented_and_muted() {
+fn plain_and_maintenance_lines_are_centered_and_muted() {
     for entry in [
         HistoryEntry::Plain {
             line: "daemon: spawned".to_string(),
@@ -360,15 +360,17 @@ fn plain_and_maintenance_lines_are_indented_and_muted() {
         );
         assert_eq!(r.lines.len(), 1);
         let text = line_text(&r.lines[0]);
-        assert!(
-            text.starts_with(&" ".repeat(AGENT_INDENT)),
-            "system line should share the transcript indent: {text:?}"
+        assert_eq!(
+            r.lines[0].alignment,
+            Some(ratatui::layout::Alignment::Center),
+            "{text:?}"
         );
         assert!(
             r.lines[0]
                 .spans
                 .iter()
-                .any(|span| !span.content.trim().is_empty() && span.style.fg == Some(INFO_TEXT)),
+                .any(|span| !span.content.trim().is_empty()
+                    && span.style.fg == Some(crate::tui::theme::DISABLED)),
             "system text should use muted foreground"
         );
     }
@@ -538,22 +540,21 @@ fn fixed_ts() -> DateTime<Local> {
     Local::now()
 }
 
-fn assert_user_border_fg(lines: &[Line<'static>], expected: Color) {
-    let border_chars = ['╭', '─', '╮', '│', '╰', '╯'];
-    let mut styled_border_spans = 0;
+fn assert_user_bar_fg(lines: &[Line<'static>], expected: Color) {
+    let mut styled_bar_spans = 0;
     for line in lines {
         for span in &line.spans {
-            if span.content.chars().any(|ch| border_chars.contains(&ch)) {
-                assert_eq!(span.style.fg, Some(expected), "border span {span:?}");
-                styled_border_spans += 1;
+            if span.content.as_ref() == "▌ " {
+                assert_eq!(span.style.fg, Some(expected), "bar span {span:?}");
+                styled_bar_spans += 1;
             }
         }
     }
-    assert!(styled_border_spans >= 4, "expected styled border spans");
+    assert!(styled_bar_spans >= 2, "header and body must both be barred");
 }
 
 #[test]
-fn failed_user_bubble_recolors_border_without_adding_chip_or_rows() {
+fn failed_user_message_recolors_bar_without_adding_chip_or_rows() {
     let ts = fixed_ts();
     let (normal, _, _, _) = render_user("hello", ts, 60, false, None, false, None);
     let (failed, _, _, _) = render_user("hello", ts, 60, false, None, true, None);
@@ -567,14 +568,14 @@ fn failed_user_bubble_recolors_border_without_adding_chip_or_rows() {
         failed
             .iter()
             .all(|line| !line_text(line).contains("send failed")),
-        "failed bubble should not render a failure chip"
+        "failed message should not render a failure chip"
     );
-    assert_user_border_fg(&normal, USER_BORDER_FG);
-    assert_user_border_fg(&failed, ERROR_TEXT);
+    assert_user_bar_fg(&normal, USER_BORDER_FG);
+    assert_user_bar_fg(&failed, ERROR_TEXT);
 }
 
 #[test]
-fn user_top_border_draws_fork_left_of_pin_and_drops_fork_first() {
+fn user_header_draws_pin_and_fork_as_one_width_gated_group() {
     let ctrl = PinControl {
         seq: 42,
         pinned: false,
@@ -582,25 +583,22 @@ fn user_top_border_draws_fork_left_of_pin_and_drops_fork_first() {
         is_pick: false,
     };
 
-    let (wide, wide_region) = user_top_border(20, Style::default(), Some(ctrl), 3);
-    let wide_text = line_text(&Line::from(wide));
-    assert_eq!(wide_text, "╭────────[fork]─[pin]╮");
+    let (wide, _, wide_region, _) =
+        render_user("message", fixed_ts(), 60, false, None, false, Some(ctrl));
+    let wide_text = line_text(&wide[0]);
+    assert!(wide_text.contains("[Pin] [Fork]"), "{wide_text:?}");
     let wide_region = wide_region.expect("wide border records controls");
-    assert_eq!(wide_region.fork_col_start, Some(11));
-    assert_eq!(wide_region.fork_col_end, Some(17));
-    assert_eq!((wide_region.col_start, wide_region.col_end), (18, 23));
+    assert_eq!(
+        wide_region.fork_col_start,
+        wide_region.col_end.checked_add(1)
+    );
 
-    let (pin_only, pin_only_region) = user_top_border(12, Style::default(), Some(ctrl), 3);
-    let pin_only_text = line_text(&Line::from(pin_only));
-    assert_eq!(pin_only_text, "╭───────[pin]╮");
-    let pin_only_region = pin_only_region.expect("pin survives narrow fallback");
-    assert_eq!(pin_only_region.fork_col_start, None);
-    assert_eq!(pin_only_region.fork_col_end, None);
-    assert_eq!(pin_only_region.col_end - pin_only_region.col_start, 5);
-
-    let (too_narrow, too_narrow_region) = user_top_border(5, Style::default(), Some(ctrl), 3);
-    assert_eq!(line_text(&Line::from(too_narrow)), "╭─────╮");
-    assert!(too_narrow_region.is_none());
+    let (narrow, _, narrow_region, _) =
+        render_user("message", fixed_ts(), 18, false, None, false, Some(ctrl));
+    let narrow_text = line_text(&narrow[0]);
+    assert!(!narrow_text.contains("[Fork]"), "{narrow_text:?}");
+    assert!(!narrow_text.contains("[Pin]"), "{narrow_text:?}");
+    assert!(narrow_region.is_none());
 }
 
 #[test]
@@ -614,10 +612,10 @@ fn failed_user_markdown_recolors_left_bar_without_adding_chip_or_rows() {
         failed.iter().map(line_text).collect::<Vec<_>>(),
         normal.iter().map(line_text).collect::<Vec<_>>()
     );
-    assert_eq!(normal[0].spans[0].content.as_ref(), "│ ");
-    assert_eq!(normal[0].spans[0].style.fg, Some(USER_BORDER_FG));
-    assert_eq!(failed[0].spans[0].content.as_ref(), "│ ");
-    assert_eq!(failed[0].spans[0].style.fg, Some(ERROR_TEXT));
+    assert_eq!(normal[1].spans[0].content.as_ref(), "▌ ");
+    assert_eq!(normal[1].spans[0].style.fg, Some(USER_BORDER_FG));
+    assert_eq!(failed[1].spans[0].content.as_ref(), "▌ ");
+    assert_eq!(failed[1].spans[0].style.fg, Some(ERROR_TEXT));
 }
 
 #[test]
@@ -652,7 +650,7 @@ fn failed_user_entry_has_no_chip_target() {
             .iter()
             .all(|line| !line_text(line).contains("send failed"))
     );
-    assert_user_border_fg(&rendered.lines, ERROR_TEXT);
+    assert_user_bar_fg(&rendered.lines, ERROR_TEXT);
 }
 
 #[test]
@@ -888,12 +886,8 @@ async fn agent_markdown_first_line_has_no_timestamp_orphan() {
         line_width(&rendered.lines[0]),
         width
     );
-    // Row 2 must be a real, full continuation — not a one-word
-    // orphan that is far shorter than row 1's text-equivalent budget.
-    // body_content_w = 40 - 4 = 36; first row reserves 6 → 30 cells
-    // of text. A genuine wrapped row 2 should be much wider than a
-    // single leftover word.
-    let row2_text: String = rendered.lines[1]
+    // Body row 2 must be a real continuation rather than an orphan.
+    let row2_text: String = rendered.lines[2]
         .spans
         .iter()
         .map(|s| s.content.as_ref())
@@ -906,7 +900,7 @@ async fn agent_markdown_first_line_has_no_timestamp_orphan() {
     // Row 2 is a soft-wrap continuation of the first logical line, so
     // the copy path must rejoin it with a space (cont = true).
     assert!(
-        rendered.continuations[1],
+        rendered.continuations[2],
         "row 2 must be marked a soft-wrap continuation"
     );
 }
@@ -1099,7 +1093,7 @@ fn render_toolbox_smoke() {
     let calls = vec![mk_call("bash", "echo ok", ToolCallState::Success)];
     let rendered = render_toolbox(&calls, 0, true, 80, false, false, &no_elided());
 
-    assert_eq!(line_text(&rendered.lines[0]), "│ bash: echo ok");
+    assert_eq!(line_text(&rendered.lines[0]), "  ▸ bash  echo ok");
 }
 
 #[test]
@@ -1204,13 +1198,13 @@ fn builtin_child_renders_as_first_class_tool_call() {
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("rename_session: name=\"Test session\"")),
+            .any(|line| line.contains("rename_session  name=\"Test session\"")),
         "{lines:?}"
     );
     assert!(
         !lines
             .iter()
-            .any(|line| line.contains("mcp: cockpit.rename_session")),
+            .any(|line| line.contains("mcp  cockpit.rename_session")),
         "{lines:?}"
     );
 }
@@ -1247,11 +1241,11 @@ fn external_child_renders_as_mcp_call() {
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("mcp: github.create_issue")),
+            .any(|line| line.contains("mcp  github.create_issue")),
         "{lines:?}"
     );
     assert!(
-        lines.iter().any(|line| line == "│   title=\"Bug\""),
+        lines.iter().any(|line| line == "    title=\"Bug\""),
         "{lines:?}"
     );
     assert!(
@@ -1296,7 +1290,7 @@ fn mcp_call_without_children_renders_as_today() {
     assert_eq!(
         lines,
         vec![
-            "│ mcp: script=\"mcp.invoke(\"cockpit\", \"rename_session\", {\"name\": \"Test session\"})\""
+            "  ▸ mcp  script=\"mcp.invoke(\"cockpit\", \"rename_session\", {\"name\": \"Test session\"})\""
                 .to_string()
         ]
     );
@@ -1424,14 +1418,14 @@ fn failed_child_shows_failure_and_reason() {
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("rename_session: name=\"Blocked\""))
+            .any(|line| line.contains("rename_session  name=\"Blocked\""))
     );
     assert!(lines.iter().any(|line| line.contains("not available")));
-    assert!(lines.iter().any(|line| line.contains("context_usage:")));
+    assert!(lines.iter().any(|line| line.contains("context_usage")));
     let failed_header = rendered
         .lines
         .iter()
-        .find(|line| line_text(line).contains("rename_session:"))
+        .find(|line| line_text(line).contains("rename_session  "))
         .expect("failed child header");
     assert!(
         failed_header
@@ -1443,7 +1437,7 @@ fn failed_child_shows_failure_and_reason() {
 }
 
 #[test]
-fn sidebar_glyphs_correct_with_children() {
+fn tool_rows_use_chevrons_without_sidebar_boxes() {
     let parent = mk_call("mcp", "script=\"mcp work\"", ToolCallState::Success);
     let child = child_call(
         &parent.call_id,
@@ -1466,11 +1460,11 @@ fn sidebar_glyphs_correct_with_children() {
         &no_elided(),
     ));
 
-    assert!(lines.first().unwrap().starts_with('╭'), "{lines:?}");
-    assert!(lines.last().unwrap().starts_with('╰'), "{lines:?}");
-    for line in lines.iter().skip(1).take(lines.len().saturating_sub(2)) {
-        assert!(line.starts_with('│'), "{lines:?}");
-    }
+    assert!(lines.first().unwrap().starts_with("  ▸"), "{lines:?}");
+    assert!(
+        lines.iter().any(|line| line.starts_with("    ▸")),
+        "{lines:?}"
+    );
 
     let single = rendered_text(&render_toolbox(
         &[mk_call("bash", "ls", ToolCallState::Success)],
@@ -1481,7 +1475,7 @@ fn sidebar_glyphs_correct_with_children() {
         false,
         &no_elided(),
     ));
-    assert!(single[0].starts_with('│'), "{single:?}");
+    assert!(single[0].starts_with("  ▸"), "{single:?}");
 }
 
 #[test]
@@ -1579,10 +1573,8 @@ fn builtin_and_tool_presentation_resolve_through_one_interface() {
     assert_eq!(not_tool.glyph, None);
 }
 
-/// `pinned-messages`: the relocated controls ride an agent reply's
-/// first content line, immediately left of the right-aligned timestamp
-/// — `[fork] [pin] HH:MM` (grey) / `[fork] [unpin] HH:MM` (yellow for
-/// unpin). The returned region records separate fork and pin ranges.
+/// Pin and Fork ride the agent role header, immediately left of the
+/// right-aligned timestamp. The returned region records both hit targets.
 #[test]
 fn agent_inline_controls_sit_left_of_timestamp_for_both_states() {
     let width: u16 = 60;
@@ -1593,7 +1585,7 @@ fn agent_inline_controls_sit_left_of_timestamp_for_both_states() {
         is_pick: false,
     };
 
-    for (pinned, label, pin_w) in [(false, "[pin]", 5u16), (true, "[unpin]", 7u16)] {
+    for (pinned, label, pin_w) in [(false, "[Pin]", 5u16), (true, "[Unpin]", 7u16)] {
         let r = render_agent(
             "Auto",
             "ok",
@@ -1614,16 +1606,22 @@ fn agent_inline_controls_sit_left_of_timestamp_for_both_states() {
             ts.chars().rev().collect::<String>().contains(':'),
             "row ends with the HH:MM timestamp: {first:?}"
         );
-        let fork_at = first.find("[fork] ").expect("fork control left of pin");
-        let pin_at = first
-            .find(&format!("{label} "))
-            .expect("pin control left of ts");
-        assert_eq!(pin_at, fork_at + "[fork] ".chars().count());
+        let pin_byte = first.find(label).expect("pin control left of fork");
+        let fork_byte = first
+            .find("[Fork]")
+            .expect("fork control left of timestamp");
+        let pin_at = UnicodeWidthStr::width(&first[..pin_byte]);
+        let fork_at = UnicodeWidthStr::width(&first[..fork_byte]);
         let pin_end = pin_at + label.chars().count();
         assert_eq!(
-            pin_end,
-            width as usize - TIMESTAMP_RIGHT_MARGIN - TIMESTAMP_WIDTH - 1,
-            "pin control ends just left of the ts gap: {first:?}"
+            fork_at,
+            pin_end + 1,
+            "fork sits one space right of pin: {first:?}"
+        );
+        assert_eq!(
+            fork_at + "[Fork]".chars().count(),
+            width as usize - TIMESTAMP_RIGHT_MARGIN - TIMESTAMP_WIDTH - 2,
+            "fork control ends two spaces left of the timestamp: {first:?}"
         );
 
         let region = r.pin_region.expect("clickable control region recorded");
@@ -1633,9 +1631,9 @@ fn agent_inline_controls_sit_left_of_timestamp_for_both_states() {
         assert_eq!(region.fork_col_end, Some((fork_at + 6) as u16));
         assert_eq!(region.col_end - region.col_start, pin_w, "{label} width");
         assert_eq!(
-            region.col_end,
-            width - TIMESTAMP_RIGHT_MARGIN as u16 - TIMESTAMP_WIDTH as u16 - 1,
-            "pin region ends just left of the ts gap"
+            region.col_end + 1,
+            region.fork_col_start.expect("fork start"),
+            "pin region ends one column left of fork"
         );
         assert_eq!(
             region.col_start as usize, pin_at,
@@ -1646,7 +1644,7 @@ fn agent_inline_controls_sit_left_of_timestamp_for_both_states() {
 }
 
 #[test]
-fn agent_inline_controls_drop_fork_before_pin_on_narrow_width() {
+fn agent_inline_controls_collapse_as_one_group_on_narrow_width() {
     let ctrl = PinControl {
         seq: 42,
         pinned: false,
@@ -1654,9 +1652,7 @@ fn agent_inline_controls_drop_fork_before_pin_on_narrow_width() {
         is_pick: false,
     };
 
-    // Wide enough to host the full `[fork] [pin]` block: both controls render
-    // and the recorded region carries the fork columns. This is the baseline
-    // the narrower bands degrade away from.
+    // Wide enough to host the full `[Pin] [Fork]` group.
     let both = render_agent(
         "Auto",
         "ok",
@@ -1665,7 +1661,7 @@ fn agent_inline_controls_drop_fork_before_pin_on_narrow_width() {
         false,
         0,
         None,
-        25,
+        40,
         false,
         Some(ctrl),
         None,
@@ -1673,30 +1669,21 @@ fn agent_inline_controls_drop_fork_before_pin_on_narrow_width() {
     );
     let both_first = line_text(&both.lines[0]);
     let both_fork_at = both_first
-        .find("[fork]")
+        .find("[Fork]")
         .expect("fork renders when the row is wide enough for the full control block");
     let both_pin_at = both_first
-        .find("[pin]")
+        .find("[Pin]")
         .expect("pin renders in the full block");
-    // The drop-fork-before-pin ordering: `[fork]` is drawn to the left of
-    // `[pin]`, so it is the control that would be shed first as width shrinks.
     assert!(
-        both_fork_at < both_pin_at,
-        "fork sits left of pin in the full control block"
+        both_pin_at < both_fork_at,
+        "pin sits left of fork in the full control block"
     );
     let both_region = both.pin_region.expect("both controls recorded a region");
     assert!(both_region.fork_col_start.is_some());
     assert!(both_region.fork_col_end.is_some());
 
-    // At exactly RESPONSE_HEADER_MIN_WIDTH — the minimum interactive width — the
-    // full `[fork] [pin]` block STILL fits, so fork is NOT dropped here. The
-    // first content line reserves the right-edge control columns before
-    // wrapping, which forces this short body to hard-break to a single leading
-    // glyph; that frees exactly enough width for the full block to remain. The
-    // fork-before-pin degradation band (where `[fork]` drops while `[pin]` is
-    // kept) therefore lives entirely below the 24-column resize floor and is
-    // shadowed by the resize indicator: there is no reachable width at or above
-    // the floor where fork is dropped but pin survives.
+    // At the full-header floor the complete action group remains visible even
+    // when the timestamp no longer fits; actions and time degrade independently.
     let floor = render_agent(
         "Auto",
         "ok",
@@ -1713,16 +1700,11 @@ fn agent_inline_controls_drop_fork_before_pin_on_narrow_width() {
     );
     let first = line_text(&floor.lines[0]);
     assert!(
-        first.contains("[fork]"),
-        "the full control block still fits at the minimum interactive width"
+        first.contains("[Pin]") && first.contains("[Fork]"),
+        "{first:?}"
     );
-    assert!(first.contains("[pin]"));
-    let region = floor
-        .pin_region
-        .expect("controls recorded a region at the floor");
-    assert!(region.fork_col_start.is_some());
-    assert!(region.fork_col_end.is_some());
-    assert_eq!(region.col_end - region.col_start, 5);
+    assert!(!first.contains("12:00"), "{first:?}");
+    assert!(floor.pin_region.is_some());
 
     // Below RESPONSE_HEADER_MIN_WIDTH the response-header redesign replaces ALL
     // header chrome (metric/timestamp/fork/pin) with a single noninteractive
@@ -1745,11 +1727,8 @@ fn agent_inline_controls_drop_fork_before_pin_on_narrow_width() {
         false,
     );
     let first = line_text(&too_narrow.lines[0]);
-    assert!(
-        first.contains('↔'),
-        "the resize indicator replaces the header below the minimum width"
-    );
-    assert!(!first.contains("[fork]") && !first.contains("[pin]"));
+    assert!(first.contains("Agent"));
+    assert!(!first.contains("[Fork]") && !first.contains("[Pin]"));
     assert!(too_narrow.pin_region.is_none());
 }
 
@@ -1775,7 +1754,7 @@ fn agent_no_pin_when_control_hidden() {
     );
     assert!(r.pin_region.is_none(), "no region when not shown");
     let first = line_text(&r.lines[0]);
-    assert!(!first.contains("[pin]") && !first.contains("[unpin]"));
+    assert!(!first.contains("[Pin]") && !first.contains("[Unpin]"));
 }
 
 #[test]
@@ -1807,7 +1786,7 @@ fn historical_lock_verb_tool_calls_still_render() {
     historical_read.output = "1|const value = 1;".into();
     let toolbox = render_toolbox(&[historical_read], 0, true, 80, false, false, &no_elided());
     let toolbox_text = rendered_text(&toolbox).join("\n");
-    assert!(toolbox_text.contains("readlock: g.ts"), "{toolbox_text}");
+    assert!(toolbox_text.contains("readlock  g.ts"), "{toolbox_text}");
     assert!(
         toolbox_text.contains("1|const value = 1;"),
         "{toolbox_text}"
@@ -1833,7 +1812,7 @@ fn historical_lock_verb_tool_calls_still_render() {
         None,
     );
     assert!(
-        line_text(&rendered_write.lines[0]).contains("write: src/lib.rs"),
+        line_text(&rendered_write.lines[0]).contains("write  src/lib.rs"),
         "{:?}",
         rendered_text(&rendered_write)
     );
@@ -1857,7 +1836,7 @@ fn historical_lock_verb_tool_calls_still_render() {
         None,
     );
     let edit_text = rendered_text(&rendered_edit).join("\n");
-    assert!(edit_text.contains("edit: src/lib.rs"), "{edit_text}");
+    assert!(edit_text.contains("◇ Edited src/lib.rs"), "{edit_text}");
     assert!(edit_text.contains("- old"), "{edit_text}");
     assert!(edit_text.contains("+ new"), "{edit_text}");
 }
@@ -1933,15 +1912,14 @@ fn toolbox_top_follows_and_clamps() {
 }
 
 #[test]
-fn toolbox_collapsed_caps_at_visible_with_rounded_caps() {
+fn toolbox_collapsed_caps_at_visible_without_box_chrome() {
     let calls: Vec<ToolCall> = (0..9)
         .map(|i| mk_call("bash", &format!("cmd{i}"), ToolCallState::Success))
         .collect();
     let r = render_toolbox(&calls, 0, true, 80, false, false, &no_elided());
     assert_eq!(r.lines.len(), TOOLBOX_VISIBLE);
-    // Rounded caps top and bottom; in between the newest calls show.
-    assert!(line_text(&r.lines[0]).starts_with('╭'));
-    assert!(line_text(&r.lines[TOOLBOX_VISIBLE - 1]).starts_with('╰'));
+    assert!(line_text(&r.lines[0]).starts_with("  ▸"));
+    assert!(line_text(&r.lines[TOOLBOX_VISIBLE - 1]).starts_with("  ▸"));
     assert!(line_text(&r.lines[0]).contains("cmd3")); // 9 - 6
     assert!(line_text(&r.lines[TOOLBOX_VISIBLE - 1]).contains("cmd8"));
 }
@@ -2005,7 +1983,7 @@ fn toolbox_read_output_styles_line_numbers_without_rewriting_text() {
     assert!(
         line.spans
             .iter()
-            .any(|span| span.content.as_ref() == "1|" && span.style.fg == Some(METADATA_TEXT))
+            .any(|span| span.content.as_ref() == "1|" && span.style.fg == Some(FOG))
     );
     assert!(
         line.spans
@@ -2056,7 +2034,7 @@ fn toolbox_expands_only_the_selected_call() {
 
     assert!(joined.contains("continued"));
     assert!(joined.contains("selected output"));
-    assert!(joined.contains("bash: cmd2"));
+    assert!(joined.contains("bash  cmd2"));
     assert!(!joined.contains("SHOULD_NOT_SHOW"));
     assert!(!joined.contains("neighbor output"));
     assert_eq!(
@@ -2096,13 +2074,7 @@ fn toolbox_wraps_long_expanded_input_with_hanging_indent() {
         "wrapped rows must fit within width: {:?}",
         r.lines.iter().map(line_text).collect::<Vec<_>>()
     );
-    assert!(r.lines[0].spans[0].content.as_ref() == "╭");
-    assert!(
-        r.lines[1..]
-            .iter()
-            .all(|line| matches!(line.spans[0].content.as_ref(), "│" | "╰")),
-        "every continuation keeps a sidebar glyph"
-    );
+    assert!(line_text(&r.lines[0]).starts_with("  ▸ bash  "));
     assert!(
         r.tool_call_rows.iter().all(|row| *row == Some(0)),
         "wrapped input rows stay mapped to the owning call"
@@ -2110,8 +2082,8 @@ fn toolbox_wraps_long_expanded_input_with_hanging_indent() {
 
     let continuation = line_text(&r.lines[1]);
     assert!(
-        continuation.starts_with("│       "),
-        "continuation should have sidebar, spacer, and six-column bash label indent: {continuation:?}"
+        continuation.starts_with("        "),
+        "continuation should use a hanging indent beneath the command: {continuation:?}"
     );
     let joined = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
     assert!(joined.contains("lambda"));
@@ -2184,8 +2156,8 @@ async fn toolbox_renders_readable_websearch_and_custom_args() {
         .map(line_text)
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(collapsed_text.contains("websearch: OpenAI model release news"));
-    assert!(collapsed_text.contains("custom_audit: prompt=\"Describe"));
+    assert!(collapsed_text.contains("websearch  OpenAI model release news"));
+    assert!(collapsed_text.contains("custom_audit  prompt=\"Describe"));
     assert!(!collapsed_text.contains("<25c>"));
     assert!(!collapsed_text.contains("<52c>"));
 
@@ -2208,7 +2180,7 @@ async fn toolbox_renders_readable_websearch_and_custom_args() {
         .map(line_text)
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(expanded_text.contains("websearch: OpenAI model release news"));
+    assert!(expanded_text.contains("websearch  OpenAI model release news"));
     assert!(
         expanded_text.contains("prompt=\"Describe the deployment risk for the west region\"")
     );
@@ -2219,20 +2191,20 @@ async fn toolbox_renders_readable_websearch_and_custom_args() {
 
 #[tokio::test]
 #[rustfmt::skip]
-async fn toolbox_honors_emoji_setting() {
+async fn toolbox_uses_one_chevron_chrome_with_or_without_emojis() {
     let calls = vec![mk_call("read", "f.txt", ToolCallState::Success)];
     assert!(
         !line_text(&render_toolbox(&calls, 0, true, 80, false, false, &no_elided()).lines[0])
             .contains('📖')
     );
-    assert!(
-        line_text(&render_toolbox(&calls, 0, true, 80, true, false, &no_elided()).lines[0])
-            .contains('📖')
-    );
+    let with_emojis =
+        line_text(&render_toolbox(&calls, 0, true, 80, true, false, &no_elided()).lines[0]);
+    assert!(!with_emojis.contains('📖'));
+    assert!(with_emojis.starts_with("  ▸ read  "));
 }
 
 #[test]
-fn write_edit_lines_show_file_type_icon_from_summary_path() {
+fn write_edit_rows_keep_file_icons_out_of_transcript_chrome() {
     let rust_icon = crate::tui::file_icons::glyph_for_path("src/lib.rs");
     let generic = crate::tui::file_icons::GENERIC_FILE_GLYPH;
     let write = mk_call("write", "src/lib.rs", ToolCallState::Success);
@@ -2243,10 +2215,13 @@ fn write_edit_lines_show_file_type_icon_from_summary_path() {
     let off = line_text(
         &render_toolbox(&[write.clone()], 0, true, 80, false, false, &no_elided()).lines[0],
     );
-    assert!(on.contains(rust_icon), "icons on: {on}");
-    assert!(on.contains("write: src/lib.rs"), "{on}");
+    assert!(
+        !on.contains(rust_icon),
+        "icons stay out of transcript rows: {on}"
+    );
+    assert!(on.contains("write  src/lib.rs"), "{on}");
     assert!(!off.contains(rust_icon), "icons off: {off}");
-    assert!(off.contains("write: src/lib.rs"), "{off}");
+    assert!(off.contains("write  src/lib.rs"), "{off}");
 
     let (icon_glyph, label) = tool_call_glyph_label(&write, false, true);
     assert_eq!(label, "write");
@@ -2299,7 +2274,7 @@ fn write_edit_lines_show_file_type_icon_from_summary_path() {
 }
 
 #[test]
-fn tool_line_and_diff_honor_file_icons() {
+fn tool_line_and_diff_use_reference_chrome_without_file_icons() {
     let rust_icon = crate::tui::file_icons::glyph_for_path("src/lib.rs");
     let line = HistoryEntry::ToolLine {
         call_id: "w".to_string(),
@@ -2321,8 +2296,8 @@ fn tool_line_and_diff_honor_file_icons() {
         None,
     );
     let on_text = line_text(&on.lines[0]);
-    assert!(on_text.contains(rust_icon), "{on_text}");
-    assert!(on_text.contains("write: src/lib.rs"), "{on_text}");
+    assert!(!on_text.contains(rust_icon), "{on_text}");
+    assert!(on_text.contains("write  src/lib.rs"), "{on_text}");
 
     let off = render_entry(
         &line,
@@ -2359,9 +2334,9 @@ fn tool_line_and_diff_honor_file_icons() {
         None,
     );
     let failed_text = line_text(&failed.lines[0]);
-    assert!(failed_text.contains(rust_icon), "{failed_text}");
+    assert!(!failed_text.contains(rust_icon), "{failed_text}");
     assert!(
-        failed_text.contains("edit: replacement did not match"),
+        failed_text.contains("edit  replacement did not match"),
         "{failed_text}"
     );
 
@@ -2384,13 +2359,13 @@ fn tool_line_and_diff_honor_file_icons() {
         None,
     );
     let diff_text = rendered_text(&diff_on).join("\n");
-    assert!(diff_text.contains(rust_icon), "{diff_text}");
+    assert!(!diff_text.contains(rust_icon), "{diff_text}");
     assert!(diff_text.contains("src/lib.rs"), "{diff_text}");
 }
 
 // ── prune dimming ──────────────────────────────────────────────────
 
-const MUTED: Color = Color::Indexed(MUTED_COLOR_INDEX);
+const MUTED: Color = FOG;
 
 /// True when any span on `line` carries the theme muted foreground.
 fn any_muted(line: &Line<'static>) -> bool {
@@ -2441,7 +2416,7 @@ fn elided_body_is_dimmed_kept_body_is_not() {
     assert!(joined.contains("(pruned"), "elided call gets a pruned tag");
 }
 
-/// Empty elided set → zero visual change: no body is muted and no tag.
+/// Empty elided set does not add a prune annotation.
 #[test]
 fn no_elisions_means_no_dimming() {
     let mut call = mk_call("search", "TODO", ToolCallState::Success);
@@ -2451,10 +2426,6 @@ fn no_elisions_means_no_dimming() {
     let r = render_toolbox(&[call], 0, true, 80, false, false, &no_elided());
     let joined: String = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
     assert!(!joined.contains("(pruned"));
-    assert!(
-        r.lines.iter().all(|l| !any_muted(l)),
-        "no elisions → nothing muted"
-    );
 }
 
 fn compact_entry(source: &str, expanded: bool) -> HistoryEntry {
@@ -2476,7 +2447,7 @@ fn compact_entry(source: &str, expanded: bool) -> HistoryEntry {
 }
 
 #[test]
-fn compaction_renders_as_tool_call() {
+fn compaction_renders_as_centered_boundary() {
     for source in ["auto", "manual", "agent_requested"] {
         let rendered = render_entry(
             &compact_entry(source, false),
@@ -2491,9 +2462,10 @@ fn compaction_renders_as_tool_call() {
             None,
         );
         let text = rendered.lines.iter().map(line_text).collect::<String>();
-        assert!(text.contains("compact:"), "{text}");
-        assert!(text.contains(&format!("source={source}")), "{text}");
-        assert_eq!(rendered.tool_call_rows, vec![Some(0)]);
+        assert!(text.contains("Compacted from deadbe"), "{text}");
+        assert!(text.contains(source), "{text}");
+        assert!(text.contains("[show summary]"), "{text}");
+        assert!(rendered.tool_call_rows.is_empty());
     }
 }
 
@@ -2517,10 +2489,10 @@ fn compaction_expand_shows_handoff() {
         .map(line_text)
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(text.contains("tokens=6000→2000"), "{text}");
-    assert!(text.contains("tail kept=4, trimmed=1"), "{text}");
+    assert!(text.contains("6000→2000 tokens"), "{text}");
+    assert!(text.contains("tail 4/1"), "{text}");
     assert!(text.contains("keep the exact handoff"), "{text}");
-    assert!(rendered.tool_call_rows.iter().all(|row| *row == Some(0)));
+    assert!(rendered.tool_call_rows.is_empty());
 }
 
 /// The backup-fallback notice (implementation note)
@@ -2620,7 +2592,7 @@ fn compact_duration_compact_under_and_over_a_minute() {
 fn any_orange(line: &Line<'static>) -> bool {
     line.spans
         .iter()
-        .any(|s| s.style.fg == Some(SUBAGENT_NAME_FG))
+        .any(|s| s.style.fg == Some(crate::tui::theme::INK))
 }
 
 fn render_sub(
@@ -2776,8 +2748,12 @@ fn subagent_report_renders_header_and_quoted_body() {
     assert!(!header.contains("[trusted]"), "{header}");
     assert!(header.contains("[private_remote]"), "{header}");
     assert!(any_orange(&r.lines[0]));
-    // Body rows carry the left `│` bar.
-    assert!(r.lines[1..].iter().any(|l| line_text(l).contains("│")));
+    // Body rows use a quiet four-column indent without a sidebar.
+    assert!(
+        r.lines[1..]
+            .iter()
+            .any(|line| line_text(line).starts_with("  "))
+    );
     // Truncated: an expand chip exists and is the clickable row.
     assert!(r.chip_row.is_some());
     let chip = line_text(&r.lines[r.chip_row.unwrap()]);
@@ -3019,8 +2995,8 @@ fn response_performance_chip_renders_and_expands_independently() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        joined.contains("3/54") || joined.contains("3.0/54"),
-        "compact chip missing in:\n{joined}"
+        joined.contains("[Agent stats]"),
+        "agent stats chip missing in:\n{joined}"
     );
     assert!(
         !joined.contains("TTFT:"),
@@ -3060,7 +3036,9 @@ fn response_performance_chip_renders_and_expands_independently() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        joined.contains("TTFT:") && joined.contains("TPS:"),
+        ["Model", "TTFT", "TPS", "Cache"]
+            .into_iter()
+            .all(|label| joined.contains(label)),
         "expanded detail missing in:\n{joined}"
     );
     // Expanding performance must not expand reasoning.
@@ -3085,8 +3063,7 @@ fn response_performance_chip_rounding_matches_detail() {
         encoding: "cl100k_base".to_string(),
     };
     assert_eq!(format_tps(&perf).as_deref(), Some("54"));
-    assert_eq!(metric_chip_text(&perf).as_deref(), Some("3/54"));
-    assert_eq!(metric_detail_text(&perf), "TTFT: 3s / TPS: 54");
+    assert_eq!(metric_chip_text(&perf).as_deref(), Some("[Agent stats]"));
 
     // 53.5 → 54 half-up: tokens*1000/ms with remainder >= half.
     let half = ResponsePerformance {
@@ -3124,7 +3101,7 @@ fn response_performance_chip_narrow_layout_preserves_controls() {
     assert!(wide.metric_region.is_some());
     assert!(wide.pin_region.is_some());
     let first = line_text(&wide.lines[0]);
-    assert!(first.contains("[fork]") || first.contains("[pin]"));
+    assert!(first.contains("[Fork]") && first.contains("[Pin]"));
 
     // Width 48: dedicated metric row, controls preserved.
     let mid = render_entry(
@@ -3142,7 +3119,7 @@ fn response_performance_chip_narrow_layout_preserves_controls() {
     assert!(mid.metric_region.is_some());
     assert!(mid.pin_region.is_some());
 
-    // Width 24: accessible header returns (floor).
+    // Width 24: stats remain accessible, while the grouped actions collapse.
     let floor = render_entry(
         &agent_with_perf("ok", "", Some(perf.clone()), false, false),
         24,
@@ -3159,7 +3136,7 @@ fn response_performance_chip_narrow_layout_preserves_controls() {
         floor.metric_region.is_some(),
         "metric retained at min width"
     );
-    assert!(floor.pin_region.is_some());
+    assert!(floor.pin_region.is_none());
 
     // Below 24: ↔ resize state, no metric hit target.
     for w in [23u16, 12, 1] {
@@ -3181,10 +3158,7 @@ fn response_performance_chip_narrow_layout_preserves_controls() {
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(
-            text.contains('↔'),
-            "width {w} should show resize state: {text}"
-        );
+        assert!(text.contains("Agent"), "width {w}: {text}");
         assert!(narrow.metric_region.is_none());
         assert!(narrow.pin_region.is_none());
     }
@@ -3218,10 +3192,10 @@ fn modes_session_setup_row_text(state: ToolCallState) -> String {
 
 fn modes_session_setup_label_fg(state: ToolCallState) -> Option<Color> {
     let call = modes_session_setup_tool_call(state);
-    // The bold `label:` span carries the semantic state colour.
+    // The bold label span carries the semantic state colour.
     tool_call_spans(&call, &call.summary, false, false, None)
         .into_iter()
-        .find(|span| span.content.contains(':'))
+        .find(|span| span.content.as_ref() == "bash")
         .and_then(|span| span.style.fg)
 }
 
@@ -3251,7 +3225,7 @@ fn modes_session_setup_tool_row_verifying_uses_distinct_color_and_accessible_lab
 
 #[test]
 fn modes_session_setup_tool_row_verifying_to_running_to_done_transition() {
-    // running uses the existing Processing (yellow) treatment; done is white.
+    // Running uses the existing Processing treatment; done is muted.
     // Only the pre-dispatch verifying state shows the accessible label.
     assert_eq!(
         modes_session_setup_label_fg(ToolCallState::Processing),
@@ -3259,7 +3233,7 @@ fn modes_session_setup_tool_row_verifying_to_running_to_done_transition() {
     );
     assert_eq!(
         modes_session_setup_label_fg(ToolCallState::Success),
-        Some(Color::White)
+        Some(FOG)
     );
     assert!(!modes_session_setup_row_text(ToolCallState::Processing).contains("Verifying"));
     assert!(!modes_session_setup_row_text(ToolCallState::Success).contains("Verifying"));
@@ -3280,7 +3254,7 @@ fn modes_session_setup_tool_row_verifying_to_done_directly_for_no_dispatch() {
     assert!(!done.contains("Verifying"));
     assert_eq!(
         modes_session_setup_label_fg(ToolCallState::Success),
-        Some(Color::White)
+        Some(FOG)
     );
 }
 

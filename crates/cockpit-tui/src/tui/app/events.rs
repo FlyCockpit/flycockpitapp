@@ -4746,7 +4746,7 @@ mod tests {
         assert!(
             restored_lines
                 .iter()
-                .any(|line| line.contains("rename_session: name=\"Test session\"")),
+                .any(|line| line.contains("rename_session  name=\"Test session\"")),
             "{restored_lines:?}"
         );
     }

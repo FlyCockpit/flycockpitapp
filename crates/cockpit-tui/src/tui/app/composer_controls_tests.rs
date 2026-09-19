@@ -331,6 +331,24 @@ fn ctrl_b_and_ctrl_n_route_to_session_seams() {
 }
 
 #[test]
+fn ctrl_b_dismisses_an_open_picker_before_focusing_the_session_rail() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    let _ = render(&mut app, 120, 24);
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    assert!(app.composer_controls.picker.is_some());
+
+    app.handle_key(ctrl(KeyCode::Char('b')));
+
+    assert!(app.session_rail.is_focused());
+    assert!(
+        app.composer_controls.picker.is_none(),
+        "rail focus must release picker ownership of arrows and Enter"
+    );
+    assert!(app.composer_controls.selection.is_none());
+}
+
+#[test]
 fn ctrl_j_focuses_rail_while_picker_open_instead_of_committing() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app(&tmp);
@@ -418,6 +436,32 @@ fn ctrl_k_router_dispatches_b_n_and_r_continuations() {
     btw.handle_key(ctrl(KeyCode::Char('k')));
     btw.handle_key(press(KeyCode::Char('b')));
     assert!(btw.btw_pane.as_ref().expect("btw pane").focused);
+
+    let pane = btw.btw_pane.as_mut().expect("btw pane");
+    pane.composer.insert_str("draft");
+    btw.handle_key(ctrl(KeyCode::Char('k')));
+    btw.handle_key(press(KeyCode::Char('b')));
+    let pane = btw.btw_pane.as_ref().expect("btw pane");
+    assert!(
+        !pane.focused,
+        "Ctrl+K b must also leave a focused /btw pane"
+    );
+    assert_eq!(
+        pane.composer.text(),
+        "draft",
+        "the leader continuation must not be inserted into /btw"
+    );
+
+    btw.btw_pane.as_mut().expect("btw pane").focused = true;
+    btw.handle_key(ctrl(KeyCode::Char('b')));
+    assert!(
+        btw.session_rail.is_focused(),
+        "bare Ctrl+B uses the global session-sidebar seam"
+    );
+    assert!(
+        btw.btw_pane.as_ref().expect("btw pane").focused,
+        "bare Ctrl+B must not trigger the old /btw focus toggle"
+    );
 
     let mut scratchpad = app(&tmp);
     scratchpad.handle_key(ctrl(KeyCode::Char('k')));

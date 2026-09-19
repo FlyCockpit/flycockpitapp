@@ -491,23 +491,6 @@ impl App {
         if self.handle_queue_key(key) {
             return false;
         }
-        if self.btw_pane.as_ref().is_some_and(|pane| pane.focused)
-            && let Some(pane) = self.btw_pane.as_mut()
-        {
-            match pane.handle_focused_key(key) {
-                crate::tui::app::btw_pane::BtwFocusedKeyOutcome::Consumed => return false,
-                crate::tui::app::btw_pane::BtwFocusedKeyOutcome::Error(error) => {
-                    pane.history.push(HistoryEntry::InferenceError {
-                        summary: error.clone(),
-                        detail: error,
-                        expanded: false,
-                    });
-                    return false;
-                }
-                crate::tui::app::btw_pane::BtwFocusedKeyOutcome::Unhandled => {}
-            }
-        }
-
         // Embedded pane (GOALS §1i): while a pane is open, `Ctrl+X`
         // force-closes it and `Ctrl+O` toggles focus — both reserved by
         // cockpit and not delivered to the child. When the pane is
@@ -701,6 +684,26 @@ impl App {
         {
             self.toggle_keys_overlay();
             return false;
+        }
+
+        // The adopted global chords and the which-key leader above outrank a
+        // focused `/btw` composer. Plain editing keys still belong to `/btw`,
+        // but Ctrl+K followed by a leader action must be able to leave it.
+        if self.btw_pane.as_ref().is_some_and(|pane| pane.focused)
+            && let Some(pane) = self.btw_pane.as_mut()
+        {
+            match pane.handle_focused_key(key) {
+                crate::tui::app::btw_pane::BtwFocusedKeyOutcome::Consumed => return false,
+                crate::tui::app::btw_pane::BtwFocusedKeyOutcome::Error(error) => {
+                    pane.history.push(HistoryEntry::InferenceError {
+                        summary: error.clone(),
+                        detail: error,
+                        expanded: false,
+                    });
+                    return false;
+                }
+                crate::tui::app::btw_pane::BtwFocusedKeyOutcome::Unhandled => {}
+            }
         }
 
         // `/prune` confirm armed (T6.d): `y` / Enter commits, any other
@@ -4438,6 +4441,10 @@ impl App {
     /// Router seam for #447's hideable session rail. Until that rail owns a
     /// hidden state, the chord toggles keyboard focus on the existing rail.
     fn toggle_session_sidebar_from_chord(&mut self) {
+        // Moving focus to the rail must also relinquish the composer control
+        // deck; otherwise its picker still owns arrows and Enter.
+        self.close_composer_picker();
+        self.composer_controls.selection = None;
         if self.session_rail.is_focused() {
             let outcome = self.session_rail.handle_key(KeyEvent::from(KeyCode::Esc));
             self.apply_session_rail_outcome(outcome);

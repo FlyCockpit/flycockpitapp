@@ -2400,7 +2400,7 @@ impl App {
             KeyCode::Char('W') => {
                 self.apply_operator_motion(op, ComposerMotion::WordForward { big: true }, false)
             }
-            KeyCode::Char(ch) if ch == 'b' => {
+            KeyCode::Char('b') => {
                 self.apply_operator_motion(op, ComposerMotion::WordBackward { big: false }, false)
             }
             KeyCode::Char('B') => {
@@ -3388,9 +3388,8 @@ impl App {
             }
             KeyCode::Down | KeyCode::Tab => self.cycle_transcript_find(1),
             KeyCode::Up | KeyCode::BackTab => self.cycle_transcript_find(-1),
-            KeyCode::Char(ch)
-                if ch == 'n'
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
+            KeyCode::Char('n')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
                 self.cycle_transcript_find(1);
@@ -4304,7 +4303,7 @@ impl App {
             KeyCode::Char('W') => self
                 .composer
                 .move_cursor(ComposerMotion::WordForward { big: true }),
-            KeyCode::Char(ch) if ch == 'b' => self
+            KeyCode::Char('b') => self
                 .composer
                 .move_cursor(ComposerMotion::WordBackward { big: false }),
             KeyCode::Char('B') => self

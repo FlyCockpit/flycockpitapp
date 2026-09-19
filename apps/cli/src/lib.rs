@@ -30,8 +30,8 @@ pub(crate) mod daemon {
         DaemonPaths, DaemonProbe, DaemonStatus, EventSender, SharedRedactionTable, caffeinate,
         capture_restart_release, daemon_pid, derive_restart_no_sandbox, discover, proto,
         restart_release_timeout, run_foreground, run_foreground_with_resume, send_current_event,
-        server, session_worker, spawn_detached_with_resume, spawn_detached_with_resume_async, stop,
-        stop_with_timeout, terminal, wait_for_restart_release,
+        server, session_worker, spawn_detached_with_resume_async, stop_with_timeout, terminal,
+        wait_for_restart_release,
     };
     pub(crate) mod client {
         pub(crate) use cockpit_core::daemon::client::{

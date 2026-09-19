@@ -1041,7 +1041,7 @@ async fn probe_or_spawn_with_spawn_authorization(
     mode: LifecycleMode,
     lifecycle_request: Option<&cockpit_client::LifecycleRequest>,
 ) -> Result<ConnectedDaemon> {
-    use crate::daemon::{DaemonPaths, discover, spawn_detached, spawn_detached_ephemeral};
+    use crate::daemon::{DaemonPaths, discover, spawn_detached_ephemeral};
 
     match mode {
         LifecycleMode::AttachOrPersistent

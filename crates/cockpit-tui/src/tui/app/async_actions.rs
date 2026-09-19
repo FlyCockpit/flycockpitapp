@@ -1090,6 +1090,8 @@ impl App {
                     result: Ok(lifecycle),
                 }) if generation == self.startup_background.generation && !self.exit_requested => {
                     self.startup_background.retry = None;
+                    self.startup_background.lifecycle_failure_started_at = None;
+                    self.clear_daemon_spawn_failure_toast();
                     let selected_lifetime = match self.lifecycle_intent() {
                         cockpit_client::LifecycleIntent::AttachOrPersistent
                         | cockpit_client::LifecycleIntent::PromoteToPersistent => "persistent",
@@ -1130,10 +1132,29 @@ impl App {
                         tracing::warn!(target: cockpit_core::startup::TARGET, event = "lifecycle-error", "startup");
                     }
                     self.startup_background.retry = Some(StartupRetry::Lifecycle);
-                    self.show_toast(
-                        format!("Daemon lifecycle unavailable: {error}"),
-                        crate::tui::app::ToastKind::Error,
-                    );
+                    let now = Instant::now();
+                    if self
+                        .startup_background
+                        .lifecycle_failure_started_at
+                        .is_none()
+                    {
+                        self.startup_background.lifecycle_failure_started_at = Some(now);
+                    }
+                    let escalate = Self::is_daemon_spawn_boot_failure(&error)
+                        || self
+                            .startup_background
+                            .lifecycle_failure_started_at
+                            .is_some_and(|start| {
+                                now >= start + cockpit_core::daemon::DAEMON_SPAWN_TIMEOUT
+                            });
+                    if escalate {
+                        self.apply_daemon_spawn_failure(&error);
+                    } else {
+                        self.show_toast(
+                            format!("Daemon lifecycle unavailable: {error}"),
+                            crate::tui::app::ToastKind::Error,
+                        );
+                    }
                 }
                 Ok(_) | Err(_) => {}
             },

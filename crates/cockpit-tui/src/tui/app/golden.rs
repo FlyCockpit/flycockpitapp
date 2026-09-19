@@ -55,6 +55,17 @@ pub fn empty_chat_banner_app() -> App {
     app
 }
 
+/// Spawn-failure surface: blocking toast + session-setup error in place of
+/// the loading placeholder.
+pub fn spawn_error_app() -> App {
+    let mut app = empty_chat_banner_app();
+    let error = "daemon socket address already in use: /tmp/cockpit.sock\n\
+--- daemon.log (last 20 lines) ---\n\
+bind-line\n";
+    app.apply_daemon_spawn_failure(error);
+    app
+}
+
 /// Settled onboarding Welcome shell — seed dump (b).
 pub fn onboarding_welcome_shell_at(frame: usize, reduced_motion: bool) -> OnboardingShell {
     let snapshot = OnboardingBootstrapSnapshot {
@@ -113,6 +124,23 @@ pub fn assert_empty_chat_banner() {
     assert!(
         preview.contains("FlyCockpit"),
         "empty chat dump must include the launch banner"
+    );
+}
+
+pub fn assert_spawn_error() {
+    let _pins = GoldenPins::install();
+    let mut app = spawn_error_app();
+    assert_golden_sizes("chat", "spawn-error", |width, height| {
+        render_app(&mut app, width, height)
+    });
+    let preview = buffer_text(&render_app(&mut app, 80, 24));
+    assert!(
+        preview.contains("already in use"),
+        "spawn-error dump must include the spawn failure summary"
+    );
+    assert!(
+        !preview.contains("Loading session setup"),
+        "spawn-error dump must not stay on the loading placeholder"
     );
 }
 
@@ -266,6 +294,12 @@ mod seed_tests {
     fn golden_empty_chat_with_banner() {
         let _env = isolate_render_env();
         assert_empty_chat_banner();
+    }
+
+    #[test]
+    fn golden_spawn_error() {
+        let _env = isolate_render_env();
+        assert_spawn_error();
     }
 
     #[test]

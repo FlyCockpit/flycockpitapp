@@ -818,11 +818,16 @@ impl SessionSetupPane {
         } else {
             match &self.status {
                 Status::Loading => vec![Line::from(Span::raw("Loading session setup…"))],
-                Status::Error(message) => vec![Line::from(styled(
-                    message.clone(),
-                    RowKind::CandidateLocked,
-                    self.color,
-                ))],
+                Status::Error(message) => message
+                    .lines()
+                    .map(|line| {
+                        Line::from(styled(
+                            line.to_string(),
+                            RowKind::CandidateLocked,
+                            self.color,
+                        ))
+                    })
+                    .collect(),
                 Status::Ready => self
                     .rows
                     .iter()
@@ -859,11 +864,15 @@ impl SessionSetupPane {
         }
         match &self.status {
             Status::Loading => lines.push(Line::from(Span::raw("Loading session setup…"))),
-            Status::Error(message) => lines.push(Line::from(styled(
-                message.clone(),
-                RowKind::CandidateLocked,
-                self.color,
-            ))),
+            Status::Error(message) => {
+                for line in message.lines() {
+                    lines.push(Line::from(styled(
+                        line.to_string(),
+                        RowKind::CandidateLocked,
+                        self.color,
+                    )));
+                }
+            }
             Status::Ready => {
                 for row in self.inline_visible_rows() {
                     lines.push(Line::from(styled(row.text.clone(), row.kind, self.color)));

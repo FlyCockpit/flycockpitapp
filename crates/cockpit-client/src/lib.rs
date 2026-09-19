@@ -501,7 +501,7 @@ impl LifecycleClient {
             cancellation.cancel().await;
             return Err(error);
         }
-        match tokio::time::timeout(REQUEST_TIMEOUT, receive).await {
+        match tokio::time::timeout(LIFECYCLE_REQUEST_TIMEOUT, receive).await {
             Ok(Ok(resolution)) => {
                 cancellation.disarm();
                 resolution
@@ -555,6 +555,10 @@ const EVENT_QUEUE: usize = 1024;
 /// generous ceiling so a hung daemon causes a loud error rather than
 /// a stalled TUI.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Lifecycle resolution may include a finite daemon boot wait. Keep this
+/// strictly above cockpit-core's spawn budget so the child boot report reaches
+/// the caller instead of being replaced by this client's generic timeout.
+pub const LIFECYCLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(75);
 /// Total sends for one `RetryLater`-eligible request, the first included. Small
 /// on purpose: the daemon-side condition clears at a turn boundary, so a client
 /// that keeps hammering would neither speed it up nor learn anything new.

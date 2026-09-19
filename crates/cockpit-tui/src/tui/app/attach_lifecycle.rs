@@ -304,18 +304,42 @@ impl App {
             }
             Ok(_) => {
                 let error = "runner attach returned an unexpected payload".to_string();
-                if pending.latch_error {
+                let now = Instant::now();
+                let escalate = pending.latch_error
+                    || Self::should_escalate_display_attach_failure(
+                        &self.display_attach_backoff,
+                        &error,
+                        now,
+                    );
+                if escalate {
                     self.adopt_runner(Err(error.clone()));
+                    if Self::is_daemon_spawn_boot_failure(&error) {
+                        self.apply_daemon_spawn_failure(&error);
+                    } else {
+                        self.apply_runner_attach_neutral_pane_error(&error);
+                    }
                 } else {
-                    self.display_attach_backoff.record_failure(Instant::now());
+                    self.display_attach_backoff.record_failure(now);
                 }
                 self.apply_runner_attach_failure(&pending.continuations, &error);
             }
             Err(error) => {
-                if pending.latch_error {
+                let now = Instant::now();
+                let escalate = pending.latch_error
+                    || Self::should_escalate_display_attach_failure(
+                        &self.display_attach_backoff,
+                        &error,
+                        now,
+                    );
+                if escalate {
                     self.adopt_runner(Err(error.clone()));
+                    if Self::is_daemon_spawn_boot_failure(&error) {
+                        self.apply_daemon_spawn_failure(&error);
+                    } else {
+                        self.apply_runner_attach_neutral_pane_error(&error);
+                    }
                 } else {
-                    self.display_attach_backoff.record_failure(Instant::now());
+                    self.display_attach_backoff.record_failure(now);
                 }
                 self.apply_runner_attach_failure(&pending.continuations, &error);
             }
@@ -712,6 +736,24 @@ impl App {
 
     pub(super) fn reset_display_attach_backoff(&mut self) {
         self.display_attach_backoff.reset();
+    }
+
+    fn should_escalate_display_attach_failure(
+        backoff: &DisplayAttachBackoff,
+        error: &str,
+        now: Instant,
+    ) -> bool {
+        Self::is_daemon_spawn_boot_failure(error) || backoff.exceeded_startup_timeout(now)
+    }
+
+    fn apply_runner_attach_neutral_pane_error(&mut self, error: &str) {
+        let message = format!("Could not start a session — {error}");
+        if let Overlay::SessionSetup(pane) = &mut self.overlay {
+            pane.set_error(message.clone());
+        }
+        if let Some(pane) = self.session_setup_inline.as_mut() {
+            pane.set_error(message);
+        }
     }
 
     /// Re-fetch the fresh-chat guidance estimate from the daemon at `socket`

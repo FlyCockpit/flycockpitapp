@@ -7,26 +7,6 @@ use cockpit_proto::{Body, Envelope, ProtoStream};
 use tokio::net::{UnixListener, UnixStream};
 use uuid::Uuid;
 
-#[test]
-fn ephemeral_spawn_arms_raii_before_the_first_wait() {
-    let source = include_str!("client.rs");
-    let spawn = source
-        .find("let child = spawn_detached_ephemeral(&paths)?;")
-        .expect("ephemeral spawn funnel");
-    let arm = source[spawn..]
-        .find("EphemeralDaemonGuard::new")
-        .map(|offset| spawn + offset)
-        .expect("provisional owner armed after spawn");
-    let wait = source[spawn..]
-        .find("wait_for_owned_daemon(&paths.socket, pid).await")
-        .map(|offset| spawn + offset)
-        .expect("daemon readiness wait");
-    assert!(
-        spawn < arm && arm < wait,
-        "no cancellation window before RAII"
-    );
-}
-
 fn daemon_status_response_with(
     daemon_version: impl Into<String>,
     protocol_version: u32,

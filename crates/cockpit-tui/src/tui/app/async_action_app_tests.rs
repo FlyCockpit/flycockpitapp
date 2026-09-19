@@ -4,6 +4,11 @@ use crate::tui::async_action::{
 };
 use std::fs;
 use std::sync::mpsc;
+#[cfg(unix)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
@@ -38,6 +43,69 @@ async fn drain_until_idle(app: &mut App) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("async action did not complete");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cold_start_hanging_child_report_replaces_loading_with_blocking_spawn_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
+    let (lifecycle, mut requests) = cockpit_client::LifecycleClient::channel(1);
+    let mut app = App::new_composed_with_session_mode(
+        Some(tmp.path()),
+        false,
+        cockpit_proto::SessionEntryMode::Code,
+        super::StartupWorkspaceTrust::Decided,
+        None,
+        lifecycle,
+    );
+    let child_reaped = Arc::new(AtomicBool::new(false));
+    let host_reaped = Arc::clone(&child_reaped);
+    let host = tokio::spawn(async move {
+        let request = requests.recv().await.expect("cold-start lifecycle request");
+        let error = tokio::task::spawn_blocking(move || {
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn hanging child");
+            std::thread::sleep(Duration::from_millis(50));
+            child.kill().expect("kill hanging child at spawn deadline");
+            child.wait().expect("reap hanging child");
+            host_reaped.store(true, Ordering::SeqCst);
+            "timed out waiting for daemon to report ready after 60s\n\
+--- daemon.log (last 20 lines) ---\n\
+still-booting"
+                .to_string()
+        })
+        .await
+        .expect("join hanging-child timeout");
+        request
+            .reply
+            .send(Err(error))
+            .expect("deliver spawn timeout through lifecycle reply");
+    });
+
+    app.start_startup_lifecycle_resolution();
+    drain_until_idle(&mut app).await;
+    host.await.expect("lifecycle host");
+
+    assert!(child_reaped.load(Ordering::SeqCst));
+    assert!(app.startup_lifecycle.is_none());
+    assert!(!app.startup_background.workspace_ready);
+    let toast = app.toast.as_ref().expect("blocking spawn-failure toast");
+    assert!(toast.persistent);
+    assert_eq!(toast.kind, super::ToastKind::Error);
+    assert!(toast.text.contains("timed out waiting for daemon"));
+    let pane_error = app
+        .session_setup_inline
+        .as_ref()
+        .and_then(|pane| pane.error_message())
+        .expect("session setup pane error");
+    assert!(pane_error.contains("still-booting"), "{pane_error}");
+    assert!(
+        !pane_error.contains("Loading session setup"),
+        "{pane_error}"
+    );
 }
 
 fn seed_pending_runner_attach(
@@ -80,6 +148,188 @@ fn stale_and_duplicate_runner_attach_completions_are_ignored() {
     let pending = app.pending_runner_attach.as_ref().unwrap();
     assert!(pending.latch_error);
     assert_eq!(pending.continuations.len(), 1);
+}
+
+#[test]
+fn latched_spawn_failure_shows_blocking_toast_and_clears_session_setup_loading() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = configured_app_body(&tmp);
+    seed_pending_runner_attach(
+        &mut app,
+        61,
+        vec![super::RunnerAttachContinuation::RetryRetainedSubmissions],
+    );
+    app.pending_runner_attach.as_mut().unwrap().latch_error = true;
+
+    app.apply_runner_attach_result(
+        crate::tui::async_action::AsyncActionId::from_raw_for_test(61),
+        Err(
+            "daemon exited before reporting ready: bind failed: test reason\n\
+--- daemon.log (last 20 lines) ---\n\
+bind-line\n"
+                .to_string(),
+        ),
+    );
+
+    let toast = app.toast.as_ref().expect("blocking toast");
+    assert!(toast.persistent, "spawn errors must not auto-expire");
+    assert_eq!(toast.kind, super::ToastKind::Error);
+    assert!(
+        toast.text.contains("daemon exited before reporting ready"),
+        "{}",
+        toast.text
+    );
+    let pane = app
+        .session_setup_inline
+        .as_ref()
+        .expect("inline session setup");
+    let error = pane.error_message().expect("session setup error");
+    assert!(
+        error.contains("bind-line"),
+        "session setup must show the spawn error, got {error}"
+    );
+    assert_eq!(app.launch.provider_line, "Daemon failed to start");
+}
+
+#[test]
+fn latched_non_spawn_attach_failure_does_not_claim_daemon_failed_to_start() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = configured_app_body(&tmp);
+    seed_pending_runner_attach(
+        &mut app,
+        63,
+        vec![super::RunnerAttachContinuation::RetryRetainedSubmissions],
+    );
+    app.pending_runner_attach.as_mut().unwrap().latch_error = true;
+
+    app.apply_runner_attach_result(
+        crate::tui::async_action::AsyncActionId::from_raw_for_test(63),
+        Err("session not found".to_string()),
+    );
+
+    assert!(
+        app.toast.is_none(),
+        "non-spawn attach errors must not block the UI"
+    );
+    assert_ne!(app.launch.provider_line, "Daemon failed to start");
+    let pane = app
+        .session_setup_inline
+        .as_ref()
+        .expect("inline session setup");
+    let error = pane.error_message().expect("session setup error");
+    assert!(
+        error.contains("session not found"),
+        "pane must show the attach error, got {error}"
+    );
+    assert!(
+        !error.contains("Daemon failed to start"),
+        "pane must not mislabel attach failures as daemon spawn errors: {error}"
+    );
+}
+
+#[test]
+fn spawn_failure_pane_shows_log_tail_while_toast_shows_first_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = configured_app_body(&tmp);
+    let error = "daemon socket address already in use: /tmp/cockpit.sock\n\
+--- daemon.log (last 20 lines) ---\n\
+bind-line\n";
+    app.apply_daemon_spawn_failure(error);
+
+    let toast = app.toast.as_ref().expect("blocking toast");
+    assert_eq!(
+        toast.text, "daemon socket address already in use: /tmp/cockpit.sock",
+        "toast must summarize only the first line"
+    );
+    let pane = app
+        .session_setup_inline
+        .as_ref()
+        .expect("inline session setup");
+    let pane_error = pane.error_message().expect("session setup error");
+    assert!(
+        pane_error.contains("--- daemon.log (last 20 lines) ---"),
+        "pane must render the full spawn error including the log tail, got {pane_error}"
+    );
+    assert!(
+        pane_error.contains("bind-line"),
+        "pane must include daemon.log tail lines, got {pane_error}"
+    );
+}
+
+#[test]
+fn lifecycle_success_clears_a_blocking_spawn_failure_toast() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = configured_app_body(&tmp);
+    app.apply_daemon_spawn_failure("daemon socket address already in use: test.sock");
+    assert!(app.toast.as_ref().is_some_and(|toast| toast.persistent));
+
+    app.apply_async_action_result(AsyncActionResult {
+        id: AsyncActionId::from_raw_for_test(64),
+        kind: AsyncActionKind::Internal("startup.lifecycle"),
+        presentation_stale: false,
+        payload: Ok(AsyncActionPayload::StartupLifecycleResolved {
+            generation: app.startup_background.generation,
+            result: Ok(App::stub_startup_lifecycle_for_tests()),
+        }),
+    });
+
+    assert!(
+        app.toast.is_none(),
+        "a recovered lifecycle must retract its stale blocking error"
+    );
+}
+
+#[test]
+fn unrelated_socket_and_contention_wording_is_not_classified_as_a_spawn_failure() {
+    assert!(!App::is_daemon_spawn_boot_failure(
+        "session socket path metadata is unavailable"
+    ));
+    assert!(!App::is_daemon_spawn_boot_failure(
+        "requested workspace is already in use"
+    ));
+}
+
+#[test]
+fn display_attach_spawn_failure_escalates_without_latching_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = configured_app_body(&tmp);
+    seed_pending_runner_attach(
+        &mut app,
+        62,
+        vec![super::RunnerAttachContinuation::RetryRetainedSubmissions],
+    );
+
+    app.apply_runner_attach_result(
+        crate::tui::async_action::AsyncActionId::from_raw_for_test(62),
+        Err("daemon spawn failed: socket path too long; set COCKPIT_SOCKET_DIR".to_string()),
+    );
+
+    let toast = app.toast.as_ref().expect("blocking toast");
+    assert!(toast.persistent, "spawn errors must not auto-expire");
+    assert_eq!(toast.kind, super::ToastKind::Error);
+    assert!(
+        toast.text.contains("COCKPIT_SOCKET_DIR"),
+        "toast must show the first error line: {}",
+        toast.text
+    );
+    let pane = app
+        .session_setup_inline
+        .as_ref()
+        .expect("inline session setup");
+    let error = pane.error_message().expect("session setup error");
+    assert!(
+        error.contains("Daemon failed to start"),
+        "pane must use spawn-specific wording, got {error}"
+    );
+    assert!(
+        error.contains("COCKPIT_SOCKET_DIR"),
+        "pane must carry the spawn error, got {error}"
+    );
+    assert_eq!(app.launch.provider_line, "Daemon failed to start");
+    assert!(
+        matches!(app.agent_runner, Some(Err(_))),
+        "display attach spawn failure must latch the runner error"
+    );
 }
 
 #[test]

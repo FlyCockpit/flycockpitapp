@@ -1283,6 +1283,7 @@ const DISPLAY_ATTACH_MAX_BACKOFF: Duration = Duration::from_secs(5);
 struct DisplayAttachBackoff {
     next_attempt_at: Option<Instant>,
     delay: Duration,
+    first_failure_at: Option<Instant>,
 }
 
 impl Default for DisplayAttachBackoff {
@@ -1290,6 +1291,7 @@ impl Default for DisplayAttachBackoff {
         Self {
             next_attempt_at: None,
             delay: DISPLAY_ATTACH_INITIAL_BACKOFF,
+            first_failure_at: None,
         }
     }
 }
@@ -1300,9 +1302,17 @@ impl DisplayAttachBackoff {
     }
 
     fn record_failure(&mut self, now: Instant) {
+        if self.first_failure_at.is_none() {
+            self.first_failure_at = Some(now);
+        }
         let delay = self.delay.min(DISPLAY_ATTACH_MAX_BACKOFF);
         self.next_attempt_at = Some(now + delay);
         self.delay = delay.saturating_mul(2).min(DISPLAY_ATTACH_MAX_BACKOFF);
+    }
+
+    fn exceeded_startup_timeout(&self, now: Instant) -> bool {
+        self.first_failure_at
+            .is_some_and(|start| now >= start + cockpit_core::daemon::DAEMON_SPAWN_TIMEOUT)
     }
 
     fn reset(&mut self) {
@@ -1913,6 +1923,7 @@ struct StartupBackground {
     /// from a shell that has exited or been replaced is presentation-inert.
     generation: u64,
     workspace_ready: bool,
+    lifecycle_failure_started_at: Option<Instant>,
     retry: Option<StartupRetry>,
     clipboard_reconcile_scheduled: bool,
     trace_milestones: HashSet<&'static str>,
@@ -4108,6 +4119,7 @@ impl App {
                 started: false,
                 generation: 1,
                 workspace_ready: false,
+                lifecycle_failure_started_at: None,
                 retry: None,
                 clipboard_reconcile_scheduled: false,
                 trace_milestones: HashSet::new(),

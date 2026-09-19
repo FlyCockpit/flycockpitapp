@@ -28,7 +28,8 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             resume_all_sessions,
         } => {
             if detach && !foreground {
-                let pid = daemon::spawn_detached_with_resume(no_sandbox, resume_all_sessions)?;
+                let pid = daemon::spawn_detached_with_resume_async(no_sandbox, resume_all_sessions)
+                    .await?;
                 println!(
                     "daemon: spawned (pid {pid})\n  socket: {}",
                     paths.socket.display()
@@ -204,8 +205,8 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                     .await;
                 }
                 if !released {
-                    let release = release
-                        .unwrap_or_else(|| daemon::capture_restart_release(&paths, old_pid));
+                    let release =
+                        release.unwrap_or_else(|| daemon::capture_restart_release(&paths, old_pid));
                     let stop_paths = paths.clone();
                     let stop_budget = remaining_command_budget(deadline);
                     let _ = tokio::task::spawn_blocking(move || {
@@ -227,7 +228,8 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                 }
             }
 
-            let pid = daemon::spawn_detached_with_resume(replacement_no_sandbox, resume)?;
+            let pid =
+                daemon::spawn_detached_with_resume_async(replacement_no_sandbox, resume).await?;
             println!("{}", restart_started_message(restarted, pid, &paths.socket));
             Ok(())
         }

@@ -878,7 +878,7 @@ async fn spawn_verified_persistent_replacement(
         });
     }
     let pid = loop {
-        match crate::daemon::spawn_detached(false) {
+        match crate::daemon::spawn_detached_async(false).await {
             Ok(pid) => break pid,
             Err(error) if replacement_deadline.is_some() => {
                 // The predecessor can release its metadata before its SQLite
@@ -1041,7 +1041,7 @@ async fn probe_or_spawn_with_spawn_authorization(
     mode: LifecycleMode,
     lifecycle_request: Option<&cockpit_client::LifecycleRequest>,
 ) -> Result<ConnectedDaemon> {
-    use crate::daemon::{DaemonPaths, discover, spawn_detached, spawn_detached_ephemeral};
+    use crate::daemon::{DaemonPaths, discover, spawn_detached_ephemeral};
 
     match mode {
         LifecycleMode::AttachOrPersistent
@@ -1189,12 +1189,21 @@ async fn probe_or_spawn_with_spawn_authorization(
 
     let (paths, pid, provisional_ephemeral_guard) = if ephemeral {
         let paths = DaemonPaths::resolve_canonical()?.with_ephemeral_lifetime();
-        let child = spawn_detached_ephemeral(&paths)?;
-        let pid = child.id();
-        // Arm exact-child cleanup before any await or other cancellation
-        // point. Once the daemon has published its verified receipt, its own
-        // client reference count becomes the sole shutdown authority.
-        let guard = crate::daemon::ephemeral_guard::EphemeralDaemonGuard::new(paths.clone(), child);
+        let spawn_paths = paths.clone();
+        // Arm exact-child cleanup inside the blocking closure so a cancelled
+        // join cannot drop an unguarded `DetachedEphemeralChild`.
+        let guard = tokio::task::spawn_blocking(
+            move || -> Result<crate::daemon::ephemeral_guard::EphemeralDaemonGuard> {
+                let child = spawn_detached_ephemeral(&spawn_paths)?;
+                Ok(crate::daemon::ephemeral_guard::EphemeralDaemonGuard::new(
+                    spawn_paths,
+                    child,
+                ))
+            },
+        )
+        .await
+        .context("joining ephemeral daemon spawn")??;
+        let pid = guard.id()?;
         (paths, pid, Some(guard))
     } else {
         // Auto-promoted persistent daemon: never `--no-sandbox` from a
@@ -1235,7 +1244,7 @@ async fn probe_or_spawn_with_spawn_authorization(
                 promoted_from_ephemeral: false,
             });
         }
-        let pid = spawn_detached(false)?;
+        let pid = crate::daemon::spawn_detached_async(false).await?;
         (canonical, pid, None)
     };
     if let Some(permit) = spawn_permit.as_mut() {

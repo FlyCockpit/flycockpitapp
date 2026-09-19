@@ -6268,18 +6268,19 @@ impl Driver {
                                 text: format!("internal error: {error}"),
                             })
                             .await;
-                        self.unwind_stack_to_root(
-                            StackUnwindReason::InferenceFailed {
-                                provider: String::new(),
-                                model: String::new(),
-                                class: crate::engine::model::InferenceErrorClass::Other(
-                                    error.to_string(),
-                                ),
-                                phase: "unknown".to_string(),
-                            },
-                            tx,
-                        )
-                        .await;
+                        let _ = self
+                            .unwind_stack_to_root(
+                                StackUnwindReason::InferenceFailed {
+                                    provider: String::new(),
+                                    model: String::new(),
+                                    class: crate::engine::model::InferenceErrorClass::Other(
+                                        error.to_string(),
+                                    ),
+                                    phase: "unknown".to_string(),
+                                },
+                                tx,
+                            )
+                            .await;
                         self.pending_idle_reason = Some(crate::engine::IdleReason::Error {
                             class: crate::engine::model::InferenceErrorClass::Other(
                                 error.to_string(),

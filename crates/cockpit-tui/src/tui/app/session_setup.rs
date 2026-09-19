@@ -622,6 +622,54 @@ impl App {
         }
     }
 
+    pub(super) fn is_daemon_spawn_boot_failure(error: &str) -> bool {
+        const MARKERS: &[&str] = &[
+            "daemon exited before reporting ready",
+            "timed out waiting for daemon to report ready",
+            "COCKPIT_SOCKET_DIR",
+            "shorter than SUN_LEN",
+            "daemon socket address already in use",
+            "another daemon is already running",
+            "--- daemon.log (last ",
+            "binding /",
+            "binding leak-reveal",
+            "spawn notify",
+            "validating socket",
+            "spawning daemon child",
+            "locating daemon spawn executable",
+        ];
+        MARKERS.iter().any(|marker| error.contains(marker))
+    }
+
+    fn spawn_error_summary(error: &str) -> String {
+        error.lines().next().unwrap_or(error).trim().to_string()
+    }
+
+    /// Blocking toast + pane state for daemon spawn/boot failures.
+    pub(super) fn apply_daemon_spawn_failure(&mut self, error: &str) {
+        let summary = Self::spawn_error_summary(error);
+        self.show_blocking_toast(summary.clone(), ToastKind::Error);
+        let pane_message = format!("Daemon failed to start: {error}");
+        if let Overlay::SessionSetup(pane) = &mut self.overlay {
+            pane.set_error(pane_message.clone());
+        }
+        if let Some(pane) = self.session_setup_inline.as_mut() {
+            pane.set_error(pane_message.clone());
+        }
+        if let Overlay::Tools(pane) = &mut self.overlay {
+            pane.note_snapshot_refresh_error(pane_message);
+        }
+        self.launch.provider_line = "Daemon failed to start".to_string();
+    }
+
+    pub(super) fn clear_daemon_spawn_failure_toast(&mut self) {
+        if self.launch.provider_line == "Daemon failed to start"
+            && self.toast.as_ref().is_some_and(|toast| toast.persistent)
+        {
+            self.toast = None;
+        }
+    }
+
     /// Surface a fixed error into the open session-setup overlay/inline panel.
     pub(super) fn apply_session_setup_snapshot_error(&mut self, error: String) {
         let message = format!("Session setup could not be loaded: {error}");

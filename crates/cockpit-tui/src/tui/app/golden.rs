@@ -13,6 +13,27 @@ use crate::tui::settings::Dialog;
 use cockpit_config::extended::VimModeSetting;
 use cockpit_proto::{OnboardingBootstrapSnapshot, OnboardingStage};
 
+fn golden_model_config() -> cockpit_config::config::providers::ProvidersConfig {
+    let mut config = cockpit_config::config::providers::ProvidersConfig::default();
+    config.providers.insert(
+        "openai".to_string(),
+        cockpit_config::config::providers::ProviderEntry {
+            models: vec![
+                cockpit_config::config::providers::ModelEntry {
+                    id: "gpt-5.2-codex".to_string(),
+                    ..Default::default()
+                },
+                cockpit_config::config::providers::ModelEntry {
+                    id: "gpt-5.2".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+    );
+    config
+}
+
 /// Clear mouse-hover unless the test opted in via [`GoldenPins::allow_hover`].
 pub fn pin_app(app: &mut App) {
     if hover_allowed() {
@@ -270,6 +291,38 @@ pub fn assert_onboarding_native_screens() {
     ] {
         assert_golden_sizes("onboarding", name, |width, height| {
             render_onboarding_stage(stage, width, height)
+        });
+    }
+    for (name, phase) in [
+        (
+            "model-default",
+            crate::tui::onboarding::ModelPhase::DefaultModel,
+        ),
+        ("model-trust", crate::tui::onboarding::ModelPhase::Trust),
+        (
+            "model-capabilities",
+            crate::tui::onboarding::ModelPhase::Capabilities,
+        ),
+        ("model-limits", crate::tui::onboarding::ModelPhase::Limits),
+        (
+            "model-thinking",
+            crate::tui::onboarding::ModelPhase::Thinking,
+        ),
+        (
+            "model-delegation",
+            crate::tui::onboarding::ModelPhase::Delegation,
+        ),
+    ] {
+        assert_golden_sizes("onboarding", name, |width, height| {
+            let mut shell = onboarding_shell_at(OnboardingStage::Model);
+            let config = golden_model_config();
+            shell.present_model(&config, Some(("openai", "gpt-5.2-codex")));
+            shell.set_model_phase_for_golden(phase);
+            let engine = Dialog::None;
+            let mut links = crate::tui::links::LinkRegistry::default();
+            render_frame(width, height, |frame| {
+                shell.render(frame, frame.area(), &engine, &mut links)
+            })
         });
     }
 }

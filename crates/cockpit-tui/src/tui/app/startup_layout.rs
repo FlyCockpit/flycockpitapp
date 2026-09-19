@@ -346,21 +346,6 @@ impl App {
                     None,
                 );
             }
-            Some(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID) => {
-                if !self.require_onboarding_snapshot_for_named_route(
-                    cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID,
-                ) {
-                    return;
-                }
-                if !self.focus_named_setup_wizard(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID)
-                {
-                    return;
-                }
-                self.mount_named_setup_wizard_in_onboarding_shell(
-                    cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID,
-                    None,
-                );
-            }
             Some(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID) => {
                 if !self.require_onboarding_snapshot_for_named_route(
                     cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
@@ -420,16 +405,7 @@ impl App {
             Ok(dialog) => {
                 self.dialog = dialog;
                 if let Some(shell) = self.onboarding_shell.as_mut() {
-                    shell.present_engine(match wizard_id {
-                        cockpit_core::wizard::SECURITY_WIZARD_ID => {
-                            crate::tui::onboarding::EngineStage::Generic
-                        }
-                        cockpit_core::wizard::MODEL_WIZARD_ID
-                        | cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID => {
-                            crate::tui::onboarding::EngineStage::Model
-                        }
-                        _ => crate::tui::onboarding::EngineStage::Model,
-                    });
+                    shell.present_engine(crate::tui::onboarding::EngineStage::Generic);
                 }
             }
             Err(error) => self.show_toast(error, super::ToastKind::Error),
@@ -816,15 +792,10 @@ impl App {
                             .map(|model| (provider_id.clone(), model.id.clone()))
                     });
                 let preselected = preselected.as_ref().map(|(p, m)| (p.as_str(), m.as_str()));
-                self.mount_onboarding_wizard(
-                    cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID,
-                    preselected,
-                    if preselected.is_some() {
-                        Some("Choose the model Cockpit should use by default.".to_string())
-                    } else {
-                        Some("No model catalog is available. Enter the exact model ID and context settings manually.".to_string())
-                    },
-                );
+                self.dialog = crate::tui::settings::Dialog::None;
+                if let Some(shell) = self.onboarding_shell.as_mut() {
+                    shell.present_model(&self.config_snapshot.providers, preselected);
+                }
             }
             OnboardingStage::Agent => {
                 self.dialog = crate::tui::settings::Dialog::None;
@@ -834,35 +805,6 @@ impl App {
                 self.dialog = crate::tui::settings::Dialog::None;
             }
             OnboardingStage::Complete => {}
-        }
-    }
-
-    fn mount_onboarding_wizard(
-        &mut self,
-        wizard_id: &str,
-        preselected_model: Option<(&str, &str)>,
-        status: Option<String>,
-    ) {
-        match crate::tui::settings::Dialog::onboarding_wizard_engine(
-            wizard_id,
-            preselected_model,
-            status,
-        ) {
-            Ok(dialog) => {
-                self.dialog = dialog;
-                if let Some(shell) = self.onboarding_shell.as_mut() {
-                    shell.present_engine(crate::tui::onboarding::EngineStage::Model);
-                }
-            }
-            Err(error) => {
-                // Fail visibly: surface the construction failure and drop
-                // the engine. The shell stays on the stage's own engine
-                // screen (never a collapsed Welcome screen), so Escape —
-                // Back still works and the stage remains retryable (#425).
-                self.dialog = crate::tui::settings::Dialog::None;
-                tracing::warn!(wizard_id, %error, "onboarding wizard engine mount failed");
-                self.show_toast(error, super::ToastKind::Error);
-            }
         }
     }
 
@@ -1310,6 +1252,17 @@ impl App {
                 }
                 self.apply_onboarding_lifetime(background_agents);
             }
+            Some(OnboardingShellAction::ApplyModel(submission)) => {
+                if self
+                    .onboarding_shell
+                    .as_ref()
+                    .is_some_and(|shell| shell.transition_pending())
+                {
+                    self.show_toast("Still applying the previous step…", super::ToastKind::Info);
+                    return;
+                }
+                self.apply_onboarding_model(submission);
+            }
             Some(OnboardingShellAction::SelectTemplate(template)) => {
                 // Mount the provider engine seeded with the canonical
                 // template chosen from the searchable catalog.
@@ -1747,6 +1700,143 @@ impl App {
         }
     }
 
+    fn apply_onboarding_model(
+        &mut self,
+        submission: cockpit_core::wizard::OnboardingModelSubmission,
+    ) {
+        let Some(snapshot) = self.onboarding_snapshot.clone() else {
+            self.show_toast(
+                "Onboarding checkpoint is unavailable",
+                super::ToastKind::Error,
+            );
+            return;
+        };
+        let project_root = match cockpit_config::config::dirs::global_config_dir() {
+            Ok(root) => root,
+            Err(error) => {
+                self.show_toast(
+                    format!("Could not resolve global Cockpit config: {error}"),
+                    super::ToastKind::Error,
+                );
+                return;
+            }
+        };
+        let descriptor = cockpit_core::wizard::onboarding_model_descriptor_for_cwd(
+            &project_root,
+            Some((&submission.provider_id, &submission.model_id)),
+        );
+        let answers_json = match cockpit_core::wizard::onboarding_model_client_answers_json(
+            descriptor,
+            &submission,
+        ) {
+            Ok(answers) => answers,
+            Err(error) => {
+                self.show_toast(
+                    format!("Could not prepare model settings: {error}"),
+                    super::ToastKind::Error,
+                );
+                return;
+            }
+        };
+        let project_root = project_root.display().to_string();
+        let generation = self.startup_background.generation;
+        let run_id = snapshot.run_id;
+        let attempt_id = snapshot.attempt_id;
+        let expected_revision = snapshot.revision;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let apply_operation_id = uuid::Uuid::new_v4().to_string();
+        let lifecycle = self.lifecycle.clone();
+        let selected_endpoint = self
+            .startup_lifecycle
+            .as_ref()
+            .map(|selected| selected.endpoint.clone());
+        if let Some(shell) = self.onboarding_shell.as_mut() {
+            shell.latch_transition(
+                snapshot.revision,
+                cockpit_proto::OnboardingTransitionKind::Advance,
+            );
+        }
+        let pending_request_id = request_id.clone();
+        let started = self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.model"),
+            crate::tui::async_action::AsyncActionPolicy::Dedupe(
+                crate::tui::async_action::AsyncActionKey::new("onboarding.model"),
+            ),
+            async move {
+                let endpoint =
+                    onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref()).await?;
+                let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let response = client
+                    .request(cockpit_proto::Request::ApplySetupWizard {
+                        client_operation_id: apply_operation_id.clone(),
+                        project_root,
+                        wizard_id: cockpit_core::wizard::MODEL_SETUP_WIZARD_ID.to_string(),
+                        answers_json,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let config_generation = match response {
+                    Ok(cockpit_proto::Response::SetupWizardApplied {
+                        wizard_id,
+                        config_generation,
+                        ..
+                    }) if wizard_id == cockpit_core::wizard::MODEL_SETUP_WIZARD_ID => {
+                        config_generation
+                    }
+                    Ok(other) => return Err(format!("unexpected model response: {other:?}")),
+                    Err(error) => return Err(error.to_string()),
+                };
+                let settlement = cockpit_proto::OnboardingStageSettlement {
+                    run_id,
+                    attempt_id,
+                    stage_revision: expected_revision,
+                    settlement_operation_id: apply_operation_id,
+                    provider_id: None,
+                    mutation_intent_hash: None,
+                    wizard_id: Some(cockpit_core::wizard::MODEL_SETUP_WIZARD_ID.to_string()),
+                    config_generation,
+                };
+                let transition = cockpit_proto::ApplyOnboardingTransition {
+                    run_id,
+                    attempt_id,
+                    expected_revision,
+                    client_operation_id: request_id.clone(),
+                    transition: cockpit_proto::OnboardingTransitionKind::Advance,
+                    settlement: Some(settlement),
+                };
+                match client
+                    .request(cockpit_proto::Request::ApplyOnboardingTransition(
+                        transition,
+                    ))
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    Ok(cockpit_proto::Response::OnboardingTransition(result)) => Ok(
+                        crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
+                            StartupOnboardingCompletion {
+                                generation,
+                                run_id,
+                                attempt_id,
+                                expected_revision,
+                                request_id,
+                                receipt: Some(result.receipt),
+                                snapshot: Some(result.snapshot),
+                            },
+                        ),
+                    ),
+                    Ok(other) => Err(format!("unexpected onboarding response: {other:?}")),
+                    Err(error) => Err(error.to_string()),
+                }
+            },
+        );
+        if let crate::tui::async_action::AsyncActionStart::Started(id) = started {
+            self.pending_startup_onboarding_operations
+                .insert(id, pending_request_id);
+        }
+    }
+
     fn apply_onboarding_lifetime(&mut self, background_agents: bool) {
         let Some(snapshot) = self.onboarding_snapshot.clone() else {
             self.show_toast(
@@ -1963,30 +2053,7 @@ impl App {
                 );
                 true
             }
-            cockpit_proto::OnboardingStage::Model => {
-                if !shell.screen_is_engine(crate::tui::onboarding::EngineStage::Model)
-                    || !self
-                        .dialog
-                        .setup_wizard_is_complete(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID)
-                {
-                    return false;
-                }
-                self.refresh_bootstrap_config_snapshot();
-                let settlement = self.dialog.onboarding_wizard_settlement(
-                    cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID,
-                    snapshot.run_id,
-                    snapshot.attempt_id,
-                    snapshot.revision,
-                );
-                if settlement.is_none() {
-                    return false;
-                }
-                self.request_onboarding_transition(
-                    cockpit_proto::OnboardingTransitionKind::Advance,
-                    settlement,
-                );
-                true
-            }
+            cockpit_proto::OnboardingStage::Model => false,
             cockpit_proto::OnboardingStage::Agent => {
                 let (agent_action, settlement) = {
                     let Some(shell) = self.onboarding_shell.as_mut() else {

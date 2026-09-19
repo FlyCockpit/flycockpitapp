@@ -1,0 +1,24 @@
+ ‹ Back                                                                         
+  Model capabilities · step 5/8                                                 
+  Grant only capabilities this model supports.                                  
+  ────────────────────────────                                                  
+  ●Welcome ●Name ●Secure store ●Provider ◐Model ○Agent ○Lifetime ○Ready         
+  ╭ Capabilities ────────────────────────────────────────────────────────────╮  
+  │ ▢ image input                                                            │  
+  │ ▢ tool calling                                                           │  
+  │ ▢ reasoning                                                              │  
+  │ ▢ structured outputs                                                     │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  ╰──────────────────────────────────────────────────────────────────────────╯  
+  Supports image input parts                                                    
+                                                                                
+                                                                                
+  ↑↓ move   space toggle   enter continue   esc back              [ Continue ]  
+                                                                                

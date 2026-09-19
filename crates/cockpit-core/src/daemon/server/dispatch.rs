@@ -236,8 +236,7 @@ async fn validate_terminal_local_operation_settlement(
 }
 
 fn onboarding_model_wizard_id(wizard_id: &str) -> bool {
-    wizard_id == crate::wizard::MODEL_WIZARD_ID
-        || wizard_id == crate::wizard::ONBOARDING_MODEL_WIZARD_ID
+    wizard_id == crate::wizard::MODEL_WIZARD_ID || wizard_id == crate::wizard::MODEL_SETUP_WIZARD_ID
 }
 
 fn validate_settlement_request_hash(

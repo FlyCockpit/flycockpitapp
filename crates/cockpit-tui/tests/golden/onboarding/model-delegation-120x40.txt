@@ -1,0 +1,40 @@
+ ‹ Back                                                                                                                 
+                 Delegation · step 5/8                                                                                  
+                 Choose how this model participates in delegation.                                                      
+                 ────────────────────────────                                                                           
+                 ●Welcome ●Name ●Secure store ●Provider ◐Model ○Agent ○Lifetime ○Ready                                  
+                 ╭ Delegation ────────────────────────────────────────────────────────────────────────╮                 
+                 │ ▢ spawn as subagent                                                                │                 
+                 │ ▣ can spawn subagents                                                              │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 ╰────────────────────────────────────────────────────────────────────────────────────╯                 
+                 This model may be selected for subagents                                                               
+                                                                                                                        
+                                                                                                                        
+                 ↑↓ move   space toggle   enter continue   esc back                        [ Continue ]                 
+                                                                                                                        

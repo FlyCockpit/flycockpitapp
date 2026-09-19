@@ -2,6 +2,7 @@
 
 use super::search::{ProviderSearchScreen, filter_catalog, onboarding_catalog};
 use super::*;
+use cockpit_config::providers::ProvidersConfig;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -1213,6 +1214,262 @@ fn lifetime_continue_submits_the_recorded_choice_by_keyboard_and_pointer() {
         submit.action,
         Some(OnboardingShellAction::ApplyLifetime(false))
     ));
+}
+
+fn model_catalog_with_distinct_policies() -> ProvidersConfig {
+    use cockpit_config::providers::{
+        CapabilityStatus, ModelCapabilities, ModelEntry, ModelTrust, ProviderEntry, ThinkingMode,
+    };
+
+    let mut config = ProvidersConfig::default();
+    let provider = ProviderEntry {
+        models: vec![
+            ModelEntry {
+                id: "model-a".into(),
+                trust: Some(ModelTrust::Untrusted),
+                capabilities: ModelCapabilities {
+                    image_input: CapabilityStatus::Supported,
+                    reasoning: CapabilityStatus::Supported,
+                    context_tokens: Some(4096),
+                    max_output_tokens: Some(512),
+                    ..Default::default()
+                },
+                default_thinking_mode: Some(ThinkingMode::High),
+                subagent_invokable: Some(false),
+                can_delegate: Some(true),
+                ..Default::default()
+            },
+            ModelEntry {
+                id: "model-b".into(),
+                trust: Some(ModelTrust::Trusted),
+                capabilities: ModelCapabilities {
+                    tool_calling: CapabilityStatus::Supported,
+                    structured_outputs: CapabilityStatus::Supported,
+                    ..Default::default()
+                },
+                default_thinking_mode: Some(ThinkingMode::Off),
+                subagent_invokable: Some(true),
+                can_delegate: Some(false),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    config.providers.insert("provider".into(), provider);
+    config
+}
+
+#[test]
+fn model_continue_commits_focus_reseeds_policy_and_submits_by_pointer() {
+    const WIDTH: u16 = 100;
+    const HEIGHT: u16 = 30;
+    let mut shell = shell_at(OnboardingStage::Model);
+    shell.present_model(
+        &model_catalog_with_distinct_policies(),
+        Some(("provider", "model-a")),
+    );
+    let mut engine = Dialog::None;
+
+    let default = render_string(&mut shell, WIDTH, HEIGHT, &engine);
+    assert!(default.contains("◉ ★ model-a"), "{default}");
+    assert!(default.contains("○   model-b"), "{default}");
+    assert!(default.contains("esc options"), "{default}");
+
+    // Arrow focus plus Continue commits model-b and reseeds every policy field.
+    shell.handle_key(key(KeyCode::Down), &mut engine);
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    assert_eq!(shell.model_phase(), Some(ModelPhase::Trust));
+    assert_eq!(shell.model_selection(), Some(("provider", "model-b")));
+    let trust = render_string(&mut shell, WIDTH, HEIGHT, &engine);
+    assert!(trust.contains("◉ trusted"), "{trust}");
+
+    // Focus differs from the reseeded trusted value; Enter must commit focus.
+    shell.handle_key(key(KeyCode::Up), &mut engine);
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    assert_eq!(shell.model_phase(), Some(ModelPhase::Capabilities));
+
+    // model-b starts with tools + structured outputs. Keyboard toggles tools;
+    // a first click focuses reasoning and the second click toggles it.
+    shell.handle_key(key(KeyCode::Down), &mut engine);
+    shell.handle_key(key(KeyCode::Char(' ')), &mut engine);
+    render_string(&mut shell, WIDTH, HEIGHT, &engine);
+    let reasoning = shell.model_row_rects()[2];
+    shell.handle_mouse(click(reasoning.x, reasoning.y), &mut engine);
+    shell.handle_mouse(click(reasoning.x, reasoning.y), &mut engine);
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    assert_eq!(shell.model_phase(), Some(ModelPhase::Limits));
+
+    for ch in "8192".chars() {
+        shell.handle_key(key(KeyCode::Char(ch)), &mut engine);
+    }
+    shell.handle_key(key(KeyCode::Tab), &mut engine);
+    for ch in "1024".chars() {
+        shell.handle_key(key(KeyCode::Char(ch)), &mut engine);
+    }
+    let limits = render_string(&mut shell, WIDTH, HEIGHT, &engine);
+    assert!(limits.contains("Context window tokens"), "{limits}");
+    assert!(limits.contains("8192"), "{limits}");
+    assert!(limits.contains("Max output tokens"), "{limits}");
+    assert!(limits.contains("1024"), "{limits}");
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+
+    // model-b reseeded thinking to off (row 1); Down + Enter commits low.
+    shell.handle_key(key(KeyCode::Down), &mut engine);
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    assert_eq!(shell.model_phase(), Some(ModelPhase::Delegation));
+
+    // model-b reseeded delegation to [true, false]. The second click toggles
+    // can_delegate, then pointer Continue returns the complete submission.
+    render_string(&mut shell, WIDTH, HEIGHT, &engine);
+    let can_delegate = shell.model_row_rects()[1];
+    shell.handle_mouse(click(can_delegate.x, can_delegate.y), &mut engine);
+    shell.handle_mouse(click(can_delegate.x, can_delegate.y), &mut engine);
+    let submit = click_action(&mut shell, 0, WIDTH, HEIGHT, &mut engine);
+    let Some(OnboardingShellAction::ApplyModel(submission)) = submit.action else {
+        panic!("pointer Continue must submit the native model form");
+    };
+    assert_eq!(submission.provider_id, "provider");
+    assert_eq!(submission.model_id, "model-b");
+    assert_eq!(submission.trust, "untrusted");
+    assert_eq!(
+        submission.capabilities,
+        vec!["reasoning", "structured_outputs"]
+    );
+    assert_eq!(submission.context_tokens, "8192");
+    assert_eq!(submission.max_output_tokens, "1024");
+    assert_eq!(submission.thinking, "low");
+    assert_eq!(
+        submission.subagent_flags,
+        vec!["subagent_invokable", "can_delegate"]
+    );
+}
+
+#[test]
+fn model_back_walks_substeps_then_escape_opens_options() {
+    const WIDTH: u16 = 100;
+    const HEIGHT: u16 = 30;
+    let mut shell = shell_at(OnboardingStage::Model);
+    shell.present_model(
+        &model_catalog_with_distinct_policies(),
+        Some(("provider", "model-a")),
+    );
+    let mut engine = Dialog::None;
+
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    assert_eq!(shell.model_phase(), Some(ModelPhase::Capabilities));
+    shell.handle_key(key(KeyCode::Esc), &mut engine);
+    assert_eq!(shell.model_phase(), Some(ModelPhase::Trust));
+
+    render_string(&mut shell, WIDTH, HEIGHT, &engine);
+    let back = shell.back_rect;
+    shell.handle_mouse(click(back.x, back.y), &mut engine);
+    assert_eq!(shell.model_phase(), Some(ModelPhase::DefaultModel));
+    shell.handle_key(key(KeyCode::Esc), &mut engine);
+    let options = render_string(&mut shell, WIDTH, HEIGHT, &engine);
+    assert!(options.contains("Leave setup?"), "{options}");
+}
+
+#[test]
+fn model_same_default_after_back_preserves_every_policy_edit() {
+    let mut shell = shell_at(OnboardingStage::Model);
+    shell.present_model(
+        &model_catalog_with_distinct_policies(),
+        Some(("provider", "model-b")),
+    );
+    let mut engine = Dialog::None;
+
+    // Change every policy group seeded by the selected catalog model.
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    shell.handle_key(key(KeyCode::Up), &mut engine);
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    shell.handle_key(key(KeyCode::Down), &mut engine);
+    shell.handle_key(key(KeyCode::Char(' ')), &mut engine);
+    shell.handle_key(key(KeyCode::Down), &mut engine);
+    shell.handle_key(key(KeyCode::Char(' ')), &mut engine);
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    for ch in "8192".chars() {
+        shell.handle_key(key(KeyCode::Char(ch)), &mut engine);
+    }
+    shell.handle_key(key(KeyCode::Tab), &mut engine);
+    for ch in "1024".chars() {
+        shell.handle_key(key(KeyCode::Char(ch)), &mut engine);
+    }
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    shell.handle_key(key(KeyCode::Down), &mut engine);
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    shell.handle_key(key(KeyCode::Char(' ')), &mut engine);
+    shell.handle_key(key(KeyCode::Down), &mut engine);
+    shell.handle_key(key(KeyCode::Char(' ')), &mut engine);
+
+    // Walk back to Default Model, then continue without changing the pair.
+    for expected in [
+        ModelPhase::Thinking,
+        ModelPhase::Limits,
+        ModelPhase::Capabilities,
+        ModelPhase::Trust,
+        ModelPhase::DefaultModel,
+    ] {
+        shell.handle_key(key(KeyCode::Esc), &mut engine);
+        assert_eq!(shell.model_phase(), Some(expected));
+    }
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    for _ in 0..4 {
+        shell.handle_key(key(KeyCode::Enter), &mut engine);
+    }
+    let Some(OnboardingShellAction::ApplyModel(submission)) =
+        shell.handle_key(key(KeyCode::Enter), &mut engine)
+    else {
+        panic!("same-model Continue must preserve edits and submit");
+    };
+
+    assert_eq!(submission.provider_id, "provider");
+    assert_eq!(submission.model_id, "model-b");
+    assert_eq!(submission.trust, "untrusted");
+    assert_eq!(
+        submission.capabilities,
+        vec!["reasoning", "structured_outputs"]
+    );
+    assert_eq!(submission.context_tokens, "8192");
+    assert_eq!(submission.max_output_tokens, "1024");
+    assert_eq!(submission.thinking, "low");
+    assert_eq!(submission.subagent_flags, vec!["can_delegate"]);
+}
+
+#[test]
+fn model_empty_catalog_shows_error_accepts_id_and_submits() {
+    const WIDTH: u16 = 100;
+    const HEIGHT: u16 = 30;
+    let mut config = ProvidersConfig::default();
+    config.providers.insert("manual".into(), Default::default());
+    let mut shell = shell_at(OnboardingStage::Model);
+    shell.present_model(&config, Some(("manual", "")));
+    let mut engine = Dialog::None;
+
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    let error = render_string(&mut shell, WIDTH, HEIGHT, &engine);
+    assert!(
+        error.contains("Choose a provider and enter a model ID."),
+        "{error}"
+    );
+    assert!(error.contains("type model id"), "{error}");
+
+    shell.paste("manual-model");
+    let next = click_action(&mut shell, 0, WIDTH, HEIGHT, &mut engine);
+    assert!(next.action.is_none());
+    assert_eq!(shell.model_phase(), Some(ModelPhase::Trust));
+    assert_eq!(shell.model_selection(), Some(("manual", "manual-model")));
+    for _ in 0..4 {
+        shell.handle_key(key(KeyCode::Enter), &mut engine);
+    }
+    assert_eq!(shell.model_phase(), Some(ModelPhase::Delegation));
+    let Some(OnboardingShellAction::ApplyModel(submission)) =
+        shell.handle_key(key(KeyCode::Enter), &mut engine)
+    else {
+        panic!("manual model entry must submit after all native substeps");
+    };
+    assert_eq!(submission.provider_id, "manual");
+    assert_eq!(submission.model_id, "manual-model");
 }
 
 #[test]

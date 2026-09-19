@@ -11,12 +11,13 @@ use anyhow::{Context, Result, anyhow};
 mod apply;
 
 pub use apply::{
-    LIFETIME_SETUP_WIZARD_ID, ModelAnswersOutcome, apply_model_answers, apply_security_answers,
+    LIFETIME_SETUP_WIZARD_ID, MODEL_SETUP_WIZARD_ID, ModelAnswersOutcome,
+    OnboardingModelSubmission, apply_model_answers, apply_security_answers,
     apply_security_answers_with_caps, apply_setup_wizard_answers,
     apply_setup_wizard_answers_authoritative, compose_wizard_host_capabilities, descriptor_for_cwd,
     descriptor_for_cwd_with_caps, model_descriptor_for_cwd,
-    onboarding_lifetime_client_answers_json, onboarding_model_descriptor_for_cwd,
-    security_config_path,
+    onboarding_lifetime_client_answers_json, onboarding_model_client_answers_json,
+    onboarding_model_descriptor_for_cwd, security_config_path,
 };
 
 macro_rules! named_setup_wizard_rows {
@@ -48,9 +49,6 @@ named_setup_wizard_rows! {
     MODEL_WIZARD_ID = "model",
     stage: None,
     complete: true,
-    ONBOARDING_MODEL_WIZARD_ID = "onboarding-model",
-    stage: Some(cockpit_proto::OnboardingStage::Model),
-    complete: false,
     ONBOARDING_PROFILE_WIZARD_ID = "onboarding-profile",
     stage: Some(cockpit_proto::OnboardingStage::Profile),
     complete: false,
@@ -687,7 +685,7 @@ pub fn onboarding_model_descriptor_with_selection(
     preselect: Option<(&str, &str)>,
 ) -> WizardDescriptor {
     let mut descriptor = model_descriptor_with_selection_mode(cfg, preselect, true);
-    descriptor.id = ONBOARDING_MODEL_WIZARD_ID;
+    descriptor.id = MODEL_SETUP_WIZARD_ID;
     descriptor
 }
 

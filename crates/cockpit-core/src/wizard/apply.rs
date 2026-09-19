@@ -41,6 +41,24 @@ use crate::wizard::{
 /// (#430); this is the single remaining authority for the wire id.
 pub const LIFETIME_SETUP_WIZARD_ID: &str = "onboarding-lifetime";
 
+/// Private wire identity used to replay the native Model screen's answers at
+/// the daemon authority boundary. It is deliberately not a named setup wizard:
+/// onboarding renders native screens rather than mounting the generic engine.
+pub const MODEL_SETUP_WIZARD_ID: &str = "onboarding-model";
+
+/// Values collected by the six native Model sub-steps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OnboardingModelSubmission {
+    pub provider_id: String,
+    pub model_id: String,
+    pub trust: String,
+    pub capabilities: Vec<String>,
+    pub context_tokens: String,
+    pub max_output_tokens: String,
+    pub thinking: String,
+    pub subagent_flags: Vec<String>,
+}
+
 fn lifetime_setup_wizard_descriptor() -> WizardDescriptor {
     WizardDescriptor {
         id: LIFETIME_SETUP_WIZARD_ID,
@@ -86,6 +104,42 @@ pub fn onboarding_lifetime_client_answers_json(background_agents: bool) -> Resul
     run.submit(WizardAnswer::Confirm(background_agents))
         .map_err(|error| anyhow!(error))?;
     run.answers_json().map_err(|error| anyhow!(error))
+}
+
+/// Build the validated answer payload consumed by the daemon's existing model
+/// setup application. The terminal action is intentionally absent: replay is
+/// the only place allowed to infer its acknowledgement.
+pub fn onboarding_model_client_answers_json(
+    descriptor: WizardDescriptor,
+    submission: &OnboardingModelSubmission,
+) -> Result<String> {
+    anyhow::ensure!(
+        descriptor.id == MODEL_SETUP_WIZARD_ID,
+        "native model submission requires the onboarding model descriptor"
+    );
+    let mut run = WizardRun::new(descriptor)?;
+    for answer in [
+        WizardAnswer::Select(submission.provider_id.clone()),
+        WizardAnswer::Text(submission.model_id.clone()),
+        WizardAnswer::Select("advanced".to_string()),
+        WizardAnswer::Select(submission.trust.clone()),
+        WizardAnswer::MultiToggle(submission.capabilities.clone()),
+        WizardAnswer::Text(submission.context_tokens.clone()),
+        WizardAnswer::Text(submission.max_output_tokens.clone()),
+    ] {
+        run.submit(answer).map_err(|error| anyhow!(error))?;
+    }
+    if run.current_step_id() == Some("thinking") {
+        run.submit(WizardAnswer::Select(submission.thinking.clone()))
+            .map_err(|error| anyhow!(error))?;
+    }
+    run.submit(WizardAnswer::MultiToggle(submission.subagent_flags.clone()))
+        .map_err(|error| anyhow!(error))?;
+    run.submit(WizardAnswer::Confirm(true))
+        .map_err(|error| anyhow!(error))?;
+    run.submit(WizardAnswer::Select("skip".to_string()))
+        .map_err(|error| anyhow!(error))?;
+    run.answers_json()
 }
 
 /// Compose a daemon-less host-capability snapshot for the setup wizard.
@@ -137,7 +191,7 @@ pub fn descriptor_for_cwd_with_caps(
             &current, None,
         ));
     }
-    if id == crate::wizard::ONBOARDING_MODEL_WIZARD_ID {
+    if id == MODEL_SETUP_WIZARD_ID {
         let current = ConfigDoc::load(&global_config)
             .ok()
             .map(|doc| doc.providers())
@@ -205,7 +259,7 @@ pub fn apply_setup_wizard_answers(
         wizard_id,
         crate::wizard::SECURITY_WIZARD_ID
             | crate::wizard::MODEL_WIZARD_ID
-            | crate::wizard::ONBOARDING_MODEL_WIZARD_ID
+            | MODEL_SETUP_WIZARD_ID
             | crate::wizard::ONBOARDING_PROFILE_WIZARD_ID
             | LIFETIME_SETUP_WIZARD_ID
     ) {
@@ -246,7 +300,7 @@ pub async fn apply_setup_wizard_answers_authoritative(
         wizard_id,
         crate::wizard::SECURITY_WIZARD_ID
             | crate::wizard::MODEL_WIZARD_ID
-            | crate::wizard::ONBOARDING_MODEL_WIZARD_ID
+            | MODEL_SETUP_WIZARD_ID
             | crate::wizard::ONBOARDING_PROFILE_WIZARD_ID
             | LIFETIME_SETUP_WIZARD_ID
     ) {
@@ -427,7 +481,7 @@ pub fn apply_model_answers(_cwd: &Path, run: &WizardRun) -> Result<ModelAnswersO
         .providers
         .get(&provider_id)
         .with_context(|| format!("provider `{provider_id}` not found"))?;
-    let onboarding = run.descriptor().id == crate::wizard::ONBOARDING_MODEL_WIZARD_ID;
+    let onboarding = run.descriptor().id == MODEL_SETUP_WIZARD_ID;
     if !onboarding {
         provider_read
             .models
@@ -795,6 +849,101 @@ mod tests {
                 .expect("current model wizard step has prefill");
             run.submit(answer).unwrap();
         }
+    }
+
+    #[test]
+    fn onboarding_model_client_answers_replay_all_native_fields_and_skip_disabled_thinking() {
+        let mut providers = crate::config::providers::ProvidersConfig::default();
+        providers.providers.insert(
+            "provider".into(),
+            crate::config::providers::ProviderEntry::default(),
+        );
+        let descriptor =
+            crate::wizard::onboarding_model_descriptor_with_selection(&providers, None);
+        let submission = OnboardingModelSubmission {
+            provider_id: "provider".into(),
+            model_id: "manual-model".into(),
+            trust: "trusted".into(),
+            capabilities: vec!["images".into(), "reasoning".into()],
+            context_tokens: "131072".into(),
+            max_output_tokens: "16384".into(),
+            thinking: "high".into(),
+            subagent_flags: vec!["subagent_invokable".into()],
+        };
+
+        let json = onboarding_model_client_answers_json(descriptor.clone(), &submission).unwrap();
+        let answers: std::collections::BTreeMap<String, WizardAnswer> =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            answers.get("provider"),
+            Some(&WizardAnswer::Select("provider".into()))
+        );
+        assert_eq!(
+            answers.get("model"),
+            Some(&WizardAnswer::Text("manual-model".into()))
+        );
+        assert_eq!(
+            answers.get("configuration"),
+            Some(&WizardAnswer::Select("advanced".into()))
+        );
+        assert_eq!(
+            answers.get("trust"),
+            Some(&WizardAnswer::Select("trusted".into()))
+        );
+        assert_eq!(
+            answers.get("capabilities"),
+            Some(&WizardAnswer::MultiToggle(vec![
+                "images".into(),
+                "reasoning".into()
+            ]))
+        );
+        assert_eq!(
+            answers.get("context-tokens"),
+            Some(&WizardAnswer::Text("131072".into()))
+        );
+        assert_eq!(
+            answers.get("max-output-tokens"),
+            Some(&WizardAnswer::Text("16384".into()))
+        );
+        assert_eq!(
+            answers.get("thinking"),
+            Some(&WizardAnswer::Select("high".into()))
+        );
+        assert_eq!(
+            answers.get("subagent-flags"),
+            Some(&WizardAnswer::MultiToggle(vec![
+                "subagent_invokable".into()
+            ]))
+        );
+        assert_eq!(
+            answers.get("default-model"),
+            Some(&WizardAnswer::Confirm(true))
+        );
+        assert_eq!(
+            answers.get("system-prompt-choice"),
+            Some(&WizardAnswer::Select("skip".into()))
+        );
+        assert!(
+            WizardRun::from_answers_json(descriptor.clone(), &json)
+                .unwrap()
+                .is_complete()
+        );
+
+        let without_reasoning = OnboardingModelSubmission {
+            capabilities: vec!["tools".into()],
+            thinking: "high".into(),
+            ..submission
+        };
+        let json =
+            onboarding_model_client_answers_json(descriptor.clone(), &without_reasoning).unwrap();
+        let answers: std::collections::BTreeMap<String, WizardAnswer> =
+            serde_json::from_str(&json).unwrap();
+        assert!(!answers.contains_key("thinking"));
+        assert!(
+            WizardRun::from_answers_json(descriptor, &json)
+                .unwrap()
+                .is_complete()
+        );
     }
 
     fn submit_security_wizard_prefills_until_save(run: &mut WizardRun) {

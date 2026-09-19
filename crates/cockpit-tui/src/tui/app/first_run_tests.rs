@@ -160,6 +160,18 @@ fn shell_screen_kind(app: &App) -> Option<crate::tui::onboarding::OnboardingScre
         .map(|shell| shell.screen_kind())
 }
 
+fn render_app(app: &mut App, width: u16, height: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect()
+}
+
 fn submit_onboarding_lifetime(app: &mut App) {
     assert_eq!(
         shell_screen_kind(app),
@@ -169,6 +181,28 @@ fn submit_onboarding_lifetime(app: &mut App) {
         shell.clear_pending_transition();
     }
     shell_key(app, KeyCode::Enter);
+}
+
+fn complete_native_model(app: &mut App) {
+    use crate::tui::onboarding::ModelPhase;
+    assert_eq!(
+        shell_screen_kind(app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::Model)
+    );
+    for phase in ModelPhase::ALL {
+        assert_eq!(
+            app.onboarding_shell
+                .as_ref()
+                .and_then(|shell| shell.model_phase()),
+            Some(phase)
+        );
+        shell_key(app, KeyCode::Enter);
+    }
+    assert!(
+        app.onboarding_shell
+            .as_ref()
+            .is_some_and(|shell| shell.transition_pending())
+    );
 }
 
 fn land_onboarding_complete_after_lifetime(app: &mut App) {
@@ -374,23 +408,18 @@ fn first_run_chains_provider_then_model() {
     set_onboarding_stage(&mut app, OnboardingStage::Model);
 
     assert_eq!(
-        app.dialog.test_page_name(),
-        Some(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID)
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::Model)
     );
     assert_eq!(
-        app.dialog.test_setup_prefill(),
-        Some(cockpit_core::wizard::WizardAnswer::Select("p".to_string()))
+        app.onboarding_shell
+            .as_ref()
+            .and_then(|shell| shell.model_selection()),
+        Some(("p", "m"))
     );
-    app.dialog
-        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert_eq!(
-        app.dialog.test_setup_answer("provider"),
-        Some(cockpit_core::wizard::WizardAnswer::Select("p".to_string()))
-    );
-    assert_eq!(
-        app.dialog.test_setup_prefill(),
-        Some(cockpit_core::wizard::WizardAnswer::Text("m".to_string()))
-    );
+    let rendered = render_app(&mut app, 100, 30);
+    assert!(rendered.contains("◉ ★ m"), "{rendered}");
+    assert!(!app.dialog.is_active());
 }
 
 #[test]
@@ -411,9 +440,29 @@ fn first_run_provider_without_catalog_offers_manual_model_entry() {
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Model);
     assert_eq!(
-        app.dialog.test_page_name(),
-        Some(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID)
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::Model)
     );
+    let rendered = render_app(&mut app, 100, 30);
+    assert!(rendered.contains("Model ID"), "{rendered}");
+    assert!(rendered.contains("type model id"), "{rendered}");
+    for ch in "manual-model".chars() {
+        shell_key(&mut app, KeyCode::Char(ch));
+    }
+    assert_eq!(
+        app.onboarding_shell
+            .as_ref()
+            .and_then(|shell| shell.model_selection()),
+        Some(("p", "manual-model"))
+    );
+    shell_key(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.onboarding_shell
+            .as_ref()
+            .and_then(|shell| shell.model_phase()),
+        Some(crate::tui::onboarding::ModelPhase::Trust)
+    );
+    assert!(!app.dialog.is_active());
 }
 
 #[test]
@@ -429,12 +478,7 @@ fn first_run_flow_completes_end_to_end() {
 
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Model);
-    assert_eq!(
-        app.dialog.test_page_name(),
-        Some(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID)
-    );
-    app.dialog.test_mark_setup_complete("model-save");
-    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    complete_native_model(&mut app);
     set_onboarding_stage(&mut app, OnboardingStage::Agent);
     settle_onboarding_agent_stage(&mut app);
     assert_eq!(
@@ -488,8 +532,7 @@ fn completion_detour_ends_when_the_added_provider_settles() {
     app.dialog.test_mark_provider_add_done("p");
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Model);
-    app.dialog.test_mark_setup_complete("model-save");
-    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    complete_native_model(&mut app);
     set_onboarding_stage(&mut app, OnboardingStage::Agent);
     settle_onboarding_agent_stage(&mut app);
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
@@ -552,8 +595,8 @@ fn first_run_completes_under_an_untrusted_workspace() {
     assert!(with_untrusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Model);
     assert_eq!(
-        app.dialog.test_page_name(),
-        Some(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID)
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::Model)
     );
 }
 
@@ -573,8 +616,7 @@ fn complete_authority_refresh_preserves_the_local_provider_detour() {
     app.dialog.test_mark_provider_add_done("p");
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Model);
-    app.dialog.test_mark_setup_complete("model-save");
-    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    complete_native_model(&mut app);
     set_onboarding_stage(&mut app, OnboardingStage::Agent);
     settle_onboarding_agent_stage(&mut app);
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
@@ -654,9 +696,7 @@ fn first_run_configuration_queues_held_draft_behind_selected_model() {
     app.dialog.test_mark_provider_add_done("p");
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Model);
-    app.dialog.test_mark_setup_complete("model-save");
-
-    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    complete_native_model(&mut app);
     set_onboarding_stage(&mut app, OnboardingStage::Agent);
     settle_onboarding_agent_stage(&mut app);
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
@@ -719,8 +759,7 @@ fn lifetime_settlement_adopts_the_committed_choice_only_after_the_daemon_commit(
     app.dialog.test_mark_provider_add_done("p");
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Model);
-    app.dialog.test_mark_setup_complete("model-save");
-    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    complete_native_model(&mut app);
     set_onboarding_stage(&mut app, OnboardingStage::Agent);
     settle_onboarding_agent_stage(&mut app);
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
@@ -967,8 +1006,8 @@ fn duplicate_engine_completion_advances_exactly_once() {
     // The advanced snapshot clears the latch and mounts the model engine.
     set_onboarding_stage(&mut app, OnboardingStage::Model);
     assert_eq!(
-        app.dialog.test_page_name(),
-        Some(cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID)
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::Model)
     );
 }
 

@@ -1706,30 +1706,176 @@ fn agent_inline_controls_collapse_as_one_group_on_narrow_width() {
     assert!(!first.contains("12:00"), "{first:?}");
     assert!(floor.pin_region.is_some());
 
-    // Below RESPONSE_HEADER_MIN_WIDTH the response-header redesign replaces ALL
-    // header chrome (metric/timestamp/fork/pin) with a single noninteractive
-    // `↔` resize indicator: neither control renders and no clickable region is
-    // recorded. This is the graceful terminal degradation — the whole control
-    // block collapses at once below the resize floor rather than degrading
-    // control-by-control there.
-    let too_narrow = render_agent(
-        "Auto",
-        "ok",
-        "",
-        fixed_ts(),
-        false,
-        0,
-        None,
-        20,
-        false,
-        Some(ctrl),
-        None,
-        false,
+    // Below RESPONSE_HEADER_MIN_WIDTH the grouped action block collapses as
+    // one unit: no `[Pin]`/`[Fork]` glyphs are painted and no hit target is
+    // recorded, so the controls are never rendered dead. The role header —
+    // `Agent` label plus the timestamp whenever it fits — stays readable.
+    // Probe the exact 22–23 band, where the glyph-width arithmetic would
+    // otherwise still fit the group (used 7 + 1 + actions 12 + margin 2 →
+    // threshold 22), plus a far-narrow width.
+    for w in [23u16, 22, 20] {
+        let too_narrow = render_agent(
+            "Auto",
+            "ok",
+            "",
+            fixed_ts(),
+            false,
+            0,
+            None,
+            w,
+            false,
+            Some(ctrl),
+            None,
+            false,
+        );
+        let first = line_text(&too_narrow.lines[0]);
+        assert!(first.contains("Agent"), "width {w}: {first:?}");
+        assert!(
+            !first.contains("[Fork]") && !first.contains("[Pin]"),
+            "width {w}: {first:?}"
+        );
+        assert!(too_narrow.pin_region.is_none(), "width {w}");
+    }
+}
+
+/// The interrupted-turn marker is rendered from the frozen
+/// [`HistoryEntry::Agent`] state the `AgentIdle(Interrupted)` finalize path
+/// produces — as that entry's last row, at every width. A settled turn and a
+/// `Plain` row never render it.
+#[test]
+fn interrupted_agent_turn_ends_with_the_stopped_marker_row() {
+    let mk = |interrupted| HistoryEntry::Agent {
+        name: "Build".to_string(),
+        text: "partial answer".to_string(),
+        reasoning: "in-flight thought".to_string(),
+        timestamp: fixed_ts(),
+        expanded: false,
+        reasoning_offset: 0,
+        think_duration: None,
+        seq: Some(2),
+        performance: None,
+        performance_expanded: false,
+        interrupted,
+    };
+    let render = |entry: &HistoryEntry, width: u16| {
+        render_entry(
+            entry,
+            width,
+            ThinkingDisplay::Condensed,
+            MarkdownOpts::default(),
+            cockpit_config::extended::DiffStyle::default(),
+            false,
+            false,
+            &no_elided(),
+            0,
+            None,
+        )
+    };
+
+    for width in [80u16, 20] {
+        let stopped = render(&mk(true), width);
+        let last = stopped.lines.last().expect("interrupted turn has rows");
+        assert_eq!(last.spans[0].content.as_ref(), "  ⎯ ", "width {width}");
+        assert_eq!(last.spans[0].style.fg, Some(crate::tui::theme::YELLOW));
+        assert_eq!(
+            last.spans[1].content.as_ref(),
+            "Stopped — you sent a message"
+        );
+        assert_eq!(last.spans[1].style.fg, Some(FOG));
+        assert_eq!(
+            stopped.continuations.last(),
+            Some(&false),
+            "the marker row starts its own logical line"
+        );
+    }
+
+    let settled = render(&mk(false), 80);
+    assert!(
+        !settled
+            .lines
+            .iter()
+            .any(|line| line_text(line).contains("Stopped — you sent a message")),
+        "a settled turn carries no marker"
     );
-    let first = line_text(&too_narrow.lines[0]);
-    assert!(first.contains("Agent"));
-    assert!(!first.contains("[Fork]") && !first.contains("[Pin]"));
-    assert!(too_narrow.pin_region.is_none());
+
+    // The pre-restyle exact-string `Plain` branch is gone: a plain row with
+    // that text renders as a centred note, never as the marker.
+    let plain = render(
+        &HistoryEntry::Plain {
+            line: "Stopped — you sent a message".to_string(),
+        },
+        80,
+    );
+    assert!(
+        !plain.lines.iter().any(|line| line_text(line).contains('⎯')),
+        "the marker is owned by the Agent entry, not plain-line matching"
+    );
+}
+
+/// While reasoning streams, the pending block renders the live `Thinking`
+/// header (FOG + italic) followed by the reasoning body itself (DISABLED +
+/// italic, wrapped to the pane), above the streaming answer body.
+#[test]
+fn pending_reasoning_streams_the_live_thinking_block() {
+    let msg = PendingMsg {
+        name: "Build".to_string(),
+        text: "Answer body".to_string(),
+        reasoning: "Check the hierarchy.".to_string(),
+        timestamp: fixed_ts(),
+        started_at: std::time::Instant::now(),
+        text_started_at: Some(std::time::Instant::now()),
+        inside_think: false,
+        body_started: true,
+        tag_partial: String::new(),
+        attempt_id: None,
+        seq: None,
+        strip_think: true,
+        response_performance: None,
+    };
+    let lines = render_pending(&msg, 40);
+    assert_eq!(line_text(&lines[1]), "  Thinking");
+    assert_eq!(lines[1].spans[0].style.fg, Some(THINKING_FG));
+    assert!(
+        lines[1].spans[0]
+            .style
+            .add_modifier
+            .contains(ratatui::style::Modifier::ITALIC)
+    );
+    assert_eq!(line_text(&lines[2]), "  Check the hierarchy.");
+    assert_eq!(lines[2].spans[0].style.fg, Some(REASONING_FG));
+    assert!(
+        lines[2].spans[0]
+            .style
+            .add_modifier
+            .contains(ratatui::style::Modifier::ITALIC)
+    );
+    // The answer body streams below the live thought, not as part of it.
+    assert!(
+        lines
+            .iter()
+            .skip(3)
+            .any(|line| line_text(line).contains("Answer body"))
+    );
+
+    // The live body wraps at the pane width like the reference's rows.
+    let mut long = msg.clone();
+    long.reasoning = "word ".repeat(12).trim_end().to_string();
+    long.text = String::new();
+    let wrapped = render_pending(&long, 40);
+    let reasoning_rows = wrapped
+        .iter()
+        .skip(2)
+        .take_while(|line| line_text(line).starts_with("  word"))
+        .count();
+    assert!(
+        reasoning_rows >= 2,
+        "a 59-column thought wraps at width 40: {:?}",
+        wrapped.iter().map(line_text).collect::<Vec<_>>()
+    );
+    assert!(
+        wrapped.iter().all(|line| line_width(line) <= 40),
+        "no row exceeds the pane width"
+    );
 }
 
 /// `pinned-messages`: visibility is preserved — with the control hidden
@@ -2960,6 +3106,7 @@ fn agent_with_perf(
         seq: Some(1),
         performance: perf,
         performance_expanded,
+        interrupted: false,
     }
 }
 
@@ -3144,7 +3291,8 @@ fn response_performance_chip_narrow_layout_preserves_controls() {
     );
     assert!(floor.pin_region.is_some());
 
-    // Below 24: ↔ resize state; the Agent label remains the metric target
+    // Below 24: the grouped controls collapse as one block (no glyphs, no
+    // hit targets) while the `Agent` label remains the metric target
     // whenever all five label columns fit.
     for w in [23u16, 12, 1] {
         let narrow = render_entry(
@@ -3166,6 +3314,10 @@ fn response_performance_chip_narrow_layout_preserves_controls() {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("Agent"), "width {w}: {text}");
+        assert!(
+            !text.contains("[Pin]") && !text.contains("[Fork]"),
+            "width {w}: no dead control glyphs below the resize floor: {text}"
+        );
         assert_eq!(narrow.metric_region.is_some(), w >= 7, "width {w}");
         assert!(narrow.pin_region.is_none());
     }

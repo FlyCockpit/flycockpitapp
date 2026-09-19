@@ -98,6 +98,11 @@ fn transcript_fixture_app() -> App {
     app.overlay = Overlay::None;
     app.launch.banner_enabled = false;
     app.mouse_capture = false;
+    // Pin the fixture to the Inline 6-column diff chrome — the shared-element
+    // spec shape — so the wide dump exercises it (the default SideBySide mode
+    // stays covered by `diff::tests::side_by_side_uses_separator_when_wide`
+    // and its narrow-degradation sibling).
+    app.diff_style = cockpit_config::extended::DiffStyle::Inline;
     let now = chrono::Local::now();
     let user = |text: &str, seq| HistoryEntry::User {
         text: text.to_string(),
@@ -109,22 +114,29 @@ fn transcript_fixture_app() -> App {
         preflight_pending: false,
         persist_failed: false,
     };
-    let agent = |text: &str, reasoning: &str, expanded: bool, seq| HistoryEntry::Agent {
-        name: "Agent".to_string(),
-        text: text.to_string(),
-        reasoning: reasoning.to_string(),
-        timestamp: now,
-        expanded,
-        reasoning_offset: 0,
-        think_duration: Some(Duration::from_secs(2)),
-        seq: Some(seq),
-        performance: Some(cockpit_client::presentation::ResponsePerformance {
-            ttft_ms: 850,
-            generation_ms: 2_000,
-            displayed_tokens: 80,
-            encoding: "o200k_base".to_string(),
-        }),
-        performance_expanded: expanded,
+    let agent = |text: &str, reasoning: &str, expanded: bool, seq, interrupted| {
+        HistoryEntry::Agent {
+            name: "Agent".to_string(),
+            text: text.to_string(),
+            reasoning: reasoning.to_string(),
+            timestamp: now,
+            expanded,
+            reasoning_offset: 0,
+            think_duration: Some(Duration::from_secs(2)),
+            seq: Some(seq),
+            performance: Some(cockpit_client::presentation::ResponsePerformance {
+                ttft_ms: 850,
+                generation_ms: 2_000,
+                displayed_tokens: 80,
+                encoding: "o200k_base".to_string(),
+            }),
+            performance_expanded: expanded,
+            // The interrupted turn uses the production shape the
+            // `AgentIdle(Interrupted)` finalize path freezes (see
+            // `App::finalize_pending_interrupted`): the marker row is
+            // rendered by the entry, not staged as a synthetic `Plain` row.
+            interrupted,
+        }
     };
     app.history = vec![
         user("Restyle the complete transcript surface.", 1),
@@ -133,10 +145,8 @@ fn transcript_fixture_app() -> App {
             "Inspect the current transcript hierarchy.",
             false,
             2,
+            true,
         ),
-        HistoryEntry::Plain {
-            line: "Stopped — you sent a message".to_string(),
-        },
         user("Continue with every transcript element.", 3),
         HistoryEntry::Plain {
             line: "steer from You: Prioritize the transcript chrome.".to_string(),
@@ -150,6 +160,7 @@ fn transcript_fixture_app() -> App {
             "Map each requested row to its owning renderer.",
             true,
             4,
+            false,
         ),
         HistoryEntry::ToolLine {
             call_id: "read-1".to_string(),
@@ -215,8 +226,9 @@ fn transcript_fixture_app() -> App {
     .into();
     app.pending = Some(PendingMsg {
         name: "Agent".to_string(),
-        text: "Streaming the final response with a stable caret while the viewport remains scrolled.\nThe fixture deliberately keeps live prose below the fold.\nThe reserved scrollbar column stays visible.\nThe jump-to-latest control remains available at both review widths."
-            .to_string(),
+        text:
+            "Streaming the final response with a stable caret while the viewport remains scrolled."
+                .to_string(),
         reasoning: "Check the final visual hierarchy.".to_string(),
         timestamp: now,
         started_at: Instant::now(),
@@ -251,26 +263,56 @@ pub fn render_transcript_fixture(width: u16, height: u16) -> Buffer {
 pub fn assert_transcript_fixture() {
     let _pins = GoldenPins::install();
     assert_golden_sizes("chat", "transcript-elements", render_transcript_fixture);
-    let preview = format!(
-        "{}\n{}",
-        buffer_text(&render_transcript_fixture(80, 24)),
-        buffer_text(&render_transcript_fixture(120, 40))
-    );
+    // Per-size marker checks that distinguish the states the byte dumps
+    // carry: both Thought collapse states plus the live `Thinking` header,
+    // the interrupted marker row from the finalized entry, the Inline
+    // 6-column diff chrome, the sticky accent, and the `↓ Latest` chip.
+    let wide = buffer_text(&render_transcript_fixture(120, 40));
     for marker in [
         "↓ Latest",
-        "▌",
-        "Thought",
-        "Stopped — you sent a message",
+        "  ⎯ Stopped — you sent a message",
+        "▸ Thought",
+        "▾ Thought",
+        "  Thinking",
+        "Check the final visual hierarchy.",
         "▸ You",
         "note to self",
         "interactive ✓",
         "background ✓",
         "◇ Edited",
+        "  │ - old line",
+        "  │ + new line",
         "[show summary]",
-        "Model  Agent",
+        "[Pin]",
+        "[Fork]",
+        "  TTFT",
     ] {
-        assert!(preview.contains(marker), "fixture must contain {marker:?}");
+        assert!(wide.contains(marker), "120x40 dump must contain {marker:?}");
     }
+    assert_sticky_bare_bar(&wide);
+    let narrow = buffer_text(&render_transcript_fixture(80, 24));
+    for marker in [
+        "↓ Latest",
+        "  Thinking",
+        "Check the final visual hierarchy.",
+        "  │ + new line",
+    ] {
+        assert!(
+            narrow.contains(marker),
+            "80x24 dump must contain {marker:?}"
+        );
+    }
+    assert_sticky_bare_bar(&narrow);
+}
+
+/// The sticky accent is the bare `▌` bar with the condensed INK-bold preview
+/// directly after it — not the `▌ ` user-message body bar.
+fn assert_sticky_bare_bar(dump: &str) {
+    let sticky = dump.lines().next().expect("sticky header row");
+    assert!(
+        sticky.starts_with('▌') && !sticky.starts_with("▌ "),
+        "sticky row must use the bare bar accent: {sticky:?}"
+    );
 }
 
 /// Settled onboarding Welcome shell — seed dump (b).

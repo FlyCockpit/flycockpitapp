@@ -2348,6 +2348,7 @@ mod affordance_hover_tests {
             seq: None,
             performance: None,
             performance_expanded: false,
+            interrupted: false,
         }
     }
 

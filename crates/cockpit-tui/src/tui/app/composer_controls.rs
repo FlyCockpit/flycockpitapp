@@ -1302,12 +1302,12 @@ impl App {
                     self.commit_composer_picker(picker, persist);
                     return true;
                 }
-                KeyCode::Up => {
+                KeyCode::Up if !key.modifiers.contains(KeyModifiers::ALT) => {
                     picker.move_cursor(-1);
                     self.composer_controls.picker = Some(picker);
                     return true;
                 }
-                KeyCode::Down => {
+                KeyCode::Down if !key.modifiers.contains(KeyModifiers::ALT) => {
                     picker.move_cursor(1);
                     self.composer_controls.picker = Some(picker);
                     return true;

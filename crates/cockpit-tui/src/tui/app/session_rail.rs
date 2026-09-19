@@ -374,6 +374,46 @@ mod tests {
     }
 
     #[test]
+    fn alt_down_switches_sessions_while_a_composer_picker_is_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = configured_app(&tmp);
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        seed_rail_sessions(&mut app, vec![summary(first, 20), summary(second, 10)]);
+        let (_outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+        let mut runner = crate::tui::agent_runner::AgentRunner::test_fixture(Default::default());
+        runner.install_live_swappable_switch_seam(outcome_rx);
+        app.agent_runner = Some(Ok(runner));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(
+            app.composer_controls.picker.is_some(),
+            "Ctrl+P opens the model picker before the session chord"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+
+        assert_eq!(app.session_rail.selected_id(), Some(second));
+        assert!(
+            matches!(
+                app.pending_session_switch_target,
+                Some(crate::tui::agent_runner::SessionTarget::Resume {
+                    session_id, ..
+                }) if session_id == second
+            ),
+            "Alt+down must resume the next session instead of navigating the picker"
+        );
+        assert!(
+            app.composer_controls.picker.is_none(),
+            "the global session chord dismisses the picker as it falls through"
+        );
+        assert_eq!(
+            app.composer_controls.selection, None,
+            "dismissal releases composer-control ownership"
+        );
+    }
+
+    #[test]
     fn rail_shortcuts_do_not_steal_composer_when_unfocused() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = configured_app(&tmp);

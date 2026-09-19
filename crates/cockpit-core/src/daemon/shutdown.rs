@@ -195,8 +195,9 @@ impl ShutdownSignal {
     /// silently.
     ///
     /// Event-driven: waiters park on the drop [`Notify`] rather than polling
-    /// the counter. Callers share this deadline with the rest of their drain
-    /// so a stuck pass consumes the same grace window, not an extra one.
+    /// the counter. Callers share this deadline with the running-work portion
+    /// of their drain so a stuck pass consumes that grace window. The
+    /// interrupt-park commit fence retains its independent correctness budget.
     pub(crate) async fn wait_for_admitted_maintenance_drain(
         &self,
         deadline: tokio::time::Instant,

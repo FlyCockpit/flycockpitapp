@@ -3601,6 +3601,34 @@ impl SessionRegistry {
         generation
     }
 
+    /// Test-only: install a delivered shutdown obligation whose park commit is
+    /// controlled by the caller. This lets daemon-level shutdown tests exercise
+    /// the real registry park fence without constructing a provider driver.
+    #[cfg(test)]
+    pub(crate) fn insert_test_pending_park_worker(
+        &self,
+    ) -> (
+        crate::engine::interrupt::ParkCommit,
+        tokio::sync::mpsc::Receiver<session_worker::SessionWork>,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session = Arc::new(
+            Session::create_deferred_for_test(
+                self.inner.db.clone(),
+                tmp.keep(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .expect("deferred session"),
+        );
+        let (handle, receiver) =
+            SessionWorkerHandle::test_handle_with_receiver(session, self.inner.locks.clone());
+        let park_commit = handle.park_commit();
+        park_commit.test_add_registered();
+        self.insert_test_worker(handle, tokio::spawn(async {}));
+        (park_commit, receiver)
+    }
+
     #[cfg(test)]
     fn insert_test_worker_without_join(&self, handle: SessionWorkerHandle) -> WorkerGeneration {
         let id = handle.session_id();

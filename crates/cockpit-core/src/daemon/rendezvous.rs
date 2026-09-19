@@ -192,6 +192,8 @@ impl StartLock {
                 .read(true)
                 .write(true)
                 .open(path)?;
+            // SAFETY: OVERLAPPED is a plain C record whose all-zero state is
+            // valid for a synchronous whole-file lock.
             let mut overlapped = unsafe { std::mem::zeroed() };
             // SAFETY: the file and OVERLAPPED remain valid for this synchronous call.
             if unsafe {

@@ -1992,6 +1992,8 @@ fn lock_published_pid_file(path: &Path) -> std::io::Result<std::fs::File> {
         .read(true)
         .write(true)
         .open(path)?;
+    // SAFETY: OVERLAPPED is a plain C record whose all-zero state is valid for
+    // a synchronous whole-file lock.
     let mut overlapped = unsafe { std::mem::zeroed() };
     // SAFETY: the handle and synchronous OVERLAPPED are valid for this call.
     if unsafe {

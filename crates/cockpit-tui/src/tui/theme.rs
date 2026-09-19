@@ -2,6 +2,8 @@
 //!
 //! Truecolor RGB tokens are the source of truth; [`resolve_color`] picks the
 //! nearest 256-color fallback when the terminal does not advertise truecolor.
+//! Every paint site that renders one of these tokens routes it through
+//! [`resolve_color`] with its paired `*_INDEX` fallback.
 
 use ratatui::style::{Color, Modifier, Style};
 
@@ -105,8 +107,10 @@ pub const SUCCESS_TEXT: Color = GREEN;
 pub const ERROR_TEXT: Color = RED;
 pub const INFO_TEXT: Color = METADATA_TEXT;
 
-/// Interaction tokens. Hover uses the excoc chip rule ([`HOVER_BG`] +
-/// [`BRASS`] + bold); focus/pressed/destructive stay distinct pressed states.
+/// Interaction tokens. Hover paint lives in the single excoc chip rule
+/// (`crate::tui::chrome::chip_style`: [`HOVER_BG`] + [`BRASS`] + bold);
+/// these hover constants stay only as inputs to the contrast matrix.
+/// Focus/pressed/destructive stay distinct pressed states.
 pub const BUTTON_HOVER_FG: Color = BRASS;
 pub const BUTTON_HOVER_BG: Color = HOVER_BG;
 pub const BUTTON_FOCUS_FG: Color = Color::Rgb(0xFF, 0xFF, 0xFF);
@@ -123,13 +127,6 @@ pub const LINK_HOVER_FG: Color = Color::Cyan;
 
 pub fn button_idle_style() -> Style {
     Style::default().add_modifier(Modifier::BOLD)
-}
-
-pub fn button_hover_style() -> Style {
-    Style::default()
-        .fg(BUTTON_HOVER_FG)
-        .bg(BUTTON_HOVER_BG)
-        .add_modifier(Modifier::BOLD)
 }
 
 pub fn button_focus_style() -> Style {
@@ -173,24 +170,71 @@ pub const CONTEXT_BLOCK_INDEX: u8 = 213;
 pub const CONTEXT_GUIDANCE_INDEX: u8 = 220;
 pub const CONTEXT_MESSAGES_INDEX: u8 = 41;
 
-/// Whether the terminal advertises 24-bit color via `COLORTERM`.
+/// Classify a `COLORTERM` value: it advertises 24-bit colour when it
+/// contains `truecolor` or `24bit` (case-insensitive). Pure (the value is
+/// passed in) so the classification is unit-testable.
+fn colorterm_advertises_truecolor(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    value.contains("truecolor") || value.contains("24bit")
+}
+
+/// Whether the terminal advertises 24-bit color via `COLORTERM`. Absent or
+/// unrecognized values are treated as non-truecolor. While a
+/// [`pin_truecolor`] is installed on this thread (tests and the golden
+/// harness only), the pin wins so renders stay byte-identical regardless
+/// of the ambient environment.
 pub fn supports_truecolor() -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(capable) = TRUECOLOR_PIN.with(std::cell::Cell::get) {
+        return capable;
+    }
     std::env::var("COLORTERM")
-        .map(|value| {
-            let value = value.to_ascii_lowercase();
-            value.contains("truecolor") || value.contains("24bit")
-        })
+        .map(|value| colorterm_advertises_truecolor(&value))
         .unwrap_or(false)
 }
 
 /// Resolve an RGB token to itself on truecolor terminals, otherwise the
-/// nearest indexed fallback.
+/// nearest indexed fallback. The single funnel through which the RGB
+/// palette reaches a terminal; non-RGB colours pass through unchanged.
 pub fn resolve_color(truecolor: Color, index: u8) -> Color {
     match truecolor {
         Color::Rgb(r, g, b) if supports_truecolor() => Color::Rgb(r, g, b),
         Color::Rgb(_, _, _) => Color::Indexed(index),
         other => other,
     }
+}
+
+// Per-thread capability override behind [`pin_truecolor`]. Tests and the
+// golden harness install it so both capability branches are exercised
+// deterministically and golden dumps never depend on the ambient
+// `COLORTERM`. Never compiled into live rendering.
+#[cfg(any(test, feature = "test-support"))]
+std::thread_local! {
+    static TRUECOLOR_PIN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// RAII guard that restores the previous capability pin on drop.
+#[cfg(any(test, feature = "test-support"))]
+pub struct TruecolorPin {
+    prev: Option<bool>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for TruecolorPin {
+    fn drop(&mut self) {
+        TRUECOLOR_PIN.with(|cell| cell.set(self.prev));
+    }
+}
+
+/// Pin the terminal colour capability for this thread, overriding the
+/// `COLORTERM` check for the guard's lifetime: the golden-dump determinism
+/// seam (dumps must not depend on the ambient `COLORTERM`) and the way
+/// tests pin both capability branches of [`resolve_color`]. Live rendering
+/// never installs a pin.
+#[cfg(any(test, feature = "test-support"))]
+pub fn pin_truecolor(capable: bool) -> TruecolorPin {
+    let prev = TRUECOLOR_PIN.with(|cell| cell.replace(Some(capable)));
+    TruecolorPin { prev }
 }
 
 #[cfg(test)]
@@ -228,16 +272,84 @@ mod tests {
     }
 
     #[test]
-    fn resolve_color_respects_truecolor_capability() {
+    fn colorterm_classification_pins_both_branches() {
+        assert!(colorterm_advertises_truecolor("truecolor"));
+        assert!(colorterm_advertises_truecolor("24bit"));
+        assert!(colorterm_advertises_truecolor("Truecolor"));
+        assert!(colorterm_advertises_truecolor("screen-256color;truecolor"));
+        assert!(!colorterm_advertises_truecolor(""));
+        assert!(!colorterm_advertises_truecolor("256color"));
+        assert!(!colorterm_advertises_truecolor("yes"));
+    }
+
+    #[test]
+    fn supports_truecolor_follows_colorterm() {
+        let env = cockpit_test_support::TestEnvGuard::blocking_lock();
+        env.remove_var("COLORTERM");
+        assert!(!supports_truecolor(), "absent COLORTERM is non-truecolor");
+        env.set_var("COLORTERM", "truecolor");
+        assert!(supports_truecolor());
+        env.set_var("COLORTERM", "24bit");
+        assert!(supports_truecolor());
+        env.set_var("COLORTERM", "256color");
+        assert!(!supports_truecolor(), "256color is not 24-bit");
+    }
+
+    #[test]
+    fn resolve_color_pins_both_capability_branches() {
+        let resolved = {
+            let _pin = pin_truecolor(true);
+            resolve_color(BRASS, BRASS_INDEX)
+        };
+        assert_eq!(resolved, BRASS, "truecolor terminals get the RGB token");
+
+        let resolved = {
+            let _pin = pin_truecolor(false);
+            resolve_color(BRASS, BRASS_INDEX)
+        };
         assert_eq!(
-            resolve_color(BRASS, BRASS_INDEX),
-            if supports_truecolor() {
-                BRASS
-            } else {
-                Color::Indexed(BRASS_INDEX)
-            }
+            resolved,
+            Color::Indexed(BRASS_INDEX),
+            "non-truecolor terminals get the indexed fallback"
         );
-        assert_eq!(resolve_color(Color::Cyan, BRASS_INDEX), Color::Cyan);
+
+        // Non-RGB colours pass through untouched in both branches.
+        let passthrough = {
+            let _pin = pin_truecolor(false);
+            resolve_color(Color::Cyan, BRASS_INDEX)
+        };
+        assert_eq!(passthrough, Color::Cyan);
+    }
+
+    #[test]
+    fn indexed_fallbacks_pin_the_documented_indices() {
+        assert_eq!(INK_INDEX, 255);
+        assert_eq!(FOG_INDEX, 109);
+        assert_eq!(BRASS_INDEX, 179);
+        assert_eq!(NIGHT_INDEX, 240);
+        assert_eq!(DISABLED_INDEX, 241);
+        assert_eq!(HOVER_BG_INDEX, 236);
+        assert_eq!(SURFACE_INDEX, 235);
+        assert_eq!(PLACEHOLDER_INDEX, 245);
+        assert_eq!(YELLOW_INDEX, 179);
+        assert_eq!(RED_INDEX, 167);
+        assert_eq!(GREEN_INDEX, 114);
+        assert_eq!(TEAL_INDEX, 80);
+        assert_eq!(WARN_INDEX, 173);
+        assert_eq!(GOOD_INDEX, GREEN_INDEX);
+        // Every `*_ANSI` fallback is the indexed spelling of its token.
+        assert_eq!(INK_ANSI, Color::Indexed(255));
+        assert_eq!(FOG_ANSI, Color::Indexed(109));
+        assert_eq!(BRASS_ANSI, Color::Indexed(179));
+        assert_eq!(NIGHT_ANSI, Color::Indexed(240));
+        assert_eq!(GOOD_ANSI, Color::Indexed(114));
+        assert_eq!(WARN_ANSI, Color::Indexed(173));
+        assert_eq!(BAD_ANSI, Color::Indexed(167));
+        assert_eq!(DISABLED_ANSI, Color::Indexed(241));
+        assert_eq!(HOVER_BG_ANSI, Color::Indexed(236));
+        assert_eq!(PLACEHOLDER_ANSI, Color::Indexed(245));
+        // Yellow shares BRASS's RGB, so it shares its fallback too.
+        assert_eq!(YELLOW_INDEX, BRASS_INDEX);
     }
 
     #[test]

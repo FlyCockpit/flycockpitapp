@@ -24,7 +24,8 @@ use crate::tui::button::{
     ButtonDispatch, ButtonId, ButtonSpec, clip_to_display_width, display_width,
 };
 use crate::tui::theme::{
-    DISABLED, DIVIDER_DIM, GREEN, MUTED_COLOR_INDEX, RED, STATUS_BRANCH_BADGE, YELLOW,
+    DISABLED, DISABLED_INDEX, DIVIDER_DIM, GREEN, GREEN_INDEX, MUTED_COLOR_INDEX, RED, RED_INDEX,
+    STATUS_BRANCH_BADGE, YELLOW, YELLOW_INDEX, resolve_color,
 };
 
 /// Height of the full header: title row, meta row, rule row.
@@ -111,6 +112,17 @@ impl HeaderSessionStatus {
             HeaderSessionStatus::Working => YELLOW,
             HeaderSessionStatus::Done => GREEN,
             HeaderSessionStatus::Idle => DISABLED,
+        }
+    }
+
+    /// The 256-colour fallback paired with [`color`](Self::color): what a
+    /// non-truecolor terminal sees for this status.
+    fn color_index(self) -> u8 {
+        match self {
+            HeaderSessionStatus::Attention => RED_INDEX,
+            HeaderSessionStatus::Reconnecting | HeaderSessionStatus::Working => YELLOW_INDEX,
+            HeaderSessionStatus::Done => GREEN_INDEX,
+            HeaderSessionStatus::Idle => DISABLED_INDEX,
         }
     }
 
@@ -307,7 +319,12 @@ pub(crate) fn paint_chat_header(
             },
         );
     }
-    let mut status_style = Style::default().fg(state.status.color());
+    // The status badge colour resolves through the terminal's colour
+    // capability: a non-truecolor terminal sees the indexed fallback.
+    let mut status_style = Style::default().fg(resolve_color(
+        state.status.color(),
+        state.status.color_index(),
+    ));
     if state.status.pulses() {
         status_style = status_style.add_modifier(Modifier::BOLD);
     }
@@ -766,9 +783,20 @@ mod tests {
         assert!(HeaderSessionStatus::Attention.label().contains("Waiting"));
         assert!(HeaderSessionStatus::Idle.label().contains("Idle"));
         assert_eq!(HeaderSessionStatus::Attention.color(), RED);
+        assert_eq!(HeaderSessionStatus::Reconnecting.color(), YELLOW);
         assert_eq!(HeaderSessionStatus::Working.color(), YELLOW);
         assert_eq!(HeaderSessionStatus::Done.color(), GREEN);
         assert_eq!(HeaderSessionStatus::Idle.color(), DISABLED);
+        // Every status also names its 256-colour fallback so the badge
+        // resolves on non-truecolor terminals.
+        assert_eq!(HeaderSessionStatus::Attention.color_index(), RED_INDEX);
+        assert_eq!(
+            HeaderSessionStatus::Reconnecting.color_index(),
+            YELLOW_INDEX
+        );
+        assert_eq!(HeaderSessionStatus::Working.color_index(), YELLOW_INDEX);
+        assert_eq!(HeaderSessionStatus::Done.color_index(), GREEN_INDEX);
+        assert_eq!(HeaderSessionStatus::Idle.color_index(), DISABLED_INDEX);
     }
 
     #[test]

@@ -219,7 +219,9 @@ const DAEMON_SPAWN_NOTIFY_ENV: &str = "COCKPIT_DAEMON_SPAWN_NOTIFY";
 const DAEMON_LOG_FILE: &str = "daemon.log";
 const DAEMON_LOG_ROTATED_FILE: &str = "daemon.log.1";
 const DAEMON_LOG_MAX_BYTES: u64 = 1024 * 1024;
-pub const DAEMON_SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DAEMON_SPAWN_TIMEOUT: Duration = Duration::from_secs(60);
+const _: () =
+    assert!(DAEMON_SPAWN_TIMEOUT.as_secs() < cockpit_client::LIFECYCLE_REQUEST_TIMEOUT.as_secs());
 /// `sysexits.h` `EX_TEMPFAIL` — dedicated code for bind refusal / address in use.
 pub const DAEMON_BIND_IN_USE_EXIT_CODE: u8 = 75;
 
@@ -1662,9 +1664,20 @@ fn spawn_detached_child(
         );
     }
     match notify.wait(&mut child, &log_path, DAEMON_SPAWN_TIMEOUT) {
-        Ok(spawn_notify::SpawnReport::Ready { .. }) => {
+        Ok(spawn_notify::SpawnReport::Ready { socket }) if socket == paths.socket => {
             cockpit_client::launch_provenance::set_process_launch_ticket(launch_ticket);
             Ok(child)
+        }
+        Ok(spawn_notify::SpawnReport::Ready { socket }) => {
+            spawn_notify::reap_or_kill(&mut child);
+            Err(spawn_notify::error_with_log_tail(
+                format!(
+                    "daemon reported ready at {}, expected {}",
+                    socket.display(),
+                    paths.socket.display()
+                ),
+                &log_path,
+            ))
         }
         Ok(report) => {
             spawn_notify::reap_or_kill(&mut child);

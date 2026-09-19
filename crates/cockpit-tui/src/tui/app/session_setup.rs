@@ -627,9 +627,7 @@ impl App {
             "daemon exited before reporting ready",
             "timed out waiting for daemon to report ready",
             "COCKPIT_SOCKET_DIR",
-            "socket path",
             "shorter than SUN_LEN",
-            "already in use",
             "daemon socket address already in use",
             "another daemon is already running",
             "--- daemon.log (last ",
@@ -662,6 +660,14 @@ impl App {
             pane.note_snapshot_refresh_error(pane_message);
         }
         self.launch.provider_line = "Daemon failed to start".to_string();
+    }
+
+    pub(super) fn clear_daemon_spawn_failure_toast(&mut self) {
+        if self.launch.provider_line == "Daemon failed to start"
+            && self.toast.as_ref().is_some_and(|toast| toast.persistent)
+        {
+            self.toast = None;
+        }
     }
 
     /// Surface a fixed error into the open session-setup overlay/inline panel.

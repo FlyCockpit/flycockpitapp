@@ -13,11 +13,12 @@ use std::io::Write;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 #[cfg(unix)]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use super::{
     DAEMON_LOG_FILE, DAEMON_LOG_MAX_BYTES, DAEMON_LOG_ROTATED_FILE, DAEMON_SPAWN_NOTIFY_ENV,
@@ -36,6 +37,7 @@ const NOTIFY_BIND_ATTEMPTS: u32 = 32;
 
 #[cfg(unix)]
 static NOTIFY_SEQ: AtomicU64 = AtomicU64::new(1);
+static SPAWN_REPORT_SENT: AtomicBool = AtomicBool::new(false);
 
 /// Parsed one-shot boot report from the child.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,7 +141,14 @@ fn report_line(line: &str) {
     if endpoint.is_empty() {
         return;
     }
+    if SPAWN_REPORT_SENT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
     if let Err(error) = write_report(&endpoint, line) {
+        SPAWN_REPORT_SENT.store(false, Ordering::Release);
         tracing::warn!(%error, endpoint, "failed to report daemon spawn status to parent");
     }
 }
@@ -153,11 +162,6 @@ fn write_report(endpoint: &str, line: &str) -> Result<()> {
         stream
             .write_all(payload.as_bytes())
             .context("writing spawn notify report")?;
-        // SAFETY: spawn notify is single-shot; clearing the env after the first
-        // report prevents late daemon shutdown from reporting to a reused pid.
-        unsafe {
-            std::env::remove_var(DAEMON_SPAWN_NOTIFY_ENV);
-        }
         Ok(())
     }
     #[cfg(windows)]
@@ -169,11 +173,6 @@ fn write_report(endpoint: &str, line: &str) -> Result<()> {
         stream
             .write_all(payload.as_bytes())
             .context("writing spawn notify report")?;
-        // SAFETY: spawn notify is single-shot; clearing the env after the first
-        // report prevents late daemon shutdown from reporting to a reused pid.
-        unsafe {
-            std::env::remove_var(DAEMON_SPAWN_NOTIFY_ENV);
-        }
         Ok(())
     }
     #[cfg(not(any(unix, windows)))]
@@ -213,7 +212,7 @@ pub(crate) fn parse_report_line(line: &str) -> Result<SpawnReport> {
 }
 
 fn sanitize_report_payload(reason: &str) -> String {
-    reason.replace(['}', '\n', '\r'], " ")
+    reason.replace(['\n', '\r'], " ")
 }
 
 pub(crate) fn prepare_daemon_log(state_dir: &Path) -> Result<std::fs::File> {
@@ -491,39 +490,41 @@ fn unix_wait(
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     kill_spawned_daemon(child);
-                    return Err(error_with_log_tail(
-                        "timed out waiting for daemon to report ready",
-                        log_path,
-                    ));
-                }
-                if verify_notify_peer(&stream, child.id()).is_err() {
-                    continue;
+                    return Err(spawn_timeout_error(timeout, log_path));
                 }
                 if remaining < MIN_NOTIFY_READ_TIMEOUT {
                     kill_spawned_daemon(child);
-                    return Err(error_with_log_tail(
-                        "timed out waiting for daemon to report ready",
-                        log_path,
-                    ));
+                    return Err(spawn_timeout_error(timeout, log_path));
                 }
-                let read_budget = remaining.min(PER_CONNECTION_READ_CAP);
-                stream
-                    .set_read_timeout(Some(read_budget))
-                    .context("setting spawn notify read timeout")?;
-                let mut line = String::new();
-                match BufReader::new(stream).read_line(&mut line) {
-                    Ok(0) => continue,
-                    Ok(_) => {
-                        if let Ok(report) = parse_report_line(&line) {
-                            return Ok(report);
+                if verify_notify_peer(&stream, child.id()).is_ok() {
+                    // BSD-derived kernels may inherit O_NONBLOCK from the
+                    // listener. Make this bounded read explicitly blocking so
+                    // connect-before-write cannot lose the one-shot report.
+                    stream
+                        .set_nonblocking(false)
+                        .context("setting spawn notify stream blocking")?;
+                    let read_budget = remaining.min(PER_CONNECTION_READ_CAP);
+                    stream
+                        .set_read_timeout(Some(read_budget))
+                        .context("setting spawn notify read timeout")?;
+                    let mut line = String::new();
+                    match BufReader::new(stream).read_line(&mut line) {
+                        Ok(0) => {}
+                        Ok(_) => {
+                            if let Ok(report) = parse_report_line(&line) {
+                                return Ok(report);
+                            }
                         }
-                        continue;
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
-                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(error) => {
-                        return Err(error).context("reading spawn notify report");
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock
+                                    | std::io::ErrorKind::TimedOut
+                                    | std::io::ErrorKind::Interrupted
+                            ) => {}
+                        Err(error) => {
+                            return Err(error).context("reading spawn notify report");
+                        }
                     }
                 }
             }
@@ -547,16 +548,20 @@ fn unix_wait(
         }
         if Instant::now() >= deadline {
             kill_spawned_daemon(child);
-            return Err(error_with_log_tail(
-                format!(
-                    "timed out waiting for daemon to report ready after {}s",
-                    timeout.as_secs().max(1)
-                ),
-                log_path,
-            ));
+            return Err(spawn_timeout_error(timeout, log_path));
         }
         std::thread::sleep(WAIT_POLL);
     }
+}
+
+fn spawn_timeout_error(timeout: Duration, log_path: &Path) -> anyhow::Error {
+    error_with_log_tail(
+        format!(
+            "timed out waiting for daemon to report ready after {}s",
+            timeout.as_secs().max(1)
+        ),
+        log_path,
+    )
 }
 
 #[cfg(unix)]
@@ -629,6 +634,7 @@ fn windows_wait(
         pipe_name,
         listener,
     } = server;
+    let child_pid = child.id();
     let join = std::thread::Builder::new()
         .name("cockpit-spawn-notify".to_string())
         .spawn(move || {
@@ -637,11 +643,25 @@ fn windows_wait(
                 .build()
                 .context("building spawn-notify runtime")?;
             runtime.block_on(async move {
+                use std::os::windows::io::AsRawHandle;
+
                 let mut listener = listener;
                 let stream = tokio::time::timeout(timeout, listener.accept())
                     .await
                     .map_err(|_| anyhow::anyhow!("spawn notify accept timed out"))?
                     .context("accepting spawn notify pipe")?;
+                cockpit_host::named_pipe::named_pipe_peer_is_current_user(stream.as_raw_handle())
+                    .context("verifying spawn notify pipe user")?;
+                let peer = cockpit_host::peer_cred::peer_identity_from_named_pipe(
+                    stream.as_raw_handle(),
+                )
+                .context("reading spawn notify pipe peer identity")?;
+                if peer.pid != child_pid {
+                    anyhow::bail!(
+                        "refusing spawn notify report from pid {} (expected spawned child {child_pid})",
+                        peer.pid
+                    );
+                }
                 let mut line = String::new();
                 let mut reader = tokio::io::BufReader::new(stream);
                 tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
@@ -675,13 +695,7 @@ fn windows_wait(
         if Instant::now() >= deadline {
             kill_spawned_daemon(child);
             drop_windows_notify_waiter(&pipe_name, join);
-            return Err(error_with_log_tail(
-                format!(
-                    "timed out waiting for daemon to report ready after {}s",
-                    timeout.as_secs().max(1)
-                ),
-                log_path,
-            ));
+            return Err(spawn_timeout_error(timeout, log_path));
         }
         std::thread::sleep(WAIT_POLL);
     }
@@ -703,6 +717,12 @@ mod tests {
         match parse_report_line("AddrInUse{/tmp/cockpit.sock}").unwrap() {
             SpawnReport::AddrInUse { path } => {
                 assert_eq!(path, PathBuf::from("/tmp/cockpit.sock"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse_report_line("AddrInUse{/tmp/brace}.sock}").unwrap() {
+            SpawnReport::AddrInUse { path } => {
+                assert_eq!(path, PathBuf::from("/tmp/brace}.sock"));
             }
             other => panic!("unexpected {other:?}"),
         }

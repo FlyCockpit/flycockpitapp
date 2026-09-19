@@ -4,6 +4,11 @@ use crate::tui::async_action::{
 };
 use std::fs;
 use std::sync::mpsc;
+#[cfg(unix)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
@@ -38,6 +43,69 @@ async fn drain_until_idle(app: &mut App) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("async action did not complete");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cold_start_hanging_child_report_replaces_loading_with_blocking_spawn_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
+    let (lifecycle, mut requests) = cockpit_client::LifecycleClient::channel(1);
+    let mut app = App::new_composed_with_session_mode(
+        Some(tmp.path()),
+        false,
+        cockpit_proto::SessionEntryMode::Code,
+        super::StartupWorkspaceTrust::Decided,
+        None,
+        lifecycle,
+    );
+    let child_reaped = Arc::new(AtomicBool::new(false));
+    let host_reaped = Arc::clone(&child_reaped);
+    let host = tokio::spawn(async move {
+        let request = requests.recv().await.expect("cold-start lifecycle request");
+        let error = tokio::task::spawn_blocking(move || {
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn hanging child");
+            std::thread::sleep(Duration::from_millis(50));
+            child.kill().expect("kill hanging child at spawn deadline");
+            child.wait().expect("reap hanging child");
+            host_reaped.store(true, Ordering::SeqCst);
+            "timed out waiting for daemon to report ready after 60s\n\
+--- daemon.log (last 20 lines) ---\n\
+still-booting"
+                .to_string()
+        })
+        .await
+        .expect("join hanging-child timeout");
+        request
+            .reply
+            .send(Err(error))
+            .expect("deliver spawn timeout through lifecycle reply");
+    });
+
+    app.start_startup_lifecycle_resolution();
+    drain_until_idle(&mut app).await;
+    host.await.expect("lifecycle host");
+
+    assert!(child_reaped.load(Ordering::SeqCst));
+    assert!(app.startup_lifecycle.is_none());
+    assert!(!app.startup_background.workspace_ready);
+    let toast = app.toast.as_ref().expect("blocking spawn-failure toast");
+    assert!(toast.persistent);
+    assert_eq!(toast.kind, super::ToastKind::Error);
+    assert!(toast.text.contains("timed out waiting for daemon"));
+    let pane_error = app
+        .session_setup_inline
+        .as_ref()
+        .and_then(|pane| pane.error_message())
+        .expect("session setup pane error");
+    assert!(pane_error.contains("still-booting"), "{pane_error}");
+    assert!(
+        !pane_error.contains("Loading session setup"),
+        "{pane_error}"
+    );
 }
 
 fn seed_pending_runner_attach(
@@ -186,6 +254,39 @@ bind-line\n";
         pane_error.contains("bind-line"),
         "pane must include daemon.log tail lines, got {pane_error}"
     );
+}
+
+#[test]
+fn lifecycle_success_clears_a_blocking_spawn_failure_toast() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = configured_app_body(&tmp);
+    app.apply_daemon_spawn_failure("daemon socket address already in use: test.sock");
+    assert!(app.toast.as_ref().is_some_and(|toast| toast.persistent));
+
+    app.apply_async_action_result(AsyncActionResult {
+        id: AsyncActionId::from_raw_for_test(64),
+        kind: AsyncActionKind::Internal("startup.lifecycle"),
+        presentation_stale: false,
+        payload: Ok(AsyncActionPayload::StartupLifecycleResolved {
+            generation: app.startup_background.generation,
+            result: Ok(App::stub_startup_lifecycle_for_tests()),
+        }),
+    });
+
+    assert!(
+        app.toast.is_none(),
+        "a recovered lifecycle must retract its stale blocking error"
+    );
+}
+
+#[test]
+fn unrelated_socket_and_contention_wording_is_not_classified_as_a_spawn_failure() {
+    assert!(!App::is_daemon_spawn_boot_failure(
+        "session socket path metadata is unavailable"
+    ));
+    assert!(!App::is_daemon_spawn_boot_failure(
+        "requested workspace is already in use"
+    ));
 }
 
 #[test]

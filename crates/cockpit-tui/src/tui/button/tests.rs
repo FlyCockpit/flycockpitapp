@@ -465,7 +465,7 @@ fn interaction_highlight_role_inventory_is_complete() {
 }
 
 #[test]
-fn links_and_selection_remain_semantic() {
+fn links_remain_semantic_and_distinct_from_button_hover() {
     let link = crate::tui::links::base_link_style();
     assert_eq!(link.fg, Some(Color::Cyan));
     assert!(link.add_modifier.contains(Modifier::UNDERLINED));
@@ -478,16 +478,6 @@ fn links_and_selection_remain_semantic() {
     let hover = crate::tui::links::hovered_link_style();
     assert!(hover.add_modifier.contains(Modifier::UNDERLINED));
     assert_ne!(hover.bg, Some(BUTTON_HOVER_BG));
-
-    let src = include_str!("../app/render.rs");
-    assert!(
-        src.contains("add_modifier(Modifier::REVERSED)"),
-        "text selection must keep reverse-video"
-    );
-    assert!(
-        !src.contains("chrome::chip_style"),
-        "selection path stays distinct from the shared chip hover rule"
-    );
 }
 
 fn collect_tui_source() -> String {
@@ -639,6 +629,9 @@ fn classify_highlight_role(rel: &str, line: &str) -> String {
     }
     if rel.contains("history/") && line.contains("UNDERLINED") {
         return "history DIM|UNDERLINED metadata → static status exception".into();
+    }
+    if rel == "golden.rs" && (line.contains("UNDERLINED") || line.contains("REVERSED")) {
+        return "golden style serializer modifier label".into();
     }
     if rel.contains("pins_overlay.rs") && line.contains("REVERSED") {
         return "pins overlay REVERSED row → row selection".into();

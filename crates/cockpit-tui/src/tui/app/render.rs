@@ -376,6 +376,11 @@ fn apply_hover_highlight(
             hovered_control_chip.and_then(|chip| control_chip_hit_for_row(meta, chip))
         {
             hover_highlight_control_chip(line, hit);
+        } else if let Some(AffordanceTarget::Metric { history_index }) = hovered
+            && let Some(hit) = meta.metric_hit
+            && hit.history_index == history_index
+        {
+            hover_highlight_range(line, hit.col_start as usize, hit.col_end as usize, None);
         } else if hovered.is_some_and(|target| affordance_target_for_row(meta) == Some(target)) {
             hover_highlight_line(line, width);
         }

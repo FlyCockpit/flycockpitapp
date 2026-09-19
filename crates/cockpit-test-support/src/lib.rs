@@ -8,6 +8,28 @@ use tokio::sync::{Mutex, MutexGuard};
 pub mod home_isolation;
 pub mod provider;
 
+/// Read a checked-in test fixture with a path-rich failure message.
+pub fn read_fixture(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|error| {
+        panic!("read test fixture {}: {error}", path.display());
+    })
+}
+
+/// Replace a generated test fixture, creating its parent directory first.
+pub fn write_fixture(path: &Path, contents: &str) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap_or_else(|error| {
+            panic!(
+                "create test fixture directory {}: {error}",
+                parent.display()
+            );
+        });
+    }
+    std::fs::write(path, contents).unwrap_or_else(|error| {
+        panic!("write test fixture {}: {error}", path.display());
+    });
+}
+
 /// Create a small test root on a latency-isolated temporary filesystem when
 /// the platform exposes one, with a normal OS temporary directory as the
 /// portable fallback.

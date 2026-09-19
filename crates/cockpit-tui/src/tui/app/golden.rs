@@ -141,6 +141,10 @@ fn transcript_fixture_app() -> App {
         HistoryEntry::Plain {
             line: "steer from You: Prioritize the transcript chrome.".to_string(),
         },
+        HistoryEntry::UserNote {
+            text: "Keep product-only transcript variants.".to_string(),
+            timestamp: now,
+        },
         agent(
             "The open thought is followed by tool work.",
             "Map each requested row to its owning renderer.",
@@ -211,7 +215,8 @@ fn transcript_fixture_app() -> App {
     .into();
     app.pending = Some(PendingMsg {
         name: "Agent".to_string(),
-        text: "Streaming the final response".to_string(),
+        text: "Streaming the final response with a stable caret while the viewport remains scrolled.\nThe fixture deliberately keeps live prose below the fold.\nThe reserved scrollbar column stays visible.\nThe jump-to-latest control remains available at both review widths."
+            .to_string(),
         reasoning: "Check the final visual hierarchy.".to_string(),
         timestamp: now,
         started_at: Instant::now(),
@@ -232,10 +237,15 @@ pub fn render_transcript_fixture(width: u16, height: u16) -> Buffer {
     let _ = render_frame(width, height, |frame| {
         app.render_chat_history_pane(frame, frame.area());
     });
-    app.set_chat_scroll_offset_from_interaction(6);
-    render_frame(width, height, |frame| {
+    app.set_chat_scroll_offset_from_interaction(1);
+    let buffer = render_frame(width, height, |frame| {
         app.render_chat_history_pane(frame, frame.area());
-    })
+    });
+    assert!(
+        app.sticky_header_area.is_some(),
+        "transcript golden must exercise the sticky header at {width}x{height}"
+    );
+    buffer
 }
 
 pub fn assert_transcript_fixture() {
@@ -252,11 +262,12 @@ pub fn assert_transcript_fixture() {
         "Thought",
         "Stopped — you sent a message",
         "▸ You",
+        "note to self",
         "interactive ✓",
         "background ✓",
         "◇ Edited",
         "[show summary]",
-        "[Agent stats]",
+        "Model  Agent",
     ] {
         assert!(preview.contains(marker), "fixture must contain {marker:?}");
     }

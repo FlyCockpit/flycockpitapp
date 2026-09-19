@@ -1020,6 +1020,12 @@ impl App {
         }
         let area = self.chat_area?;
         let rel = (mouse.row - area.y) as usize;
+        let rel_col = mouse.column.saturating_sub(area.x);
+        if let Some(hit) = self.performance_chip_hit_at(rel, rel_col) {
+            return Some(AffordanceTarget::Metric {
+                history_index: hit.history_index,
+            });
+        }
         self.chat_row_meta
             .get(rel)
             .and_then(crate::tui::app::render::affordance_target_for_row)
@@ -1235,7 +1241,9 @@ impl App {
             AffordanceTarget::ReasoningWindow { history_index } => {
                 self.scroll_reasoning_window(history_index, up)
             }
-            AffordanceTarget::Chip { .. } | AffordanceTarget::Subagent { .. } => false,
+            AffordanceTarget::Metric { .. }
+            | AffordanceTarget::Chip { .. }
+            | AffordanceTarget::Subagent { .. } => false,
         }
     }
 

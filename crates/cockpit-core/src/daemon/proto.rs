@@ -319,6 +319,7 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             seq,
             hint,
             pre_write_content,
+            write_applied,
         } => vec![Event::ToolEnd {
             session_id,
             agent,
@@ -329,6 +330,7 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             seq,
             hint,
             pre_write_content,
+            write_applied,
         }],
         TurnEvent::ResourceWait {
             agent,

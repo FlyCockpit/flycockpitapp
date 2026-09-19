@@ -3002,6 +3002,7 @@ async fn execute_ordinary_call_unscoped(
                     .as_ref()
                     .ok()
                     .and_then(|out| out.pre_write_content.clone()),
+                write_applied: result.as_ref().ok().is_some_and(|out| out.write_applied),
             })
             .await;
     }

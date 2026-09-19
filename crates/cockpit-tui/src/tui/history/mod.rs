@@ -247,10 +247,8 @@ pub enum HistoryEntry {
         /// they scroll back to the end.
         follow: bool,
     },
-    /// A standalone tool call rendered as one styled line outside any
-    /// box. Used for `write`: conceptually diffs that break the box, but the
-    /// engine doesn't surface pre-write file content yet (see
-    /// [`crate::tui::diff`]), so they render as a one-liner until that lands.
+    /// A standalone tool call rendered as one styled line outside any box.
+    /// Applied writes render as diffs; failed or refused writes use this row.
     ToolLine {
         call_id: String,
         tool: String,

@@ -1123,6 +1123,9 @@ pub enum Event {
         /// not exist). UI-only.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pre_write_content: Option<String>,
+        /// Whether this `write` actually committed its requested body.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        write_applied: bool,
     },
 
     /// A resource-managed tool call is waiting for scheduler permits. UI-only:

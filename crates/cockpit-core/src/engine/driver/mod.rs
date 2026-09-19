@@ -16151,6 +16151,7 @@ impl Driver {
                             // The hint layer is `bash`-only.
                             hint: None,
                             pre_write_content: None,
+                            write_applied: false,
                         })
                         .await;
                     next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
@@ -16281,6 +16282,7 @@ impl Driver {
                                 // The hint layer is `bash`-only.
                                 hint: None,
                                 pre_write_content: None,
+                                write_applied: false,
                             })
                             .await;
                     }

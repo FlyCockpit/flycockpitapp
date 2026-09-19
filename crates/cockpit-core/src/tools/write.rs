@@ -89,7 +89,8 @@ impl Tool for WriteTool {
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         // The recall provider owns its sole writable pseudofile (plan) and
         // must run before every host-path guard.
-        if let Some(output) = crate::tools::recall::write(&args, ctx).await? {
+        if let Some(mut output) = crate::tools::recall::write(&args, ctx).await? {
+            output.write_applied = true;
             return Ok(output);
         }
         let path_arg = args
@@ -295,6 +296,9 @@ impl Tool for WriteTool {
             message.push('\n');
             message.push_str(&created);
         }
+        let write_applied = human_knowledge_outcome
+            .as_ref()
+            .is_none_or(|outcome| outcome.applied);
         if let Some(outcome) = human_knowledge_outcome {
             message.push('\n');
             message.push_str(&crate::knowledge::human_knowledge_edit_outcome_note(
@@ -331,7 +335,10 @@ impl Tool for WriteTool {
 
         let pre_write_content = bounded_pre_write_content(&ctx.redact, existing_before.as_deref());
         let mut output = ToolOutput::text(message);
-        output.pre_write_content = pre_write_content;
+        if write_applied {
+            output.pre_write_content = pre_write_content;
+            output.write_applied = true;
+        }
         Ok(output)
     }
 }
@@ -416,9 +423,11 @@ impl Tool for PlanWriteTool {
                 "Plan may write only its current session plan pseudofile",
             ));
         }
-        crate::tools::recall::write(&args, ctx)
+        let mut output = crate::tools::recall::write(&args, ctx)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("recall plan write was not dispatched"))
+            .ok_or_else(|| anyhow::anyhow!("recall plan write was not dispatched"))?;
+        output.write_applied = true;
+        Ok(output)
     }
 }
 
@@ -2399,6 +2408,7 @@ mod tests {
             .await
             .unwrap();
         assert!(out.pre_write_content.is_none());
+        assert!(out.write_applied);
     }
 
     #[tokio::test]
@@ -2416,6 +2426,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.pre_write_content.as_deref(), Some("before\n"));
+        assert!(out.write_applied);
+    }
+
+    #[tokio::test]
+    async fn write_existing_file_scrubs_pre_write_content_at_capture() {
+        const SECRET: &str = "sk-write-capture-secret-xyzzy";
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(tmp.path());
+        ctx.redact = Arc::new(
+            crate::redact::RedactionTable::empty()
+                .with_forced_literal(SECRET.to_string(), "$redacted:pre-write".to_string())
+                .unwrap(),
+        );
+        let file = tmp.path().join("existing.md");
+        std::fs::write(&file, format!("before {SECRET}\n")).unwrap();
+        note_read(&ctx, &file).await;
+
+        let out = WriteTool
+            .call(
+                serde_json::json!({"path": "existing.md", "content": "after\n"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let captured = out.pre_write_content.expect("existing-file pre-image");
+        assert!(
+            !captured.contains(SECRET),
+            "capture leaked classified secret"
+        );
+        assert!(captured.contains("before "));
+        assert!(out.write_applied);
     }
 
     #[tokio::test]
@@ -3584,6 +3626,8 @@ mod tests {
             .await
             .unwrap();
         assert!(out.content.contains("soul_edit_mode=human_only"), "{out:?}");
+        assert!(!out.write_applied);
+        assert!(out.pre_write_content.is_none());
         assert!(identity_ctx.locks.holder(&soul).is_none());
 
         #[cfg(unix)]

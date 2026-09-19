@@ -5673,8 +5673,7 @@ fn wrap_ghost_line_chunks(
 }
 
 /// True for tools that take an `old_string` / `new_string` pair we can render
-/// as a diff. `write` is not in here because the engine doesn't surface the
-/// pre-write file content.
+/// as a diff. Writes use their separate applied-result path.
 pub(super) fn is_edit_tool(tool: &str) -> bool {
     matches!(
         tool,

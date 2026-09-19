@@ -210,6 +210,7 @@ impl App {
         self.pending_git_blocks.clear();
         self.accepted_tags.clear();
         self.pending_edit_args.clear();
+        self.pending_write_args.clear();
         self.pending_control_requests.clear();
         self.pin_count = 0;
         self.pin_count_session = None;

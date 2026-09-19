@@ -4,6 +4,195 @@ use cockpit_client::presentation::TurnEvent;
 use cockpit_proto::HistoryEntry as Wire;
 use serde_json::json;
 
+fn rendered_diff_lines(entry: &HistoryEntry) -> Vec<String> {
+    let HistoryEntry::Diff {
+        verb,
+        path,
+        old,
+        new,
+        ..
+    } = entry
+    else {
+        panic!("expected diff entry, got {entry:?}");
+    };
+    crate::tui::diff::render_diff(
+        *verb,
+        path,
+        old,
+        new,
+        cockpit_config::extended::DiffStyle::Inline,
+        120,
+        false,
+        false,
+    )
+    .iter()
+    .map(|line| {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    })
+    .collect()
+}
+
+#[test]
+fn live_write_events_render_created_and_edited_fixture_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let created_path = tmp.path().join("created.txt");
+    std::fs::write(&created_path, "alpha\nbeta\n").unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    app.apply_event(TurnEvent::ToolStart {
+        agent: "Build".into(),
+        call_id: "write-new".into(),
+        tool: "write".into(),
+        args: json!({"path": "created.txt", "content": std::fs::read_to_string(&created_path).unwrap()}),
+    });
+    app.apply_event(TurnEvent::ToolEnd {
+        agent: "Build".into(),
+        call_id: "write-new".into(),
+        tool: "write".into(),
+        output: "wrote".into(),
+        truncated: false,
+        seq: Some(1),
+        hint: None,
+        pre_write_content: None,
+        write_applied: true,
+    });
+    assert_eq!(
+        rendered_diff_lines(app.history.last().unwrap()),
+        ["  ◇ Created created.txt  +2", "  │ + alpha", "  │ + beta",]
+    );
+
+    let edited_path = tmp.path().join("edited.txt");
+    std::fs::write(&edited_path, "keep\nold line\n").unwrap();
+    let old = std::fs::read_to_string(&edited_path).unwrap();
+    std::fs::write(&edited_path, "keep\nnew line\n").unwrap();
+    let new = std::fs::read_to_string(&edited_path).unwrap();
+    app.apply_event(TurnEvent::ToolStart {
+        agent: "Build".into(),
+        call_id: "write-edit".into(),
+        tool: "write".into(),
+        args: json!({"path": "edited.txt", "content": new}),
+    });
+    app.apply_event(TurnEvent::ToolEnd {
+        agent: "Build".into(),
+        call_id: "write-edit".into(),
+        tool: "write".into(),
+        output: "wrote".into(),
+        truncated: false,
+        seq: Some(2),
+        hint: None,
+        pre_write_content: Some(old),
+        write_applied: true,
+    });
+    assert_eq!(
+        rendered_diff_lines(app.history.last().unwrap()),
+        [
+            "  ◇ Edited edited.txt  +1 -1",
+            "  │   keep",
+            "  │ - old line",
+            "  │ + new line",
+        ]
+    );
+}
+
+#[test]
+fn restored_applied_write_renders_edited_fixture_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("restored.txt");
+    std::fs::write(&path, "before\n").unwrap();
+    let old = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, "after\n").unwrap();
+    let new = std::fs::read_to_string(&path).unwrap();
+    let entries = wire_history_to_entries(vec![Wire::ToolCall {
+        seq: 1,
+        agent: "Build".into(),
+        call_id: "restored-write".into(),
+        parent_call_id: None,
+        parent_child_index: None,
+        tool: "write".into(),
+        mcp_server: None,
+        mcp_builtin: None,
+        mcp_kind: None,
+        original_input: json!({"path": "restored.txt", "content": new}),
+        wire_input: json!({"path": "restored.txt", "content": new}),
+        recovery_kind: None,
+        recovery_stage: None,
+        output: "wrote".into(),
+        hard_fail: false,
+        truncated: false,
+        hint: None,
+        pre_write_content: Some(old),
+        write_applied: true,
+    }]);
+    assert_eq!(
+        rendered_diff_lines(&entries[0]),
+        [
+            "  ◇ Edited restored.txt  +1 -1",
+            "  │ - before",
+            "  │ + after",
+        ]
+    );
+}
+
+#[test]
+fn unapplied_write_end_stays_a_tool_line_and_drains_cached_args() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    app.apply_event(TurnEvent::ToolStart {
+        agent: "Build".into(),
+        call_id: "refused-write".into(),
+        tool: "write".into(),
+        args: json!({"path": "identity.md", "content": "not written"}),
+    });
+    app.apply_event(TurnEvent::ToolEnd {
+        agent: "Build".into(),
+        call_id: "refused-write".into(),
+        tool: "write".into(),
+        output: "Refused: identity is human-only".into(),
+        truncated: false,
+        seq: Some(1),
+        hint: None,
+        pre_write_content: None,
+        write_applied: false,
+    });
+
+    assert!(matches!(
+        app.history.last(),
+        Some(HistoryEntry::ToolLine { summary, .. })
+            if summary == "Refused: identity is human-only"
+    ));
+    assert!(app.pending_write_args.is_empty());
+}
+
+#[test]
+fn failed_write_line_retains_its_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    app.apply_event(TurnEvent::ToolStart {
+        agent: "Build".into(),
+        call_id: "failed-write".into(),
+        tool: "write".into(),
+        args: json!({"path": "blocked.txt", "content": "body"}),
+    });
+    app.apply_event(TurnEvent::ToolError {
+        agent: "Build".into(),
+        call_id: "failed-write".into(),
+        tool: "write".into(),
+        error: "permission denied".into(),
+        kind: cockpit_proto::ToolFailKind::Execution,
+        seq: Some(1),
+    });
+
+    assert!(matches!(
+        app.history.last(),
+        Some(HistoryEntry::ToolLine {
+            icon_path: Some(path),
+            ..
+        }) if path == "blocked.txt"
+    ));
+}
+
 #[test]
 fn replayed_user_row_uses_display_text() {
     let entries = wire_history_to_entries(vec![Wire::User {
@@ -224,6 +413,7 @@ fn converts_user_assistant_tool_call_to_tui_entries() {
             truncated: false,
             hint: None,
             pre_write_content: None,
+            write_applied: false,
         },
     ];
 
@@ -312,6 +502,7 @@ fn consecutive_tool_calls_coalesce_into_one_box() {
         truncated: false,
         hint: None,
         pre_write_content: None,
+        write_applied: false,
     };
     let entries = wire_history_to_entries(vec![tc("a"), tc("b"), tc("c")]);
     assert_eq!(entries.len(), 1, "one box holds all three calls");

@@ -1456,6 +1456,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             seq: _,
             hint,
             pre_write_content,
+            write_applied: _,
         } => {
             scrub_string(output, redact);
             scrub_option_string(hint, redact);
@@ -1831,6 +1832,7 @@ fn scrub_history_entry_free_text(entry: &mut proto::HistoryEntry, redact: &Redac
             truncated: _,
             hint,
             pre_write_content,
+            write_applied: _,
         } => {
             scrub_json_strings(original_input, redact);
             scrub_json_strings(wire_input, redact);

@@ -2613,6 +2613,9 @@ pub enum HistoryEntry {
         /// not exist). UI/timeline only.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pre_write_content: Option<String>,
+        /// Whether this `write` actually committed its requested body.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        write_applied: bool,
     },
     /// Display-only terminal inference failure restored into attach history.
     /// Never enters model-bound rehydration context.

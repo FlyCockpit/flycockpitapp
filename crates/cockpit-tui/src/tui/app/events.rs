@@ -1657,6 +1657,7 @@ impl App {
                 call_id,
                 hint,
                 pre_write_content,
+                write_applied,
                 ..
             } => {
                 if let Some(args) = self.pending_edit_args.remove(&call_id) {
@@ -1670,19 +1671,21 @@ impl App {
                     return;
                 }
                 if let Some(args) = self.pending_write_args.remove(&call_id) {
-                    let verb = if pre_write_content.is_some() {
-                        DiffVerb::Edited
-                    } else {
-                        DiffVerb::Created
-                    };
-                    self.history.push(HistoryEntry::Diff {
-                        tool,
-                        path: args.path,
-                        old: pre_write_content.unwrap_or_default(),
-                        new: args.new,
-                        verb,
-                    });
-                    return;
+                    if write_applied {
+                        let verb = if pre_write_content.is_some() {
+                            DiffVerb::Edited
+                        } else {
+                            DiffVerb::Created
+                        };
+                        self.history.push(HistoryEntry::Diff {
+                            tool,
+                            path: args.path,
+                            old: pre_write_content.unwrap_or_default(),
+                            new: args.new,
+                            verb,
+                        });
+                        return;
+                    }
                 }
                 if !self.update_tool_state(
                     &call_id,
@@ -1754,7 +1757,7 @@ impl App {
                 // produced a ToolEnd — the diff would be misleading on a
                 // hard failure.
                 let pending_edit = self.pending_edit_args.remove(&call_id);
-                let _pending_write = self.pending_write_args.remove(&call_id);
+                let pending_write = self.pending_write_args.remove(&call_id);
                 // Bold red when the model built the call badly; plain red
                 // when the tool failed for another reason.
                 let state = match kind {
@@ -1769,7 +1772,9 @@ impl App {
                         call_id,
                         tool,
                         summary: cockpit_host::text::first_line(&error, 200),
-                        icon_path: pending_edit.map(|args| args.path),
+                        icon_path: pending_edit
+                            .map(|args| args.path)
+                            .or_else(|| pending_write.map(|args| args.path)),
                         state,
                     });
                 }
@@ -3009,9 +3014,7 @@ fn backup_failure_reason(error_class: &cockpit_proto::InferenceErrorClass) -> St
     }
 }
 
-/// True for write tools rendered as a standalone line (they'd be diffs,
-/// but the engine doesn't surface pre-write content yet — see
-/// [`crate::tui::diff`]).
+/// True for write tools whose successful applied results render as diffs.
 fn is_write_tool(tool: &str) -> bool {
     matches!(
         tool,
@@ -3228,6 +3231,7 @@ pub(super) fn wire_history_to_entries(wire: Vec<cockpit_proto::HistoryEntry>) ->
                 hard_fail,
                 hint,
                 pre_write_content,
+                write_applied,
                 ..
             } => {
                 let state = restored_tool_state(hard_fail);
@@ -3260,7 +3264,8 @@ pub(super) fn wire_history_to_entries(wire: Vec<cockpit_proto::HistoryEntry>) ->
                     });
                     continue;
                 }
-                if is_write_tool(&tool)
+                if write_applied
+                    && is_write_tool(&tool)
                     && let Some(args) = extract_write_args(&original_input)
                 {
                     let verb = if pre_write_content.is_some() {
@@ -4545,6 +4550,7 @@ mod tests {
             seq: None,
             hint: None,
             pre_write_content: None,
+            write_applied: false,
         });
         app.apply_event(TurnEvent::ToolProgress(
             cockpit_client::presentation::ToolProgress {
@@ -4747,6 +4753,7 @@ mod tests {
             truncated: false,
             hint: None,
             pre_write_content: None,
+            write_applied: false,
         };
         let parent = cockpit_proto::HistoryEntry::ToolCall {
             seq: 2,
@@ -4767,6 +4774,7 @@ mod tests {
             truncated: false,
             hint: None,
             pre_write_content: None,
+            write_applied: false,
         };
 
         let restored = wire_history_to_entries(vec![child, parent]);

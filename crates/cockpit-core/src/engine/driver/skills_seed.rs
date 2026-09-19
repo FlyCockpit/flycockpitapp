@@ -467,6 +467,7 @@ impl Driver {
                 // The hint layer is `bash`-only.
                 hint: None,
                 pre_write_content: None,
+                write_applied: false,
             })
             .await;
 

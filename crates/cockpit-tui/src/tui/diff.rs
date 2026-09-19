@@ -542,6 +542,27 @@ mod tests {
     }
 
     #[test]
+    fn write_created_side_by_side_places_additions_in_right_column() {
+        let rendered = lines_to_strings(&render_diff(
+            DiffVerb::Created,
+            "new.txt",
+            "",
+            "alpha\nbeta\n",
+            DiffStyle::SideBySide,
+            120,
+            false,
+            false,
+        ));
+        assert_eq!(rendered[0], "  ◇ Created new.txt  +2");
+        let first = rendered[1].split_once(COL_SEPARATOR).unwrap();
+        let second = rendered[2].split_once(COL_SEPARATOR).unwrap();
+        assert_eq!(first.0.trim(), "");
+        assert_eq!(first.1.trim(), "1 alpha");
+        assert_eq!(second.0.trim(), "");
+        assert_eq!(second.1.trim(), "2 beta");
+    }
+
+    #[test]
     fn write_created_renders_all_additions() {
         let lines = render_diff(
             DiffVerb::Created,

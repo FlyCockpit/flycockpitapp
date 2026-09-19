@@ -125,6 +125,7 @@ fn transcript_json_from_history(history: &[proto::HistoryEntry]) -> Value {
                 output,
                 hard_fail,
                 pre_write_content,
+                write_applied,
                 ..
             } => {
                 if is_edit_tool(tool)
@@ -142,7 +143,8 @@ fn transcript_json_from_history(history: &[proto::HistoryEntry]) -> Value {
                 }
                 let presentation =
                     crate::engine::tool::known_tool_presentation(tool, original_input);
-                if is_write_tool(tool)
+                if *write_applied
+                    && is_write_tool(tool)
                     && let Some((path, new)) = extract_write_args(original_input)
                 {
                     flush_tool_calls(&mut turns, &mut pending_tool_calls);

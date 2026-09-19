@@ -1498,6 +1498,7 @@ mod safety_gate_tests {
                 exit_code: None,
                 output_sidecar: None,
                 pre_write_content: None,
+                write_applied: false,
                 host_effect_unknown: false,
             })
         }

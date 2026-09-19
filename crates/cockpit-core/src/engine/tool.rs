@@ -702,7 +702,9 @@ mod model_ephemeral_tests {
             "resource": { "cpu": 1 },
             "exit_code": 1,
             "output_sidecar": { "stdout": "full" },
-            "display": "timeline only"
+            "display": "timeline only",
+            "pre_write_content": "before",
+            "write_applied": true
         });
         assert_eq!(
             strip_model_ephemeral_fields(&metadata, &ToolOutput::result_metadata_schema()),
@@ -1206,6 +1208,10 @@ pub struct ToolOutput {
     /// Pre-write file body for `write` tool calls (`None` when the path did not
     /// exist). UI/timeline only — never enters model-facing content.
     pub pre_write_content: Option<String>,
+    /// True only when a `write` call actually committed its requested body.
+    /// Distinguishes new-file writes (`pre_write_content == None`) from clean
+    /// early returns such as identity refusals.
+    pub write_applied: bool,
     /// True when the dispatcher abandoned the call (timeout or cancel) after
     /// handing it to the tool. Host receipt is then unknown: a verification
     /// dispatch that already entered `executing` must settle `Unknown`, not
@@ -1587,7 +1593,8 @@ impl ToolOutput {
                 "exit_code": { "x-cockpit-model-ephemeral": true },
                 "output_sidecar": { "x-cockpit-model-ephemeral": true },
                 "display": { "x-cockpit-model-ephemeral": true },
-                "pre_write_content": { "x-cockpit-model-ephemeral": true }
+                "pre_write_content": { "x-cockpit-model-ephemeral": true },
+                "write_applied": { "x-cockpit-model-ephemeral": true }
             }
         })
     }
@@ -1625,6 +1632,9 @@ impl ToolOutput {
                 Value::String(pre_write_content.clone()),
             );
         }
+        if self.write_applied {
+            metadata.insert("write_applied".to_string(), Value::Bool(true));
+        }
         metadata
     }
 
@@ -1645,6 +1655,7 @@ impl ToolOutput {
             exit_code: None,
             output_sidecar: None,
             pre_write_content: None,
+            write_applied: false,
             host_effect_unknown: false,
         }
     }
@@ -1666,6 +1677,7 @@ impl ToolOutput {
             exit_code: None,
             output_sidecar: None,
             pre_write_content: None,
+            write_applied: false,
             host_effect_unknown: false,
         }
     }

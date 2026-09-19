@@ -6476,6 +6476,9 @@ async fn handle_serialized_request_impl(
                 cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
             ))
         }
+        Request::ApplyOnboardingProfile { .. } => Err(bad_request(
+            "onboarding profile apply is only valid during locked bootstrap",
+        )),
         Request::ApplyOnboardingTransition(request) => {
             let capabilities = ctx
                 .host_capabilities
@@ -18544,11 +18547,6 @@ async fn handle_serialized_request_impl(
                 let global_config =
                     cockpit_config::config::dirs::global_config_file().map_err(internal)?;
                 prepare_user_level_write_target(ctx, &global_config)?;
-                if wizard_id == crate::wizard::ONBOARDING_AGENT_WIZARD_ID {
-                    return Err(bad_request(
-                        "the onboarding agent stage uses ApplyAuthoredAgentPackage, not ApplySetupWizard",
-                    ));
-                }
                 // Every generic wizard apply is a config publication: it
                 // shares the daemon-wide serialization gate with provider
                 // mutations so a wizard write cannot interleave with a

@@ -76,13 +76,13 @@ fn max_reservation_money(
     let values = statement
         .query_map([reservation_id], |row| row.get::<_, Vec<u8>>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    values
+    Ok(values
         .into_iter()
         .map(read_money)
         .collect::<rusqlite::Result<Vec<_>>>()?
         .into_iter()
         .max()
-        .unwrap_or(0)
+        .unwrap_or(0))
 }
 
 fn scope_has_positive_debt(

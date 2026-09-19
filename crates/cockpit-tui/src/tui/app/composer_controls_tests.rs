@@ -118,6 +118,189 @@ fn queue_item(text: &str, class: QueueDeliveryClass) -> cockpit_proto::QueueItem
     }
 }
 
+#[test]
+fn key_router_precedence_matrix_covers_every_focus_and_picker_state() {
+    use super::input::KeyRouterStage;
+
+    #[derive(Clone, Copy, Debug)]
+    enum FocusState {
+        Composer,
+        Queue,
+        Btw,
+        Rail,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PickerState {
+        Closed,
+        Model,
+        Effort,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Chord {
+        CtrlP,
+        CtrlE,
+        CtrlB,
+        CtrlN,
+        CtrlKb,
+        CtrlKn,
+        CtrlKr,
+        CtrlUp,
+        AltUp,
+        AltDown,
+        Enter,
+        Esc,
+        Up,
+        Down,
+        CtrlJ,
+    }
+
+    impl Chord {
+        fn keys(self) -> Vec<KeyEvent> {
+            match self {
+                Self::CtrlP => vec![ctrl(KeyCode::Char('p'))],
+                Self::CtrlE => vec![ctrl(KeyCode::Char('e'))],
+                Self::CtrlB => vec![ctrl(KeyCode::Char('b'))],
+                Self::CtrlN => vec![ctrl(KeyCode::Char('n'))],
+                Self::CtrlKb => vec![ctrl(KeyCode::Char('k')), press(KeyCode::Char('b'))],
+                Self::CtrlKn => vec![ctrl(KeyCode::Char('k')), press(KeyCode::Char('n'))],
+                Self::CtrlKr => vec![ctrl(KeyCode::Char('k')), press(KeyCode::Char('r'))],
+                Self::CtrlUp => vec![ctrl(KeyCode::Up)],
+                Self::AltUp => vec![KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)],
+                Self::AltDown => vec![KeyEvent::new(KeyCode::Down, KeyModifiers::ALT)],
+                Self::Enter => vec![press(KeyCode::Enter)],
+                Self::Esc => vec![press(KeyCode::Esc)],
+                Self::Up => vec![press(KeyCode::Up)],
+                Self::Down => vec![press(KeyCode::Down)],
+                Self::CtrlJ => vec![ctrl(KeyCode::Char('j'))],
+            }
+        }
+
+        fn expected(self, focus: FocusState, picker: PickerState) -> KeyRouterStage {
+            match self {
+                Self::CtrlP
+                | Self::CtrlE
+                | Self::CtrlB
+                | Self::CtrlN
+                | Self::CtrlKb
+                | Self::CtrlKn
+                | Self::CtrlKr
+                | Self::CtrlJ => KeyRouterStage::CtrlChord,
+                Self::AltUp | Self::AltDown => KeyRouterStage::AltChord,
+                Self::CtrlUp | Self::Enter | Self::Esc | Self::Up | Self::Down
+                    if !matches!(picker, PickerState::Closed) =>
+                {
+                    KeyRouterStage::ComposerPicker
+                }
+                Self::Enter | Self::Esc | Self::Up | Self::Down => match focus {
+                    FocusState::Queue => KeyRouterStage::Queue,
+                    FocusState::Btw if matches!(self, Self::Enter | Self::Esc) => {
+                        KeyRouterStage::Btw
+                    }
+                    FocusState::Rail => KeyRouterStage::Rail,
+                    FocusState::Composer | FocusState::Btw => KeyRouterStage::Composer,
+                },
+                Self::CtrlUp => match focus {
+                    FocusState::Rail => KeyRouterStage::Rail,
+                    FocusState::Composer | FocusState::Queue | FocusState::Btw => {
+                        KeyRouterStage::Composer
+                    }
+                },
+            }
+        }
+    }
+
+    const FOCUSES: [FocusState; 4] = [
+        FocusState::Composer,
+        FocusState::Queue,
+        FocusState::Btw,
+        FocusState::Rail,
+    ];
+    const PICKERS: [PickerState; 3] =
+        [PickerState::Closed, PickerState::Model, PickerState::Effort];
+    const CHORDS: [Chord; 15] = [
+        Chord::CtrlP,
+        Chord::CtrlE,
+        Chord::CtrlB,
+        Chord::CtrlN,
+        Chord::CtrlKb,
+        Chord::CtrlKn,
+        Chord::CtrlKr,
+        Chord::CtrlUp,
+        Chord::AltUp,
+        Chord::AltDown,
+        Chord::Enter,
+        Chord::Esc,
+        Chord::Up,
+        Chord::Down,
+        Chord::CtrlJ,
+    ];
+
+    for picker in PICKERS {
+        for focus in FOCUSES {
+            for chord in CHORDS {
+                let tmp = tempfile::tempdir().unwrap();
+                let mut app = app(&tmp);
+                match picker {
+                    PickerState::Closed => {}
+                    PickerState::Model => {
+                        app.composer_controls.selection = Some(ComposerControlKind::Model);
+                        app.open_composer_picker(ComposerControlKind::Model);
+                    }
+                    PickerState::Effort => {
+                        app.composer_controls.selection = Some(ComposerControlKind::Effort);
+                        app.open_composer_picker(ComposerControlKind::Effort);
+                    }
+                }
+                match focus {
+                    FocusState::Composer => {}
+                    FocusState::Queue => {
+                        let item = queue_item("queued", QueueDeliveryClass::Held);
+                        app.queue_focus = Some(item.id);
+                        app.queue.push(item);
+                    }
+                    FocusState::Btw => {
+                        app.btw_pane = Some(super::btw_pane::BtwPane::new(
+                            cockpit_proto::BtwForkInfo {
+                                session_id: Uuid::new_v4(),
+                                parent_session_id: Uuid::new_v4(),
+                                short_id: Some("btw001".to_string()),
+                                tangent: false,
+                                created_at: 1,
+                                message_count: 0,
+                            },
+                            false,
+                        ));
+                        app.btw_pane.as_mut().expect("btw pane").focused = true;
+                    }
+                    FocusState::Rail => app.session_rail.focus(),
+                }
+
+                let keys = chord.keys();
+                let mut actual = KeyRouterStage::Composer;
+                for (index, key) in keys.iter().copied().enumerate() {
+                    actual = app
+                        .handle_precedence_key(key)
+                        .unwrap_or(KeyRouterStage::Composer);
+                    if index + 1 < keys.len() {
+                        assert_eq!(
+                            actual,
+                            KeyRouterStage::CtrlChord,
+                            "leader must own prefix: chord={chord:?} focus={focus:?} picker={picker:?}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    actual,
+                    chord.expected(focus, picker),
+                    "chord={chord:?} focus={focus:?} picker={picker:?}"
+                );
+            }
+        }
+    }
+}
+
 fn bottom_border(buf: &ratatui::buffer::Buffer, app: &App) -> String {
     let area = app.input_area.expect("input rendered");
     row_text(buf, area.y + area.height.saturating_sub(1))

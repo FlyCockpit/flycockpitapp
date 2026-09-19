@@ -480,7 +480,152 @@ impl App {
         exit
     }
 
+    /// The single precedence funnel for the chat shell's overlapping key
+    /// owners. A returned stage has consumed the key; later stages are never
+    /// called. Cockpit-only required-decision surfaces retain their existing
+    /// modal contract through the availability predicates below.
+    pub(super) fn handle_precedence_key(&mut self, key: KeyEvent) -> Option<KeyRouterStage> {
+        if self.onboarding_shell.is_some() {
+            return None;
+        }
+
+        let embedded_pane_owns_input = self.pane.is_some() && self.pane_focused;
+        if !embedded_pane_owns_input {
+            if self.keys_overlay.is_some() {
+                if is_keys_leader(&key) {
+                    self.keys_overlay = None;
+                    return Some(KeyRouterStage::CtrlChord);
+                }
+                if let Some(action) = keys_leader_action(&key) {
+                    self.keys_overlay = None;
+                    self.dispatch_keys_leader_action(action);
+                    return Some(KeyRouterStage::CtrlChord);
+                }
+            }
+
+            if self.composer_chords_available()
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+            {
+                match key.code {
+                    KeyCode::Char('p') | KeyCode::Char('P') => {
+                        self.open_composer_picker_from_chord(
+                            crate::tui::composer_controls::ComposerControlKind::Model,
+                        );
+                        return Some(KeyRouterStage::CtrlChord);
+                    }
+                    KeyCode::Char('e') | KeyCode::Char('E') => {
+                        self.open_composer_picker_from_chord(
+                            crate::tui::composer_controls::ComposerControlKind::Effort,
+                        );
+                        return Some(KeyRouterStage::CtrlChord);
+                    }
+                    KeyCode::Char(ch) if ch.eq_ignore_ascii_case(&'b') => {
+                        self.toggle_session_sidebar_from_chord();
+                        return Some(KeyRouterStage::CtrlChord);
+                    }
+                    KeyCode::Char(ch) if ch.eq_ignore_ascii_case(&'n') => {
+                        self.close_composer_picker();
+                        self.composer_controls.selection = None;
+                        self.pending_new_session = true;
+                        return Some(KeyRouterStage::CtrlChord);
+                    }
+                    _ => {}
+                }
+            }
+
+            if is_keys_leader(&key)
+                && self.question_dialog.is_none()
+                && !self.pending_prune_confirm
+                && !self.pending_resume_compaction_confirm
+                && self.pending_stop_confirm.is_none()
+            {
+                self.close_composer_picker();
+                self.composer_controls.selection = None;
+                self.toggle_keys_overlay();
+                return Some(KeyRouterStage::CtrlChord);
+            }
+
+            if Self::is_session_rail_focus_chord(&key)
+                && self.question_dialog.is_none()
+                && !self.dialog.is_active()
+                && matches!(self.overlay, Overlay::None)
+                && self.keys_overlay.is_none()
+            {
+                self.close_composer_picker();
+                self.composer_controls.selection = None;
+                self.session_rail.focus();
+                if let Some(pane) = self.btw_pane.as_mut() {
+                    pane.focused = false;
+                }
+                return Some(KeyRouterStage::CtrlChord);
+            }
+        }
+
+        if key.modifiers.contains(KeyModifiers::ALT)
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.composer_chords_available()
+        {
+            let delta = match key.code {
+                KeyCode::Up => Some(-1),
+                KeyCode::Down => Some(1),
+                _ => None,
+            };
+            if let Some(delta) = delta {
+                self.close_composer_picker();
+                self.composer_controls.selection = None;
+                self.switch_session_from_chord(delta);
+                return Some(KeyRouterStage::AltChord);
+            }
+        }
+
+        if self.composer_controls.picker.is_some() && self.handle_composer_control_key(key) {
+            return Some(KeyRouterStage::ComposerPicker);
+        }
+        if self.handle_queue_key(key) {
+            return Some(KeyRouterStage::Queue);
+        }
+        if self.btw_pane.as_ref().is_some_and(|pane| pane.focused)
+            && let Some(pane) = self.btw_pane.as_mut()
+        {
+            match pane.handle_focused_key(key) {
+                crate::tui::app::btw_pane::BtwFocusedKeyOutcome::Consumed => {
+                    return Some(KeyRouterStage::Btw);
+                }
+                crate::tui::app::btw_pane::BtwFocusedKeyOutcome::Error(error) => {
+                    pane.history.push(HistoryEntry::InferenceError {
+                        summary: error.clone(),
+                        detail: error,
+                        expanded: false,
+                    });
+                    return Some(KeyRouterStage::Btw);
+                }
+                crate::tui::app::btw_pane::BtwFocusedKeyOutcome::Unhandled => {}
+            }
+        }
+        if self.handle_session_rail_key(key) {
+            return Some(KeyRouterStage::Rail);
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+            && matches!(key.code, KeyCode::Up)
+            && self.composer_chrome_interactive()
+            && self.composer.is_empty()
+            && self.focus_queue_from_composer()
+        {
+            return Some(KeyRouterStage::Composer);
+        }
+        None
+    }
+
     fn handle_key_inner(&mut self, key: KeyEvent) -> bool {
+        if self.handle_precedence_key(key).is_some() {
+            return false;
+        }
         if key.code == KeyCode::Home
             && self.composer.is_empty()
             && self.sticky_header_area.is_some()
@@ -488,22 +633,13 @@ impl App {
             self.jump_to_sticky_user_header();
             return false;
         }
-        // An open composer picker owns its modal keys before queue-row focus.
-        // This ordering is defensive: opening a picker clears queue focus, but
-        // a later Ctrl+Up must still move the picker instead of re-entering the
-        // queue and allowing it to swallow subsequent arrows or Enter.
-        // Ordinary keys that dismiss the picker continue through the router.
-        if self.composer_controls.picker.is_some() && self.handle_composer_control_key(key) {
-            return false;
-        }
-        if self.handle_queue_key(key) {
-            return false;
-        }
         // Embedded pane (GOALS §1i): while a pane is open, `Ctrl+X`
         // force-closes it and `Ctrl+O` toggles focus — both reserved by
         // cockpit and not delivered to the child. When the pane is
         // focused, every other key (incl. Ctrl+C) is forwarded to the
-        // child PTY rather than handled by the TUI.
+        // child PTY rather than handled by the TUI. The adopted Alt+arrow
+        // session chords are the deliberate exception, claimed by the
+        // precedence funnel above.
         if self.pane.is_some() {
             if is_pane_force_close(&key) {
                 self.close_pane(true);
@@ -559,68 +695,6 @@ impl App {
         {
             return self.request_guarded_exit();
         }
-        // Excoc's global chords (`reference/example-tui/src/tui.rs:157-201`):
-        // Ctrl first, then Alt, both routed ahead of the overlay/dialog and
-        // slash handling below. An open overlay pane does not block them
-        // (`composer_chords_available`); cockpit-only decision surfaces
-        // (dialogs, transcript find, transcript pick modes, the which-key
-        // overlay) do.
-        if self.composer_chords_available()
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key
-                .modifiers
-                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
-        {
-            match key.code {
-                KeyCode::Char('p') | KeyCode::Char('P') => {
-                    self.open_composer_picker_from_chord(
-                        crate::tui::composer_controls::ComposerControlKind::Model,
-                    );
-                    return false;
-                }
-                KeyCode::Char('e') | KeyCode::Char('E') => {
-                    self.open_composer_picker_from_chord(
-                        crate::tui::composer_controls::ComposerControlKind::Effort,
-                    );
-                    return false;
-                }
-                KeyCode::Char(ch) if ch.eq_ignore_ascii_case(&'b') => {
-                    self.toggle_session_sidebar_from_chord();
-                    return false;
-                }
-                KeyCode::Char(ch) if ch.eq_ignore_ascii_case(&'n') => {
-                    self.pending_new_session = true;
-                    return false;
-                }
-                // `Ctrl+↑` is the re-homed cockpit queue shortcut, not an
-                // excoc global: it keeps requiring the composer chrome.
-                KeyCode::Up
-                    if self.composer_chrome_interactive()
-                        && self.composer.is_empty()
-                        && self.focus_queue_from_composer() =>
-                {
-                    return false;
-                }
-                _ => {}
-            }
-        }
-        if key.modifiers.contains(KeyModifiers::ALT)
-            && !key.modifiers.contains(KeyModifiers::CONTROL)
-            && self.pane.is_none()
-            && self.composer_chords_available()
-        {
-            match key.code {
-                KeyCode::Up => {
-                    self.switch_session_from_chord(-1);
-                    return false;
-                }
-                KeyCode::Down => {
-                    self.switch_session_from_chord(1);
-                    return false;
-                }
-                _ => {}
-            }
-        }
         if key.kind == KeyEventKind::Press
             && key.modifiers.contains(KeyModifiers::ALT)
             && self.pane.is_none()
@@ -658,15 +732,6 @@ impl App {
         // and always consume so nothing leaks underneath. The leader key also
         // closes it (toggle). TUI-only — never touches the agent or history.
         if self.keys_overlay.is_some() {
-            if is_keys_leader(&key) {
-                self.keys_overlay = None;
-                return false;
-            }
-            if let Some(action) = keys_leader_action(&key) {
-                self.keys_overlay = None;
-                self.dispatch_keys_leader_action(action);
-                return false;
-            }
             if let Some(overlay) = self.keys_overlay.as_mut()
                 && overlay.handle_key(key)
             {
@@ -684,36 +749,6 @@ impl App {
         // those prompts must not be obscured. The `dangerous-action`
         // confirm-armed states (`/prune`, `/plans` start, `/stop`) likewise
         // keep the key first.
-        if is_keys_leader(&key)
-            && self.question_dialog.is_none()
-            && !self.pending_prune_confirm
-            && !self.pending_resume_compaction_confirm
-            && self.pending_stop_confirm.is_none()
-        {
-            self.toggle_keys_overlay();
-            return false;
-        }
-
-        // The adopted global chords and the which-key leader above outrank a
-        // focused `/btw` composer. Plain editing keys still belong to `/btw`,
-        // but Ctrl+K followed by a leader action must be able to leave it.
-        if self.btw_pane.as_ref().is_some_and(|pane| pane.focused)
-            && let Some(pane) = self.btw_pane.as_mut()
-        {
-            match pane.handle_focused_key(key) {
-                crate::tui::app::btw_pane::BtwFocusedKeyOutcome::Consumed => return false,
-                crate::tui::app::btw_pane::BtwFocusedKeyOutcome::Error(error) => {
-                    pane.history.push(HistoryEntry::InferenceError {
-                        summary: error.clone(),
-                        detail: error,
-                        expanded: false,
-                    });
-                    return false;
-                }
-                crate::tui::app::btw_pane::BtwFocusedKeyOutcome::Unhandled => {}
-            }
-        }
-
         // `/prune` confirm armed (T6.d): `y` / Enter commits, any other
         // non-modifier key cancels. Ahead of composer routing so the
         // keystroke doesn't leak into the textbox.
@@ -1320,23 +1355,6 @@ impl App {
         // focus so drag-select remains copyable while the rail is focused.
         if self.is_copy_selection_key(&key) {
             self.copy_selection_plaintext();
-            return false;
-        }
-
-        if Self::is_session_rail_focus_chord(&key)
-            && self.question_dialog.is_none()
-            && !self.dialog.is_active()
-            && matches!(self.overlay, Overlay::None)
-            && self.keys_overlay.is_none()
-        {
-            self.session_rail.focus();
-            if let Some(pane) = self.btw_pane.as_mut() {
-                pane.focused = false;
-            }
-            return false;
-        }
-
-        if self.handle_session_rail_key(key) {
             return false;
         }
 
@@ -4416,6 +4434,17 @@ enum KeysLeaderAction {
     BtwFocus,
     Scratchpad,
     RevealTranscript,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum KeyRouterStage {
+    CtrlChord,
+    AltChord,
+    ComposerPicker,
+    Queue,
+    Btw,
+    Rail,
+    Composer,
 }
 
 fn keys_leader_action(key: &KeyEvent) -> Option<KeysLeaderAction> {

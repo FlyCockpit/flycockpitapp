@@ -573,7 +573,8 @@ impl App {
     /// surfaces — the question/approval dialogs, transcript pick modes,
     /// transcript find (where `Ctrl+P` stays find-previous), and the
     /// which-key overlay — still swallow keys while they are up. The
-    /// embedded pane is excluded by the caller.
+    /// top-level router separately preserves embedded-pane ownership for Ctrl
+    /// chords while keeping excoc's Alt session chords global.
     pub(super) fn composer_chords_available(&self) -> bool {
         self.question_dialog.is_none()
             && !self.dialog.is_active()

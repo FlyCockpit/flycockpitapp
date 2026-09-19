@@ -15250,26 +15250,45 @@ fn authority_recovery_precedes_both_socket_binds() {
     );
 }
 
-#[test]
-fn oauth_expiry_maintenance_runs_without_new_admission() {
-    let server = include_str!("mod.rs");
-    let accept_loop = server
-        .split("pub async fn run_accept_loop")
-        .nth(1)
-        .expect("accept loop must exist");
-    assert!(accept_loop.contains("dispatch::maintain_durable_oauth_flows(&ctx).await"));
+#[tokio::test]
+async fn oauth_expiry_maintenance_runs_without_new_admission() {
+    let ctx = test_ctx();
+    let flow_id = "expired-without-receipt";
+    let vault_id = format!("oauth-flow:{flow_id}");
+    let marker = serde_json::json!({
+        "kind": "expired",
+        "owner": "oauth-maintenance-owner",
+        "begin_client_operation_id": "oauth-maintenance-operation",
+        "terminal_error": {
+            "code": "conflict",
+            "message": "expired test flow",
+        },
+        "expired_at_unix_ms": 1,
+    });
+    let bytes = serde_json::to_vec(&marker).expect("serialize expired OAuth marker");
+    ctx.secret_vault
+        .mutate_item(
+            cockpit_db::secret_vault::SecretVaultKind::SealedState,
+            &vault_id,
+            Some(&bytes),
+        )
+        .expect("seed expired OAuth marker");
+    assert!(
+        ctx.secret_vault
+            .list_item_ids(cockpit_db::secret_vault::SecretVaultKind::SealedState)
+            .expect("list seeded OAuth markers")
+            .contains(&vault_id)
+    );
 
-    let dispatch = include_str!("dispatch.rs");
-    let maintenance = dispatch
-        .split("pub(super) async fn maintain_durable_oauth_flows")
-        .nth(1)
-        .and_then(|tail| tail.split("fn find_durable_oauth_flow").next())
-        .expect("periodic OAuth maintenance must exist");
-    assert!(maintenance.contains("expire_ready_oauth_flow"));
-    assert!(maintenance.contains("local_operation_settlement"));
-    assert!(maintenance.contains("receipt.is_none()"));
-    assert!(!maintenance.contains("begin_local_operation"));
-    assert!(!maintenance.contains("commit_oauth_begin"));
+    crate::daemon::editor_maintenance::run_editor_maintenance_pass(ctx.clone()).await;
+
+    assert!(
+        !ctx.secret_vault
+            .list_item_ids(cockpit_db::secret_vault::SecretVaultKind::SealedState)
+            .expect("list maintained OAuth markers")
+            .contains(&vault_id),
+        "editor/OAuth maintenance should remove an expired tombstone after its receipt retires"
+    );
 }
 
 #[test]

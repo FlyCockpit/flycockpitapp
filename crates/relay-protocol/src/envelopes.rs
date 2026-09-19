@@ -492,7 +492,7 @@ pub fn parse_incoming(value: &str) -> serde_json::Result<IncomingRelayFrame> {
             return serde_json::from_value::<SystemRelayFrame>(parsed)
                 .map(IncomingRelayFrame::System);
         }
-        let v = serde_json::from_str::<SupportedRelayEnvelopeVersionProbe>(value)?.v;
+        let v = serde_json::from_str::<RelayEnvelopeVersionProbe>(value)?.v;
         return Ok(IncomingRelayFrame::Unknown { v, kind });
     }
     let v = serde_json::from_str::<RelayEnvelopeVersionProbe>(value)?.v;
@@ -855,15 +855,63 @@ mod tests {
     }
 
     #[test]
-    fn frame_kind_unknown_with_bad_version_still_rejected() {
+    fn frame_kind_unknown_with_unsupported_version_routes_to_unknown() {
+        let unsupported_version = RELAY_ENVELOPE_VERSION + 1;
         let raw = json!({
-            "v": RELAY_ENVELOPE_VERSION + 1,
+            "v": unsupported_version,
             "type": "mystery",
             "payload": {}
         })
         .to_string();
 
-        assert!(parse_incoming(&raw).is_err());
+        assert_eq!(
+            parse_incoming(&raw).unwrap(),
+            IncomingRelayFrame::Unknown {
+                v: unsupported_version,
+                kind: "mystery".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn frame_kind_unknown_with_zero_version_routes_to_unknown() {
+        let raw = json!({
+            "v": 0,
+            "type": "mystery",
+            "payload": {}
+        })
+        .to_string();
+
+        assert_eq!(
+            parse_incoming(&raw).unwrap(),
+            IncomingRelayFrame::Unknown {
+                v: 0,
+                kind: "mystery".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn client_frame_with_zero_version_routes_to_unknown() {
+        let raw = json!({
+            "v": 0,
+            "channelId": "ch-zero",
+            "from": "client",
+            "principal": {
+                "userId": "user-zero",
+                "grants": []
+            },
+            "payload": { "kind": "req" }
+        })
+        .to_string();
+
+        assert_eq!(
+            parse_incoming(&raw).unwrap(),
+            IncomingRelayFrame::Unknown {
+                v: 0,
+                kind: "client".to_string(),
+            }
+        );
     }
 
     #[test]

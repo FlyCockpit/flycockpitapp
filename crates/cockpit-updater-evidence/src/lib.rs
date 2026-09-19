@@ -26,7 +26,7 @@ pub struct FakeFixtureEvidence {
 
 /// Validate canonical fake-fixture evidence before offline signing or publication.
 pub fn validate_fake_fixture_evidence(evidence: &FakeFixtureEvidence) -> Result<(), String> {
-    use std::collections::{BTreeSet, HashSet};
+    use std::collections::HashSet;
 
     if evidence.release_tag.trim().is_empty() {
         return Err("release_tag must be non-empty".to_string());
@@ -40,15 +40,20 @@ pub fn validate_fake_fixture_evidence(evidence: &FakeFixtureEvidence) -> Result<
 
     let mut identities = HashSet::new();
     let mut paths = HashSet::new();
-    let mut canonical = evidence.targets.clone();
-    canonical.sort_by(|left, right| {
-        left.version
+    for pair in evidence.targets.windows(2) {
+        let [left, right] = pair else {
+            continue;
+        };
+        let ordering = left
+            .version
             .cmp(&right.version)
             .then_with(|| left.platform.cmp(&right.platform))
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    if canonical != evidence.targets {
-        return Err("targets must be listed in canonical version/platform/path order".to_string());
+            .then_with(|| left.path.cmp(&right.path));
+        if ordering.is_gt() {
+            return Err(
+                "targets must be listed in canonical version/platform/path order".to_string(),
+            );
+        }
     }
 
     for target in &evidence.targets {
@@ -76,23 +81,6 @@ pub fn validate_fake_fixture_evidence(evidence: &FakeFixtureEvidence) -> Result<
         if !paths.insert(target.path.clone()) {
             return Err(format!("duplicate target path `{}`", target.path));
         }
-    }
-
-    let inventory: BTreeSet<(String, String, String)> = evidence
-        .targets
-        .iter()
-        .map(|target| {
-            (
-                target.version.clone(),
-                target.platform.clone(),
-                target.path.clone(),
-            )
-        })
-        .collect();
-    if inventory.len() != evidence.targets.len() {
-        return Err(
-            "target inventory must contain unique version/platform/path tuples".to_string(),
-        );
     }
 
     Ok(())

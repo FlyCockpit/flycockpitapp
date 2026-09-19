@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::{
-    AuthorizationCapability, CumulativeAckV1, FallbackReceiveWindow, FallbackSendWindow,
-    NoiseChild, ReceiveDisposition, RecordKind, TranscriptAuthorizationGate,
+    ACK_WIRE_LEN, AuthorizationCapability, CumulativeAckV1, FallbackReceiveWindow,
+    FallbackSendWindow, NoiseChild, ReceiveDisposition, RecordKind, TranscriptAuthorizationGate,
     TranscriptAuthorizationRequest,
 };
 
@@ -384,11 +384,7 @@ fn encode_contiguous_observation(
 ) -> Result<Vec<u8>, NoiseBindingError> {
     let gap_filled = records.len() > 1;
     let byte_list_len = byte_list_wire_len(&records)?;
-    let ack_len = if gap_filled {
-        acknowledge.encode().len()
-    } else {
-        0
-    };
+    let ack_len = if gap_filled { ACK_WIRE_LEN } else { 0 };
     let response_len = 2_usize
         .checked_add(ack_len)
         .and_then(|response_len| response_len.checked_add(byte_list_len))

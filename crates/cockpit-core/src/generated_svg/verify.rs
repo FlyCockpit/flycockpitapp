@@ -241,6 +241,8 @@ fn verify_start(
     let mut radial_fr = None;
     let inherited_object_bbox = stack.last().is_some_and(|frame| frame.object_bbox);
     let mut object_bbox = inherited_object_bbox;
+    // Validate whitespace for every attribute in this complete first pass.
+    // The second pass can then focus on bounds, ordering, and value semantics.
     for attribute in event.attributes().with_checks(true) {
         let attribute = attribute.map_err(|_| error("attribute"))?;
         // The canonical serializer never writes literal XML whitespace to
@@ -254,6 +256,9 @@ fn verify_start(
         let value = attribute
             .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
             .map_err(|_| error("attribute"))?;
+        if value.contains('\t') || value.contains('\n') {
+            return fail(SvgSanitizeCode::StructuralVerify, "attribute-whitespace");
+        }
         object_bbox |= match (kind, name) {
             (Kind::ClipPath, "clipPathUnits") => value == "objectBoundingBox",
             (Kind::Mask, "maskUnits" | "maskContentUnits") => value == "objectBoundingBox",

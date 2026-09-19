@@ -47,6 +47,7 @@ pub mod connector;
 pub mod control_replay;
 pub(crate) mod diagnostics_probe;
 pub(crate) mod dream_scheduler;
+pub(crate) mod editor_maintenance;
 pub mod effective_default_recovery;
 #[cfg(feature = "remote")]
 pub mod egress;
@@ -83,6 +84,7 @@ pub mod remote_audit_upload;
 pub(crate) mod remote_outbox_worker;
 #[cfg(feature = "remote")]
 pub mod remote_project_resolver;
+pub(crate) mod retention_maintenance;
 #[cfg(feature = "extended")]
 pub mod scheduler;
 pub mod server;
@@ -1871,13 +1873,41 @@ async fn drain_daemon_context(
     ctx: &std::sync::Arc<server::DaemonContext>,
     grace: Duration,
 ) -> Result<()> {
+    // Admitted maintenance and the registry's running-work phase draw from one
+    // grace deadline. The interrupt-park commit fence remains an independent
+    // correctness budget and may extend total stop latency beyond that grace.
+    let drain_deadline = tokio::time::Instant::now() + grace;
+    let maintenance_drained = ctx
+        .shutdown_signal()
+        .wait_for_admitted_maintenance_drain(drain_deadline)
+        .await;
+    if !maintenance_drained {
+        tracing::warn!(
+            remaining = ctx.shutdown_signal().admitted_guidance_passes(),
+            "daemon: maintenance passes still admitted at the drain deadline; forcing cancellation"
+        );
+        ctx.shutdown_signal().force();
+        ctx.broadcast_global(proto::Event::DaemonDraining { forced: true });
+    }
     // `drain_all` owns the ordered shutdown deadlines: first make every
-    // resumable interrupt and paused-work row durable, then apply `grace` to
-    // the remaining running work.  A parallel timer starting here would force
-    // the shared shutdown signal while the durability phase is still running;
-    // that can cancel the interrupt waiter before it is parked and let an
-    // apparently clean restart lose its resumable-work row.
-    let drain = ctx.registry.drain_all(grace).await;
+    // resumable interrupt and paused-work row durable, then apply the bounded
+    // registry grace to running work. A parallel timer starting here
+    // would force the shared shutdown signal while the durability phase is
+    // still running; that can cancel the interrupt waiter before it is parked
+    // and let an apparently clean restart lose its resumable-work row.
+    let remaining_grace = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
+    // Only an explicitly requested `--grace 0` may select `drain_all`'s
+    // zero-grace force-stop path. Maintenance can consume the shared running-
+    // work budget, but it must not consume the independent interrupt-park
+    // correctness fence. In particular, a maintenance timeout above forces
+    // cancellation while still preserving enough registry budget to durably
+    // park resumable work.
+    let registry_grace = if grace.is_zero() {
+        Duration::ZERO
+    } else {
+        remaining_grace.max(registry::INTERRUPT_PARK_COMMIT_DEADLINE)
+    };
+    let drain = ctx.registry.drain_all(registry_grace).await;
     let mut failures = Vec::new();
     if !drain.park_commit.is_clean() {
         failures.push(format!("interrupt park commit: {:?}", drain.park_commit));
@@ -2965,6 +2995,11 @@ async fn run_foreground_inner_with_boot_db_impl(
     let mut guidance_maintenance_task = ForegroundTask::new(
         guidance_maintenance::spawn_guidance_maintenance(ctx.clone()),
     );
+    let mut retention_maintenance_task = ForegroundTask::new(
+        retention_maintenance::spawn_retention_maintenance(ctx.clone()),
+    );
+    let mut editor_maintenance_task =
+        ForegroundTask::new(editor_maintenance::spawn_editor_maintenance(ctx.clone()));
     let update_check_task =
         crate::updater::maybe_spawn_background(ctx.clone()).map(ForegroundTask::new);
     #[cfg(feature = "remote")]
@@ -3056,6 +3091,8 @@ async fn run_foreground_inner_with_boot_db_impl(
     signal_task.abort_and_join().await;
     lock_sweeper.abort_and_join().await;
     guidance_maintenance_task.abort_and_join().await;
+    retention_maintenance_task.abort_and_join().await;
+    editor_maintenance_task.abort_and_join().await;
     if let Some(mut task) = update_check_task {
         task.abort_and_join().await;
     }
@@ -3512,6 +3549,45 @@ mod tests {
         CleanupReport, DaemonTestHarness, TEST_OWNER_ENV, TestDaemonManifest,
         TestDaemonManifestEntry, cleanup_manifest, write_manifest,
     };
+
+    #[tokio::test]
+    async fn maintenance_timeout_preserves_interrupt_park_fence() {
+        let ctx = server::test_ctx();
+        let maintenance_pass = ctx
+            .shutdown_signal()
+            .admit_guidance_maintenance()
+            .expect("running daemon admits maintenance");
+        assert!(ctx.shutdown_signal().begin_drain());
+        let (park_commit, mut work_rx) = ctx.registry.insert_test_pending_park_worker();
+
+        let drain_ctx = ctx.clone();
+        let drain = tokio::spawn(async move {
+            drain_daemon_context(&drain_ctx, Duration::from_millis(20)).await
+        });
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), work_rx.recv())
+                .await
+                .expect("maintenance deadline and shutdown dispatch"),
+            Some(session_worker::SessionWork::Shutdown {
+                pause_for_resume: true
+            })
+        ));
+        assert!(
+            ctx.shutdown_signal().is_forced(),
+            "an admitted maintenance pass that exceeds grace must be cancelled"
+        );
+        assert!(
+            !drain.is_finished(),
+            "a computed-zero remainder must not skip the interrupt-park fence"
+        );
+
+        park_commit.report_shutdown_committed();
+        drain
+            .await
+            .expect("drain task")
+            .expect("parked worker drains cleanly");
+        drop(maintenance_pass);
+    }
 
     #[cfg(unix)]
     fn mode(path: &std::path::Path) -> u32 {

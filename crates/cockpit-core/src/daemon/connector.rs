@@ -718,11 +718,10 @@ async fn run_socket(
                         ) {
                             continue;
                         }
-                        let principal = principal_from_relay_wire(frame.principal.clone());
                         let handle = channels.entry(frame.channel_id.clone()).or_insert_with(|| {
                             spawn_channel(
                                 frame.channel_id.clone(),
-                                principal,
+                                principal_from_relay_wire(frame.principal.clone()),
                                 ctx.clone(),
                                 relay_url.clone(),
                                 out_tx.clone(),

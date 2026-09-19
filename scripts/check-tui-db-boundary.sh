@@ -28,14 +28,35 @@ fi
 # These are real compiler-negative fixtures, not comments. Compile them against
 # the root workspace artifact so the proof uses the repository lockfile rather
 # than a second dependency resolver that can fail before reaching the import.
-cargo check --quiet --locked -p cockpit-core
+#
+# Resolve the cockpit-core metadata artifact from cargo's own compiler-artifact
+# report instead of picking the newest rmeta by mtime: an interrupted build
+# (for example a clippy run that fails under -D warnings) can leave a truncated
+# 0-byte rmeta behind, and a different feature set or driver can leave one this
+# rustc cannot load. Either would fail the fixture before it proves the import.
+core_rmeta="$(
+  cargo check --quiet --locked -p cockpit-core --message-format=json |
+    python3 -c '
+import json, sys
+
+for line in sys.stdin.read().splitlines():
+    if not line.strip():
+        continue
+    message = json.loads(line)
+    if message.get("reason") != "compiler-artifact":
+        continue
+    target = message.get("target", {})
+    if target.get("name") != "cockpit_core" or "lib" not in target.get("kind", []):
+        continue
+    rmeta = [str(name) for name in message.get("filenames", []) if str(name).endswith(".rmeta")]
+    if rmeta:
+        print(rmeta[0])
+        break
+'
+)"
 dependency_dir="$CARGO_TARGET_DIR/debug/deps"
-# An interrupted build can leave a zero-byte libcockpit_core-*.rmeta behind;
-# rustc refuses to load it (E0463) before the fixture can prove anything, so
-# only non-empty artifacts are candidates.
-core_rmeta="$(find "$dependency_dir" -maxdepth 1 -name 'libcockpit_core-*.rmeta' -size +1c -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
-if [[ -z "$core_rmeta" ]]; then
-  echo "cockpit-core metadata artifact missing" >&2
+if [[ -z "$core_rmeta" || ! -f "$core_rmeta" || ! -s "$core_rmeta" ]]; then
+  echo "cockpit-core metadata artifact missing or empty" >&2
   exit 1
 fi
 for fixture in direct_alias core_alias; do

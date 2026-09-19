@@ -1,5 +1,91 @@
 use crate::support::{SpawnedDaemon, output_text};
 
+#[cfg(unix)]
+#[test]
+fn cold_clients_started_within_ten_ms_share_one_daemon() {
+    use crate::support::{
+        HermeticCockpit, HermeticLaunchKind, HermeticProfile, INITIAL_PTY_COLS, INITIAL_PTY_ROWS,
+    };
+    use portable_pty::{PtySize, native_pty_system};
+    use std::io::Read as _;
+
+    let mut session = HermeticCockpit::prepare(HermeticProfile::Default);
+    let trust = session
+        .spec()
+        .launch_path(HermeticLaunchKind::TrustSet)
+        .std_command()
+        .output()
+        .expect("pre-trust race project");
+    assert!(trust.status.success(), "{}", output_text(&trust));
+    let mut launch = session.spec().launch_path(HermeticLaunchKind::PtyChild);
+    launch.args = vec!["stats".to_string()];
+    let spawn_client = || {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: INITIAL_PTY_ROWS,
+                cols: INITIAL_PTY_COLS,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open client PTY");
+        let child = pair
+            .slave
+            .spawn_command(launch.pty_command())
+            .expect("spawn PTY client");
+        drop(pair.slave);
+        let reader = pair.master.try_clone_reader().expect("clone PTY reader");
+        (child, pair.master, reader)
+    };
+
+    let (mut first, first_pty, mut first_output) = spawn_client();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let (mut second, second_pty, mut second_output) = spawn_client();
+    let first_status = first.wait().expect("wait first PTY client");
+    let second_status = second.wait().expect("wait second PTY client");
+    drop(first_pty);
+    drop(second_pty);
+    let mut first_text = String::new();
+    first_output
+        .read_to_string(&mut first_text)
+        .expect("read first PTY output");
+    let mut second_text = String::new();
+    second_output
+        .read_to_string(&mut second_text)
+        .expect("read second PTY output");
+    assert!(
+        first_status.success(),
+        "first racing PTY client failed: {first_text}"
+    );
+    assert!(
+        second_status.success(),
+        "second racing PTY client failed: {second_text}"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let status = loop {
+        let mut command = session
+            .spec()
+            .launch_path(HermeticLaunchKind::DaemonStatus)
+            .std_command();
+        let output = command.arg("--json").output().expect("daemon status");
+        if output.status.success() {
+            break output;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "racing PTY clients did not publish a daemon: {}",
+            output_text(&output)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(status.status.success(), "{}", output_text(&status));
+    let value: serde_json::Value = serde_json::from_slice(&status.stdout).expect("status JSON");
+    let published_pid = value["pid"].as_u64().expect("published daemon pid");
+    assert!(published_pid > 0);
+
+    session.stop_child_spawned_daemon();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawned_daemon_start_status_stop_round_trip() {
     let daemon = SpawnedDaemon::start().await;

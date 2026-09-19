@@ -56,6 +56,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub skip_setup: bool,
 
+    /// Attach to an existing daemon but never start one.
+    #[arg(long, global = true)]
+    pub no_spawn: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -86,6 +90,9 @@ pub struct PublicCli {
     pub no_sandbox: bool,
     #[arg(long, global = true)]
     pub skip_setup: bool,
+    /// Attach to an existing daemon but never start one.
+    #[arg(long, global = true)]
+    pub no_spawn: bool,
     #[command(subcommand)]
     pub command: Option<PublicCommand>,
 }
@@ -229,6 +236,7 @@ impl From<PublicCli> for Cli {
             debug_last_message: value.debug_last_message,
             no_sandbox: value.no_sandbox,
             skip_setup: value.skip_setup,
+            no_spawn: value.no_spawn,
             command: value.command.map(|command| match command {
                 PublicCommand::Acp => Command::Acp,
                 PublicCommand::Ask(args) => Command::Ask(args),

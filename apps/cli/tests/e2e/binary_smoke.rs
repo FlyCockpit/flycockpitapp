@@ -42,6 +42,24 @@ fn daemon_status_is_isolated_to_test_home() {
 }
 
 #[test]
+fn no_spawn_refuses_to_create_a_daemon() {
+    let home = IsolatedHome::new();
+    let output = home
+        .cockpit()
+        .args(["--no-spawn", "stats"])
+        .output()
+        .expect("run no-spawn command");
+
+    assert_failure("cockpit --no-spawn stats", &output, &home);
+    assert!(output_text(&output).contains("no daemon running"));
+    assert!(!home.pid_file().exists(), "no-spawn must not publish a pid");
+    assert!(
+        !home.socket_path().exists(),
+        "no-spawn must not bind a socket"
+    );
+}
+
+#[test]
 fn jq_applet_supports_common_flags_and_bindings() {
     let home = IsolatedHome::new();
 

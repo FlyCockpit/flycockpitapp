@@ -174,6 +174,7 @@ impl StartLock {
                 .create(true)
                 .read(true)
                 .write(true)
+                .truncate(false)
                 .mode(0o600)
                 .open(path)
                 .with_context(|| format!("opening daemon start lock {}", path.display()))?;
@@ -191,6 +192,7 @@ impl StartLock {
                 .create(true)
                 .read(true)
                 .write(true)
+                .truncate(false)
                 .open(path)?;
             // SAFETY: OVERLAPPED is a plain C record whose all-zero state is
             // valid for a synchronous whole-file lock.

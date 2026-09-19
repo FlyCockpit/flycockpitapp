@@ -4889,7 +4889,7 @@ mod windows_pipe_tests {
         );
         let reveal = listener.pipe_name().leak_reveal_sibling().expect("sibling");
         let reveal_path = DaemonPaths::leak_reveal_socket_path(&control);
-        windows_pipe::NamedPipeListener::bind_named(&reveal_path, reveal.clone(), true)
+        windows_pipe::NamedPipeListener::bind_named(&reveal_path, reveal.clone())
             .expect("bind reveal");
         assert!(cockpit_host::named_pipe::pipe_is_listening(&reveal));
         assert!(

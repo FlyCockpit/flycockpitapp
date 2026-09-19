@@ -484,6 +484,7 @@ fn history_entry_render_fingerprint(entry: &HistoryEntry) -> u64 {
             seq,
             performance,
             performance_expanded,
+            interrupted,
         } => {
             hash_len(&mut hasher, name);
             hash_len(&mut hasher, text);
@@ -495,6 +496,7 @@ fn history_entry_render_fingerprint(entry: &HistoryEntry) -> u64 {
             seq.hash(&mut hasher);
             performance.hash(&mut hasher);
             performance_expanded.hash(&mut hasher);
+            interrupted.hash(&mut hasher);
         }
         HistoryEntry::Diff {
             tool,
@@ -5342,7 +5344,7 @@ pub(super) fn extract_selection_semantic(
         };
         if meta.copy_target.is_some() {
             if !meta.copy_provenance_present {
-                // Header chrome such as the narrow-width `↔` indicator is
+                // Header chrome such as the narrow-width role header is
                 // tagged as part of the message but has no semantic map.
                 // Skip it rather than failing the whole selection.
                 continue;
@@ -6063,6 +6065,7 @@ mod render_history_spacing_tests {
             seq: None,
             performance: None,
             performance_expanded: false,
+            interrupted: false,
         }
     }
 

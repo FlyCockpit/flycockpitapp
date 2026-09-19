@@ -205,6 +205,12 @@ pub enum HistoryEntry {
         /// closed on live/replay and is never persisted. Toggled
         /// independently of the reasoning `expanded` field.
         performance_expanded: bool,
+        /// The turn was cut short by the user (Ctrl+C or a message that
+        /// raced the stream). Set from `AgentIdle(Interrupted)` at
+        /// finalization — see `App::finalize_pending_interrupted` — so the
+        /// frozen entry renders the trailing `⎯ Stopped — you sent a
+        /// message` marker row instead of looking like a settled reply.
+        interrupted: bool,
     },
     /// Completed `edit` tool call. Rendered as a diff per `tui.diff_style`
     /// (side-by-side / inline / hidden). Stored instead of a `Plain` line so
@@ -636,10 +642,10 @@ pub struct Rendered {
     /// ranges so hit-tests route only visible glyphs.
     pub pin_region: Option<PinRegion>,
     /// Where the clickable response-performance metric chip landed, when
-    /// drawn. `None` when the entry has no performance snapshot, the chip
-    /// was hidden (mouse mode off), or the terminal is below the minimum
-    /// supported width (24 columns) and the header is replaced by the
-    /// `↔` resize state. Carries exact row/column ranges so hit-tests
+    /// drawn. `None` when the entry has no performance snapshot or the
+    /// chip was hidden (mouse mode off); below the minimum supported
+    /// width (24 columns) the `Agent` label itself remains the chip's
+    /// union hit target. Carries exact row/column ranges so hit-tests
     /// route only visible glyphs; clicking toggles
     /// `performance_expanded` only.
     pub metric_region: Option<MetricRegion>,
@@ -782,6 +788,20 @@ fn centered_note(text: &str) -> Line<'static> {
     .centered()
 }
 
+/// Trailing marker row for an agent turn the user cut short: a short `⎯`
+/// rule in warning yellow plus the muted explanation. Rendered as the last
+/// row of the frozen [`HistoryEntry::Agent`] entry so an interrupted turn
+/// reads as stopped rather than settled.
+fn interrupted_marker_line() -> Line<'static> {
+    Line::from(vec![
+        Span::styled("  ⎯ ", Style::default().fg(crate::tui::theme::YELLOW)),
+        Span::styled(
+            "Stopped — you sent a message".to_string(),
+            Style::default().fg(FOG),
+        ),
+    ])
+}
+
 fn render_plain(line: &str) -> Rendered {
     let lines = if let Some((from, body)) = line
         .strip_prefix("steer from ")
@@ -794,11 +814,6 @@ fn render_plain(line: &str) -> Rendered {
             )),
             Line::from(Span::styled(format!("  {body}"), Style::default().fg(FOG))),
         ]
-    } else if line == "Stopped — you sent a message" {
-        vec![Line::from(vec![
-            Span::styled("  ⎯ ", Style::default().fg(crate::tui::theme::YELLOW)),
-            Span::styled(line.to_string(), Style::default().fg(FOG)),
-        ])]
     } else {
         vec![centered_note(line)]
     };
@@ -1200,6 +1215,7 @@ pub fn render_entry(
             think_duration,
             performance,
             performance_expanded,
+            interrupted,
             ..
         } => {
             let effective_reasoning: &str = match thinking {
@@ -1211,7 +1227,7 @@ pub fn render_entry(
                 ThinkingDisplay::Condensed => *expanded,
                 ThinkingDisplay::Hidden => false,
             };
-            render_agent(
+            let mut rendered = render_agent(
                 name,
                 text,
                 effective_reasoning,
@@ -1224,7 +1240,12 @@ pub fn render_entry(
                 pin,
                 performance.clone(),
                 *performance_expanded,
-            )
+            );
+            if *interrupted {
+                rendered.lines.push(interrupted_marker_line());
+                rendered.continuations.push(false);
+            }
+            rendered
         }
     }
 }
@@ -1555,8 +1576,9 @@ fn render_pending_tail_lines(
 /// owned by the status indicator (`render_status_indicator`), so before
 /// any text arrives this renders nothing — keeping a single live status
 /// line on screen instead of a duplicate "Thinking" in two places.
-/// Reasoning is captured but not displayed live (the user can expand
-/// once the turn finalizes).
+/// While reasoning is streaming it renders live: the `Thinking` header
+/// (FOG + italic) followed by the reasoning body wrapped to the pane
+/// (DISABLED + italic), above the answer body once it starts.
 pub fn render_pending(msg: &PendingMsg, width: u16) -> Vec<Line<'static>> {
     // Text streaming in — same rendering as Agent (no expansion in
     // live state; reasoning shown after finalization). Markdown is
@@ -1582,15 +1604,26 @@ pub fn render_pending(msg: &PendingMsg, width: u16) -> Vec<Line<'static>> {
     )
     .lines;
     if !msg.reasoning.trim().is_empty() {
-        lines.insert(
-            1,
-            Line::from(Span::styled(
-                "  Thinking",
+        // Live thinking block: the `Thinking` header plus the reasoning
+        // streamed so far, wrapped to `width - 2` (DISABLED + italic),
+        // matching the reference's live-thought rows. It sits above the
+        // answer body and is never treated as the agent's body text.
+        let reasoning_w = (width as usize).saturating_sub(2).max(1);
+        let mut reasoning_rows = vec![Line::from(Span::styled(
+            "  Thinking",
+            Style::default()
+                .fg(THINKING_FG)
+                .add_modifier(Modifier::ITALIC),
+        ))];
+        for chunk in wrap_with_reserved_first_line(&msg.reasoning, reasoning_w, 0) {
+            reasoning_rows.push(Line::from(Span::styled(
+                format!("  {chunk}"),
                 Style::default()
-                    .fg(THINKING_FG)
+                    .fg(REASONING_FG)
                     .add_modifier(Modifier::ITALIC),
-            )),
-        );
+            )));
+        }
+        lines.splice(1..1, reasoning_rows);
     }
     if msg.text.trim().is_empty() {
         lines.push(Line::from(Span::styled(
@@ -1817,8 +1850,10 @@ fn render_skill_auto_injected(
 }
 
 /// Minimum terminal width for response-header controls (metric chip,
-/// detail, timestamp, fork, pin, overflow menu). Below this the complete
-/// header is replaced by a noninteractive one-cell `↔` resize state.
+/// detail, timestamp, fork, pin, overflow menu). Below this the grouped
+/// controls collapse as one block — no glyphs are painted and no hit
+/// targets are recorded — while the role header (label, plus the
+/// timestamp whenever it fits) and the body stay readable.
 const RESPONSE_HEADER_MIN_WIDTH: u16 = 24;
 
 /// Format TTFT (time-to-first-token) for the compact chip per the spec:
@@ -1914,8 +1949,20 @@ fn render_agent(
         Span::styled("▌ ", Style::default().fg(USER_BORDER_FG)),
         Span::styled("Agent", agent_style),
     ];
-    let (header, header_pin_region) =
-        render_first_line_with_pin_and_timestamp(header_spans, timestamp, width, pin);
+    let (header, header_pin_region) = render_first_line_with_pin_and_timestamp(
+        header_spans,
+        timestamp,
+        width,
+        // Below RESPONSE_HEADER_MIN_WIDTH the grouped controls collapse as
+        // one block — no `[Pin]`/`[Fork]` glyphs are painted and no hit
+        // targets are recorded, so the controls are never rendered dead.
+        // The role header (label + timestamp when it fits) stays readable.
+        if width >= RESPONSE_HEADER_MIN_WIDTH {
+            pin
+        } else {
+            None
+        },
+    );
     let mut pin_region = header_pin_region;
     let has_metrics = performance
         .as_ref()
@@ -1942,12 +1989,13 @@ fn render_agent(
     // reference transcript. No second compact stats label is inserted.
     let metric_text: Option<String> = None;
 
-    // Below the minimum supported width for response-header controls,
-    // replace all header chrome (metric, detail, timestamp, fork, pin,
-    // overflow menu) with a noninteractive one-cell `↔` resize state.
-    // It has no hit target, never clips horizontally, and retains no
-    // hidden mouse action; the complete accessible header returns only
-    // after resize to 24 columns or wider.
+    // Below the minimum supported width for response-header controls, the
+    // grouped controls (metric detail, timestamp, fork, pin, overflow menu)
+    // collapse as one block: no control glyphs are painted and no hit
+    // targets are recorded, so nothing renders dead. The role header —
+    // `Agent` label plus the timestamp whenever it fits — and the body
+    // stay readable at every width; the complete interactive header
+    // returns after resize to 24 columns or wider.
     if width < RESPONSE_HEADER_MIN_WIDTH {
         let mut out: Vec<Line<'static>> = vec![header];
         let mut conts: Vec<bool> = vec![false];

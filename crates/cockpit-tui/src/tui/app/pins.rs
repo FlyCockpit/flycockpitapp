@@ -987,6 +987,7 @@ mod tests {
             seq,
             performance: None,
             performance_expanded: false,
+            interrupted: false,
         }
     }
 
@@ -1669,6 +1670,7 @@ mod tests {
             seq: Some(1),
             performance: None,
             performance_expanded: false,
+            interrupted: false,
         }]
         .into();
         app.enter_copy_pick_mode();

@@ -2034,11 +2034,19 @@ impl App {
                 if has_working_span && !matches_working_span {
                     return;
                 }
+                let interrupted = matches!(reason, cockpit_proto::IdleReason::Interrupted);
                 self.apply_idle_reason_status(reason);
                 self.reconnect = None;
                 // A completed/failed turn can no longer retract its user row.
                 self.local_user_submission_ids_by_seq.clear();
-                self.finalize_pending();
+                // An interrupted turn freezes its partial stream with the
+                // `⎯ Stopped — you sent a message` marker instead of looking
+                // like a settled reply.
+                if interrupted {
+                    self.finalize_pending_interrupted();
+                } else {
+                    self.finalize_pending();
+                }
                 // AgentIdle is turn-boundary chrome, not a stack unwind.
                 // Foreground enqueue/path follow `ForegroundInputTarget`
                 // (and spawn/report for activity). Truncating here would
@@ -2837,6 +2845,17 @@ impl App {
     /// the first text delta — that's the *reasoning* time, not the
     /// total turn time.
     pub(super) fn finalize_pending(&mut self) {
+        self.finalize_pending_with(false);
+    }
+
+    /// Finalize the in-flight assistant turn as interrupted: the frozen
+    /// entry keeps the partial stream and renders the trailing
+    /// `⎯ Stopped — you sent a message` marker row.
+    pub(super) fn finalize_pending_interrupted(&mut self) {
+        self.finalize_pending_with(true);
+    }
+
+    fn finalize_pending_with(&mut self, interrupted: bool) {
         let Some(mut p) = self.pending.take() else {
             return;
         };
@@ -2879,6 +2898,7 @@ impl App {
                 seq: p.seq,
                 performance: p.response_performance,
                 performance_expanded: false,
+                interrupted,
             });
         }
     }
@@ -3172,6 +3192,10 @@ pub(super) fn wire_history_to_entries(wire: Vec<cockpit_proto::HistoryEntry>) ->
                     seq: (seq != 0).then_some(seq),
                     performance: None,
                     performance_expanded: false,
+                    // The interrupt marker is live-turn chrome driven by the
+                    // `AgentIdle` reason; the wire snapshot does not persist
+                    // it, so a resumed turn renders as a settled reply.
+                    interrupted: false,
                 });
             }
             Wire::ToolCall {
@@ -4510,6 +4534,44 @@ mod tests {
         };
         assert_eq!(calls[0].state, ToolCallState::Success);
         assert!(calls[0].progress.is_none());
+    }
+
+    #[test]
+    fn interrupted_idle_freezes_the_partial_turn_with_the_stopped_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let mut pending = new_pending("Build".to_string(), true);
+        pending.text = "partial answer".to_string();
+        pending.reasoning = "in-flight thought".to_string();
+        app.pending = Some(pending);
+
+        app.apply_event(TurnEvent::AgentIdle {
+            turn_id: None,
+            reason: cockpit_proto::IdleReason::Interrupted,
+        });
+
+        assert!(app.pending.is_none());
+        let Some(HistoryEntry::Agent {
+            interrupted, text, ..
+        }) = app.history.last()
+        else {
+            panic!("interrupted idle must freeze the pending turn into history");
+        };
+        assert!(interrupted, "the frozen entry carries the stopped marker");
+        assert_eq!(text, "partial answer");
+
+        // Any other idle reason settles the turn without the marker.
+        let mut pending = new_pending("Build".to_string(), true);
+        pending.text = "full answer".to_string();
+        app.pending = Some(pending);
+        app.apply_event(TurnEvent::AgentIdle {
+            turn_id: None,
+            reason: cockpit_proto::IdleReason::Completed,
+        });
+        let Some(HistoryEntry::Agent { interrupted, .. }) = app.history.last() else {
+            panic!("completed idle must finalize the pending turn");
+        };
+        assert!(!interrupted, "a completed turn renders as settled");
     }
 
     #[test]

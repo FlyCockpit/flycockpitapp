@@ -26,6 +26,7 @@ fn agent(text: &str, reasoning: &str) -> HistoryEntry {
         seq: None,
         performance: None,
         performance_expanded: false,
+        interrupted: false,
     }
 }
 

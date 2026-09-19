@@ -105,6 +105,7 @@ fn agent_entry(text: &str) -> HistoryEntry {
         seq: Some(7),
         performance: None,
         performance_expanded: false,
+        interrupted: false,
     }
 }
 

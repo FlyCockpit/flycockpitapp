@@ -182,9 +182,12 @@ impl App {
             &raw.replace('\n', " "),
             usize::from(area.width).saturating_sub(2),
         );
+        // The sticky accent is the bare `▌` bar (no trailing space — the
+        // user-message body keeps `▌ `), followed directly by the condensed
+        // INK-bold preview, matching the reference sticky row.
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("▌ ", Style::default().fg(accent).bg(surface)),
+                Span::styled("▌", Style::default().fg(accent).bg(surface)),
                 Span::styled(
                     condensed,
                     Style::default()

@@ -16,7 +16,10 @@ security fixes; if you self-host, pull updates regularly.
 ## Cockpit CLI threat model
 
 The Rust CLI (`apps/cli`) is a local coding harness with a persistent daemon.
-Its security boundaries and limitations are deliberately explicit:
+Its security boundaries and limitations are deliberately explicit. The
+[local daemon same-user boundary](docs/security/same-user-boundary.md) records
+why the OS user account, not process ancestry or an agent-child marker, is the
+control-plane boundary.
 
 - Provider credentials, named secrets, subscription-ack flags, sealed
   compartment literals, session sealed values, and session redaction tables
@@ -53,9 +56,10 @@ Its security boundaries and limitations are deliberately explicit:
   unconfined and follows grant-or-ask: it requires approval unless a matching session,
   project, or global grant exists. The Windows PowerShell installer does not change that
   limitation.
-- On Unix, the daemon uses a `0600` socket under `$XDG_RUNTIME_DIR/cockpit/`
-  when available (otherwise its private state directory), rather than `/tmp`,
-  and validates the connecting peer's UID on every accepted connection.
+- On Unix, the daemon uses a `0600` socket in an owner-only `0700`
+  `$XDG_RUNTIME_DIR/cockpit/` directory when available (otherwise its private
+  state directory), rather than `/tmp`, and validates the connecting peer's UID
+  on every accepted connection.
 - Cockpit has no telemetry, analytics, crash-reporting service, or self-update
   client. See the CLI [egress and local-storage disclosure](apps/cli/README.md#what-leaves-your-machine)
   for what can leave the machine.

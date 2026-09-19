@@ -453,9 +453,8 @@ pub fn bind_reveal_socket(
         let reveal = control
             .leak_reveal_sibling()
             .context("deriving leak-reveal pipe name")?;
-        let listener =
-            crate::daemon::windows_pipe::NamedPipeListener::bind_named(&path, reveal, true)
-                .with_context(|| format!("binding leak-reveal pipe {}", path.display()))?;
+        let listener = crate::daemon::windows_pipe::NamedPipeListener::bind_named(&path, reveal)
+            .with_context(|| format!("binding leak-reveal pipe {}", path.display()))?;
         Ok(BoundRevealSocket::new(listener, path))
     }
 }

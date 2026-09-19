@@ -261,6 +261,29 @@ fn header_session_status_tracks_real_state() {
         "attention outranks busy: {title:?}"
     );
 
+    // An inference reconnect outranks a busy span, and the badge paints in
+    // the yellow token (fg pinned truecolor for a deterministic assert).
+    app.attention_interrupt = None;
+    app.reconnect = Some(super::ReconnectStatus {
+        attempt: 1,
+        provider: "anthropic".to_string(),
+        model: "claude".to_string(),
+        url: "https://api.anthropic.com".to_string(),
+    });
+    let _truecolor = crate::tui::theme::pin_truecolor(true);
+    let buf = render(&mut app, 100, 30);
+    let title = row_text(&buf, 0);
+    assert!(
+        title.contains("Reconnecting"),
+        "reconnect outranks busy: {title:?}"
+    );
+    let dot = (0..buf.area.width)
+        .find(|&col| buf[(col, 0)].symbol() == "●")
+        .expect("status dot on the title row");
+    assert_eq!(buf[(dot, 0)].fg, crate::tui::theme::YELLOW);
+    drop(_truecolor);
+    app.reconnect = None;
+
     // Nothing in flight over a transcript that has carried a turn: done,
     // the reference resting rule — not idle.
     app.busy = false;

@@ -1901,14 +1901,58 @@ fn pending_reasoning_streams_the_live_thinking_block() {
         !wrapped.iter().any(|line| line_text(line).contains("· · ·")),
         "think-only rendering must put the caret on the thought, not add a placeholder"
     );
+    let last_thought = line_text(wrapped.last().expect("think-only rows"));
     assert!(
-        line_text(wrapped.last().expect("think-only rows")).ends_with('▌'),
-        "the streaming caret follows the final thought row"
+        last_thought.contains("word") && last_thought.ends_with('▌'),
+        "the streaming caret follows thought text instead of an empty body row: {last_thought:?}"
+    );
+    assert!(
+        wrapped
+            .iter()
+            .all(|line| !line_text(line).trim().is_empty()),
+        "think-only rendering must not leak an empty Markdown body row"
     );
     assert!(
         wrapped.iter().all(|line| line_width(line) <= 40),
         "no row exceeds the pane width"
     );
+}
+
+#[test]
+fn finalized_think_only_agent_omits_empty_markdown_body() {
+    for width in [20, 40] {
+        for expanded in [false, true] {
+            let rendered = render_agent(
+                "builder",
+                "",
+                "Check the hierarchy.",
+                fixed_ts(),
+                expanded,
+                0,
+                None,
+                width,
+                true,
+                None,
+                None,
+                false,
+            );
+            let rows = rendered.lines.iter().map(line_text).collect::<Vec<_>>();
+
+            assert!(
+                rows.iter().all(|row| !row.trim().is_empty()),
+                "empty Markdown body leaked at width={width}, expanded={expanded}: {rows:?}"
+            );
+            assert_eq!(
+                rows.iter().filter(|row| row.contains("Thought")).count(),
+                1,
+                "think-only Agent keeps exactly one Thought chip: {rows:?}"
+            );
+            let reasoning_body_visible = rows.iter().any(|row| row.contains("Check"))
+                && rows.iter().any(|row| row.contains("hierarchy."));
+            assert_eq!(reasoning_body_visible, expanded, "{rows:?}");
+            assert!(rendered.copy_body_start.is_none());
+        }
+    }
 }
 
 #[test]

@@ -446,7 +446,6 @@ fn unix_wait(
     loop {
         match server.listener.accept() {
             Ok((stream, _)) => {
-                verify_notify_peer(&stream)?;
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     kill_spawned_daemon(child);
@@ -455,14 +454,27 @@ fn unix_wait(
                         log_path,
                     ));
                 }
+                if verify_notify_peer(&stream).is_err() {
+                    continue;
+                }
                 stream
                     .set_read_timeout(Some(remaining))
                     .context("setting spawn notify read timeout")?;
                 let mut line = String::new();
-                BufReader::new(stream)
-                    .read_line(&mut line)
-                    .context("reading spawn notify report")?;
-                return parse_report_line(&line);
+                match BufReader::new(stream).read_line(&mut line) {
+                    Ok(0) => continue,
+                    Ok(_) => {
+                        if let Ok(report) = parse_report_line(&line) {
+                            return Ok(report);
+                        }
+                        continue;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        return Err(error).context("reading spawn notify report");
+                    }
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -523,6 +535,30 @@ fn windows_bind() -> Result<SpawnNotifyServer> {
 }
 
 #[cfg(windows)]
+fn unblock_windows_notify_waiter(pipe_name: &str) {
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return;
+    };
+    let _ = runtime.block_on(async {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        if let Ok(client) = ClientOptions::new().open(pipe_name) {
+            let _ = client;
+        }
+    });
+}
+
+#[cfg(windows)]
+fn drop_windows_notify_waiter(pipe_name: &str, join: std::thread::JoinHandle<Result<SpawnReport>>) {
+    if !join.is_finished() {
+        unblock_windows_notify_waiter(pipe_name);
+    }
+    let _ = join.join();
+}
+
+#[cfg(windows)]
 fn windows_wait(
     server: SpawnNotifyServer,
     child: &mut Child,
@@ -530,7 +566,7 @@ fn windows_wait(
     timeout: Duration,
 ) -> Result<SpawnReport> {
     let SpawnNotifyServer {
-        pipe_name: _,
+        pipe_name,
         listener,
     } = server;
     let join = std::thread::Builder::new()
@@ -564,6 +600,7 @@ fn windows_wait(
         }
         match child.try_wait() {
             Ok(Some(_)) => {
+                drop_windows_notify_waiter(&pipe_name, join);
                 return Err(error_with_log_tail(
                     "daemon exited before reporting ready",
                     log_path,
@@ -571,11 +608,13 @@ fn windows_wait(
             }
             Ok(None) => {}
             Err(error) => {
+                drop_windows_notify_waiter(&pipe_name, join);
                 return Err(error).context("polling spawned daemon child");
             }
         }
         if Instant::now() >= deadline {
             kill_spawned_daemon(child);
+            drop_windows_notify_waiter(&pipe_name, join);
             return Err(error_with_log_tail(
                 format!(
                     "timed out waiting for daemon to report ready after {}s",

@@ -11,7 +11,7 @@ use uuid::Uuid;
 fn ephemeral_spawn_arms_raii_before_the_first_wait() {
     let source = include_str!("client.rs");
     let spawn = source
-        .find("let child = spawn_detached_ephemeral(&paths)?;")
+        .find("spawn_blocking(move || spawn_detached_ephemeral(&spawn_paths))")
         .expect("ephemeral spawn funnel");
     let arm = source[spawn..]
         .find("EphemeralDaemonGuard::new")

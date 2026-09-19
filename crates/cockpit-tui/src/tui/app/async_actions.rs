@@ -1090,6 +1090,7 @@ impl App {
                     result: Ok(lifecycle),
                 }) if generation == self.startup_background.generation && !self.exit_requested => {
                     self.startup_background.retry = None;
+                    self.startup_background.lifecycle_failure_started_at = None;
                     let selected_lifetime = match self.lifecycle_intent() {
                         cockpit_client::LifecycleIntent::AttachOrPersistent
                         | cockpit_client::LifecycleIntent::PromoteToPersistent => "persistent",

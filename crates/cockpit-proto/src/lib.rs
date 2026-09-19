@@ -107,12 +107,12 @@ pub use host_capabilities::{
 };
 pub use launch::{LaunchBundle, LaunchInfo, RepoStatus};
 pub use onboarding::{
-    ApplyOnboardingSecureIntent, ApplyOnboardingTransition, BeginOrReopenOnboarding,
-    LockedBootstrapHello, MAX_SENSITIVE_ONBOARDING_PASSPHRASE_BYTES, OnboardingBootstrapEvent,
-    OnboardingBootstrapSnapshot, OnboardingBootstrapState, OnboardingReceiptQuery,
-    OnboardingReceiptStatus, OnboardingSecurePlacement, OnboardingStage, OnboardingStageSettlement,
-    OnboardingTransitionKind, OnboardingTransitionReceipt, OnboardingTransitionResult,
-    SensitiveOnboardingIntentError, SensitiveOnboardingIntentFrame,
+    ApplyOnboardingProfile, ApplyOnboardingSecureIntent, ApplyOnboardingTransition,
+    BeginOrReopenOnboarding, LockedBootstrapHello, MAX_SENSITIVE_ONBOARDING_PASSPHRASE_BYTES,
+    OnboardingBootstrapEvent, OnboardingBootstrapSnapshot, OnboardingBootstrapState,
+    OnboardingReceiptQuery, OnboardingReceiptStatus, OnboardingSecurePlacement, OnboardingStage,
+    OnboardingStageSettlement, OnboardingTransitionKind, OnboardingTransitionReceipt,
+    OnboardingTransitionResult, SensitiveOnboardingIntentError, SensitiveOnboardingIntentFrame,
     SensitiveOnboardingIntentResponse, SensitiveOnboardingPassphrase,
     decode_sensitive_onboarding_intent, decode_sensitive_onboarding_response,
     encode_sensitive_onboarding_intent, encode_sensitive_onboarding_response,

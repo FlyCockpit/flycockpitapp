@@ -1045,6 +1045,7 @@ pub enum Request {
     GetOnboardingBootstrapSnapshot,
     BeginOrReopenOnboarding(crate::BeginOrReopenOnboarding),
     ApplyOnboardingTransition(crate::ApplyOnboardingTransition),
+    ApplyOnboardingProfile(crate::ApplyOnboardingProfile),
     GetOnboardingTransitionReceipt(crate::OnboardingReceiptQuery),
     /// Retry ready-service construction after vault authority exists but the
     /// first locked-to-ready transition failed.
@@ -3684,12 +3685,7 @@ impl Request {
                 validate_owner_project_root(project_root)?;
                 if !matches!(
                     wizard_id.as_str(),
-                    "security"
-                        | "model"
-                        | "onboarding-model"
-                        | "onboarding-profile"
-                        | "onboarding-agent"
-                        | "onboarding-lifetime"
+                    "security" | "model" | "onboarding-model" | "onboarding-lifetime"
                 ) {
                     return Err("setup wizard id is not supported".to_string());
                 }
@@ -4479,6 +4475,14 @@ impl Request {
             Self::GetAuthoredAgentPackageReceipt(query) => {
                 validate_owner_identifier("client operation", &query.client_operation_id, 128)?;
             }
+            Self::ApplyOnboardingProfile(request) => {
+                validate_owner_identifier("client operation", &request.client_operation_id, 128)?;
+                if request.display_name.len() > 256 {
+                    return Err(
+                        "onboarding profile display name exceeds maximum length".to_string()
+                    );
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -4602,6 +4606,7 @@ macro_rules! request_variants {
             (Request::GetOnboardingBootstrapSnapshot, "get_onboarding_bootstrap_snapshot");
             (Request::BeginOrReopenOnboarding(..), "begin_or_reopen_onboarding");
             (Request::ApplyOnboardingTransition(..), "apply_onboarding_transition");
+            (Request::ApplyOnboardingProfile(..), "apply_onboarding_profile");
             (Request::GetOnboardingTransitionReceipt(..), "get_onboarding_transition_receipt");
             (Request::RetryOnboardingReadyConstruction, "retry_onboarding_ready_construction");
             (Request::GetAppFlag { .. }, "get_app_flag");
@@ -4980,6 +4985,7 @@ macro_rules! command {
             (Request::GetOnboardingBootstrapSnapshot, "get_onboarding_bootstrap_snapshot", owner_only, none, false, read_only, none, serialized, none, "-", []);
             (Request::BeginOrReopenOnboarding(request), "begin_or_reopen_onboarding", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "request:BeginOrReopenOnboarding", [request: $crate::BeginOrReopenOnboarding => param]);
             (Request::ApplyOnboardingTransition(request), "apply_onboarding_transition", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "request:ApplyOnboardingTransition", [request: $crate::ApplyOnboardingTransition => param]);
+            (Request::ApplyOnboardingProfile(request), "apply_onboarding_profile", owner_only, none, true, local_only, none, serialized, none, "request:ApplyOnboardingProfile", [request: $crate::ApplyOnboardingProfile => param]);
             (Request::GetOnboardingTransitionReceipt(request), "get_onboarding_transition_receipt", owner_only, none, false, read_only, none, serialized, none, "request:OnboardingReceiptQuery", [request: $crate::OnboardingReceiptQuery => param]);
             (Request::RetryOnboardingReadyConstruction, "retry_onboarding_ready_construction", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::GetAppFlag { key }, "get_app_flag", owner_only, none, false, local_only, none, serialized, none, "key:AppFlagKey", [key: AppFlagKey => param]);

@@ -219,7 +219,7 @@ async fn attempt_restart_if_idle(
         });
     }
     let no_sandbox = daemon::derive_restart_no_sandbox(paths, false);
-    let pid = daemon::spawn_detached_with_resume(no_sandbox, true)?;
+    let pid = daemon::spawn_detached_with_resume_async(no_sandbox, true).await?;
     Ok(SkewRestartOutcome::Restarted {
         pid,
         reason: skew_reason,

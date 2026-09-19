@@ -878,7 +878,7 @@ async fn spawn_verified_persistent_replacement(
         });
     }
     let pid = loop {
-        match crate::daemon::spawn_detached(false) {
+        match crate::daemon::spawn_detached_async(false).await {
             Ok(pid) => break pid,
             Err(error) if replacement_deadline.is_some() => {
                 // The predecessor can release its metadata before its SQLite
@@ -1189,7 +1189,10 @@ async fn probe_or_spawn_with_spawn_authorization(
 
     let (paths, pid, provisional_ephemeral_guard) = if ephemeral {
         let paths = DaemonPaths::resolve_canonical()?.with_ephemeral_lifetime();
-        let child = spawn_detached_ephemeral(&paths)?;
+        let spawn_paths = paths.clone();
+        let child = tokio::task::spawn_blocking(move || spawn_detached_ephemeral(&spawn_paths))
+            .await
+            .context("joining ephemeral daemon spawn")??;
         let pid = child.id();
         // Arm exact-child cleanup before any await or other cancellation
         // point. Once the daemon has published its verified receipt, its own
@@ -1235,7 +1238,7 @@ async fn probe_or_spawn_with_spawn_authorization(
                 promoted_from_ephemeral: false,
             });
         }
-        let pid = spawn_detached(false)?;
+        let pid = crate::daemon::spawn_detached_async(false).await?;
         (canonical, pid, None)
     };
     if let Some(permit) = spawn_permit.as_mut() {

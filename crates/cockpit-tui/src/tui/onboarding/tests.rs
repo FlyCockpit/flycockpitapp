@@ -1174,24 +1174,19 @@ fn provider_auth_engine_renders_inside_full_screen_chrome_at_narrow_and_wide_siz
 }
 
 #[test]
-fn setup_engine_stages_share_shell_chrome_at_narrow_and_wide_sizes() {
-    let home = tempfile::tempdir().unwrap();
-    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(home.path());
-    let cases = [(
-        OnboardingStage::Lifetime,
-        cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
-    )];
-
-    for (stage, wizard_id) in cases {
-        let engine = Dialog::onboarding_wizard_engine(wizard_id, None, None).unwrap();
-        let mut shell = shell_at(stage);
-        shell.present_engine(EngineStage::for_stage(stage).unwrap());
-        for (width, height) in [(48, 18), (110, 32)] {
-            let rendered = render_string(&mut shell, width, height, &engine);
-            assert!(rendered.contains("Cockpit setup"), "{rendered}");
-            assert!(rendered.contains("Setup —"), "{rendered}");
-            assert!(rendered.contains("esc: options"), "{rendered}");
-        }
+fn lifetime_native_screen_renders_inside_full_screen_chrome_at_narrow_and_wide_sizes() {
+    let mut shell = shell_at(OnboardingStage::Lifetime);
+    let engine = Dialog::None;
+    for (width, height) in [(48, 18), (110, 32)] {
+        let rendered = render_string(&mut shell, width, height, &engine);
+        assert!(rendered.contains("Background agents"), "{rendered}");
+        assert!(
+            rendered.contains("Keep agents running in the background"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("‹ Back"), "{rendered}");
+        assert!(rendered.contains("[ Continue ]"), "{rendered}");
+        assert!(!rendered.contains("Setup —"), "{rendered}");
     }
 }
 
@@ -1220,6 +1215,7 @@ fn chrome_paints_back_and_action_bar_on_every_settled_screen() {
     let engine = Dialog::None;
     for stage in [
         OnboardingStage::Profile,
+        OnboardingStage::Lifetime,
         OnboardingStage::SecureStore,
         OnboardingStage::Provider,
         OnboardingStage::Model,

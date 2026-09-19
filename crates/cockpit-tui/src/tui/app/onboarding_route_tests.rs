@@ -106,7 +106,6 @@ fn named_setup_wizard_rejects_stale_complete_stage_for_first_run_wizards() {
         cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID,
         cockpit_core::wizard::ONBOARDING_MODEL_WIZARD_ID,
         cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
-        cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID,
     ] {
         let mut app = App::new(Some(tmp.path()), false);
         app.apply_onboarding_bootstrap_snapshot(Some(snapshot(

@@ -160,6 +160,22 @@ fn shell_screen_kind(app: &App) -> Option<crate::tui::onboarding::OnboardingScre
         .map(|shell| shell.screen_kind())
 }
 
+fn submit_onboarding_lifetime(app: &mut App) {
+    assert_eq!(
+        shell_screen_kind(app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::Lifetime)
+    );
+    if let Some(shell) = app.onboarding_shell.as_mut() {
+        shell.clear_pending_transition();
+    }
+    shell_key(app, KeyCode::Enter);
+}
+
+fn land_onboarding_complete_after_lifetime(app: &mut App) {
+    submit_onboarding_lifetime(app);
+    set_onboarding_stage(app, OnboardingStage::Complete);
+}
+
 fn settle_onboarding_agent_stage(app: &mut App) {
     use cockpit_proto::{
         AGENT_AUTHORING_DTO_VERSION, AgentAuthoringCatalogOrigin, AgentAuthoringCompatibleRoute,
@@ -377,14 +393,10 @@ fn first_run_flow_completes_end_to_end() {
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Lifetime);
     assert_eq!(
-        app.dialog.test_page_name(),
-        Some(cockpit_core::wizard::ONBOARDING_LIFETIME_WIZARD_ID)
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::Lifetime)
     );
-    app.dialog.test_mark_setup_complete("lifetime-save");
-    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
-    // The terminal Complete transition is now requested when the lifetime
-    // stage settles; the completion screen itself waits for the
-    // authoritative Complete revision to land.
+    submit_onboarding_lifetime(&mut app);
     assert!(
         app.onboarding_shell
             .as_ref()
@@ -431,9 +443,7 @@ fn completion_detour_ends_when_the_added_provider_settles() {
     settle_onboarding_agent_stage(&mut app);
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Lifetime);
-    app.dialog.test_mark_setup_complete("lifetime-save");
-    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
-    set_onboarding_stage(&mut app, OnboardingStage::Complete);
+    land_onboarding_complete_after_lifetime(&mut app);
     assert_eq!(
         shell_screen_kind(&app),
         Some(crate::tui::onboarding::OnboardingScreenKind::Complete)
@@ -518,9 +528,7 @@ fn complete_authority_refresh_preserves_the_local_provider_detour() {
     settle_onboarding_agent_stage(&mut app);
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Lifetime);
-    app.dialog.test_mark_setup_complete("lifetime-save");
-    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
-    set_onboarding_stage(&mut app, OnboardingStage::Complete);
+    land_onboarding_complete_after_lifetime(&mut app);
 
     // Open the detour and mount its provider engine.
     shell_key(&mut app, KeyCode::Up);
@@ -590,6 +598,7 @@ fn first_run_configuration_queues_held_draft_behind_selected_model() {
         prompt_cache_retention: None,
     });
     write_config(tmp.path(), &cfg);
+    write_global_config(&cfg);
     select_provider_template(&mut app, "openai");
     app.dialog.test_mark_provider_add_done("p");
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
@@ -601,11 +610,19 @@ fn first_run_configuration_queues_held_draft_behind_selected_model() {
     settle_onboarding_agent_stage(&mut app);
     assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Lifetime);
-    app.dialog.test_mark_setup_complete("lifetime-save");
-
+    with_trusted_workspace(tmp.path(), || app.refresh_bootstrap_config_snapshot());
+    assert!(
+        app.config_snapshot.providers.active_model.is_some(),
+        "lifetime settlement needs a configured default model"
+    );
+    assert!(app.submit_after_model_selection);
     let (control_tx, mut control_rx) = mpsc::channel(4);
     app.agent_runner = Some(Ok(AgentRunner::stub_with_control_tx(control_tx)));
-    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    submit_onboarding_lifetime(&mut app);
+    assert!(
+        app.pending_model_selection.is_some(),
+        "lifetime settlement must queue model selection while a draft is held"
+    );
 
     let request = control_rx.try_recv().expect("model request queued").request;
     let selection_id = match request {

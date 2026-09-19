@@ -1,7 +1,6 @@
 //! Background agent lifetime choice for the onboarding shell.
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -93,24 +92,5 @@ impl LifetimeScreen {
                 ])
             })
             .collect()
-    }
-
-    pub(crate) fn render(&self, frame: &mut Frame, area: Rect) {
-        let mut y = area.y;
-        for line in self.lines() {
-            if y >= area.bottom() {
-                break;
-            }
-            frame.render_widget(
-                ratatui::widgets::Paragraph::new(line),
-                Rect {
-                    x: area.x,
-                    y,
-                    width: area.width,
-                    height: 1,
-                },
-            );
-            y += 1;
-        }
     }
 }

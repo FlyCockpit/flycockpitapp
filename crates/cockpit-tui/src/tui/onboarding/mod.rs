@@ -512,6 +512,7 @@ impl OnboardingShell {
         self.stage
     }
 
+    #[cfg(test)]
     pub(crate) fn screen_is_complete(&self) -> bool {
         matches!(self.screen, OnboardingScreen::Complete { .. })
     }
@@ -528,14 +529,6 @@ impl OnboardingShell {
     pub(crate) fn test_agent_authoring_phase(&self) -> Option<agent::Phase> {
         match &self.screen {
             OnboardingScreen::AgentAuthoring(screen) => Some(screen.test_phase()),
-            _ => None,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_agent_authoring_status(&self) -> Option<String> {
-        match &self.screen {
-            OnboardingScreen::AgentAuthoring(screen) => screen.test_status().map(str::to_owned),
             _ => None,
         }
     }
@@ -570,15 +563,6 @@ impl OnboardingShell {
     ) {
         if let OnboardingScreen::AgentAuthoring(screen) = &mut self.screen {
             screen.apply_outcome(outcome);
-        }
-    }
-
-    pub(crate) fn replace_agent_authoring_projection(
-        &mut self,
-        projection: cockpit_proto::AgentAuthoringProjection,
-    ) {
-        if let OnboardingScreen::AgentAuthoring(screen) = &mut self.screen {
-            screen.replace_projection(projection);
         }
     }
 
@@ -1670,8 +1654,7 @@ impl OnboardingShell {
         list_row_rects: &mut Vec<Rect>,
     ) {
         let lines = screen.lines();
-        let mut y = area.y;
-        for line in lines {
+        for (y, line) in (area.y..).zip(lines) {
             if y >= area.bottom() {
                 break;
             }
@@ -1684,7 +1667,6 @@ impl OnboardingShell {
                     height: 1,
                 },
             );
-            y += 1;
         }
         list_row_rects.clear();
         for index in 0..2u16 {

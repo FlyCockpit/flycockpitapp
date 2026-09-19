@@ -324,11 +324,6 @@ impl AgentAuthoringScreen {
         self.phase
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_status(&self) -> Option<&str> {
-        self.status.as_deref()
-    }
-
     pub fn help_text(&self) -> &'static str {
         match self.phase {
             Phase::SourceIdentity

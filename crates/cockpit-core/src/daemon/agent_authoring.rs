@@ -783,18 +783,64 @@ mod tests {
     }
 
     #[test]
-    fn onboarding_agent_setup_wizard_bridge_is_removed_from_dispatch() {
-        let dispatch = include_str!("server/dispatch.rs");
+    fn onboarding_agent_setup_wizard_id_is_refused_before_dispatch() {
+        use cockpit_proto::Request;
+
+        let request = Request::ApplySetupWizard {
+            client_operation_id: "onboarding-agent-op".into(),
+            project_root: "/tmp/project".into(),
+            wizard_id: "onboarding-agent".into(),
+            answers_json: "{}".into(),
+        };
+        let err = request
+            .validate_semantics()
+            .expect_err("legacy onboarding-agent wizard id must be rejected");
         assert!(
-            dispatch.contains(
-                "the onboarding agent stage uses ApplyAuthoredAgentPackage, not ApplySetupWizard"
-            ),
-            "the legacy onboarding-agent ApplySetupWizard bridge must fail closed"
+            err.contains("setup wizard id is not supported"),
+            "unexpected validation error: {err}"
         );
-        assert!(
-            !dispatch.contains("prepare_onboarding_agent_answers_for_catalog"),
-            "onboarding agent installation must not route through ApplySetupWizard"
-        );
+    }
+
+    #[test]
+    fn onboarding_agent_settlement_uses_authored_package_rpc() {
+        use cockpit_proto::{
+            AgentAuthoringSourceKind, ApplyAuthoredAgentPackageRequest,
+            AuthoredAgentOnboardingCorrelation, AuthoredAgentPackageDraft, AuthoredAgentSource,
+            Request,
+        };
+        use uuid::Uuid;
+
+        let request = Request::ApplyAuthoredAgentPackage(ApplyAuthoredAgentPackageRequest {
+            client_operation_id: "onboarding-agent-install".into(),
+            expected_policy_revision: "aa".repeat(32),
+            package: AuthoredAgentPackageDraft {
+                dto_version: cockpit_proto::AGENT_AUTHORING_DTO_VERSION,
+                name: "helper".into(),
+                markdown: "---\ndescription: helper\n---\nbody\n".into(),
+                source: AuthoredAgentSource {
+                    kind: AgentAuthoringSourceKind::Authored,
+                    source_locator: "authored/helper".into(),
+                    pin: None,
+                    third_party_trust_confirmed: false,
+                },
+                children: vec![],
+                mcp_json: None,
+                sidecars: vec![],
+                policy_revision: "aa".repeat(32),
+                model_trust_confirmations: vec![],
+                make_default: true,
+                draft_revision: None,
+            },
+            onboarding: Some(AuthoredAgentOnboardingCorrelation {
+                run_id: Uuid::now_v7(),
+                attempt_id: Uuid::now_v7(),
+                stage_revision: 0,
+            }),
+            validate_only: true,
+        });
+        request
+            .validate_semantics()
+            .expect("onboarding agent installation must settle through ApplyAuthoredAgentPackage");
     }
 
     #[test]

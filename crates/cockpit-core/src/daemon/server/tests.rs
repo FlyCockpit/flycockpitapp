@@ -20040,7 +20040,9 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "clean_managed_workspace_lease"
         | "restart_if_idle"
         | "stop_daemon" => AuthzAllowedOutcome::Response,
-        "apply_onboarding_transition" | "retry_onboarding_ready_construction" => {
+        "apply_onboarding_transition"
+        | "apply_onboarding_profile"
+        | "retry_onboarding_ready_construction" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
         // The matrix deliberately drops the attached worker after its prelude;
@@ -20715,6 +20717,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("get_onboarding_bootstrap_snapshot"),
         authz_owner_only("begin_or_reopen_onboarding"),
         authz_owner_only("apply_onboarding_transition"),
+        authz_owner_only("apply_onboarding_profile"),
         authz_owner_only("get_onboarding_transition_receipt"),
         authz_owner_only("retry_onboarding_ready_construction"),
         authz_owner_only("get_app_flag"),
@@ -22722,6 +22725,12 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 client_operation_id: "authz-onboarding-transition".into(),
                 transition: proto::OnboardingTransitionKind::Advance,
                 settlement: None,
+            })
+        }
+        "apply_onboarding_profile" => {
+            Request::ApplyOnboardingProfile(proto::ApplyOnboardingProfile {
+                client_operation_id: "authz-onboarding-profile".into(),
+                display_name: "Ada".into(),
             })
         }
         "get_onboarding_transition_receipt" => {
@@ -31191,6 +31200,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::GetOnboardingBootstrapSnapshot, kind: "get_onboarding_bootstrap_snapshot", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::BeginOrReopenOnboarding(proto::BeginOrReopenOnboarding { expected_revision: None, client_operation_id: "fixture-onboarding-begin".into(), reentry: false }), kind: "begin_or_reopen_onboarding", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::ApplyOnboardingTransition(proto::ApplyOnboardingTransition { run_id: Uuid::now_v7(), attempt_id: Uuid::now_v7(), expected_revision: 0, client_operation_id: "fixture-onboarding-transition".into(), transition: proto::OnboardingTransitionKind::Advance, settlement: None }), kind: "apply_onboarding_transition", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::ApplyOnboardingProfile(proto::ApplyOnboardingProfile { client_operation_id: "fixture-onboarding-profile".into(), display_name: "Ada".into() }), kind: "apply_onboarding_profile", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetOnboardingTransitionReceipt(proto::OnboardingReceiptQuery { run_id: Uuid::now_v7(), attempt_id: Uuid::now_v7(), client_operation_id: "fixture-onboarding-receipt".into() }), kind: "get_onboarding_transition_receipt", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::SaveExtendedConfig { project_root: "/tmp/project".into(), path: "AGENTS.md".into(), content: String::new(), base_hash: None }, kind: "save_extended_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::ExportPolicy { project_root: "/tmp/project".into() }, kind: "export_policy", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
@@ -31543,6 +31553,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         ApplySetupWizard,
         GetOnboardingBootstrapSnapshot,
         BeginOrReopenOnboarding,
+        ApplyOnboardingProfile,
         ApplyOnboardingTransition,
         GetOnboardingTransitionReceipt,
         SaveExtendedConfig,

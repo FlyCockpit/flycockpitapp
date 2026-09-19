@@ -326,6 +326,14 @@ fn ensure_global_layer_for_write() -> Result<()> {
 /// Persist the native onboarding profile display name through the global layer.
 pub fn apply_onboarding_profile_display_name(display_name: &str) -> Result<bool> {
     let trimmed = display_name.trim();
+    if !trimmed.is_empty() {
+        if trimmed.chars().count() > 80 {
+            anyhow::bail!("name must be 80 characters or fewer");
+        }
+        if trimmed.chars().any(char::is_control) {
+            anyhow::bail!("name cannot contain control characters");
+        }
+    }
     let next = (!trimmed.is_empty()).then(|| trimmed.to_string());
     let target = global_config_file().context("resolving global config for onboarding profile")?;
     let mut doc = ExtendedConfigDoc::load(&target)?;
@@ -1644,6 +1652,26 @@ mod tests {
         let changed =
             apply_onboarding_profile_display_name("").expect("blank name is a skip, not an error");
         assert!(!changed);
+    }
+
+    #[test]
+    fn apply_onboarding_profile_display_name_rejects_control_characters() {
+        let err = apply_onboarding_profile_display_name("A\nda")
+            .expect_err("control characters must not persist");
+        assert!(
+            err.to_string().contains("control characters"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_onboarding_profile_display_name_rejects_long_names() {
+        let err = apply_onboarding_profile_display_name(&"x".repeat(81))
+            .expect_err("overlong names must not persist");
+        assert!(
+            err.to_string().contains("80 characters"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

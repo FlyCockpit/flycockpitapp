@@ -4482,6 +4482,21 @@ impl Request {
                         "onboarding profile display name exceeds maximum length".to_string()
                     );
                 }
+                let trimmed = request.display_name.trim();
+                if !trimmed.is_empty() {
+                    if trimmed.chars().count() > 80 {
+                        return Err(
+                            "onboarding profile display name must be 80 characters or fewer"
+                                .to_string(),
+                        );
+                    }
+                    if trimmed.chars().any(char::is_control) {
+                        return Err(
+                            "onboarding profile display name cannot contain control characters"
+                                .to_string(),
+                        );
+                    }
+                }
             }
             _ => {}
         }

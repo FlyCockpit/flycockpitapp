@@ -33,8 +33,8 @@ pub(crate) use registry::RegisteredButton;
 use ratatui::style::Style;
 
 use crate::tui::theme::{
-    button_destructive_style, button_disabled_style, button_focus_style, button_hover_style,
-    button_idle_style, button_pressed_style,
+    button_destructive_style, button_disabled_style, button_focus_style, button_idle_style,
+    button_pressed_style,
 };
 
 #[cfg(test)]
@@ -48,7 +48,10 @@ pub(crate) fn button_style(spec: &ButtonSpec, hover: bool, pressed: bool) -> Sty
         return button_pressed_style();
     }
     if hover {
-        return button_hover_style();
+        // Buttons hover through the single excoc chip rule, so the whole
+        // shell shares one hover paint and later theme work cannot drift
+        // between buttons and every other chip.
+        return crate::tui::chrome::chip_style(Style::default(), true);
     }
     if spec.focused {
         return button_focus_style();

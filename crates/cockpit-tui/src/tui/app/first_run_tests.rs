@@ -176,6 +176,57 @@ fn land_onboarding_complete_after_lifetime(app: &mut App) {
     set_onboarding_stage(app, OnboardingStage::Complete);
 }
 
+/// Simulate the authoritative completion of the lifetime settlement RPC
+/// added after `before` was captured (earlier stages leave stale pending
+/// entries in these tests because their actions never drain): the daemon
+/// committed the `ApplySetupWizard` write and the terminal Advance, and
+/// the correlated receipt lands on the event loop. The client-side
+/// adoption (config re-read, summary, held draft) runs only here — never
+/// at latch time (#426).
+fn land_onboarding_lifetime_completion(
+    app: &mut App,
+    before: &[crate::tui::async_action::AsyncActionId],
+) {
+    let (action_id, request_id) = app
+        .pending_startup_onboarding_operations
+        .iter()
+        .find(|(id, _)| !before.contains(id))
+        .map(|(id, request)| (*id, request.clone()))
+        .expect("the lifetime settlement RPC is pending");
+    let snapshot = app
+        .onboarding_snapshot
+        .clone()
+        .expect("lifetime stage snapshot");
+    let receipt = cockpit_proto::OnboardingTransitionReceipt {
+        run_id: snapshot.run_id,
+        attempt_id: snapshot.attempt_id,
+        consumed_revision: snapshot.revision,
+        receipt_id: uuid::Uuid::from_u128(31),
+        status: cockpit_proto::OnboardingReceiptStatus::Committed,
+    };
+    let mut complete = onboarding_snapshot(OnboardingStage::Complete);
+    complete.revision = snapshot.revision + 1;
+    complete.last_receipt = Some(receipt.clone());
+    app.apply_async_action_result(crate::tui::async_action::AsyncActionResult {
+        id: action_id,
+        kind: crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.lifetime"),
+        presentation_stale: false,
+        payload: Ok(
+            crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
+                super::StartupOnboardingCompletion {
+                    generation: app.startup_background.generation,
+                    run_id: snapshot.run_id,
+                    attempt_id: snapshot.attempt_id,
+                    expected_revision: snapshot.revision,
+                    request_id,
+                    receipt: Some(receipt),
+                    snapshot: Some(complete),
+                },
+            ),
+        ),
+    });
+}
+
 fn settle_onboarding_agent_stage(app: &mut App) {
     use cockpit_proto::{
         AGENT_AUTHORING_DTO_VERSION, AgentAuthoringCatalogOrigin, AgentAuthoringCompatibleRoute,
@@ -618,7 +669,24 @@ fn first_run_configuration_queues_held_draft_behind_selected_model() {
     assert!(app.submit_after_model_selection);
     let (control_tx, mut control_rx) = mpsc::channel(4);
     app.agent_runner = Some(Ok(AgentRunner::stub_with_control_tx(control_tx)));
+    let before = app
+        .pending_startup_onboarding_operations
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
     submit_onboarding_lifetime(&mut app);
+    assert!(
+        app.pending_model_selection.is_none(),
+        "the held draft must not release before the wizard apply commits"
+    );
+    assert!(
+        app.submit_after_model_selection,
+        "a failed or in-flight apply must leave the draft held for retry"
+    );
+
+    // The wizard apply commits and the terminal Advance lands: only the
+    // correlated completion releases the draft behind the selected model.
+    land_onboarding_lifetime_completion(&mut app, &before);
     assert!(
         app.pending_model_selection.is_some(),
         "lifetime settlement must queue model selection while a draft is held"
@@ -637,6 +705,79 @@ fn first_run_configuration_queues_held_draft_behind_selected_model() {
     let queued = pending.queued_submission.as_ref().expect("draft held");
     assert_eq!(queued.submission.text, "draft from first run");
     assert_eq!(app.composer.text(), "draft from first run");
+}
+
+#[test]
+fn lifetime_settlement_adopts_the_committed_choice_only_after_the_daemon_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    write_config(tmp.path(), &ProvidersConfig::default());
+    let mut app = App::new(Some(tmp.path()), false);
+    advance_through_secure_store(&mut app, tmp.path());
+    select_provider_template(&mut app, "openai");
+    write_global_config(&config_with_provider("p", "m"));
+    app.dialog.test_mark_provider_add_done("p");
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    set_onboarding_stage(&mut app, OnboardingStage::Model);
+    app.dialog.test_mark_setup_complete("model-save");
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    set_onboarding_stage(&mut app, OnboardingStage::Agent);
+    settle_onboarding_agent_stage(&mut app);
+    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    set_onboarding_stage(&mut app, OnboardingStage::Lifetime);
+    assert_eq!(
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::Lifetime)
+    );
+
+    // Disk still carries the `background_agents: true` default, so this
+    // process holds the persistent owner intent before the choice.
+    assert!(!app.ephemeral_preference);
+
+    // Choose "Stop the daemon when the last client leaves" and Continue:
+    // latching the settlement must not adopt the choice ahead of the
+    // daemon commit — the apply can still fail and be retried.
+    if let Some(shell) = app.onboarding_shell.as_mut() {
+        shell.clear_pending_transition();
+    }
+    let before = app
+        .pending_startup_onboarding_operations
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    shell_key(&mut app, KeyCode::Down);
+    shell_key(&mut app, KeyCode::Enter);
+    assert!(
+        app.onboarding_shell
+            .as_ref()
+            .is_some_and(|shell| shell.transition_pending()),
+        "the lifetime settlement must latch the terminal transition"
+    );
+    assert!(
+        !app.ephemeral_preference,
+        "the process must keep the pre-choice intent until the wizard apply commits"
+    );
+
+    // The correlated completion lands: the committed choice now owns this
+    // process's lifetime preference and default acquisition intent, so
+    // closing the last client stops the owner as the screen promised. The
+    // fabricated receipt stands in for the daemon, so the fixture also
+    // performs the daemon's committed write of the choice to the global
+    // config — the completion refresh reads that disk state.
+    let global = cockpit_config::dirs::global_config_file().unwrap();
+    let mut doc = cockpit_config::extended::ExtendedConfigDoc::load(&global).unwrap();
+    let mut extended = doc.config();
+    extended.daemon.background_agents = false;
+    doc.write(&extended).unwrap();
+    land_onboarding_lifetime_completion(&mut app, &before);
+    assert!(
+        app.ephemeral_preference,
+        "the committed ephemeral choice must flip the process lifetime preference"
+    );
+    assert_eq!(
+        app.lifecycle_intent(),
+        cockpit_client::LifecycleIntent::AttachOrEphemeral
+    );
 }
 
 #[test]

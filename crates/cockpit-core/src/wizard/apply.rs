@@ -35,7 +35,11 @@ use crate::wizard::{
     sandbox_mode_answer,
 };
 
-const LIFETIME_SETUP_WIZARD_ID: &str = "onboarding-lifetime";
+/// Wire id of the onboarding lifetime setup wizard: the daemon replays it
+/// and the native Lifetime screen sends it in `ApplySetupWizard`. The
+/// deleted public row constant from `named_setup_wizard_rows!` is gone
+/// (#430); this is the single remaining authority for the wire id.
+pub const LIFETIME_SETUP_WIZARD_ID: &str = "onboarding-lifetime";
 
 fn lifetime_setup_wizard_descriptor() -> WizardDescriptor {
     WizardDescriptor {

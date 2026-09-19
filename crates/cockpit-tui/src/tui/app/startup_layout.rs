@@ -1787,35 +1787,17 @@ impl App {
             .startup_lifecycle
             .as_ref()
             .map(|selected| selected.endpoint.clone());
-        self.refresh_bootstrap_config_snapshot();
-        let configured_model = self.config_snapshot.providers.active_model.clone();
-        let summary = self.onboarding_completion_summary();
+        // Latch only. Every client-side adoption of the choice — the
+        // bootstrap config re-read (lifetime preference, default intent,
+        // default model), the completion summary, and the held-draft
+        // release — waits for the correlated completion in
+        // `finish_onboarding_lifetime_settlement`, because the wizard
+        // apply can still fail until its receipt lands (#426).
         if let Some(shell) = self.onboarding_shell.as_mut() {
-            shell.note_completion_summary(summary);
             shell.latch_transition(
                 snapshot.revision,
                 cockpit_proto::OnboardingTransitionKind::Advance,
             );
-        }
-        if self.submit_after_model_selection {
-            match configured_model {
-                Some(active) => {
-                    if self.notify_active_model_selected(
-                        active,
-                        false,
-                        cockpit_proto::ActiveModelSwitchTrigger::Picker,
-                    ) {
-                        self.submit_after_model_selection = false;
-                        let _ = self.submit_input();
-                    }
-                }
-                None => {
-                    self.submit_after_model_selection = false;
-                    self.push_plain(
-                        "Your draft is still here; choose a model before sending.".to_string(),
-                    );
-                }
-            }
         }
         let pending_request_id = request_id.clone();
         let started = self.async_actions.start(
@@ -1833,7 +1815,7 @@ impl App {
                     .request(cockpit_proto::Request::ApplySetupWizard {
                         client_operation_id: uuid::Uuid::new_v4().to_string(),
                         project_root,
-                        wizard_id: "onboarding-lifetime".to_string(),
+                        wizard_id: cockpit_core::wizard::LIFETIME_SETUP_WIZARD_ID.to_string(),
                         answers_json,
                     })
                     .await
@@ -1879,6 +1861,46 @@ impl App {
         if let crate::tui::async_action::AsyncActionStart::Started(id) = started {
             self.pending_startup_onboarding_operations
                 .insert(id, pending_request_id);
+        }
+    }
+
+    /// Adopt the committed lifetime settlement on the correlated
+    /// `onboarding.lifetime` completion. The wizard apply has written the
+    /// global config by then, so the bootstrap re-read (the sanctioned
+    /// detached first-run resolution) picks up the recorded
+    /// `background_agents` choice — resetting this process's lifetime
+    /// preference and default owner intent — plus the effective default
+    /// model and TUI chrome. The completion summary is recorded from that
+    /// authoritative view before the `Complete` revision presents it, and
+    /// a draft held behind model selection is released only now that the
+    /// choice is durable. Same post-commit order the pre-native
+    /// `service_onboarding_shell` poll arm used (#426).
+    pub(super) fn finish_onboarding_lifetime_settlement(&mut self) {
+        self.refresh_bootstrap_config_snapshot();
+        let configured_model = self.config_snapshot.providers.active_model.clone();
+        let summary = self.onboarding_completion_summary();
+        if let Some(shell) = self.onboarding_shell.as_mut() {
+            shell.note_completion_summary(summary);
+        }
+        if self.submit_after_model_selection {
+            match configured_model {
+                Some(active) => {
+                    if self.notify_active_model_selected(
+                        active,
+                        false,
+                        cockpit_proto::ActiveModelSwitchTrigger::Picker,
+                    ) {
+                        self.submit_after_model_selection = false;
+                        let _ = self.submit_input();
+                    }
+                }
+                None => {
+                    self.submit_after_model_selection = false;
+                    self.push_plain(
+                        "Your draft is still here; choose a model before sending.".to_string(),
+                    );
+                }
+            }
         }
     }
 

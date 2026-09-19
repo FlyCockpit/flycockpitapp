@@ -60,9 +60,7 @@ pub fn empty_chat_banner_app() -> App {
 pub fn spawn_error_app() -> App {
     let mut app = empty_chat_banner_app();
     let error = "daemon spawn failed: socket path too long; set COCKPIT_SOCKET_DIR".to_string();
-    app.show_blocking_toast(error.clone(), ToastKind::Error);
-    app.apply_session_setup_snapshot_error(error);
-    app.launch.provider_line = "Daemon failed to start".to_string();
+    app.apply_daemon_spawn_failure(&error);
     app
 }
 

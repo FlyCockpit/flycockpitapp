@@ -304,22 +304,34 @@ impl App {
             }
             Ok(_) => {
                 let error = "runner attach returned an unexpected payload".to_string();
-                if pending.latch_error {
+                let now = Instant::now();
+                let escalate = pending.latch_error
+                    || Self::should_escalate_display_attach_failure(
+                        &self.display_attach_backoff,
+                        &error,
+                        now,
+                    );
+                if escalate {
                     self.adopt_runner(Err(error.clone()));
+                    self.apply_daemon_spawn_failure(&error);
                 } else {
-                    self.display_attach_backoff.record_failure(Instant::now());
+                    self.display_attach_backoff.record_failure(now);
                 }
                 self.apply_runner_attach_failure(&pending.continuations, &error);
             }
             Err(error) => {
-                if pending.latch_error {
+                let now = Instant::now();
+                let escalate = pending.latch_error
+                    || Self::should_escalate_display_attach_failure(
+                        &self.display_attach_backoff,
+                        &error,
+                        now,
+                    );
+                if escalate {
                     self.adopt_runner(Err(error.clone()));
-                    self.show_blocking_toast(error.clone(), ToastKind::Error);
-                    self.apply_session_setup_snapshot_error(error.clone());
-                    // Banner chrome otherwise stays on the startup placeholder.
-                    self.launch.provider_line = "Daemon failed to start".to_string();
+                    self.apply_daemon_spawn_failure(&error);
                 } else {
-                    self.display_attach_backoff.record_failure(Instant::now());
+                    self.display_attach_backoff.record_failure(now);
                 }
                 self.apply_runner_attach_failure(&pending.continuations, &error);
             }
@@ -716,6 +728,14 @@ impl App {
 
     pub(super) fn reset_display_attach_backoff(&mut self) {
         self.display_attach_backoff.reset();
+    }
+
+    fn should_escalate_display_attach_failure(
+        backoff: &DisplayAttachBackoff,
+        error: &str,
+        now: Instant,
+    ) -> bool {
+        Self::is_daemon_spawn_boot_failure(error) || backoff.exceeded_startup_timeout(now)
     }
 
     /// Re-fetch the fresh-chat guidance estimate from the daemon at `socket`

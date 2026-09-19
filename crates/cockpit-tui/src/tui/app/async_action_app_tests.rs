@@ -119,6 +119,49 @@ fn latched_spawn_failure_shows_blocking_toast_and_clears_session_setup_loading()
 }
 
 #[test]
+fn display_attach_spawn_failure_escalates_without_latching_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = configured_app_body(&tmp);
+    seed_pending_runner_attach(
+        &mut app,
+        62,
+        vec![super::RunnerAttachContinuation::RetryRetainedSubmissions],
+    );
+
+    app.apply_runner_attach_result(
+        crate::tui::async_action::AsyncActionId::from_raw_for_test(62),
+        Err("daemon spawn failed: socket path too long; set COCKPIT_SOCKET_DIR".to_string()),
+    );
+
+    let toast = app.toast.as_ref().expect("blocking toast");
+    assert!(toast.persistent, "spawn errors must not auto-expire");
+    assert_eq!(toast.kind, super::ToastKind::Error);
+    assert!(
+        toast.text.contains("COCKPIT_SOCKET_DIR"),
+        "toast must show the first error line: {}",
+        toast.text
+    );
+    let pane = app
+        .session_setup_inline
+        .as_ref()
+        .expect("inline session setup");
+    let error = pane.error_message().expect("session setup error");
+    assert!(
+        error.contains("Daemon failed to start"),
+        "pane must use spawn-specific wording, got {error}"
+    );
+    assert!(
+        error.contains("COCKPIT_SOCKET_DIR"),
+        "pane must carry the spawn error, got {error}"
+    );
+    assert_eq!(app.launch.provider_line, "Daemon failed to start");
+    assert!(
+        matches!(app.agent_runner, Some(Err(_))),
+        "display attach spawn failure must latch the runner error"
+    );
+}
+
+#[test]
 fn attach_coalescing_retains_typed_model_and_btw_continuations() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = configured_app_body(&tmp);

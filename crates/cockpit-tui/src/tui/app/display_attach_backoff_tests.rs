@@ -2,6 +2,17 @@ use super::{DISPLAY_ATTACH_INITIAL_BACKOFF, DISPLAY_ATTACH_MAX_BACKOFF, DisplayA
 use std::time::{Duration, Instant};
 
 #[test]
+fn exceeded_startup_timeout_after_daemon_spawn_budget() {
+    let mut backoff = DisplayAttachBackoff::default();
+    let t0 = Instant::now();
+    backoff.record_failure(t0);
+    assert!(!backoff.exceeded_startup_timeout(
+        t0 + cockpit_core::daemon::DAEMON_SPAWN_TIMEOUT - Duration::from_millis(1)
+    ));
+    assert!(backoff.exceeded_startup_timeout(t0 + cockpit_core::daemon::DAEMON_SPAWN_TIMEOUT));
+}
+
+#[test]
 fn suppresses_repeated_attach_ticks_until_backoff_expires() {
     let mut backoff = DisplayAttachBackoff::default();
     let t0 = Instant::now();

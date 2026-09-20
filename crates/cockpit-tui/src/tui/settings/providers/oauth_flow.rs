@@ -1475,7 +1475,10 @@ fn render_provider_oauth(
     mut controls: Option<&mut Vec<(usize, usize)>>,
 ) {
     let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
-    let yellow = Style::default().fg(Color::Yellow);
+    let yellow = Style::default().fg(resolve_color(
+        crate::tui::theme::BRASS,
+        crate::tui::theme::BRASS_INDEX,
+    ));
     let green = Style::default().fg(Color::Green);
     let red = Style::default().fg(Color::Red);
     let cyan = Style::default().fg(Color::Cyan);
@@ -1539,7 +1542,10 @@ fn render_provider_oauth(
             let style = if i == cursor {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(resolve_color(
+                    crate::tui::theme::INK,
+                    crate::tui::theme::INK_INDEX,
+                ))
             };
             if let Some(controls) = controls.as_deref_mut() {
                 controls.push((lines.len(), i));
@@ -1576,7 +1582,10 @@ fn render_provider_oauth(
         let style = if i == cursor {
             yellow.add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(resolve_color(
+                crate::tui::theme::INK,
+                crate::tui::theme::INK_INDEX,
+            ))
         };
         if let Some(controls) = controls.as_deref_mut() {
             controls.push((lines.len(), i));

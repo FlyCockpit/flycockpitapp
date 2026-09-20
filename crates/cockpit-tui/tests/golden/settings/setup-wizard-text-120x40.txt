@@ -1,0 +1,40 @@
+                                                                                                               ● Working
+ ◆ Cockpit             [Hide] ⎇ /tmp/project                                                               [Setup: Code]
+                              ──────────────────────────────────────────────────────────────────────────────────────────
+  + New session               ▌Restyle the complete transcript surface.                           [Pin] [Fork]  08:45  │
+                              ▌ Continue with every transcript element.                                                │
+ SESSIONS                                                                                                              │
+ no active sessions in all pr   ▸ You                                                                                  │
+                                Prioritize the transcript chrome.                                                      │
+                              note to self                                                                      08:45  │
+                              ┊ Keep product-only transcript variants.                                                 │
+                              ▌ Agent╭ What should Cockpit call you? ───────────────────────────────────────────╮8:45  │
+                                Model│Set an optional display name                                              │      █
+                                TTFT │                                                                          │      █
+                                TPS  │Your name (leave blank to skip)                                           │      █
+                                Cache│This stays in your global Cockpit config and can be changed later.        │      █
+                                ▾ Tho│                                                                          │      █
+                                Map e│╭ Value ─────────────────────────────────────────────────────────────────╮│      █
+                                The o││ ameliaA                                                                ││      █
+                                     │╰────────────────────────────────────────────────────────────────────────╯│      █
+                                ▸ rea│                                                                          │      █
+                                     │                                                                          │      █
+                                ─ exp│                                                                          │      █
+                              ▌ inter│                                                                          │      █
+                              ▌ Inter│                                                                          │      █
+                                     │                                                                          │      █
+                              ▌ backg│                                                                          │      █
+                                Backg│                                                                          │      █
+                                     │                                                                          │      █
+                                ◇ Edi│↑/↓  space: toggle  enter: continue  esc: close    [ Cancel ] [ Continue ]│      █
+                                │ - o╰──────────────────────────────────────────────────────────────────────────╯      █
+                                │ + new line                                                                           █
+                                │   shared line                                                                        █
+                               ⋯ Compacted from abc123 · auto · ctx 82.0% · 9000→2400 tokens · 6 turns · tail 2/1 ·  ⋯ █
+                                                               ⋯ 2 seed tools (~42) ⋯                                  █
+                                [show summary]                                                                         █
+                                                                                                                       █
+                              ▌ Agent                                                                           08:45  █
+ ● working  ● waiting  ● done   Thinking                                                                               █
+                                Check the final visual hierarchy.                                                      █
+                                Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

@@ -197,7 +197,10 @@ impl SettingsCx {
 
     pub(super) fn render_skills_page(&self, frame: &mut Frame, area: Rect, p: &SkillsPage) {
         let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
-        let yellow = Style::default().fg(Color::Yellow);
+        let yellow = Style::default().fg(resolve_color(
+            crate::tui::theme::BRASS,
+            crate::tui::theme::BRASS_INDEX,
+        ));
         let mut lines: Vec<Line<'static>> = vec![
             Line::from(Span::styled(
                 "Skills".to_string(),
@@ -226,7 +229,10 @@ impl SettingsCx {
         let toggle_label_style = if toggle_on_cursor {
             yellow.add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(resolve_color(
+                crate::tui::theme::INK,
+                crate::tui::theme::INK_INDEX,
+            ))
         };
         let toggle_value = if self.extended.skills.auto_bang_commands {
             "Claude mode (run inline !`command`; output scrubbed)"
@@ -235,6 +241,10 @@ impl SettingsCx {
         };
         lines.push(Line::from(vec![
             Span::raw(toggle_marker),
+            crate::tui::chrome::check_mark(
+                self.extended.skills.auto_bang_commands,
+                toggle_on_cursor,
+            ),
             Span::styled("auto-! commands  ", toggle_label_style),
             Span::styled(toggle_value.to_string(), muted),
         ]));
@@ -250,7 +260,10 @@ impl SettingsCx {
         let walk_label_style = if walk_on_cursor {
             yellow.add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(resolve_color(
+                crate::tui::theme::INK,
+                crate::tui::theme::INK_INDEX,
+            ))
         };
         let walk_value = if self.extended.skills.ancestor_walk {
             "on (relative entries also scan ancestors up to the git root)"
@@ -259,6 +272,7 @@ impl SettingsCx {
         };
         lines.push(Line::from(vec![
             Span::raw(walk_marker),
+            crate::tui::chrome::check_mark(self.extended.skills.ancestor_walk, walk_on_cursor),
             Span::styled("ancestor walk    ", walk_label_style),
             Span::styled(walk_value.to_string(), muted),
         ]));
@@ -303,7 +317,10 @@ impl SettingsCx {
             let style = if on_cursor {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(resolve_color(
+                    crate::tui::theme::INK,
+                    crate::tui::theme::INK_INDEX,
+                ))
             };
             lines.push(Line::from(vec![
                 Span::raw(marker),

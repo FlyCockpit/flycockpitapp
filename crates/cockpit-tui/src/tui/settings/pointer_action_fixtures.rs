@@ -399,6 +399,7 @@ fixture_enum!(WizardPayloadControlKey {
     ContinueHeaders,
     CopilotContinue,
     DoneContinue,
+    Continue,
     EditText
 });
 
@@ -435,6 +436,7 @@ fn wizard_payload_key(control: &WizardControlId) -> WizardPayloadControlKey {
         WizardControlId::ContinueHeaders => WizardPayloadControlKey::ContinueHeaders,
         WizardControlId::CopilotContinue => WizardPayloadControlKey::CopilotContinue,
         WizardControlId::DoneContinue => WizardPayloadControlKey::DoneContinue,
+        WizardControlId::Continue => WizardPayloadControlKey::Continue,
         WizardControlId::EditText => WizardPayloadControlKey::EditText,
     }
 }
@@ -1040,6 +1042,7 @@ enum WizardControlKind {
     ContinueHeaders,
     CopilotContinue,
     DoneContinue,
+    Continue,
     EditText,
 }
 
@@ -1061,6 +1064,7 @@ fn wizard_control_kind(control: &WizardControlId) -> WizardControlKind {
         WizardControlId::ContinueHeaders => WizardControlKind::ContinueHeaders,
         WizardControlId::CopilotContinue => WizardControlKind::CopilotContinue,
         WizardControlId::DoneContinue => WizardControlKind::DoneContinue,
+        WizardControlId::Continue => WizardControlKind::Continue,
         WizardControlId::EditText => WizardControlKind::EditText,
     }
 }
@@ -1105,7 +1109,7 @@ fn wizard_key(step: ProviderWizardStep, control: &WizardControlId) -> ProvidersF
         {
             ProvidersFixture::WizardAuthCopyDetectedEnv
         }
-        ProviderWizardStep::ApiKey if matches!(control, WizardControlKind::EditText) => {
+        ProviderWizardStep::ApiKey if matches!(control, WizardControlKind::Continue) => {
             ProvidersFixture::WizardApiKeyEdit
         }
         ProviderWizardStep::EnvVar if matches!(control, WizardControlKind::EditText) => {

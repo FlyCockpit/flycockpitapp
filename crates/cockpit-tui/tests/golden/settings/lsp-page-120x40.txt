@@ -2,9 +2,9 @@
  ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › LSP ────────────────────────────╮e]
                               ──│[Close settings]  [Back]                                                            │──
   + New session               ▌R│╭ Options ─────────────────────────────────────────────────────────────────────────╮│ │
-                              ▌ ││› enabled                 on                                                      ││ │
+                              ▌ ││› ▣ enabled               on                                                      ││ │
  SESSIONS                       ││  auto install            ask                                                     ││ │
- no active sessions in all pr   ││  diagnostics             on                                                      ││ │
+ no active sessions in all pr   ││  ▣ diagnostics           on                                                      ││ │
                                 ││  other files limit       5                                                       ││ │
                               no││  per-file limit          20                                                      ││ │
                               ┊ ││  severity                error (errors only)                                     ││ │

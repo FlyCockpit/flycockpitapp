@@ -3959,7 +3959,7 @@ impl SettingsCx {
                     let before = lines.len();
                     push_wrapped_text(
                         &mut lines,
-                        settings_area.width,
+                        crate::tui::chrome::scrollbar_content(settings_area).width,
                         heading.blurb,
                         muted_style(),
                     );

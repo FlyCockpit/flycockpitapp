@@ -1629,22 +1629,6 @@ impl SettingsPage for BudgetEditorPage {
                 "  USD 1/request, USD 10/session, USD 100/project-month".into(),
                 None,
             ));
-            rows.push((
-                "[Save]".into(),
-                Some((
-                    GenerationAction::SaveBudget,
-                    self.authority_loaded && !self.save_pending,
-                    if self.authority_loaded {
-                        self.save_pending.then_some("save_pending")
-                    } else {
-                        Some("authoritative_policy_unavailable")
-                    },
-                )),
-            ));
-            rows.push((
-                "[Cancel]".into(),
-                Some((GenerationAction::Cancel, true, None)),
-            ));
             if let Some(status) = &self.status {
                 rows.push((String::new(), None));
                 rows.push((status.clone(), None));
@@ -1662,6 +1646,26 @@ impl SettingsPage for BudgetEditorPage {
     }
     fn title(&self, _cx: &SettingsCx) -> String {
         "Budget".to_owned()
+    }
+
+    fn help_row_actions(&self, _cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        super::shell::finish_help_row(
+            _cx,
+            vec![
+                super::shell::SettingsHelpAction {
+                    label: "Cancel",
+                    enabled: true,
+                    primary: false,
+                    action: SettingsPointerAction::Generation(GenerationAction::Cancel),
+                },
+                super::shell::SettingsHelpAction {
+                    label: "Save",
+                    enabled: self.authority_loaded && !self.save_pending,
+                    primary: true,
+                    action: SettingsPointerAction::Generation(GenerationAction::SaveBudget),
+                },
+            ],
+        )
     }
     fn help_text(&self, _cx: &SettingsCx) -> &'static str {
         "↑/↓: navigate  ctrl+s: save  h/esc: back"

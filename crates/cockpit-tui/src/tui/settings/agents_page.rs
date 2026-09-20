@@ -4054,7 +4054,10 @@ impl SettingsCx {
         }
 
         let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
-        let yellow = Style::default().fg(Color::Yellow);
+        let yellow = Style::default().fg(resolve_color(
+            crate::tui::theme::BRASS,
+            crate::tui::theme::BRASS_INDEX,
+        ));
         let red = Style::default().fg(Color::Red);
         let cyan = Style::default().fg(Color::Cyan);
 
@@ -4085,7 +4088,10 @@ impl SettingsCx {
             let name_style = if on_cursor {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(resolve_color(
+                    crate::tui::theme::INK,
+                    crate::tui::theme::INK_INDEX,
+                ))
             };
             let tag = match row.kind {
                 AgentKind::Builtin { overridden: true } => " (built-in, overridden)",

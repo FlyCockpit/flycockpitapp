@@ -11,7 +11,7 @@
 //!   - the corresponding handlers + renderers on [`SettingsDialog`]
 //!     (multiple `impl` blocks across this file and `mod.rs`)
 //!   - provider-only free helpers (`render_header_editor`,
-//!     `render_field_row`, `valid_url`, `valid_id`,
+//!     `valid_url`, `valid_id`,
 //!     `render_copilot_body`).
 
 mod deepfetch;
@@ -55,7 +55,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::tui::settings::provider_entries_equal;
 use crate::tui::textfield::TextField;
-use crate::tui::theme::{FOG, FOG_INDEX, INK, INK_INDEX, resolve_color};
+use crate::tui::theme::{BRASS, BRASS_INDEX, FOG, FOG_INDEX, INK, INK_INDEX, resolve_color};
 use cockpit_config::providers::{
     HeaderSpec, ModelEntry, ModelFetchStatusKind, ModelMergePolicy, OnUnlistedModelsFetch,
     ProviderEntry, ProviderModelCatalog, WireApi, format_model_fetch_age,
@@ -76,7 +76,7 @@ use super::settings_editor::{SettingsEditor, SettingsResult};
 use super::shell::{
     SettingsControlId, SettingsScrollRegionId, push_wrapped_text, selected_line_from_marker,
 };
-use super::{Nav, SettingsCx, SettingsDialog, SettingsPage, save_button_line};
+use super::{Nav, SettingsCx, SettingsDialog, SettingsPage};
 #[cfg(test)]
 use super::{Page, TestPageRef};
 
@@ -193,6 +193,20 @@ fn provider_catalog_suffix(catalog: ProviderModelCatalog) -> &'static str {
         ProviderModelCatalog::Live => "",
         ProviderModelCatalog::CodexFallback => " · fallback catalog active",
     }
+}
+
+fn reserve_provider_field<'a>(
+    lines: &mut Vec<Line<'static>>,
+    fields: &mut Vec<(usize, &'static str, &'a TextField, bool, &'static str)>,
+    title: &'static str,
+    field: &'a TextField,
+    focused: bool,
+    placeholder: &'static str,
+) -> usize {
+    let line = lines.len();
+    lines.extend([Line::default(), Line::default(), Line::default()]);
+    fields.push((line, title, field, focused, placeholder));
+    line
 }
 
 fn provider_catalog_suffix_for_entry(entry: &ProviderEntry) -> String {
@@ -3389,7 +3403,7 @@ impl SettingsCx {
         let button_selected = cursor == 0;
         let button_style = if button_selected {
             Style::default()
-                .fg(Color::Yellow)
+                .fg(resolve_color(BRASS, BRASS_INDEX))
                 .add_modifier(Modifier::BOLD)
         } else {
             muted
@@ -3450,10 +3464,10 @@ impl SettingsCx {
                     red.add_modifier(Modifier::BOLD)
                 } else if row == cursor {
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(resolve_color(BRASS, BRASS_INDEX))
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(resolve_color(INK, INK_INDEX))
                 };
                 let model_count = format!("{} models", entry.models.len());
                 bindings.push((
@@ -3521,7 +3535,7 @@ impl SettingsCx {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
                 msg.to_string(),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(resolve_color(BRASS, BRASS_INDEX)),
             )));
         }
         let selected_line = selected_line_from_marker(&lines);
@@ -3691,10 +3705,14 @@ impl SettingsCx {
             super::pointer_acceptance_tests::record_rendered_wizard_step(step);
         }
         let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
-        let yellow = Style::default().fg(Color::Yellow);
+        let yellow = Style::default().fg(resolve_color(
+            crate::tui::theme::BRASS,
+            crate::tui::theme::BRASS_INDEX,
+        ));
         let red = Style::default().fg(Color::Red);
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut controls = Vec::new();
+        let mut fields = Vec::new();
 
         if s.is_step("api-key") {
             self.render_add_api_key_step(frame, area, s);
@@ -3712,11 +3730,14 @@ impl SettingsCx {
                 for (i, t) in ordered.iter().enumerate() {
                     let marker = if i == s.template_cursor { "› " } else { "  " };
                     let style = if t.is_disabled() {
-                        muted.add_modifier(Modifier::DIM)
+                        Style::default().fg(resolve_color(
+                            crate::tui::theme::DISABLED,
+                            crate::tui::theme::DISABLED_INDEX,
+                        ))
                     } else if i == s.template_cursor {
                         yellow.add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::White)
+                        Style::default().fg(resolve_color(INK, INK_INDEX))
                     };
                     controls.push((lines.len(), i));
                     lines.push(Line::from(vec![
@@ -3759,7 +3780,7 @@ impl SettingsCx {
                     let style = if index == s.wire_api_cursor {
                         yellow.add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::White)
+                        Style::default().fg(resolve_color(INK, INK_INDEX))
                     };
                     controls.push((lines.len(), index));
                     lines.push(Line::from(vec![
@@ -3774,11 +3795,28 @@ impl SettingsCx {
                 let t = s.template.expect("template chosen");
                 lines.push(Line::from(vec![
                     Span::styled("Template: ", muted),
-                    Span::styled(t.display.to_string(), Style::default().fg(Color::White)),
+                    Span::styled(
+                        t.display.to_string(),
+                        Style::default().fg(resolve_color(INK, INK_INDEX)),
+                    ),
                 ]));
                 lines.push(Line::default());
-                let id_line = render_field_row(&mut lines, "id", &s.id_field, s.is_step("id"));
-                let url_line = render_field_row(&mut lines, "url", &s.url_field, s.is_step("url"));
+                let id_line = reserve_provider_field(
+                    &mut lines,
+                    &mut fields,
+                    "Provider ID",
+                    &s.id_field,
+                    s.is_step("id"),
+                    "provider-id",
+                );
+                let url_line = reserve_provider_field(
+                    &mut lines,
+                    &mut fields,
+                    "Base URL",
+                    &s.url_field,
+                    s.is_step("url"),
+                    "https://api.example.com",
+                );
                 if s.is_step("id") {
                     controls.push((id_line, 0));
                 } else if s.is_step("url") {
@@ -3815,7 +3853,7 @@ impl SettingsCx {
                         let style = if index == s.auth_method_cursor {
                             yellow.add_modifier(Modifier::BOLD)
                         } else {
-                            Style::default().fg(Color::White)
+                            Style::default().fg(resolve_color(INK, INK_INDEX))
                         };
                         controls.push((lines.len(), index));
                         lines.push(Line::from(vec![
@@ -3842,7 +3880,14 @@ impl SettingsCx {
                 }
                 if s.is_step("env-var") {
                     lines.push(Line::default());
-                    let line = render_field_row(&mut lines, "env var", &s.env_var_field, true);
+                    let line = reserve_provider_field(
+                        &mut lines,
+                        &mut fields,
+                        "Environment variable",
+                        &s.env_var_field,
+                        true,
+                        "API_KEY",
+                    );
                     controls.push((line, 0));
                 }
                 if s.is_step("headers") {
@@ -3871,21 +3916,24 @@ impl SettingsCx {
                 let t = s.template.expect("template chosen");
                 lines.push(Line::from(vec![
                     Span::styled("Template: ", muted),
-                    Span::styled(t.display.to_string(), Style::default().fg(Color::White)),
+                    Span::styled(
+                        t.display.to_string(),
+                        Style::default().fg(resolve_color(INK, INK_INDEX)),
+                    ),
                 ]));
                 lines.push(Line::default());
                 lines.push(Line::from(vec![
                     Span::styled("id:  ", muted),
                     Span::styled(
                         s.id_field.text().to_string(),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(resolve_color(INK, INK_INDEX)),
                     ),
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled("API url: ", muted),
                     Span::styled(
                         s.url_field.text().to_string(),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(resolve_color(INK, INK_INDEX)),
                     ),
                 ]));
                 lines.push(Line::default());
@@ -3922,7 +3970,10 @@ impl SettingsCx {
                 let t = s.template.expect("template chosen");
                 lines.push(Line::from(vec![
                     Span::styled("Template: ", muted),
-                    Span::styled(t.display.to_string(), Style::default().fg(Color::White)),
+                    Span::styled(
+                        t.display.to_string(),
+                        Style::default().fg(resolve_color(INK, INK_INDEX)),
+                    ),
                 ]));
                 lines.push(Line::default());
                 controls.extend(render_oauth_body_with_controls(
@@ -3990,6 +4041,33 @@ impl SettingsCx {
             )
                 .into(),
         );
+        let offset = self.scroll_states.offset_for("providers:add");
+        for (line, title, field, focused, placeholder) in fields {
+            let y = area.y.saturating_add(line.saturating_sub(offset) as u16);
+            if line < offset || y >= area.bottom() {
+                continue;
+            }
+            let rect = Rect::new(
+                area.x,
+                y,
+                area.width,
+                3.min(area.bottom().saturating_sub(y)),
+            );
+            if let Some(caret) =
+                crate::tui::chrome::render_field(frame, rect, title, field, focused, placeholder)
+            {
+                frame.set_cursor_position(caret);
+            }
+            if let Some(action) = provider_add_pointer_action(s, 0) {
+                self.pointer_surface
+                    .register(super::shell::SettingsPointerTarget {
+                        rect,
+                        action: super::shell::SettingsPointerAction::Page(action),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+            }
+        }
         if let Some(links) = links {
             register_visible_link_regions(
                 links,
@@ -4055,70 +4133,23 @@ impl SettingsCx {
     }
 
     fn render_add_api_key_step(&self, frame: &mut Frame, area: Rect, s: &AddState) {
-        use ratatui::layout::{Constraint, Layout};
         let t = s.template.expect("template chosen");
-        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
-        let (title, subtitle) = crate::tui::onboarding::provider_api_key_copy(t);
-        let layout = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(3),
-            Constraint::Min(1),
-        ])
-        .split(area);
-        frame.render_widget(
-            Line::from(Span::styled(
-                title.to_string(),
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            layout[0],
-        );
-        frame.render_widget(Line::from(Span::styled(subtitle, muted)), layout[1]);
-        frame.render_widget(
-            Line::from(vec![
-                Span::styled("Template: ", muted),
-                Span::styled(
-                    t.display.to_string(),
-                    Style::default().fg(resolve_color(INK, INK_INDEX)),
-                ),
-            ]),
-            layout[2],
-        );
-        if let Some(caret) = crate::tui::chrome::render_field_masked(
-            frame,
-            layout[3],
-            "API key",
-            s.api_key_field.as_ref(),
-            true,
-            "Paste API key",
-            true,
-        ) {
-            frame.set_cursor_position(caret);
-        }
+        let mut screen = crate::tui::onboarding::AuthScreen::new(t);
+        let field_rect = screen.render_api_key_external(frame, area, s.api_key_field.as_ref());
         if let Some(action) = provider_add_pointer_action(s, 0) {
             self.pointer_surface
                 .register(super::shell::SettingsPointerTarget {
-                    rect: layout[3],
+                    rect: field_rect,
                     action: super::shell::SettingsPointerAction::Page(action),
                     enabled: true,
                     disabled_reason: None,
                 });
         }
-        if let Some(meta) = t.api_key {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    format!("Hint: {} · {}", meta.format_hint, meta.console_url),
-                    muted,
-                ))),
-                layout[4],
-            );
-        }
     }
 
     fn render_edit(&self, frame: &mut Frame, area: Rect, s: &EditState) {
         let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
-        let yellow = Style::default().fg(Color::Yellow);
+        let yellow = Style::default().fg(resolve_color(BRASS, BRASS_INDEX));
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut bindings = Vec::new();
 
@@ -4233,7 +4264,7 @@ impl SettingsCx {
             let style = if selected {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(resolve_color(INK, INK_INDEX))
             };
             lines.push(Line::from(vec![
                 Span::raw(marker),
@@ -4282,7 +4313,7 @@ impl SettingsCx {
                 Span::styled(prompt.to_string(), muted),
                 Span::styled(
                     s.field_buf.text().to_string(),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(resolve_color(INK, INK_INDEX)),
                 ),
             ]));
         }
@@ -4347,7 +4378,7 @@ impl SettingsCx {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
                 status.clone(),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(resolve_color(BRASS, BRASS_INDEX)),
             )));
         }
         let selected_line = selected_line_from_marker(&lines);
@@ -4456,7 +4487,7 @@ impl SettingsCx {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
                 status.clone(),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(resolve_color(BRASS, BRASS_INDEX)),
             )));
         }
         let selected_line = selected_line_from_marker(&lines);
@@ -4490,7 +4521,7 @@ impl SettingsCx {
         parent: &EditState,
     ) {
         let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
-        let yellow = Style::default().fg(Color::Yellow);
+        let yellow = Style::default().fg(resolve_color(BRASS, BRASS_INDEX));
         let scope_label = match &editor.scope {
             super::settings_editor::SettingsScope::Model { model_id } => {
                 format!("{} › {}", parent.provider_id, model_id)
@@ -4522,13 +4553,13 @@ impl SettingsCx {
             let label_style = if selected {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(resolve_color(INK, INK_INDEX))
             };
             let overridden = editor.is_overridden(*field);
             let value_style = if !overridden {
                 muted
             } else if selected {
-                Style::default().fg(Color::White)
+                Style::default().fg(resolve_color(INK, INK_INDEX))
             } else {
                 muted
             };
@@ -4773,7 +4804,7 @@ impl SettingsCx {
 
     fn render_fetch_all(&self, frame: &mut Frame, area: Rect, s: &FetchAllState) {
         let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
-        let yellow = Style::default().fg(Color::Yellow);
+        let yellow = Style::default().fg(resolve_color(BRASS, BRASS_INDEX));
         let green = Style::default().fg(Color::Green);
         let red = Style::default().fg(Color::Red);
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -4837,7 +4868,7 @@ impl SettingsCx {
             let style = if i == s.cursor {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(resolve_color(INK, INK_INDEX))
             };
             bindings.push((
                 lines.len(),
@@ -4858,7 +4889,7 @@ impl SettingsCx {
         let style = if s.cursor == 2 {
             yellow.add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(resolve_color(INK, INK_INDEX))
         };
         bindings.push((
             lines.len(),
@@ -4887,7 +4918,7 @@ impl SettingsCx {
 
     fn render_fetch_one_prompt(&self, frame: &mut Frame, area: Rect, s: &FetchOnePromptState) {
         let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
-        let yellow = Style::default().fg(Color::Yellow);
+        let yellow = Style::default().fg(resolve_color(BRASS, BRASS_INDEX));
         let mut lines: Vec<Line<'static>> = Vec::new();
 
         lines.push(Line::from(Span::styled(
@@ -4917,7 +4948,7 @@ impl SettingsCx {
             let style = if i == s.cursor {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(resolve_color(INK, INK_INDEX))
             };
             bindings.push((
                 lines.len(),
@@ -4951,7 +4982,7 @@ impl SettingsCx {
         let style = if s.cursor == 2 {
             yellow.add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(resolve_color(INK, INK_INDEX))
         };
         bindings.push((
             lines.len(),
@@ -4985,7 +5016,7 @@ impl SettingsCx {
         s: &FetchFallbackPromptState,
     ) {
         let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
-        let yellow = Style::default().fg(Color::Yellow);
+        let yellow = Style::default().fg(resolve_color(BRASS, BRASS_INDEX));
         let mut lines: Vec<Line<'static>> = Vec::new();
 
         lines.push(Line::from(Span::styled(
@@ -5009,7 +5040,7 @@ impl SettingsCx {
             let style = if i == s.cursor {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(resolve_color(INK, INK_INDEX))
             };
             let choice = match i {
                 0 => super::pointer_actions::FetchFallbackChoice::Retry,
@@ -5064,7 +5095,7 @@ fn render_header_editor(
     h: &HeaderEditor,
 ) -> Vec<(usize, SettingsControlId)> {
     let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
-    let yellow = Style::default().fg(Color::Yellow);
+    let yellow = Style::default().fg(resolve_color(BRASS, BRASS_INDEX));
     let mut bindings = Vec::new();
     lines.push(Line::from(Span::styled(
         "Headers:".to_string(),
@@ -5084,7 +5115,7 @@ fn render_header_editor(
         let name_style = if cursor_here {
             yellow.add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(resolve_color(INK, INK_INDEX))
         };
         bindings.push((lines.len(), SettingsControlId(i as u64)));
         lines.push(Line::from(vec![
@@ -5141,13 +5172,14 @@ fn provider_header_pointer_action(
 /// doesn't bleed through.
 fn render_header_edit_popup(cx: &SettingsCx, frame: &mut Frame, area: Rect, h: &HeaderEditor) {
     let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
-    let yellow = Style::default().fg(Color::Yellow);
+    let yellow = Style::default().fg(resolve_color(
+        crate::tui::theme::BRASS,
+        crate::tui::theme::BRASS_INDEX,
+    ));
 
     let name_focus = matches!(h.mode, HeaderMode::EditName);
 
     let mut body: Vec<Line<'static>> = Vec::new();
-    render_field_row(&mut body, "Name ", &h.name_buf, name_focus);
-    render_field_row(&mut body, "Value", &h.value_buf, !name_focus);
 
     // Dynamic-reference status for the value (headers commonly reference
     // `$VAR` or `$secret:<name>`).  This is deliberately syntax-only: the
@@ -5231,13 +5263,43 @@ fn render_header_edit_popup(cx: &SettingsCx, frame: &mut Frame, area: Rect, h: &
         " Add header "
     };
     let width = area.width.saturating_sub(6).clamp(24, 70);
-    let height = (body.len() as u16) + 2; // +2 for the top/bottom border
+    let height = (body.len() as u16) + 8; // two three-row fields + borders
     let rect = centered_rect(area, width, height);
     let block = crate::tui::chrome::rounded_block(title, true);
     let inner = block.inner(rect);
     frame.render_widget(Clear, rect);
     frame.render_widget(block, rect);
-    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), inner);
+    let name_rect = Rect::new(inner.x, inner.y, inner.width, 3);
+    let value_rect = Rect::new(inner.x, inner.y.saturating_add(3), inner.width, 3);
+    if let Some(caret) = crate::tui::chrome::render_field(
+        frame,
+        name_rect,
+        "Name",
+        &h.name_buf,
+        name_focus,
+        "Header name",
+    ) {
+        frame.set_cursor_position(caret);
+    }
+    if let Some(caret) = crate::tui::chrome::render_field(
+        frame,
+        value_rect,
+        "Value",
+        &h.value_buf,
+        !name_focus,
+        "Header value",
+    ) {
+        frame.set_cursor_position(caret);
+    }
+    frame.render_widget(
+        Paragraph::new(body).wrap(Wrap { trim: false }),
+        Rect::new(
+            inner.x,
+            inner.y.saturating_add(6),
+            inner.width,
+            inner.height.saturating_sub(6),
+        ),
+    );
 }
 
 /// Render a [`ModelEditor`] as rows + `[+ add model]`. Each row shows the
@@ -5248,7 +5310,7 @@ fn render_model_editor(
     m: &ModelEditor,
 ) -> Vec<(usize, SettingsControlId)> {
     let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
-    let yellow = Style::default().fg(Color::Yellow);
+    let yellow = Style::default().fg(resolve_color(BRASS, BRASS_INDEX));
     let green = Style::default().fg(Color::Green);
     let mut bindings = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -5274,7 +5336,7 @@ fn render_model_editor(
             let id_style = if cursor_here {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(resolve_color(INK, INK_INDEX))
             };
             let tag = if row.manual { "M" } else { " " };
             let mut detail = row.name.clone().unwrap_or_default();
@@ -5345,7 +5407,7 @@ fn render_model_fetch_status_block(
         cockpit_config::providers::ProviderModelFetchDisplayState::Fallback
         | cockpit_config::providers::ProviderModelFetchDisplayState::Preserved
         | cockpit_config::providers::ProviderModelFetchDisplayState::Unsupported => {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(resolve_color(BRASS, BRASS_INDEX))
         }
         cockpit_config::providers::ProviderModelFetchDisplayState::Failed
         | cockpit_config::providers::ProviderModelFetchDisplayState::AuthFailed => {
@@ -5383,19 +5445,6 @@ fn render_model_edit_popup(frame: &mut Frame, area: Rect, m: &ModelEditor) {
     let red = Style::default().fg(Color::Red);
 
     let mut body: Vec<Line<'static>> = Vec::new();
-    render_field_row(&mut body, "Id     ", &m.id_buf, m.focus == ModelField::Id);
-    render_field_row(
-        &mut body,
-        "Name   ",
-        &m.name_buf,
-        m.focus == ModelField::Name,
-    );
-    render_field_row(
-        &mut body,
-        "Context",
-        &m.context_buf,
-        m.focus == ModelField::Context,
-    );
     body.push(Line::default());
     if let Some(status) = &m.status {
         body.push(Line::from(Span::styled(format!("  {status}"), red)));
@@ -5416,13 +5465,55 @@ fn render_model_edit_popup(frame: &mut Frame, area: Rect, m: &ModelEditor) {
         " Add model "
     };
     let width = area.width.saturating_sub(6).clamp(24, 70);
-    let height = (body.len() as u16) + 2; // +2 for the top/bottom border
+    let height = (body.len() as u16) + 11; // three three-row fields + borders
     let rect = centered_rect(area, width, height);
     let block = crate::tui::chrome::rounded_block(title, true);
     let inner = block.inner(rect);
     frame.render_widget(Clear, rect);
     frame.render_widget(block, rect);
-    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), inner);
+    let id_rect = Rect::new(inner.x, inner.y, inner.width, 3);
+    let name_rect = Rect::new(inner.x, inner.y.saturating_add(3), inner.width, 3);
+    let context_rect = Rect::new(inner.x, inner.y.saturating_add(6), inner.width, 3);
+    let mut caret = None;
+    caret = crate::tui::chrome::render_field(
+        frame,
+        id_rect,
+        "ID",
+        &m.id_buf,
+        m.focus == ModelField::Id,
+        "model-id",
+    )
+    .or(caret);
+    caret = crate::tui::chrome::render_field(
+        frame,
+        name_rect,
+        "Name",
+        &m.name_buf,
+        m.focus == ModelField::Name,
+        "Display name",
+    )
+    .or(caret);
+    caret = crate::tui::chrome::render_field(
+        frame,
+        context_rect,
+        "Context",
+        &m.context_buf,
+        m.focus == ModelField::Context,
+        "Tokens",
+    )
+    .or(caret);
+    if let Some(caret) = caret {
+        frame.set_cursor_position(caret);
+    }
+    frame.render_widget(
+        Paragraph::new(body).wrap(Wrap { trim: false }),
+        Rect::new(
+            inner.x,
+            inner.y.saturating_add(9),
+            inner.width,
+            inner.height.saturating_sub(9),
+        ),
+    );
 }
 
 /// A `width`×`height` rect centered within `area`, clamped to fit.
@@ -5437,47 +5528,6 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
         width,
         height,
     }
-}
-
-fn render_field_row(
-    lines: &mut Vec<Line<'static>>,
-    label: &str,
-    field: &TextField,
-    active: bool,
-) -> usize {
-    let line = lines.len();
-    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
-    let value_style = if active {
-        Style::default().fg(Color::White)
-    } else {
-        muted
-    };
-    let marker = if active { "› " } else { "  " };
-    let mut spans = vec![
-        Span::raw(marker),
-        Span::styled(
-            format!("{label}: "),
-            if active {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                muted
-            },
-        ),
-    ];
-    if active {
-        let text = field.text();
-        let cursor = cockpit_host::text::floor_char_boundary(text, field.cursor());
-        let (before, after) = text.split_at(cursor);
-        spans.push(Span::styled(before.to_string(), value_style));
-        spans.push(super::shell::cursor_marker_span());
-        spans.push(Span::styled(after.to_string(), value_style));
-    } else {
-        spans.push(Span::styled(field.text().to_string(), value_style));
-    }
-    lines.push(Line::from(spans));
-    line
 }
 
 /// Build the `ProvidersPage` for `/model-settings`: the active model's
@@ -5621,10 +5671,16 @@ fn provider_add_pointer_action(
                 return None;
             }
         }
-        WizardStepId::ProviderId
-        | WizardStepId::Url
-        | WizardStepId::ApiKey
-        | WizardStepId::EnvVar => WizardControlId::EditText,
+        WizardStepId::ProviderId | WizardStepId::Url | WizardStepId::EnvVar => {
+            WizardControlId::EditText
+        }
+        WizardStepId::ApiKey => {
+            if index == 0 {
+                WizardControlId::Continue
+            } else {
+                return None;
+            }
+        }
         WizardStepId::CopyDetectedEnv => return None,
         WizardStepId::CopilotAuth => (index == 0).then_some(WizardControlId::CopilotContinue)?,
         WizardStepId::Done => (index == 0).then_some(WizardControlId::DoneContinue)?,
@@ -6660,7 +6716,7 @@ impl SettingsPage for ProvidersPage {
                     primary: true,
                     action: SettingsPointerAction::Providers(ProvidersAction::WizardControl(
                         WizardStepId::ApiKey,
-                        WizardControlId::EditText,
+                        WizardControlId::Continue,
                     )),
                 });
                 actions.push(super::shell::SettingsHelpAction {

@@ -1208,6 +1208,19 @@ mod seed_tests {
     }
 
     #[test]
+    fn golden_setup_wizard_text() {
+        let _env = isolate_render_env();
+        let mut app = transcript_fixture_app();
+        app.dialog = crate::tui::settings::golden_setup_wizard_text();
+        app.dialog.handle_key(KeyEvent::new(
+            KeyCode::Char('A'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let buffer = render_app(&mut app, 120, 40);
+        crate::tui::golden::assert_golden("settings", "setup-wizard-text", 120, 40, &buffer);
+    }
+
+    #[test]
     fn golden_shell_chrome() {
         let _env = isolate_render_env();
         assert_shell_chrome();

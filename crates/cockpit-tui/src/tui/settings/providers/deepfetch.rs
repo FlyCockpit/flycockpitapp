@@ -441,7 +441,10 @@ impl SettingsCx {
         state: &DeepFetchState,
     ) {
         let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
-        let yellow = Style::default().fg(Color::Yellow);
+        let yellow = Style::default().fg(resolve_color(
+            crate::tui::theme::BRASS,
+            crate::tui::theme::BRASS_INDEX,
+        ));
         let red = Style::default().fg(Color::Red);
         let mut lines = vec![
             Line::from(vec![

@@ -2,38 +2,38 @@
  ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › MCP › Add ──────────────────────╮e]
                               ──│[Close settings]  [Back]                                                            │──
   + New session               ▌R│╭ Options ─────────────────────────────────────────────────────────────────────────╮│ │
-                              ▌ ││Add MCP server                                                                    ││ │
- SESSIONS                       ││                                                                                  ││ │
- no active sessions in all pr   ││Server                                                                            ││ │
-                                ││name:                                                                             ││ │
-                              no││enabled: yes                                                                      ││ │
-                              ┊ ││transport: streamable                                                             ││ │
-                              ▌ ││                                                                                  ││ │
-                                ││Connection                                                                        ││ █
-                                ││endpoint: remote transports                                                       ││ █
-                                ││command: stdio                                                                    ││ █
-                                ││args: stdio, space separated                                                      ││ █
-                                ││base env: stdio env, one KEY=VALUE per row                                        ││ █
-                                ││                                                                                  ││ █
-                                ││Auth                                                                              ││ █
-                                ││auth: none (public)                                                               ││ █
-                                ││header name: Authorization                                                        ││ █
-                                ││header value: literal stored in credentials, or $ENV                              ││ █
-                                ││auth env: stdio env auth, one KEY=VALUE per row                                   ││ █
-                              ▌ ││oauth authorize:                                                                  ││ █
-                              ▌ ││oauth token:                                                                      ││ █
-                                ││oauth client id:                                                                  ││ █
-                              ▌ ││oauth scopes: space separated                                                     ││ █
-                                ││                                                                                  ││ █
-                                ││Behavior                                                                          ││ █
-                                ││cache ttl: 3600                                                                   ││ █
-                                ││connect timeout: seconds, remote                                                  ││ █
-                                ││request timeout: seconds, remote                                                  ││ █
-                                ││                                                                                  ││ █
-                               ⋯││Warning: this server will be unauthenticated (public).                            ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
+                              ▌ ││Add MCP server                                                                   █││ │
+ SESSIONS                       ││                                                                                 █││ │
+ no active sessions in all pr   ││Server                                                                           █││ │
+                                ││╭ Name ──────────────────────────────────────────────────────────────────────────╮││ │
+                              no│││ Server name                                                                    │││ │
+                              ┊ ││╰────────────────────────────────────────────────────────────────────────────────╯││ │
+                              ▌ ││▣ enabled: yes                                                                   █││ │
+                                ││transport: streamable                                                            █││ █
+                                ││                                                                                 █││ █
+                                ││Connection                                                                       █││ █
+                                ││╭ Endpoint ──────────────────────────────────────────────────────────────────────╮││ █
+                                │││ Remote transport URL                                                           │││ █
+                                ││╰────────────────────────────────────────────────────────────────────────────────╯││ █
+                                ││╭ Command ───────────────────────────────────────────────────────────────────────╮││ █
+                                │││ stdio command                                                                  │││ █
+                                ││╰────────────────────────────────────────────────────────────────────────────────╯││ █
+                                ││╭ Arguments ─────────────────────────────────────────────────────────────────────╮││ █
+                                │││ stdio, space separated                                                         │││ █
+                              ▌ ││╰────────────────────────────────────────────────────────────────────────────────╯││ █
+                              ▌ ││╭ Base environment ──────────────────────────────────────────────────────────────╮││ █
+                                │││ KEY=VALUE per row                                                              │││ █
+                              ▌ ││╰────────────────────────────────────────────────────────────────────────────────╯││ █
+                                ││                                                                                 │││ █
+                                ││Auth                                                                             │││ █
+                                ││auth: none (public)                                                              │││ █
+                                ││╭ Header name ───────────────────────────────────────────────────────────────────╮││ █
+                                │││ Authorization                                                                  │││ █
+                                ││╰────────────────────────────────────────────────────────────────────────────────╯││ █
+                               ⋯││╭ Header value ──────────────────────────────────────────────────────────────────╮││ █
+                                │││ Literal or $ENV                                                                │││ █
+                                ││╰────────────────────────────────────────────────────────────────────────────────╯││ █
+                                ││╭ Auth environment ──────────────────────────────────────────────────────────────╮││ █
                               ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
  ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab  enter: cycle / save  type to edit  [ save ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █

@@ -2838,6 +2838,16 @@ fn setup_wizard_dialog(
     Ok(Dialog::SetupWizard(wizard))
 }
 
+#[cfg(test)]
+pub(crate) fn golden_setup_wizard_text() -> Dialog {
+    setup_wizard_dialog(
+        std::path::Path::new("/fixture/project"),
+        cockpit_core::wizard::onboarding_profile_descriptor(),
+        None,
+    )
+    .expect("profile text wizard fixture")
+}
+
 impl Deref for SettingsDialog {
     type Target = SettingsCx;
 
@@ -8696,8 +8706,7 @@ impl SettingsDialog {
         };
         let mut help_row = self.page.help_row_actions(&self.cx);
         help_row.hover = self.cx.pointer_surface.help_row_hover.get();
-        let help_action_rects =
-            shell::render_settings_help_row(frame, layout[2], &help, &help_row);
+        let help_action_rects = shell::render_settings_help_row(frame, layout[2], &help, &help_row);
         self.cx
             .pointer_surface
             .set_help_row_action_rects(help_action_rects.clone());
@@ -9108,27 +9117,6 @@ pub(super) fn save_status<T: SaveStatusValue>(r: Result<T, String>) -> Option<St
         Ok(value) => Some(value.status()),
         Err(e) => Some(format!("save failed: {e}")),
     }
-}
-
-/// A bottom-of-list `[label]` save-button row. The glyphs are a placeholder;
-/// `render_control_lines` paints the exact `[label]` cells through
-/// `ButtonRegistry` so the hit rect is the painted label, not the list row.
-pub(super) fn save_button_line(label: &str, selected: bool) -> Line<'static> {
-    let text = label.trim_start_matches('[').trim_end_matches(']');
-    let spec = crate::tui::button::ButtonSpec::new(
-        crate::tui::button::ButtonId::Settings(pointer_actions::SettingsPointerAction::Mcp(
-            pointer_actions::McpAction::Save,
-        )),
-        text,
-        crate::tui::button::ButtonDispatch::Settings(pointer_actions::SettingsPointerAction::Mcp(
-            pointer_actions::McpAction::Save,
-        )),
-    )
-    .focused(selected);
-    Line::from(Span::styled(
-        crate::tui::button::bracketed_label(text),
-        crate::tui::button::button_style(&spec, false, false),
-    ))
 }
 
 fn render_root(frame: &mut Frame, area: Rect, cursor: usize, cx: &SettingsCx) {
@@ -10539,11 +10527,12 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
                     run.prefill(),
                     Some(cockpit_core::wizard::WizardAnswer::Confirm(true))
                 );
-                lines.push(Line::from(format!(
-                    "{} yes    {} no",
-                    if yes { "◉" } else { "○" },
-                    if yes { "○" } else { "◉" }
-                )));
+                lines.push(Line::from(vec![
+                    crate::tui::chrome::radio_mark(yes, *cursor == 0),
+                    Span::raw("yes    "),
+                    crate::tui::chrome::radio_mark(!yes, *cursor == 1),
+                    Span::raw("no"),
+                ]));
             }
             cockpit_core::wizard::StepKind::Text => {
                 field_line = Some(lines.len());
@@ -10573,12 +10562,10 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
                         .as_ref()
                         .map(|values| values.iter().any(|value| value == option.id.as_ref()))
                         .unwrap_or_else(|| multi.contains(option.id.as_ref()));
-                    let check = if checked { "▣" } else { "▢" };
                     let row = |style| crate::tui::chrome::chip_style(style, hovered);
                     lines.push(Line::from(vec![
                         Span::styled(marker, row(ink)),
-                        Span::styled(check.to_string(), row(ink)),
-                        Span::styled(" ", row(ink)),
+                        crate::tui::chrome::check_mark(checked, hovered),
                         Span::styled(option.label.to_string(), row(ink)),
                         Span::styled("  ", row(ink)),
                         Span::styled(option.description.to_string(), row(muted)),
@@ -10622,8 +10609,7 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
                     let row = |style| crate::tui::chrome::chip_style(style, hovered);
                     lines.push(Line::from(vec![
                         Span::styled(marker, row(ink)),
-                        Span::styled(if checked { "▣" } else { "▢" }.to_string(), row(ink)),
-                        Span::styled(" ", row(ink)),
+                        crate::tui::chrome::check_mark(checked, hovered),
                         Span::styled(item.name.to_string(), row(ink)),
                         Span::styled("  ", row(ink)),
                         Span::styled(format!("tier: {tier}"), row(muted)),

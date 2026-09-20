@@ -444,7 +444,10 @@ impl SettingsCx {
         p: &StringListPage,
     ) {
         let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
-        let yellow = Style::default().fg(Color::Yellow);
+        let yellow = Style::default().fg(resolve_color(
+            crate::tui::theme::BRASS,
+            crate::tui::theme::BRASS_INDEX,
+        ));
         let mut lines: Vec<Line<'static>> = vec![
             Line::from(Span::styled(
                 p.kind.title().to_string(),
@@ -484,7 +487,10 @@ impl SettingsCx {
             let style = if on_cursor {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(resolve_color(
+                    crate::tui::theme::INK,
+                    crate::tui::theme::INK_INDEX,
+                ))
             };
             lines.push(Line::from(vec![
                 Span::raw(marker),

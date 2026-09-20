@@ -5416,16 +5416,30 @@ fn fetch_all_save_failure_surfaces() {
 }
 
 #[test]
-fn render_field_row_places_caret_at_textfield_cursor() {
+fn edit_popup_places_caret_at_textfield_cursor() {
     let mut field = TextField::new("alpha");
     field.handle_key(press(KeyCode::Home));
     field.handle_key(press(KeyCode::Right));
     field.handle_key(press(KeyCode::Right));
-    let mut lines = Vec::new();
-
-    render_field_row(&mut lines, "Name", &field, true);
-
-    assert_eq!(line_text(&lines[0]), "› Name: al\u{E000}pha");
+    let backend = TestBackend::new(40, 8);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    let mut rendered_caret = None;
+    terminal
+        .draw(|frame| {
+            let caret = crate::tui::chrome::render_field(
+                frame,
+                ratatui::layout::Rect::new(0, 0, 40, 3),
+                "Name",
+                &field,
+                true,
+                "name",
+            )
+            .expect("focused field has a caret");
+            rendered_caret = Some(caret);
+            frame.set_cursor_position(caret);
+        })
+        .expect("draw");
+    assert_eq!(rendered_caret, Some(ratatui::layout::Position::new(3, 1)));
 }
 
 #[test]

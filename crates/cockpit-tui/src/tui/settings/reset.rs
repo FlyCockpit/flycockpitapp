@@ -89,7 +89,10 @@ impl ResetButton {
         } else {
             let style = if selected {
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(resolve_color(
+                        crate::tui::theme::BRASS,
+                        crate::tui::theme::BRASS_INDEX,
+                    ))
                     .add_modifier(Modifier::BOLD)
             } else {
                 muted

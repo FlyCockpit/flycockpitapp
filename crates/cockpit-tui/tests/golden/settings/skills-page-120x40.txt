@@ -9,8 +9,8 @@
                               no││list scans nothing. Ancestor walk extends relative entries to every dir up to the ││ │
                               ┊ ││git root.                                                                         ││ │
                               ▌ ││                                                                                  ││ │
-                                ││› auto-! commands  Codex mode (default — inject !`command` verbatim; never runs)  ││ █
-                                ││  ancestor walk    off (default — relative entries resolve against cwd only)      ││ █
+                                ││› ▢ auto-! commands  Codex mode (default — inject !`command` verbatim; never runs ││ █
+                                ││  ▢ ancestor walk    off (default — relative entries resolve against cwd only)    ││ █
                                 ││                                                                                  ││ █
                                 ││scan directories                                                                  ││ █
                                 ││  [+ add directory]                                                               ││ █

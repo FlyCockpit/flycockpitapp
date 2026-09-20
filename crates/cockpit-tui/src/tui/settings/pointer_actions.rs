@@ -316,6 +316,7 @@ pub(super) enum WizardControlId {
     ContinueHeaders,
     CopilotContinue,
     DoneContinue,
+    Continue,
     EditText,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -783,7 +784,16 @@ impl SettingsPointerAction {
                 ProvidersAction::Open(_)
                     | ProvidersAction::EditField(_, _)
                     | ProvidersAction::OAuthOption(_, _)
-                    | ProvidersAction::WizardControl(_, _)
+                    | ProvidersAction::WizardControl(
+                        _,
+                        WizardControlId::Template(_)
+                            | WizardControlId::WireApi(_)
+                            | WizardControlId::AuthMethod(_)
+                            | WizardControlId::OAuth(_)
+                            | WizardControlId::Header(_)
+                            | WizardControlId::AddHeader
+                            | WizardControlId::EditText,
+                    )
                     | ProvidersAction::FetchAllConfirm(_)
                     | ProvidersAction::FetchOneConfirm(_, _)
                     | ProvidersAction::FetchFallbackConfirm(_, _)

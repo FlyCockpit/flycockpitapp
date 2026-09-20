@@ -408,11 +408,11 @@ pub(super) fn lsp_rows(dialog: &SettingsCx, p: &LspPage) -> (Vec<Line<'static>>,
     let d = &dialog.extended.lsp.diagnostics;
     let project_context = dialog.project_context();
     let mut rows = vec![
-        lsp_row(
+        lsp_toggle_row(
             row_index(LspRow::Enabled),
             p.cursor,
             "enabled",
-            on_off(dialog.extended.lsp.enabled),
+            dialog.extended.lsp.enabled,
         ),
         lsp_row(
             row_index(LspRow::AutoInstall),
@@ -420,11 +420,11 @@ pub(super) fn lsp_rows(dialog: &SettingsCx, p: &LspPage) -> (Vec<Line<'static>>,
             "auto install",
             dialog.extended.lsp.auto_install.as_str(),
         ),
-        lsp_row(
+        lsp_toggle_row(
             row_index(LspRow::Diagnostics),
             p.cursor,
             "diagnostics",
-            on_off(d.enabled),
+            d.enabled,
         ),
         lsp_edit_row(
             row_index(LspRow::OtherFilesLimit),
@@ -533,6 +533,21 @@ fn lsp_row(
         Span::raw(marker(selected)),
         Span::styled(format!("{:<24}", label.into()), selected_or_field(selected)),
         Span::styled(value.into(), muted_style()),
+    ])
+}
+
+fn lsp_toggle_row(
+    idx: usize,
+    cursor: usize,
+    label: impl Into<String>,
+    enabled: bool,
+) -> Line<'static> {
+    let selected = idx == cursor;
+    Line::from(vec![
+        Span::raw(marker(selected)),
+        crate::tui::chrome::check_mark(enabled, selected),
+        Span::styled(format!("{:<22}", label.into()), selected_or_field(selected)),
+        Span::styled(if enabled { "on" } else { "off" }, muted_style()),
     ])
 }
 

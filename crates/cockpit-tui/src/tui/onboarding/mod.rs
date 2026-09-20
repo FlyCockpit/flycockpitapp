@@ -50,7 +50,7 @@ use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
 use crate::tui::settings::Dialog;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use auth::AuthPhase;
-use auth::AuthScreen;
+pub(crate) use auth::AuthScreen;
 pub(crate) use auth::AuthSubmission;
 pub(crate) use auth::provider_api_key_copy;
 use chrome::ActionBar;

@@ -20,16 +20,17 @@ use ratatui::text::{Line, Span};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::tui::textfield::TextField;
+use crate::tui::theme::resolve_color;
 use cockpit_core::mcp::config::{
     Auth, DEFAULT_PROFILE, EnvAuth, HeaderAuth, McpConfig, OauthAuth, ServerConfig, Transport,
 };
 
 use super::secret_display;
 use super::shell::{
-    SettingsScrollRegionId, error_style, marker, muted_style, push_text_field_at_cursor,
-    selected_line_from_marker, selected_style, warning_style,
+    SettingsPointerAction, SettingsPointerTarget, SettingsScrollRegionId, error_style, marker,
+    muted_style, selected_line_from_marker, selected_style, warning_style,
 };
-use super::{Nav, SettingsCx, SettingsPage, save_button_line, save_status};
+use super::{Nav, SettingsCx, SettingsPage, save_status};
 
 /// `/settings → MCP` state: the server list or the add form.
 pub(super) enum McpPage {
@@ -154,13 +155,6 @@ const FIELD_CONNECT_TIMEOUT: usize = 16;
 const FIELD_REQUEST_TIMEOUT: usize = 17;
 const ADD_FIELDS: usize = 18;
 
-macro_rules! push_pointer_text_field {
-    ($bindings:expr, $id:expr, $($args:expr),+ $(,)?) => {{
-        let range = push_text_field_at_cursor($($args),+);
-        $bindings.extend(range.map(|line| (line, mcp_add_action($id))));
-    }};
-}
-
 fn mcp_add_action(index: usize) -> super::pointer_actions::McpAction {
     use super::pointer_actions::McpAction;
     match index {
@@ -215,6 +209,31 @@ fn mcp_add_index(action: &super::pointer_actions::McpAction) -> Option<usize> {
         | McpAction::Authenticate(_)
         | McpAction::Delete(_) => return None,
     })
+}
+
+/// Reserve the three rows occupied by an excoc field in the scroll model.
+/// The field itself is painted after the line list so it uses the shared
+/// rounded-field renderer and places the terminal cursor, while scrolling and
+/// row hit-testing continue to use the existing list geometry.
+fn reserve_field<'a>(
+    lines: &mut Vec<Line<'static>>,
+    fields: &mut Vec<(
+        usize,
+        usize,
+        &'static str,
+        &'a TextField,
+        bool,
+        &'static str,
+    )>,
+    index: usize,
+    title: &'static str,
+    field: &'a TextField,
+    focused: bool,
+    placeholder: &'static str,
+) {
+    let line = lines.len();
+    lines.extend([Line::default(), Line::default(), Line::default()]);
+    fields.push((line, index, title, field, focused, placeholder));
 }
 
 type EnvMaps = (BTreeMap<String, String>, BTreeMap<String, String>);
@@ -304,7 +323,9 @@ fn cached_row_color(cx: &SettingsCx, name: &str, s: &ServerConfig) -> Color {
     match cached_lifecycle(cx, name, s) {
         ServerLifecycle::Error | ServerLifecycle::NeedsAuth => Color::Red,
         ServerLifecycle::Ready => Color::Green,
-        ServerLifecycle::DisabledDraft => Color::Yellow,
+        ServerLifecycle::DisabledDraft => {
+            resolve_color(crate::tui::theme::BRASS, crate::tui::theme::BRASS_INDEX)
+        }
     }
 }
 
@@ -314,7 +335,9 @@ pub(crate) fn row_color(name: &str, s: &ServerConfig) -> Color {
     match lifecycle(name, s) {
         ServerLifecycle::Error | ServerLifecycle::NeedsAuth => Color::Red,
         ServerLifecycle::Ready => Color::Green,
-        ServerLifecycle::DisabledDraft => Color::Yellow,
+        ServerLifecycle::DisabledDraft => {
+            resolve_color(crate::tui::theme::BRASS, crate::tui::theme::BRASS_INDEX)
+        }
     }
 }
 
@@ -880,7 +903,10 @@ impl SettingsCx {
         for warning in &self.mcp_shadow_warnings {
             lines.push(Line::from(Span::styled(
                 format!("shadowed: {warning}"),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(resolve_color(
+                    crate::tui::theme::BRASS,
+                    crate::tui::theme::BRASS_INDEX,
+                )),
             )));
         }
         if !self.mcp_shadow_warnings.is_empty() {
@@ -1022,19 +1048,19 @@ impl SettingsCx {
             Line::from(Span::styled("Server", muted_style())),
         ];
         let mut bindings = Vec::new();
-        push_pointer_text_field!(
-            bindings,
-            FIELD_NAME,
+        let mut fields = Vec::new();
+        reserve_field(
             &mut lines,
-            area.width,
-            "name",
-            s.name.text(),
-            s.name.cursor(),
+            &mut fields,
+            FIELD_NAME,
+            "Name",
+            &s.name,
             s.cursor == FIELD_NAME,
-            None,
+            "Server name",
         );
         bindings.push((lines.len(), mcp_add_action(FIELD_ENABLED)));
         lines.push(Line::from(vec![
+            crate::tui::chrome::check_mark(s.enabled, s.cursor == FIELD_ENABLED),
             Span::raw("enabled: "),
             Span::styled(
                 if s.enabled { "yes" } else { "no (draft)" },
@@ -1059,49 +1085,41 @@ impl SettingsCx {
         ]));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("Connection", muted_style())));
-        push_pointer_text_field!(
-            bindings,
+        reserve_field(
+            &mut lines,
+            &mut fields,
             FIELD_ENDPOINT,
-            &mut lines,
-            area.width,
-            "endpoint",
-            s.endpoint.text(),
-            s.endpoint.cursor(),
+            "Endpoint",
+            &s.endpoint,
             s.cursor == FIELD_ENDPOINT,
-            Some("remote transports"),
+            "Remote transport URL",
         );
-        push_pointer_text_field!(
-            bindings,
+        reserve_field(
+            &mut lines,
+            &mut fields,
             FIELD_COMMAND,
-            &mut lines,
-            area.width,
-            "command",
-            s.command.text(),
-            s.command.cursor(),
+            "Command",
+            &s.command,
             s.cursor == FIELD_COMMAND,
-            Some("stdio"),
+            "stdio command",
         );
-        push_pointer_text_field!(
-            bindings,
+        reserve_field(
+            &mut lines,
+            &mut fields,
             FIELD_ARGS,
-            &mut lines,
-            area.width,
-            "args",
-            s.args.text(),
-            s.args.cursor(),
+            "Arguments",
+            &s.args,
             s.cursor == FIELD_ARGS,
-            Some("stdio, space separated"),
+            "stdio, space separated",
         );
-        push_pointer_text_field!(
-            bindings,
-            FIELD_BASE_ENV,
+        reserve_field(
             &mut lines,
-            area.width,
-            "base env",
-            s.base_env.text(),
-            s.base_env.cursor(),
+            &mut fields,
+            FIELD_BASE_ENV,
+            "Base environment",
+            &s.base_env,
             s.cursor == FIELD_BASE_ENV,
-            Some("stdio env, one KEY=VALUE per row"),
+            "KEY=VALUE per row",
         );
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("Auth", muted_style())));
@@ -1117,117 +1135,97 @@ impl SettingsCx {
                 },
             ),
         ]));
-        push_pointer_text_field!(
-            bindings,
+        reserve_field(
+            &mut lines,
+            &mut fields,
             FIELD_HEADER_NAME,
-            &mut lines,
-            area.width,
-            "header name",
-            s.header_name.text(),
-            s.header_name.cursor(),
+            "Header name",
+            &s.header_name,
             s.cursor == FIELD_HEADER_NAME,
-            Some("remote header auth"),
+            "Remote header auth",
         );
-        push_pointer_text_field!(
-            bindings,
+        reserve_field(
+            &mut lines,
+            &mut fields,
             FIELD_HEADER_VALUE,
-            &mut lines,
-            area.width,
-            "header value",
-            s.header_value.text(),
-            s.header_value.cursor(),
+            "Header value",
+            &s.header_value,
             s.cursor == FIELD_HEADER_VALUE,
-            Some("literal stored in credentials, or $ENV"),
+            "Literal or $ENV",
         );
-        push_pointer_text_field!(
-            bindings,
+        reserve_field(
+            &mut lines,
+            &mut fields,
             FIELD_AUTH_ENV,
-            &mut lines,
-            area.width,
-            "auth env",
-            s.auth_env.text(),
-            s.auth_env.cursor(),
+            "Auth environment",
+            &s.auth_env,
             s.cursor == FIELD_AUTH_ENV,
-            Some("stdio env auth, one KEY=VALUE per row"),
+            "KEY=VALUE per row",
         );
-        push_pointer_text_field!(
-            bindings,
+        reserve_field(
+            &mut lines,
+            &mut fields,
             FIELD_OAUTH_AUTHORIZE,
-            &mut lines,
-            area.width,
-            "oauth authorize",
-            s.oauth_authorize_url.text(),
-            s.oauth_authorize_url.cursor(),
+            "OAuth authorize URL",
+            &s.oauth_authorize_url,
             s.cursor == FIELD_OAUTH_AUTHORIZE,
-            None,
+            "Authorization endpoint",
         );
-        push_pointer_text_field!(
-            bindings,
+        reserve_field(
+            &mut lines,
+            &mut fields,
             FIELD_OAUTH_TOKEN,
-            &mut lines,
-            area.width,
-            "oauth token",
-            s.oauth_token_url.text(),
-            s.oauth_token_url.cursor(),
+            "OAuth token URL",
+            &s.oauth_token_url,
             s.cursor == FIELD_OAUTH_TOKEN,
-            None,
+            "Token endpoint",
         );
-        push_pointer_text_field!(
-            bindings,
+        reserve_field(
+            &mut lines,
+            &mut fields,
             FIELD_OAUTH_CLIENT,
-            &mut lines,
-            area.width,
-            "oauth client id",
-            s.oauth_client_id.text(),
-            s.oauth_client_id.cursor(),
+            "OAuth client ID",
+            &s.oauth_client_id,
             s.cursor == FIELD_OAUTH_CLIENT,
-            None,
+            "Client ID",
         );
-        push_pointer_text_field!(
-            bindings,
-            FIELD_OAUTH_SCOPES,
+        reserve_field(
             &mut lines,
-            area.width,
-            "oauth scopes",
-            s.oauth_scopes.text(),
-            s.oauth_scopes.cursor(),
+            &mut fields,
+            FIELD_OAUTH_SCOPES,
+            "OAuth scopes",
+            &s.oauth_scopes,
             s.cursor == FIELD_OAUTH_SCOPES,
-            Some("space separated"),
+            "Space separated",
         );
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("Behavior", muted_style())));
-        push_pointer_text_field!(
-            bindings,
+        reserve_field(
+            &mut lines,
+            &mut fields,
             FIELD_CACHE_TTL,
-            &mut lines,
-            area.width,
-            "cache ttl",
-            s.cache_ttl_secs.text(),
-            s.cache_ttl_secs.cursor(),
+            "Cache TTL",
+            &s.cache_ttl_secs,
             s.cursor == FIELD_CACHE_TTL,
-            Some("seconds"),
+            "Seconds",
         );
-        push_pointer_text_field!(
-            bindings,
+        reserve_field(
+            &mut lines,
+            &mut fields,
             FIELD_CONNECT_TIMEOUT,
-            &mut lines,
-            area.width,
-            "connect timeout",
-            s.connect_timeout_secs.text(),
-            s.connect_timeout_secs.cursor(),
+            "Connect timeout",
+            &s.connect_timeout_secs,
             s.cursor == FIELD_CONNECT_TIMEOUT,
-            Some("seconds, remote"),
+            "Seconds",
         );
-        push_pointer_text_field!(
-            bindings,
-            FIELD_REQUEST_TIMEOUT,
+        reserve_field(
             &mut lines,
-            area.width,
-            "request timeout",
-            s.request_timeout_secs.text(),
-            s.request_timeout_secs.cursor(),
+            &mut fields,
+            FIELD_REQUEST_TIMEOUT,
+            "Request timeout",
+            &s.request_timeout_secs,
             s.cursor == FIELD_REQUEST_TIMEOUT,
-            Some("seconds, remote"),
+            "Seconds",
         );
         bindings.push((lines.len(), mcp_add_action(FIELD_REQUEST_TIMEOUT)));
         if !s.auth.is_compatible(s.transport) {
@@ -1262,6 +1260,30 @@ impl SettingsCx {
             bindings,
             (&self.pointer_surface, SettingsScrollRegionId("mcp:add")).into(),
         );
+        let offset = self.scroll_states.offset_for("mcp:add");
+        for (line, index, title, field, focused, placeholder) in fields {
+            let y = area.y.saturating_add(line.saturating_sub(offset) as u16);
+            if line < offset || y >= area.bottom() {
+                continue;
+            }
+            let rect = Rect::new(
+                area.x,
+                y,
+                area.width,
+                3.min(area.bottom().saturating_sub(y)),
+            );
+            if let Some(caret) =
+                crate::tui::chrome::render_field(frame, rect, title, field, focused, placeholder)
+            {
+                frame.set_cursor_position(caret);
+            }
+            self.pointer_surface.register(SettingsPointerTarget {
+                rect,
+                action: SettingsPointerAction::Page(mcp_add_action(index).into()),
+                enabled: true,
+                disabled_reason: None,
+            });
+        }
     }
 }
 
@@ -1924,7 +1946,10 @@ mod tests {
         // Public + enabled → green.
         assert_eq!(row_color("a", &server(Auth::None, true)), Color::Green);
         // Public + disabled → yellow.
-        assert_eq!(row_color("a", &server(Auth::None, false)), Color::Yellow);
+        assert_eq!(
+            row_color("a", &server(Auth::None, false)),
+            resolve_color(crate::tui::theme::BRASS, crate::tui::theme::BRASS_INDEX)
+        );
         // OAuth with no stored token → red (needs auth), regardless of enabled.
         // (No credentials stored in the test env for `mcp:unauthed`.)
         let red = row_color(

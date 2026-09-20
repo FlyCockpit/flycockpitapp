@@ -597,6 +597,67 @@ impl AuthScreen {
         }
     }
 
+    /// Render the API-key Authenticate surface around a credential field
+    /// owned by another reducer. Settings' provider wizard intentionally
+    /// keeps its mature persistence state machine, but it must not fork the
+    /// first-run Authenticate presentation.
+    pub(crate) fn render_api_key_external(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        key: &TextField,
+    ) -> Rect {
+        let rows = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Min(1),
+        ])
+        .split(area);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                self.title(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ))),
+            rows[0],
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                self.subtitle(),
+                Style::new().fg(theme::FOG),
+            ))),
+            rows[1],
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("Template: ", Style::new().fg(theme::FOG)),
+                Span::styled(
+                    self.template.display.to_string(),
+                    Style::new().fg(theme::INK),
+                ),
+            ])),
+            rows[2],
+        );
+        self.key_rect = rows[3];
+        if let Some(caret) =
+            ui::render_field_masked(frame, rows[3], "API key", key, true, "Paste API key", true)
+        {
+            frame.set_cursor_position(caret);
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                self.template
+                    .api_key
+                    .map(|meta| format!("Hint: {} · {}", meta.format_hint, meta.console_url))
+                    .unwrap_or_else(|| "Input is masked (^R to reveal).".to_string()),
+                Style::new().fg(theme::FOG),
+            ))),
+            rows[4],
+        );
+        rows[3]
+    }
+
     fn render_device(&self, frame: &mut Frame, area: Rect) {
         let rows = Layout::vertical([
             Constraint::Length(2),

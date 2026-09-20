@@ -2496,8 +2496,7 @@ fn pointer_redact_pattern_rows_dispatch_from_fresh_sources() {
                     .filter_map(|target| match &target.action {
                         shell::SettingsPointerAction::Page(
                             action @ SettingsPointerAction::List(
-                                ListAction::MoveUp(_)
-                                | ListAction::MoveDown(_),
+                                ListAction::MoveUp(_) | ListAction::MoveDown(_),
                             ),
                         ) => Some(action.clone()),
                         _ => None,
@@ -5455,24 +5454,25 @@ fn mcp_add_form_renders_cursor_at_textfield_position() {
         .collect();
     let y = rendered
         .iter()
-        .position(|row| row.contains("name: abX"))
-        .expect("name row rendered") as u16;
-    let row = &rendered[usize::from(y)];
+        .position(|row| row.contains("Name"))
+        .expect("rounded name field rendered") as u16;
+    let row = rendered
+        .iter()
+        .find(|row| row.contains("abXcd"))
+        .expect("edited value rendered");
     let row_chars = row.chars().collect::<Vec<_>>();
     let value_start = row_chars
-        .windows(6)
-        .position(|text| text == ['n', 'a', 'm', 'e', ':', ' '])
-        .expect("name label rendered")
-        + 6;
+        .windows(2)
+        .position(|text| text == ['a', 'b'])
+        .expect("edited value rendered");
     let value_end = row_chars
         .windows(2)
         .position(|pair| pair == ['c', 'd'])
-        .expect("tail rendered")
-        + 2;
+        .expect("tail rendered");
     let cursor = terminal.backend_mut().get_cursor_position().unwrap();
-    assert_eq!(cursor.y, y);
+    assert_eq!(cursor.y, y.saturating_add(1));
     assert!(
-        usize::from(cursor.x) > value_start && usize::from(cursor.x) < value_end,
+        usize::from(cursor.x) > value_start && usize::from(cursor.x) <= value_end,
         "cursor should be inside the edited value, not pinned at the end: row={row:?}, cursor={cursor:?}"
     );
 }

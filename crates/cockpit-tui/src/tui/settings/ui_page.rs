@@ -580,7 +580,10 @@ impl SettingsCx {
         target: super::category::SettingId,
     ) {
         let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
-        let yellow = Style::default().fg(Color::Yellow);
+        let yellow = Style::default().fg(resolve_color(
+            crate::tui::theme::BRASS,
+            crate::tui::theme::BRASS_INDEX,
+        ));
         let pointer_enabled = self.pointer_surface.enabled.get();
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut bindings = Vec::new();
@@ -604,9 +607,21 @@ impl SettingsCx {
                 ));
                 lines.push(Line::from(vec![
                     Span::styled("› ".to_string(), muted),
-                    Span::styled(before.to_string(), Style::default().fg(Color::White)),
+                    Span::styled(
+                        before.to_string(),
+                        Style::default().fg(resolve_color(
+                            crate::tui::theme::INK,
+                            crate::tui::theme::INK_INDEX,
+                        )),
+                    ),
                     super::shell::cursor_marker_span(),
-                    Span::styled(after.to_string(), Style::default().fg(Color::White)),
+                    Span::styled(
+                        after.to_string(),
+                        Style::default().fg(resolve_color(
+                            crate::tui::theme::INK,
+                            crate::tui::theme::INK_INDEX,
+                        )),
+                    ),
                 ]));
                 lines.push(Line::default());
                 if picker.entries.is_empty() {
@@ -716,7 +731,10 @@ impl SettingsCx {
                     let label_style = if active {
                         yellow.add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::White)
+                        Style::default().fg(resolve_color(
+                            crate::tui::theme::INK,
+                            crate::tui::theme::INK_INDEX,
+                        ))
                     };
                     let value = e.value();
                     let mut spans = vec![
@@ -806,7 +824,10 @@ fn render_grab_list(
     delete: &RowDeleteConfirm,
 ) {
     let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
-    let yellow = Style::default().fg(Color::Yellow);
+    let yellow = Style::default().fg(resolve_color(
+        crate::tui::theme::BRASS,
+        crate::tui::theme::BRASS_INDEX,
+    ));
     let mut lines: Vec<Line<'static>> = vec![
         Line::from(Span::styled(
             title.to_string(),
@@ -846,7 +867,10 @@ fn render_grab_list(
         let style = if on_cursor {
             yellow.add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(resolve_color(
+                crate::tui::theme::INK,
+                crate::tui::theme::INK_INDEX,
+            ))
         };
         lines.push(Line::from(vec![
             Span::raw(marker),

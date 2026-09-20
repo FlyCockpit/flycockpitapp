@@ -1960,30 +1960,6 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
                     mutate_reason,
                 )),
             ));
-            let save_reason = if !can_mutate {
-                mutate_reason
-            } else if page.session.requires_reload_before_reapply() {
-                Some(REASON_RELOAD_REQUIRED)
-            } else if page.session.save_pending || page.session.busy {
-                Some(REASON_SAVE_PENDING)
-            } else if !page.session.form.local_edits_preserved {
-                Some(REASON_NO_PENDING_CHANGES)
-            } else {
-                None
-            };
-            rows.push((
-                "[Save]".into(),
-                Some((
-                    SidecarAction::SaveCentralPolicy,
-                    can_mutate
-                        && !page.session.requires_reload_before_reapply()
-                        && !page.session.save_pending
-                        && !page.session.busy
-                        && page.session.form.local_edits_preserved,
-                    save_reason,
-                )),
-            ));
-            rows.push(("[Cancel]".into(), Some((SidecarAction::Cancel, true, None))));
         }
         SidecarPageKind::ResolverDetail => {
             if let Some(trace) = &page.session.reducer.resolution {
@@ -2768,6 +2744,35 @@ impl SettingsPage for SidecarPage {
 
     fn help_text(&self, _cx: &SettingsCx) -> &'static str {
         "↑/↓: navigate  enter: open  h/esc: back"
+    }
+
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        if self.kind != SidecarPageKind::CentralPolicyEditor {
+            return super::shell::finish_help_row(cx, Vec::new());
+        }
+        let enabled = self.session.authoritative_mutations
+            && self.session.principal.can_mutate()
+            && !self.session.requires_reload_before_reapply()
+            && !self.session.save_pending
+            && !self.session.busy
+            && self.session.form.local_edits_preserved;
+        super::shell::finish_help_row(
+            cx,
+            vec![
+                super::shell::SettingsHelpAction {
+                    label: "Cancel",
+                    enabled: true,
+                    primary: false,
+                    action: SettingsPointerAction::Sidecar(SidecarAction::Cancel),
+                },
+                super::shell::SettingsHelpAction {
+                    label: "Save",
+                    enabled,
+                    primary: true,
+                    action: SettingsPointerAction::Sidecar(SidecarAction::SaveCentralPolicy),
+                },
+            ],
+        )
     }
 
     fn as_any(&self) -> &dyn Any {

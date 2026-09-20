@@ -1,0 +1,40 @@
+                                                                                                               ● Working
+ ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › Harnesses ──────────────────────╮e]
+                              ──│[Close settings]  [Back]                                                            │──
+  + New session               ▌R│╭ Options ─────────────────────────────────────────────────────────────────────────╮│ │
+                              ▌ ││External harnesses (harness_invoke)                                               ││ │
+ SESSIONS                       ││config: /fixture/project/.cockpit/config.json                                     ││ │
+ no active sessions in all pr   ││settings target is not a daemon-discovered layer                                  ││ │
+                                ││                                                                                  ││ │
+                              no││                                                                                  ││ │
+                              ┊ ││› [+ add harness]                                                                 ││ │
+                              ▌ ││  [seed installed presets]                                                        ││ │
+                                ││  [reset to verified presets]  enter: reset                                       ││ █
+                                ││                                                                                  ││ █
+                                ││settings target is not a daemon-discovered layer                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                               ⋯││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                              ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
+ ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  enter: edit/seed  a: add  d: dele│ █
+                                ╰────────────────────────────────────────────────────────────────────────────────────╯ █
+                                Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

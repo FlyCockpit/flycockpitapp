@@ -1,0 +1,40 @@
+                                                                                                               ● Working
+ ◆ Cockpit             [Hide] ⎇ /tmp/project                                                               [Setup: Code]
+                              ──────────────────────────────────────────────────────────────────────────────────────────
+  + New session               ▌Restyle the complete transcript surface.                           [Pin] [Fork]  08:45  │
+                              ▌ Continue with every transcript element.                                                │
+ SESSIONS                                                                                                              │
+ no active sessions in all pr   ▸ You                                                                                  │
+                                Prioritize the transcript chrome.                                                      │
+                              note to self                                                                      08:45  │
+                              ┊ Keep product-only transcript variants.                                                 │
+                              ▌ Agent╭ Choose a setup wizard ───────────────────────────────────────────────────╮8:45  │
+                                Model│› provider  Configure an inference provider and its authentication        │      █
+                                TTFT │  security  Review sandboxing, approvals, redaction, and workspace trust  │      █
+                                TPS  │  model  Set trust, capabilities, limits, thinking, delegation, and       │      █
+                                Cache│default model                                                             │      █
+                                ▾ Tho│                                                                          │      █
+                                Map e│                                                                          │      █
+                                The o│                                                                          │      █
+                                     │                                                                          │      █
+                                ▸ rea│                                                                          │      █
+                                     │                                                                          │      █
+                                ─ exp│                                                                          │      █
+                              ▌ inter│                                                                          │      █
+                              ▌ Inter│                                                                          │      █
+                                     │                                                                          │      █
+                              ▌ backg│                                                                          │      █
+                                Backg│                                                                          │      █
+                                     │                                                                          │      █
+                                ◇ Edi│↑/↓  enter: select  esc: close                                            │      █
+                                │ - o╰──────────────────────────────────────────────────────────────────────────╯      █
+                                │ + new line                                                                           █
+                                │   shared line                                                                        █
+                               ⋯ Compacted from abc123 · auto · ctx 82.0% · 9000→2400 tokens · 6 turns · tail 2/1 ·  ⋯ █
+                                                               ⋯ 2 seed tools (~42) ⋯                                  █
+                                [show summary]                                                                         █
+                                                                                                                       █
+                              ▌ Agent                                                                           08:45  █
+ ● working  ● waiting  ● done   Thinking                                                                               █
+                                Check the final visual hierarchy.                                                      █
+                                Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

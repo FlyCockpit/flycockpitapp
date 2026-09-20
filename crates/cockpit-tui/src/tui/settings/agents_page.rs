@@ -37,7 +37,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::tui::theme::{FOG, FOG_INDEX, resolve_color};
 use crate::tui::tool_surface_picker::{
     ToolSurfaceDraft, ToolSurfaceEditOutcome, ToolSurfacePicker, ToolSurfaceRender,
     tool_surface_lines,
@@ -4158,7 +4158,7 @@ impl SettingsCx {
             return;
         }
 
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
         let red = Style::default().fg(Color::Red);
         let cyan = Style::default().fg(Color::Cyan);
@@ -4186,7 +4186,7 @@ impl SettingsCx {
         let mut selected_action_line = None;
         for (i, row) in p.rows.iter().enumerate() {
             let on_cursor = i == p.cursor;
-            let marker = if on_cursor { "▸ " } else { "  " };
+            let marker = if on_cursor { "› " } else { "  " };
             let name_style = if on_cursor {
                 yellow.add_modifier(Modifier::BOLD)
             } else {

@@ -1321,18 +1321,18 @@ impl OnboardingShell {
                         }
                         return None;
                     }
-                    if matches!(
+                    let oauth_cancel = if matches!(
                         phase,
                         auth::AuthPhase::DeviceIdle
                             | auth::AuthPhase::PasteCallback
                             | auth::AuthPhase::ApiKey
                     ) {
-                        if let Some(action) = screen.cancel_oauth() {
-                            return Some(OnboardingShellAction::OAuth(action));
-                        }
-                    }
+                        screen.cancel_oauth()
+                    } else {
+                        None
+                    };
                     self.present_provider_search(None);
-                    return None;
+                    return oauth_cancel.map(OnboardingShellAction::OAuth);
                 }
                 let template = screen.template();
                 if let Some(submission) = screen.handle_key(key) {

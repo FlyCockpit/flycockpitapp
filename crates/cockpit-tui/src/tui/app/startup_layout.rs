@@ -1346,7 +1346,10 @@ impl App {
                     .as_ref()
                     .is_some_and(|shell| shell.completion_detour_active())
                 {
+                    self.refresh_bootstrap_config_snapshot();
+                    let summary = self.onboarding_completion_summary();
                     if let Some(shell) = self.onboarding_shell.as_mut() {
+                        shell.note_completion_summary(summary);
                         shell.return_to_completion();
                     }
                     self.dialog = crate::tui::settings::Dialog::None;

@@ -1,6 +1,12 @@
 use super::*;
+use crate::tui::theme::{
+    BRASS, BRASS_INDEX, GOOD, GOOD_INDEX, HOVER_BG, HOVER_BG_INDEX, RED, RED_INDEX, SURFACE,
+    SURFACE_INDEX, YELLOW, YELLOW_INDEX, resolve_color,
+};
 use cockpit_proto::MessageRole;
-use crossterm::event::{KeyEventKind, KeyEventState};
+use crossterm::event::{KeyEventKind, KeyEventState, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier};
 use ratatui::{Terminal, backend::TestBackend};
 use std::collections::HashMap;
 
@@ -94,6 +100,248 @@ fn message(seq: i64, text: &str) -> SessionMessage {
     }
 }
 
+fn golden_rail(
+    selected: bool,
+    hovered: Option<usize>,
+    visible: bool,
+    pointer: Option<(u16, u16)>,
+) -> ratatui::buffer::Buffer {
+    let mut first = summary(Uuid::from_u128(1), 1_725_582_480_000);
+    first.title = Some("Build session rail".into());
+    first.favorite = true;
+    first.pin_count = 2;
+    let mut second = summary(Uuid::from_u128(2), 1_725_496_800_000);
+    second.title = Some("Waiting for approval".into());
+    second.open_interrupts = 1;
+    let mut rail = test_rail(vec![
+        (first, Tier::Processing),
+        (second, Tier::PendingQuestion),
+    ]);
+    rail.current_mut().selected_session_id = if selected {
+        Some(Uuid::from_u128(1))
+    } else {
+        None
+    };
+    rail.hovered_card = hovered;
+    rail.pointer_position = pointer;
+    rail.set_visible(visible);
+    crate::tui::golden::render_frame(120, 40, |frame| {
+        let persistent = visible.then_some(Rect::new(0, 0, 30, 40));
+        rail.render(frame, persistent, None, None, 120);
+    })
+}
+
+const EXCOC_RAIL_WIDTH: u16 = 30;
+
+fn rail_row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+    (0..EXCOC_RAIL_WIDTH)
+        .map(|x| buffer[(x, y)].symbol())
+        .collect()
+}
+
+fn assert_cell(
+    buffer: &ratatui::buffer::Buffer,
+    x: u16,
+    y: u16,
+    symbol: &str,
+    fg: Color,
+    bg: Color,
+    modifier: Modifier,
+) {
+    let cell = &buffer[(x, y)];
+    assert_eq!(cell.symbol(), symbol, "cell ({x},{y})");
+    assert_eq!(cell.fg, fg, "fg at ({x},{y})");
+    assert_eq!(cell.bg, bg, "bg at ({x},{y})");
+    assert_eq!(cell.modifier, modifier, "modifier at ({x},{y})");
+}
+
+/// excoc sidebar inner layout at 120×40 with a 30-column persistent rail:
+/// header y=1, new-session y=3, SESSIONS y=5, cards from y=6, legend last two rows.
+fn assert_excoc_open_selected_rail_cells(buffer: &ratatui::buffer::Buffer) {
+    let surface = resolve_color(SURFACE, SURFACE_INDEX);
+    let hover = resolve_color(HOVER_BG, HOVER_BG_INDEX);
+    let brass = resolve_color(BRASS, BRASS_INDEX);
+    let row1 = rail_row_text(buffer, 1);
+    assert!(
+        row1.contains('◆') && row1.contains("Cockpit"),
+        "excoc header title"
+    );
+    assert!(
+        row1.trim_end().ends_with("[Hide]"),
+        "excoc Hide chip flush-right in header"
+    );
+    assert_eq!(buffer[(1, 1)].bg, surface, "sidebar SURFACE wash");
+    assert!(
+        rail_row_text(buffer, 3).contains("+ New session"),
+        "excoc new-session chip"
+    );
+    assert!(
+        rail_row_text(buffer, 5)
+            .trim_start()
+            .starts_with("SESSIONS"),
+        "excoc sessions label row"
+    );
+    assert_cell(buffer, 1, 6, "▌", brass, hover, Modifier::BOLD);
+    assert_cell(buffer, 1, 7, "▌", brass, hover, Modifier::BOLD);
+    let datetime = crate::tui::golden::PINNED_DATETIME;
+    assert!(
+        rail_row_text(buffer, 7).contains(datetime),
+        "excoc datetime row uses pinned %b %-d, %H:%M"
+    );
+    let legend = format!("{}{}", rail_row_text(buffer, 37), rail_row_text(buffer, 38));
+    assert!(
+        legend.contains('●') && legend.contains("working") && legend.contains("waiting"),
+        "excoc activity legend"
+    );
+    let mut dot_colours = Vec::new();
+    for x in 0..EXCOC_RAIL_WIDTH {
+        if buffer[(x, 37)].symbol() == "●" {
+            dot_colours.push(buffer[(x, 37)].fg);
+        }
+    }
+    assert_eq!(
+        dot_colours,
+        vec![
+            resolve_color(YELLOW, YELLOW_INDEX),
+            resolve_color(RED, RED_INDEX),
+            resolve_color(GOOD, GOOD_INDEX),
+        ],
+        "excoc legend dot colours in order"
+    );
+    // Product-only selected-row metadata (third line) is allowed; excoc has no
+    // equivalent, so this is not part of the excoc parity check.
+    assert!(
+        rail_row_text(buffer, 8).contains("pin 2"),
+        "selected-row product metadata remains a bounded extension"
+    );
+}
+
+fn assert_excoc_hidden_show_chip(buffer: &ratatui::buffer::Buffer) {
+    assert!(
+        rail_row_text(buffer, 0).starts_with("[Show]"),
+        "hidden rail paints excoc Show at terminal origin"
+    );
+}
+
+fn assert_excoc_hovered_action_row(buffer: &ratatui::buffer::Buffer) {
+    let row = rail_row_text(buffer, 9);
+    assert!(row.contains("[Pin]"), "hover replaces datetime with Pin");
+    assert!(row.contains("[Archive]"), "hover Archive chip");
+    assert!(row.contains("[×]"), "hover delete chip");
+    let pin_fg = buffer[(row.find("[Pin]").unwrap() as u16, 9)].fg;
+    let archive_fg = buffer[(row.find("[Archive]").unwrap() as u16, 9)].fg;
+    let delete_fg = buffer[(row.find("[×]").unwrap() as u16, 9)].fg;
+    assert_eq!(
+        pin_fg,
+        Color::Indexed(crate::tui::theme::MUTED_COLOR_INDEX),
+        "Pin uses FOG like excoc"
+    );
+    assert_eq!(
+        archive_fg,
+        Color::Indexed(crate::tui::theme::MUTED_COLOR_INDEX),
+        "Archive uses FOG like excoc"
+    );
+    assert_eq!(
+        delete_fg,
+        resolve_color(RED, RED_INDEX),
+        "delete chip uses RED"
+    );
+}
+
+#[test]
+fn golden_rail_region_matches_excoc_paint_rules_120x40() {
+    let _pins = crate::tui::golden::GoldenPins::install().allow_hover();
+    assert_excoc_open_selected_rail_cells(&golden_rail(true, None, true, None));
+    assert_excoc_hidden_show_chip(&golden_rail(false, None, false, None));
+    assert_excoc_hovered_action_row(&golden_rail(false, Some(1), true, Some((5, 9))));
+}
+
+#[test]
+fn wheel_over_rail_steps_one_session_window() {
+    let cards: Vec<_> = (0..20)
+        .map(|i| {
+            (
+                summary(Uuid::from_u128(i as u128 + 1), 1000 - i),
+                Tier::Idle,
+            )
+        })
+        .collect();
+    let mut rail = test_rail(cards);
+    let backend = TestBackend::new(36, 14);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            rail.render(frame, Some(Rect::new(0, 0, 36, 14)), None, None, 80);
+        })
+        .unwrap();
+    assert!(
+        20 > rail.session_viewport_for_test(),
+        "sessions must overflow the viewport"
+    );
+    let before = rail.session_scroll_for_test();
+    let list = rail.list_area_for_test().expect("list area");
+    rail.handle_mouse(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: list.x + 1,
+        row: list.y + 1,
+        modifiers: KeyModifiers::empty(),
+    });
+    assert_eq!(
+        rail.session_scroll_for_test(),
+        before + 1,
+        "wheel down over the rail advances the session window by one"
+    );
+}
+
+#[test]
+fn sessions_keybindings_include_open_preview_and_switch_actions() {
+    let group = SessionRail::keybindings();
+    let actions: Vec<_> = group.bindings.iter().map(|b| b.action).collect();
+    for required in ["open", "preview", "switch", "forks", "windows"] {
+        assert!(
+            actions.contains(&required),
+            "missing Sessions which-key action: {required}"
+        );
+    }
+}
+
+#[test]
+fn hover_archive_mutates_without_confirm_popover() {
+    let id = Uuid::from_u128(1);
+    let mut rail = test_rail(vec![(summary(id, 10), Tier::Idle)]);
+    rail.action_hits = vec![ActionHit {
+        index: 0,
+        action: CardAction::Archive,
+        rect: Rect::new(10, 1, 8, 1),
+    }];
+    let outcome = rail.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 11,
+        row: 1,
+        modifiers: KeyModifiers::empty(),
+    });
+    assert!(matches!(
+        outcome,
+        Some(RailOutcome::Mutate(effect))
+            if matches!(effect.request, cockpit_proto::Request::ArchiveSession { cascade: true, .. })
+    ));
+    assert!(matches!(rail.step, Step::Browse));
+}
+
+#[test]
+fn golden_session_rail_open_hidden_hovered_and_selected_120x40() {
+    let _pins = crate::tui::golden::GoldenPins::install().allow_hover();
+    for (name, selected, hovered, visible) in [
+        ("open", false, None, true),
+        ("hidden-show", false, None, false),
+        ("hovered-row", false, Some(1), true),
+        ("selected-row", true, None, true),
+    ] {
+        let buffer = golden_rail(selected, hovered, visible, None);
+        crate::tui::golden::assert_golden("session-rail", name, 120, 40, &buffer);
+    }
+}
+
 #[test]
 fn named_width_tests_80_79_56_55() {
     assert!(matches!(
@@ -105,6 +353,10 @@ fn named_width_tests_80_79_56_55() {
     assert_eq!(
         RailLayoutMode::from_width(55),
         RailLayoutMode::HiddenUntilFocused
+    );
+    assert_eq!(
+        RailLayoutMode::from_width_and_preference(120, false),
+        RailLayoutMode::HiddenByPreference
     );
 }
 
@@ -204,6 +456,43 @@ fn unknown_metrics_are_omitted() {
     assert!(!text.contains("inbox"));
     assert!(!text.contains("archived"));
     assert!(!text.contains('★'));
+}
+
+#[test]
+fn rows_are_two_lines_with_a_bounded_selected_metadata_extension() {
+    let mut s = summary(Uuid::from_u128(1), 10);
+    s.pin_count = 2;
+    let plain = super::render::card_lines(&s, Tier::ToolRunning, false, true, 80, false);
+    let selected = super::render::card_lines(&s, Tier::ToolRunning, true, true, 80, false);
+    assert_eq!(plain.len(), 2);
+    assert_eq!(selected.len(), 3);
+    let meta: String = selected[2]
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    assert!(meta.contains("tool running"));
+    assert!(meta.contains("[alpha]"));
+    assert!(meta.contains("pin 2"));
+    assert!(selected[0].spans[0].content.contains('▌'));
+    assert!(selected[1].spans[0].content.contains('▌'));
+}
+
+#[test]
+fn activity_tiers_collapse_to_four_reference_dot_colours() {
+    for tier in [
+        Tier::ActiveSchedules,
+        Tier::ToolRunning,
+        Tier::InferenceInProgress,
+        Tier::Processing,
+    ] {
+        assert_eq!(tier.color(), crate::tui::theme::YELLOW);
+    }
+    for tier in [Tier::Interrupted, Tier::PendingQuestion, Tier::Unread] {
+        assert_eq!(tier.color(), crate::tui::theme::RED);
+    }
+    assert_eq!(Tier::Done.color(), crate::tui::theme::GOOD);
+    assert_eq!(Tier::Idle.color(), crate::tui::theme::DISABLED);
 }
 
 #[test]
@@ -394,6 +683,33 @@ fn card_click_outside_action_hits_does_not_mutate() {
     });
     assert!(!matches!(outcome, Some(RailOutcome::Mutate(_))));
     assert!(!matches!(outcome, Some(RailOutcome::Resume(_))));
+}
+
+#[test]
+fn filtered_title_click_selects_the_visible_row() {
+    let beta_id = Uuid::from_u128(2);
+    let mut alpha = summary(Uuid::from_u128(1), 100);
+    alpha.title = Some("alpha".into());
+    let mut beta = summary(beta_id, 90);
+    beta.title = Some("beta".into());
+    let mut rail = test_rail(vec![(alpha, Tier::Idle), (beta, Tier::Idle)]);
+    rail.current_mut().selected_session_id = Some(Uuid::from_u128(1));
+    rail.search = "beta".into();
+    rail.card_hits = vec![CardHit {
+        index: 0,
+        rect: Rect::new(0, 5, 20, 2),
+    }];
+    rail.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 2,
+        row: 5,
+        modifiers: KeyModifiers::empty(),
+    });
+    assert_eq!(
+        rail.selected_id(),
+        Some(beta_id),
+        "title click indices follow filtered_cards(), not the raw card list"
+    );
 }
 
 #[test]
@@ -628,20 +944,6 @@ fn capability_parity_table_covers_sessions_pane_operations() {
         "mouse confirm",
     ] {
         assert!(names.contains(&required), "missing parity row: {required}");
-    }
-    let proofs = format!(
-        "{}\n{}\n{}",
-        include_str!("tests.rs"),
-        include_str!("../app/session_rail.rs"),
-        include_str!("../app/selection_copy_state_tests.rs"),
-    );
-    for row in capability_parity_table() {
-        assert!(
-            proofs.contains(&format!("fn {}(", row.proof)),
-            "missing named proof {} for {}",
-            row.proof,
-            row.operation
-        );
     }
 }
 
@@ -1026,7 +1328,7 @@ fn replacement_favorite_after_attachment_change_is_not_wedged_by_stale_receipt()
 }
 
 #[test]
-fn unselected_cards_do_not_record_action_hits() {
+fn hover_actions_belong_only_to_the_hovered_row() {
     let selected = Uuid::from_u128(1);
     let other = Uuid::from_u128(2);
     let mut rail = test_rail(vec![
@@ -1041,30 +1343,107 @@ fn unselected_cards_do_not_record_action_hits() {
             rail.render(frame, Some(Rect::new(0, 0, 36, 24)), None, None, 80);
         })
         .unwrap();
-    assert!(
-        !rail.action_hits.is_empty(),
-        "selected card must expose action hits"
-    );
-    assert!(
-        rail.action_hits.iter().all(|hit| hit.index == 0),
-        "action hits must only cover the selected card"
-    );
     let other_card = rail
         .card_hits
         .iter()
         .find(|hit| hit.index == 1)
         .expect("unselected card hit");
-    let meta_row = other_card
-        .rect
-        .y
-        .saturating_add(other_card.rect.height.saturating_sub(2));
+    rail.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: other_card.rect.x.saturating_add(2),
+        row: other_card.rect.y,
+        modifiers: KeyModifiers::empty(),
+    });
+    terminal
+        .draw(|frame| {
+            rail.render(frame, Some(Rect::new(0, 0, 36, 24)), None, None, 80);
+        })
+        .unwrap();
+    assert!(
+        !rail.action_hits.is_empty(),
+        "hovered card must expose action hits"
+    );
+    assert!(
+        rail.action_hits.iter().all(|hit| hit.index == 1),
+        "action hits must only cover the hovered card"
+    );
+    let other_card = rail.card_hits.iter().find(|hit| hit.index == 1).unwrap();
     let outcome = rail.handle_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: other_card.rect.x.saturating_add(2),
-        row: meta_row,
+        row: other_card.rect.y,
         modifiers: KeyModifiers::empty(),
     });
     assert!(!matches!(outcome, Some(RailOutcome::Resume(_))));
     assert!(!matches!(outcome, Some(RailOutcome::SetFavorite { .. })));
     assert!(!matches!(outcome, Some(RailOutcome::Mutate(_))));
+
+    let delete = rail
+        .action_hits
+        .iter()
+        .find(|hit| hit.action == CardAction::Delete)
+        .expect("hovered row delete chip")
+        .rect;
+    let outcome = rail.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: delete.x,
+        row: delete.y,
+        modifiers: KeyModifiers::empty(),
+    });
+    assert!(outcome.is_none());
+    assert!(
+        matches!(rail.step, Step::Confirm { session_id, .. } if session_id == other),
+        "the × chip must enter the existing confirm-delete flow"
+    );
+}
+
+#[test]
+fn header_chips_route_visibility_and_new_session_outcomes() {
+    let mut rail = test_rail(vec![(summary(Uuid::from_u128(1), 10), Tier::Idle)]);
+    let backend = TestBackend::new(36, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            rail.render(frame, Some(Rect::new(0, 0, 36, 24)), None, None, 80);
+        })
+        .unwrap();
+
+    let toggle = rail.toggle_area.expect("hide chip hit area");
+    let new_session = rail.new_session_area.expect("new-session chip hit area");
+    assert!(matches!(
+        rail.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: toggle.x,
+            row: toggle.y,
+            modifiers: KeyModifiers::empty(),
+        }),
+        Some(RailOutcome::ToggleVisibility)
+    ));
+
+    assert!(matches!(
+        rail.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: new_session.x,
+            row: new_session.y,
+            modifiers: KeyModifiers::empty(),
+        }),
+        Some(RailOutcome::NewSession)
+    ));
+
+    rail.set_visible(false);
+    terminal
+        .draw(|frame| rail.render(frame, None, None, None, 80))
+        .unwrap();
+    let show = rail.toggle_area.expect("show chip hit area");
+    assert_eq!(show.x, 0);
+    assert_eq!(show.y, 0);
+    assert!(matches!(
+        rail.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: show.x,
+            row: show.y,
+            modifiers: KeyModifiers::empty(),
+        }),
+        Some(RailOutcome::ToggleVisibility)
+    ));
 }

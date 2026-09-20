@@ -1075,6 +1075,33 @@ fn vim_mode_round_trips_through_extended_doc() {
 }
 
 #[test]
+fn persist_global_session_rail_visible_round_trips_on_disk() {
+    let tmp = TempDir::new().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    persist_global_session_rail_visible(false).unwrap();
+    let path = crate::config::dirs::global_config_file().unwrap();
+    let hidden = ExtendedConfigDoc::load(&path).unwrap().config();
+    assert!(!hidden.tui.session_rail_visible);
+    persist_global_session_rail_visible(true).unwrap();
+    let shown = ExtendedConfigDoc::load(&path).unwrap().config();
+    assert!(shown.tui.session_rail_visible);
+}
+
+#[test]
+fn session_rail_visibility_round_trips_through_tui_config() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+    let mut config = doc.config();
+    assert!(config.tui.session_rail_visible);
+    config.tui.session_rail_visible = false;
+    doc.write(&config).unwrap();
+
+    let restarted = ExtendedConfigDoc::load(&path).unwrap().config();
+    assert!(!restarted.tui.session_rail_visible);
+}
+
+#[test]
 fn unknown_root_keys_survive_write() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");

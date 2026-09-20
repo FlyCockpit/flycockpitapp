@@ -230,66 +230,66 @@ impl PaneGeometry {
     }
 
     /// Split `area` into the named sub-rects.
+    ///
+    /// `body` is deliberately stable in dialog mode: callers split persistent
+    /// navigation (the session rail) from it before choosing the dialog or
+    /// overlay renderer. Dialog mode suppresses composer chrome, but never
+    /// substitutes a separate fullscreen geometry that can erase that split.
+    /// This ordering is the public seam used by subsequent popover work.
     pub fn layout(&self, area: Rect) -> PaneRects {
-        if self.dialog > 0 {
-            let parts =
-                Layout::vertical([Constraint::Min(0), Constraint::Length(self.status)]).split(area);
-            PaneRects {
-                body: parts[0],
-                indicator: Rect::new(0, 0, 0, 0),
-                queue: Rect::new(0, 0, 0, 0),
-                suggestions: Rect::new(0, 0, 0, 0),
-                input: Rect::new(0, 0, 0, 0),
-                pins: Rect::new(0, 0, 0, 0),
-                sandbox_notice: Rect::new(0, 0, 0, 0),
-                compact: Rect::new(0, 0, 0, 0),
-                status: parts[1],
-            }
+        let dialog_mode = self.dialog > 0;
+        let strip_input_overlap = if dialog_mode {
+            0
         } else {
-            let strip_input_overlap = self.strip_input_overlap();
-            let input_slot = self.input.saturating_sub(strip_input_overlap);
-            let parts = Layout::vertical([
-                Constraint::Min(0),
-                Constraint::Length(self.indicator),
-                Constraint::Length(self.active_strip()),
-                Constraint::Length(input_slot),
-                Constraint::Length(self.pins),
-                Constraint::Length(self.sandbox_notice),
-                Constraint::Length(self.compact),
-                Constraint::Length(self.status),
-            ])
-            .split(area);
-            let input = if strip_input_overlap > 0 {
-                Rect::new(
-                    parts[3].x,
-                    parts[3].y.saturating_sub(strip_input_overlap),
-                    parts[3].width,
-                    self.input,
-                )
-            } else {
-                parts[3]
-            };
-            let queue = if self.suggestions > 0 {
-                Rect::new(0, 0, 0, 0)
-            } else {
-                parts[2]
-            };
-            let suggestions = if self.suggestions > 0 {
-                parts[2]
-            } else {
-                Rect::new(0, 0, 0, 0)
-            };
-            PaneRects {
-                body: parts[0],
-                indicator: parts[1],
-                queue,
-                suggestions,
-                input,
-                pins: parts[4],
-                sandbox_notice: parts[5],
-                compact: parts[6],
-                status: parts[7],
-            }
+            self.strip_input_overlap()
+        };
+        let input_slot = if dialog_mode {
+            0
+        } else {
+            self.input.saturating_sub(strip_input_overlap)
+        };
+        let visible = |height| if dialog_mode { 0 } else { height };
+        let parts = Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(visible(self.indicator)),
+            Constraint::Length(visible(self.active_strip())),
+            Constraint::Length(input_slot),
+            Constraint::Length(visible(self.pins)),
+            Constraint::Length(visible(self.sandbox_notice)),
+            Constraint::Length(visible(self.compact)),
+            Constraint::Length(self.status),
+        ])
+        .split(area);
+        let input = if strip_input_overlap > 0 {
+            Rect::new(
+                parts[3].x,
+                parts[3].y.saturating_sub(strip_input_overlap),
+                parts[3].width,
+                self.input,
+            )
+        } else {
+            parts[3]
+        };
+        let queue = if self.suggestions > 0 {
+            Rect::new(0, 0, 0, 0)
+        } else {
+            parts[2]
+        };
+        let suggestions = if self.suggestions > 0 {
+            parts[2]
+        } else {
+            Rect::new(0, 0, 0, 0)
+        };
+        PaneRects {
+            body: parts[0],
+            indicator: parts[1],
+            queue,
+            suggestions,
+            input,
+            pins: parts[4],
+            sandbox_notice: parts[5],
+            compact: parts[6],
+            status: parts[7],
         }
     }
 }
@@ -314,6 +314,17 @@ mod tests {
         for _transient in transient_heights {
             assert_eq!(PaneGeometry::baseline_body_height(40), 33);
         }
+    }
+
+    #[test]
+    fn dialog_layout_keeps_a_stable_body_for_pre_overlay_navigation_split() {
+        let geometry = PaneGeometry::compute(3, 1, 2, 0, 1, 1, 20, 12, 0);
+        let rects = geometry.layout(Rect::new(0, 0, 120, 40));
+        assert_eq!(rects.body, Rect::new(0, 0, 120, 39));
+        assert_eq!(rects.status, Rect::new(0, 39, 120, 1));
+        assert!(rects.input.is_empty());
+        assert!(rects.queue.is_empty());
+        assert!(rects.indicator.is_empty());
     }
 
     #[test]

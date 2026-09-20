@@ -41,6 +41,8 @@ const DAEMON_UNAVAILABLE_HINT: &str =
 #[derive(Debug)]
 pub enum RailOutcome {
     Unfocus,
+    ToggleVisibility,
+    NewSession,
     Resume(Uuid),
     LoadList,
     LoadPreview {
@@ -129,7 +131,8 @@ struct Level {
     lineage_root: Option<Uuid>,
     cards: Vec<(SessionSummary, Tier)>,
     selected_session_id: Option<Uuid>,
-    row_offset: usize,
+    /// First visible session index in the filtered list (excoc `sidebar_scroll`).
+    session_scroll: usize,
 }
 
 impl Level {
@@ -139,7 +142,7 @@ impl Level {
             lineage_root: None,
             cards: Vec::new(),
             selected_session_id: None,
-            row_offset: 0,
+            session_scroll: 0,
         }
     }
 
@@ -149,10 +152,6 @@ impl Level {
         level.cards = cards;
         level.restore_selection(None);
         level
-    }
-
-    fn select(&mut self, index: usize) {
-        self.selected_session_id = self.cards.get(index).map(|(summary, _)| summary.session_id);
     }
 
     fn restore_selection(&mut self, session_id: Option<Uuid>) {
@@ -276,6 +275,7 @@ pub struct SessionRail {
     last_preview_height: usize,
     last_preview_rows: usize,
     last_preview_reached_top: bool,
+    last_session_view: usize,
     card_hits: Vec<CardHit>,
     action_hits: Vec<ActionHit>,
     list_area: Option<Rect>,
@@ -286,6 +286,11 @@ pub struct SessionRail {
     last_frame_width: u16,
     confirm_buttons: crate::tui::button::ButtonRegistry,
     pointer_capture: bool,
+    visible: bool,
+    hovered_card: Option<usize>,
+    pointer_position: Option<(u16, u16)>,
+    toggle_area: Option<Rect>,
+    new_session_area: Option<Rect>,
     counts: RailRequestCounts,
 }
 
@@ -331,6 +336,7 @@ impl SessionRail {
             last_preview_height: 0,
             last_preview_rows: 0,
             last_preview_reached_top: false,
+            last_session_view: 1,
             card_hits: Vec::new(),
             action_hits: Vec::new(),
             list_area: None,
@@ -341,6 +347,11 @@ impl SessionRail {
             last_frame_width: 0,
             confirm_buttons: crate::tui::button::ButtonRegistry::default(),
             pointer_capture: false,
+            visible: true,
+            hovered_card: None,
+            pointer_position: None,
+            toggle_area: None,
+            new_session_area: None,
             counts: RailRequestCounts::default(),
         }
     }
@@ -362,8 +373,28 @@ impl SessionRail {
                 },
                 KeyBinding {
                     key: "Enter",
-                    action: "resume",
-                    desc: "resume the highlighted session",
+                    action: "open",
+                    desc: "open the highlighted session",
+                },
+                KeyBinding {
+                    key: "Tab",
+                    action: "preview",
+                    desc: "focus the selected session preview",
+                },
+                KeyBinding {
+                    key: "Ctrl+N",
+                    action: "new session",
+                    desc: "start a fresh session",
+                },
+                KeyBinding {
+                    key: "Alt+↑/↓",
+                    action: "switch",
+                    desc: "resume the previous or next session",
+                },
+                KeyBinding {
+                    key: "Ctrl+B",
+                    action: "hide/show",
+                    desc: "toggle the session rail",
                 },
                 KeyBinding {
                     key: "/",
@@ -469,6 +500,27 @@ impl SessionRail {
         self.use_emojis = use_emojis;
     }
 
+    pub fn set_visible(&mut self, visible: bool) {
+        self.visible = visible;
+        if !visible {
+            self.unfocus();
+        }
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    pub fn toggle_visibility(&mut self) -> bool {
+        self.set_visible(!self.visible);
+        self.visible
+    }
+
+    pub fn clear_hover(&mut self) {
+        self.hovered_card = None;
+        self.pointer_position = None;
+    }
+
     pub fn set_pointer_capture(&mut self, capture: bool) {
         self.pointer_capture = capture;
     }
@@ -484,6 +536,8 @@ impl SessionRail {
         self.search_area = None;
         self.compact_area = None;
         self.rail_area = None;
+        self.toggle_area = None;
+        self.new_session_area = None;
         self.confirm_buttons.begin_frame(self.pointer_capture, 1);
     }
 
@@ -499,7 +553,7 @@ impl SessionRail {
     }
 
     pub fn layout_mode(&self, width: u16) -> RailLayoutMode {
-        RailLayoutMode::from_width(width)
+        RailLayoutMode::from_width_and_preference(width, self.visible)
     }
 
     pub fn rail_area(&self) -> Option<Rect> {
@@ -700,7 +754,8 @@ impl SessionRail {
                     }) {
                         level.selected_session_id = None;
                     }
-                    level.row_offset = 0;
+                    level.session_scroll = 0;
+                    self.ensure_session_scroll_shows_selected();
                 }
                 if self.selected_id() != self.preview.as_ref().map(|preview| preview.session_id) {
                     self.preview = None;
@@ -974,15 +1029,15 @@ impl SessionRail {
             .pending_favorites
             .get(&canonical_root)
             .and_then(|intent| intent.queued);
-        if let Some(desired) = queued {
-            if let Some(intent) = self.pending_favorites.get_mut(&canonical_root) {
-                intent.desired = desired;
-                intent.queued = None;
-                intent.in_flight = true;
-                intent.generation = self.list_generation;
-                intent.attachment_generation = self.attachment_generation;
-                intent.target_session_id = session_id;
-            }
+        if let Some(desired) = queued
+            && let Some(intent) = self.pending_favorites.get_mut(&canonical_root)
+        {
+            intent.desired = desired;
+            intent.queued = None;
+            intent.in_flight = true;
+            intent.generation = self.list_generation;
+            intent.attachment_generation = self.attachment_generation;
+            intent.target_session_id = session_id;
             self.counts.favorite_started = self.counts.favorite_started.saturating_add(1);
             Some((session_id, canonical_root, desired))
         } else {
@@ -1232,6 +1287,24 @@ impl SessionRail {
             }
             return None;
         }
+        if matches!(mouse.kind, MouseEventKind::Moved) {
+            self.pointer_position = Some((mouse.column, mouse.row));
+            self.hovered_card = hit_card(&self.card_hits, mouse.column, mouse.row);
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self
+                .toggle_area
+                .is_some_and(|rect| point_in_rect(rect, mouse.column, mouse.row))
+        {
+            return Some(RailOutcome::ToggleVisibility);
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self
+                .new_session_area
+                .is_some_and(|rect| point_in_rect(rect, mouse.column, mouse.row))
+        {
+            return Some(RailOutcome::NewSession);
+        }
         if let Some(compact) = self.compact_area
             && point_in_rect(compact, mouse.column, mouse.row)
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
@@ -1301,9 +1374,12 @@ impl SessionRail {
                 if let Some(index) = hit_card(&self.card_hits, mouse.column, mouse.row) {
                     self.focus();
                     self.column_focus = ColumnFocus::List;
-                    if let Some(level) = self.levels.last_mut() {
-                        level.select(index);
+                    if let Some((summary, _)) = self.filtered_cards().get(index)
+                        && let Some(level) = self.levels.last_mut()
+                    {
+                        level.selected_session_id = Some(summary.session_id);
                     }
+                    self.ensure_session_scroll_shows_selected();
                     return self.preview_for_selection();
                 }
                 if self
@@ -1339,6 +1415,7 @@ impl SessionRail {
         if let Some(level) = self.levels.last_mut() {
             level.selected_session_id = Some(summary.session_id);
         }
+        self.ensure_session_scroll_shows_selected();
         match action {
             CardAction::Select => self.preview_for_selection(),
             CardAction::Open => {
@@ -1359,7 +1436,8 @@ impl SessionRail {
                     },
                 ),
             CardAction::Preview => self.preview_for_selection(),
-            CardAction::Archive | CardAction::Delete => {
+            CardAction::Archive => self.archive_selected(),
+            CardAction::Delete => {
                 self.open_confirm();
                 None
             }
@@ -1417,6 +1495,7 @@ impl SessionRail {
         if let Some(level) = self.levels.last_mut() {
             level.restore_selection(selected);
         }
+        self.ensure_session_scroll_shows_selected();
         if self.selected_id() != self.preview.as_ref().map(|preview| preview.session_id) {
             self.preview = None;
         }
@@ -1555,6 +1634,9 @@ impl SessionRail {
         };
         if let Some(level) = self.levels.last_mut() {
             level.selected_session_id = Some(cards[next].0.session_id);
+        }
+        if next != prev {
+            self.ensure_session_scroll_shows_selected();
         }
         next != prev
     }
@@ -1729,13 +1811,68 @@ impl SessionRail {
 
     fn scroll_up(&mut self) {
         let level = self.current_mut();
-        level.row_offset = level.row_offset.saturating_sub(1);
+        level.session_scroll = level.session_scroll.saturating_sub(1);
     }
 
     fn scroll_down(&mut self) {
-        let max = self.last_content_rows.saturating_sub(self.last_body_height);
+        let cards = self.filtered_cards().len();
+        let view = self.last_session_view.max(1);
+        let max = cards.saturating_sub(view);
         let level = self.current_mut();
-        level.row_offset = level.row_offset.saturating_add(1).min(max);
+        level.session_scroll = (level.session_scroll + 1).min(max);
+    }
+
+    /// Keep the selected session inside the sidebar window after a selection change.
+    fn ensure_session_scroll_shows_selected(&mut self) {
+        let cards = self.filtered_cards();
+        let selected_id = self.current().selected_session_id;
+        let pos = selected_id.and_then(|id| {
+            cards
+                .iter()
+                .position(|(summary, _)| summary.session_id == id)
+        });
+        let Some(pos) = pos else {
+            return;
+        };
+        let view = self.last_session_view.max(1);
+        let level = self.current_mut();
+        if pos < level.session_scroll {
+            level.session_scroll = pos;
+        } else if pos >= level.session_scroll + view {
+            level.session_scroll = pos + 1 - view;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_scroll_for_test(&self) -> usize {
+        self.current().session_scroll
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_viewport_for_test(&self) -> usize {
+        self.last_session_view
+    }
+
+    #[cfg(test)]
+    pub(crate) fn list_area_for_test(&self) -> Option<Rect> {
+        self.list_area
+    }
+
+    fn archive_selected(&mut self) -> Option<RailOutcome> {
+        if !self.daemon_connected {
+            self.notice = Some(DAEMON_UNAVAILABLE_HINT.to_string());
+            return None;
+        }
+        let s = self.selected()?.clone();
+        self.error = None;
+        Some(RailOutcome::Mutate(Box::new(self.begin_mutation(
+            s.session_id,
+            "archive",
+            cockpit_proto::Request::ArchiveSession {
+                session_id: s.session_id,
+                cascade: true,
+            },
+        ))))
     }
 
     fn scroll_preview_up(&mut self) -> Option<RailOutcome> {

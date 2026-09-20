@@ -77,6 +77,14 @@ impl App {
         match outcome {
             None => false,
             Some(RailOutcome::Unfocus) => true,
+            Some(RailOutcome::ToggleVisibility) => {
+                self.toggle_session_sidebar_from_chord();
+                true
+            }
+            Some(RailOutcome::NewSession) => {
+                self.pending_new_session = true;
+                true
+            }
             Some(RailOutcome::Resume(session_id)) => {
                 self.resume_session(session_id);
                 true
@@ -150,26 +158,28 @@ mod tests {
         }
     }
 
-    fn configured_app(tmp: &tempfile::TempDir) -> App {
-        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    fn configured_app(tmp: &tempfile::TempDir) -> (App, cockpit_test_support::TestEnvGuard) {
+        let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         let cockpit = tmp.path().join(".cockpit");
-        std::fs::create_dir(&cockpit).unwrap();
+        std::fs::create_dir_all(&cockpit).unwrap();
+        cockpit_config::config::dirs::ensure_global_config_dir().unwrap();
         std::fs::write(
             cockpit.join("config.json"),
             r#"{"active_model":{"provider":"p","model":"m"}}"#,
         )
         .unwrap();
         let provider_dir = cockpit.join("providers");
-        std::fs::create_dir(&provider_dir).unwrap();
+        std::fs::create_dir_all(&provider_dir).unwrap();
         std::fs::write(
             provider_dir.join("p.json"),
             r#"{"url":"https://example.test","models":[{"id":"m"}]}"#,
         )
         .unwrap();
-        cockpit_config::trust::with_workspace_trust_policy(
+        let app = cockpit_config::trust::with_workspace_trust_policy(
             super::super::trusted_workspace_policy_for_tests(tmp.path()),
             || App::new(Some(tmp.path()), false),
-        )
+        );
+        (app, env)
     }
 
     fn summary(id: Uuid, last_active: i64) -> SessionSummary {
@@ -217,10 +227,7 @@ mod tests {
     }
 
     fn render_width(app: &mut App, width: u16, height: u16) -> String {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
-        let buffer = terminal.backend().buffer();
+        let buffer = render_buffer(app, width, height);
         buffer
             .content()
             .iter()
@@ -228,10 +235,25 @@ mod tests {
             .collect()
     }
 
+    fn render_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16, x_start: u16, x_end: u16) -> String {
+        let mut out = String::new();
+        for x in x_start..x_end {
+            out.push_str(buf[(x, y)].symbol());
+        }
+        out
+    }
+
     #[test]
     fn named_shell_widths_80_79_56_55() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = configured_app(&tmp);
+        let (mut app, _env) = configured_app(&tmp);
         app.first_paint_completed = true;
 
         let text80 = render_width(&mut app, 80, 24);
@@ -282,7 +304,7 @@ mod tests {
     #[test]
     fn sessions_command_focuses_rail_search() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = configured_app(&tmp);
+        let (mut app, _env) = configured_app(&tmp);
         assert!(!app.session_rail.is_focused());
         let cmd = *super::super::slash::SLASH_COMMANDS
             .iter()
@@ -294,10 +316,157 @@ mod tests {
         assert!(!app.overlay.is_open());
     }
 
+    fn popover_chat_body(app: &App, width: u16, height: u16) -> ratatui::layout::Rect {
+        let rects = app
+            .geometry()
+            .layout(ratatui::layout::Rect::new(0, 0, width, height));
+        let (_rail, chat_body) = app.session_rail.split_body(rects.body, width);
+        chat_body
+    }
+
+    fn chat_column_text(buf: &ratatui::buffer::Buffer, rail_right: u16, width: u16) -> String {
+        (0..buf.area.height)
+            .map(|y| row_text(buf, y, rail_right, width))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn persistent_rail_remains_visible_under_owned_popover_surfaces() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        {
+            let (mut tools, _env) = configured_app(&tmp);
+            let command = *super::super::slash::SLASH_COMMANDS
+                .iter()
+                .find(|command| command.name == "tools")
+                .unwrap();
+            tools.execute_slash(command);
+            assert!(matches!(tools.overlay, Overlay::Tools(_)));
+            let tools_buf = render_buffer(&mut tools, 120, 40);
+            let rail = tools.session_rail.rail_area().expect("persistent rail");
+            let rail_right = rail.x + rail.width;
+            let tools_text = tools_buf
+                .content()
+                .iter()
+                .map(|cell| cell.symbol().to_string())
+                .collect::<String>();
+            assert!(tools_text.contains("◆ Cockpit"));
+            assert!(tools_text.contains("SESSIONS"));
+            let chat_has_tools =
+                chat_column_text(&tools_buf, rail_right, 120).contains("current agent tools");
+            assert!(
+                chat_has_tools,
+                "tools popover must render in the chat body, not over the rail"
+            );
+            let chat_body = popover_chat_body(&tools, 120, 40);
+            let popover = tools.last_popover_rect_for_tests();
+            assert!(
+                popover.height > 12,
+                "zero-dialog overlays must not clamp to the legacy 12-row popover"
+            );
+            assert_eq!(
+                popover.height,
+                chat_body.height.saturating_sub(2).max(1),
+                "tools popover height tracks the chat body, not a fixed dialog slot"
+            );
+            assert!(popover.x >= rail_right, "popover sits in the chat column");
+        }
+
+        {
+            let (mut quick, _env) = configured_app(&tmp);
+            quick.open_quick_dialog();
+            assert!(matches!(quick.overlay, Overlay::Quick(_)));
+            let quick_geom = quick.geometry();
+            assert!(
+                quick_geom.dialog > 0,
+                "quick overlay owns a bounded dialog height"
+            );
+            render_buffer(&mut quick, 120, 40);
+            let rail = quick.session_rail.rail_area().expect("quick rail");
+            let rail_right = rail.x + rail.width;
+            let quick_popover = quick.last_popover_rect_for_tests();
+            assert_eq!(
+                quick_popover.height, quick_geom.dialog,
+                "dialog-height overlays keep their declared height"
+            );
+            assert!(quick_popover.x >= rail_right);
+        }
+
+        {
+            let (mut settings, _env) = configured_app(&tmp);
+            settings.dialog = Dialog::Settings(Box::new(
+                crate::tui::settings::SettingsDialog::open(tmp.path().join("config.json")),
+            ));
+            let settings_buf = render_buffer(&mut settings, 120, 40);
+            assert!(settings.session_rail.rail_area().is_some());
+            let settings_rail = settings.session_rail.rail_area().expect("settings rail");
+            let rail_right = settings_rail.x + settings_rail.width;
+            let settings_popover = settings.last_popover_rect_for_tests();
+            assert!(settings_popover.x >= rail_right);
+            assert!(settings_popover.height > 12);
+            assert!(
+                chat_column_text(&settings_buf, rail_right, 120).contains("Settings"),
+                "settings dialog paints in the chat column beside the rail"
+            );
+        }
+
+        {
+            let (mut picker, _env) = configured_app(&tmp);
+            picker.launch.active_model = Some(("p".to_string(), "m".to_string()));
+            picker.config_snapshot.providers.providers.insert(
+                "p".to_string(),
+                cockpit_config::providers::ProviderEntry {
+                    models: vec![cockpit_config::providers::ModelEntry {
+                        id: "m".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            picker.handle_key(ctrl('p'));
+            assert!(
+                picker.composer_controls.picker.is_some(),
+                "pill model picker opens through composer controls after #476"
+            );
+            let picker_buf = render_buffer(&mut picker, 120, 40);
+            assert!(picker.session_rail.rail_area().is_some());
+            let picker_rail = picker.session_rail.rail_area().expect("picker rail");
+            let rail_right = picker_rail.x + picker_rail.width;
+            let picker_popover = picker.last_popover_rect_for_tests();
+            assert!(picker_popover.x >= rail_right);
+            assert!(picker_popover.height > 12);
+            assert!(
+                chat_column_text(&picker_buf, rail_right, 120).contains('m'),
+                "model picker paints in the chat column beside the rail"
+            );
+        }
+
+        {
+            let (mut trust, _env) = configured_app(&tmp);
+            trust.dialog = Dialog::open_workspace_trust(cockpit_config::trust::TrustRoot {
+                opened_path: tmp.path().to_path_buf(),
+                root: tmp.path().to_path_buf(),
+                kind: cockpit_config::trust::TrustRootKind::Directory,
+            });
+            let trust_buf = render_buffer(&mut trust, 120, 40);
+            assert!(trust.session_rail.rail_area().is_some());
+            let trust_rail = trust.session_rail.rail_area().expect("trust rail");
+            let rail_right = trust_rail.x + trust_rail.width;
+            let trust_popover = trust.last_popover_rect_for_tests();
+            assert!(trust_popover.x >= rail_right);
+            assert!(trust_popover.height > 12);
+            assert!(
+                chat_column_text(&trust_buf, rail_right, 120).contains("trust"),
+                "workspace trust dialog paints in the chat column beside the rail"
+            );
+        }
+    }
+
     #[test]
     fn ctrl_j_focuses_rail_and_escape_returns_to_composer() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = configured_app(&tmp);
+        let (mut app, _env) = configured_app(&tmp);
         app.composer.insert_str("hello");
         app.handle_key(ctrl('j'));
         assert!(app.session_rail.is_focused());
@@ -311,7 +480,7 @@ mod tests {
     #[test]
     fn alt_arrows_cycle_sessions_without_leaving_rail_focus() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = configured_app(&tmp);
+        let (mut app, _env) = configured_app(&tmp);
         let first = Uuid::from_u128(1);
         let second = Uuid::from_u128(2);
         seed_rail_sessions(&mut app, vec![summary(first, 20), summary(second, 10)]);
@@ -348,9 +517,54 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_b_visibility_survives_a_config_backed_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut first, _env) = configured_app(&tmp);
+        assert!(first.session_rail.is_visible());
+        first.handle_key(ctrl('b'));
+        assert!(!first.session_rail.is_visible());
+        assert!(!first.config_snapshot.extended.tui.session_rail_visible);
+
+        first.clear_model_and_config_chrome_for_empty_session();
+        let mut attach_extended = first.config_snapshot.extended.clone();
+        attach_extended.tui.session_rail_visible = false;
+        first.apply_config_snapshot(cockpit_proto::ConfigSnapshot {
+            session_id: uuid::Uuid::new_v4(),
+            generation: 1,
+            extended: attach_extended,
+            providers: cockpit_proto::ProviderConfigView::default(),
+        });
+        assert!(
+            !first.session_rail.is_visible(),
+            "hide must survive config-snapshot epoch then daemon apply (attach path)"
+        );
+        assert!(!first.config_snapshot.extended.tui.session_rail_visible);
+
+        let global = cockpit_config::config::dirs::global_config_file().unwrap();
+        let persisted = cockpit_config::extended::ExtendedConfigDoc::load(&global)
+            .unwrap()
+            .config();
+        assert!(!persisted.tui.session_rail_visible);
+        drop(_env);
+        let (mut restarted, _env2) = configured_app(&tmp);
+        assert!(
+            !restarted.config_snapshot.extended.tui.session_rail_visible,
+            "held config must match the persisted hide preference before attach or toggle"
+        );
+        assert!(
+            !restarted.session_rail.is_visible(),
+            "App::new reads the persisted global session-rail preference before first paint"
+        );
+
+        restarted.handle_key(ctrl('b'));
+        assert!(restarted.session_rail.is_visible());
+        assert!(restarted.config_snapshot.extended.tui.session_rail_visible);
+    }
+
+    #[test]
     fn alt_arrows_switch_sessions_while_an_overlay_pane_is_open() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = configured_app(&tmp);
+        let (mut app, _env) = configured_app(&tmp);
         let first = Uuid::from_u128(1);
         let second = Uuid::from_u128(2);
         seed_rail_sessions(&mut app, vec![summary(first, 20), summary(second, 10)]);
@@ -376,7 +590,7 @@ mod tests {
     #[test]
     fn alt_down_switches_sessions_while_a_composer_picker_is_open() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = configured_app(&tmp);
+        let (mut app, _env) = configured_app(&tmp);
         let first = Uuid::from_u128(1);
         let second = Uuid::from_u128(2);
         seed_rail_sessions(&mut app, vec![summary(first, 20), summary(second, 10)]);
@@ -416,7 +630,7 @@ mod tests {
     #[test]
     fn rail_shortcuts_do_not_steal_composer_when_unfocused() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = configured_app(&tmp);
+        let (mut app, _env) = configured_app(&tmp);
         app.handle_key(press(KeyCode::Char('a')));
         app.handle_key(press(KeyCode::Char('b')));
         assert_eq!(app.composer.text(), "ab");
@@ -426,7 +640,7 @@ mod tests {
     #[test]
     fn startup_does_not_issue_a_list_before_first_paint() {
         let tmp = tempfile::tempdir().unwrap();
-        let app = configured_app(&tmp);
+        let (app, _env) = configured_app(&tmp);
         assert!(!app.first_paint_completed);
         assert_eq!(app.session_rail.request_counts().list_started, 0);
         assert!(app.session_rail.needs_initial_list() || !app.session_rail.daemon_connected());
@@ -435,7 +649,7 @@ mod tests {
     #[test]
     fn no_overlay_sessions_variant_in_production_enum() {
         let tmp = tempfile::tempdir().unwrap();
-        let app = configured_app(&tmp);
+        let (app, _env) = configured_app(&tmp);
         assert!(matches!(app.overlay, Overlay::None));
         let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tui/app/mod.rs"));
         assert!(
@@ -447,7 +661,7 @@ mod tests {
     #[test]
     fn churn_counts_one_list_through_startup_resize_search_reconnect() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = configured_app(&tmp);
+        let (mut app, _env) = configured_app(&tmp);
         app.first_paint_completed = true;
         app.session_rail.set_daemon_connected(true);
         app.start_sessions_list_action();
@@ -524,7 +738,7 @@ mod tests {
     #[test]
     fn reconnect_aborts_pending_session_mutation() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = configured_app(&tmp);
+        let (mut app, _env) = configured_app(&tmp);
         app.first_paint_completed = true;
         seed_rail_sessions(&mut app, vec![summary(Uuid::from_u128(1), 10)]);
         app.session_rail.focus();
@@ -549,7 +763,7 @@ mod tests {
     #[test]
     fn attachment_change_aborts_pending_session_mutation() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = configured_app(&tmp);
+        let (mut app, _env) = configured_app(&tmp);
         app.first_paint_completed = true;
         seed_rail_sessions(&mut app, vec![summary(Uuid::from_u128(1), 10)]);
         app.session_rail.focus();
@@ -578,7 +792,7 @@ mod tests {
         use ratatui::layout::Rect;
 
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = configured_app(&tmp);
+        let (mut app, _env) = configured_app(&tmp);
         app.mouse_capture = true;
         app.session_rail.focus();
         render_width(&mut app, 55, 24);

@@ -16,6 +16,8 @@ pub const COMPACT_AFFORDANCE_WIDTH: u16 = 3;
 /// How the rail occupies the chat shell at a given terminal width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RailLayoutMode {
+    /// The user preference closes the rail regardless of available width.
+    HiddenByPreference,
     /// `width >= 80`. Persistent cards; chat consumes the remainder.
     Wide { rail_width: u16 },
     /// `56 <= width < 80`. Cards hidden; one-column focus/search affordance.
@@ -27,6 +29,14 @@ pub enum RailLayoutMode {
 
 impl RailLayoutMode {
     pub fn from_width(width: u16) -> Self {
+        Self::from_width_and_preference(width, true)
+    }
+
+    /// Resolve both responsive width and the persisted user preference.
+    pub fn from_width_and_preference(width: u16, visible: bool) -> Self {
+        if !visible {
+            return Self::HiddenByPreference;
+        }
         if width >= WIDE_BREAKPOINT {
             let remainder_after_min = width.saturating_sub(RAIL_MIN_WIDTH);
             let rail_width = (width / 4)
@@ -48,6 +58,7 @@ impl RailLayoutMode {
     /// Columns occupied by the persistent (non-overlay) rail column.
     pub fn persistent_width(self, focused: bool) -> u16 {
         match self {
+            Self::HiddenByPreference => 0,
             Self::Wide { rail_width } => rail_width,
             Self::Compact if !focused => COMPACT_AFFORDANCE_WIDTH,
             Self::Compact | Self::HiddenUntilFocused => 0,
@@ -57,6 +68,7 @@ impl RailLayoutMode {
     /// Overlay-sized rail width while focused in a non-wide layout.
     pub fn focused_overlay_width(self, frame_width: u16) -> u16 {
         match self {
+            Self::HiddenByPreference => 0,
             Self::Wide { rail_width } => rail_width,
             Self::Compact | Self::HiddenUntilFocused => {
                 let overlay = RAIL_MAX_WIDTH.min(frame_width.saturating_sub(1));
@@ -71,6 +83,7 @@ impl RailLayoutMode {
 
     pub fn shows_cards(self, focused: bool) -> bool {
         match self {
+            Self::HiddenByPreference => false,
             Self::Wide { .. } => true,
             Self::Compact | Self::HiddenUntilFocused => focused,
         }
@@ -78,6 +91,7 @@ impl RailLayoutMode {
 
     pub fn occupies_shell(self, focused: bool) -> bool {
         match self {
+            Self::HiddenByPreference => false,
             Self::Wide { .. } | Self::Compact => true,
             Self::HiddenUntilFocused => focused,
         }

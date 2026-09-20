@@ -40,7 +40,7 @@ pub const UPDATE_ENV: &str = "COCKPIT_UPDATE_GOLDEN";
 pub const PINNED_HHMM: &str = "12:00";
 
 /// Pinned session-rail datetime used while [`GoldenPins`] is installed.
-pub const PINNED_DATETIME: &str = "2020-01-15 12:00";
+pub const PINNED_DATETIME: &str = "Jan 15, 12:00";
 
 /// Cloud RNG entropy for `clouds::seed_with(w, h, entropy)` (#428).
 pub const CLOUD_SEED: u64 = 1;

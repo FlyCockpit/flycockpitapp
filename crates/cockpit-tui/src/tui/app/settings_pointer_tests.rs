@@ -154,10 +154,10 @@ fn settings_hover_is_not_stolen_by_session_rail() {
     terminal
         .draw(|frame| app.render(frame))
         .expect("settings over shell");
-    assert!(
-        app.session_rail.rail_area().is_none() && app.session_rail.compact_area().is_none(),
-        "a body-owning dialog must drop last-frame rail hit geometry"
-    );
+    let rail = app
+        .session_rail
+        .rail_area()
+        .expect("settings keeps persistent session navigation visible");
 
     let target = {
         let Dialog::Settings(dialog) = &app.dialog else {
@@ -166,15 +166,15 @@ fn settings_hover_is_not_stolen_by_session_rail() {
         dialog
             .pointer_test_button_targets()
             .into_iter()
-            .find(|target| target.rect.x < 28)
+            .find(|target| target.rect.x >= rail.right())
             .map(|target| target.rect)
             .or_else(|| {
                 dialog
                     .pointer_test_target_rects()
                     .into_iter()
-                    .find(|rect| rect.x < 28)
+                    .find(|rect| rect.x >= rail.right())
             })
-            .expect("settings control in former rail columns")
+            .expect("settings control in the chat remainder")
     };
     app.handle_mouse(mouse(MouseEventKind::Moved, target.x, target.y));
     let Dialog::Settings(dialog) = &app.dialog else {
@@ -182,7 +182,7 @@ fn settings_hover_is_not_stolen_by_session_rail() {
     };
     assert!(
         dialog.pointer_test_has_hover(),
-        "settings must own hover in the columns the rail occupied last frame"
+        "settings must own hover inside its post-rail body"
     );
 }
 

@@ -29,12 +29,10 @@ impl App {
             .is_some_and(|area| point_in(area, col, row))
     }
 
-    /// Rail hits are frame-scoped and sit below every body-owning modal.
-    /// `Overlay::None` is not enough: settings/wizard live on `Dialog`.
+    /// Rail hits are frame-scoped. Dialogs and overlays are rendered in the
+    /// body remaining after the rail split, so neither surface overlaps it.
     pub(super) fn session_rail_owns_pointer(&self, col: u16, row: u16) -> bool {
         self.pointer_over_session_rail(col, row)
-            && matches!(self.overlay, Overlay::None)
-            && !self.dialog.is_active()
     }
 }
 
@@ -198,6 +196,7 @@ impl App {
                 }
                 return;
             }
+            self.session_rail.clear_hover();
             if self.mouse_capture {
                 let _ = self.button_registry.handle_mouse(mouse);
                 let hovered_picker_row = self
@@ -244,8 +243,8 @@ impl App {
             self.pending_link_activation = None;
         }
         // Overlay/compact rails paint over the transcript. Hits in that rect
-        // belong to the rail, not to hidden links or pin/fork chips. Body-owning
-        // dialogs (settings/wizard) outrank the rail for every event kind.
+        // belong to the rail, not to hidden links or pin/fork chips. Persistent
+        // rails are disjoint from the dialog/overlay body by construction.
         if !pointer_in_composer_picker && self.session_rail_owns_pointer(mouse.column, mouse.row) {
             self.link_registry.clear_hover();
             self.link_pointer_gesture.cancel();

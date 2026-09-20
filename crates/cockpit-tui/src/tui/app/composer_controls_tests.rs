@@ -500,22 +500,26 @@ fn ctrl_e_opens_effort_picker_through_router() {
 #[test]
 fn ctrl_b_and_ctrl_n_route_to_session_seams() {
     let tmp = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    cockpit_config::config::dirs::ensure_global_config_dir().unwrap();
     let mut app = app(&tmp);
     assert!(!app.session_rail.is_focused());
     assert!(!app.pending_new_session);
 
     app.handle_key(ctrl(KeyCode::Char('b')));
-    assert!(app.session_rail.is_focused());
+    assert!(!app.session_rail.is_visible());
     app.handle_key(ctrl(KeyCode::Char('b')));
-    assert!(!app.session_rail.is_focused());
+    assert!(app.session_rail.is_visible());
 
     app.handle_key(ctrl(KeyCode::Char('n')));
     assert!(app.pending_new_session);
 }
 
 #[test]
-fn ctrl_b_dismisses_an_open_picker_before_focusing_the_session_rail() {
+fn ctrl_b_dismisses_an_open_picker_before_hiding_the_session_rail() {
     let tmp = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    cockpit_config::config::dirs::ensure_global_config_dir().unwrap();
     let mut app = app(&tmp);
     let _ = render(&mut app, 120, 24);
     app.handle_key(ctrl(KeyCode::Char('p')));
@@ -523,10 +527,10 @@ fn ctrl_b_dismisses_an_open_picker_before_focusing_the_session_rail() {
 
     app.handle_key(ctrl(KeyCode::Char('b')));
 
-    assert!(app.session_rail.is_focused());
+    assert!(!app.session_rail.is_visible());
     assert!(
         app.composer_controls.picker.is_none(),
-        "rail focus must release picker ownership of arrows and Enter"
+        "rail visibility toggle must release picker ownership of arrows and Enter"
     );
     assert!(app.composer_controls.selection.is_none());
 }
@@ -754,7 +758,7 @@ fn ctrl_k_router_dispatches_b_n_and_r_continuations() {
     btw.btw_pane.as_mut().expect("btw pane").focused = true;
     btw.handle_key(ctrl(KeyCode::Char('b')));
     assert!(
-        btw.session_rail.is_focused(),
+        !btw.session_rail.is_visible(),
         "bare Ctrl+B uses the global session-sidebar seam"
     );
     assert!(
